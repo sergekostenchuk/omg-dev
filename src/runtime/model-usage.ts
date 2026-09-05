@@ -1,6 +1,7 @@
 import type { Store, Revision } from "../storage/store.js";
 import type { RoleBinding } from "./environment.js";
 import { requireCondition } from "../errors.js";
+import type { Ref } from "../pipeline/contracts.js";
 
 export interface TokenUsage {
   inputTokens: number; outputTokens: number;
@@ -8,10 +9,12 @@ export interface TokenUsage {
 }
 export interface ModelCall {
   projectId: string; draftId: string; purpose: string; requestId: string;
+  profile?: Ref | null;
+  questionId?: string | null;
   startedAt: number; finishedAt: number | null; status: "running" | "succeeded" | "failed";
   requested: RoleBinding; confirmed: { model: string | null; effort: string | null; speed: string | null };
   request: { chars: number; bytes: number; hash: string };
-  response: { chars: number; bytes: number } | null;
+  response: { chars: number; bytes: number; record?: Ref } | null;
   usage: TokenUsage | null; usageSource: "adapter" | "unavailable"; error: string | null;
 }
 const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
@@ -55,6 +58,6 @@ export function modelUsage(store: Store, project: string, since: number) {
         cumulative: summarize(selected), period: summarize(selected.filter(record => recent.includes(record))) };
     }),
     active: calls.filter(record => record.value.status === "running").map(record => ({ id: record.id,
-      draftId: record.value.draftId, purpose: record.value.purpose, model: record.value.requested.model,
+      draftId: record.value.draftId, questionId: record.value.questionId ?? null, purpose: record.value.purpose, model: record.value.requested.model,
       effort: record.value.requested.effort, speed: record.value.requested.speed ?? "inherited", startedAt: record.value.startedAt })) };
 }

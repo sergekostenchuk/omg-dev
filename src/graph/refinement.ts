@@ -13,6 +13,7 @@ import { REFINEMENT_CONTRACT_VERSION, refinementQuestions, deferredGap, type Tec
 import { technicalResearchFindings } from "./research-evidence.js";
 import { layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 import { defectGaps, defectInputs } from "./plan-defects.js";
+import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -62,6 +63,7 @@ export class Refinement {
     return refinementQuestions(level, [...(level === "R2" ? this.#gaps(project) : []), ...defectGaps(this.store, project, imported)]);
   }
   begin(project: string, level: Exclude<ResearchLevel, "R3">): Revision<DiscoveryDraft> {
+    assertPilotBoundary(this.store, project, level);
     requireCondition(["R0", "R1", "R2"].includes(level), "phase_invalid", "Use the feasibility checker for R3");
     const inputs = this.#inputs(project, level);
     if (level === "R0") return derivedDraft(this.store, project, "om-g2", level, "compilation", this.#r0Entries(project), inputs, REFINEMENT_CONTRACT_VERSION);
@@ -71,6 +73,7 @@ export class Refinement {
       uniqueRefs([...inputs, reference(workspace), ...effective.guards, ...defectInputs(this.store, project)]), REFINEMENT_CONTRACT_VERSION);
   }
   finishResearch(project: string, level: Exclude<ResearchLevel, "R3">, draftRef: Ref, expected: number): Revision<Milestone> {
+    assertPilotBoundary(this.store, project, level);
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
     const inputs = uniqueRefs([...this.#inputs(project, level), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
     requireCondition(checked.findings.length === 0, "research_unresolved", "Research is unresolved or stale");
@@ -97,6 +100,7 @@ export class Refinement {
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
+    assertPilotBoundary(this.store, project, `L${level}`);
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
     requireCondition(!expectedGraph || (graphAtStart && canonical(reference(graphAtStart)) === canonical(expectedGraph)),
       "graph_stale", "The constructed graph changed before layer acceptance");
@@ -114,6 +118,7 @@ export class Refinement {
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
   }
   prepareLayer(project: string, level: 2 | 3): Revision<DiscoveryDraft> {
+    assertPilotBoundary(this.store, project, `L${level}`);
     const inputs = this.#inputs(project, `L${level}`);
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph?.value.version === 2, "graph_upgrade_required", "Layer research needs the enriched operation map");
@@ -123,6 +128,7 @@ export class Refinement {
       [layerDesignSpec(level)], uniqueRefs([...inputs, reference(upper), ...effective.guards]), LAYER_DESIGN_VERSION);
   }
   buildLayer(project: string, level: 2 | 3, draft: Ref, expected: number, actor: string): Revision<Graph> {
+    assertPilotBoundary(this.store, project, `L${level}`);
     const inputs = this.#inputs(project, `L${level}`);
     const record = this.store.get<DiscoveryDraft>(draft.id);
     requireCondition(record && inputs.every(input => record.value.inputs.some(ref => canonical(ref) === canonical(input))),
@@ -162,6 +168,7 @@ export class Refinement {
     return result;
   }
   assess(project: string, expected: number): Revision<Feasibility> {
+    assertPilotBoundary(this.store, project, "R3");
     const inputs = this.#inputs(project, "R3"); const effective = this.environments.effective(project); const environment = effective.environment;
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && graph.kind === "graph", "graph_missing", "Operation map is missing");
@@ -197,6 +204,7 @@ export class Refinement {
     return result;
   }
   publish(project: string, ref: Ref, expected: number) {
+    assertPilotBoundary(this.store, project, "R3");
     const result = this.feasibilityGate(project, ref);
     requireCondition(result.findings.length === 0, "feasibility_not_ready", "The current R3 result is not ready");
     return this.pipeline.draft(project, "om-g2", { feasibility: ref } as unknown as Json, expected);

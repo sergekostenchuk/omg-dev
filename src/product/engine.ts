@@ -27,6 +27,7 @@ import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
 import { RefinementResearch } from "./refinement-research.js";
 import { modelUsage } from "../runtime/model-usage.js";
+import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -188,8 +189,9 @@ export class ProductEngine {
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
+      case "configure-reader-pilot": this.#project(command.project); return configureReaderPilot(this.store, this.environments, command.project, command.settings, command.expected);
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
-      case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
+      case "execute-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3"); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
       case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
       case "repair-plan": this.#project(command.project); return this.repairs.run(command.project, command.run, command.maxTurns);
@@ -204,13 +206,14 @@ export class ProductEngine {
       case "assess": this.#project(command.project); return this.refinement.assess(command.project, command.expected);
       case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
       case "compile": {
+        assertPilotBoundary(this.store, command.project, "R3");
         this.#project(command.project); const plan = this.compiler.compile(command.project);
         const current = this.store.get<StageArtifact>(stageId(command.project, "compilation"));
         if (current?.value.status === "accepted" && (current.value.content as unknown as { plan?: Ref }).plan?.hash === plan.hash) return plan;
         const stage = this.compiler.publish(command.project, reference(plan), current?.revision ?? 0);
         this.pipeline.accept(command.project, "compilation", stage.revision); return plan;
       }
-      case "draft-plan": this.#project(command.project); return this.compiler.publish(command.project, command.plan, command.expected);
+      case "draft-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3"); return this.compiler.publish(command.project, command.plan, command.expected);
       case "create-project": return this.store.write<Project>({ id: `project:${command.project}`, kind: "project", expected: 0, value: { id: command.project, title: command.title } });
       case "prepare-stage": return this.prepare(command.project, command.stage);
       case "source-document": this.#project(command.project); return this.discovery.evidence.document(command.project, command.id, command.text, command.media, command.expected);
@@ -243,7 +246,9 @@ export class ProductEngine {
       }
       case "refine-graph": this.#project(command.project); return this.graphs.refine(command.project, command.expected, command.draft, this.actor);
       case "draft-stage": return this.draft(command.project, command.stage, command.draftId, command.expected);
-      case "accept-stage": this.#project(command.project); return this.pipeline.accept(command.project, command.stage, command.expected);
+      case "accept-stage": this.#project(command.project);
+        if (["om-g2", "compilation", "execution"].includes(command.stage)) assertPilotBoundary(this.store, command.project, "R3");
+        return this.pipeline.accept(command.project, command.stage, command.expected);
       case "project": return this.projection(command.project);
       case "export-stage": return this.exportStage(command.project, command.stage);
     }
