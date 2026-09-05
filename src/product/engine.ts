@@ -9,6 +9,8 @@ import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 import { parseCommand } from "./commands.js";
 import type { Graph } from "../graph/model.js";
+import { Environments } from "../runtime/environment.js";
+import { Refinement } from "../graph/refinement.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -16,13 +18,22 @@ export class ProductEngine {
   readonly discovery: Discovery;
   readonly graphs: GraphRepository;
   readonly pipeline: Pipeline;
+  readonly environments: Environments;
+  readonly refinement: Refinement;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
     this.pipeline = new Pipeline(store, validators);
+    this.environments = new Environments(store);
+    this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
+    if (stage === "om-g2") {
+      const content = context.content as { feasibility?: unknown } | null;
+      if (!content || Object.keys(content).join(",") !== "feasibility" || !isRef(content.feasibility)) return rejected("feasibility_missing", "This stage requires a bound R3 result");
+      return this.refinement.feasibilityGate(context.projectId, content.feasibility);
+    }
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;
     if (!content || typeof content !== "object" || !isRef(content.draft) || !content.fields
@@ -86,6 +97,8 @@ export class ProductEngine {
       drafts: this.store.list<DiscoveryDraft>("discovery-draft").filter(item => item.value.projectId === project),
       questions: this.store.list<Question>("question").filter(item => item.value.projectId === project),
       sources: this.store.list<{ projectId: string }>("source").filter(item => item.value.projectId === project),
+      environment: this.store.get(`environment:${project}`), phases: this.store.list<{ projectId: string }>("phase").filter(item => item.value.projectId === project),
+      feasibility: this.store.get(`feasibility:${project}`),
     };
   }
   exportStage(project: string, stage: Stage): string {
@@ -96,6 +109,12 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
+      case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
+      case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
+      case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);
+      case "assess": this.#project(command.project); return this.refinement.assess(command.project, command.expected);
+      case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
       case "create-project": return this.store.write<Project>({ id: `project:${command.project}`, kind: "project", expected: 0, value: { id: command.project, title: command.title } });
       case "prepare-stage": return this.prepare(command.project, command.stage);
       case "source-document": this.#project(command.project); return this.discovery.evidence.document(command.project, command.id, command.text, command.media, command.expected);

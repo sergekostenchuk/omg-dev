@@ -4,8 +4,15 @@ import type { Json } from "../canonical.js";
 import type { Ref, Stage } from "../pipeline/contracts.js";
 import type { Selector } from "../evidence/evidence.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import type { Environment } from "../runtime/environment.js";
 
 export type ProductCommand =
+  | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
+  | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
+  | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
+  | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
+  | { type: "assess"; project: string; expected: number }
+  | { type: "draft-om"; project: string; feasibility: Ref; expected: number }
   | { type: "create-project"; project: string; title: string }
   | { type: "prepare-stage"; project: string; stage: UpstreamStage }
   | { type: "source-document"; project: string; id: string; text: string; media: "text/plain" | "application/json"; expected: number }
@@ -27,7 +34,16 @@ const ref = { type: "object", additionalProperties: false, required: ["id", "rev
 const stage = { enum: ["discovery", "concept", "operation-map", "specification", "features", "om-g2", "compilation", "execution"] };
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const command = (type: string, properties: Record<string, unknown>) => object({ type: { const: type }, ...properties });
+const processCommand = object({ executable: string, args: { type: "array", items: { type: "string" } } });
+const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
+const researchLevel = { enum: ["R0", "R1", "R2"] };
 const schema = { oneOf: [
+  command("configure", { project, expected, environment: object({ workspace: string, implementer: role, reviewer: role,
+    fullCheck: processCommand, timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } }) }),
+  command("begin-research", { project, level: researchLevel }),
+  command("finish-research", { project, level: researchLevel, draft: ref, expected }),
+  command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),
+  command("assess", { project, expected }), command("draft-om", { project, feasibility: ref, expected }),
   command("create-project", { project, title: string }),
   command("prepare-stage", { project, stage: { enum: UPSTREAM_STAGES } }),
   command("source-document", { project, id: project, text: { type: "string", maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] }, expected }),

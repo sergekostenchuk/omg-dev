@@ -115,10 +115,28 @@ export function validateGraph(input: unknown): Validation {
     if (!nodes.has(join.consumer) || canonical(actual) !== canonical([...join.connectors].sort())) fail("join_inputs_invalid", join.id, "Join must name exactly the consumer's incoming connectors");
   }
   const horizon = new Set(graph.horizon);
+  const l3Edges = byLevel.get(3) ?? [];
+  const reaches = (from: string, to: string): boolean => {
+    const queue = [from]; const seen = new Set<string>();
+    while (queue.length) {
+      const current = queue.shift()!; if (current === to) return true;
+      if (seen.has(current)) continue; seen.add(current);
+      for (const [source, target] of l3Edges) if (source === current) queue.push(target);
+    }
+    return false;
+  };
+  const writers = new Map<string, string[]>();
   for (const id of horizon) {
     const node = nodes.get(id);
     if (!node || node.kind !== "work") { fail("horizon_invalid", id, "Only L3 work nodes can enter the execution horizon"); continue; }
     if (!node.code.length || !node.tests.length) fail("l3_evidence_missing", id, "Active L3 needs code references and product tests");
+    if (node.parent && nodes.has(node.parent) && canonical(node.boundary) !== canonical(nodes.get(node.parent)!.boundary)) fail("boundary_mismatch", id, "Work must preserve its operation's authority, state, writer and rollback boundary");
+    if (artifacts.get(node.outcome)?.external) fail("external_outcome", id, "An implementation cannot claim an external input as its own produced outcome");
+    for (const ref of node.code.filter(ref => ref.access === "write")) {
+      const prior = writers.get(ref.path) ?? [];
+      for (const other of prior) if (!reaches(other, id) && !reaches(id, other)) fail("write_ownership_overlap", ref.path, "Shared writes need an ordered connector dependency");
+      writers.set(ref.path, [...prior, id]);
+    }
     for (const connector of graph.connectors) for (const binding of connector.bindings) if (binding.level === 3 && binding.producer.node === id && binding.anchor === null) {
       if (binding.consumers.some(consumer => !horizon.has(consumer.node))) fail("future_dependency_unanchored", connector.id, "A consumer outside the horizon needs a sleeping contract");
       if (!node.tests.some(testId => tests.get(testId)?.covers.includes(connector.id))) fail("connector_test_missing", connector.id, "Active producer needs a test covering this connector");

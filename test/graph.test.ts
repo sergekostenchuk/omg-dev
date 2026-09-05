@@ -55,3 +55,15 @@ test("future consumers require anchors and a real anchor outcome", () => {
   graph.anchors[0]!.outcome = "garden-data";
   assert.deepEqual(validateGraph(graph).findings, []);
 });
+
+test("active work preserves operation boundaries and orders shared writes", () => {
+  const graph = exampleGraph();
+  graph.nodes.find(node => node.id === "garden-consume-work")!.boundary = {
+    ...graph.nodes.find(node => node.id === "garden-consume-work")!.boundary, writer: "someone-else",
+  };
+  assert.ok(validateGraph(graph).findings.some(f => f.code === "boundary_mismatch"));
+  const unordered = exampleGraph(); unordered.connectors = []; unordered.joins = [];
+  unordered.artifacts[0]!.terminal = true; unordered.tests.forEach(t => { t.covers = []; });
+  unordered.nodes.find(node => node.id === "garden-consume-work")!.code[0]!.path = "produce.txt";
+  assert.ok(validateGraph(unordered).findings.some(f => f.code === "write_ownership_overlap"));
+});
