@@ -10,6 +10,7 @@ import type { Graph } from "../graph/model.js";
 import { layerDeltaView } from "./layer-delta.js";
 import { researchConsumerIds } from "../graph/research-evidence.js";
 import { contextTable, targetFieldGroups, CONTEXT_ENCODING } from "./context-tables.js";
+import { archivedContext, contextValue, contextPage, type ContextPage } from "./working-context.js";
 
 const escape = (value: string) => value.replaceAll("~", "~0").replaceAll("/", "~1");
 const descriptor = (pointer: string, value: unknown) => ({ pointer, chars: canonical(value).length, hash: hashJson(value) });
@@ -27,7 +28,13 @@ export function contextCatalogue(store: Store, draft: Revision<DiscoveryDraft>) 
   });
 }
 
-export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref, pointer: string, maxChars: number) {
+export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref, pointer: string, maxChars: number, page?: ContextPage) {
+  if (store.get(ref.id, ref.revision)?.kind === "research-context") {
+    const value = contextValue(archivedContext(store, draft, ref), pointer);
+    const result = { record: ref, pointer, ...contextPage(value, page) };
+    requireCondition(canonical(result).length <= maxChars, "context_read_limit", "Use a smaller page; the complete original remains in the archive");
+    return result;
+  }
   requireCondition(contextCatalogue(store, draft).some(item => canonical(item.ref) === canonical(ref)),
     "context_reference_foreign", "Only the current draft and its bound context records can be read");
   const record = store.get(ref.id, ref.revision)!;
@@ -39,7 +46,7 @@ export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, 
     requireCondition(value !== null && typeof value === "object" && Object.hasOwn(value, key), "context_missing", "Context pointer does not exist");
     value = (value as Record<string, Json>)[key]!;
   }
-  const result = { record: ref, pointer, value };
+  const result = { record: ref, pointer, ...contextPage(value, page) };
   requireCondition(canonical(result).length <= maxChars, "context_read_limit", "Select a smaller child pointer; the original context remains available");
   return result;
 }
@@ -87,7 +94,12 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     const { action, observation } = record.value;
     if (action.action === "read_source") return evidence.verify(observation as Observation);
     if (action.action === "read") return sourceCurrent(observation.ref);
-    if (action.action === "read_context") return catalogue.some(item => canonical(item.ref) === canonical(observation.record));
+    if (action.action === "read_context") {
+      if (store.get(observation.record.id)?.kind === "research-context") {
+        try { archivedContext(store, draft, observation.record); return true; } catch { return false; }
+      }
+      return catalogue.some(item => canonical(item.ref) === canonical(observation.record));
+    }
     return action.action === "search"; // Search results are navigation hints, never evidence of a fact.
   };
   return {

@@ -3,6 +3,7 @@ import type { Ref } from "../pipeline/contracts.js";
 import type { Observation, Selector } from "../evidence/evidence.js";
 import type { LayerDelta } from "./layer-delta.js";
 import type { BundleInput } from "./reader.js";
+import type { ContextPage } from "./working-context.js";
 
 export interface ResearchAssessment {
   projectId: string; question: Ref; value: Json; observations: Observation[];
@@ -14,7 +15,8 @@ export interface ResearchAnswer { projectId: string; question: string; assessmen
 export type ResearchAction =
   | ({ action: "answer_delta"; question: string; citations: { source: Ref; selector: Selector }[] } & LayerDelta)
   | { action: "read_bundle"; purpose: string; inputs: BundleInput[] }
-  | { action: "read_context"; record: Ref; pointer: string }
+  | { action: "read_context"; record: Ref; pointer: string; page?: ContextPage }
+  | { action: "checkpoint"; question: string; value: Json; citations: { source: Ref; selector: Selector }[]; unresolved: string[] }
   | { action: "search"; query: string }
   | { action: "read_source"; source: Ref; start: number; end: number }
   | { action: "read"; path: string; media: "text/plain" | "application/json" }
@@ -31,4 +33,5 @@ export interface ResearchRun {
 export interface ResearchTurn {
   run: string; number: number; action: unknown; assessment: Ref | null; observation: unknown; error: string | null;
   status: "pending" | "completed"; question: Ref | null;
+  replayedFrom?: Ref;
 }

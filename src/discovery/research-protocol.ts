@@ -11,6 +11,7 @@ import { reference } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { DELTA_COLLECTIONS } from "./layer-delta.js";
+import { workingContext } from "./working-context.js";
 
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const text = { type: "string", minLength: 1 };
@@ -24,6 +25,8 @@ const bundleItem = (properties: Record<string, unknown>) => {
   schema.properties['range'] = object({ start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 0 } });
   return schema;
 };
+const contextRead = object({ action: { const: "read_context" }, record: ref, pointer: { type: "string" } });
+contextRead.properties['page'] = object({ offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } });
 const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   object({ action: { const: "answer_delta" }, question: text, base: ref,
     upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
@@ -31,7 +34,9 @@ const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   object({ action: { const: "read_bundle" }, purpose: text, inputs: { type: "array", minItems: 1, items: { oneOf: [
     bundleItem({ path: text, media: { enum: ["text/plain", "application/json"] } }), bundleItem({ source: ref }),
   ] } } }),
-  object({ action: { const: "read_context" }, record: ref, pointer: { type: "string" } }),
+  contextRead,
+  object({ action: { const: "checkpoint" }, question: text, value: {},
+    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
   object({ action: { const: "search" }, query: text }),
   object({ action: { const: "read_source" }, source: ref, start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 1 } }),
   object({ action: { const: "read" }, path: text, media: { enum: ["text/plain", "application/json"] } }),
@@ -44,10 +49,16 @@ export function researchAction(value: unknown): ResearchAction {
   return value;
 }
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
-  audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot> }): Promise<unknown> {
+  audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
+    onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
   const requestId = randomUUID();
-  const input = JSON.stringify({ protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt, subject: context });
+  const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt };
+  const subject = audit?.pilot && audit.purpose !== "reader" ? workingContext(audit.store, environment.projectId,
+    audit.draftId, audit.questionId ?? "", context, audit.pilot.value.maxRequestChars - JSON.stringify({ ...envelope, subject: {} }).length)
+    : context;
+  audit?.onContext?.(subject as Record<string, any>);
+  const input = JSON.stringify({ ...envelope, subject });
   const reservation = audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
   let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,

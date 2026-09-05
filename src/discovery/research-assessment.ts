@@ -16,7 +16,7 @@ import { layerDeltaView } from "./layer-delta.js";
 import { technicalProposalFindings } from "../graph/research-evidence.js";
 import type { TechnicalReport } from "../graph/research-contracts.js";
 import type { Graph } from "../graph/model.js";
-import { assessmentReadings, ASSESSMENT_READING_ENCODING } from "./assessment-readings.js";
+import { assessmentSession } from "./assessment-session.js";
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
@@ -36,16 +36,16 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
   const pilotPacket = pilot ? pilotContext(store, draft, question) : null;
   const context = pilotPacket ? { ...pilotPacket, role: "assess-answer", question: question.value.spec,
-    readings: assessmentReadings(pilotPacket.readings, observations), readingEncoding: ASSESSMENT_READING_ENCODING,
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations, consumerFeedback: consumerFeedback(store, draft.value) }
     : { role: "assess-answer", question: question.value.spec, value: action.value, observations,
       prerequisites: researchPrerequisites(store, draft.value), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
-  const response = await researchCall(dispatch.reviewer, dispatch,
-    "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions.",
-    context, signal, { store, draftId: draft.id, questionId: question.id, purpose: "assessor", ...(pilot ? { pilot } : {}) }) as { verdict?: unknown; reasons?: unknown } | null;
+  const prompt = "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions.";
+  const response = (pilot ? await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal)
+    : await researchCall(dispatch.reviewer, dispatch, prompt, context, signal,
+      { store, draftId: draft.id, questionId: question.id, purpose: "assessor" })) as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response && ["supported", "insufficient", "conflicting"].includes(String(response.verdict))
     && Array.isArray(response.reasons) && response.reasons.every(item => typeof item === "string")
     && (response.verdict === "supported" || response.reasons.length > 0), "assessment_invalid", "Assessment must explicitly classify support and explain unresolved evidence");

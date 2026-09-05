@@ -1,0 +1,115 @@
+import type { Store, Revision } from "../storage/store.js";
+import type { DiscoveryDraft, Question } from "./discovery.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
+import { reference, type Ref } from "../pipeline/contracts.js";
+import { requireCondition } from "../errors.js";
+
+interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
+export interface ContextPage { offset: number; limit: number }
+const escape = (s: string) => s.replaceAll("~", "~0").replaceAll("/", "~1");
+const instruction = "Full context is retained in working.archive in SQLite. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. focus is the latest requested material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+
+export function contextValue(value: unknown, pointer: string): unknown {
+  requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
+  for (const part of pointer === "" ? [] : pointer.slice(1).split("/")) {
+    requireCondition(!/~(?![01])/.test(part), "selector_invalid", "Invalid pointer escape");
+    const key = part.replaceAll("~1", "/").replaceAll("~0", "~");
+    requireCondition(value !== null && typeof value === "object" && Object.hasOwn(value, key), "context_missing", "Context pointer does not exist");
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value;
+}
+
+export function contextPage(value: unknown, page?: ContextPage) {
+  if (!page) return { value };
+  requireCondition(Number.isSafeInteger(page.offset) && page.offset >= 0 && Number.isSafeInteger(page.limit) && page.limit > 0
+    && (typeof value === "string" || Array.isArray(value)), "context_page_invalid", "Page a string or array with nonnegative offset and positive limit");
+  requireCondition(page.offset <= value.length, "context_page_invalid", "Page offset exceeds the original value");
+  const end = Math.min(value.length, page.offset + page.limit);
+  return { value: value.slice(page.offset, end), page: { offset: page.offset, end, total: value.length,
+    unit: typeof value === "string" ? "utf16" : "items", next: end < value.length ? end : null } };
+}
+
+export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref) {
+  const record = store.get<Archive>(ref.id, ref.revision);
+  requireCondition(record?.kind === "research-context" && record.hash === ref.hash && record.value.projectId === draft.value.projectId
+    && record.value.draft.id === draft.id && draft.value.questions.includes(record.value.question.id),
+    "context_reference_foreign", "The context archive belongs to another research basis");
+  const original = store.get<DiscoveryDraft>(record.value.draft.id, record.value.draft.revision);
+  const question = store.get<Question>(record.value.question.id);
+  requireCondition(original?.hash === record.value.draft.hash && canonical(original.value.inputs) === canonical(draft.value.inputs)
+    && question?.revision === record.value.question.revision && question.hash === record.value.question.hash,
+    "context_reference_stale", "The question or its research basis has changed");
+  return record.value;
+}
+
+/** The complete request is a product journal entry, not a replacement source.
+ * Only its bounded working projection crosses the provider boundary. */
+export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
+  context: unknown, maxChars: number): Record<string, any> {
+  const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
+  requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
+    && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
+  const body = JSON.parse(JSON.stringify(context)) as Record<string, Json>;
+  body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
+    Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
+  const value: Archive = { projectId, draft: reference(draft), question: reference(question), body };
+  const id = `research-context:${hashJson(value)}`;
+  const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
+    [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+  const mandatory = ["role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence"];
+  const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
+  packet.working = { archive: reference(archive), instruction,
+    sections: Object.entries(body).filter(([key]) => !mandatory.includes(key)).map(([key, v]) => ({
+      pointer: `/body/${escape(key)}`, chars: JSON.stringify(v).length,
+      count: Array.isArray(v) || typeof v === "string" ? v.length : null })), omitted: [] as string[] };
+  // Defaults preserve the action protocol's collection shapes, not completeness.
+  Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  const length = () => JSON.stringify(packet).length;
+  requireCondition(length() <= maxChars, "pilot_core_limit", "Required intent, constraints or candidate exceed the request limit; split the research question, do not raise the ceiling");
+  const add = (key: string, v: unknown) => {
+    const prior = packet[key]; packet[key] = v;
+    if (length() <= maxChars - 512) return true;
+    if (prior === undefined) delete packet[key]; else packet[key] = prior;
+    return false;
+  };
+  // Reserve room for the addresses even when a value cannot be included.
+  packet.working.omitted = Object.keys(body).filter(key => !mandatory.includes(key));
+  requireCondition(length() <= maxChars, "pilot_core_limit", "Required context index exceeds the request limit");
+  const isAssessor = Object.hasOwn(body, "assessmentState");
+  packet.working.maxPageChars = Math.max(1, maxChars - length() - 512);
+  if (body['focus']) {
+    const focus = body['focus'];
+    if (!isAssessor && typeof focus === "object" && !Array.isArray(focus) && Object.hasOwn(focus, "observations")) add("readings", [focus]);
+    else add("focus", focus);
+  }
+  for (const key of isAssessor ? ["assessmentNotes"] : ["previousProposal", "currentProposal", "checkpoint", "inventory", "catalogue", "answers", "history", "openGaps", "failures"]) {
+    if (Object.hasOwn(body, key) && add(key, body[key])) packet.working.omitted = packet.working.omitted.filter((k: string) => k !== key);
+  }
+  // Readings are never accumulated automatically. The most recent explicitly
+  // requested bundle is enough for the next step; all others stay addressable.
+  // Evidence pages for the assessor: concatenate fragments to recover the exact
+  // serialized observations. No fragment is presented as a complete observation.
+  if (Array.isArray(body['observations'])) {
+    const encoded = JSON.stringify(body['observations']);
+    const state = body['assessmentState'] as { offset?: number } | undefined;
+    const offset = state?.offset ?? 0;
+    requireCondition(Number.isSafeInteger(offset) && offset >= 0 && offset <= encoded.length, "assessment_cursor_invalid", "Invalid evidence cursor");
+    const room = maxChars - length() - 512;
+    if (offset === 0 && JSON.stringify(body['observations']).length + length() + 150 <= maxChars && add("observations", body['observations'])) {
+      packet.evidencePage = { offset: 0, end: encoded.length, total: encoded.length, complete: true };
+    } else {
+      let lo = 0, hi = Math.max(0, Math.min(encoded.length - offset, room));
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (add("evidencePage", { offset, end: offset + mid, total: encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + mid) })) lo = mid;
+        else hi = mid - 1;
+      }
+      requireCondition(lo > 0 || offset === encoded.length, "pilot_evidence_limit", "No room for evidence; continue with a smaller working selection");
+      add("evidencePage", { offset, end: offset + lo, total: encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + lo) });
+    }
+  }
+  requireCondition(length() <= maxChars, "pilot_request_limit", "The working request exceeds its fixed limit");
+  return packet;
+}

@@ -17,6 +17,7 @@ import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pil
 import { pilotContext, readPilotContext, retainPilotRead } from "./pilot-context.js";
 import { readBundle } from "./reader.js";
 import { expandLayerDelta } from "./layer-delta.js";
+import { checkpoint, latestFocus, recoverableAnswer } from "./research-continuation.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available.`;
@@ -73,7 +74,12 @@ export class Researcher {
           .sort((a, b) => a.value.number - b.value.number);
         const history = turns.slice(-8).map(item => item.value);
         const inventory = sources.inventory();
+        const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
+          && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
+          focus: latestFocus(this.store, turns, pending[0]!), checkpoints,
+          checkpoint: [...turns].reverse().find(t => (t.value.action as { action?: string })?.action === "checkpoint"
+            && t.value.question?.id === pending[0]!.id && !t.value.error)?.value.observation ?? null,
           inventory: { ...inventory, sources: inventory.sources.map(source => ({ ...source, excerpt: "", truncated: source.length > 0 })) },
           history: history.map(turn => ({ number: turn.number, action: (turn.action as { action?: string })?.action,
             error: turn.error, assessment: turn.assessment,
@@ -87,6 +93,13 @@ export class Researcher {
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
         let pendingTurn = turns.find(item => item.value.status === "pending" && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
+        const recover = !pendingTurn && pilot ? recoverableAnswer(turns, pending[0]!) : null;
+        if (recover) {
+          run = this.save(run, { turns: run.value.turns + 1 });
+          pendingTurn = this.store.writeMany<ResearchTurn>([{ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
+            value: { ...recover.value, number: run.value.turns, status: "pending", error: null, observation: null, replayedFrom: reference(recover) } }],
+            [reference(recover), reference(pending[0]!), reference(draft), reference(environment), ...draft.value.inputs])[0]!;
+        }
         let action: ResearchAction;
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
@@ -95,7 +108,7 @@ export class Researcher {
             + (pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "") : ""), context, signal,
             { store: this.store, draftId, purpose: "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
           const questionId = "question" in action ? action.question : null;
-          const question = questionId ? pending.find(item => item.id === questionId) : null;
+          const question = questionId ? pending.find(item => item.id === questionId) : pilot ? pending[0] : null;
           pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
             value: { run: id, number: run.value.turns, action, assessment: null, observation: null, error: null,
               status: "pending", question: question ? reference(question) : null } });
@@ -110,7 +123,11 @@ export class Researcher {
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
             requireCondition(pilot, "reader_pilot_required", "Addressed context reads need the configured experiment");
-            observation = readPilotContext(this.store, draft, action.record, action.pointer, pilot.value.maxReadChars);
+            observation = readPilotContext(this.store, draft, action.record, action.pointer, pilot.value.maxReadChars, action.page);
+          } else if (action.action === "checkpoint") {
+            requireCondition(pilot, "reader_pilot_required", "Checkpoints need the configured experiment");
+            const saved = checkpoint(this.store, draft, pending[0]!, action);
+            observation = { ref: reference(saved), ...saved.value as object };
           } else if (action.action === "search") observation = sources.search(action.query);
           else if (action.action === "read") {
             const source = sources.read(action.path, action.media); observation = { ref: reference(source), length: source.value.content.length,
@@ -150,7 +167,7 @@ export class Researcher {
             }
           }
         } catch (failure) {
-          if (failure instanceof EngineError && (["research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
+          if (failure instanceof EngineError && (["input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
             "research_response_invalid", "assessment_invalid"].includes(failure.code) || failure.code.startsWith("pilot_"))) throw failure;
           error = failure instanceof Error ? failure.message : "Research action failed";
           if (failure instanceof EngineError && failure.details !== null) observation = { code: failure.code, details: failure.details };

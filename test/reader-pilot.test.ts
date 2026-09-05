@@ -25,7 +25,10 @@ import { answerLayerFixture } from "./layer-design-fixture.js";
 import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
 import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
-import { assessmentReadings } from "../src/discovery/assessment-readings.js";
+import { workingContext } from "../src/discovery/working-context.js";
+import { checkpoint, recoverableAnswer } from "../src/discovery/research-continuation.js";
+import { assessAnswer } from "../src/discovery/research-assessment.js";
+import { assessmentSession } from "../src/discovery/assessment-session.js";
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -45,7 +48,7 @@ function fixture(t: test.TestContext) {
   const readerPath = join(root, "reader.mjs");
   writeFileSync(join(root, "README.md"), "Planned runtime\nRestrict writes to the chosen scope.\nRoll back on failure.\n");
   writeFileSync(readerPath, `import {readFileSync,appendFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
-appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts),referencedReading:Boolean(c.readings?.[0]?.observations?.[0]?.valueFrom)})+'\\n');
+appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
 if(c.role!=='reader'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
@@ -210,38 +213,6 @@ test("active experiment refuses creation and execution of R2 and later phases", 
   assert.throws(() => engine.refinement.begin("p", "R2"), { code: "phase_not_ready" }, "Disabling the pilot does not bypass normal prerequisites");
 });
 
-test("assessor aliases only identical covered text in the same request and preserves stored evidence", async t => {
-  const { root, engine, store, draft } = fixture(t);
-  const body = "Scope and rollback conditions 😀\r\n".repeat(20);
-  const source = engine.discovery.evidence.document("p", "assessor-text", "prefix" + body + "suffix", "text/plain", 0);
-  const evidence = engine.discovery.evidence;
-  const original = evidence.observe("p", reference(source), { kind: "text-range", start: 6, end: 6 + body.length });
-  const full = evidence.observe("p", reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
-  const readings = [{ observations: [original], unresolved: ["Unknown recovery behavior"], coverage: { partial: true } }];
-  const untouched = structuredClone(readings);
-  const packed = assessmentReadings(readings, [full]);
-  const selected = packed[0]!.observations[0]!;
-  assert.ok("valueFrom" in selected);
-  assert.equal(selected.valueFrom.pointer, "/observations/0/value");
-  assert.equal((full.value as string).slice(selected.valueFrom.start, selected.valueFrom.end), original.value);
-  assert.deepEqual(selected.source, original.source); assert.deepEqual(selected.selector, original.selector);
-  assert.deepEqual(packed[0]!.unresolved, readings[0]!.unresolved);
-  assert.deepEqual(packed[0]!.coverage, readings[0]!.coverage);
-  assert.deepEqual(readings, untouched);
-  for (const foreign of [{ ...full, source: { ...full.source, revision: 99 } }, { ...full, projectId: "other" },
-    { ...full, value: "different" }, { ...full, selector: { kind: "json-pointer" as const, pointer: "" } },
-    evidence.observe("p", reference(source), { kind: "text-range", start: 7, end: 6 + body.length })]) {
-    assert.deepEqual(assessmentReadings(readings, [foreign]), readings);
-  }
-  assert.deepEqual(assessmentReadings(readings, []), readings);
-  writeFileSync(join(root, "README.md"), "Header\n" + "Limit writes to scope. ".repeat(30) + "\n" + "Roll back on failure. ".repeat(30) + "\n");
-  await engine.researcher.run("p", draft.id, 2);
-  const calls = readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-  assert.equal(calls.find(call => call.role === "assess-answer")?.referencedReading, true);
-  assert.ok(store.list<any>("reader-result")[0]!.value.observations[0].value.includes("Limit writes to scope"));
-  assert.ok(store.list<any>("research-assessment").some(a => a.value.observations.some((o: any) => typeof o.value === "string" && o.value.includes("Limit writes to scope"))));
-});
-
 test("R1 pilot routes reading to its configured reader, assesses originals, and resumes without repeating accepted answers", async t => {
   const { engine, store, draft } = fixture(t);
   const first = await engine.researcher.run("p", draft.id, 4);
@@ -364,4 +335,165 @@ test("invalid technical consumer references are rejected before paying an assess
   assert.equal(store.get<Question>(question.id)!.value.status, "open");
   const rejected = store.list<ResearchTurn>("research-turn").find(turn => turn.value.error !== null)!;
   assert.equal((rejected.value.observation as {code:string}).code, "research_proposal_invalid");
+});
+
+test("working set stays bounded while every old observation remains addressable after restart", t => {
+  const { root, store, draft, question } = fixture(t);
+  const base = pilotContext(store, draft, question);
+  const readings = Array.from({ length: 30 }, (_, index) => ({ purpose: `reading-${index}`,
+    observations: [{ value: `EXCEPTION-${index}: ` + "source condition 😀\r\n".repeat(2000) }] }));
+  const full = { ...base, readings, focus: readings.at(-1), history: Array(50).fill("historical response".repeat(1000)) };
+  const packet = workingContext(store, "p", draft.id, question.id, full, 70000);
+  assert.ok(JSON.stringify(packet).length <= 70000);
+  assert.ok(packet.readings.length <= 1);
+  assert.deepEqual(packet.core, JSON.parse(JSON.stringify(base.core)));
+  assert.ok(packet.working.omitted.includes("readings"));
+  assert.equal(packet.working.sections.find((s: any) => s.pointer === "/body/readings").count, 30);
+  const original = readPilotContext(store, draft, packet.working.archive, "/body/readings/0/observations/0/value", 10000, { offset: 0, limit: 100 });
+  assert.equal(original.value, readings[0]!.observations[0]!.value.slice(0, 100));
+  assert.equal(original.page!.next, 100);
+  const next = readPilotContext(store, draft, packet.working.archive, "/body/readings/0/observations/0/value", 10000, { offset: 100, limit: 100 });
+  assert.equal(next.value, readings[0]!.observations[0]!.value.slice(100, 200));
+  const page = readPilotContext(store, draft, packet.working.archive, "/body/readings", 70000, { offset: 1, limit: 1 });
+  assert.deepEqual(page.value, [readings[1]]);
+  assert.throws(() => readPilotContext(store, draft, packet.working.archive, "/body/readings", 100, { offset: -1, limit: 1 }), { code: "context_page_invalid" });
+  assert.throws(() => readPilotContext(store, draft, { ...packet.working.archive, hash: "f".repeat(64) }, "/body", 10000), { code: "context_reference_foreign" });
+  assert.throws(() => readPilotContext(store, { ...draft, value: { ...draft.value, projectId: "other" } }, packet.working.archive, "/body", 10000), { code: "context_reference_foreign" });
+  store.close();
+  const reopened = new Store(join(root, "state.sqlite"));
+  try {
+    assert.equal(readPilotContext(reopened, draft, packet.working.archive, "/body/readings/0/observations/0/value", 70000).value, readings[0]!.observations[0]!.value);
+    assert.equal(reopened.list("model-call").length, 0);
+    reopened.write({ id: question.id, kind: question.kind, expected: question.revision, value: { ...question.value, beforeHash: "changed" } });
+    assert.throws(() => readPilotContext(reopened, draft, packet.working.archive, "/body/readings", 10000), { code: "context_reference_stale" });
+  } finally { reopened.close(); }
+});
+
+test("intermediate checkpoints preserve exact evidence and never accept a question", t => {
+  const { root, store, engine, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.file("p", "notes", root, "README.md", "text/plain", 0);
+  const action = { action: "checkpoint" as const, question: question.id, value: { findings: ["Proposed interpretation, not a fact"] },
+    citations: [{ source: reference(source), selector: { kind: "text-range" as const, start: 0, end: source.value.content.length } }],
+    unresolved: ["Check the exception on restart"] };
+  const saved = checkpoint(store, draft, question, action);
+  assert.equal((saved.value as any).status, "unassessed");
+  assert.equal((saved.value as any).observations[0].value, source.value.content);
+  assert.deepEqual(checkpoint(store, draft, question, action), saved);
+  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  assert.equal(store.list("research-assessment").filter(a => (a.value as any).question?.id === question.id).length, 0);
+  assert.throws(() => checkpoint(store, draft, question, { ...action, question: "foreign" }), { code: "research_question_foreign" });
+  writeFileSync(join(root, "README.md"), "changed");
+  assert.throws(() => checkpoint(store, draft, question, action), { code: "source_stale" });
+});
+
+test("legacy transport-stopped answer is replayed to assessor without another analyst or history rewrite", async t => {
+  const { engine, store, settings, pilot, draft, question } = fixture(t);
+  const limited = configureReaderPilot(store, engine.environments, "p", { ...settings, maxCalls: 3 }, pilot.revision);
+  await engine.researcher.run("p", draft.id, 2);
+  const pending = store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
+  const legacy = store.write<ResearchTurn>({ id: pending.id, kind: pending.kind, expected: pending.revision,
+    value: { ...pending.value, status: "completed", error: "An input changed before the transaction could commit" } });
+  assert.equal(recoverableAnswer([legacy], question)?.id, legacy.id);
+  assert.equal(recoverableAnswer([{ ...legacy, value: { ...legacy.value, error: "Semantic refusal" } }], question), null);
+  assert.equal(recoverableAnswer([legacy], { ...question, revision: 99 }), null);
+  configureReaderPilot(store, engine.environments, "p", { ...settings, maxCalls: 4 }, limited.revision);
+  await engine.researcher.run("p", draft.id, 1);
+  assert.deepEqual(store.get(legacy.id), legacy, "Historical failed turn is untouched");
+  assert.ok(store.list<ResearchTurn>("research-turn").some(turn => turn.value.replayedFrom?.id === legacy.id));
+  assert.equal(store.list<ModelCall>("model-call").filter(call => call.value.purpose === "analyst").length, 2);
+  assert.equal(store.get<Question>(question.id)!.value.status, "answered");
+});
+
+test("assessor resumes bounded evidence pages after budget stop and sees a late exception before acceptance", async t => {
+  const { root, store, engine, environment, settings, pilot, draft, question } = fixture(t);
+  const sourceText = "Evidence line. ".repeat(18000) + "EXCEPTION: never grant this effect.";
+  writeFileSync(join(root, "large.txt"), sourceText);
+  const source = engine.discovery.evidence.file("p", "large-evidence", root, "large.txt", "text/plain", 0);
+  const command = join(root, "paged-assessor.mjs");
+  writeFileSync(command, `import {readFileSync,appendFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+appendFileSync('pages.jsonl',JSON.stringify({chars:JSON.stringify(req).length,page:c.evidencePage,observations:c.observations})+'\\n');
+const seen=JSON.stringify(c.observations).includes('EXCEPTION')||c.evidencePage.text?.includes('EXCEPTION');
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{verdict:seen?'conflicting':'supported',reasons:[seen?'Exception forbids the effect':'Provisional page judgment']},usage:{inputTokens:100,outputTokens:20,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const limited = configureReaderPilot(store, engine.environments, "p", { ...settings, maxRequestChars: 60000, maxCalls: 2,
+    agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const action = { action: "answer" as const, question: question.id, value: { applicability: "applicable", reason: "Evaluate a proposal",
+    facts: [], designs: [{ id: "d", decision: "Grant this effect", benefit: "A useful output", consumer: "compilation" }], gaps: [] },
+    citations: [{ source: reference(source), selector: { kind: "text-range" as const, start: 0, end: sourceText.length } }] };
+  await assert.rejects(assessAnswer(store, question, action, environment, root, undefined, limited), { code: "pilot_call_limit" });
+  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  const saved = store.list<any>("assessment-session")[0]!;
+  assert.ok(saved.value.offset > 0); assert.equal(saved.value.result, null);
+  const { projectId: _projectId, ...continuedSettings } = limited.value;
+  const resumed = configureReaderPilot(store, engine.environments, "p", { ...continuedSettings, maxCalls: 20 }, limited.revision);
+  const result = await assessAnswer(store, question, action, environment, root, undefined, resumed);
+  assert.equal(result.value.verdict, "conflicting");
+  const pages = readFileSync(join(root, "pages.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(pages.every(page => page.chars <= 60000));
+  let end = 0, text = "";
+  for (const item of pages) { assert.equal(item.page.offset, end); end = item.page.end; text += item.page.text; }
+  assert.deepEqual(JSON.parse(text), result.value.observations);
+  assert.ok(pages.length > 2);
+  assert.equal(store.get<Question>(draft.value.questions[0]!)!.value.status, "open");
+});
+
+test("checkpoint and addressed continuation work through the researcher across restart", async t => {
+  const { root, store, engine, settings, pilot, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.file("p", "checkpoint-source", root, "README.md", "text/plain", 0);
+  const citations = [{ source: reference(source), selector: { kind: "text-range", start: 0, end: source.value.content.length } }];
+  const command = join(root, "checkpoint-provider.mjs");
+  const value = { applicability: "applicable", reason: "A bounded proposal", facts: [], designs: [{ id: "d", decision: "Preserve the exception", benefit: "Correct output", consumer: "compilation" }], gaps: [] };
+  writeFileSync(command, `import {readFileSync,writeFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};else{
+const step=existsSync('checkpoint-step')?Number(readFileSync('checkpoint-step','utf8')):0;writeFileSync('checkpoint-step',String(step+1));
+if(step===0)research={action:'checkpoint',question:c.question.id,value:{finding:'Preserve the exception'},citations:${JSON.stringify(citations)},unresolved:['Verify before acceptance']};
+else if(step===1){if(c.checkpoint.status!=='unassessed')throw Error('Checkpoint cannot be promoted');research={action:'read_context',record:c.working.archive,pointer:'/body/checkpoints/0/proposal'};}
+else {if(c.focus.value.finding!=='Preserve the exception')throw Error('Missing exact continuation');research={action:'answer',question:c.question.id,value:${JSON.stringify(value)},citations:${JSON.stringify(citations)}};}}
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, "p", { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const firstCheckpointRun = await engine.researcher.run("p", draft.id, 1);
+  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  assert.equal(store.list("research-checkpoint").length, 1, firstCheckpointRun.value.error ?? "Checkpoint was not saved");
+  store.close();
+  const reopened = new Store(join(root, "state.sqlite"));
+  try {
+    const continued = new ProductEngine(reopened);
+    await continued.researcher.run("p", draft.id, 2);
+    assert.equal(reopened.get<Question>(question.id)!.value.status, "answered");
+    assert.equal(reopened.list("model-call").length, 4);
+    assert.equal(reopened.list<ModelCall>("model-call").filter(c => c.value.purpose === "reader").length, 0);
+  } finally { reopened.close(); }
+});
+
+test("an assessor checkpoint cannot forget requested context that did not fit the wire", async t => {
+  const { root, store, engine, environment, settings, pilot, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.file("p", "focus-source", root, "README.md", "text/plain", 0);
+  const observations = [engine.discovery.evidence.observe("p", reference(source), { kind: "text-range", start: 0, end: source.value.content.length })];
+  const command = join(root, "focus-provider.mjs");
+  writeFileSync(command, `import {readFileSync,writeFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+const step=existsSync('focus-step')?Number(readFileSync('focus-step','utf8')):0;writeFileSync('focus-step',String(step+1));
+const research=step===0?{action:'read_context',record:c.working.archive,pointer:'/body/extra'}:step===1?{action:'assessment_checkpoint',notes:['Still awaiting context']}:{verdict:'supported',reasons:[]};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const selected = configureReaderPilot(store, engine.environments, "p", { ...settings, maxRequestChars: 60000, maxReadChars: 200000,
+    agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const context = { ...pilotContext(store, draft, question), role: "assess-answer", observations, value: "candidate", extra: "exception ".repeat(10000) };
+  await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
+    { code: "assessment_invalid" });
+  const session = store.list<any>("assessment-session")[0]!.value;
+  assert.equal(session.result, null);
+  assert.equal(session.focus.value, context.extra);
+  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+});
+
+test("assessment continuation never reuses a verdict after its supplied research context changes", async t => {
+  const { root, store, environment, pilot, draft, question } = fixture(t);
+  const context = { ...pilotContext(store, draft, question), role: "assess-answer", value: "same candidate", observations: [] };
+  const dispatch = pilotEnvironment(environment.value, pilot.value);
+  await assessmentSession(store, draft, question, environment, dispatch, pilot, context, "Evaluate");
+  await assessmentSession(store, draft, question, environment, dispatch, pilot, context, "Evaluate");
+  assert.equal(store.list("model-call").length, 1, "Exact continuation may reuse its completed verdict");
+  await assessmentSession(store, draft, question, environment, dispatch, pilot,
+    { ...context, readings: [{ ref: reference(question), purpose: "New evidence", observations: [], coverage: [], unresolved: ["New contradiction requires consideration"] }] }, "Evaluate");
+  assert.equal(store.list("model-call").length, 2);
+  assert.equal(store.list("assessment-session").length, 2);
+  assert.ok(readFileSync(join(root, "calls.jsonl"), "utf8").includes("assess-answer"));
 });
