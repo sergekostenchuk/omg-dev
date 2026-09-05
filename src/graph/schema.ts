@@ -8,6 +8,8 @@ const nullableId = { anyOf: [id, { type: "null" }] };
 const endpoint = object({ node: id, port: id });
 
 export const commandSchema = object({ executable: text, args: array({ type: "string" }) });
+const testSchema = object({ id, node: id, command: commandSchema, covers: ids });
+testSchema.properties['obligations'] = { type: "array", uniqueItems: true, items: { enum: ["outcome", "durable_cold_read", "restart_cold", "provider_safety"] } };
 export const graphSchema = object({
   version: { const: 1 }, id, title: text, horizon: ids,
   contracts: array(object({ id, schema: { type: ["object", "boolean"] } })),
@@ -25,5 +27,5 @@ export const graphSchema = object({
   })),
   anchors: array(object({ id, owner: id, outcome: id, test: id })),
   joins: array(object({ id, consumer: id, connectors: { ...ids, minItems: 1 } })),
-  tests: array(object({ id, node: id, command: commandSchema, covers: ids })),
+  tests: array(testSchema),
 });

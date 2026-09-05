@@ -37,6 +37,8 @@ test("the real product command path carries two independent products from brief 
       engine.execute({ type: "accept-stage", project, stage, expected: artifact.revision });
     }
     assert.equal(engine.pipeline.inspect(project, "features").state, "accepted");
+    const guards = engine.pipeline.inspect(project, "features").guards;
+    assert.equal(guards.length, new Set(guards.map(item => `${item.id}:${item.revision}:${item.hash}`)).size);
     assert.match(engine.exportStage(project, "features"), /requirements/);
   }
   const reopened = new Store(path);

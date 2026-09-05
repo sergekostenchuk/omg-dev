@@ -26,6 +26,10 @@ export interface StageProjection { stage: Stage; state: StageState; artifact: Re
 
 export const stageId = (project: string, stage: Stage): string => `stage:${project}:${stage}`;
 export const reference = (record: Revision<unknown>): Ref => ({ id: record.id, revision: record.revision, hash: record.hash });
+export function uniqueRefs(values: readonly Ref[]): Ref[] {
+  return [...new Map(values.map(ref => [`${ref.id}:${ref.revision}:${ref.hash}`, ref])).entries()]
+    .sort(([left], [right]) => left.localeCompare(right)).map(([, ref]) => ref);
+}
 export function isRef(value: unknown): value is Ref {
   if (!value || typeof value !== "object") return false;
   const ref = value as Record<string, unknown>;

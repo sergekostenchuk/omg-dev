@@ -1,6 +1,6 @@
 import { Store, type Revision } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
-import { STAGES, predecessor, reference, isRef, type Stage, type StageArtifact, type StageValidators,
+import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
 import { REQUIREMENTS, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
@@ -14,6 +14,7 @@ import { Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
 import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
+import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -23,12 +24,14 @@ export class ProductEngine {
   readonly pipeline: Pipeline;
   readonly environments: Environments;
   readonly refinement: Refinement;
+  readonly compiler: Compiler;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
     this.pipeline = new Pipeline(store, validators);
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
+    this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
@@ -36,6 +39,11 @@ export class ProductEngine {
       const content = context.content as { feasibility?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "feasibility" || !isRef(content.feasibility)) return rejected("feasibility_missing", "This stage requires a bound R3 result");
       return this.refinement.feasibilityGate(context.projectId, content.feasibility);
+    }
+    if (stage === "compilation") {
+      const content = context.content as { plan?: unknown } | null;
+      if (!content || Object.keys(content).join(",") !== "plan" || !isRef(content.plan)) return rejected("plan_missing", "Compilation stage requires a generated plan");
+      return this.compiler.gate(context.projectId, content.plan);
     }
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;
@@ -95,6 +103,7 @@ export class ProductEngine {
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
+    const currentPlan = this.store.get<Ref>(`current-plan:${project}`);
     const feasibility = this.store.get<Feasibility>(`feasibility:${project}`);
     const drafts = this.store.list<DiscoveryDraft>("discovery-draft").filter(item => item.value.projectId === project);
     const research = new Map(drafts.map(draft => [draft.id, this.discovery.gate(project, reference(draft))]));
@@ -110,6 +119,8 @@ export class ProductEngine {
       environment: this.store.get<Environment>(`environment:${project}`),
       phases: PHASES.filter(phase => phase !== "R3").map(phase => ({ phase, record: this.store.get(`phase:${project}:${phase}`), gate: this.refinement.gate(project, phase) })),
       feasibility, feasibilityGate: feasibility ? this.refinement.feasibilityGate(project, reference(feasibility)) : null,
+      plans: this.store.list<MachinePlan>("plan").filter(item => item.value.projectId === project), currentPlan,
+      planGate: currentPlan ? this.compiler.gate(project, currentPlan.value) : null,
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
     };
   }
@@ -127,13 +138,21 @@ export class ProductEngine {
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);
       case "assess": this.#project(command.project); return this.refinement.assess(command.project, command.expected);
       case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
+      case "compile": {
+        this.#project(command.project); const plan = this.compiler.compile(command.project);
+        const current = this.store.get<StageArtifact>(stageId(command.project, "compilation"));
+        if (current?.value.status === "accepted" && (current.value.content as unknown as { plan?: Ref }).plan?.hash === plan.hash) return plan;
+        const stage = this.compiler.publish(command.project, reference(plan), current?.revision ?? 0);
+        this.pipeline.accept(command.project, "compilation", stage.revision); return plan;
+      }
+      case "draft-plan": this.#project(command.project); return this.compiler.publish(command.project, command.plan, command.expected);
       case "create-project": return this.store.write<Project>({ id: `project:${command.project}`, kind: "project", expected: 0, value: { id: command.project, title: command.title } });
       case "prepare-stage": return this.prepare(command.project, command.stage);
       case "source-document": this.#project(command.project); return this.discovery.evidence.document(command.project, command.id, command.text, command.media, command.expected);
       case "source-file": {
-        this.#project(command.project); const environment = this.environments.get(command.project);
-        workspacePath(environment.value.workspace, command.path);
-        return this.discovery.evidence.file(command.project, command.id, environment.value.workspace, command.path, command.media, command.expected);
+        this.#project(command.project); const effective = this.environments.effective(command.project);
+        workspacePath(effective.root, command.path);
+        return this.discovery.evidence.file(command.project, command.id, effective.root, command.path, command.media, command.expected);
       }
       case "answer-decision": return this.discovery.decision(command.question, command.expected, this.actor, command.value);
       case "answer-fact": return this.discovery.fact(command.question, command.expected, command.source, command.selector);

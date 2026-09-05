@@ -5,6 +5,7 @@ import type { Finding } from "../pipeline/contracts.js";
 import { graphSchema } from "./schema.js";
 import { LEVEL, type Graph, type Endpoint } from "./model.js";
 import { safeRelativePath, topologicalOrder } from "./topology.js";
+import { requiredTests } from "./obligations.js";
 
 const ajv = new Ajv({ allErrors: true, strict: true, allowUnionTypes: true });
 const shape = ajv.compile<Graph>(graphSchema);
@@ -130,6 +131,8 @@ export function validateGraph(input: unknown): Validation {
     const node = nodes.get(id);
     if (!node || node.kind !== "work") { fail("horizon_invalid", id, "Only L3 work nodes can enter the execution horizon"); continue; }
     if (!node.code.length || !node.tests.length) fail("l3_evidence_missing", id, "Active L3 needs code references and product tests");
+    const coverage = new Set(node.tests.flatMap(ref => tests.get(ref)?.obligations ?? ["outcome"]));
+    for (const obligation of requiredTests(node)) if (obligation.status === "required" && !coverage.has(obligation.name)) fail("test_obligation_missing", id, `Required test category: ${obligation.name}`);
     if (node.parent && nodes.has(node.parent) && canonical(node.boundary) !== canonical(nodes.get(node.parent)!.boundary)) fail("boundary_mismatch", id, "Work must preserve its operation's authority, state, writer and rollback boundary");
     if (artifacts.get(node.outcome)?.external) fail("external_outcome", id, "An implementation cannot claim an external input as its own produced outcome");
     for (const ref of node.code.filter(ref => ref.access === "write")) {

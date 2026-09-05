@@ -1,7 +1,7 @@
 import { Store, type Revision } from "../storage/store.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Json } from "../canonical.js";
-import { STAGES, predecessor, reference, stageId, isRef, type Stage, type StageArtifact,
+import { STAGES, predecessor, reference, stageId, isRef, uniqueRefs, type Stage, type StageArtifact,
   type StageProjection, type StageValidators, type Finding, type Ref } from "./contracts.js";
 
 export class Pipeline {
@@ -57,17 +57,17 @@ export class Pipeline {
         findings.push({ code: "input_stale", target: stageId(projectId, prior), message: "A prerequisite changed; revise this stage against its current version" });
       } else inputs.push(current.artifact);
     }
-    for (const proof of artifact.value.proofs) {
+    for (const proof of uniqueRefs(artifact.value.proofs)) {
       const current = this.store.get(proof.id);
       if (!current || current.hash !== proof.hash || current.revision !== proof.revision) findings.push({ code: "proof_stale", target: proof.id, message: "The evidence used by this stage has changed" });
       else guards.push(reference(current));
     }
-    if (findings.length) return { stage, state: artifact.value.status === "accepted" ? "stale" : "blocked", artifact, findings, guards };
+    if (findings.length) return { stage, state: artifact.value.status === "accepted" ? "stale" : "blocked", artifact, findings, guards: uniqueRefs(guards) };
     const validation = this.validators[stage]({ projectId, content: artifact.value.content, inputs });
     findings.push(...validation.findings);
     guards.push(...validation.guards);
     const state = findings.length ? (artifact.value.status === "accepted" ? "stale" : "blocked") : artifact.value.status;
-    return { stage, state, artifact, findings, guards };
+    return { stage, state, artifact, findings, guards: uniqueRefs(guards) };
   }
   accept(projectId: string, stage: Stage, expected: number): Revision<StageArtifact> {
     const checked = this.inspect(projectId, stage);

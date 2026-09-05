@@ -6,7 +6,7 @@ import { requireCondition, EngineError } from "../errors.js";
 import { digest } from "../canonical.js";
 import type { Command, Graph } from "../graph/model.js";
 import { safeRelativePath } from "../graph/topology.js";
-import type { Finding } from "../pipeline/contracts.js";
+import { reference, type Ref, type Finding } from "../pipeline/contracts.js";
 
 export interface RoleBinding { actor: string; model: string; effort: string; command: Command }
 export interface Environment {
@@ -14,11 +14,15 @@ export interface Environment {
   fullCheck: Command; timeoutMs: number;
 }
 export interface RepositoryState { root: string; head: string; tree: string; files: { path: string; hash: string | null }[] }
+export interface ExecutionRoot { projectId: string; sourceRoot: string; workspace: Ref; path: string; branch: string; base: string; head: string; state: "creating" | "ready" }
 export function git(cwd: string, args: string[], input?: string): string {
+  return gitBytes(cwd, args, input === undefined ? undefined : Buffer.from(input)).toString("utf8").trim();
+}
+export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-  const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, encoding: "utf8", timeout: 15_000, maxBuffer: 8_000_000 });
-  if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr, error: result.error?.message });
-  return result.stdout.trim();
+  const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
+  if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });
+  return result.stdout;
 }
 export function executablePath(command: Command, cwd: string): string {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
@@ -81,6 +85,8 @@ export class Environments {
     requireCondition(value && typeof value.workspace === "string" && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 100 && value.timeoutMs <= 3_600_000,
       "environment_invalid", "Workspace and a bounded timeout are required");
     const workspace = realpathSync(value.workspace);
+    const root = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
+    requireCondition(!root || root.value.sourceRoot === workspace, "workspace_in_use", "Create a new project to use another repository after execution has begun");
     for (const role of [value.implementer, value.reviewer]) requireCondition(role && typeof role.actor === "string" && role.actor.trim()
       && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort),
     "role_invalid", "Each role needs an identity, model and supported effort");
@@ -96,5 +102,20 @@ export class Environments {
   get(projectId: string): Revision<Environment> {
     const environment = this.store.get<Environment>(`environment:${projectId}`);
     requireCondition(environment && environment.kind === "environment", "environment_missing", "Choose a workspace and executor roles first"); return environment;
+  }
+  effective(projectId: string): { environment: Revision<Environment>; root: string; guards: Ref[] } {
+    const environment = this.get(projectId); const execution = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
+    if (!execution) return { environment, root: environment.value.workspace, guards: [] };
+    const workspace = this.store.get(`workspace:${projectId}`);
+    requireCondition(execution.kind === "execution-root" && execution.value.projectId === projectId && execution.value.state === "ready"
+      && workspace && execution.value.workspace.hash === workspace.hash && execution.value.sourceRoot === environment.value.workspace,
+    "execution_root_recovery", "The managed worktree needs recovery before new planning");
+    const current = execution.value;
+    requireCondition(git(current.path, ["rev-parse", "HEAD"]) === current.head
+      && git(current.path, ["symbolic-ref", "HEAD"]) === `refs/heads/${current.branch}`,
+    "execution_root_recovery", "The managed worktree head differs from its accepted state");
+    const common = (path: string) => realpathSync(resolve(path, git(path, ["rev-parse", "--git-common-dir"])));
+    requireCondition(common(current.path) === common(current.sourceRoot), "execution_root_foreign", "Worktree belongs to another repository");
+    return { environment, root: current.path, guards: [reference(execution)] };
   }
 }

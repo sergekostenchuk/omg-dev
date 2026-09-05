@@ -13,6 +13,8 @@ export type ProductCommand =
   | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
   | { type: "assess"; project: string; expected: number }
   | { type: "draft-om"; project: string; feasibility: Ref; expected: number }
+  | { type: "compile"; project: string }
+  | { type: "draft-plan"; project: string; plan: Ref; expected: number }
   | { type: "create-project"; project: string; title: string }
   | { type: "prepare-stage"; project: string; stage: UpstreamStage }
   | { type: "source-document"; project: string; id: string; text: string; media: "text/plain" | "application/json"; expected: number }
@@ -46,6 +48,7 @@ const schema = { oneOf: [
   command("finish-research", { project, level: researchLevel, draft: ref, expected }),
   command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),
   command("assess", { project, expected }), command("draft-om", { project, feasibility: ref, expected }),
+  command("compile", { project }), command("draft-plan", { project, plan: ref, expected }),
   command("create-project", { project, title: string }),
   command("prepare-stage", { project, stage: { enum: UPSTREAM_STAGES } }),
   command("source-document", { project, id: project, text: { type: "string", maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] }, expected }),

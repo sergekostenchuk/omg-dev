@@ -1,6 +1,7 @@
 import type { Json } from "../canonical.js";
 
 export interface Command { executable: string; args: string[] }
+export type Obligation = "outcome" | "durable_cold_read" | "restart_cold" | "provider_safety";
 export interface Boundary { authority: string; writer: string; rollback: string; state: "transient" | "durable"; provider: boolean }
 export interface CodeRef { path: string; access: "read" | "write"; status: "existing" | "planned" }
 export interface Port { id: string; direction: "in" | "out"; contract: string }
@@ -19,6 +20,6 @@ export interface Graph {
   connectors: Connector[];
   anchors: { id: string; owner: string; outcome: string; test: string }[];
   joins: { id: string; consumer: string; connectors: string[] }[];
-  tests: { id: string; node: string; command: Command; covers: string[] }[];
+  tests: { id: string; node: string; command: Command; covers: string[]; obligations?: Obligation[] }[];
 }
 export const LEVEL = { product: 0, block: 1, operation: 2, work: 3 } as const;

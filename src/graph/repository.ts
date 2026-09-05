@@ -2,7 +2,7 @@ import { Store, type Revision } from "../storage/store.js";
 import { requireCondition } from "../errors.js";
 import { hashJson } from "../canonical.js";
 import { Discovery, type DiscoveryDraft } from "../discovery/discovery.js";
-import { reference, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { requireGraph, validateGraph } from "./validate.js";
 import type { Graph } from "./model.js";
 import { LEVEL } from "./model.js";
@@ -31,7 +31,7 @@ export class GraphRepository {
         const node = graph.nodes.find(item => item.id === obligation.node);
         return node && LEVEL[node.kind] <= level;
       });
-      const value: Layer = { projection: projectGraph(graph, level), inputs: applicable.flatMap(obligation => obligation.inputs), obligations: applicable };
+      const value: Layer = { projection: projectGraph(graph, level), inputs: uniqueRefs(applicable.flatMap(obligation => obligation.inputs)), obligations: applicable };
       if (!previous || previous.hash !== hashJson(value)) writes.push({ id: layerId, kind: "graph-layer", expected: previous?.revision ?? 0, value });
     }
     return this.store.writeMany<Graph>(writes, guards)[0]!;
@@ -80,7 +80,7 @@ export class GraphRepository {
       const node = layer.value.projection.nodes.find(item => item.id === obligation.node);
       if (!node || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
     }
-    for (const input of layer.value.inputs) {
+    for (const input of uniqueRefs(layer.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.hash !== input.hash || current.revision !== input.revision
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
@@ -103,7 +103,7 @@ export class GraphRepository {
       const node = graph.value.nodes.find(item => item.id === obligation.node);
       if (!node || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
     }
-    for (const input of binding.value.inputs) {
+    for (const input of uniqueRefs(binding.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.hash !== input.hash || current.revision !== input.revision
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });

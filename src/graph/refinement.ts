@@ -3,7 +3,7 @@ import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, typ
 import { GraphRepository } from "./repository.js";
 import { Environments, inspectRepository, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
-import { reference, isRef, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { reference, isRef, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 import type { Graph } from "./model.js";
@@ -37,7 +37,7 @@ export class Refinement {
       requireCondition(previous.findings.length === 0, "phase_not_ready", "The preceding refinement phase is missing or stale");
       guards.push(...previous.guards);
     }
-    return guards;
+    return uniqueRefs(guards);
   }
   begin(project: string, level: Exclude<ResearchLevel, "R3">): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(RESEARCH, level), "phase_invalid", "Use the feasibility checker for R3");
@@ -53,19 +53,19 @@ export class Refinement {
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
     if (level !== "R0") {
-      const environment = this.environments.get(project);
+      const effective = this.environments.effective(project);
       for (const id of draft.value.questions) {
         const question = this.store.get<Question>(id)!;
         const fact = this.store.get<Fact>(question.value.answer!.id)!;
         const source = this.store.get<Source>(fact.value.observation.source.id)!;
         requireCondition(source.value.origin.kind === "file", "repository_evidence_required", "R1/R2 require an actual file from the selected repository");
-        const path = workspacePath(environment.value.workspace, relative(environment.value.workspace, source.value.origin.location));
+        const path = workspacePath(effective.root, relative(effective.root, source.value.origin.location));
         requireCondition(digest(readFileSync(path)) === source.value.sha256, "source_stale", "Repository source changed after research capture");
       }
       inputs.push(reference(this.store.get(`workspace:${project}`)!));
     }
     return this.store.writeMany<Milestone>([{ id: `phase:${project}:${level}`, kind: "phase", expected,
-      value: { projectId: project, phase: level, inputs: [...inputs, ...checked.guards], draft: draftRef, layer: null } }], [...inputs, ...checked.guards])[0]!;
+      value: { projectId: project, phase: level, inputs: uniqueRefs([...inputs, ...checked.guards]), draft: draftRef, layer: null } }], uniqueRefs([...inputs, ...checked.guards]))[0]!;
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number): Revision<Milestone> {
     const phase = `L${level}` as Phase; const inputs = this.#inputs(project, phase);
@@ -75,14 +75,14 @@ export class Refinement {
     requireCondition(graph && (level !== 3 || graph.value.horizon.length > 0), "horizon_empty", "Choose the nearest L3 execution horizon");
     const layer = this.store.get(`graph-layer:${project}:${level}`)!;
     return this.store.writeMany<Milestone>([{ id: `phase:${project}:${phase}`, kind: "phase", expected,
-      value: { projectId: project, phase, inputs: [...inputs, ...checked.guards], draft: null, layer: reference(layer) } }], [...inputs, ...checked.guards])[0]!;
+      value: { projectId: project, phase, inputs: uniqueRefs([...inputs, ...checked.guards]), draft: null, layer: reference(layer) } }], uniqueRefs([...inputs, ...checked.guards]))[0]!;
   }
   gate(project: string, phase: Phase): GateResult {
     const milestone = this.store.get<Milestone>(`phase:${project}:${phase}`);
     const result: GateResult = { findings: [], guards: [] };
     if (!milestone || milestone.kind !== "phase") { result.findings.push({ code: "phase_missing", target: phase, message: "Refinement phase is not complete" }); return result; }
     result.guards.push(reference(milestone));
-    for (const ref of milestone.value.inputs) {
+    for (const ref of uniqueRefs(milestone.value.inputs)) {
       const current = this.store.get(ref.id);
       if (!current || current.revision !== ref.revision || current.hash !== ref.hash
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "phase_stale", target: ref.id, message: "An input to this phase changed" });
@@ -91,12 +91,12 @@ export class Refinement {
     return result;
   }
   assess(project: string, expected: number): Revision<Feasibility> {
-    const inputs = this.#inputs(project, "R3"); const environment = this.environments.get(project);
+    const inputs = this.#inputs(project, "R3"); const effective = this.environments.effective(project); const environment = effective.environment;
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && graph.kind === "graph", "graph_missing", "Operation map is missing");
-    const graphGate = this.graphs.gate(project); const inspected = inspectRepository(environment.value, graph.value);
+    const graphGate = this.graphs.gate(project); const inspected = inspectRepository({ ...environment.value, workspace: effective.root }, graph.value);
     const findings = [...graphGate.findings, ...inspected.findings];
-    const guards = [...inputs, reference(environment), ...graphGate.guards];
+    const guards = uniqueRefs([...inputs, reference(environment), ...graphGate.guards, ...effective.guards]);
     return this.store.writeMany<Feasibility>([{ id: `feasibility:${project}`, kind: "feasibility", expected,
       value: { projectId: project, ready: findings.length === 0, graph: reference(graph), environment: reference(environment),
         repository: inspected.state, inputs: guards, findings } }], guards)[0]!;
@@ -108,7 +108,7 @@ export class Refinement {
       return { findings: [{ code: "feasibility_not_ready", target: project, message: "R3 is missing, stale or not ready" }], guards: [] };
     }
     const result: GateResult = { findings: [], guards: [reference(record)] };
-    for (const input of record.value.inputs) {
+    for (const input of uniqueRefs(record.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "feasibility_stale", target: input.id, message: "An R3 input changed" });
@@ -116,7 +116,8 @@ export class Refinement {
     }
     const graph = this.store.get<Graph>(`graph:${project}`);
     try {
-      const inspected = inspectRepository(this.environments.get(project).value, graph!.value);
+      const effective = this.environments.effective(project);
+      const inspected = inspectRepository({ ...effective.environment.value, workspace: effective.root }, graph!.value);
       result.findings.push(...inspected.findings);
       if (canonical(inspected.state) !== canonical(record.value.repository)) result.findings.push({ code: "repository_stale", target: project, message: "Repository state changed after R3" });
     } catch { result.findings.push({ code: "environment_missing", target: project, message: "Environment is unavailable" }); }

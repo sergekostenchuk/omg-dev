@@ -4,7 +4,7 @@ import { Store, type Revision } from "../storage/store.js";
 import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
-import { reference, STAGES, isRef, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
+import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
 import { REQUIREMENTS, type UpstreamStage } from "./requirements.js";
 
@@ -47,7 +47,7 @@ export class Discovery {
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
-    const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs,
+    const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs),
       fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
@@ -111,7 +111,7 @@ export class Discovery {
       return { findings: [{ code: "discovery_stale", target: draftRef.id, message: "Discovery draft is missing, foreign or changed" }], guards };
     }
     guards.push(reference(draft));
-    for (const input of draft.value.inputs) {
+    for (const input of uniqueRefs(draft.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash) fail("research_context_stale", input.id, "Research was performed against a different input version");
       else guards.push(reference(current));
@@ -137,6 +137,6 @@ export class Discovery {
       }
       if (canonical(value) !== canonical(draft.value.fields[question.value.spec.field])) fail("answer_target_mismatch", id, "The answer no longer matches its target field");
     }
-    return { findings, guards };
+    return { findings, guards: uniqueRefs(guards) };
   }
 }

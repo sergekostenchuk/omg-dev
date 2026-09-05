@@ -7,6 +7,9 @@ import { chromium } from "playwright";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { createProductServer } from "../src/server.js";
+import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { git } from "../src/runtime/environment.js";
+import { reference } from "../src/pipeline/contracts.js";
 
 test("browser completes source→discovery→acceptance, survives reload and fits desktop/mobile", { timeout: 60_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-browser-")); const store = new Store(join(root, "state.sqlite"));
@@ -69,4 +72,29 @@ test("browser completes source→discovery→acceptance, survives reload and fit
   await page.getByRole("heading", { name: "Концепция", exact: true }).waitFor();
   await page.screenshot({ path: join(output, "mobile.png"), fullPage: true });
   assert.deepEqual(errors, []);
+});
+
+test("browser compiles the accepted map and reloads the generated task dependencies", { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-plan-ui-")); const workspace = join(root, "repo"); mkdirSync(workspace);
+  git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "Product input\n");
+  git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
+  const store = new Store(join(root, "state.sqlite")); const engine = new ProductEngine(store);
+  preparedFeatures(engine, "garden"); const command = { executable: process.execPath, args: ["--version"] };
+  engine.environments.configure("garden", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000 }, 0);
+  refinedLayers(engine, "garden"); const r3 = engine.refinement.assess("garden", 0);
+  const om = engine.refinement.publish("garden", reference(r3), 0); engine.pipeline.accept("garden", "om-g2", om.revision);
+  const server = createProductServer(engine);
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const browser = await chromium.launch({ channel: "chrome", headless: true });
+  t.after(async () => { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); store.close(); rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage();
+  await page.goto(`http://127.0.0.1:${(server.address() as { port: number }).port}/#token=${server.accessToken}`);
+  await page.getByLabel("Выбор стадии", { exact: true }).selectOption("compilation");
+  await page.getByRole("button", { name: "Скомпилировать машинный план", exact: true }).click();
+  await page.getByRole("heading", { name: "Задач в горизонте: 2", exact: true }).waitFor();
+  assert.equal(await page.getByText("Предшественники: produce work", { exact: true }).count(), 1);
+  await page.reload(); await page.getByLabel("Выбор стадии", { exact: true }).selectOption("compilation");
+  await page.getByRole("heading", { name: "Задач в горизонте: 2", exact: true }).waitFor();
+  assert.equal(await page.locator(".stage-panel .section-heading .badge.accepted").count(), 1);
 });
