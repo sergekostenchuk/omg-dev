@@ -11,6 +11,7 @@ import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { derivedDraft, type Derivation } from "../discovery/derived-draft.js";
 import { REFINEMENT_CONTRACT_VERSION, refinementQuestions, deferredGap, type TechnicalGap, type TechnicalReport } from "./research-contracts.js";
 import { technicalResearchFindings } from "./research-evidence.js";
+import { layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -101,11 +102,29 @@ export class Refinement {
     requireCondition(checked.findings.length === 0, "layer_not_ready", "Graph layer is missing or stale");
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && (level !== 3 || graph.value.horizon.length > 0), "horizon_empty", "Choose the nearest L3 execution horizon");
+    requireCondition(graph.value.version !== 2 || level === 1 || this.graphs.layerIsDerived(project, level),
+      "layer_design_required", "Build this layer from assessed research before sealing it");
     const layer = this.store.get(`graph-layer:${project}:${level}`)!;
     const guards = uniqueRefs([...inputs, ...checked.guards]);
     return this.#milestone(`phase:${project}:${phase}`, expected,
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase, inputs: guards, draft: null, layer: reference(layer) },
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
+  }
+  prepareLayer(project: string, level: 2 | 3): Revision<DiscoveryDraft> {
+    const inputs = this.#inputs(project, `L${level}`);
+    const graph = this.store.get<Graph>(`graph:${project}`);
+    requireCondition(graph?.value.version === 2, "graph_upgrade_required", "Layer research needs the enriched operation map");
+    const effective = this.environments.effective(project);
+    const upper = this.store.get(`graph-layer:${project}:${level - 1}`)!;
+    return this.discovery.create(project, "om-g2", level === 2 ? "R1" : "R2", graph.value.nodes.find(node => node.kind === "product")!.id,
+      [layerDesignSpec(level)], uniqueRefs([...inputs, reference(upper), ...effective.guards]), LAYER_DESIGN_VERSION);
+  }
+  buildLayer(project: string, level: 2 | 3, draft: Ref, expected: number, actor: string): Revision<Graph> {
+    const inputs = this.#inputs(project, `L${level}`);
+    const record = this.store.get<DiscoveryDraft>(draft.id);
+    requireCondition(record && inputs.every(input => record.value.inputs.some(ref => canonical(ref) === canonical(input))),
+      "layer_research_foreign", "Layer design must use all current refinement prerequisites");
+    return this.graphs.deriveLayer(project, level, expected, draft, actor, inputs);
   }
   gate(project: string, phase: Phase): GateResult {
     const milestone = this.store.get<Milestone>(`phase:${project}:${phase}`);

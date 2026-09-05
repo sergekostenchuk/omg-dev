@@ -121,8 +121,10 @@ test("a terminal producer cannot change recipient by selecting another outcome's
   const graph = enrichedGraph(exampleGraph("p"), "p");
   graph.actors!.push({ id: "admin", role: "Operator", channels: ["CLI"] });
   graph.requirements!.push({ id: "admin-requirement", section: "admin-section", outcome: "p-refusal", beneficiary: "admin", statement: "Inspect rejected operations" });
+  for (const refusal of graph.nodes.filter(node => node.outcome === "p-refusal")) {
+    refusal.beneficiary = "admin"; refusal.implements = ["admin-requirement"];
+  }
   const refusal = graph.nodes.find(node => node.id === "p-refusal-block")!;
-  refusal.beneficiary = "admin"; refusal.implements = ["admin-requirement"];
   graph.journeys!.push({ id: "admin-journey", actor: "admin", variant: "operator_admin", entry: refusal.id, path: [refusal.id], outcome: "p-refusal", terminal: "safe_failure" });
   assert.deepEqual(validateGraph(graph).findings, []);
   const output = graph.nodes.find(node => node.id === "p-consume-block")!;

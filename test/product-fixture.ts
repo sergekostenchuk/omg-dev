@@ -8,6 +8,7 @@ import type { Json } from "../src/canonical.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { designOf } from "../src/graph/builder.js";
+import { deriveLayerFixture } from "./layer-design-fixture.js";
 
 export function preparedFeatures(engine: ProductEngine, project: string, graph: Graph = exampleGraph(project),
   valueFor: (field: string) => Json = field => preparedField(project, field)) {
@@ -36,6 +37,7 @@ export function refinedLayers(engine: ProductEngine, project: string) {
     if (level !== "R0") answerTechnicalFixture(engine, project, draft);
     const current = engine.store.get(draft.id)!;
     engine.refinement.finishResearch(project, level, reference(current), 0);
+    if (layer !== 1) deriveLayerFixture(engine, project, layer);
     engine.refinement.sealLayer(project, layer, 0);
   }
 }

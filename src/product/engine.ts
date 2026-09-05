@@ -166,6 +166,8 @@ export class ProductEngine {
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);
+      case "prepare-layer": this.#project(command.project); return this.refinement.prepareLayer(command.project, command.level);
+      case "build-layer": this.#project(command.project); return this.refinement.buildLayer(command.project, command.level, command.draft, command.expected, this.actor);
       case "assess": this.#project(command.project); return this.refinement.assess(command.project, command.expected);
       case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
       case "compile": {

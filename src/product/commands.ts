@@ -12,6 +12,8 @@ export type ProductCommand =
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
   | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
   | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
+  | { type: "prepare-layer"; project: string; level: 2 | 3 }
+  | { type: "build-layer"; project: string; level: 2 | 3; draft: Ref; expected: number }
   | { type: "assess"; project: string; expected: number }
   | { type: "draft-om"; project: string; feasibility: Ref; expected: number }
   | { type: "compile"; project: string }
@@ -49,6 +51,8 @@ const schema = { oneOf: [
   command("begin-research", { project, level: researchLevel }),
   command("finish-research", { project, level: researchLevel, draft: ref, expected }),
   command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),
+  command("prepare-layer", { project, level: { enum: [2, 3] } }),
+  command("build-layer", { project, level: { enum: [2, 3] }, draft: ref, expected }),
   command("assess", { project, expected }), command("draft-om", { project, feasibility: ref, expected }),
   command("compile", { project }), command("draft-plan", { project, plan: ref, expected }),
   command("create-project", { project, title: string }),

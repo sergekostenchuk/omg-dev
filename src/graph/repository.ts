@@ -1,7 +1,7 @@
 import { Store, type Revision } from "../storage/store.js";
 import { requireCondition } from "../errors.js";
 import { canonical, hashJson } from "../canonical.js";
-import { Discovery, type DiscoveryDraft } from "../discovery/discovery.js";
+import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
 import { reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { requireGraph, validateGraph } from "./validate.js";
 import type { Graph } from "./model.js";
@@ -9,6 +9,7 @@ import { LEVEL } from "./model.js";
 import { projectGraph } from "./project.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { continuityFindings } from "./semantics.js";
+import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 
 interface Obligation { node: string; field: string; valueHash: string; inputs: Ref[] }
 interface LayerProof { level: 1 | 2 | 3; hash: string; inputs: Ref[] }
@@ -81,6 +82,40 @@ export class GraphRepository {
     const obligations = (prior?.value.obligations ?? []).filter(item => item.node !== node.id || !fields.has(item.field));
     for (const field of fields) obligations.push({ node: node.id, field, valueHash: hashJson(draft.value.fields[field]), inputs: result.guards });
     return this.#write(projectId, checked, expected, actor, obligations, result.guards, prior?.value.layerProofs ?? []);
+  }
+  deriveLayer(projectId: string, level: 2 | 3, expected: number, draftRef: Ref, actor: string, guards: Ref[] = []): Revision<Graph> {
+    const current = this.store.get<Graph>(`graph:${projectId}`);
+    requireCondition(current?.kind === "graph" && current.revision === expected, "graph_stale", "Graph changed or is missing");
+    const checked = this.discovery.gate(projectId, draftRef);
+    requireCondition(checked.findings.length === 0, "research_unresolved", "Layer construction requires current resolved research");
+    const draft = this.store.get<DiscoveryDraft>(draftRef.id)!;
+    const questions = draft.value.questions.map(id => this.store.get<Question>(id)!);
+    const research = this.store.get(`phase:${projectId}:R${level - 1}`);
+    const upper = this.store.get(`graph-layer:${projectId}:${level - 1}`);
+    requireCondition(draft.value.stage === "om-g2" && draft.value.level === `R${level - 1}`
+      && draft.value.consumer === current.value.nodes.find(node => node.kind === "product")?.id
+      && draft.value.contractVersion === LAYER_DESIGN_VERSION
+      && canonical(questions.map(question => question.value.spec)) === canonical([layerDesignSpec(level)])
+      && research && upper && [research, upper].every(record => draft.value.inputs.some(ref => canonical(ref) === canonical(reference(record)))),
+    "layer_research_foreign", "Layer design must use its exact contract, accepted research and upper layer");
+    requireCondition(questions.every(question => question.value.answer && this.store.get(question.value.answer.id)?.kind === "research-answer"),
+      "research_assessment_required", "Layer construction requires assessed model research, not a manual graph declaration");
+    const graph = composeLayer(current.value, level, draft.value.fields['layerDesign']);
+    const prior = this.store.get<Binding>(`graph-binding:${projectId}`);
+    const proofs = [...(prior?.value.layerProofs ?? []).filter(proof => proof.level < level),
+      { level, hash: hashJson(projectGraph(graph, level)), inputs: checked.guards }];
+    if (canonical(prior?.value.layerProofs?.find(proof => proof.level === level) ?? null) === canonical(proofs.at(-1)))
+      proofs.push(...(prior?.value.layerProofs ?? []).filter(proof => proof.level > level));
+    const obligations = (prior?.value.obligations ?? []).filter(obligation => {
+      const node = graph.nodes.find(item => item.id === obligation.node);
+      return node && LEVEL[node.kind] < level;
+    });
+    return this.#write(projectId, graph, expected, actor, obligations,
+      uniqueRefs([...guards, ...checked.guards, reference(current)]), proofs);
+  }
+  layerIsDerived(projectId: string, level: 2 | 3): boolean {
+    const layer = this.store.get<Layer>(`graph-layer:${projectId}:${level}`);
+    return Boolean(layer?.value.layerProofs?.some(proof => proof.level === level));
   }
   layerGate(projectId: string, level: 1 | 2 | 3, expected?: Ref): GateResult {
     const layer = this.store.get<Layer>(`graph-layer:${projectId}:${level}`);

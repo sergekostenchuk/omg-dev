@@ -21,6 +21,7 @@ export function enrichedGraph(source: Graph, project: string, initial: Json = pr
   graph.nodes.push({ id: refusalNode, parent: root.id, kind: "block", title: "Reject invalid input", outcome: refusal,
     boundary: { ...root.boundary }, code: [], tests: [], ports: [], purpose: "Handle invalid requests safely", benefit: "Avoid an incorrect result",
     beneficiary: recipient, implements: graph.requirements.map(requirement => requirement.id) });
+  graph.nodes.push({ ...structuredClone(graph.nodes.at(-1)!), id: `${project}-refusal-operation`, parent: refusalNode, kind: "operation" });
   graph.edges = [{ id: `${project}-invalid-transition`, relation: "on_failure", source: `${project}-produce-block`, target: refusalNode, condition: "Input validation fails" }];
   graph.journeys = [];
   for (const [variant, coverage] of Object.entries(preparation.journeys) as [string, any][]) if (coverage.applicability === "applicable") {

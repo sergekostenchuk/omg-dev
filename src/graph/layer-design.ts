@@ -1,0 +1,63 @@
+import { canonical, type Json } from "../canonical.js";
+import type { FieldSpec } from "../discovery/discovery.js";
+import { requireCondition } from "../errors.js";
+import { mapDesignSchema } from "./builder.js";
+import { LEVEL, type Graph } from "./model.js";
+import { projectGraph } from "./project.js";
+import { requireGraph } from "./validate.js";
+import { RefinementRelations } from "./relations.js";
+
+export const LAYER_DESIGN_VERSION = 1;
+export function layerDesignSpec(level: 2 | 3): FieldSpec {
+  const schema = structuredClone(mapDesignSchema);
+  if (level === 3) schema.properties['horizon'] = { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } };
+  return { field: "layerDesign", kind: "design", proof: "assessment", schema: schema as Json,
+    risk: "Исследование не превращается в полную связную декомпозицию с проверяемыми результатами",
+    prompt: `Построй L${level} той же карты по принятым результатам R${level - 1}, ТЗ и фичам. Верни полный граф до L${level}, без полей version/id/title/actors/requirements: их наследует движок. Сохрани верхние уровни без изменения. ${level === 2
+      ? "Раскрой операции, полномочия, данные, входы/выходы и пути отказа. Не придумывай атомарные задачи L3 заранее."
+      : "Раскрой текущий горизонт атомарных результатов с точными code refs, тестовыми контрактами, ресурсами, последовательными и отложенными связями. Planned код обозначай planned. Не подставляй фиктивные доказательства существующего кода."} Внутренние связи допустимы внутри одного родителя; межблочные связи уточняют прежние connectors. Не закрывай пробелы статусом ready: сохрани неизвестное в исследовании и верни его в R${level - 1}.`,
+  };
+}
+
+export function layerDesignOf(graph: Graph, level: 2 | 3): Json {
+  const { id: _id, title: _title, level: _level, version: _version, actors: _actors, requirements: _requirements, ...design } = projectGraph(graph, level);
+  return structuredClone(design) as unknown as Json;
+}
+
+export function composeLayer(base: Graph, level: 2 | 3, design: unknown): Graph {
+  requireCondition(base.version === 2, "graph_upgrade_required", "Automatic refinement needs an enriched map");
+  requireCondition(design && typeof design === "object" && !Array.isArray(design), "layer_design_missing", "A researched layer design is required");
+  requireCondition(!["version", "id", "title", "actors", "requirements"].some(key => Object.hasOwn(design, key)),
+    "derived_field_conflict", "Layer identity, actors and requirements are inherited from the accepted map");
+  const graph = requireGraph({ ...design, version: base.version, id: base.id, title: base.title, actors: base.actors, requirements: base.requirements });
+  requireCondition(graph.nodes.some(node => LEVEL[node.kind] === level) && graph.nodes.every(node => LEVEL[node.kind] <= level),
+    "layer_detail_invalid", `The design must contain L${level} and cannot author future layers`);
+  requireCondition(level !== 3 || graph.horizon.length > 0, "horizon_empty", "L3 needs a researched nearest execution horizon");
+  const upper = (level - 1) as 1 | 2;
+  requireCondition(canonical(projectGraph(base, upper)) === canonical(projectGraph(graph, upper)),
+    "upper_layer_drift", "Refinement cannot silently rewrite accepted upper-layer results, contracts or responsibility");
+  const relations = new RefinementRelations(graph);
+  if (level === 2) {
+    for (const block of graph.nodes.filter(node => node.kind === "block")) requireCondition(graph.nodes.some(node => node.kind === "operation"
+      && relations.refines(node.id, block.id) && node.outcome === block.outcome), "layer_outcome_uncovered", `L2 does not realize the result of ${block.id}`);
+  }
+  const active = graph.nodes.filter(node => graph.horizon.includes(node.id));
+  for (const connector of graph.connectors) for (const binding of connector.bindings.filter(binding => binding.level === upper)) {
+    // An upper dependency remains represented even when its other end is sleeping.
+    // `realizes` may fold both endpoint roles into one atomic implementation.
+    if (level === 2 || active.some(node => [binding.producer, ...binding.consumers].some(endpoint => relations.refines(node.id, endpoint.node)))) {
+      const lower = connector.bindings.filter(binding => binding.level === level);
+      requireCondition(lower.some(item => relations.refines(item.producer.node, binding.producer.node))
+        && binding.consumers.every(consumer => lower.some(item => item.consumers.some(node => relations.refines(node.node, consumer.node)))),
+      "layer_connector_uncovered", `L${level} loses a producer or consumer of ${connector.id}`);
+    }
+  }
+  if (level === 3) for (const node of active) for (const port of node.ports.filter(port => port.direction === "in")) {
+    requireCondition(graph.connectors.some(connector => connector.bindings.some(binding => binding.level === 3
+      && binding.consumers.some(endpoint => endpoint.node === node.id && endpoint.port === port.id))),
+    "layer_port_unbound", `The active input ${node.id}/${port.id} has no producer binding`);
+  }
+  // Reconfirming an unchanged layer preserves its already authored descendants.
+  // A changed layer replaces only the current graph revision; prior graphs remain in SQLite.
+  return canonical(projectGraph(base, level)) === canonical(projectGraph(graph, level)) ? structuredClone(base) : graph;
+}

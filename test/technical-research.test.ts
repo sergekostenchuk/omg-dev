@@ -16,6 +16,7 @@ import { exampleGraph } from "./graph-fixture.js";
 import { reuseResearch } from "../src/discovery/research-reuse.js";
 import { researchGraphContext } from "../src/discovery/research-context.js";
 import type { Graph } from "../src/graph/model.js";
+import { deriveLayerFixture } from "./layer-design-fixture.js";
 
 function fixture(t: test.TestContext, graph = exampleGraph("p")) {
   const root = mkdtempSync(join(tmpdir(), "omg-technical-")), workspace = join(root, "repo"); mkdirSync(workspace);
@@ -71,7 +72,7 @@ test("R1 forwards addressable next-level gaps to R2 and R2 cannot leave them unr
   const gap = { id: "input-gap", target: "p-consume-operation", field: "ports", question: "Which validated input does the consumer require?",
     consumer: "p-consume-work", requiredFor: "next" as const };
   answerTechnicalFixture(engine, "p", r1, (field, report) => field === "integrations" ? { ...report, gaps: [gap] } : report);
-  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); engine.refinement.sealLayer("p", 2, 0);
+  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); deriveLayerFixture(engine, "p", 2); engine.refinement.sealLayer("p", 2, 0);
   const r2 = engine.refinement.begin("p", "R2");
   assert.equal(r2.value.questions.length, TECHNICAL_RESEARCH.R2.length + 1);
   const inherited = r2.value.questions.map(id => store.get<{ spec: { field: string; prompt: string } }>(id)!.value.spec).find(spec => spec.field.startsWith("gap_"))!;
@@ -131,7 +132,7 @@ test("activating a previously sleeping horizon gap invalidates R2 before L3 can 
     consumer: "p-consume-block", requiredFor: "next" as const };
   const r1 = engine.refinement.begin("p", "R1");
   answerTechnicalFixture(engine, "p", r1, (field, report) => field === "integrations" ? { ...report, gaps: [gap] } : report);
-  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); engine.refinement.sealLayer("p", 2, 0);
+  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); deriveLayerFixture(engine, "p", 2); engine.refinement.sealLayer("p", 2, 0);
   const r2 = engine.refinement.begin("p", "R2");
   assert.equal(r2.value.questions.length, TECHNICAL_RESEARCH.R2.length);
   answerTechnicalFixture(engine, "p", r2);
@@ -146,7 +147,7 @@ test("activating a previously sleeping horizon gap invalidates R2 before L3 can 
   answerTechnicalFixture(engine, "p", refreshed);
   engine.refinement.finishResearch("p", "R2", reference(store.get(refreshed.id)!), phase.revision);
   assert.deepEqual(engine.refinement.gate("p", "R2").findings, []);
-  engine.refinement.sealLayer("p", 3, 0);
+  deriveLayerFixture(engine, "p", 3); engine.refinement.sealLayer("p", 3, 0);
 });
 
 test("a deferred gap first found by R2 is re-researched when its consumer enters the horizon", t => {
@@ -155,7 +156,7 @@ test("a deferred gap first found by R2 is re-researched when its consumer enters
   graph.connectors[0]!.bindings[2]!.anchor = "future-input"; graph.connectors[0]!.wakeTest = graph.tests[0]!.id;
   const { engine, store } = fixture(t, graph); finishR0(engine);
   const r1 = engine.refinement.begin("p", "R1"); answerTechnicalFixture(engine, "p", r1);
-  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); engine.refinement.sealLayer("p", 2, 0);
+  engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0); deriveLayerFixture(engine, "p", 2); engine.refinement.sealLayer("p", 2, 0);
   const gap = { id: "r2-future", target: "p-produce-block", field: "ports", question: "Which future input contract is required?",
     consumer: "p-consume-block", requiredFor: "next" as const };
   const r2 = engine.refinement.begin("p", "R2");
@@ -174,5 +175,5 @@ test("a deferred gap first found by R2 is re-researched when its consumer enters
   answerTechnicalFixture(engine, "p", next);
   engine.refinement.finishResearch("p", "R2", reference(store.get(next.id)!), phase.revision);
   assert.deepEqual(engine.refinement.gate("p", "R2").findings, []);
-  engine.refinement.sealLayer("p", 3, 0);
+  deriveLayerFixture(engine, "p", 3); engine.refinement.sealLayer("p", 3, 0);
 });

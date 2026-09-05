@@ -99,7 +99,9 @@ export function validateGraph(input: unknown): Validation {
           const refs = incoming.get(consumer.node) ?? new Set<string>(); refs.add(connector.id); incoming.set(consumer.node, refs);
         }
       }
-      if (binding.level > 1 && !connector.bindings.some(upper => upper.level === binding.level - 1
+      const sameParent = nodes.get(binding.producer.node)?.parent;
+      const localFlow = graph.version === 2 && sameParent && binding.consumers.every(consumer => nodes.get(consumer.node)?.parent === sameParent);
+      if (binding.level > 1 && !(localFlow && !connector.bindings.some(upper => upper.level < binding.level)) && !connector.bindings.some(upper => upper.level === binding.level - 1
         && relations.refines(binding.producer.node, upper.producer.node)
         && binding.consumers.every(consumer => upper.consumers.some(parent => relations.refines(consumer.node, parent.node))))) {
         fail("refinement_gap", connector.id, "Lower-level endpoints must refine the same upper connector");

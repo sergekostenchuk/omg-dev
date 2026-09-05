@@ -39,6 +39,13 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
     .map(gap => ({ ...gap, deferred: Boolean(graph && deferredGap(graph.value, gap)) })) : [];
   const currentHorizon = graph?.value.nodes.filter(node => graph.value.horizon.includes(node.id))
     .map(node => ({ id: node.id, parent: node.parent, outcome: node.outcome, code: node.code })) ?? [];
-  return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon,
+  const research = draft.inputs.flatMap(ref => {
+    const phase = store.get<{ draft: Ref | null }>(ref.id, ref.revision);
+    if (phase?.kind !== "phase" || phase.hash !== ref.hash || !phase.value.draft) return [];
+    const report = store.get<DiscoveryDraft>(phase.value.draft.id, phase.value.draft.revision);
+    return report?.hash === phase.value.draft.hash && report.value.level === draft.level
+      ? [{ ref: reference(report), fields: report.value.fields }] : [];
+  });
+  return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon, research,
     previousResearch: earlier ? reference(earlier) : null, openGaps };
 }
