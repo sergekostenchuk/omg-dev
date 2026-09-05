@@ -13,6 +13,7 @@ export interface FieldSpec { field: string; kind: "fact" | "decision"; prompt: s
 export interface DiscoveryDraft {
   projectId: string; stage: Stage; level: ResearchLevel; consumer: string;
   fields: Record<string, Json>; questions: string[];
+  inputs: Ref[];
 }
 export interface Question {
   projectId: string; draftId: string; stage: Stage; level: ResearchLevel; consumer: string;
@@ -26,11 +27,11 @@ const ajv = new Ajv({ strict: true });
 export class Discovery {
   readonly evidence: Evidence;
   constructor(private readonly store: Store) { this.evidence = new Evidence(store); }
-  forStage(projectId: string, stage: UpstreamStage, consumer: string): Revision<DiscoveryDraft> {
+  forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = []): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
-    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage]);
+    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage], inputs);
   }
-  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[]): Revision<DiscoveryDraft> {
+  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = []): Revision<DiscoveryDraft> {
     requireCondition(STAGES.includes(stage) && ["R0", "R1", "R2", "R3"].includes(level) && typeof consumer === "string"
       && consumer.trim() && Array.isArray(specs) && specs.length > 0,
       "question_unbound", "Discovery needs a level, consumer and explicit questions");
@@ -45,12 +46,13 @@ export class Discovery {
     for (const spec of specs) ajv.compile(spec.schema as object);
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
-    const draft: DiscoveryDraft = { projectId, stage, level, consumer,
+    requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
+    const draft: DiscoveryDraft = { projectId, stage, level, consumer, inputs,
       fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
         value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }))];
-    return this.store.writeMany<DiscoveryDraft>(writes)[0]!;
+    return this.store.writeMany<DiscoveryDraft>(writes, inputs)[0]!;
   }
   #question(id: string, expected: number): Revision<Question> {
     const question = this.store.get<Question>(id);
@@ -109,6 +111,11 @@ export class Discovery {
       return { findings: [{ code: "discovery_stale", target: draftRef.id, message: "Discovery draft is missing, foreign or changed" }], guards };
     }
     guards.push(reference(draft));
+    for (const input of draft.value.inputs) {
+      const current = this.store.get(input.id);
+      if (!current || current.revision !== input.revision || current.hash !== input.hash) fail("research_context_stale", input.id, "Research was performed against a different input version");
+      else guards.push(reference(current));
+    }
     for (const id of draft.value.questions) {
       const question = this.store.get<Question>(id);
       if (!question || question.kind !== "question" || question.value.projectId !== projectId || question.value.draftId !== draft.id
