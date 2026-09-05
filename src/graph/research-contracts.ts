@@ -54,7 +54,7 @@ export const TECHNICAL_RESEARCH: Record<"R1" | "R2", FieldSpec[]> = {
 };
 export function refinementQuestions(level: "R1" | "R2", gaps: TechnicalGap[] = []): FieldSpec[] {
   const groups = new Map<string, TechnicalGap[]>();
-  if (level === "R2") for (const gap of gaps) {
+  for (const gap of gaps) {
     const key = canonical([gap.target, gap.field]); const group = groups.get(key) ?? [];
     if (!group.some(item => canonical(item) === canonical(gap))) group.push(gap);
     groups.set(key, group);

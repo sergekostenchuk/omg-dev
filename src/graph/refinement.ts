@@ -5,13 +5,14 @@ import { Environments, inspectRepository, type RepositoryState } from "../runtim
 import { Pipeline } from "../pipeline/pipeline.js";
 import { reference, isRef, uniqueRefs, stageId, type StageArtifact, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { canonical, type Json } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import type { Graph } from "./model.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { derivedDraft, type Derivation } from "../discovery/derived-draft.js";
 import { REFINEMENT_CONTRACT_VERSION, refinementQuestions, deferredGap, type TechnicalGap, type TechnicalReport } from "./research-contracts.js";
 import { technicalResearchFindings } from "./research-evidence.js";
 import { layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
+import { defectGaps, defectInputs } from "./plan-defects.js";
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -57,8 +58,8 @@ export class Refinement {
     return Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
       .filter(gap => !graph || !deferredGap(graph.value, gap));
   }
-  #questions(project: string, level: "R1" | "R2"): FieldSpec[] {
-    return refinementQuestions(level, level === "R2" ? this.#gaps(project) : []);
+  #questions(project: string, level: "R1" | "R2", imported: Ref[] = []): FieldSpec[] {
+    return refinementQuestions(level, [...(level === "R2" ? this.#gaps(project) : []), ...defectGaps(this.store, project, imported)]);
   }
   begin(project: string, level: Exclude<ResearchLevel, "R3">): Revision<DiscoveryDraft> {
     requireCondition(["R0", "R1", "R2"].includes(level), "phase_invalid", "Use the feasibility checker for R3");
@@ -67,11 +68,11 @@ export class Refinement {
     const effective = this.environments.effective(project);
     const workspace = this.store.get(`workspace:${project}`)!;
     return this.discovery.create(project, "om-g2", level, "compilation", this.#questions(project, level),
-      uniqueRefs([...inputs, reference(workspace), ...effective.guards]), REFINEMENT_CONTRACT_VERSION);
+      uniqueRefs([...inputs, reference(workspace), ...effective.guards, ...defectInputs(this.store, project)]), REFINEMENT_CONTRACT_VERSION);
   }
   finishResearch(project: string, level: Exclude<ResearchLevel, "R3">, draftRef: Ref, expected: number): Revision<Milestone> {
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
-    const inputs = this.#inputs(project, level); const checked = this.discovery.gate(project, draftRef);
+    const inputs = uniqueRefs([...this.#inputs(project, level), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
     requireCondition(checked.findings.length === 0, "research_unresolved", "Research is unresolved or stale");
     const draft = this.store.get<DiscoveryDraft>(draftRef.id)!;
     requireCondition(draft.value.level === level && draft.value.stage === "om-g2" && draft.value.consumer === "compilation", "research_foreign", "Research belongs to a different refinement phase");
@@ -79,7 +80,7 @@ export class Refinement {
       "research_contract_upgrade_required", "New research completion requires the enriched contract");
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     requireCondition((level === "R0" ? specs.length === 0 && canonical(draft.value.derivations) === canonical(this.#r0Entries(project))
-      : canonical(specs) === canonical(this.#questions(project, level)))
+      : canonical(specs) === canonical(this.#questions(project, level, draft.value.inputs)))
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
     if (level !== "R0") {
@@ -87,7 +88,7 @@ export class Refinement {
       const graph = this.store.get<Graph>(`graph:${project}`);
       requireCondition(graph, "graph_missing", "Technical research needs the current operation map");
       const findings = technicalResearchFindings(this.store, this.discovery, draft.value, graph.value, effective.root);
-      requireCondition(findings.length === 0, "technical_research_incomplete", findings.map(item => `${item.code}: ${item.message}`).join("; "));
+      if (findings.length) throw new EngineError("technical_research_incomplete", findings.map(item => `${item.code}: ${item.message}`).join("; "), findings);
       inputs.push(reference(this.store.get(`workspace:${project}`)!), ...effective.guards);
     }
     const guards = uniqueRefs([...inputs, ...checked.guards]);
@@ -146,7 +147,7 @@ export class Refinement {
       if (phase === "R2" && milestone.value.draft) {
         const draft = this.store.get<DiscoveryDraft>(milestone.value.draft.id, milestone.value.draft.revision);
         const specs = draft?.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
-        if (!draft || canonical(specs) !== canonical(this.#questions(project, "R2"))) result.findings.push({
+        if (!draft || canonical(specs) !== canonical(this.#questions(project, "R2", draft.value.inputs))) result.findings.push({
           code: "research_horizon_changed", target: "R2", message: "Current horizon requires research obligations absent from the accepted R2 result" });
         const graph = this.store.get<Graph>(`graph:${project}`);
         if (draft && graph) for (const gap of Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)) {

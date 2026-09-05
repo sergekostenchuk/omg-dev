@@ -12,6 +12,7 @@ export type ProductCommand =
   | { type: "execute-plan"; project: string; plan: Ref; retry: boolean; maxContextChars: number; maxCorrections: number }
   | { type: "stop-execution"; project: string }
   | { type: "recover-execution"; project: string }
+  | { type: "repair-plan"; project: string; run: Ref; maxTurns: number }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
   | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
@@ -54,6 +55,7 @@ const schema = { oneOf: [
   command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),
+  command("repair-plan", { project, run: ref, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("configure", { project, expected, environment: object({ workspace: string, implementer: role, reviewer: role,
     fullCheck: processCommand, timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } }) }),
   command("begin-research", { project, level: researchLevel }),

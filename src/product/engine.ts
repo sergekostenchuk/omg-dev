@@ -23,6 +23,7 @@ import type { ExecutionRoot } from "../runtime/environment.js";
 import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
+import { PlanRepairs } from "./repairs.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -35,6 +36,7 @@ export class ProductEngine {
   readonly compiler: Compiler;
   readonly executor: Executor;
   readonly researcher: Researcher;
+  readonly repairs: PlanRepairs;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
@@ -44,6 +46,7 @@ export class ProductEngine {
     this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
     this.executor = new Executor(store, this.compiler, this.environments);
     this.researcher = new Researcher(store, this.discovery, this.environments);
+    this.repairs = new PlanRepairs(this);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
@@ -179,6 +182,7 @@ export class ProductEngine {
       case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
       case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
+      case "repair-plan": this.#project(command.project); return this.repairs.run(command.project, command.run, command.maxTurns);
       case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);

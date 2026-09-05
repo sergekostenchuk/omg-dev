@@ -18,6 +18,22 @@ import { createHash } from 'node:crypto';
 const [journal, behavior] = process.argv.slice(2);
 const raw=readFileSync(0,'utf8'), request=JSON.parse(raw), context=request.subject.context;
 const previous=existsSync(journal)?readFileSync(journal,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse):[];
+if(request.mode==='research') {
+ const c=request.subject;
+ appendFileSync(journal,JSON.stringify({mode:'research',role:c.role})+'\n');
+ const reply=research=>process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research}));
+ if(c.role==='assess-answer') reply({verdict:'supported',reasons:[]});
+ else {
+  const q=c.questions[0], source=c.inventory.sources.find(item=>item.ref.id.includes(':failure-'));
+  const manifest=JSON.parse(readFileSync(journal+'.repair.json','utf8'));
+  const value=q.field==='layerDesign'?manifest.design:
+   {applicability:'applicable',reason:'Repair the observed missing consumer refusal contract while retaining the accepted producer',facts:[],
+    designs:[{id:q.field+'-repair',decision:'Add a consumer counterfactual that removes its input and requires input_missing, preserve the accepted producer and its data contract',benefit:'A caller receives a defined refusal instead of unchecked input',consumer:'p-consume-work'}],gaps:[]};
+  if(manifest.researchGap&&q.field==='contractsAndConsumers'&&!c.inventory.sources.some(item=>item.ref.id.includes(':repair-feedback-')))
+   value.gaps=[{id:'unresolved-consumer',target:'p-consume-work',field:'ports',consumer:'p-consume-work',requiredFor:'current',question:'The current consumer input remains unresolved'}];
+  reply({action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:''}}]});
+ }
+} else {
 appendFileSync(journal,JSON.stringify({ mode:request.mode, task:context.binding.task, chars:raw.length, bytes:Buffer.byteLength(raw), hash:createHash('sha256').update(raw).digest('hex'), subject:request.subject })+'\n');
 if(behavior==='wait') await new Promise(resolve=>setTimeout(resolve,30000));
 const response={protocol:request.protocol,requestId:request.requestId};
@@ -33,10 +49,11 @@ if(request.mode==='implement') {
  response.text='Implemented the bounded module';
  response.artifacts=context.produces.map(id=>behavior==='business-value'?{id,value:'invented'}:{id});
  if(behavior==='missing-output')response.artifacts=[];
-} else response.review=behavior==='plan-defect'
+} else response.review=behavior==='plan-defect'||behavior==='repair'&&context.action.title==='consume work'&&!context.criteria.tests.some(test=>test.contract.counterfactuals.length)
  ? {verdict:'request_changes',kind:'plan',findings:['The proposed responsibility cannot deliver the required result']}
  : {verdict:'pass',kind:'none',findings:[]};
 process.stdout.write(JSON.stringify(response));
+}
 `;
 const CHECK = String.raw`
 import assert from 'node:assert/strict';
@@ -45,6 +62,7 @@ const mode=process.argv[2];
 if(mode==='produce'||mode==='all') {const {produce}=await import('./produce.mjs');assert.equal(produce(1),2);}
 if(mode==='consume'||mode==='all'&&existsSync('consume.mjs')) {const {consume}=await import('./consume.mjs');assert.equal(consume(1),4);}
 if(mode==='mutation') {const {produce}=await import('./produce.mjs');assert.throws(()=>produce(undefined),/input_missing/);}
+if(mode==='consume-mutation') {const {consume}=await import('./consume.mjs');assert.throws(()=>consume(undefined),/input_missing/);}
 `;
 
 export function executionFixture(t: TestContext, behavior = "normal") {

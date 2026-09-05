@@ -4,6 +4,7 @@ import type { DiscoveryDraft } from "./discovery.js";
 import type { Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { deferredGap, REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
+import type { PlanDefect } from "../graph/plan-defects.js";
 
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
@@ -46,6 +47,10 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
     return report?.hash === phase.value.draft.hash && report.value.level === draft.level
       ? [{ ref: reference(report), fields: report.value.fields }] : [];
   });
-  return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon, research,
+  const failures = draft.inputs.flatMap(ref => {
+    const defect = store.get<PlanDefect>(ref.id, ref.revision);
+    return defect?.kind === "plan-defect" && defect.hash === ref.hash ? [{ ref, ...defect.value }] : [];
+  });
+  return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon, research, failures,
     previousResearch: earlier ? reference(earlier) : null, openGaps };
 }
