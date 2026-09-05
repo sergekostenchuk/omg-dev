@@ -4,6 +4,7 @@ import type { Json } from "../canonical.js";
 import type { Ref, Stage } from "../pipeline/contracts.js";
 import type { Selector } from "../evidence/evidence.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import type { DetailSelector } from "../compiler/context.js";
 import type { Environment } from "../runtime/environment.js";
 
 export type ProductCommand =
@@ -17,6 +18,8 @@ export type ProductCommand =
   | { type: "assess"; project: string; expected: number }
   | { type: "draft-om"; project: string; feasibility: Ref; expected: number }
   | { type: "compile"; project: string }
+  | { type: "task-context"; project: string; plan: Ref; task: string; maxChars: number }
+  | { type: "task-detail"; project: string; plan: Ref; task: string; kind: "graph" | "evidence" | "evidence-index"; selector: DetailSelector; maxChars: number }
   | { type: "draft-plan"; project: string; plan: Ref; expected: number }
   | { type: "create-project"; project: string; title: string }
   | { type: "prepare-stage"; project: string; stage: UpstreamStage }
@@ -55,6 +58,10 @@ const schema = { oneOf: [
   command("build-layer", { project, level: { enum: [2, 3] }, draft: ref, expected }),
   command("assess", { project, expected }), command("draft-om", { project, feasibility: ref, expected }),
   command("compile", { project }), command("draft-plan", { project, plan: ref, expected }),
+  command("task-context", { project, plan: ref, task: string, maxChars: { type: "integer", minimum: 1 } }),
+  command("task-detail", { project, plan: ref, task: string, kind: { enum: ["graph", "evidence", "evidence-index"] },
+    selector: object({ id: { type: "string" }, pointer: { type: "string" }, start: { anyOf: [expected, { type: "null" }] }, end: { anyOf: [expected, { type: "null" }] } }),
+    maxChars: { type: "integer", minimum: 1 } }),
   command("create-project", { project, title: string }),
   command("prepare-stage", { project, stage: { enum: UPSTREAM_STAGES } }),
   command("source-document", { project, id: project, text: { type: "string", maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] }, expected }),

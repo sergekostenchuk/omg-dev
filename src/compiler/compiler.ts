@@ -1,7 +1,7 @@
 import { Store, type Revision } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { Refinement, type Feasibility } from "../graph/refinement.js";
-import { Environments } from "../runtime/environment.js";
+import { Environments, type Environment } from "../runtime/environment.js";
 import { requireGraph } from "../graph/validate.js";
 import type { Graph } from "../graph/model.js";
 import { hashJson, type Json } from "../canonical.js";
@@ -13,6 +13,7 @@ import { deriveTasks } from "./derive.js";
 import { resolveArtifact } from "./inputs.js";
 import { requireBasis } from "./basis.js";
 import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
+import { taskContext, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 export type { MachinePlan } from "./model.js";
 
 export class Compiler {
@@ -77,5 +78,43 @@ export class Compiler {
   publish(project: string, planRef: Ref, expected: number) {
     const checked = this.gate(project, planRef); requireCondition(checked.findings.length === 0, "plan_stale", "Plan inputs are not current");
     return this.pipeline.draft(project, "compilation", { plan: planRef } as unknown as Json, expected);
+  }
+  #contextPlan(project: string, planRef: Ref, task: string): Revision<MachinePlan> {
+    const checked = this.gate(project, planRef);
+    requireCondition(checked.findings.length === 0, "plan_stale", "Task context needs current exact plan inputs");
+    const plan = this.store.get<MachinePlan>(planRef.id)!;
+    requireCondition(plan.value.tasks.some(item => item.id === task), "task_foreign", "Task does not belong to this machine plan");
+    return plan;
+  }
+  context(project: string, planRef: Ref, task: string, maxChars: number) {
+    const plan = this.#contextPlan(project, planRef, task);
+    const ref = plan.value.environment;
+    const environment = this.store.get<Environment>(ref.id, ref.revision);
+    requireCondition(environment?.kind === "environment" && environment.hash === ref.hash && environment.value.projectId === project,
+      "context_environment_foreign", "Full-run criteria must come from the exact plan environment");
+    return taskContext(plan, environment.value.fullCheck, task, maxChars);
+  }
+  detail(project: string, planRef: Ref, task: string, kind: "graph" | "evidence" | "evidence-index", selector: DetailSelector, maxChars: number) {
+    const plan = this.#contextPlan(project, planRef, task);
+    const evidence = plan.value.guards.flatMap(ref => {
+      const record = this.store.get(ref.id, ref.revision);
+      return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
+        && ["source", "stage", "discovery-draft", "research-assessment"].includes(record.kind)
+        ? [{ ref, kind: record.kind } satisfies EvidenceDetail] : [];
+    });
+    let value: unknown; let source = plan.value.graph;
+    if (kind === "evidence-index") { value = evidence; source = reference(plan); }
+    else if (kind === "evidence") {
+      const found = evidence.find(item => item.ref.id === selector.id);
+      requireCondition(found, "context_evidence_foreign", "Evidence must be an exact input of this plan");
+      source = found.ref; value = this.store.get(found.ref.id, found.ref.revision)!.value;
+    } else {
+      const graph = plan.value.graphSnapshot;
+      value = [graph.nodes, graph.artifacts, graph.contracts, graph.connectors, graph.tests, graph.joins, graph.anchors,
+        graph.actors ?? [], graph.requirements ?? [], graph.edges ?? [], graph.transfers ?? [], graph.packets ?? [], graph.journeys ?? []]
+        .flat().find(item => item.id === selector.id);
+      requireCondition(value, "context_detail_missing", "Graph entity is absent from this exact plan");
+    }
+    return boundedContext({ binding: { plan: reference(plan), task, source }, kind, selector, value: selectDetail(value, selector) }, maxChars);
   }
 }

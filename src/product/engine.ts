@@ -168,6 +168,8 @@ export class ProductEngine {
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);
       case "prepare-layer": this.#project(command.project); return this.refinement.prepareLayer(command.project, command.level);
       case "build-layer": this.#project(command.project); return this.refinement.buildLayer(command.project, command.level, command.draft, command.expected, this.actor);
+      case "task-context": this.#project(command.project); return this.compiler.context(command.project, command.plan, command.task, command.maxChars);
+      case "task-detail": this.#project(command.project); return this.compiler.detail(command.project, command.plan, command.task, command.kind, command.selector, command.maxChars);
       case "assess": this.#project(command.project); return this.refinement.assess(command.project, command.expected);
       case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
       case "compile": {
