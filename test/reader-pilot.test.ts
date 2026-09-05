@@ -25,6 +25,7 @@ import { answerLayerFixture } from "./layer-design-fixture.js";
 import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
 import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
+import { assessmentReadings } from "../src/discovery/assessment-readings.js";
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -44,7 +45,7 @@ function fixture(t: test.TestContext) {
   const readerPath = join(root, "reader.mjs");
   writeFileSync(join(root, "README.md"), "Planned runtime\nRestrict writes to the chosen scope.\nRoll back on failure.\n");
   writeFileSync(readerPath, `import {readFileSync,appendFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
-appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
+appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts),referencedReading:Boolean(c.readings?.[0]?.observations?.[0]?.valueFrom)})+'\\n');
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
 if(c.role!=='reader'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
@@ -207,6 +208,38 @@ test("active experiment refuses creation and execution of R2 and later phases", 
   assert.equal(store.list("model-call").length, 0);
   configureReaderPilot(store, engine.environments, "p", { ...settings, active: false }, pilot.revision);
   assert.throws(() => engine.refinement.begin("p", "R2"), { code: "phase_not_ready" }, "Disabling the pilot does not bypass normal prerequisites");
+});
+
+test("assessor aliases only identical covered text in the same request and preserves stored evidence", async t => {
+  const { root, engine, store, draft } = fixture(t);
+  const body = "Scope and rollback conditions 😀\r\n".repeat(20);
+  const source = engine.discovery.evidence.document("p", "assessor-text", "prefix" + body + "suffix", "text/plain", 0);
+  const evidence = engine.discovery.evidence;
+  const original = evidence.observe("p", reference(source), { kind: "text-range", start: 6, end: 6 + body.length });
+  const full = evidence.observe("p", reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
+  const readings = [{ observations: [original], unresolved: ["Unknown recovery behavior"], coverage: { partial: true } }];
+  const untouched = structuredClone(readings);
+  const packed = assessmentReadings(readings, [full]);
+  const selected = packed[0]!.observations[0]!;
+  assert.ok("valueFrom" in selected);
+  assert.equal(selected.valueFrom.pointer, "/observations/0/value");
+  assert.equal((full.value as string).slice(selected.valueFrom.start, selected.valueFrom.end), original.value);
+  assert.deepEqual(selected.source, original.source); assert.deepEqual(selected.selector, original.selector);
+  assert.deepEqual(packed[0]!.unresolved, readings[0]!.unresolved);
+  assert.deepEqual(packed[0]!.coverage, readings[0]!.coverage);
+  assert.deepEqual(readings, untouched);
+  for (const foreign of [{ ...full, source: { ...full.source, revision: 99 } }, { ...full, projectId: "other" },
+    { ...full, value: "different" }, { ...full, selector: { kind: "json-pointer" as const, pointer: "" } },
+    evidence.observe("p", reference(source), { kind: "text-range", start: 7, end: 6 + body.length })]) {
+    assert.deepEqual(assessmentReadings(readings, [foreign]), readings);
+  }
+  assert.deepEqual(assessmentReadings(readings, []), readings);
+  writeFileSync(join(root, "README.md"), "Header\n" + "Limit writes to scope. ".repeat(30) + "\n" + "Roll back on failure. ".repeat(30) + "\n");
+  await engine.researcher.run("p", draft.id, 2);
+  const calls = readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(calls.find(call => call.role === "assess-answer")?.referencedReading, true);
+  assert.ok(store.list<any>("reader-result")[0]!.value.observations[0].value.includes("Limit writes to scope"));
+  assert.ok(store.list<any>("research-assessment").some(a => a.value.observations.some((o: any) => typeof o.value === "string" && o.value.includes("Limit writes to scope"))));
 });
 
 test("R1 pilot routes reading to its configured reader, assesses originals, and resumes without repeating accepted answers", async t => {

@@ -16,6 +16,7 @@ import { layerDeltaView } from "./layer-delta.js";
 import { technicalProposalFindings } from "../graph/research-evidence.js";
 import type { TechnicalReport } from "../graph/research-contracts.js";
 import type { Graph } from "../graph/model.js";
+import { assessmentReadings, ASSESSMENT_READING_ENCODING } from "./assessment-readings.js";
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
@@ -33,7 +34,9 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     if (findings.length) throw new EngineError("research_proposal_invalid", "Correct the typed proposal findings before model assessment", findings);
   }
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
-  const context = pilot ? { ...pilotContext(store, draft, question), role: "assess-answer", question: question.value.spec,
+  const pilotPacket = pilot ? pilotContext(store, draft, question) : null;
+  const context = pilotPacket ? { ...pilotPacket, role: "assess-answer", question: question.value.spec,
+    readings: assessmentReadings(pilotPacket.readings, observations), readingEncoding: ASSESSMENT_READING_ENCODING,
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations, consumerFeedback: consumerFeedback(store, draft.value) }
