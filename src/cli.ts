@@ -23,7 +23,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const store = new Store(resolve(database));
   try {
-    console.log(JSON.stringify(command === "command" ? new ProductEngine(store).execute(JSON.parse(readFileSync(0, "utf8")))
+    console.log(JSON.stringify(command === "command" ? await new ProductEngine(store).execute(JSON.parse(readFileSync(0, "utf8")))
       : command === "backup" ? await store.snapshot(directory)
       : { databaseId: store.databaseId, entities: store.list() }));
   } finally { store.close(); }

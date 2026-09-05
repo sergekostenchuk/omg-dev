@@ -1,5 +1,5 @@
 import { Store, type Revision } from "../storage/store.js";
-import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question, type Fact } from "../discovery/discovery.js";
+import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
 import { GraphRepository } from "./repository.js";
 import { Environments, inspectRepository, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
@@ -55,12 +55,13 @@ export class Refinement {
     if (level !== "R0") {
       const effective = this.environments.effective(project);
       for (const id of draft.value.questions) {
-        const question = this.store.get<Question>(id)!;
-        const fact = this.store.get<Fact>(question.value.answer!.id)!;
-        const source = this.store.get<Source>(fact.value.observation.source.id)!;
-        requireCondition(source.value.origin.kind === "file", "repository_evidence_required", "R1/R2 require an actual file from the selected repository");
-        const path = workspacePath(effective.root, relative(effective.root, source.value.origin.location));
-        requireCondition(digest(readFileSync(path)) === source.value.sha256, "source_stale", "Repository source changed after research capture");
+        const sources = this.discovery.observations(id).map(observation => this.store.get<Source>(observation.source.id)!);
+        const files = sources.filter(source => source.value.origin.kind === "file");
+        requireCondition(files.length > 0, "repository_evidence_required", "R1/R2 require an actual file from the selected repository");
+        for (const source of files) {
+          const path = workspacePath(effective.root, relative(effective.root, source.value.origin.location));
+          requireCondition(digest(readFileSync(path)) === source.value.sha256, "source_stale", "Repository source changed after research capture");
+        }
       }
       inputs.push(reference(this.store.get(`workspace:${project}`)!));
     }

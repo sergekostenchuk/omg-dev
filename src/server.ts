@@ -42,7 +42,7 @@ export function createProductServer(engine: ProductEngine) {
       requireCondition(typeof supplied === "string" && /^[a-f0-9]{64}$/.test(supplied) && timingSafeEqual(Buffer.from(supplied), Buffer.from(token)), "session_forbidden", "Open the connection link printed by the local engine");
       if (url.pathname === "/api/projects" && request.method === "GET") { respond(response, 200, engine.store.list<Project>("project")); return; }
       if (url.pathname === "/api/project" && request.method === "GET") { respond(response, 200, engine.projection(url.searchParams.get("id") ?? "")); return; }
-      if (url.pathname === "/api/command" && request.method === "POST") { respond(response, 200, engine.execute(await body(request))); return; }
+      if (url.pathname === "/api/command" && request.method === "POST") { respond(response, 200, await engine.execute(await body(request))); return; }
       if (url.pathname === "/api/chat" && request.method === "POST") {
         const input = await body(request) as { project: string; message: string };
         requireCondition(input && typeof input.project === "string" && typeof input.message === "string"

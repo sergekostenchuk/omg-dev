@@ -16,6 +16,9 @@ import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 
+import { Researcher } from "../discovery/research-runner.js";
+import type { ResearchRun } from "../discovery/research-model.js";
+
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
 export class ProductEngine {
@@ -25,6 +28,7 @@ export class ProductEngine {
   readonly environments: Environments;
   readonly refinement: Refinement;
   readonly compiler: Compiler;
+  readonly researcher: Researcher;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
@@ -32,6 +36,7 @@ export class ProductEngine {
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
     this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
+    this.researcher = new Researcher(store, this.discovery, this.environments);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
@@ -121,6 +126,7 @@ export class ProductEngine {
       feasibility, feasibilityGate: feasibility ? this.refinement.feasibilityGate(project, reference(feasibility)) : null,
       plans: this.store.list<MachinePlan>("plan").filter(item => item.value.projectId === project), currentPlan,
       planGate: currentPlan ? this.compiler.gate(project, currentPlan.value) : null,
+      researchRuns: this.store.list<ResearchRun>("research-run").filter(item => item.value.projectId === project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
     };
   }
@@ -132,6 +138,7 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
       case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);

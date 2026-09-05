@@ -7,6 +7,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.j
 import type { Environment } from "../runtime/environment.js";
 
 export type ProductCommand =
+  | { type: "research-draft"; project: string; draftId: string; maxTurns: number }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
   | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
@@ -42,6 +43,7 @@ const processCommand = object({ executable: string, args: { type: "array", items
 const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const schema = { oneOf: [
+  command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("configure", { project, expected, environment: object({ workspace: string, implementer: role, reviewer: role,
     fullCheck: processCommand, timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } }) }),
   command("begin-research", { project, level: researchLevel }),

@@ -7,6 +7,7 @@ import { requireCondition } from "../errors.js";
 import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
 import { REQUIREMENTS, type UpstreamStage } from "./requirements.js";
+import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision"; prompt: string; risk: string; schema: Json }
@@ -61,7 +62,7 @@ export class Discovery {
     requireCondition(question.value.status !== "answered", "question_already_answered", "Reopen the question before changing an answer");
     return question;
   }
-  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact, kind: "decision" | "fact", guards: Ref[]): Revision<DiscoveryDraft> {
+  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "fact" | "research-answer", guards: Ref[]): Revision<DiscoveryDraft> {
     const q = question.value; const draft = this.store.get<DiscoveryDraft>(q.draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.projectId === q.projectId
       && draft.value.questions.includes(question.id), "question_unbound", "Question must belong to this draft");
@@ -75,7 +76,7 @@ export class Discovery {
       { id: draft.id, kind: draft.kind, expected: draft.revision, value: { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } } },
       { id, kind, expected: 0, value: answer },
       { id: question.id, kind: question.kind, expected: question.revision, value: { ...q, status: "answered", answer: answerRef } },
-    ], [...guards, reference(question), reference(draft)])[0]!;
+    ], [...guards, ...draft.value.inputs, reference(question), reference(draft)])[0]!;
   }
   decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
@@ -88,6 +89,35 @@ export class Discovery {
     requireCondition(question.value.spec.kind === "fact", "decision_required", "A preference requires an owner decision");
     const observation = this.evidence.observe(question.value.projectId, source, selector);
     return this.#answer(question, observation.value, { projectId: question.value.projectId, question: id, observation }, "fact", [source]);
+  }
+  researched(id: string, expected: number, assessmentRef: Ref): Revision<DiscoveryDraft> {
+    const question = this.#question(id, expected);
+    const assessment = this.store.get<ResearchAssessment>(assessmentRef.id);
+    requireCondition(assessment?.kind === "research-assessment" && assessment.hash === assessmentRef.hash && assessment.revision === assessmentRef.revision
+      && assessment.value.verdict === "supported" && assessment.value.projectId === question.value.projectId
+      && canonical(assessment.value.question) === canonical(reference(question))
+      && assessment.value.researcher !== assessment.value.assessor && assessment.value.observations.length > 0
+      && assessment.value.observations.every(item => this.evidence.verify(item)), "research_not_supported", "An exact supported assessment with current evidence is required");
+    const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
+    return this.#answer(question, answer.value, answer, "research-answer", [assessmentRef, assessment.value.environment,
+      ...assessment.value.observations.map(item => item.source)]);
+  }
+  observations(questionId: string): Observation[] {
+    const question = this.store.get<Question>(questionId);
+    requireCondition(question?.kind === "question" && question.value.status === "answered" && question.value.answer,
+      "question_unresolved", "The question has no accepted evidence");
+    const answer = this.store.get<Fact | ResearchAnswer | Decision>(question.value.answer.id);
+    requireCondition(answer?.hash === question.value.answer.hash && answer.revision === question.value.answer.revision,
+      "answer_foreign", "The question's exact answer is unavailable");
+    if (answer.kind === "fact") return [(answer.value as Fact).observation];
+    if (answer.kind === "research-answer") {
+      const ref = (answer.value as ResearchAnswer).assessment;
+      const assessment = this.store.get<ResearchAssessment>(ref.id);
+      requireCondition(assessment?.kind === "research-assessment" && assessment.hash === ref.hash && assessment.revision === ref.revision
+        && assessment.value.verdict === "supported", "research_not_supported", "Research evidence has no supported assessment");
+      return assessment.value.observations;
+    }
+    return [];
   }
   unresolved(id: string, expected: number): void {
     const question = this.#question(id, expected);
@@ -121,12 +151,25 @@ export class Discovery {
       if (!question || question.kind !== "question" || question.value.projectId !== projectId || question.value.draftId !== draft.id
         || question.value.status !== "answered" || !question.value.answer) { fail("question_unresolved", id, "Question has no accepted answer"); continue; }
       guards.push(reference(question));
-      const ref = question.value.answer; const answer = this.store.get<Decision | Fact>(ref.id);
+      const ref = question.value.answer; const answer = this.store.get<Decision | Fact | ResearchAnswer>(ref.id);
       if (!answer || answer.hash !== ref.hash || answer.revision !== ref.revision || answer.value.projectId !== projectId || answer.value.question !== id
-        || answer.kind !== question.value.spec.kind) { fail("answer_foreign", id, "Answer binding is invalid"); continue; }
+        || (answer.kind !== question.value.spec.kind && answer.kind !== "research-answer")) { fail("answer_foreign", id, "Answer binding is invalid"); continue; }
       guards.push(reference(answer));
       let value: Json;
-      if (answer.kind === "fact") {
+      if (answer.kind === "research-answer") {
+        const research = answer.value as ResearchAnswer;
+        const assessment = this.store.get<ResearchAssessment>(research.assessment.id);
+        const issued = assessment ? this.store.get<Question>(assessment.value.question.id, assessment.value.question.revision) : null;
+        if (assessment?.kind !== "research-assessment" || assessment.hash !== research.assessment.hash
+          || assessment.revision !== research.assessment.revision || assessment.value.verdict !== "supported"
+          || issued?.hash !== assessment.value.question.hash || issued.id !== id
+          || canonical(issued.value.spec) !== canonical(question.value.spec) || assessment.value.researcher === assessment.value.assessor
+          || assessment.value.observations.length === 0 || !assessment.value.observations.every(item => this.evidence.verify(item))
+          || canonical(assessment.value.value) !== canonical(research.value)) {
+          fail("research_evidence_stale", id, "Research assessment or its supporting sources are stale or foreign"); continue;
+        }
+        guards.push(reference(assessment), ...assessment.value.observations.map(item => item.source)); value = research.value;
+      } else if (answer.kind === "fact") {
         const observation = (answer.value as Fact).observation;
         if (!this.evidence.verify(observation)) { fail("evidence_stale", id, "Source evidence is missing or changed"); continue; }
         guards.push(observation.source); value = observation.value;
