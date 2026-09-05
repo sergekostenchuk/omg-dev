@@ -29,3 +29,33 @@ export const graphSchema = object({
   joins: array(object({ id, consumer: id, connectors: { ...ids, minItems: 1 } })),
   tests: array(testSchema),
 });
+
+export const graphV2Schema = structuredClone(graphSchema) as { type: string; additionalProperties: boolean; required: string[]; properties: Record<string, any> };
+graphV2Schema.properties['version'] = { const: 2 };
+const properties = graphV2Schema.properties;
+const texts = { type: "array", items: text, minItems: 1 };
+const addRequired = (schema: { properties: Record<string, unknown>; required: string[] }, fields: Record<string, unknown>) => {
+  Object.assign(schema.properties, fields); schema.required.push(...Object.keys(fields));
+};
+addRequired(properties['nodes'].items, { purpose: text, benefit: text, beneficiary: id, implements: ids });
+properties['nodes'].items.properties.code.items.properties.symbol = text;
+const codeRefSchema = properties['nodes'].items.properties.code.items;
+properties['connectors'].items.properties.bindings.items.properties.producer.properties.codeRef = structuredClone(codeRefSchema);
+properties['connectors'].items.properties.bindings.items.properties.consumers.items.properties.codeRef = structuredClone(codeRefSchema);
+addRequired(properties['artifacts'].items, { kind: id, purpose: text,
+  durability: { enum: ["durable_source", "durable_draft", "versioned", "immutable", "reconstructible", "evidence", "recoverable", "capability"] },
+  sensitivity: { enum: ["public", "project_internal", "restricted"] } });
+addRequired(properties['joins'].items, { failures: object({ missing: text, extra: text, foreign: text, stale: text, duplicate: text, returnsTo: id }) });
+addRequired(properties['tests'].items, { contract: object({ given: texts, when: text, then: texts, forbiddenEffects: texts,
+  entrypoint: object({ kind: { enum: ["cli", "api", "route", "product_caller"] }, path: text, symbol: { anyOf: [text, { type: "null" }] }, status: { enum: ["existing", "planned"] } }),
+  counterfactuals: array(object({ connector: id, mutation: { enum: ["remove", "revoke", "substitute"] }, expectedFailure: text, command: commandSchema })),
+  resourceClass: { enum: ["pure", "own_dirs", "exclusive"] }, resources: ids,
+}) });
+addRequired(graphV2Schema, {
+  actors: array(object({ id, role: text, channels: texts })),
+  requirements: array(object({ id, section: id, outcome: id, beneficiary: id, statement: text })),
+  edges: array(object({ id, relation: { enum: ["requires", "realizes", "on_success", "on_failure", "returns_to"] }, source: id, target: id, condition: text })),
+  journeys: array(object({ id, actor: id, variant: text, entry: id, path: { ...ids, minItems: 1, uniqueItems: false }, outcome: id, terminal: { enum: ["success", "safe_failure", "recovery"] } })),
+  transfers: array(object({ id, path: text, from: id, to: id, condition: { const: "producer_committed" } })),
+  packets: array(object({ id, unit: id, purpose: text, writePaths: { ...array(text), minItems: 1, uniqueItems: true } })),
+});

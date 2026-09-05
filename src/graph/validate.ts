@@ -2,21 +2,27 @@ import { Ajv } from "ajv";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import type { Finding } from "../pipeline/contracts.js";
-import { graphSchema } from "./schema.js";
+import { graphSchema, graphV2Schema } from "./schema.js";
+import { semanticFindings } from "./semantics.js";
+import { dependencyEdges } from "./dependencies.js";
+import { RefinementRelations } from "./relations.js";
 import { LEVEL, type Graph, type Endpoint } from "./model.js";
 import { safeRelativePath, topologicalOrder } from "./topology.js";
 import { requiredTests } from "./obligations.js";
 
 const ajv = new Ajv({ allErrors: true, strict: true, allowUnionTypes: true });
 const shape = ajv.compile<Graph>(graphSchema);
+const enrichedShape = ajv.compile<Graph>(graphV2Schema);
 export interface Validation { graph: Graph | null; hash: string | null; findings: Finding[] }
 
 export function validateGraph(input: unknown): Validation {
-  if (!shape(input)) return { graph: null, hash: null, findings: (shape.errors ?? []).map(error => ({
+  const validateShape = (input as { version?: unknown } | null)?.version === 2 ? enrichedShape : shape;
+  if (!validateShape(input)) return { graph: null, hash: null, findings: (validateShape.errors ?? []).map(error => ({
     code: "graph_shape", target: error.instancePath, message: `${error.keyword}: ${error.message ?? "invalid"}`,
   })).sort((a, b) => canonical(a).localeCompare(canonical(b))) };
   const graph = structuredClone(input);
   const findings: Finding[] = [];
+  findings.push(...semanticFindings(graph));
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, message });
   const allIds = new Set<string>();
   for (const list of [graph.nodes, graph.artifacts, graph.connectors, graph.anchors, graph.tests, graph.joins, graph.contracts]) {
@@ -39,6 +45,7 @@ export function validateGraph(input: unknown): Validation {
     }
     return false;
   };
+  const relations = new RefinementRelations(graph);
   for (const contract of graph.contracts) {
     try { new Ajv({ strict: true }).compile(contract.schema as object); }
     catch { fail("contract_invalid", contract.id, "Contract must be a valid self-contained JSON Schema"); }
@@ -93,14 +100,15 @@ export function validateGraph(input: unknown): Validation {
         }
       }
       if (binding.level > 1 && !connector.bindings.some(upper => upper.level === binding.level - 1
-        && descendant(binding.producer.node, upper.producer.node)
-        && binding.consumers.every(consumer => upper.consumers.some(parent => descendant(consumer.node, parent.node))))) {
+        && relations.refines(binding.producer.node, upper.producer.node)
+        && binding.consumers.every(consumer => upper.consumers.some(parent => relations.refines(consumer.node, parent.node))))) {
         fail("refinement_gap", connector.id, "Lower-level endpoints must refine the same upper connector");
       }
     }
   }
   for (const artifact of graph.artifacts) if (!artifact.external && !artifact.terminal
     && !graph.connectors.some(connector => connector.artifact === artifact.id)) fail("orphan_artifact", artifact.id, "Intermediate artifact needs a producer and consumer connector");
+  if (graph.version === 2) for (const level of [1, 2, 3] as const) byLevel.set(level, dependencyEdges(graph, level));
   for (const [level, edges] of byLevel) {
     try { topologicalOrder(graph.nodes.filter(node => LEVEL[node.kind] === level).map(node => node.id), edges); }
     catch (error) { fail("dependency_cycle", String(level), error instanceof Error ? error.message : "Cycle"); }

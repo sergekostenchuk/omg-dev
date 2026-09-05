@@ -11,6 +11,8 @@ import type { DiscoveryDraft } from "../src/discovery/discovery.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
+import { enrichedGraph } from "./enriched-graph-fixture.js";
+import { designOf } from "../src/graph/builder.js";
 
 test("the real product command path carries two independent products from brief to traceable features and cold reopen", t => {
   const root = mkdtempSync(join(tmpdir(), "omg-product-")); const path = join(root, "state.sqlite"); const store = new Store(path);
@@ -19,7 +21,7 @@ test("the real product command path carries two independent products from brief 
   for (const project of ["garden", "invoice"]) {
     engine.execute({ type: "create-project", project, title: project });
     const source = engine.execute({ type: "source-document", project, id: "brief", text: `A brief for ${project}`, media: "text/plain", expected: 0 }) as Revision;
-    const graph = exampleGraph(project); graph.horizon = [];
+    const graph = enrichedGraph(exampleGraph(project), project); graph.horizon = [];
     engine.execute({ type: "save-graph", project, graph, expected: 0 });
     for (const stage of UPSTREAM_STAGES) {
       const draft = engine.execute({ type: "prepare-stage", project, stage }) as Revision<DiscoveryDraft>;
@@ -29,7 +31,7 @@ test("the real product command path carries two independent products from brief 
           source: reference(source), selector: { kind: "text-range", start: 0, end: `A brief for ${project}`.length } });
         else {
           const field = question.value.spec.field;
-          const value = preparedField(project, field);
+          const value = field === "mapDesign" ? designOf(graph) : preparedField(project, field);
           engine.execute({ type: "answer-decision", question: id, expected: 1, value });
         }
       }

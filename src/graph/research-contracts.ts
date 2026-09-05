@@ -2,6 +2,7 @@ import type { FieldSpec } from "../discovery/discovery.js";
 import type { Json } from "../canonical.js";
 import { digest, canonical } from "../canonical.js";
 import type { Graph } from "./model.js";
+import { RefinementRelations } from "./relations.js";
 
 export const REFINEMENT_CONTRACT_VERSION = 2;
 const text: Json = { type: "string", minLength: 1 };
@@ -17,14 +18,8 @@ export interface TechnicalReport {
 export function deferredGap(graph: Graph, gap: TechnicalGap): boolean {
   if (gap.requiredFor !== "next") return false;
   const nodes = new Map(graph.nodes.map(node => [node.id, node]));
-  const inside = (child: string, ancestor: string): boolean => {
-    let node = nodes.get(child); const seen = new Set<string>();
-    while (node && !seen.has(node.id)) {
-      if (node.id === ancestor) return true;
-      seen.add(node.id); node = node.parent ? nodes.get(node.parent) : undefined;
-    }
-    return false;
-  };
+  const relations = new RefinementRelations(graph);
+  const inside = (child: string, ancestor: string) => relations.refines(child, ancestor);
   if (!nodes.has(gap.target) || !nodes.has(gap.consumer)
     || graph.horizon.some(node => inside(node, gap.target) || inside(node, gap.consumer))) return false;
   return graph.connectors.some(connector => connector.wakeTest && graph.tests.some(test => test.id === connector.wakeTest)

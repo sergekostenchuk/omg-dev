@@ -1,22 +1,43 @@
-import { digest } from "../canonical.js";
+import type { Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
-import type { Graph, Node, Boundary } from "./model.js";
+import { requireGraph } from "./validate.js";
+import { graphV2Schema } from "./schema.js";
+import { projectGraph } from "./project.js";
+import type { Graph } from "./model.js";
 
-export function buildL1(projectId: string, title: string, journey: string[]): Graph {
-  requireCondition(journey.length > 0 && journey.length <= 100 && journey.every(item => typeof item === "string" && item.trim()), "journey_invalid", "A bounded journey with nonempty steps is required");
-  const boundary: Boundary = { authority: "owner", writer: "engine", rollback: "forward-revision", state: "transient", provider: false };
-  const contract = "change-manifest"; const outcome = `${projectId}:result`;
-  const product: Node = { id: `${projectId}:product`, kind: "product", parent: null, title, outcome, boundary, ports: [], code: [], tests: [] };
-  const blocks: Node[] = journey.map((step, index) => {
-    const id = `block:${digest(`${projectId}\0${index}\0${step}`).slice(0,20)}`;
-    return { id, kind: "block", parent: product.id, title: step, outcome: index === journey.length - 1 ? outcome : `${id}:result`, boundary,
-      ports: [{ id: "in", direction: "in", contract }, { id: "out", direction: "out", contract }], code: [], tests: [] };
-  });
-  return { version: 1, id: `${projectId}:map`, title, horizon: [], nodes: [product, ...blocks],
-    contracts: [{ id: contract, schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "object", required: ["path", "hash"], properties: { path: { type: "string" }, hash: { type: "string" } }, additionalProperties: false } } }, additionalProperties: false } }],
-    artifacts: blocks.map((block, index) => ({ id: block.outcome, contract, external: false, terminal: index === blocks.length - 1 })),
-    connectors: blocks.slice(0,-1).map((block, index) => ({ id: `flow:${block.id}`, artifact: block.outcome, returnsTo: block.id, wakeTest: null,
-      bindings: [{ level: 1, producer: { node: block.id, port: "out" }, consumers: [{ node: blocks[index + 1]!.id, port: "in" }], anchor: null }] })),
-    anchors: [], joins: [], tests: [],
-  };
+export const mapDesignSchema = structuredClone(graphV2Schema);
+for (const field of ["version", "id", "title", "actors", "requirements"]) {
+  delete mapDesignSchema.properties[field]; mapDesignSchema.required = mapDesignSchema.required.filter(item => item !== field);
+}
+mapDesignSchema.properties['horizon'] = { type: "array", maxItems: 0 };
+
+export function designOf(graph: Graph): Record<string, unknown> {
+  const projection = projectGraph(graph, 1);
+  const { id: _id, title: _title, level: _level, version: _version, actors: _actors, requirements: _requirements, ...design } = projection;
+  return design;
+}
+export function buildL1(graphId: string, title: string, design: unknown,
+  initial: Record<string, Json>, concept: Record<string, Json>): Graph {
+  requireCondition(design && typeof design === "object" && !Array.isArray(design), "map_design_missing", "A researched map design is required");
+  requireCondition(!["version", "id", "title", "actors", "requirements"].some(key => Object.hasOwn(design, key)), "derived_field_conflict", "Map identity, actors and concept requirements are supplied by the engine");
+  const preparation = initial['preparation'] as unknown as { actors: { id: string; role: string; channels: string[] }[];
+    outcomes: { id: string }[]; journeys: Record<string, { applicability: string; scenarios: { actor: string; outcome: string }[] }> };
+  const sections = concept['conceptSections'] as unknown as { id: string; requirements: { id: string; outcome: string; beneficiary: string; statement: string }[] }[];
+  requireCondition(preparation && sections, "map_inputs_missing", "The initial research and concept must provide their enriched data");
+  const actors = preparation.actors.map(({ id, role, channels }) => ({ id, role, channels }));
+  const requirements = sections.flatMap(section => section.requirements.map(({ id, outcome, beneficiary, statement }) => ({ id, section: section.id, outcome, beneficiary, statement })));
+  const graph = requireGraph({ ...design, version: 2, id: graphId, title, actors, requirements });
+  requireCondition(graph.horizon.length === 0 && graph.nodes.every(node => ["product", "block"].includes(node.kind)
+    && node.code.length === 0 && node.tests.length === 0) && graph.tests.length === 0 && graph.packets!.length === 0 && graph.transfers!.length === 0,
+    "l1_detail_leak", "Initial topology must describe blocks and product flows without future code or task details");
+  requireCondition(graph.connectors.every(connector => connector.bindings.every(binding => binding.level === 1)), "l1_detail_leak", "Initial map bindings must be L1");
+  for (const outcome of preparation.outcomes) requireCondition(graph.journeys!.some(journey => journey.outcome === outcome.id && journey.terminal === "success"),
+    "outcome_uncovered", `The product outcome ${outcome.id} has no successful path`);
+  for (const [variant, entry] of Object.entries(preparation.journeys)) if (entry.applicability === "applicable") {
+    const positive = ["success", "first_use", "repeated_use"].includes(variant);
+    for (const scenario of entry.scenarios) requireCondition(graph.journeys!.some(journey => journey.variant === variant && journey.actor === scenario.actor
+      && (positive ? journey.terminal === "success" && journey.outcome === scenario.outcome
+        : journey.terminal !== "success" || journey.outcome === scenario.outcome)), "journey_uncovered", `Missing ${variant} journey for ${scenario.actor}`);
+  }
+  return graph;
 }

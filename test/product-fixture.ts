@@ -6,11 +6,14 @@ import type { Graph } from "../src/graph/model.js";
 import { preparedField } from "./preparation-fixture.js";
 import type { Json } from "../src/canonical.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
+import { enrichedGraph } from "./enriched-graph-fixture.js";
+import { designOf } from "../src/graph/builder.js";
 
 export function preparedFeatures(engine: ProductEngine, project: string, graph: Graph = exampleGraph(project),
   valueFor: (field: string) => Json = field => preparedField(project, field)) {
   engine.execute({ type: "create-project", project, title: project });
   const source = engine.discovery.evidence.document(project, "brief", `A brief for ${project}`, "text/plain", 0);
+  graph = enrichedGraph(graph, project, valueFor("preparation"), valueFor("conceptSections"));
   engine.graphs.save(project, graph, 0, "owner");
   for (const stage of UPSTREAM_STAGES) {
     const draft = engine.prepare(project, stage);
@@ -19,7 +22,7 @@ export function preparedFeatures(engine: ProductEngine, project: string, graph: 
       if (question.value.spec.kind === "fact") engine.discovery.fact(id, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
       else {
         const field = question.value.spec.field;
-        const value = valueFor(field);
+        const value = field === "mapDesign" ? designOf(graph) as unknown as Json : valueFor(field);
         engine.discovery.decision(id, 1, "owner", value);
       }
     }

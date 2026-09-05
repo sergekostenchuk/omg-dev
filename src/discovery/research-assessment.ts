@@ -12,7 +12,7 @@ import { researchPrerequisites, researchGraphContext } from "./research-context.
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal): Promise<Revision<ResearchAssessment>> {
-  requireCondition(new Ajv({ strict: true }).compile(question.value.spec.schema as object)(action.value),
+  requireCondition(new Ajv({ strict: true, allowUnionTypes: true }).compile(question.value.spec.schema as object)(action.value),
     "answer_invalid", "Proposed research result does not satisfy its consumer contract");
   const evidence = new Evidence(store);
   const observations = action.citations.map(item => evidence.observe(question.value.projectId, item.source, item.selector));

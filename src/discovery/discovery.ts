@@ -28,7 +28,7 @@ export interface Question {
 export interface Decision { projectId: string; actor: string; question: string; value: Json }
 export interface Fact { projectId: string; question: string; observation: Observation }
 
-const ajv = new Ajv({ strict: true });
+const ajv = new Ajv({ strict: true, allowUnionTypes: true });
 export class Discovery {
   readonly evidence: Evidence;
   constructor(private readonly store: Store) { this.evidence = new Evidence(store); }

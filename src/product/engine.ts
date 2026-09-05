@@ -3,7 +3,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -12,13 +12,12 @@ import type { Graph } from "../graph/model.js";
 import { Environments, workspacePath, type Environment } from "../runtime/environment.js";
 import { Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
+import { projectGraph } from "../graph/project.js";
 import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
-
 import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
-
 import { preparationFindings } from "../discovery/preparation-validation.js";
 
 export interface Project { id: string; title: string }
@@ -60,10 +59,11 @@ export class ProductEngine {
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
     const result = this.discovery.gate(context.projectId, content.draft);
-    const legacy = draft.value.contractVersion === undefined;
-    if ((legacy && !context.accepted) || (!legacy && draft.value.contractVersion !== RESEARCH_CONTRACT_VERSION))
+    const version = draft.value.contractVersion ?? 1;
+    const legacy = version === 1;
+    if ((version !== RESEARCH_CONTRACT_VERSION && !context.accepted) || ![1, 2, RESEARCH_CONTRACT_VERSION].includes(version))
       result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const expected = (legacy ? LEGACY_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
+    const expected = (legacy ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
     if (!legacy && result.findings.length === 0) {
@@ -78,6 +78,15 @@ export class ProductEngine {
     if (stage === "operation-map") {
       if (!isRef(content.graph)) result.findings.push({ code: "graph_missing", target: stage, message: "An operation map is required" });
       else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
+      if (version === RESEARCH_CONTRACT_VERSION && result.findings.length === 0) {
+        const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
+        const initial = this.store.get<StageArtifact>(stageId(context.projectId, "discovery"))!.value.content as unknown as StageContent;
+        const concept = this.store.get<StageArtifact>(stageId(context.projectId, "concept"))!.value.content as unknown as StageContent;
+        try {
+          const proposed = buildL1(graph.value.id, graph.value.title, content.fields['mapDesign'], initial.fields, concept.fields);
+          if (canonical(projectGraph(graph.value, 1)) !== canonical(projectGraph(proposed, 1))) result.findings.push({ code: "map_design_drift", target: graph.id, message: "Stored L1 must match the researched design and accepted concept" });
+        } catch (error) { result.findings.push({ code: "map_design_invalid", target: stage, message: error instanceof Error ? error.message : "Invalid researched map" }); }
+      }
     } else if (content.graph !== null) result.findings.push({ code: "graph_binding_unexpected", target: stage, message: "This stage inherits its map through the accepted prerequisite" });
     if (stage === "features") {
       const specification = prior?.value.content as unknown as StageContent;
@@ -185,8 +194,17 @@ export class ProductEngine {
           && draft.value.projectId === command.project, "discovery_foreign", "Map construction needs this project's map-stage research");
         requireCondition(this.discovery.gate(command.project, reference(draft)).findings.length === 0,
           "research_unresolved", "Resolve the map-stage questions first");
-        const journey = draft.value.fields['journey']; requireCondition(Array.isArray(journey) && journey.every(value => typeof value === "string"), "journey_invalid", "Journey must contain text steps");
-        return this.graphs.saveDerived(command.project, buildL1(command.project, project.value.title, journey), command.expected, this.actor, reference(draft));
+        const prerequisite = this.pipeline.inspect(command.project, "concept");
+        requireCondition(prerequisite.state === "accepted" && prerequisite.artifact
+          && draft.value.contractVersion === RESEARCH_CONTRACT_VERSION
+          && draft.value.inputs.some(ref => canonical(ref) === canonical(reference(prerequisite.artifact!)))
+          && canonical(draft.value.questions.map(id => this.store.get<Question>(id)!.value.spec)) === canonical(REQUIREMENTS['operation-map']),
+        "research_context_stale", "Map construction must use the current accepted concept and complete research contract");
+        const initial = this.store.get<StageArtifact>(stageId(command.project, "discovery"))!.value.content as unknown as StageContent;
+        const concept = this.store.get<StageArtifact>(stageId(command.project, "concept"))!.value.content as unknown as StageContent;
+        const existing = this.store.get<Graph>(`graph:${command.project}`);
+        const graph = buildL1(existing?.value.id ?? `${command.project}:map`, project.value.title, draft.value.fields['mapDesign'], initial.fields, concept.fields);
+        return this.graphs.saveDerived(command.project, graph, command.expected, this.actor, reference(draft));
       }
       case "refine-graph": this.#project(command.project); return this.graphs.refine(command.project, command.expected, command.draft, this.actor);
       case "draft-stage": return this.draft(command.project, command.stage, command.draftId, command.expected);

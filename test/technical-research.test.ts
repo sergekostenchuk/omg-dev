@@ -15,6 +15,7 @@ import type { Json } from "../src/canonical.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { reuseResearch } from "../src/discovery/research-reuse.js";
 import { researchGraphContext } from "../src/discovery/research-context.js";
+import type { Graph } from "../src/graph/model.js";
 
 function fixture(t: test.TestContext, graph = exampleGraph("p")) {
   const root = mkdtempSync(join(tmpdir(), "omg-technical-")), workspace = join(root, "repo"); mkdirSync(workspace);
@@ -136,7 +137,7 @@ test("activating a previously sleeping horizon gap invalidates R2 before L3 can 
   answerTechnicalFixture(engine, "p", r2);
   const phase = engine.refinement.finishResearch("p", "R2", reference(store.get(r2.id)!), 0);
   assert.deepEqual(engine.refinement.gate("p", "R2").findings, []);
-  const active = structuredClone(graph); active.horizon = ["p-produce-work", "p-consume-work"];
+  const active = structuredClone(store.get<Graph>("graph:p")!.value); active.horizon = ["p-produce-work", "p-consume-work"];
   engine.graphs.save("p", active, store.get("graph:p")!.revision, "owner");
   assert.ok(engine.refinement.gate("p", "R2").findings.some(item => item.code === "research_horizon_changed"));
   assert.throws(() => engine.refinement.sealLayer("p", 3, 0), /preceding refinement phase/);
@@ -161,7 +162,7 @@ test("a deferred gap first found by R2 is re-researched when its consumer enters
   answerTechnicalFixture(engine, "p", r2, (field, report) => field === "connectivityAndProof" ? { ...report, gaps: [gap] } : report);
   const phase = engine.refinement.finishResearch("p", "R2", reference(store.get(r2.id)!), 0);
   assert.deepEqual(engine.refinement.gate("p", "R2").findings, []);
-  const active = structuredClone(graph); active.horizon = ["p-produce-work", "p-consume-work"];
+  const active = structuredClone(store.get<Graph>("graph:p")!.value); active.horizon = ["p-produce-work", "p-consume-work"];
   engine.graphs.save("p", active, store.get("graph:p")!.revision, "owner");
   assert.ok(engine.refinement.gate("p", "R2").findings.some(item => item.target === "r2-future"));
   assert.throws(() => engine.refinement.sealLayer("p", 3, 0), /preceding refinement phase/);
