@@ -5,6 +5,7 @@ import { exampleGraph } from "./graph-fixture.js";
 import type { Graph } from "../src/graph/model.js";
 import { preparedField } from "./preparation-fixture.js";
 import type { Json } from "../src/canonical.js";
+import { answerTechnicalFixture } from "./technical-research-fixture.js";
 
 export function preparedFeatures(engine: ProductEngine, project: string, graph: Graph = exampleGraph(project),
   valueFor: (field: string) => Json = field => preparedField(project, field)) {
@@ -27,11 +28,9 @@ export function preparedFeatures(engine: ProductEngine, project: string, graph: 
 }
 
 export function refinedLayers(engine: ProductEngine, project: string) {
-  const source = engine.discovery.evidence.file(project, "context", engine.environments.get(project).value.workspace, "README.md", "text/plain", 0);
   for (const [level, layer] of [["R0", 1], ["R1", 2], ["R2", 3]] as const) {
     const draft = engine.refinement.begin(project, level);
-    if (level === "R0") engine.discovery.decision(draft.value.questions[0]!, 1, "owner", "Owner receives the produced result; implementation and review are separate roles");
-    else engine.discovery.fact(draft.value.questions[0]!, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
+    if (level !== "R0") answerTechnicalFixture(engine, project, draft);
     const current = engine.store.get(draft.id)!;
     engine.refinement.finishResearch(project, level, reference(current), 0);
     engine.refinement.sealLayer(project, layer, 0);

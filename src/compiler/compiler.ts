@@ -12,6 +12,7 @@ import type { MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
 import { resolveArtifact } from "./inputs.js";
 import { requireBasis } from "./basis.js";
+import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 export type { MachinePlan } from "./model.js";
 
 export class Compiler {
@@ -56,12 +57,15 @@ export class Compiler {
     requireCondition(hashJson(derived.tasks) === hashJson(plan.value.tasks), "plan_derivation_mismatch", "Tasks must be derived from the bound map without manual edits");
     return plan;
   }
-  gate(project: string, ref: Ref): GateResult {
+  gate(project: string, ref: Ref, allowHistorical = false): GateResult {
     requireCondition(isRef(ref), "plan_ref_invalid", "A versioned plan reference is required");
     const plan = this.read(ref.id); const result: GateResult = { findings: [], guards: [reference(plan)] };
     if (plan.value.projectId !== project || plan.hash !== ref.hash || plan.revision !== ref.revision) {
       result.findings.push({ code: "plan_foreign", target: ref.id, message: "Plan binding is foreign or changed" }); return result;
     }
+    const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
+    if (basis.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && basis.value.contractVersion === undefined))
+      result.findings.push({ code: "refinement_upgrade_required", target: plan.value.feasibility.id, message: "New plan admission requires the enriched refinement contract" });
     for (const input of plan.value.guards) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash

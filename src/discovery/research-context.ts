@@ -1,6 +1,9 @@
 import type { Store } from "../storage/store.js";
 import { STAGES, reference, type StageArtifact } from "../pipeline/contracts.js";
 import type { DiscoveryDraft } from "./discovery.js";
+import type { Graph } from "../graph/model.js";
+import type { Ref } from "../pipeline/contracts.js";
+import { deferredGap, REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
 
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
@@ -22,4 +25,20 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
     }
     return { ref: reference(record), stage: record.value.stage, fields: record === latest ? fields : identities };
   });
+}
+
+export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
+  if (draft.stage !== "om-g2" || draft.level === "R0") return null;
+  const level = draft.level === "R1" ? 1 : 2;
+  const layer = store.get<{ projection: Graph }>(`graph-layer:${draft.projectId}:${level}`);
+  if (!layer || !draft.inputs.some(ref => ref.id === layer.id && ref.revision === layer.revision && ref.hash === layer.hash)) return null;
+  const graph = store.get<Graph>(`graph:${draft.projectId}`);
+  const previous = draft.level === "R2" ? store.get<{ draft: Ref | null }>(`phase:${draft.projectId}:R2`) : null;
+  const earlier = previous?.value.draft ? store.get<DiscoveryDraft>(previous.value.draft.id, previous.value.draft.revision) : null;
+  const openGaps = earlier?.value.contractVersion === REFINEMENT_CONTRACT_VERSION ? Object.values(earlier.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
+    .map(gap => ({ ...gap, deferred: Boolean(graph && deferredGap(graph.value, gap)) })) : [];
+  const currentHorizon = graph?.value.nodes.filter(node => graph.value.horizon.includes(node.id))
+    .map(node => ({ id: node.id, parent: node.parent, outcome: node.outcome, code: node.code })) ?? [];
+  return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon,
+    previousResearch: earlier ? reference(earlier) : null, openGaps };
 }

@@ -45,12 +45,12 @@ export class ProductEngine {
     if (stage === "om-g2") {
       const content = context.content as { feasibility?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "feasibility" || !isRef(content.feasibility)) return rejected("feasibility_missing", "This stage requires a bound R3 result");
-      return this.refinement.feasibilityGate(context.projectId, content.feasibility);
+      return this.refinement.feasibilityGate(context.projectId, content.feasibility, context.accepted === true);
     }
     if (stage === "compilation") {
       const content = context.content as { plan?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "plan" || !isRef(content.plan)) return rejected("plan_missing", "Compilation stage requires a generated plan");
-      return this.compiler.gate(context.projectId, content.plan);
+      return this.compiler.gate(context.projectId, content.plan, context.accepted === true);
     }
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;

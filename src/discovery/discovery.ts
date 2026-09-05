@@ -8,14 +8,17 @@ import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Findin
 import type { Graph } from "../graph/model.js";
 import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "./requirements.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
+import { deriveFields, type Derivation } from "./derived-draft.js";
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
-export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment" }
+export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
+  targets?: { target: string; field: string; consumer: string; question: string }[] }
 export interface DiscoveryDraft {
   projectId: string; createdAt: number; stage: Stage; level: ResearchLevel; consumer: string;
   fields: Record<string, Json>; questions: string[];
   inputs: Ref[];
   contractVersion?: number;
+  derivations?: Derivation[];
 }
 export interface Question {
   projectId: string; draftId: string; stage: Stage; level: ResearchLevel; consumer: string;
@@ -144,6 +147,13 @@ export class Discovery {
       return { findings: [{ code: "discovery_stale", target: draftRef.id, message: "Discovery draft is missing, foreign or changed" }], guards };
     }
     guards.push(reference(draft));
+    if (draft.value.derivations) {
+      try {
+        if (draft.value.questions.length || canonical(deriveFields(this.store, projectId, draft.value.derivations)) !== canonical(draft.value.fields))
+          fail("derivation_conflict", draft.id, "Derived research must exactly preserve its accepted source fields");
+        guards.push(...draft.value.derivations.map(entry => entry.source));
+      } catch { fail("derivation_stale", draft.id, "The accepted source of derived research changed or is unavailable"); }
+    }
     for (const input of uniqueRefs(draft.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash) fail("research_context_stale", input.id, "Research was performed against a different input version");

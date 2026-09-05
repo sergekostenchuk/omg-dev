@@ -11,6 +11,9 @@ export function reuseResearch(store: Store, discovery: Discovery, draft: Revisio
     if (question.value.status === "answered") continue;
     for (const prior of store.list<ResearchAssessment>("research-assessment")) {
       const value = prior.value;
+      const report = value.value;
+      if (draft.value.stage === "om-g2" && report && typeof report === "object" && !Array.isArray(report)
+        && Array.isArray(report['gaps']) && report['gaps'].length > 0) continue;
       if (value.projectId !== draft.value.projectId || value.verdict !== "supported" || value.researcher === value.assessor
         || canonical(value.environment) !== canonical(environment) || value.observations.length === 0
         || !value.observations.every(item => discovery.evidence.verify(item))) continue;

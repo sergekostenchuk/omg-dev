@@ -31,7 +31,7 @@ test("R0/L1/R1/L2/R2/L3/R3 checks a real repository without a machine plan or ex
     { field: "anything", kind: "decision", prompt: "Pretend research is complete", risk: "masquerade", schema: { type: "string" } },
   ]);
   const fakeAnswered = engine.discovery.decision(fake.value.questions[0]!, 1, "owner", "ready");
-  assert.throws(() => engine.refinement.finishResearch("garden", "R1", reference(fakeAnswered), 1), /phase's contract/);
+  assert.throws(() => engine.refinement.finishResearch("garden", "R1", reference(fakeAnswered), 1), /enriched contract/);
   const r3 = engine.refinement.assess("garden", 0);
   assert.equal(r3.value.ready, true); assert.equal(store.list("plan").length, 0); assert.equal(store.list("run").length, 0);
   assert.equal(r3.value.repository!.head, git(workspace, ["rev-parse", "HEAD"]));
