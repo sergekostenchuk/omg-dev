@@ -10,7 +10,8 @@ import { boundedContext } from "../compiler/context.js";
 export async function callAgent(role: RoleBinding, environment: Environment, mode: "implement" | "review",
   prompt: string, subject: unknown, maxChars: number, usage: (value: AgentUsage) => void, observer: ProcessObserver, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const requestId = randomUUID();
-  const request = boundedContext({ protocol: "omg-agent/v1", requestId, mode, model: role.model, effort: role.effort, prompt, subject }, maxChars);
+  const request = boundedContext({ protocol: "omg-agent/v1", requestId, mode, model: role.model, effort: role.effort,
+    ...(role.speed ? { speed: role.speed } : {}), prompt, subject }, maxChars);
   const measured: AgentUsage = { mode, model: role.model, effort: role.effort, requestHash: request.hash, requestChars: request.chars,
     requestBytes: request.utf8Bytes, responseChars: null, responseBytes: null };
   usage(measured);

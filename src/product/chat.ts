@@ -19,6 +19,7 @@ export class Chat {
     try {
       const history = this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === projectId && item.value.status === "completed").sort((a,b) => a.value.createdAt - b.value.createdAt).slice(-12).map(item => ({ user: item.value.message, assistant: item.value.text }));
       const request = { protocol: "omg-agent/v1", requestId, mode: "chat", model: turn.model, effort: environment.value.implementer.effort,
+        ...(environment.value.implementer.speed ? { speed: environment.value.implementer.speed } : {}),
         prompt: JSON.stringify({ message, history, project: context }), environment: reference(environment) };
       const result = await runProcess(environment.value.implementer.command, environment.value.workspace, JSON.stringify(request), environment.value.timeoutMs);
       requireCondition(result.exitCode === 0, "provider_failed", result.stderr.slice(-2000) || "Selected provider failed");

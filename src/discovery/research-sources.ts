@@ -15,8 +15,13 @@ export class ResearchSources {
   inventory() {
     let files: string[] = [];
     try { files = gitBytes(this.root, ["ls-files", "-z"]).toString("utf8").split("\0").filter(Boolean); } catch { /* A new product can begin from documents without a repository. */ }
-    return { sources: this.list().map(item => ({ ref: reference(item), kind: item.value.origin.kind, location: item.value.origin.location,
-      media: item.value.mediaType, length: item.value.content.length, excerpt: item.value.content.slice(0, 3000), truncated: item.value.content.length > 3000 })),
+    return { sources: this.list().map(item => {
+      // File bytes are delivered by read/read_source/search when requested.
+      // Repeating every captured code header in every request wastes context.
+      const excerpt = item.value.origin.kind === "file" ? "" : item.value.content.slice(0, 3000);
+      return { ref: reference(item), kind: item.value.origin.kind, location: item.value.origin.location,
+        media: item.value.mediaType, length: item.value.content.length, excerpt, truncated: item.value.content.length > excerpt.length };
+    }),
       files: files.slice(0, 2000), filesTruncated: files.length > 2000 };
   }
   read(path: string, media: Source['mediaType']) {

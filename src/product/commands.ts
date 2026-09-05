@@ -10,6 +10,7 @@ import type { Environment } from "../runtime/environment.js";
 export type ProductCommand =
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
+  | { type: "model-usage"; project: string; since: number }
   | { type: "research-draft"; project: string; draftId: string; maxTurns: number }
   | { type: "execute-plan"; project: string; plan: Ref; retry: boolean; maxContextChars: number; maxCorrections: number }
   | { type: "stop-execution"; project: string }
@@ -52,10 +53,12 @@ const object = (properties: Record<string, unknown>) => ({ type: "object", addit
 const command = (type: string, properties: Record<string, unknown>) => object({ type: { const: type }, ...properties });
 const processCommand = object({ executable: string, args: { type: "array", items: { type: "string" } } });
 const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
+role.properties['speed'] = { enum: ["inherited", "fast"] };
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const schema = { oneOf: [
   command("research-stage", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("research-phase", { project, phase: { enum: ["R1", "R2", "L2", "L3"] }, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
+  command("model-usage", { project, since: expected }),
   command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),

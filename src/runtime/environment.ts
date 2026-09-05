@@ -8,7 +8,7 @@ import type { Command, Graph } from "../graph/model.js";
 import { safeRelativePath } from "../graph/topology.js";
 import { reference, type Ref, type Finding } from "../pipeline/contracts.js";
 
-export interface RoleBinding { actor: string; model: string; effort: string; command: Command }
+export interface RoleBinding { actor: string; model: string; effort: string; command: Command; speed?: "fast" | "inherited" }
 export interface Environment {
   projectId: string; workspace: string; implementer: RoleBinding; reviewer: RoleBinding;
   fullCheck: Command; timeoutMs: number;
@@ -88,7 +88,8 @@ export class Environments {
     const root = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
     requireCondition(!root || root.value.sourceRoot === workspace, "workspace_in_use", "Create a new project to use another repository after execution has begun");
     for (const role of [value.implementer, value.reviewer]) requireCondition(role && typeof role.actor === "string" && role.actor.trim()
-      && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort),
+      && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)
+      && (role.speed === undefined || ["inherited", "fast"].includes(role.speed)),
     "role_invalid", "Each role needs an identity, model and supported effort");
     executablePath(value.implementer.command, workspace); executablePath(value.reviewer.command, workspace); executablePath(value.fullCheck, workspace);
     requireCondition(value.implementer.actor !== value.reviewer.actor, "reviewer_not_independent", "Implementer and reviewer must differ");

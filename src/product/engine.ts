@@ -26,6 +26,7 @@ import { preparationFindings } from "../discovery/preparation-validation.js";
 import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
 import { RefinementResearch } from "./refinement-research.js";
+import { modelUsage } from "../runtime/model-usage.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -186,6 +187,7 @@ export class ProductEngine {
     switch (command.type) {
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
+      case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
       case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
