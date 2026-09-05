@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { configureReaderPilot, pilotEnvironment, type ReaderPilotSettings } from "../src/discovery/reader-pilot.js";
-import { numberedSource, readerObservations, readBundle } from "../src/discovery/reader.js";
+import { numberedSource, readerSourcePacket, readerObservations, readBundle } from "../src/discovery/reader.js";
 import { pilotContext, readPilotContext } from "../src/discovery/pilot-context.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { canonical } from "../src/canonical.js";
@@ -41,6 +41,7 @@ function fixture(t: test.TestContext) {
   writeFileSync(readerPath, `import {readFileSync,appendFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
 appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
 let research;
+if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
 if(c.role==='reader')research={selections:[{source:c.sources[0].ref,firstLine:2,lastLine:3}],unresolved:[]};
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(!c.readings.length)research={action:'read_bundle',purpose:'Read the scoped runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]};
@@ -75,6 +76,31 @@ test("reader returns exact source coordinates; the engine extracts originals and
   assert.equal(store.get<Question>(question.id)!.value.status, "open", "Reading does not accept an answer or stage");
   assert.deepEqual(engine.environments.get("p"), environment, "The experimental assignment does not rewrite accepted environment history");
   assert.equal(pilotEnvironment(environment.value, pilot.value).implementer.actor, "author");
+});
+
+test("compact reader packets preserve every visible character and original selection coordinates", t => {
+  const { root, engine, store } = fixture(t);
+  const text = "Header\r\n" + "Условие 😀: разрешено только внутри scope.\r\n".repeat(30) + "Последняя строка";
+  writeFileSync(join(root, "compact.txt"), text);
+  const source = engine.discovery.evidence.file("p", "compact", root, "compact.txt", "text/plain", 0);
+  for (const range of [{ start: 0, end: text.length }, { start: 11, end: text.length - 3 }]) {
+    const supplied = numberedSource(source, range);
+    const packet = readerSourcePacket(supplied);
+    assert.deepEqual(packet.ref, reference(source));
+    assert.deepEqual(packet.visibleRange, range);
+    assert.equal(packet.totalChars, text.length);
+    assert.equal(packet.partial, range.start !== 0 || range.end !== text.length);
+    assert.deepEqual(packet.lineColumns, ["line", "text"]);
+    assert.equal(packet.lines.map(([, text]) => text).join(""), text.slice(range.start, range.end));
+    assert.ok(canonical(packet).length < canonical(supplied).length * 0.8, "Repeated offsets and object keys are omitted from the wire");
+    for (const [line, original] of packet.lines) {
+      const selected = readerObservations(store, "p", [supplied], {
+        selections: [{ source: packet.ref, firstLine: line, lastLine: line }], unresolved: [],
+      }, 10000);
+      assert.equal(selected.observations[0]!.value, original);
+      assert.ok(engine.discovery.evidence.verify(selected.observations[0]!));
+    }
+  }
 });
 
 test("reader cannot replace evidence with a summary, choose foreign ranges, or return changed source bytes", t => {
