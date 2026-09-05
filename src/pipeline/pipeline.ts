@@ -48,7 +48,13 @@ export class Pipeline {
     const prior = predecessor(stage);
     if (artifact.value.inputs.length !== (prior ? 1 : 0)) findings.push({ code: "input_set_invalid", target: artifact.id, message: "Stage input set is incomplete or contains extras" });
     if (prior) {
-      const current = this.inspect(projectId, prior);
+      // Execution consumes a sealed compilation version. Its commits must not make
+      // historical R3 evidence retroactively invalidate the completed result.
+      const completedResult = artifact.value.content && typeof artifact.value.content === "object" && !Array.isArray(artifact.value.content)
+        ? artifact.value.content['result'] : null;
+      const sealed = stage === "execution" && artifact.value.status === "accepted" && isRef(completedResult)
+        ? this.store.get<StageArtifact>(stageId(projectId, prior)) : null;
+      const current = sealed ? { state: sealed.value.status, artifact: sealed, guards: [reference(sealed)] } : this.inspect(projectId, prior);
       guards.push(...current.guards);
       const expected = artifact.value.inputs[0];
       if (current.state !== "accepted" || !expected || !current.artifact

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Store, type Revision } from "../storage/store.js";
@@ -20,7 +20,7 @@ export function git(cwd: string, args: string[], input?: string): string {
 }
 export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-  const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
+  const result = spawnSync("git", ["--literal-pathspecs", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
   if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });
   return result.stdout;
 }
@@ -38,7 +38,7 @@ export function workspacePath(root: string, path: string): string {
   requireCondition(safeRelativePath(path), "path_invalid", "Work paths must be explicit relative paths");
   const base = realpathSync(root); const target = resolve(base, path);
   let ancestor = target;
-  while (!existsSync(ancestor)) { const next = dirname(ancestor); requireCondition(next !== ancestor, "path_invalid", "Path has no existing ancestor"); ancestor = next; }
+  while (!lstatSync(ancestor, { throwIfNoEntry: false })) { const next = dirname(ancestor); requireCondition(next !== ancestor, "path_invalid", "Path has no existing ancestor"); ancestor = next; }
   const resolved = realpathSync(ancestor); const within = relative(base, resolved);
   requireCondition(within !== ".." && !within.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(within), "path_escape", "Work path escapes the selected repository");
   requireCondition(!path.split("/").includes(".git"), "path_invalid", "Git metadata cannot be a work target");

@@ -5,7 +5,8 @@ import { executablePath } from "./environment.js";
 import { StringDecoder } from "node:string_decoder";
 
 export interface ProcessResult { exitCode: number | null; stdout: string; stderr: string; signal: NodeJS.Signals | null }
-export function runProcess(command: Command, cwd: string, input: string, timeoutMs: number, signal?: AbortSignal, detached = true): Promise<ProcessResult> {
+export function runProcess(command: Command, cwd: string, input: string, timeoutMs: number, signal?: AbortSignal, detached = true,
+  onSpawn?: (pid: number) => void): Promise<ProcessResult> {
   if (signal?.aborted) return Promise.reject(new EngineError("process_cancelled", "Execution was cancelled before launch"));
   const executable = executablePath(command, cwd);
   const env = Object.fromEntries(["PATH", "HOME", "USERPROFILE", "SystemRoot", "WINDIR", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL"]
@@ -39,6 +40,11 @@ export function runProcess(command: Command, cwd: string, input: string, timeout
       if (failure) reject(failure); else resolve({ exitCode, signal: exitSignal, stdout, stderr });
     });
     signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort(); else child.stdin.end(input);
+    try {
+      if (signal?.aborted) abort();
+      else { if (child.pid) onSpawn?.(child.pid); child.stdin.end(input); }
+    } catch (error) {
+      failure = error instanceof EngineError ? error : new EngineError("process_record_failed", "Process ownership could not be recorded"); terminate();
+    }
   });
 }

@@ -16,6 +16,10 @@ import { projectGraph } from "../graph/project.js";
 import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
+import { Executor } from "../execution/runner.js";
+import { resultGate } from "../execution/result.js";
+import type { TaskRun } from "../execution/model.js";
+import type { ExecutionRoot } from "../runtime/environment.js";
 import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
@@ -29,6 +33,7 @@ export class ProductEngine {
   readonly environments: Environments;
   readonly refinement: Refinement;
   readonly compiler: Compiler;
+  readonly executor: Executor;
   readonly researcher: Researcher;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
@@ -37,6 +42,7 @@ export class ProductEngine {
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
     this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
+    this.executor = new Executor(store, this.compiler, this.environments);
     this.researcher = new Researcher(store, this.discovery, this.environments);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
@@ -50,6 +56,11 @@ export class ProductEngine {
       const content = context.content as { plan?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "plan" || !isRef(content.plan)) return rejected("plan_missing", "Compilation stage requires a generated plan");
       return this.compiler.gate(context.projectId, content.plan, context.accepted === true);
+    }
+    if (stage === "execution") {
+      const content = context.content as { result?: unknown } | null;
+      if (!content || !isRef(content.result) || Object.keys(content).join(",") !== "result") return rejected("execution_result_missing", "Execution requires a complete committed result");
+      return resultGate(this.store, context.projectId, content.result);
     }
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;
@@ -149,6 +160,9 @@ export class ProductEngine {
       feasibility, feasibilityGate: feasibility ? this.refinement.feasibilityGate(project, reference(feasibility)) : null,
       plans: this.store.list<MachinePlan>("plan").filter(item => item.value.projectId === project), currentPlan,
       planGate: currentPlan ? this.compiler.gate(project, currentPlan.value) : null,
+      runs: this.store.list<TaskRun>("task-run").filter(item => item.value.projectId === project),
+      executionRoot: this.store.get<ExecutionRoot>(`execution-root:${project}`),
+      executionRunning: this.executor.isRunning(project),
       researchRuns: this.store.list<ResearchRun>("research-run").filter(item => item.value.projectId === project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
     };
@@ -162,6 +176,9 @@ export class ProductEngine {
     const command = parseCommand(input);
     switch (command.type) {
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
+      case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
+      case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
+      case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
       case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);

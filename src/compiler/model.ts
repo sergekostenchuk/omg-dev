@@ -7,7 +7,8 @@ import { nodeContext } from "../graph/node-context.js";
 
 export interface ArtifactReceipt {
   projectId: string; artifact: string; node: string; signature: string; contractHash: string;
-  commit: string; tree: string; value: { files: { path: string; hash: string }[] };
+  commit: string; tree: string; value: { files: { path: string; hash: string | null }[] };
+  plan?: Ref; run?: Ref;
 }
 export interface TaskInput { connector: string; artifact: string; producerTask: string | null; receipt: Ref | null; source: Ref | null }
 export interface CompiledTask {
