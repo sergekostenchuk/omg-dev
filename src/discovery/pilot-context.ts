@@ -8,6 +8,7 @@ import { requireCondition } from "../errors.js";
 import { researchGraphContext } from "./research-context.js";
 import type { Graph } from "../graph/model.js";
 import { layerDeltaView } from "./layer-delta.js";
+import { researchConsumerIds } from "../graph/research-evidence.js";
 
 const escape = (value: string) => value.replaceAll("~", "~0").replaceAll("/", "~1");
 const descriptor = (pointer: string, value: unknown) => ({ pointer, chars: canonical(value).length, hash: hashJson(value) });
@@ -60,6 +61,20 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   const preparation = initial.fields['preparation'];
   const map = researchGraphContext(store, draft.value);
   requireCondition(map, "context_basis_missing", "The pilot requires the accepted upper map");
+  const allowedConsumers = researchConsumerIds(store, project, map.graph);
+  const gapTargetFields = [...map.graph.nodes, ...preparation.actors].map(target => ({ id: target.id, fields: Object.keys(target) }));
+  const spec = structuredClone(question.value.spec);
+  if (draft.value.consumer === "compilation") {
+    const schema = spec.schema as any;
+    requireCondition(schema?.properties?.designs?.items?.properties?.consumer && schema?.properties?.gaps?.items?.properties?.target,
+      "pilot_question_unsupported", "The experiment requires the technical report contract");
+    schema.properties.designs.items.properties.consumer = { enum: allowedConsumers };
+    schema.properties.gaps.items.properties.consumer = { enum: allowedConsumers };
+    schema.properties.gaps.items.properties.target = { enum: allowedConsumers };
+    schema.properties.gaps.items.allOf = gapTargetFields.map(target => ({
+      if: { properties: { target: { const: target.id } } }, then: { properties: { field: { enum: target.fields } } },
+    }));
+  }
   const evidence = new Evidence(store);
   const sourceCurrent = (ref: Ref) => {
     const source = store.get<Source>(ref.id);
@@ -82,7 +97,8 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   };
   return {
     role: "research", stage: draft.value.stage, level: draft.value.level, consumer: draft.value.consumer,
-    draft: reference(draft), question: { id: question.id, ...question.value.spec },
+    draft: reference(draft), question: { id: question.id, ...spec },
+    allowedConsumers,
     currentProposal: question.value.spec.field === "layerDesign" && draft.value.fields['layerDesign']
       ? layerDeltaView(store, project, draft.value.fields['layerDesign']) : draft.value.fields[question.value.spec.field],
     graphBase: reference(store.get<Graph>(`graph:${project}`)!),

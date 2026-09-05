@@ -4,7 +4,7 @@ import { Evidence } from "../evidence/evidence.js";
 import { reference } from "../pipeline/contracts.js";
 import type { Environment } from "../runtime/environment.js";
 import { hashJson } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import type { Question, DiscoveryDraft } from "./discovery.js";
 import type { ResearchAction, ResearchAssessment } from "./research-model.js";
 import { researchCall } from "./research-protocol.js";
@@ -13,6 +13,9 @@ import { consumerFeedback } from "./consumer-feedback.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
 import { pilotContext } from "./pilot-context.js";
 import { layerDeltaView } from "./layer-delta.js";
+import { technicalProposalFindings } from "../graph/research-evidence.js";
+import type { TechnicalReport } from "../graph/research-contracts.js";
+import type { Graph } from "../graph/model.js";
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
@@ -23,6 +26,12 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const draft = store.get<DiscoveryDraft>(question.value.draftId);
   requireCondition(draft?.kind === "discovery-draft", "draft_missing", "The research context is missing");
   requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor, "assessor_not_independent", "Research assessment requires a separate actor");
+  if (pilot && draft.value.consumer === "compilation") {
+    const graph = store.get<Graph>(`graph:${draft.value.projectId}`)!;
+    const findings = technicalProposalFindings(store, draft.value.projectId, draft.value.level, question.id, question.value.spec.field,
+      action.value as unknown as TechnicalReport, observations, graph.value, root);
+    if (findings.length) throw new EngineError("research_proposal_invalid", "Correct the typed proposal findings before model assessment", findings);
+  }
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
   const context = pilot ? { ...pilotContext(store, draft, question), role: "assess-answer", question: question.value.spec,
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value) : action.value,

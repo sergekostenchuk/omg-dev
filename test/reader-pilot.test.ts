@@ -47,6 +47,7 @@ else if(!c.readings.length)research={action:'read_bundle',purpose:'Read the scop
 else if(c.question.field==='layerDesign')research={action:'answer_delta',question:c.question.id,base:c.graphBase,...JSON.parse(readFileSync('delta.json','utf8')),citations:c.readings[0].observations.map(o=>({source:o.source,selector:o.selector}))};
 else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'A scoped local product',facts:[{id:c.question.field+'-fact',claim:'README defines scope and rollback',path:'README.md'}],designs:[{id:c.question.field+'-design',decision:'Apply the defined scope and rollback',benefit:'Safe local output',consumer:'compilation'}],gaps:[]},citations:c.readings[0].observations.map(o=>({source:o.source,selector:o.selector}))};
 const response={protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:100,outputTokens:25,cachedInputTokens:0,reasoningOutputTokens:5}};
+if(existsSync('bad-consumer')&&research.action==='answer')research.value.designs[0].consumer='invented-consumer';
 if(existsSync('omit-usage'))delete response.usage;
 console.log(JSON.stringify(response));`);
   const settings: ReaderPilotSettings = { experimental: true, active: true, stopAfter: "L2",
@@ -238,4 +239,18 @@ test("a previously prepared L3 cannot bypass the pilot boundary through build-la
     { code: "pilot_boundary_reached" });
   assert.deepEqual(store.get(before.id), before);
   assert.throws(() => engine.execute({ type: "compile", project: "p" }), { code: "pilot_boundary_reached" });
+});
+
+test("invalid technical consumer references are rejected before paying an assessor", async t => {
+  const { root, engine, store, draft, question } = fixture(t);
+  writeFileSync(join(root, "bad-consumer"), "fixture");
+  const context = pilotContext(store, draft, question);
+  assert.ok(context.allowedConsumers.includes("compilation"));
+  assert.deepEqual((context.question.schema as any).properties.designs.items.properties.consumer.enum, context.allowedConsumers);
+  await engine.researcher.run("p", draft.id, 2);
+  const calls = store.list<ModelCall>("model-call");
+  assert.equal(calls.length, 3); assert.equal(calls.filter(call => call.value.purpose === "assessor").length, 0);
+  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  const rejected = store.list<ResearchTurn>("research-turn").find(turn => turn.value.error !== null)!;
+  assert.equal((rejected.value.observation as {code:string}).code, "research_proposal_invalid");
 });
