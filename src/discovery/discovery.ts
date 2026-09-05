@@ -1,0 +1,135 @@
+import { Ajv } from "ajv";
+import { randomUUID } from "node:crypto";
+import { Store, type Revision } from "../storage/store.js";
+import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
+import { requireCondition } from "../errors.js";
+import { reference, STAGES, isRef, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
+import type { Graph } from "../graph/model.js";
+import { REQUIREMENTS, type UpstreamStage } from "./requirements.js";
+
+export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
+export interface FieldSpec { field: string; kind: "fact" | "decision"; prompt: string; risk: string; schema: Json }
+export interface DiscoveryDraft {
+  projectId: string; stage: Stage; level: ResearchLevel; consumer: string;
+  fields: Record<string, Json>; questions: string[];
+}
+export interface Question {
+  projectId: string; draftId: string; stage: Stage; level: ResearchLevel; consumer: string;
+  spec: FieldSpec; beforeHash: string; status: "open" | "answered" | "unresolved";
+  answer: Ref | null;
+}
+export interface Decision { projectId: string; actor: string; question: string; value: Json }
+export interface Fact { projectId: string; question: string; observation: Observation }
+
+const ajv = new Ajv({ strict: true });
+export class Discovery {
+  readonly evidence: Evidence;
+  constructor(private readonly store: Store) { this.evidence = new Evidence(store); }
+  forStage(projectId: string, stage: UpstreamStage, consumer: string): Revision<DiscoveryDraft> {
+    requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
+    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage]);
+  }
+  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[]): Revision<DiscoveryDraft> {
+    requireCondition(STAGES.includes(stage) && ["R0", "R1", "R2", "R3"].includes(level) && typeof consumer === "string"
+      && consumer.trim() && Array.isArray(specs) && specs.length > 0,
+      "question_unbound", "Discovery needs a level, consumer and explicit questions");
+    const graph = this.store.get<Graph>(`graph:${projectId}`);
+    requireCondition(STAGES.includes(consumer as Stage) || (graph?.kind === "graph" && graph.value.nodes.some(node => node.id === consumer)),
+      "consumer_missing", "The research consumer must be an existing stage or graph node");
+    requireCondition(specs.every(spec => spec && typeof spec === "object" && typeof spec.field === "string" && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(spec.field)
+      && !["constructor", "prototype", "__proto__"].includes(spec.field)
+      && ["fact", "decision"].includes(spec.kind) && typeof spec.prompt === "string" && spec.prompt.trim()
+      && typeof spec.risk === "string" && spec.risk.trim() && Object.hasOwn(spec, "schema"))
+      && new Set(specs.map(spec => spec.field)).size === specs.length, "question_invalid", "Questions need unique fields, a type, prompt and risk");
+    for (const spec of specs) ajv.compile(spec.schema as object);
+    const id = `discovery:${projectId}:${randomUUID()}`;
+    const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
+    const draft: DiscoveryDraft = { projectId, stage, level, consumer,
+      fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
+    const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
+      ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
+        value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }))];
+    return this.store.writeMany<DiscoveryDraft>(writes)[0]!;
+  }
+  #question(id: string, expected: number): Revision<Question> {
+    const question = this.store.get<Question>(id);
+    requireCondition(question && question.kind === "question" && question.revision === expected,
+      "question_stale", "Question is missing or changed");
+    requireCondition(question.value.status !== "answered", "question_already_answered", "Reopen the question before changing an answer");
+    return question;
+  }
+  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact, kind: "decision" | "fact", guards: Ref[]): Revision<DiscoveryDraft> {
+    const q = question.value; const draft = this.store.get<DiscoveryDraft>(q.draftId);
+    requireCondition(draft && draft.kind === "discovery-draft" && draft.value.projectId === q.projectId
+      && draft.value.questions.includes(question.id), "question_unbound", "Question must belong to this draft");
+    requireCondition(hashJson(draft.value.fields[q.spec.field]) === q.beforeHash,
+      "target_stale", "The target field changed since this question was issued");
+    const validate = ajv.compile(q.spec.schema as object);
+    requireCondition(validate(value), "answer_invalid", "The answer does not satisfy the field contract");
+    const id = `${kind}:${q.projectId}:${randomUUID()}`;
+    const answerRef: Ref = { id, revision: 1, hash: hashJson(answer) };
+    return this.store.writeMany<DiscoveryDraft>([
+      { id: draft.id, kind: draft.kind, expected: draft.revision, value: { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } } },
+      { id, kind, expected: 0, value: answer },
+      { id: question.id, kind: question.kind, expected: question.revision, value: { ...q, status: "answered", answer: answerRef } },
+    ], [...guards, reference(question), reference(draft)])[0]!;
+  }
+  decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
+    const question = this.#question(id, expected);
+    requireCondition(question.value.spec.kind === "decision", "fact_requires_evidence", "An owner's choice cannot confirm a factual question");
+    requireCondition(typeof actor === "string" && actor.trim(), "actor_missing", "Decision needs an owner identity");
+    return this.#answer(question, value, { projectId: question.value.projectId, actor, question: id, value }, "decision", []);
+  }
+  fact(id: string, expected: number, source: Ref, selector: Selector): Revision<DiscoveryDraft> {
+    const question = this.#question(id, expected);
+    requireCondition(question.value.spec.kind === "fact", "decision_required", "A preference requires an owner decision");
+    const observation = this.evidence.observe(question.value.projectId, source, selector);
+    return this.#answer(question, observation.value, { projectId: question.value.projectId, question: id, observation }, "fact", [source]);
+  }
+  unresolved(id: string, expected: number): void {
+    const question = this.#question(id, expected);
+    this.store.write({ id, kind: "question", expected, value: { ...question.value, status: "unresolved" } });
+  }
+  reopen(id: string, expected: number): Revision<Question> {
+    const q = this.store.get<Question>(id);
+    requireCondition(q && q.kind === "question" && q.revision === expected, "question_stale", "Question changed");
+    const draft = this.store.get<DiscoveryDraft>(q.value.draftId);
+    requireCondition(draft, "draft_missing", "Question target is missing");
+    return this.store.writeMany<Question>([{ id, kind: "question", expected,
+      value: { ...q.value, beforeHash: hashJson(draft.value.fields[q.value.spec.field]), status: "open", answer: null } }], [reference(draft)])[0]!;
+  }
+  gate(projectId: string, draftRef: Ref): GateResult {
+    requireCondition(isRef(draftRef), "discovery_ref_invalid", "Discovery needs a versioned draft reference");
+    const findings: Finding[] = []; const guards: Ref[] = [];
+    const fail = (code: string, target: string, message: string) => findings.push({ code, target, message });
+    const draft = this.store.get<DiscoveryDraft>(draftRef.id);
+    if (!draft || draft.kind !== "discovery-draft" || draft.value.projectId !== projectId
+      || draft.revision !== draftRef.revision || draft.hash !== draftRef.hash) {
+      return { findings: [{ code: "discovery_stale", target: draftRef.id, message: "Discovery draft is missing, foreign or changed" }], guards };
+    }
+    guards.push(reference(draft));
+    for (const id of draft.value.questions) {
+      const question = this.store.get<Question>(id);
+      if (!question || question.kind !== "question" || question.value.projectId !== projectId || question.value.draftId !== draft.id
+        || question.value.status !== "answered" || !question.value.answer) { fail("question_unresolved", id, "Question has no accepted answer"); continue; }
+      guards.push(reference(question));
+      const ref = question.value.answer; const answer = this.store.get<Decision | Fact>(ref.id);
+      if (!answer || answer.hash !== ref.hash || answer.revision !== ref.revision || answer.value.projectId !== projectId || answer.value.question !== id
+        || answer.kind !== question.value.spec.kind) { fail("answer_foreign", id, "Answer binding is invalid"); continue; }
+      guards.push(reference(answer));
+      let value: Json;
+      if (answer.kind === "fact") {
+        const observation = (answer.value as Fact).observation;
+        if (!this.evidence.verify(observation)) { fail("evidence_stale", id, "Source evidence is missing or changed"); continue; }
+        guards.push(observation.source); value = observation.value;
+      } else {
+        const decision = answer.value as Decision;
+        if (!decision.actor?.trim()) { fail("actor_missing", id, "Decision owner is missing"); continue; }
+        value = decision.value;
+      }
+      if (canonical(value) !== canonical(draft.value.fields[question.value.spec.field])) fail("answer_target_mismatch", id, "The answer no longer matches its target field");
+    }
+    return { findings, guards };
+  }
+}

@@ -8,6 +8,7 @@ import { createSnapshot, type Snapshot, type SnapshotOptions } from "./snapshots
 
 export interface Revision<T = Json> { id: string; kind: string; revision: number; hash: string; value: T }
 export interface Write { id: string; kind: string; expected: number; value: unknown }
+export interface ReadGuard { id: string; revision: number; hash: string }
 
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
@@ -46,8 +47,8 @@ export class Store {
   history<T = Json>(id: string): Revision<T>[] {
     return this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
   }
-  write<T = Json>(input: Write): Revision<T> { return this.writeMany([input])[0]! as Revision<T>; }
-  writeMany(inputs: Write[]): Revision[] {
+  write<T = Json>(input: Write): Revision<T> { return this.writeMany<T>([input])[0]!; }
+  writeMany<T = Json>(inputs: Write[], guards: ReadGuard[] = []): Revision<T>[] {
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
     const ids = new Set<string>();
     const prepared = inputs.map(input => {
@@ -61,7 +62,12 @@ export class Store {
     });
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const results: Revision[] = [];
+      for (const guard of guards) {
+        const current = this.get(guard.id);
+        requireCondition(current && current.revision === guard.revision && current.hash === guard.hash,
+          "input_stale", "An input changed before the transaction could commit");
+      }
+      const results: Revision<T>[] = [];
       for (const input of prepared) {
         const current = this.get(input.id);
         if ((current?.revision ?? 0) !== input.expected) throw new EngineError("revision_conflict", "Entity changed; reload before writing", { id: input.id });
@@ -70,7 +76,7 @@ export class Store {
         this.#db.prepare("INSERT INTO revisions VALUES(?,?,?,?,?)").run(input.id, revision, input.kind, input.body, input.hash);
         this.#db.prepare("INSERT INTO heads VALUES(?,?) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision").run(input.id, revision);
         this.#db.prepare("INSERT INTO events(entity_id,revision) VALUES(?,?)").run(input.id, revision);
-        results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as Json });
+        results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as T });
       }
       this.#db.exec("COMMIT");
       return results;
