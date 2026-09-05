@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/storage/store.js";
+import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES, REQUIREMENTS } from "../src/discovery/requirements.js";
 import { preparedField } from "./preparation-fixture.js";
@@ -172,4 +172,26 @@ test("existing connector semantic drift is fed back with current L1 for model co
   assert.ok(store.list<ConsumerFeedback>("research-feedback").some(item => item.value.findings.some(finding => finding.code === "graph_semantic_drift")));
   const accepted = store.get<{content:{fields:Record<string,Json>}}>(result.stage!.id)!;
   assert.deepEqual(accepted.value.content.fields['mapDesign'], designOf(graph));
+});
+
+test("a map retry cannot adopt a competing graph written after consumer feedback", async t => {
+  const { engine, store, setup } = fixture(t); setup("p");
+  for (const stage of ["discovery", "concept"] as const) {
+    const draft = engine.prepare("p", stage); await engine.stageResearch.run("p", draft.id, 6);
+  }
+  const draft = engine.prepare("p", "operation-map");
+  const write = store.writeMany.bind(store); let pending = true;
+  store.writeMany = function<T>(inputs: Write[], guards?: ReadGuard[]): Revision<T>[] {
+    const records = write<T>(inputs, guards);
+    if (pending && inputs.some(input => input.kind === "research-feedback")) {
+      pending = false;
+      const graph = buildL1("p:map", "p", designOf(enrichedGraph(exampleGraph("p"), "p")),
+        { preparation: preparedField("p", "preparation") }, { conceptSections: preparedField("p", "conceptSections") });
+      engine.graphs.save("p", graph, 0, "competing-writer");
+    }
+    return records;
+  };
+  await assert.rejects(engine.stageResearch.run("p", draft.id, 5), { code: "revision_conflict" });
+  assert.equal(store.history("graph:p").length, 1);
+  assert.equal(store.get("stage:p:operation-map"), null);
 });

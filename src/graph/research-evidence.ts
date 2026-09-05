@@ -11,12 +11,12 @@ import { deferredGap, type TechnicalReport } from "./research-contracts.js";
 export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string): Finding[] {
   root = realpathSync(root);
   const findings: Finding[] = [];
-  const fail = (code: string, target: string, message: string) => findings.push({ code, target, message });
   const initial = store.get<StageArtifact>(stageId(draft.projectId, "discovery"));
   const actors = (initial?.value.content as unknown as { fields?: { preparation?: { actors?: { id: string }[] } } })?.fields?.preparation?.actors ?? [];
   const consumers = new Set<string>([...STAGES, ...graph.nodes.map(node => node.id), ...actors.map(actor => actor.id)]);
   for (const questionId of draft.questions) {
     const question = store.get<{ spec: { field: string }; answer: { id: string } | null }>(questionId)!;
+    const fail = (code: string, target: string, message: string) => findings.push({ code, target, message, field: question.value.spec.field });
     const answer = question.value.answer ? store.get(question.value.answer.id) : null;
     if (answer?.kind !== "research-answer") { fail("research_assessment_required", questionId, "Technical research requires an evidence-assessed report; a manual declaration is insufficient"); continue; }
     const report = draft.fields[question.value.spec.field] as unknown as TechnicalReport;

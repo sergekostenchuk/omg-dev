@@ -96,8 +96,10 @@ export class Refinement {
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null },
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
   }
-  sealLayer(project: string, level: 1 | 2 | 3, expected: number): Revision<Milestone> {
+  sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
+    requireCondition(!expectedGraph || (graphAtStart && canonical(reference(graphAtStart)) === canonical(expectedGraph)),
+      "graph_stale", "The constructed graph changed before layer acceptance");
     const phase = `L${level}` as Phase; const inputs = this.#inputs(project, phase);
     const checked = this.graphs.layerGate(project, level);
     requireCondition(checked.findings.length === 0, "layer_not_ready", "Graph layer is missing or stale");

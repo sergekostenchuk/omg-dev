@@ -25,6 +25,7 @@ import type { ResearchRun } from "../discovery/research-model.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
 import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
+import { RefinementResearch } from "./refinement-research.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -39,6 +40,7 @@ export class ProductEngine {
   readonly researcher: Researcher;
   readonly repairs: PlanRepairs;
   readonly stageResearch: StageResearch;
+  readonly refinementResearch: RefinementResearch;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
@@ -50,6 +52,7 @@ export class ProductEngine {
     this.researcher = new Researcher(store, this.discovery, this.environments);
     this.repairs = new PlanRepairs(this);
     this.stageResearch = new StageResearch(this);
+    this.refinementResearch = new RefinementResearch(this, actor);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
@@ -182,6 +185,7 @@ export class ProductEngine {
     const command = parseCommand(input);
     switch (command.type) {
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
+      case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
       case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
