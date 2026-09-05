@@ -14,7 +14,7 @@ import { preparedFeatures } from "./product-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { projectGraph } from "../src/graph/project.js";
-import type { Question } from "../src/discovery/discovery.js";
+import type { Question, DiscoveryDraft } from "../src/discovery/discovery.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import { layerDesignOf } from "../src/graph/layer-design.js";
@@ -24,6 +24,11 @@ import type { Json } from "../src/canonical.js";
 import { answerLayerFixture } from "./layer-design-fixture.js";
 import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
+import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
+
+function records<T>(value: T[] | ContextTable): T[] {
+  return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
+}
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-reader-pilot-"));
@@ -42,6 +47,7 @@ function fixture(t: test.TestContext) {
 appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
+if(c.role!=='reader'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
 if(c.role==='reader')research={selections:[{source:c.sources[0].ref,firstLine:2,lastLine:3}],unresolved:[]};
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(!c.readings.length)research={action:'read_bundle',purpose:'Read the scoped runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]};
@@ -136,7 +142,7 @@ test("pilot packet preserves global constraints and exposes exact bound context 
   const { store, draft, question } = fixture(t);
   const packet = pilotContext(store, draft, question);
   assert.ok(packet.core.constraints.length > 0); assert.ok(packet.core.requirements.length > 0);
-  assert.ok(packet.map.connectors.length > 0); assert.ok(packet.map.journeys.length > 0);
+  assert.ok(records(packet.map.connectors).length > 0); assert.ok(records(packet.map.journeys).length > 0);
   assert.ok(packet.map.contracts.every(contract => !Object.hasOwn(contract, "schema")));
   const selected = packet.map.contracts[0]!;
   const detail = readPilotContext(store, draft, packet.map.ref, selected.pointer, 10000);
@@ -144,6 +150,50 @@ test("pilot packet preserves global constraints and exposes exact bound context 
   assert.throws(() => readPilotContext(store, draft, { ...packet.map.ref, hash: "f".repeat(64) }, selected.pointer, 10000), { code: "context_reference_foreign" });
   assert.throws(() => readPilotContext(store, draft, packet.map.ref, "/projection/absent", 10000), { code: "context_missing" });
   assert.throws(() => readPilotContext(store, draft, packet.map.ref, selected.pointer, 1), { code: "context_read_limit" });
+});
+
+test("compact context preserves nulls, unknown properties, Unicode and heterogeneous record shapes", () => {
+  const original = Array.from({ length: 20 }, (_, index) => ({ identifier: `n-${index}`,
+    exactCondition: "Не писать вне области. Исключение: только по разрешению.\r\n😀", optionalValue: null,
+    futureField: { nested: [false, 0, "", { columns: ["literal"], rows: [["source data"]] }] } }));
+  const packed = contextTable(original);
+  assert.ok(JSON.stringify(packed).length < JSON.stringify(original).length);
+  assert.deepEqual(records(packed), original);
+  const mixed = [{ id: "a", present: null }, { id: "b" }];
+  assert.deepEqual(records(contextTable(mixed)), mixed, "Absent and null are not interchangeable");
+  assert.deepEqual(contextTable([]), []);
+  const targets = [{ id: "one", condition: "a" }, { id: "two", condition: "b" }, { id: "three", other: 1 }];
+  const groups = targetFieldGroups(targets);
+  assert.equal(groups.length, 2);
+  for (const target of targets) assert.deepEqual(groups.find(group => group.targets.includes(target.id))!.fields, Object.keys(target).sort());
+});
+
+test("R1 and L2 retain all requirement criteria and transition conditions with a stable prefix", t => {
+  const { store, draft, question } = fixture(t);
+  const before = pilotContext(store, draft, question);
+  const fields = store.get<any>("stage:p:concept")!.value.content.fields;
+  assert.deepEqual(before.core.requirements.map((section: any) => ({ ...section, requirements: records(section.requirements) })), fields.conceptSections);
+  assert.deepEqual(before.core.acceptance, fields.acceptance);
+  assert.deepEqual(before.core.specificationConstraints, store.get<any>("stage:p:specification")!.value.content.fields.constraints);
+  for (const edge of records<any>(before.map.controls)) {
+    const detail = readPilotContext(store, draft, before.map.ref, edge.pointer, 10000).value as any;
+    assert.equal(edge.condition, detail.condition);
+    assert.equal(edge.source, detail.source); assert.equal(edge.target, detail.target);
+  }
+  const next = store.get<Question>(draft.value.questions[1]!)!;
+  const changedDraft = store.write<DiscoveryDraft>({ id: draft.id, kind: draft.kind, expected: draft.revision,
+    value: { ...draft.value, fields: { ...draft.value.fields, runtime: "A new candidate" } } });
+  const after = pilotContext(store, changedDraft, next);
+  const prefix = (packet: unknown) => JSON.stringify(packet).split(',"draft":')[0];
+  assert.equal(prefix(before), prefix(after), "Changing a question and draft does not change the stable product prefix");
+  assert.notEqual(JSON.stringify(before), JSON.stringify(after));
+  assert.deepEqual(question.value.spec.schema, before.question.schema);
+  // L2 uses the same complete product material, even though its output is a delta.
+  const layerQuestion = { ...question, value: { ...question.value, spec: { ...question.value.spec, field: "layerDesign" } } };
+  const layerDraft = { ...draft, value: { ...draft.value, consumer: "operation-map" as const } };
+  const layer = pilotContext(store, layerDraft, layerQuestion);
+  assert.deepEqual(layer.core, before.core);
+  assert.deepEqual(layer.map, before.map);
 });
 
 test("active experiment refuses creation and execution of R2 and later phases", async t => {
@@ -272,7 +322,9 @@ test("invalid technical consumer references are rejected before paying an assess
   writeFileSync(join(root, "bad-consumer"), "fixture");
   const context = pilotContext(store, draft, question);
   assert.ok(context.allowedConsumers.includes("compilation"));
-  assert.deepEqual((context.question.schema as any).properties.designs.items.properties.consumer.enum, context.allowedConsumers);
+  assert.deepEqual(context.question.schema, question.value.spec.schema, "The saved schema is not expanded with repeated conditional blocks");
+  const graph = store.get<any>("graph:p")!.value;
+  for (const node of graph.nodes) assert.deepEqual(context.gapFields.find(group => group.targets.includes(node.id))!.fields, Object.keys(node).sort());
   await engine.researcher.run("p", draft.id, 2);
   const calls = store.list<ModelCall>("model-call");
   assert.equal(calls.length, 3); assert.equal(calls.filter(call => call.value.purpose === "assessor").length, 0);

@@ -9,6 +9,7 @@ import { researchGraphContext } from "./research-context.js";
 import type { Graph } from "../graph/model.js";
 import { layerDeltaView } from "./layer-delta.js";
 import { researchConsumerIds } from "../graph/research-evidence.js";
+import { contextTable, targetFieldGroups, CONTEXT_ENCODING } from "./context-tables.js";
 
 const escape = (value: string) => value.replaceAll("~", "~0").replaceAll("/", "~1");
 const descriptor = (pointer: string, value: unknown) => ({ pointer, chars: canonical(value).length, hash: hashJson(value) });
@@ -62,18 +63,12 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   const map = researchGraphContext(store, draft.value);
   requireCondition(map, "context_basis_missing", "The pilot requires the accepted upper map");
   const allowedConsumers = researchConsumerIds(store, project, map.graph);
-  const gapTargetFields = [...map.graph.nodes, ...preparation.actors].map(target => ({ id: target.id, fields: Object.keys(target) }));
+  const gapFields = targetFieldGroups([...map.graph.nodes, ...preparation.actors]);
   const spec = structuredClone(question.value.spec);
   if (draft.value.consumer === "compilation") {
     const schema = spec.schema as any;
     requireCondition(schema?.properties?.designs?.items?.properties?.consumer && schema?.properties?.gaps?.items?.properties?.target,
       "pilot_question_unsupported", "The experiment requires the technical report contract");
-    schema.properties.designs.items.properties.consumer = { enum: allowedConsumers };
-    schema.properties.gaps.items.properties.consumer = { enum: allowedConsumers };
-    schema.properties.gaps.items.properties.target = { enum: allowedConsumers };
-    schema.properties.gaps.items.allOf = gapTargetFields.map(target => ({
-      if: { properties: { target: { const: target.id } } }, then: { properties: { field: { enum: target.fields } } },
-    }));
   }
   const evidence = new Evidence(store);
   const sourceCurrent = (ref: Ref) => {
@@ -97,27 +92,28 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   };
   return {
     role: "research", stage: draft.value.stage, level: draft.value.level, consumer: draft.value.consumer,
-    draft: reference(draft), question: { id: question.id, ...spec },
-    allowedConsumers,
-    currentProposal: question.value.spec.field === "layerDesign" && draft.value.fields['layerDesign']
-      ? layerDeltaView(store, project, draft.value.fields['layerDesign']) : draft.value.fields[question.value.spec.field],
+    contextEncoding: CONTEXT_ENCODING, allowedConsumers, gapFields,
     graphBase: reference(store.get<Graph>(`graph:${project}`)!),
     core: { initial: initial.ref, brief: initial.fields['brief'], objective: initial.fields['objective'],
       problem: preparation.problem, existingSituation: preparation.existingSituation, actors: preparation.actors,
       outcomes: preparation.outcomes, constraints: preparation.constraints, risks: preparation.risks, unknowns: preparation.unknowns,
-      concept: concept.ref, requirements: concept.fields['conceptSections'], acceptance: concept.fields['acceptance'],
+      concept: concept.ref, requirements: concept.fields['conceptSections'].map((section: { requirements: object[] }) => ({
+        ...section, requirements: contextTable(section.requirements) })), acceptance: concept.fields['acceptance'],
       specification: specification.ref, specificationConstraints: specification.fields['constraints'],
-      features: features.ref, featureIndex: features.fields['features'] },
+      features: features.ref, featureIndex: contextTable(features.fields['features']) },
     map: { ref: map.ref, level: map.level,
-      nodes: map.graph.nodes.map((node, index) => ({ id: node.id, title: node.title, kind: node.kind, parent: node.parent,
-        outcome: node.outcome, boundary: node.boundary, pointer: `/projection/nodes/${index}` })),
-      connectors: map.graph.connectors.map((connector, index) => ({ id: connector.id, artifact: connector.artifact,
+      nodes: contextTable(map.graph.nodes.map((node, index) => ({ id: node.id, title: node.title, kind: node.kind, parent: node.parent,
+        outcome: node.outcome, boundary: node.boundary, pointer: `/projection/nodes/${index}` }))),
+      connectors: contextTable(map.graph.connectors.map((connector, index) => ({ id: connector.id, artifact: connector.artifact,
         bindings: connector.bindings.map(binding => ({ level: binding.level, producer: binding.producer, consumers: binding.consumers, anchor: binding.anchor })),
-        returnsTo: connector.returnsTo, pointer: `/projection/connectors/${index}` })),
+        returnsTo: connector.returnsTo, pointer: `/projection/connectors/${index}` }))),
       contracts: map.graph.contracts.map((contract, index) => ({ id: contract.id, ...descriptor(`/projection/contracts/${index}`, contract) })),
-      controls: (map.graph.edges ?? []).map((edge, index) => ({ id: edge.id, relation: edge.relation, source: edge.source,
-        target: edge.target, pointer: `/projection/edges/${index}` })),
-      journeys: (map.graph.journeys ?? []).map((journey, index) => ({ ...journey, pointer: `/projection/journeys/${index}` })) },
+      controls: contextTable((map.graph.edges ?? []).map((edge, index) => ({ id: edge.id, relation: edge.relation, source: edge.source,
+        target: edge.target, condition: edge.condition, pointer: `/projection/edges/${index}` }))),
+      journeys: contextTable((map.graph.journeys ?? []).map((journey, index) => ({ ...journey, pointer: `/projection/journeys/${index}` }))) },
+    draft: reference(draft), question: { id: question.id, ...spec },
+    currentProposal: question.value.spec.field === "layerDesign" && draft.value.fields['layerDesign']
+      ? layerDeltaView(store, project, draft.value.fields['layerDesign']) : draft.value.fields[question.value.spec.field],
     catalogue,
     answers: draft.value.questions.map(id => store.get<Question>(id)!).map(q => ({ field: q.value.spec.field, status: q.value.status,
       pointer: `/fields/${escape(q.value.spec.field)}` })),
