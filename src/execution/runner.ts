@@ -15,6 +15,7 @@ import { executionInputs } from "./inputs.js";
 import { taskContext } from "../compiler/context.js";
 import { canonical } from "../canonical.js";
 import { recoverCommits } from "./recovery.js";
+import { executionOwnership } from "./ownership.js";
 
 export class Executor {
   private readonly active = new Map<string, AbortController>();
@@ -37,8 +38,8 @@ export class Executor {
         && stage.value.status === "accepted" && canonical((stage.value.content as unknown as { plan: Ref }).plan) === canonical(reference(plan)),
         "plan_not_accepted", "Execution requires the accepted compilation result");
       const existingRoot = this.store.get<ExecutionRoot>(`execution-root:${project}`);
-      if (existingRoot?.value.state === "ready") currentBasis(this.store, plan.value, existingRoot.value);
-      else requireCondition(this.compiler.gate(project, planRef).findings.length === 0, "plan_stale", "Refresh changed plan inputs before creating its worktree");
+      if (existingRoot?.value.state === "ready") currentBasis(this.store, plan, existingRoot.value);
+      else requireCondition(this.compiler.gate(project, planRef, true).findings.length === 0, "plan_stale", "Refresh changed plan inputs before creating its worktree");
       let root = ensureWorktree(this.store, this.environments, plan.value);
       const environment = this.store.get<Environment>(plan.value.environment.id, plan.value.environment.revision)!;
       const results: Revision<TaskRun>[] = []; let parent = plan.value.base.head;
@@ -59,7 +60,7 @@ export class Executor {
           run = this.save(run, { state: "interrupted", child: null, error: "Previous process stopped before acceptance. Candidate files are preserved; retry explicitly." });
         }
         if (run && (run.value.state === "needs_plan" || !options.retry && !corrections.has(task.id))) { results.push(run); return results; }
-        const guards = currentBasis(this.store, plan.value, root.value);
+        const guards = currentBasis(this.store, plan, root.value);
         if (!run) requireCondition(!git(root.value.path, ["status", "--porcelain", "--untracked-files=all"]),
           "worktree_dirty", "The managed worktree contains an unfinished change; recover that attempt first");
         const previous = run?.value;
@@ -78,10 +79,11 @@ export class Executor {
         try {
           requireWritePaths(root.value.path, task.writePaths);
           const inputs = executionInputs(this.store, plan, task, root.value);
-          run = this.save(run, { inputs: inputs.guards });
+          const ownership = executionOwnership(this.store, plan, task, root.value);
+          run = this.save(run, { inputs: [...inputs.guards, ...ownership.guards] });
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, options.maxContextChars).text);
           const response = await callAgent(actual.implementer, actual, "implement", "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.",
-            { context, parent, inputs: inputs.inputs, correction: previous ? { error: previous.error, review: previous.review } : null },
+            { context, parent, inputs: inputs.inputs, ownership: ownership.grants, correction: previous ? { error: previous.error, review: previous.review } : null },
             options.maxContextChars, measure, observe, signal);
           const output = implementation(response, task);
           const tree = capture(root.value, parent, task);
@@ -102,7 +104,7 @@ export class Executor {
           if (verdict.verdict === "request_changes") {
             throw new EngineError(verdict.kind === "plan" ? "plan_review_failed" : "code_review_failed", verdict.findings.join("\n"));
           }
-          run = commitIntent(this.store, root, run, plan.value, task, actual, [reference(lock), ...currentBasis(this.store, plan.value, root.value)]);
+          run = commitIntent(this.store, root, run, plan.value, task, actual, [reference(lock), ...currentBasis(this.store, plan, root.value)]);
           publishCommit(root.value, run.value);
           this.afterGitPublish?.(run.value);
           run = finishCommit(this.store, root, run, plan.value, task, actual);

@@ -44,6 +44,8 @@ if(request.mode==='implement') {
  writeFileSync(file,file==='produce.mjs'
   ? 'export const produce=n=>{if(!Number.isFinite(n))throw new Error("input_missing");return n+'+(wrong?2:1)+'};\n'
   : 'import {produce} from "./produce.mjs"; export const consume=n=>produce(n)*'+(wrong?3:2)+';\n');
+ if(context.action.title==='Upgrade producer safety')writeFileSync(file,'export const produce=n=>{if(!Number.isFinite(n))throw new Error("input_missing");const result=n+1;if(!Number.isSafeInteger(result))throw new Error("output_overflow");return result};\n');
+ if(context.action.title==='Upgrade consumer safety')writeFileSync(file,'import {produce} from "./produce.mjs";export const consume=n=>{const result=produce(n)*2;if(!Number.isSafeInteger(result))throw new Error("result_overflow");return result};\n');
  if(behavior==='scope')writeFileSync('foreign.txt','outside scope');
  if(behavior==='delete'&&existsSync('obsolete.txt'))unlinkSync('obsolete.txt');
  response.text='Implemented the bounded module';
@@ -63,6 +65,8 @@ if(mode==='produce'||mode==='all') {const {produce}=await import('./produce.mjs'
 if(mode==='consume'||mode==='all'&&existsSync('consume.mjs')) {const {consume}=await import('./consume.mjs');assert.equal(consume(1),4);}
 if(mode==='mutation') {const {produce}=await import('./produce.mjs');assert.throws(()=>produce(undefined),/input_missing/);}
 if(mode==='consume-mutation') {const {consume}=await import('./consume.mjs');assert.throws(()=>consume(undefined),/input_missing/);}
+if(mode==='overflow-produce') {const {produce}=await import('./produce.mjs');assert.throws(()=>produce(Number.MAX_SAFE_INTEGER),/output_overflow/);}
+if(mode==='overflow-consume') {const {consume}=await import('./consume.mjs');assert.throws(()=>consume(Number.MAX_SAFE_INTEGER-1),/result_overflow/);}
 `;
 
 export function executionFixture(t: TestContext, behavior = "normal") {

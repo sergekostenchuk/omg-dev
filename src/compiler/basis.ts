@@ -7,7 +7,7 @@ import { hashJson } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 
 export function requireBasis(store: Store, plan: MachinePlan): void {
-  requireCondition(plan && plan.version === 1 && [plan.graph, plan.environment, plan.stage, plan.feasibility].every(isRef)
+  requireCondition(plan && [1, 2].includes(plan.version) && [plan.graph, plan.environment, plan.stage, plan.feasibility].every(isRef)
     && Array.isArray(plan.guards) && plan.guards.every(isRef) && Array.isArray(plan.tasks), "plan_invalid", "Plan requires its versioned compilation basis");
   const stage = store.get<StageArtifact>(plan.stage.id, plan.stage.revision);
   const feasibility = store.get<Feasibility>(plan.feasibility.id, plan.feasibility.revision);

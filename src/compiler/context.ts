@@ -42,7 +42,7 @@ export function taskContext(plan: Revision<MachinePlan>, fullCheck: Command, tas
   return boundedContext({ version: "omg-task-context/v1", binding: { plan: reference(plan), graph: plan.value.graph, task: task.id,
     base: { commit: plan.value.base.head, tree: plan.value.base.tree } },
     action: { title: task.title, outcome: task.outcome, ...(task.purpose ? { purpose: task.purpose, benefit: task.benefit!, beneficiary: task.beneficiary! } : {}) },
-    scope: { boundary: task.boundary, code: node.code, ports: node.ports, packets: task.packets ?? [] },
+    scope: { boundary: task.boundary, code: node.code, ports: node.ports, packets: task.packets ?? [], ownership: task.ownership ?? [] },
     requirements: task.requirements ?? [], actor: graph.actors?.find(actor => actor.id === task.beneficiary) ?? null,
     inputs: task.inputs, produces: task.produces, artifacts,
     contracts: graph.contracts.filter(contract => contractIds.has(contract.id)),

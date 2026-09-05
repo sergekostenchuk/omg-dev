@@ -14,6 +14,7 @@ import { resolveArtifact } from "./inputs.js";
 import { requireBasis } from "./basis.js";
 import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
+import { Owners } from "../ownership/owners.js";
 export type { MachinePlan } from "./model.js";
 
 export class Compiler {
@@ -28,10 +29,11 @@ export class Compiler {
     requireCondition(checked.findings.length === 0 && feasibility.value.repository, "feasibility_not_ready", "Current R3 proof is required");
     const record = this.store.get<Graph>(`graph:${project}`)!; const graph = requireGraph(record.value);
     const environment = this.environments.get(project);
+    const owners = new Owners(this.store, project, feasibility.value.repository!);
     const derived = deriveTasks(project, record.hash, graph, (producer, artifact) =>
-      resolveArtifact(this.store, project, graph, feasibility.value.repository!, producer, artifact));
+      resolveArtifact(this.store, project, graph, feasibility.value.repository!, producer, artifact), { version: 2, owner: path => owners.latest(path) });
     const guards = [...new Map([...stage.guards, ...checked.guards, ...derived.guards].map(ref => [`${ref.id}:${ref.revision}`, ref])).values()];
-    const body = { version: 1 as const, projectId: project, graph: reference(record), environment: reference(environment),
+    const body = { version: 2 as const, projectId: project, graph: reference(record), environment: reference(environment),
       stage: reference(stage.artifact), feasibility: feasibilityRef, base: feasibility.value.repository,
       guards, tasks: derived.tasks, graphSnapshot: graph };
     const value: MachinePlan = { ...body, hash: hashJson(body) }; const id = `plan:${project}:${value.hash}`;
@@ -53,8 +55,10 @@ export class Compiler {
     const graph = this.store.get<Graph>(plan.value.graph.id, plan.value.graph.revision);
     requireCondition(graph?.kind === "graph" && graph.hash === plan.value.graph.hash
       && hashJson(graph.value) === hashJson(plan.value.graphSnapshot), "plan_foreign", "Plan must bind its exact graph version");
+    const owners = plan.value.version === 2 ? new Owners(this.store, plan.value.projectId, plan.value.base) : null;
     const derived = deriveTasks(plan.value.projectId, graph.hash, requireGraph(graph.value), (producer, artifact) =>
-      resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards));
+      resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards),
+    { version: plan.value.version, owner: path => owners?.latest(path) ?? null });
     requireCondition(hashJson(derived.tasks) === hashJson(plan.value.tasks), "plan_derivation_mismatch", "Tasks must be derived from the bound map without manual edits");
     return plan;
   }
@@ -64,6 +68,8 @@ export class Compiler {
     if (plan.value.projectId !== project || plan.hash !== ref.hash || plan.revision !== ref.revision) {
       result.findings.push({ code: "plan_foreign", target: ref.id, message: "Plan binding is foreign or changed" }); return result;
     }
+    if (plan.value.version !== 2 && !allowHistorical) result.findings.push({ code: "plan_version_upgrade_required", target: ref.id,
+      message: "New plan admission requires version 2 write grants; historical accepted plans remain readable" });
     const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
     if (basis.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && basis.value.contractVersion === undefined))
       result.findings.push({ code: "refinement_upgrade_required", target: plan.value.feasibility.id, message: "New plan admission requires the enriched refinement contract" });
@@ -99,7 +105,7 @@ export class Compiler {
     const evidence = plan.value.guards.flatMap(ref => {
       const record = this.store.get(ref.id, ref.revision);
       return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
-        && ["source", "stage", "discovery-draft", "research-assessment"].includes(record.kind)
+        && ["source", "stage", "discovery-draft", "research-assessment", "task-run"].includes(record.kind)
         ? [{ ref, kind: record.kind } satisfies EvidenceDetail] : [];
     });
     let value: unknown; let source = plan.value.graph;

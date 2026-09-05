@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json && esbuild ui/app.tsx --bundle --format=esm --jsx=automatic --outfile=public/app.js",
     "test": "node --test dist/test/*.test.js",
     "check": "npm run build && npm test",
+    "check:backend": "node scripts/check-backend.mjs",
     "start": "node dist/src/cli.js",
     "dev": "npm run build && node dist/src/cli.js serve"
   },

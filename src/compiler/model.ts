@@ -11,15 +11,17 @@ export interface ArtifactReceipt {
   plan?: Ref; run?: Ref;
 }
 export interface TaskInput { connector: string; artifact: string; producerTask: string | null; receipt: Ref | null; source: Ref | null }
+export interface WriteGrant { path: string; from: string | null; transfer: string | null; producerTask: string | null; receipt: Ref | null }
 export interface CompiledTask {
   id: string; node: string; title: string; outcome: string; signature: string;
   boundary: Boundary; writePaths: string[]; readPaths: string[]; tests: Graph['tests'];
   dependencies: string[]; inputs: TaskInput[]; produces: string[];
   obligations: { name: Obligation; status: "required" | "not_applicable"; reason: string }[];
   purpose?: string; benefit?: string; beneficiary?: string; requirements?: Requirement[]; packets?: WorkPacket[];
+  ownership?: WriteGrant[];
 }
 export interface MachinePlan {
-  version: 1; projectId: string; graph: Ref; environment: Ref; stage: Ref; feasibility: Ref;
+  version: 1 | 2; projectId: string; graph: Ref; environment: Ref; stage: Ref; feasibility: Ref;
   base: NonNullable<Feasibility['repository']>; guards: Ref[]; tasks: CompiledTask[];
   graphSnapshot: Graph; hash: string;
 }

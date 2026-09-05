@@ -9,6 +9,7 @@ import type { Graph } from "./model.js";
 import { deferredGap, type TechnicalReport } from "./research-contracts.js";
 
 export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string): Finding[] {
+  root = realpathSync(root);
   const findings: Finding[] = [];
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, message });
   const initial = store.get<StageArtifact>(stageId(draft.projectId, "discovery"));

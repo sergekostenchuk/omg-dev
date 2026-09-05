@@ -1,19 +1,26 @@
 import { relative, isAbsolute } from "node:path";
-import { Store } from "../storage/store.js";
+import { Store, type Revision } from "../storage/store.js";
 import type { MachinePlan } from "../compiler/model.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { gitBytes, type ExecutionRoot } from "../runtime/environment.js";
 import { digest } from "../canonical.js";
 import { requireCondition } from "../errors.js";
+import { artifactProgress } from "./artifact-progress.js";
+import { uniqueRefs } from "../pipeline/contracts.js";
 
 // Executing a sealed plan changes its own code. Those changes are evaluated by the
 // execution gates; they do not retroactively rewrite the repository facts used by R3.
-export function currentBasis(store: Store, plan: MachinePlan, root: ExecutionRoot): Ref[] {
+export function currentBasis(store: Store, record: Revision<MachinePlan>, root: ExecutionRoot): Ref[] {
+  const plan = record.value;
   const guards: Ref[] = [];
   for (const ref of plan.guards) {
     if (ref.id === `execution-root:${plan.projectId}`) continue; // Exact progress is checked against committed task parents.
     const current = store.get(ref.id);
+    if (current && (current.hash !== ref.hash || current.revision !== ref.revision)) {
+      const accepted = artifactProgress(store, record, root, ref, current);
+      if (accepted) { guards.push(...accepted); continue; }
+    }
     requireCondition(current && current.hash === ref.hash && current.revision === ref.revision,
       "plan_stale", `A sealed plan input changed: ${ref.id}`);
     if (current.kind === "source") {
@@ -27,5 +34,5 @@ export function currentBasis(store: Store, plan: MachinePlan, root: ExecutionRoo
     }
     guards.push(ref);
   }
-  return guards;
+  return uniqueRefs(guards);
 }

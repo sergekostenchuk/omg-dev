@@ -6,6 +6,8 @@ import type { Source } from "../src/evidence/evidence.js";
 import type { TechnicalReport } from "../src/graph/research-contracts.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { hashJson, type Json } from "../src/canonical.js";
+import { realpathSync } from "node:fs";
+import { join } from "node:path";
 
 const DESIGNS: Record<string, string> = {
   productDomain: "Model input, validated intermediate data and terminal result as distinct values; one transformation owns each output.",
@@ -28,8 +30,11 @@ const DESIGNS: Record<string, string> = {
 export function answerTechnicalFixture(engine: ProductEngine, project: string, draft: Revision<DiscoveryDraft>,
   transform: (field: string, report: TechnicalReport) => TechnicalReport = (_field, report) => report): void {
   const environment = engine.environments.get(project);
+  const root = realpathSync(engine.environments.effective(project).root);
   let source = engine.store.get<Source>(`source:${project}:context`);
-  source ??= engine.discovery.evidence.file(project, "context", environment.value.workspace, "README.md", "text/plain", 0);
+  const key = source && source.value.origin.location !== join(root, "README.md") ? `context-${hashJson(root).slice(0, 24)}` : "context";
+  source = engine.store.get<Source>(`source:${project}:${key}`);
+  source ??= engine.discovery.evidence.file(project, key, root, "README.md", "text/plain", 0);
   for (const id of draft.value.questions) {
     const question = engine.store.get<Question>(id)!;
     if (question.value.status === "answered") continue;
