@@ -5,7 +5,8 @@
     "noUncheckedIndexedAccess": true, "exactOptionalPropertyTypes": true,
     "noFallthroughCasesInSwitch": true, "noUnusedLocals": true,
     "noUnusedParameters": true, "sourceMap": true,
+    "jsx": "react-jsx",
     "types": ["node"], "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "ui/**/*.tsx", "ui/**/*.d.ts"]
 }

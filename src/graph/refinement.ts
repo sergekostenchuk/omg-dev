@@ -1,5 +1,5 @@
 import { Store, type Revision } from "../storage/store.js";
-import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
+import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question, type Fact } from "../discovery/discovery.js";
 import { GraphRepository } from "./repository.js";
 import { Environments, inspectRepository, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
@@ -7,6 +7,11 @@ import { reference, isRef, type Ref, type GateResult } from "../pipeline/contrac
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 import type { Graph } from "./model.js";
+import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { relative } from "node:path";
+import { readFileSync } from "node:fs";
+import { digest } from "../canonical.js";
+import { workspacePath } from "../runtime/environment.js";
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -47,6 +52,18 @@ export class Refinement {
     requireCondition(canonical(specs) === canonical(RESEARCH[level])
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
+    if (level !== "R0") {
+      const environment = this.environments.get(project);
+      for (const id of draft.value.questions) {
+        const question = this.store.get<Question>(id)!;
+        const fact = this.store.get<Fact>(question.value.answer!.id)!;
+        const source = this.store.get<Source>(fact.value.observation.source.id)!;
+        requireCondition(source.value.origin.kind === "file", "repository_evidence_required", "R1/R2 require an actual file from the selected repository");
+        const path = workspacePath(environment.value.workspace, relative(environment.value.workspace, source.value.origin.location));
+        requireCondition(digest(readFileSync(path)) === source.value.sha256, "source_stale", "Repository source changed after research capture");
+      }
+      inputs.push(reference(this.store.get(`workspace:${project}`)!));
+    }
     return this.store.writeMany<Milestone>([{ id: `phase:${project}:${level}`, kind: "phase", expected,
       value: { projectId: project, phase: level, inputs: [...inputs, ...checked.guards], draft: draftRef, layer: null } }], [...inputs, ...checked.guards])[0]!;
   }
@@ -67,7 +84,8 @@ export class Refinement {
     result.guards.push(reference(milestone));
     for (const ref of milestone.value.inputs) {
       const current = this.store.get(ref.id);
-      if (!current || current.revision !== ref.revision || current.hash !== ref.hash) result.findings.push({ code: "phase_stale", target: ref.id, message: "An input to this phase changed" });
+      if (!current || current.revision !== ref.revision || current.hash !== ref.hash
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "phase_stale", target: ref.id, message: "An input to this phase changed" });
       else result.guards.push(reference(current));
     }
     return result;
@@ -92,7 +110,8 @@ export class Refinement {
     const result: GateResult = { findings: [], guards: [reference(record)] };
     for (const input of record.value.inputs) {
       const current = this.store.get(input.id);
-      if (!current || current.revision !== input.revision || current.hash !== input.hash) result.findings.push({ code: "feasibility_stale", target: input.id, message: "An R3 input changed" });
+      if (!current || current.revision !== input.revision || current.hash !== input.hash
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "feasibility_stale", target: input.id, message: "An R3 input changed" });
       else result.guards.push(reference(current));
     }
     const graph = this.store.get<Graph>(`graph:${project}`);

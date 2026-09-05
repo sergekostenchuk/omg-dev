@@ -25,11 +25,11 @@ export function preparedFeatures(engine: ProductEngine, project: string, graph: 
 }
 
 export function refinedLayers(engine: ProductEngine, project: string) {
-  const source = engine.discovery.evidence.document(project, "context", '{"context":{"language":"JavaScript"}}', "application/json", 0);
+  const source = engine.discovery.evidence.file(project, "context", engine.environments.get(project).value.workspace, "README.md", "text/plain", 0);
   for (const [level, layer] of [["R0", 1], ["R1", 2], ["R2", 3]] as const) {
     const draft = engine.refinement.begin(project, level);
     if (level === "R0") engine.discovery.decision(draft.value.questions[0]!, 1, "owner", "Owner receives the produced result; implementation and review are separate roles");
-    else engine.discovery.fact(draft.value.questions[0]!, 1, reference(source), { kind: "json-pointer", pointer: "/context" });
+    else engine.discovery.fact(draft.value.questions[0]!, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
     const current = engine.store.get(draft.id)!;
     engine.refinement.finishResearch(project, level, reference(current), 0);
     engine.refinement.sealLayer(project, layer, 0);

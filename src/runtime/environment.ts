@@ -86,7 +86,12 @@ export class Environments {
     "role_invalid", "Each role needs an identity, model and supported effort");
     executablePath(value.implementer.command, workspace); executablePath(value.reviewer.command, workspace); executablePath(value.fullCheck, workspace);
     requireCondition(value.implementer.actor !== value.reviewer.actor, "reviewer_not_independent", "Implementer and reviewer must differ");
-    return this.store.write<Environment>({ id: `environment:${projectId}`, kind: "environment", expected, value: { ...value, workspace, projectId } });
+    const selected = this.store.get<{ path: string }>(`workspace:${projectId}`);
+    const writes: { id: string; kind: string; expected: number; value: unknown }[] = [
+      { id: `environment:${projectId}`, kind: "environment", expected, value: { ...value, workspace, projectId } },
+    ];
+    if (!selected || selected.value.path !== workspace) writes.push({ id: `workspace:${projectId}`, kind: "workspace", expected: selected?.revision ?? 0, value: { path: workspace } });
+    return this.store.writeMany<Environment>(writes)[0]!;
   }
   get(projectId: string): Revision<Environment> {
     const environment = this.store.get<Environment>(`environment:${projectId}`);

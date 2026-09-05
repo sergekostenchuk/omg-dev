@@ -12,6 +12,14 @@ export interface Source {
 }
 export type Selector = { kind: "json-pointer"; pointer: string } | { kind: "text-range"; start: number; end: number };
 export interface Observation { projectId: string; source: Ref; selector: Selector; value: Json }
+export function sourceIsCurrent(source: Source): boolean {
+  try {
+    if (digest(source.content) !== source.sha256) return false;
+    return source.origin.kind === "owner-document" || (source.origin.kind === "file"
+      && realpathSync(source.origin.location) === source.origin.location
+      && digest(readFileSync(source.origin.location)) === source.sha256);
+  } catch { return false; }
+}
 
 export class Evidence {
   constructor(private readonly store: Store) {}
@@ -43,6 +51,7 @@ export class Evidence {
     requireCondition(source.revision === sourceRef.revision && source.hash === sourceRef.hash,
       "source_stale", "Evidence must reference the current source version");
     requireCondition(digest(source.value.content) === source.value.sha256, "source_corrupt", "Source checksum mismatch");
+    requireCondition(sourceIsCurrent(source.value), "source_stale", "The captured source file has changed or disappeared");
     let value: unknown;
     if (selector.kind === "json-pointer") {
       requireCondition(source.value.mediaType === "application/json", "selector_invalid", "JSON selection requires a JSON source");

@@ -11,7 +11,7 @@ import { REQUIREMENTS, type UpstreamStage } from "./requirements.js";
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision"; prompt: string; risk: string; schema: Json }
 export interface DiscoveryDraft {
-  projectId: string; stage: Stage; level: ResearchLevel; consumer: string;
+  projectId: string; createdAt: number; stage: Stage; level: ResearchLevel; consumer: string;
   fields: Record<string, Json>; questions: string[];
   inputs: Ref[];
 }
@@ -47,7 +47,7 @@ export class Discovery {
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
-    const draft: DiscoveryDraft = { projectId, stage, level, consumer, inputs,
+    const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs,
       fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,

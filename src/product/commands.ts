@@ -16,10 +16,12 @@ export type ProductCommand =
   | { type: "create-project"; project: string; title: string }
   | { type: "prepare-stage"; project: string; stage: UpstreamStage }
   | { type: "source-document"; project: string; id: string; text: string; media: "text/plain" | "application/json"; expected: number }
+  | { type: "source-file"; project: string; id: string; path: string; media: "text/plain" | "application/json"; expected: number }
   | { type: "answer-decision"; question: string; expected: number; value: Json }
   | { type: "answer-fact"; question: string; expected: number; source: Ref; selector: Selector }
   | { type: "reopen-question"; question: string; expected: number }
   | { type: "save-graph"; project: string; expected: number; graph: unknown }
+  | { type: "build-map"; project: string; draftId: string; expected: number }
   | { type: "refine-graph"; project: string; expected: number; draft: Ref }
   | { type: "draft-stage"; project: string; stage: UpstreamStage; draftId: string; expected: number }
   | { type: "accept-stage"; project: string; stage: Stage; expected: number }
@@ -47,6 +49,7 @@ const schema = { oneOf: [
   command("create-project", { project, title: string }),
   command("prepare-stage", { project, stage: { enum: UPSTREAM_STAGES } }),
   command("source-document", { project, id: project, text: { type: "string", maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] }, expected }),
+  command("source-file", { project, id: project, path: string, media: { enum: ["text/plain", "application/json"] }, expected }),
   command("answer-decision", { question: string, expected, value: {} }),
   command("answer-fact", { question: string, expected, source: ref, selector: { oneOf: [
     object({ kind: { const: "json-pointer" }, pointer: { type: "string" } }),
@@ -54,6 +57,7 @@ const schema = { oneOf: [
   ] } }),
   command("reopen-question", { question: string, expected }),
   command("save-graph", { project, expected, graph: { type: "object" } }),
+  command("build-map", { project, draftId: string, expected }),
   command("refine-graph", { project, expected, draft: ref }),
   command("draft-stage", { project, stage: { enum: UPSTREAM_STAGES }, draftId: string, expected }),
   command("accept-stage", { project, stage, expected }),

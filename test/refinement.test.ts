@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/storage/store.js";
@@ -21,17 +21,17 @@ test("R0/L1/R1/L2/R2/L3/R3 checks a real repository without a machine plan or ex
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   preparedFeatures(engine, "garden");
   assert.throws(() => engine.refinement.sealLayer("garden", 1, 0), /preceding refinement phase/);
+  const command = { executable: process.execPath, args: ["--version"] };
+  engine.environments.configure("garden", { workspace,
+    implementer: { actor: "worker", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command },
+    fullCheck: command, timeoutMs: 1000 }, 0);
   refinedLayers(engine, "garden");
   const fake = engine.discovery.create("garden", "om-g2", "R1", "compilation", [
     { field: "anything", kind: "decision", prompt: "Pretend research is complete", risk: "masquerade", schema: { type: "string" } },
   ]);
   const fakeAnswered = engine.discovery.decision(fake.value.questions[0]!, 1, "owner", "ready");
   assert.throws(() => engine.refinement.finishResearch("garden", "R1", reference(fakeAnswered), 1), /phase's contract/);
-  const command = { executable: process.execPath, args: ["--version"] };
-  engine.environments.configure("garden", { workspace,
-    implementer: { actor: "worker", model: "fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command },
-    fullCheck: command, timeoutMs: 1000 }, 0);
   const r3 = engine.refinement.assess("garden", 0);
   assert.equal(r3.value.ready, true); assert.equal(store.list("plan").length, 0); assert.equal(store.list("run").length, 0);
   assert.equal(r3.value.repository!.head, git(workspace, ["rev-parse", "HEAD"]));
@@ -44,4 +44,9 @@ test("R0/L1/R1/L2/R2/L3/R3 checks a real repository without a machine plan or ex
   assert.equal(refused.value.ready, false);
   assert.ok(refused.value.findings.some(f => f.code === "repository_dirty"));
   assert.equal(store.get<Feasibility>(r3.id, 1)!.value.ready, true);
+  unlinkSync(join(workspace, "uncommitted.txt"));
+  writeFileSync(join(workspace, "README.md"), "The repository architecture has changed\n");
+  git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "changed research source"]);
+  assert.throws(() => engine.execute({ type: "assess", project: "garden", expected: 2 }), /preceding refinement phase/);
+  assert.ok(engine.projection("garden").feasibilityGate!.findings.length);
 });

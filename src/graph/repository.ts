@@ -7,6 +7,7 @@ import { requireGraph, validateGraph } from "./validate.js";
 import type { Graph } from "./model.js";
 import { LEVEL } from "./model.js";
 import { projectGraph } from "./project.js";
+import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 
 interface Obligation { node: string; field: string; valueHash: string; inputs: Ref[] }
 interface Binding { graph: Ref; inputs: Ref[]; actor: string; obligations: Obligation[] }
@@ -42,6 +43,14 @@ export class GraphRepository {
     const obligations = (previous?.value.obligations ?? []).filter(item => graph.nodes.some(node => node.id === item.node));
     return this.#write(projectId, graph, expected, actor, obligations);
   }
+  saveDerived(projectId: string, value: unknown, expected: number, actor: string, draftRef: Ref): Revision<Graph> {
+    const graph = requireGraph(value); const checked = this.discovery.gate(projectId, draftRef);
+    requireCondition(checked.findings.length === 0, "research_unresolved", "Map derivation needs current research");
+    const obligations = graph.nodes.flatMap(node => (["title", "outcome", "ports"] as const).map(field => ({
+      node: node.id, field, valueHash: hashJson(node[field]), inputs: checked.guards,
+    })));
+    return this.#write(projectId, graph, expected, actor, obligations, checked.guards);
+  }
   refine(projectId: string, expected: number, draftRef: Ref, actor: string): Revision<Graph> {
     const graph = this.store.get<Graph>(`graph:${projectId}`);
     requireCondition(graph && graph.revision === expected && graph.kind === "graph", "graph_stale", "Graph changed or is missing");
@@ -73,7 +82,8 @@ export class GraphRepository {
     }
     for (const input of layer.value.inputs) {
       const current = this.store.get(input.id);
-      if (!current || current.hash !== input.hash || current.revision !== input.revision) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
+      if (!current || current.hash !== input.hash || current.revision !== input.revision
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
       else result.guards.push(reference(current));
     }
     return result;
@@ -95,7 +105,8 @@ export class GraphRepository {
     }
     for (const input of binding.value.inputs) {
       const current = this.store.get(input.id);
-      if (!current || current.hash !== input.hash || current.revision !== input.revision) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });
+      if (!current || current.hash !== input.hash || current.revision !== input.revision
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });
       else result.guards.push(reference(current));
     }
     return result;
