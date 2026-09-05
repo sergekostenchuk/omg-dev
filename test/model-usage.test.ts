@@ -9,6 +9,7 @@ import { researchCall } from "../src/discovery/research-protocol.js";
 import { codexUsage } from "../src/adapters/codex-usage.js";
 import { modelUsage, tokenUsage, type ModelCall } from "../src/runtime/model-usage.js";
 import type { Environment } from "../src/runtime/environment.js";
+import { runProcess } from "../src/runtime/process.js";
 
 const PROVIDER = `import {readFileSync} from 'node:fs';
 const req=JSON.parse(readFileSync(0,'utf8')),scenario=process.argv[2];
@@ -91,6 +92,7 @@ if(outcome==='failed')process.exitCode=1;`;
       { action: "pause", reason: "Fixture completed" });
     const args = JSON.parse(readFileSync(join(root, "args.json"), "utf8")) as string[];
     assert.ok(args.includes("--json")); assert.ok(args.includes('service_tier="fast"')); assert.ok(args.includes("features.fast_mode=true"));
+    assert.ok(!args.includes("skills.max_context_tokens=1"), "Existing adapter invocations keep their configured context");
     const report = modelUsage(store, "p", 0);
     assert.deepEqual(report.cumulative.reportedTokens, { input: 200, output: 30, cachedInput: 150, reasoningOutput: 10 });
     assert.equal(report.roles[0]!.requestedSpeed, "fast"); assert.deepEqual(report.roles[0]!.confirmedSpeeds, [null]);
@@ -102,5 +104,35 @@ if(outcome==='failed')process.exitCode=1;`;
     const failures = modelUsage(store, "p", 0).cumulative;
     assert.equal(failures.failed, 4); assert.equal(failures.measuredCalls, 5);
     assert.deepEqual(failures.reportedTokens, { input: 1000, output: 150, cachedInput: 750, reasoningOutput: 50 });
+  } finally { if (previousPath === undefined) delete process.env['PATH']; else process.env['PATH'] = previousPath; }
+});
+
+test("compact research is opt-in, retains the exact request, and cannot apply to coding or review", async t => {
+  const { root, store, environment } = fixture(t);
+  const mock = `#!${process.execPath}\nimport {readFileSync,writeFileSync} from 'node:fs';
+const args=process.argv.slice(2);writeFileSync('compact-args.json',JSON.stringify(args));writeFileSync('compact-input.txt',readFileSync(0,'utf8'));
+writeFileSync(args[args.indexOf('-o')+1],JSON.stringify({action:'pause',reason:'Fixture only'}));
+console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:30,output_tokens:5,cached_input_tokens:0,reasoning_output_tokens:0}}));`;
+  writeFileSync(join(root, "codex"), mock, { mode: 0o700 });
+  const previousPath = process.env['PATH']; process.env['PATH'] = `${root}:${previousPath ?? ""}`;
+  try {
+    const adapter = fileURLToPath(new URL("../src/adapters/codex-stdio.js", import.meta.url));
+    const env = environment("normal");
+    env.implementer.command = { executable: process.execPath, args: [adapter, "--compact-research"] };
+    const subject = { condition: "Не менять источники.\r\n😀", source: { id: "exact-source", revision: 3, hash: "a".repeat(64) } };
+    await researchCall(env.implementer, env, "Exact research instruction", subject, undefined, { store, draftId: "draft-p", purpose: "analyst" });
+    const args = JSON.parse(readFileSync(join(root, "compact-args.json"), "utf8")) as string[];
+    for (const setting of ["features.shell_tool=false", 'web_search="disabled"', "skills.max_context_tokens=1", "--json", 'service_tier="fast"']) assert.ok(args.includes(setting));
+    for (const forbidden of ["--ignore-user-config", "project_doc_max_bytes=0", "danger-full-access"]) assert.ok(!args.includes(forbidden));
+    assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
+    const sent = readFileSync(join(root, "compact-input.txt"), "utf8");
+    assert.ok(sent.endsWith("Exact research instruction\nSubject:\n" + JSON.stringify(subject)));
+    assert.equal(store.list<ModelCall>("model-call")[0]!.value.usage!.inputTokens, 30);
+    for (const mode of ["implement", "review", "chat"]) {
+      const result = await runProcess(env.implementer.command, root, JSON.stringify({ protocol: "omg-agent/v1", requestId: "probe",
+        mode, model: "fixture", effort: "high", prompt: "No dispatch permitted" }), 3000);
+      assert.notEqual(result.exitCode, 0); assert.match(result.stderr, /adapter_mode_invalid/);
+      assert.equal(readFileSync(join(root, "compact-input.txt"), "utf8"), sent, "Rejected mode never reaches the provider");
+    }
   } finally { if (previousPath === undefined) delete process.env['PATH']; else process.env['PATH'] = previousPath; }
 });

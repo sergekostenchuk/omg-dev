@@ -7,11 +7,16 @@ import { codexUsage } from "./codex-usage.js";
 import type { TokenUsage } from "../runtime/model-usage.js";
 
 async function main() {
+  const options = process.argv.slice(2);
+  requireCondition(options.length === 0 || (options.length === 1 && options[0] === "--compact-research"),
+    "adapter_option_invalid", "Supported option: --compact-research");
+  const compactResearch = options[0] === "--compact-research";
   const request = JSON.parse(readFileSync(0, "utf8")) as { protocol: string; requestId: string; mode: string; model: string; effort: string; speed?: string; prompt: string; subject?: unknown };
   requireCondition(request.protocol === "omg-agent/v1" && ["chat", "research", "implement", "review"].includes(request.mode)
     && typeof request.requestId === "string" && typeof request.prompt === "string" && typeof request.model === "string"
     && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(request.effort)
     && (request.speed === undefined || ["inherited", "fast"].includes(request.speed)), "adapter_input_invalid", "Invalid agent request");
+  requireCondition(!compactResearch || request.mode === "research", "adapter_mode_invalid", "Compact research is only for the engine-managed research protocol");
   const directory = mkdtempSync(join(tmpdir(), "omg-codex-"));
   let usage: TokenUsage | null = null;
   try {
@@ -19,6 +24,10 @@ async function main() {
     const args = ["exec", "--json", "--ephemeral", "--color", "never", "--sandbox", request.mode === "implement" ? "workspace-write" : "read-only",
       "-m", request.model, "-c", `model_reasoning_effort=${JSON.stringify(request.effort)}`, "-o", output];
     if (request.speed === "fast") args.push("-c", 'service_tier="fast"', "-c", "features.fast_mode=true");
+    // The engine supplies all context and executes requested reads. Keep the
+    // user's login, project instructions and remaining configuration intact.
+    if (compactResearch) args.push("-c", "features.shell_tool=false", "-c", 'web_search="disabled"',
+      "-c", "skills.max_context_tokens=1");
     if (request.mode === "review") {
       const schema = { type: "object", additionalProperties: false, required: ["verdict", "kind", "findings"], properties: {
         verdict: { type: "string", enum: ["pass", "request_changes"] }, kind: { type: "string", enum: ["none", "code", "plan"] },
