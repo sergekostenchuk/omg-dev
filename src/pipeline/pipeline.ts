@@ -63,7 +63,7 @@ export class Pipeline {
       else guards.push(reference(current));
     }
     if (findings.length) return { stage, state: artifact.value.status === "accepted" ? "stale" : "blocked", artifact, findings, guards: uniqueRefs(guards) };
-    const validation = this.validators[stage]({ projectId, content: artifact.value.content, inputs });
+    const validation = this.validators[stage]({ projectId, content: artifact.value.content, inputs, accepted: artifact.value.status === "accepted" });
     findings.push(...validation.findings);
     guards.push(...validation.guards);
     const state = findings.length ? (artifact.value.status === "accepted" ? "stale" : "blocked") : artifact.value.status;

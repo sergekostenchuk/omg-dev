@@ -3,7 +3,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -18,6 +18,8 @@ import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 
 import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
+
+import { preparationFindings } from "../discovery/preparation-validation.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -58,9 +60,19 @@ export class ProductEngine {
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
     const result = this.discovery.gate(context.projectId, content.draft);
-    const expected = REQUIREMENTS[stage as UpstreamStage];
+    const legacy = draft.value.contractVersion === undefined;
+    if ((legacy && !context.accepted) || (!legacy && draft.value.contractVersion !== RESEARCH_CONTRACT_VERSION))
+      result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
+    const expected = (legacy ? LEGACY_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
+    if (!legacy && result.findings.length === 0) {
+      const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
+      result.findings.push(...preparationFindings(stage, content.fields, name => {
+        const source = this.store.get<StageArtifact>(stageId(context.projectId, name));
+        return (source?.value.content as unknown as StageContent | undefined)?.fields ?? null;
+      }, outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
+    }
     const prior = context.inputs[0];
     if (prior && !draft.value.inputs.some(input => input.id === prior.id && input.hash === prior.hash && input.revision === prior.revision)) result.findings.push({ code: "research_context_stale", target: stage, message: "Research must bind the accepted prerequisite used by this stage" });
     if (stage === "operation-map") {
@@ -103,6 +115,8 @@ export class ProductEngine {
     const draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.stage === stage && draft.value.projectId === project,
       "discovery_foreign", "Research must belong to this project and stage");
+    requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required",
+      "Prepare enriched research before creating a new stage result; previous accepted versions remain historical");
     const layer = stage === "operation-map" ? this.store.get(`graph-layer:${project}:1`) : null;
     const content = { draft: reference(draft), fields: draft.value.fields, graph: layer ? reference(layer) : null };
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);

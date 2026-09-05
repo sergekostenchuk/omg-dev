@@ -18,6 +18,7 @@ export interface GateContext {
   projectId: string;
   content: Json;
   inputs: ReadonlyArray<Revision<StageArtifact>>;
+  accepted?: boolean;
 }
 export interface GateResult { findings: Finding[]; guards: Ref[] }
 export type StageValidator = (context: GateContext) => GateResult;

@@ -6,15 +6,16 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
-import { REQUIREMENTS, type UpstreamStage } from "./requirements.js";
+import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "./requirements.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
-export interface FieldSpec { field: string; kind: "fact" | "decision"; prompt: string; risk: string; schema: Json }
+export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment" }
 export interface DiscoveryDraft {
   projectId: string; createdAt: number; stage: Stage; level: ResearchLevel; consumer: string;
   fields: Record<string, Json>; questions: string[];
   inputs: Ref[];
+  contractVersion?: number;
 }
 export interface Question {
   projectId: string; draftId: string; stage: Stage; level: ResearchLevel; consumer: string;
@@ -30,9 +31,9 @@ export class Discovery {
   constructor(private readonly store: Store) { this.evidence = new Evidence(store); }
   forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = []): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
-    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage], inputs);
+    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage], inputs, RESEARCH_CONTRACT_VERSION);
   }
-  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = []): Revision<DiscoveryDraft> {
+  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = [], contractVersion?: number): Revision<DiscoveryDraft> {
     requireCondition(STAGES.includes(stage) && ["R0", "R1", "R2", "R3"].includes(level) && typeof consumer === "string"
       && consumer.trim() && Array.isArray(specs) && specs.length > 0,
       "question_unbound", "Discovery needs a level, consumer and explicit questions");
@@ -41,14 +42,15 @@ export class Discovery {
       "consumer_missing", "The research consumer must be an existing stage or graph node");
     requireCondition(specs.every(spec => spec && typeof spec === "object" && typeof spec.field === "string" && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(spec.field)
       && !["constructor", "prototype", "__proto__"].includes(spec.field)
-      && ["fact", "decision"].includes(spec.kind) && typeof spec.prompt === "string" && spec.prompt.trim()
+      && ["fact", "decision", "design"].includes(spec.kind) && (spec.proof === undefined || ["extraction", "assessment"].includes(spec.proof))
+      && typeof spec.prompt === "string" && spec.prompt.trim()
       && typeof spec.risk === "string" && spec.risk.trim() && Object.hasOwn(spec, "schema"))
       && new Set(specs.map(spec => spec.field)).size === specs.length, "question_invalid", "Questions need unique fields, a type, prompt and risk");
     for (const spec of specs) ajv.compile(spec.schema as object);
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
-    const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs),
+    const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs), ...(contractVersion === undefined ? {} : { contractVersion }),
       fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
@@ -62,7 +64,7 @@ export class Discovery {
     requireCondition(question.value.status !== "answered", "question_already_answered", "Reopen the question before changing an answer");
     return question;
   }
-  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "fact" | "research-answer", guards: Ref[]): Revision<DiscoveryDraft> {
+  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "design" | "fact" | "research-answer", guards: Ref[]): Revision<DiscoveryDraft> {
     const q = question.value; const draft = this.store.get<DiscoveryDraft>(q.draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.projectId === q.projectId
       && draft.value.questions.includes(question.id), "question_unbound", "Question must belong to this draft");
@@ -80,13 +82,14 @@ export class Discovery {
   }
   decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
-    requireCondition(question.value.spec.kind === "decision", "fact_requires_evidence", "An owner's choice cannot confirm a factual question");
+    requireCondition(question.value.spec.kind === "decision" || question.value.spec.kind === "design", "fact_requires_evidence", "An owner's choice cannot confirm a factual question");
     requireCondition(typeof actor === "string" && actor.trim(), "actor_missing", "Decision needs an owner identity");
-    return this.#answer(question, value, { projectId: question.value.projectId, actor, question: id, value }, "decision", []);
+    return this.#answer(question, value, { projectId: question.value.projectId, actor, question: id, value }, question.value.spec.kind, []);
   }
   fact(id: string, expected: number, source: Ref, selector: Selector): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
     requireCondition(question.value.spec.kind === "fact", "decision_required", "A preference requires an owner decision");
+    requireCondition(question.value.spec.proof !== "assessment", "research_assessment_required", "This factual question needs research and an assessment, not just copied source bytes");
     const observation = this.evidence.observe(question.value.projectId, source, selector);
     return this.#answer(question, observation.value, { projectId: question.value.projectId, question: id, observation }, "fact", [source]);
   }

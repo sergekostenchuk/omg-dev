@@ -1,11 +1,12 @@
 import type { FieldSpec } from "./discovery.js";
+import { UPSTREAM_DETAILS } from "./preparation-contracts.js";
 
 const text = { type: "string", minLength: 1 };
 const texts = { type: "array", minItems: 1, uniqueItems: true, items: text };
 export const UPSTREAM_STAGES = ["discovery", "concept", "operation-map", "specification", "features"] as const;
 export type UpstreamStage = typeof UPSTREAM_STAGES[number];
 // The same contracts generate research questions and validate their resulting stage fields.
-export const REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = {
+export const LEGACY_REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = {
   discovery: [
     { field: "brief", kind: "fact", prompt: "Какой исходный текст описывает задачу? Выберите его в источнике.", risk: "Нет проверяемого исходного поручения", schema: text },
     { field: "objective", kind: "decision", prompt: "Какой результат вы хотите получить?", risk: "Не выбрана цель продукта", schema: text },
@@ -30,3 +31,7 @@ export const REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = {
     } },
   ],
 };
+export const RESEARCH_CONTRACT_VERSION = 2;
+export const REQUIREMENTS = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
+  [...LEGACY_REQUIREMENTS[stage].map(spec => ({ ...spec, kind: spec.kind === "decision" && spec.field !== "objective" ? "design" as const : spec.kind })), UPSTREAM_DETAILS[stage]],
+])) as Record<UpstreamStage, FieldSpec[]>;

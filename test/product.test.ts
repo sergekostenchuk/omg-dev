@@ -10,6 +10,7 @@ import { UPSTREAM_STAGES } from "../src/discovery/requirements.js";
 import type { DiscoveryDraft } from "../src/discovery/discovery.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { exampleGraph } from "./graph-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
 
 test("the real product command path carries two independent products from brief to traceable features and cold reopen", t => {
   const root = mkdtempSync(join(tmpdir(), "omg-product-")); const path = join(root, "state.sqlite"); const store = new Store(path);
@@ -28,8 +29,7 @@ test("the real product command path carries two independent products from brief 
           source: reference(source), selector: { kind: "text-range", start: 0, end: `A brief for ${project}`.length } });
         else {
           const field = question.value.spec.field;
-          const value = field === "features" ? [{ title: "Deliver result", outcome: `${project}-result`, requirements: [0] }]
-            : ["acceptance", "journey", "behavior", "constraints"].includes(field) ? [`${field} for ${project}`] : `${field} for ${project}`;
+          const value = preparedField(project, field);
           engine.execute({ type: "answer-decision", question: id, expected: 1, value });
         }
       }
@@ -70,6 +70,7 @@ test("unrelated research cannot approve a stage and research retains the input v
   const initial = engine.prepare("demo", "discovery");
   engine.discovery.fact(initial.value.questions[0]!, 1, reference(source), { kind: "text-range", start: 0, end: 5 });
   engine.discovery.decision(initial.value.questions[1]!, 1, "owner", "Outcome");
+  engine.discovery.decision(initial.value.questions[2]!, 1, "owner", preparedField("demo", "preparation"));
   const artifact = engine.draft("demo", "discovery", initial.id, 0);
   engine.pipeline.accept("demo", "discovery", artifact.revision);
   assert.throws(() => engine.draft("demo", "concept", initial.id, 0), /Research must belong/);

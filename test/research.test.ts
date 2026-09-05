@@ -8,17 +8,19 @@ import { ProductEngine } from "../src/product/engine.js";
 import { reference } from "../src/pipeline/contracts.js";
 import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
 import type { FieldSpec } from "../src/discovery/discovery.js";
+import { researchInput } from "./preparation-fixture.js";
 
 // Protocol fixture, not a claim of live-model research quality. The assessor's
 // controlled responses let the test isolate whether the engine enforces them.
 const ADAPTER = `import {readFileSync,appendFileSync,existsSync,writeFileSync} from 'node:fs';
+import {isDeepStrictEqual} from 'node:util';
 const req=JSON.parse(readFileSync(0,'utf8')), c=req.subject, scenario=process.argv[2];
 appendFileSync(process.argv[3],c.role+'\\n');
 if(scenario==='failure') {process.stderr.write('provider unavailable');process.exit(1)}
 const reply=research=>console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research}));
 if(c.role==='assess-answer') {
  if(scenario==='assessor-retry'&&!existsSync(process.argv[3]+'.retry')) {writeFileSync(process.argv[3]+'.retry','started');process.stderr.write('assessor unavailable');process.exit(1)}
- const same=c.observations.some(o=>JSON.stringify(o.value)===JSON.stringify(c.value));
+ const same=c.observations.some(o=>isDeepStrictEqual(o.value,c.value));
  reply({verdict:scenario==='irrelevant'||!same?'insufficient':'supported',reasons:scenario==='irrelevant'||!same?['The source does not support this requested property']:[]});
 } else if(c.role==='assess-escalation') {
  if(scenario==='race') {writeFileSync(process.argv[3]+'.awaiting','started');await new Promise(resolve=>setTimeout(resolve,300));}
@@ -31,7 +33,9 @@ if(c.role==='assess-answer') {
   else reply({action:'need_owner',question:q.id,reason:'Missing owner destination',searched:[source.ref]});
  } else if(scenario==='pause-first' && !c.history.length) reply({action:'read_source',source:source.ref,start:0,end:source.length});
  else {
-  const values=JSON.parse(source.excerpt);
+  const full=c.history.find(t=>t.action.action==='read_source'&&t.action.source.hash===source.ref.hash&&t.action.start===0&&t.action.end===source.length);
+  if(source.truncated&&!full) {reply({action:'read_source',source:source.ref,start:0,end:source.length});process.exit(0)}
+  const values=JSON.parse(full?full.observation.value:source.excerpt);
   reply({action:'answer',question:q.id,value:values[q.field],citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field}}]});
  }
 }`;
@@ -56,10 +60,10 @@ test("research command connects a process provider, evidence assessment and down
   const { store, engine, configure } = fixture(t);
   for (const project of ["garden", "inventory"]) {
     configure(project);
-    engine.discovery.evidence.document(project, "brief", JSON.stringify({ brief: `Existing request for ${project}`, objective: `Deliver ${project} outcome` }), "application/json", 0);
+    engine.discovery.evidence.document(project, "brief", researchInput(project), "application/json", 0);
     const draft = engine.prepare(project, "discovery");
     const run = await engine.execute({ type: "research-draft", project, draftId: draft.id, maxTurns: 4 }) as { value: ResearchRun };
-    assert.equal(run.value.status, "completed"); assert.equal(run.value.ownerQuestion, null);
+    assert.equal(run.value.status, "completed", JSON.stringify(run.value)); assert.equal(run.value.ownerQuestion, null);
     const content = engine.draft(project, "discovery", draft.id, 0);
     engine.pipeline.accept(project, "discovery", content.revision);
     assert.equal(engine.pipeline.inspect(project, "discovery").state, "accepted");
@@ -70,7 +74,7 @@ test("research command connects a process provider, evidence assessment and down
     const reused = await engine.researcher.run(project, next.id, 4);
     assert.equal(reused.value.status, "completed"); assert.equal(reused.value.turns, 0);
     assert.equal(store.list("research-turn").length, count, "The same stage questions and input versions reuse assessed evidence");
-    engine.discovery.evidence.document(project, "brief", JSON.stringify({ brief: "Changed source", objective: "Changed owner intent" }), "application/json", 1);
+    engine.discovery.evidence.document(project, "brief", researchInput(project, "Changed source", "Changed owner intent"), "application/json", 1);
     assert.equal(engine.pipeline.inspect(project, "discovery").state, "stale");
     const refreshed = await engine.researcher.run(project, draft.id, 4);
     assert.equal(refreshed.value.status, "completed", "Only answers with changed evidence are reopened and researched");
@@ -79,14 +83,14 @@ test("research command connects a process provider, evidence assessment and down
 
 test("bounded research resumes without erasing answers or escalating an exhausted allowance to the owner", async t => {
   const { engine, configure } = fixture(t, "pause-first"); configure("p");
-  engine.discovery.evidence.document("p", "brief", JSON.stringify({ brief: "Input", objective: "Owner outcome" }), "application/json", 0);
+  engine.discovery.evidence.document("p", "brief", researchInput("p", "Input", "Owner outcome"), "application/json", 0);
   const draft = engine.prepare("p", "discovery");
   const first = await engine.researcher.run("p", draft.id, 1);
   assert.equal(first.value.status, "paused"); assert.equal(first.value.ownerQuestion, null);
   const second = await engine.researcher.run("p", draft.id, 1);
   assert.equal(second.value.status, "paused");
   const answered = engine.store.get(draft.value.questions[0]!)!;
-  const third = await engine.researcher.run("p", draft.id, 1);
+  const third = await engine.researcher.run("p", draft.id, 2);
   assert.equal(third.value.status, "completed");
   assert.equal(engine.store.get(answered.id)!.revision, answered.revision);
 });
@@ -125,15 +129,15 @@ test("provider failure preserves unresolved work and is not an owner question", 
 
 test("a proposed answer survives assessor outage and resumes assessment without calling its researcher again", async t => {
   const { engine, configure, store, root } = fixture(t, "assessor-retry"); configure("p");
-  engine.discovery.evidence.document("p", "brief", JSON.stringify({ brief: "Input", objective: "Owner outcome" }), "application/json", 0);
+  engine.discovery.evidence.document("p", "brief", researchInput("p", "Input", "Owner outcome"), "application/json", 0);
   const draft = engine.prepare("p", "discovery"); const first = await engine.researcher.run("p", draft.id, 4);
   assert.equal(first.value.status, "paused");
-  const candidate = store.list<ResearchTurn>("research-turn")[0]!;
+  const candidate = store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
   assert.equal(candidate.value.status, "pending");
   assert.equal((candidate.value.action as { value: string }).value, "Input");
   const second = await engine.researcher.run("p", draft.id, 4);
   assert.equal(second.value.status, "completed");
-  assert.equal(readFileSync(join(root, "calls.txt"), "utf8").split("\n").filter(role => role === "research").length, 2);
+  assert.equal(readFileSync(join(root, "calls.txt"), "utf8").split("\n").filter(role => role === "research").length, draft.value.questions.length + 1);
   assert.equal(store.get<ResearchTurn>(candidate.id)!.value.status, "completed");
 });
 
