@@ -5,6 +5,7 @@ import type { Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { deferredGap, REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
 import type { PlanDefect } from "../graph/plan-defects.js";
+import { projectGraph } from "../graph/project.js";
 
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
@@ -21,7 +22,8 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
     for (const [name, value] of Object.entries(fields)) {
       if (name === "preparation" && value && typeof value === "object") {
         const preparation = value as Record<string, unknown>;
-        identities[name] = { actors: preparation['actors'], outcomes: preparation['outcomes'], constraints: preparation['constraints'] };
+        identities[name] = { actors: preparation['actors'], outcomes: preparation['outcomes'], constraints: preparation['constraints'],
+          ...(draft.stage === "operation-map" ? { journeys: preparation['journeys'] } : {}) };
       } else if (name === "conceptSections" && Array.isArray(value)) identities[name] = value;
     }
     return { ref: reference(record), stage: record.value.stage, fields: record === latest ? fields : identities };
@@ -29,6 +31,11 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
 }
 
 export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
+  if (draft.stage === "operation-map") {
+    const graph = store.get<Graph>(`graph:${draft.projectId}`);
+    return graph ? { ref: reference(graph), level: 1, graph: projectGraph(graph.value, 1),
+      currentHorizon: [], research: [], failures: [], previousResearch: null, openGaps: [] } : null;
+  }
   if (draft.stage !== "om-g2" || draft.level === "R0") return null;
   const level = draft.level === "R1" ? 1 : 2;
   const layer = store.get<{ projection: Graph }>(`graph-layer:${draft.projectId}:${level}`);

@@ -5,12 +5,15 @@ type Row = Record<string, any>;
 export function preparationFindings(stage: Stage, fields: Record<string, Json>, upstream: (stage: Stage) => Record<string, Json> | null,
   graphOutcomes: string[]): Finding[] {
   const findings: Finding[] = [];
-  const fail = (code: string, target: string, message: string) => findings.push({ code, target, message });
+  const fieldsByStage: Partial<Record<Stage, string>> = { discovery: "preparation", concept: "conceptSections", "operation-map": "operationRequirements",
+    specification: "behaviorContracts", features: "featurePreparation" };
+  const field = fieldsByStage[stage];
+  const fail = (code: string, target: string, message: string) => findings.push({ code, target, message, ...(field ? { field } : {}) });
   const unique = (rows: Row[], label: string) => {
     if (new Set(rows.map(row => row['id'])).size !== rows.length) fail("preparation_duplicate", label, "Semantic identifiers must be unique");
   };
   const preparation = (stage === "discovery" ? fields['preparation'] : upstream("discovery")?.['preparation']) as Row | undefined;
-  if (!preparation) { fail("preparation_missing", stage, "Enriched initial research is required for new work"); return findings; }
+  if (!preparation) { findings.push({ code: "preparation_missing", target: stage, message: "Enriched initial research is required for new work" }); return findings; }
   const actors = preparation['actors'] as Row[], outcomes = preparation['outcomes'] as Row[];
   if (stage === "discovery") {
     unique(actors, "actors"); unique(outcomes, "outcomes");
@@ -26,7 +29,7 @@ export function preparationFindings(stage: Stage, fields: Record<string, Json>, 
     return findings;
   }
   const sections = (stage === "concept" ? fields['conceptSections'] : upstream("concept")?.['conceptSections']) as Row[] | undefined;
-  if (!sections) { fail("concept_requirements_missing", stage, "Addressable concept requirements are required"); return findings; }
+  if (!sections) { findings.push({ code: "concept_requirements_missing", target: stage, message: "Addressable concept requirements are required" }); return findings; }
   const requirements = sections.flatMap(section => section['requirements'] as Row[]);
   if (stage === "concept") {
     unique(sections, "conceptSections"); unique(requirements, "conceptRequirements");

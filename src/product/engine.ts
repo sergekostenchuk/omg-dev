@@ -24,6 +24,7 @@ import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
 import { PlanRepairs } from "./repairs.js";
+import { StageResearch } from "./stage-research.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -37,6 +38,7 @@ export class ProductEngine {
   readonly executor: Executor;
   readonly researcher: Researcher;
   readonly repairs: PlanRepairs;
+  readonly stageResearch: StageResearch;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
@@ -47,6 +49,7 @@ export class ProductEngine {
     this.executor = new Executor(store, this.compiler, this.environments);
     this.researcher = new Researcher(store, this.discovery, this.environments);
     this.repairs = new PlanRepairs(this);
+    this.stageResearch = new StageResearch(this);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
@@ -111,13 +114,13 @@ export class ProductEngine {
       if (!Array.isArray(features) || !Array.isArray(behavior) || !graph) result.findings.push({ code: "feature_binding_missing", target: stage, message: "Features require a specification and operation map" });
       else for (const raw of features) {
         const feature = raw as { title: string; outcome: string; requirements: number[] };
-        if (!graph.value.projection.artifacts.some(artifact => artifact.id === feature.outcome)) result.findings.push({ code: "feature_outcome_missing", target: feature.title, message: "Feature outcome must exist in the operation map" });
+        if (!graph.value.projection.artifacts.some(artifact => artifact.id === feature.outcome)) result.findings.push({ code: "feature_outcome_missing", target: feature.title, field: "features", message: "Feature outcome must exist in the operation map" });
         for (const index of feature.requirements) {
-          if (!Number.isSafeInteger(index) || index < 0 || index >= behavior.length) result.findings.push({ code: "feature_requirement_missing", target: feature.title, message: "Feature refers to a nonexistent requirement" });
+          if (!Number.isSafeInteger(index) || index < 0 || index >= behavior.length) result.findings.push({ code: "feature_requirement_missing", target: feature.title, field: "features", message: "Feature refers to a nonexistent requirement" });
           else covered.add(index);
         }
       }
-      if (Array.isArray(behavior) && covered.size !== behavior.length) result.findings.push({ code: "requirement_uncovered", target: stage, message: "Every specified behavior needs a feature" });
+      if (Array.isArray(behavior) && covered.size !== behavior.length) result.findings.push({ code: "requirement_uncovered", target: stage, field: "features", message: "Every specified behavior needs a feature" });
       const layer = this.graphs.layerGate(context.projectId, 1); result.findings.push(...layer.findings); result.guards.push(...layer.guards);
     }
     return result;
@@ -178,6 +181,7 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
       case "execute-plan": this.#project(command.project); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };

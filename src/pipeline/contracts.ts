@@ -4,7 +4,7 @@ import type { Revision } from "../storage/store.js";
 export const STAGES = ["discovery", "concept", "operation-map", "specification", "features", "om-g2", "compilation", "execution"] as const;
 export type Stage = typeof STAGES[number];
 export type StageState = "missing" | "draft" | "blocked" | "accepted" | "stale";
-export interface Finding { code: string; target: string; message: string }
+export interface Finding { code: string; target: string; message: string; field?: string }
 export interface Ref { id: string; revision: number; hash: string }
 export interface StageArtifact {
   projectId: string;
