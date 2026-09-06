@@ -14,6 +14,7 @@ export interface TechnicalReport {
   facts: { id: string; claim: string; path: string }[];
   designs: { id: string; decision: string; benefit: string; consumer: string }[];
   gaps: TechnicalGap[];
+  coverage?: { obligation: string; facts: string[]; designs: string[]; gaps: string[] }[];
 }
 export function deferredGap(graph: Graph, gap: TechnicalGap): boolean {
   if (gap.requiredFor !== "next") return false;

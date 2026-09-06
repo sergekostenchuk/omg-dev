@@ -2,7 +2,7 @@ import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import { planningContext } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
 
@@ -64,7 +64,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   if (body['dispatchMode'] === "planning") return planningContext(body, reference(archive), maxChars);
-  const mandatory = ["role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
   const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
   packet.working = { archive: reference(archive), instruction,
@@ -78,7 +78,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     packet.history = body['history'] ?? [];
   }
   const length = () => JSON.stringify(packet).length;
-  requireCondition(length() <= maxChars, "pilot_core_limit", "Required intent, constraints or candidate exceed the request limit; split the research question, do not raise the ceiling");
+  if (length() > maxChars) throw new EngineError("pilot_core_limit", "Required intent, constraints or candidate exceed the working limit", { required: length() });
   const add = (key: string, v: unknown) => {
     const prior = packet[key]; packet[key] = v;
     if (length() <= maxChars - 512) return true;
@@ -87,7 +87,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   };
   // Reserve room for the addresses even when a value cannot be included.
   packet.working.omitted = Object.keys(body).filter(key => !mandatory.includes(key));
-  requireCondition(length() <= maxChars, "pilot_core_limit", "Required context index exceeds the request limit");
+  if (length() > maxChars) throw new EngineError("pilot_core_limit", "Required context index exceeds the working limit", { required: length() });
   const isAssessor = Object.hasOwn(body, "assessmentState");
   packet.working.maxPageChars = Math.max(1, maxChars - length() - 512);
   if (body['synthesisState']) {
@@ -105,8 +105,11 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       packet.synthesisPage.end = index + 1;
       packet.synthesisPage.complete = index + 1 === materials.length;
     }
-    requireCondition(packet.synthesisPage.end > offset || offset === materials.length,
-      "synthesis_material_limit", "This material needs a smaller addressed page; the complete original is at /body/synthesisMaterials");
+    if (packet.synthesisPage.end === offset && offset !== materials.length) {
+      const first = materials[offset];
+      const minimal = { ...packet, ...(first.kind === "reader" ? { readings: [first.value] } : { selectedContext: [first.value] }) };
+      throw new EngineError("synthesis_material_limit", "One addressed material does not fit beside mandatory context", { required: JSON.stringify(minimal).length + 512 });
+    }
     requireCondition(length() <= maxChars, "pilot_request_limit", "The synthesis page exceeds its fixed limit");
     return packet;
   }

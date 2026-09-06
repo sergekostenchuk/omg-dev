@@ -27,7 +27,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const draft = store.get<DiscoveryDraft>(question.value.draftId);
   requireCondition(draft?.kind === "discovery-draft", "draft_missing", "The research context is missing");
   requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor, "assessor_not_independent", "Research assessment requires a separate actor");
-  if (pilot && draft.value.consumer === "compilation") {
+  if (draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) && draft.value.consumer === "compilation") {
     const graph = store.get<Graph>(`graph:${draft.value.projectId}`)!;
     const findings = technicalProposalFindings(store, draft.value.projectId, draft.value.level, question.id, question.value.spec.field,
       action.value as unknown as TechnicalReport, observations, graph.value, root);
@@ -37,7 +37,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const pilotPacket = pilot ? pilotContext(store, draft, question) : null;
   const context = pilotPacket ? { ...pilotPacket, role: "assess-answer", question: question.value.spec,
     sourceLocations: observations.map(o => ({ source: o.source, location: store.get<any>(o.source.id)!.value.origin.location })),
-    value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value) : action.value,
+    value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations, consumerFeedback: consumerFeedback(store, draft.value) }
     : { role: "assess-answer", question: question.value.spec, value: action.value, observations,

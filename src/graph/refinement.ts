@@ -1,3 +1,4 @@
+import { researchScope, scopedQuestions, scopeDefersGap } from "./research-scope.js";
 import { Store, type Revision } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
 import { GraphRepository } from "./repository.js";
@@ -60,6 +61,8 @@ export class Refinement {
       .filter(gap => !graph || !deferredGap(graph.value, gap));
   }
   #questions(project: string, level: "R1" | "R2", imported: Ref[] = [], grouping: "target" | "target-field" = "target"): FieldSpec[] {
+    const scope = level === "R2" ? researchScope(this.store, project) : null;
+    if (scope) return scopedQuestions(scope.value, defectGaps(this.store, project, imported), grouping);
     return refinementQuestions(level, [...(level === "R2" ? this.#gaps(project) : []), ...defectGaps(this.store, project, imported)], grouping);
   }
   #matchesQuestions(project: string, level: "R1" | "R2", specs: unknown, imported: Ref[]): boolean {
@@ -72,6 +75,8 @@ export class Refinement {
     assertPilotBoundary(this.store, project, level);
     requireCondition(["R0", "R1", "R2"].includes(level), "phase_invalid", "Use the feasibility checker for R3");
     const inputs = this.#inputs(project, level);
+    const scope = level === "R2" ? researchScope(this.store, project) : null;
+    if (scope) inputs.push(reference(scope));
     if (level === "R0") return derivedDraft(this.store, project, "om-g2", level, "compilation", this.#r0Entries(project), inputs, REFINEMENT_CONTRACT_VERSION);
     const effective = this.environments.effective(project);
     const workspace = this.store.get(`workspace:${project}`)!;
@@ -81,7 +86,8 @@ export class Refinement {
   finishResearch(project: string, level: Exclude<ResearchLevel, "R3">, draftRef: Ref, expected: number): Revision<Milestone> {
     assertPilotBoundary(this.store, project, level);
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
-    const inputs = uniqueRefs([...this.#inputs(project, level), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
+    const scope = level === "R2" ? researchScope(this.store, project) : null;
+    const inputs = uniqueRefs([...this.#inputs(project, level), ...(scope ? [reference(scope)] : []), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
     requireCondition(checked.findings.length === 0, "research_unresolved", "Research is unresolved or stale");
     const draft = this.store.get<DiscoveryDraft>(draftRef.id)!;
     requireCondition(draft.value.level === level && draft.value.stage === "om-g2" && draft.value.consumer === "compilation", "research_foreign", "Research belongs to a different refinement phase");
@@ -130,6 +136,8 @@ export class Refinement {
     requireCondition(graph?.value.version === 2, "graph_upgrade_required", "Layer research needs the enriched operation map");
     const effective = this.environments.effective(project);
     const upper = this.store.get(`graph-layer:${project}:${level - 1}`)!;
+    const scope = level === 3 ? researchScope(this.store, project) : null;
+    if (scope) inputs.push(reference(scope));
     return this.discovery.create(project, "om-g2", level === 2 ? "R1" : "R2", graph.value.nodes.find(node => node.kind === "product")!.id,
       [layerDesignSpec(level)], uniqueRefs([...inputs, reference(upper), ...effective.guards]), LAYER_DESIGN_VERSION);
   }
@@ -165,7 +173,7 @@ export class Refinement {
           code: "research_horizon_changed", target: "R2", message: "Current horizon requires research obligations absent from the accepted R2 result" });
         const graph = this.store.get<Graph>(`graph:${project}`);
         if (draft && graph) for (const gap of Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)) {
-          if (!deferredGap(graph.value, gap)) result.findings.push({ code: "research_horizon_changed", target: gap.id,
+          if (!scopeDefersGap(this.store, project, gap) && !deferredGap(graph.value, gap)) result.findings.push({ code: "research_horizon_changed", target: gap.id,
             message: "A gap reported by R2 is now required by the current horizon and must be resolved" });
         }
       }

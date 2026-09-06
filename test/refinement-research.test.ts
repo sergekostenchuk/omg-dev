@@ -13,6 +13,7 @@ import { layerDesignOf } from "../src/graph/layer-design.js";
 import { reference } from "../src/pipeline/contracts.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import type { ConsumerResult } from "../src/discovery/consumer-research.js";
+import type { ResearchTurn } from "../src/discovery/research-model.js";
 import type { ConsumerFeedback } from "../src/discovery/consumer-feedback.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
 
@@ -24,7 +25,7 @@ let research;
 if(process.argv[3]==='fail')process.exit(1);
 if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else {
- const q=c.questions[0],source=c.inventory.sources.find(s=>s.kind==='file'),feedback=c.consumerFeedback.some(f=>f.findings.some(x=>x.field===q.field));
+ const q=c.questions.find(q=>!['runtime','contractsAndConsumers'].includes(q.field))??c.questions[0],source=c.inventory.sources.find(s=>s.kind==='file'),feedback=c.consumerFeedback.some(f=>f.findings.some(x=>x.field===q.field))||c.history.some(t=>t.error&&t.action?.question===q.id);
  let value;
  if(q.field==='layerDesign') {
   value=JSON.parse(readFileSync(process.argv[2],'utf8'))[c.level==='R1'?'2':'3'];
@@ -69,10 +70,15 @@ test("R1/R2 and L2/L3 consumers autonomously correct only rejected fields for tw
       assert.equal(result.status, "accepted", JSON.stringify(result));
       assert.deepEqual(engine.refinement.gate(project, phase).findings, []);
       const feedback = store.list<ConsumerFeedback>("research-feedback").filter(item => item.value.draft.id === draft.id);
-      assert.equal(feedback.length, 1);
-      assert.ok(feedback[0]!.value.findings.some(finding => phase.startsWith("L") ? finding.code === "upper_layer_drift"
-        : finding.code === "repository_evidence_required"));
-      const affected = new Set(feedback[0]!.value.questions.map(ref => ref.id));
+      const early = store.list<ResearchTurn>("research-turn").filter(turn => turn.value.run === result.research?.id && turn.value.error);
+      if (phase.startsWith("L")) {
+        assert.equal(feedback.length, 1);
+        assert.ok(feedback[0]!.value.findings.some(finding => finding.code === "upper_layer_drift"));
+      } else {
+        assert.equal(feedback.length, 0, "Invalid facts must be refused before paid assessment and final consumption");
+        assert.ok(early.some(turn => JSON.stringify(turn.value.observation).includes("repository_evidence_required")));
+      }
+      const affected = new Set(phase.startsWith("L") ? feedback[0]!.value.questions.map(ref => ref.id) : early.map(turn => turn.value.question?.id ?? (turn.value.action as {question:string}).question));
       assert.equal(affected.size, 1);
       assert.ok(draft.value.questions.filter(id => !affected.has(id)).every(id => store.get<Question>(id)!.revision === 2));
       const turns = store.list("research-turn").length;
@@ -83,11 +89,12 @@ test("R1/R2 and L2/L3 consumers autonomously correct only rejected fields for tw
   }
 });
 
-test("R1 consumer feedback survives a cold database reopen and uses only the remaining question", async t => {
+test("R1 early proposal feedback survives a cold database reopen and uses only the remaining question", async t => {
   const { engine, store, path } = fixture(t, "p");
   const draft = engine.refinement.begin("p", "R1");
   const first = await engine.refinementResearch.run("p", "R1", draft.id, 9);
-  assert.equal(first.status, "paused"); assert.ok(first.feedback);
+  assert.equal(first.status, "paused"); assert.equal(first.feedback, null);
+  assert.ok(store.list<ResearchTurn>("research-turn").some(turn => JSON.stringify(turn.value.observation).includes("repository_evidence_required")));
   assert.equal(store.get("phase:p:R1"), null, "A supported model assessment cannot publish an invalid factual claim");
   assert.deepEqual(draft.value.questions.filter(id => store.get<Question>(id)!.value.status === "open")
     .map(id => store.get<Question>(id)!.value.spec.field), ["runtime"]);
@@ -138,13 +145,13 @@ test("layer acceptance binds the exact constructed graph across the build-to-sea
   assert.equal(store.get("phase:p:L2"), null);
 });
 
-test("a retry cannot adopt a competing phase accepted after consumer feedback", async t => {
+test("a retry cannot adopt a competing phase accepted after early proposal feedback", async t => {
   const { engine, store } = fixture(t, "p");
   const draft = engine.refinement.begin("p", "R1"), other = engine.refinement.begin("p", "R1");
   const write = store.writeMany.bind(store); let pending = true;
   store.writeMany = function<T>(inputs: Write[], guards?: ReadGuard[]): Revision<T>[] {
     const records = write<T>(inputs, guards);
-    if (pending && inputs.some(input => input.kind === "research-feedback")) {
+    if (pending && inputs.some(input => input.kind === "research-turn" && Boolean((input.value as ResearchTurn).error))) {
       pending = false;
       answerTechnicalFixture(engine, "p", other);
       engine.refinement.finishResearch("p", "R1", reference(store.get<DiscoveryDraft>(other.id)!), 0);

@@ -1,3 +1,4 @@
+import { phasePolicy } from "./phase-policy.js";
 import { Ajv } from "ajv";
 import type { Store, Revision } from "../storage/store.js";
 import { executablePath, type Environment, type RoleBinding, type Environments } from "../runtime/environment.js";
@@ -12,6 +13,7 @@ export interface ReaderPilotSettings {
   maxRequestChars: number; maxReadChars: number; maxReplyChars: number;
   maxCalls: number; maxReportedTokens: number;
   callTimeoutMs?: number;
+  physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
 }
@@ -26,6 +28,7 @@ export const readerPilotSchema = object({ experimental: { const: true }, active:
   maxRequestChars: positive, maxReadChars: positive, maxReplyChars: positive, maxCalls: positive, maxReportedTokens: positive });
 readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object({ call: object({ id: text, revision: positive,
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
+readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: positive, maxReplyChars: positive, basis: text });
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
 readerPilotSchema.properties['callTimeoutMs'] = { type: "integer", minimum: 1, maximum: 3_000_000 };
@@ -60,8 +63,12 @@ export function readerPilot(store: Store, project: string): Revision<ReaderPilot
 }
 
 export function assertPilotBoundary(store: Store, project: string, phase: string): void {
-  requireCondition(!readerPilot(store, project) || !["R2", "L3", "R3"].includes(phase),
-    "pilot_boundary_reached", "The experiment stops after accepted L2, before R2; audit and an owner decision are required");
+  const policy = phasePolicy(store, project);
+  const pilot = readerPilot(store, project);
+  const configured = store.get(`reader-pilot:${project}`);
+  if (policy?.value.stopAfter === "L3") requireCondition(pilot, "phase_protections_missing", "Continuation cannot disable its context and budget preset");
+  requireCondition(!(policy || configured) || !(policy?.value.stopAfter === "L3" ? ["R3"] : ["R2", "L3", "R3"]).includes(phase),
+    "pilot_boundary_reached", "This phase is beyond the explicitly permitted continuation boundary");
 }
 
 /** The source environment stays unchanged so accepted source/assessment history

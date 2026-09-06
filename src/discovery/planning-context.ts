@@ -1,5 +1,5 @@
 import { relative, isAbsolute } from "node:path";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { contextTable } from "./context-tables.js";
 
@@ -17,6 +17,14 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
     return path && !path.startsWith("..") && !isAbsolute(path) ? path : s;
   };
   const packet: Record<string, any> = {
+    mapStatus: body.mapStatus, mapStatusFindings: body.mapStatusFindings,
+    researchScope: body.researchScope ? { ref: body.researchScope.ref, outcome: body.researchScope.outcome,
+      nodes: body.researchScope.nodes, boundaries: body.researchScope.boundaries, expansions: body.researchScope.expansions,
+      uiRequired: body.researchScope.uiRequired, changedPaths: body.researchScope.changedPaths,
+      obligations: contextTable(body.researchScope.obligations.map((o: any, index: number) => ({ id: o.gap.id,
+        target: o.gap.target, field: o.gap.field, consumer: o.gap.consumer, state: o.state, wake: o.wake,
+        pointer: `/obligations/${index}` }))),
+      instruction: "Complete original gap questions and deferral reasons remain at ref /obligations/index; this is an address index, not evidence of irrelevance." } : null,
     role: body.role, dispatchMode: "planning", stage: body.stage, level: body.level, consumer: body.consumer,
     draft: body.draft, question: { id: body.question.id, field: body.question.field, kind: body.question.kind,
       prompt: body.question.prompt, risk: body.question.risk },
@@ -54,6 +62,6 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
   for (const key of ["requirements", "nodes", "sources", "records", "alreadyRead", "priorReads", "unresolvedEvidence"]) {
     packet[key] = contextTable(packet[key]);
   }
-  requireCondition(JSON.stringify(packet).length <= maxChars, "planning_context_limit", "Planning index exceeds its configured ceiling; narrow the planning scope without dropping constraints");
+  if (JSON.stringify(packet).length > maxChars) throw new EngineError("planning_context_limit", "Lossless planning index exceeds its working ceiling", { required: JSON.stringify(packet).length });
   return packet;
 }

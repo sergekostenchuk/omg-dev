@@ -1,3 +1,4 @@
+import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
@@ -163,6 +164,7 @@ export class ProductEngine {
       return { ...question, assessment: { state: question.value.status === "answered" && findings.length ? "stale" : question.value.status, findings } };
     });
     return { project: this.#project(project), stages: this.pipeline.project(project), graph: this.store.get<Graph>(`graph:${project}`),
+      mapStatus: mapStatus(this.store, project),
       graphGate: this.graphs.gate(project),
       drafts, questions,
       sources: this.store.list<Source>("source").filter(item => item.value.projectId === project),
@@ -186,6 +188,8 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
+        { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);

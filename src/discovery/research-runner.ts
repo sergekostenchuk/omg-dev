@@ -1,3 +1,5 @@
+import { readResearchContext } from "./research-limits.js";
+import { planningForQuestion } from "./research-routing.js";
 import { Store, type Revision } from "../storage/store.js";
 import { Environments } from "../runtime/environment.js";
 import { reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
@@ -14,7 +16,7 @@ import { researchPrerequisites, researchGraphContext } from "./research-context.
 import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
 import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pilot.js";
-import { pilotContext, readPilotContext, retainPilotRead } from "./pilot-context.js";
+import { pilotContext, retainPilotRead } from "./pilot-context.js";
 import { readBundle } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
@@ -42,7 +44,7 @@ export class Researcher {
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
     if (draft.value.stage === "om-g2") assertPilotBoundary(this.store, project, draft.value.level);
     const effective = this.environments.effective(project); const environment = effective.environment;
-    const pilot = draft.value.stage === "om-g2" && draft.value.level === "R1" ? readerPilot(this.store, project) : null;
+    const pilot = draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) ? readerPilot(this.store, project) : null;
     const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: effective.root };
     const sources = new ResearchSources(this.store, project, effective.root);
     const id = `research-run:${hashJson([project, draftId])}`;
@@ -83,11 +85,11 @@ export class Researcher {
           try {
             const { revises: _revises, ...prior } = previousProposal as LayerDelta;
             const { candidateHash: _candidateHash, ...resolved } = layerDeltaView(this.store, project,
-              layerDeltaCandidate(this.store, draft, pending[0]!, previousProposal as LayerDelta));
+              layerDeltaCandidate(this.store, draft, pending[0]!, previousProposal as LayerDelta), draft.value.level === "R2" ? 3 : 2);
             previousProposal = { ...prior, ...resolved };
           } catch { /* Retain the failed raw proposal and its typed feedback. */ }
         }
-        const planning = pilot?.value.planning?.fields.includes(pending[0]!.value.spec.field) ? pilot.value.planning : null;
+        const planning = planningForQuestion(this.store, draft, pending[0]!, pilot);
         let mode = planning ? dispatchMode(turns, pending[0]!) : null;
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
@@ -141,7 +143,8 @@ export class Researcher {
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
           run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
-          const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "";
+          const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign"
+            ? (draft.value.level === "R2" ? DELTA_INSTRUCTION.replaceAll("L2", "L3").replace("preserve L1", "preserve L1/L2").replace("and do not add L3", "and provide the nonempty horizon array of atomic result IDs") : DELTA_INSTRUCTION) : "";
           const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
             : INSTRUCTION + (pilot ? PILOT_INSTRUCTION + deltaInstruction : "");
           action = mode === "synthesis" && pilot ? await synthesisSession(this.store, draft, pending[0]!, environment,
@@ -175,7 +178,7 @@ export class Researcher {
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
             requireCondition(pilot, "reader_pilot_required", "Addressed context reads need the configured experiment");
-            observation = readPilotContext(this.store, draft, action.record, action.pointer, pilot.value.maxReadChars, action.page);
+            observation = readResearchContext(this.store, draft, pending[0]!.id, pilot, action.record, action.pointer, action.page);
             const repeated = repeatedContextRead(this.store, turns, pending[0]!, startTurn, observation, action);
             if (repeated) {
               this.store.write<ResearchTurn>({ id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,

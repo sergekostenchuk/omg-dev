@@ -1,3 +1,10 @@
+import { estimateCliCall } from "../adapters/codex-estimate.js";
+import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
+import { phasePolicy } from "./phase-policy.js";
+import { budgetSegment, budgetUsage, budgetGroups, reserveResearchCall, workingLimit, accommodateQuestion, accommodateMetric } from "../runtime/research-budget.js";
+import { planningForQuestion } from "./research-routing.js";
+import { researchScope } from "../graph/research-scope.js";
+import type { DiscoveryDraft, Question } from "./discovery.js";
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
@@ -40,6 +47,7 @@ const answerDelta = object({ action: { const: "answer_delta" }, question: text, 
   upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
   citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } });
 answerDelta.properties['revises'] = ref;
+answerDelta.properties['horizon'] = { type: 'array', minItems: 1, uniqueItems: true, items: text };
 const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   ...readSchemas,
   object({ action: { const: "read_plan" }, question: text, reads: { type: "array", minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
@@ -59,27 +67,80 @@ export function researchAction(value: unknown): ResearchAction {
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
     onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
+  const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
+  const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
+  let segment = null;
+  let groups: string[] = [];
+  let protectedQuestion: Revision<Question> | null = null;
+  if (audit && draft?.value.stage === "om-g2") {
+    const phase = draft.value.consumer !== "compilation" && draft.value.level === "R2" ? "L3" : draft.value.level;
+    assertPilotBoundary(audit.store, environment.projectId, phase);
+    if (draft.value.level === "R2" && policy) {
+      const current = readerPilot(audit.store, environment.projectId);
+      requireCondition(current && audit.pilot && hashJson(reference(current)) === hashJson(reference(audit.pilot)),
+        "phase_protections_missing", "Every R2 role must use the current protected preset");
+      const question = audit.store.get<Question>(audit.questionId ?? "");
+      requireCondition(question, "budget_question_missing", "Every R2 role needs its logical question");
+      protectedQuestion = question;
+      planningForQuestion(audit.store, draft, question, current);
+      const scope = researchScope(audit.store, environment.projectId);
+      requireCondition(scope && draft.value.inputs.some(ref => hashJson(ref) === hashJson(reference(scope))),
+        "research_scope_stale", "R2 requires its current explicit research scope");
+      segment = budgetSegment(audit.store, environment.projectId, policy.value.budgetSegment!);
+      groups = budgetGroups(audit.store, draft.id, question.id);
+    }
+  }
   const requestId = randomUUID();
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt };
-  const requestLimit = audit?.purpose === "reading-planner" && audit.pilot?.value.planning
+  const initialRequestLimit = audit?.purpose === "reading-planner" && audit.pilot?.value.planning
     ? audit.pilot.value.planning.maxRequestChars : audit?.pilot?.value.maxRequestChars;
-  const subject = audit?.pilot && audit.purpose !== "reader" ? workingContext(audit.store, environment.projectId,
-    audit.draftId, audit.questionId ?? "", context, requestLimit! - JSON.stringify({ ...envelope, subject: {} }).length)
-    : context;
+  let requestLimit = segment && audit ? workingLimit(audit.store, segment, groups.join(","),
+    audit.purpose === "reading-planner" ? "planningChars" : "requestChars", initialRequestLimit!) : initialRequestLimit;
+  const pack = (limit: number) => audit?.pilot && audit.purpose !== "reader" ? workingContext(audit.store, environment.projectId,
+    audit.draftId, audit.questionId ?? "", context, limit - JSON.stringify({ ...envelope, subject: {} }).length) : context;
+  let subject;
+  try { subject = pack(requestLimit!); }
+  catch (error) {
+    if (!segment || !audit || !(error instanceof EngineError) || !["planning_context_limit", "pilot_core_limit", "synthesis_material_limit"].includes(error.code)) throw error;
+    // Measure the exact packed representation locally; never pay to regenerate it.
+    const required = (error.details as { required?: number } | null)?.required;
+    requireCondition(Number.isSafeInteger(required) && required! > 0, "budget_need_unknown", "A working increase requires the actual minimal packed size");
+    const needed = required! + JSON.stringify({ ...envelope, subject: {} }).length;
+    requestLimit = accommodateMetric(audit.store, segment, groups.join(","), audit.purpose === "reading-planner" ? "planningChars" : "requestChars",
+      initialRequestLimit!, needed, draft!, audit.questionId!, [reference(draft!)], error.message, audit.pilot?.value.physicalLimits?.maxRequestChars);
+    subject = pack(requestLimit);
+  }
   audit?.onContext?.(subject as Record<string, any>);
   const input = JSON.stringify({ ...envelope, subject });
+  requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
+    "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
   const replay = audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
     audit.questionId, audit.purpose, input) : null;
   if (replay) return replay.research;
   if (audit?.purpose === "reading-planner" && audit.pilot?.value.planning) {
-    requireCondition(audit.store.list<ModelCall>("model-call").filter(call => call.value.draftId === audit.draftId
-      && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length < audit.pilot.value.planning.maxRounds,
-      "planning_round_limit", "Reading expansion allowance reached; preserve the unresolved research for continuation");
+    const rounds = audit.store.list<ModelCall>("model-call").filter(call => call.value.draftId === audit.draftId
+      && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length;
+    const allowed = segment ? accommodateMetric(audit.store, segment, groups.join(","), "rounds", audit.pilot.value.planning.maxRounds,
+      rounds + 1, draft!, audit.questionId!, [], "Addressed unresolved research requires another planning round") : audit.pilot.value.planning.maxRounds;
+    requireCondition(rounds < allowed, "planning_round_limit", "Reading expansion allowance reached; evidence is preserved");
   }
-  const reservation = audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
+  const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
+  const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length) : null;
+  if (segment && audit && estimate) {
+    requireCondition(input.length <= requestLimit!, "pilot_request_limit", "Complete envelope exceeds its working limit");
+    const remainingRoles = audit.purpose === "assessor" ? [] : audit.purpose === "analyst" ? [{ role: environment.reviewer, purpose: "assessor" }]
+      : [{ role: environment.implementer, purpose: "analyst" }, { role: environment.reviewer, purpose: "assessor" },
+        ...(audit.purpose === "reading-planner" ? [{ role: audit.pilot!.value.reader, purpose: "reader" }] : [])];
+    const remaining = remainingRoles.reduce((total, item) => total + estimateCliCall(audit.store, environment.projectId, item.role, item.purpose, input.length).tokens, 0);
+    accommodateQuestion(audit.store, segment, groups, estimate, draft!, audit.questionId!, remaining);
+    const reserved = reserveResearchCall(audit.store, segment, `model-call:${requestId}`, groups, estimate);
+    reservation.writes.push(...reserved.writes);
+    reservation.guards.push(...reserved.guards, reference(policy!), reference(audit.pilot!), reference(draft!), reference(protectedQuestion!), ...draft!.value.inputs);
+  }
   let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,
+      ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
       profile: audit.pilot ? reference(audit.pilot) : null,
       questionId: audit.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
@@ -107,7 +168,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     requireCondition(response, "research_response_invalid", "Research adapter must return a protocol response");
     requireCondition(response.protocol === "omg-agent/v1" && response.requestId === requestId && Object.hasOwn(response, "research"),
       "research_response_foreign", "Research response is missing or belongs to another invocation");
-    requireCondition(!audit?.pilot || JSON.stringify(response.research).length <= audit.pilot.value.maxReplyChars,
+    const replyLimit = segment && audit?.pilot ? accommodateMetric(audit.store, segment, groups.join(","), "replyChars", audit.pilot.value.maxReplyChars,
+      JSON.stringify(response.research).length, draft!, audit.questionId!, [reference(draft!)], "Preserve an already paid complete response without regeneration", audit.pilot.value.physicalLimits?.maxReplyChars) : audit?.pilot?.value.maxReplyChars;
+    requireCondition(!audit?.pilot?.value.physicalLimits || JSON.stringify(response.research).length <= audit.pilot.value.physicalLimits.maxReplyChars,
+      "budget_transport_limit", "Response exceeds the declared physical response capacity");
+    requireCondition(!audit?.pilot || JSON.stringify(response.research).length <= replyLimit!,
       "pilot_reply_limit", "The generated response exceeds the configured limit; its usage has been recorded");
     patch.status = "succeeded"; return response.research;
   } catch (error) {
@@ -123,6 +188,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       }
       call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision,
         value: { ...call.value, ...patch, finishedAt: Date.now() } }, ...responseWrites])[0]!;
+      if (segment && budgetUsage(audit.store, segment).measured > segment.value.limit) {
+        audit.store.write({ id: `budget-incident:${requestId}`, kind: "budget-incident", expected: 0,
+          value: { projectId: environment.projectId, segment: reference(segment), call: reference(call), reason: "Actual provider usage exceeded the experimental forecast and the owner budget; further calls are forbidden" } });
+        throw new EngineError("budget_actual_overrun", "Actual usage exceeded the owner budget; the incident is recorded and further calls are blocked");
+      }
     }
   }
 }

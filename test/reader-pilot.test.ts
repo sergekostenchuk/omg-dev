@@ -1,3 +1,4 @@
+import { configurePhasePolicy } from "../src/discovery/phase-policy.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
@@ -17,7 +18,7 @@ import { projectGraph } from "../src/graph/project.js";
 import type { Question, DiscoveryDraft } from "../src/discovery/discovery.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
-import { layerDesignOf } from "../src/graph/layer-design.js";
+import { layerDesignOf, layerDesignSpec } from "../src/graph/layer-design.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView } from "../src/discovery/layer-delta.js";
 import type { ConsumerResult } from "../src/discovery/consumer-research.js";
 import type { Json } from "../src/canonical.js";
@@ -216,7 +217,7 @@ test("active experiment refuses creation and execution of R2 and later phases", 
   await assert.rejects(engine.researcher.run("p", foreignPhase.id, 1), { code: "pilot_boundary_reached" });
   assert.equal(store.list("model-call").length, 0);
   configureReaderPilot(store, engine.environments, "p", { ...settings, active: false }, pilot.revision);
-  assert.throws(() => engine.refinement.begin("p", "R2"), { code: "phase_not_ready" }, "Disabling the pilot does not bypass normal prerequisites");
+  assert.throws(() => engine.refinement.begin("p", "R2"), { code: "pilot_boundary_reached" }, "Disabling the pilot cannot grant permission for another phase");
 });
 
 test("R1 pilot routes reading to its configured reader, assesses originals, and resumes without repeating accepted answers", async t => {
@@ -309,8 +310,8 @@ test("an explicit reserve resumes unknown usage without converting it into measu
 });
 
 test("a previously prepared L3 cannot bypass the pilot boundary through build-layer", t => {
-  const { engine, store, settings, pilot, draft: r1, full } = fixture(t);
-  const inactive = configureReaderPilot(store, engine.environments, "p", { ...settings, active: false }, pilot.revision);
+  const { engine, store, draft: r1, full } = fixture(t);
+  configurePhasePolicy(store, "p", "L3", "R2-L3", 0);
   answerTechnicalFixture(engine, "p", r1);
   engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0);
   const l2 = engine.refinement.prepareLayer("p", 2);
@@ -321,7 +322,7 @@ test("a previously prepared L3 cannot bypass the pilot boundary through build-la
   engine.refinement.finishResearch("p", "R2", reference(store.get(r2.id)!), 0);
   const l3 = engine.refinement.prepareLayer("p", 3);
   const ready3 = answerLayerFixture(engine, "p", l3, 3, full);
-  configureReaderPilot(store, engine.environments, "p", settings, inactive.revision);
+  configurePhasePolicy(store, "p", "L2", "R2-L3", 1);
   const before = store.get("graph:p")!;
   assert.throws(() => engine.execute({ type: "build-layer", project: "p", level: 3, draft: reference(ready3), expected: before.revision }),
     { code: "pilot_boundary_reached" });
@@ -972,4 +973,48 @@ test("a new correction reference cannot return the previous cached correction fo
   const b=await synthesisSession(store,draft,question,environment,dispatch,configured,{...context,previousProposalRef:reference(second)},'Return JSON') as any;
   assert.deepEqual(a.revises,reference(first));assert.deepEqual(b.revises,reference(second));
   assert.equal(store.list('model-call').length,2,'A different exact proposal needs a fresh correction');
+});
+
+test("early technical consumer rejection does not depend on the pilot or pay an assessor", async t => {
+  const { root, store, engine, environment, question } = fixture(t);
+  const source = engine.discovery.evidence.file('p', 'early-source', root, 'README.md', 'text/plain', 0);
+  const action = { action: 'answer' as const, question: question.id,
+    value: { applicability: 'applicable', reason: 'fixture', facts: [], designs: [{ id: 'bad', decision: 'proposal', benefit: 'benefit', consumer: 'invented' }], gaps: [] },
+    citations: [{ source: reference(source), selector: { kind: 'text-range' as const, start: 0, end: 10 } }] };
+  await assert.rejects(assessAnswer(store, question, action, environment, root), { code: 'research_proposal_invalid' });
+  assert.equal(store.list('model-call').length, 0);
+});
+
+test("L3 delta preserves L2, carries its atomic horizon and refuses an empty horizon or foreign base", t => {
+  const { engine, store, full } = fixture(t);
+  const { level: _level, ...upper } = projectGraph(full, 2);
+  engine.graphs.save("p", upper, store.get("graph:p")!.revision, "fixture");
+  const draft = engine.discovery.create("p", "om-g2", "R2", full.nodes.find(n => n.kind === "product")!.id, [layerDesignSpec(3)], [], 1);
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const target = layerDesignOf(full, 3), delta = layerDeltaView(store, "p", target, 3);
+  const result = expandLayerDelta(store, draft, question, delta) as Record<string, Json>;
+  assert.deepEqual(result['horizon'], full.horizon);
+  assert.equal((result['nodes'] as {id:string}[]).length, full.nodes.length);
+  assert.throws(() => expandLayerDelta(store, draft, question, {...delta, horizon: []}), {code: "horizon_empty"});
+  assert.throws(() => expandLayerDelta(store, draft, question, {...delta, base: {...delta.base, revision: 999}}), {code: "graph_stale"});
+});
+
+test('map status has a product command and stale annotations are omitted from research packets',t=>{
+  const {engine,store,draft,question,full}=fixture(t);
+  const graph=store.get('graph:p')!, node=full.nodes.find(n=>n.kind==='block')!.id;
+  engine.execute({type:'set-map-status',project:'p',expected:0,base:reference(graph),nodes:[{id:node,status:'existing',explanation:'Fixture source',code:[{path:'README.md',access:'read',status:'existing'}]}]});
+  assert.ok(pilotContext(store,draft,question).mapStatus);
+  store.write({id:graph.id,kind:graph.kind,expected:graph.revision,value:graph.value});
+  const packet=pilotContext(store,draft,question);
+  assert.equal(packet.mapStatus,null);
+  assert.equal(packet.mapStatusFindings[0]!.code,'map_status_stale');
+  assert.throws(()=>engine.execute({type:'set-map-status',project:'p',expected:1,base:reference(graph),nodes:[]}),{code:'command_invalid'});
+});
+
+test('declared physical envelope capacity refuses the actual call before the adapter starts',async t=>{
+  const {engine,store,draft,question,environment,settings,pilot}=fixture(t);
+  const bounded=configureReaderPilot(store,engine.environments,'p',{...settings,physicalLimits:{maxRequestChars:20,maxReplyChars:1000,basis:'Deterministic test transport capacity'}},pilot.revision);
+  await assert.rejects(researchCall(environment.value.implementer,environment.value,'Fixture',pilotContext(store,draft,question),undefined,
+    {store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:bounded}),{code:'budget_transport_limit'});
+  assert.equal(store.list('model-call').length,0);
 });

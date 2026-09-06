@@ -1,7 +1,8 @@
+import { scopeDefersGap } from "./research-scope.js";
 import { realpathSync } from "node:fs";
 import { relative } from "node:path";
 import { Store } from "../storage/store.js";
-import { Discovery, type DiscoveryDraft } from "../discovery/discovery.js";
+import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
 import { STAGES, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
 import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath } from "../runtime/environment.js";
@@ -28,6 +29,21 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   if (report.applicability === "applicable" && !report.facts.length && !report.designs.length) fail("research_report_empty", questionId, "An applicable domain needs concrete facts or explicit design decisions");
   if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
   if (field.startsWith("gap_") && report.applicability !== "applicable") fail("research_gap_unresolved", questionId, "An inherited gap needs a concrete resolution, including when research disproves its premise");
+  const obligations = store.get<Question>(questionId)?.value.spec.obligations;
+  if (obligations?.length) {
+    const coverage = report.coverage;
+    if (!Array.isArray(coverage) || coverage.length !== obligations.length || new Set(coverage.map(c => c.obligation)).size !== obligations.length)
+      fail("research_group_coverage_missing", questionId, "Every original group obligation needs its own explicit evidence/design/gap resolution");
+    for (const obligation of obligations) {
+      const item = coverage?.find(c => c.obligation === obligation.id);
+      if (!item || !Array.isArray(item.facts) || !Array.isArray(item.designs) || !Array.isArray(item.gaps)
+        || item.facts.length + item.designs.length + item.gaps.length === 0
+        || !item.facts.every(id => report.facts.some(f => f.id === id))
+        || !item.designs.every(id => report.designs.some(d => d.id === id && d.consumer === obligation.consumer))
+        || !item.gaps.every(id => report.gaps.some(g => g.id === id && g.target === obligation.target && g.field === obligation.field && g.consumer === obligation.consumer)))
+        fail("research_group_coverage_missing", obligation.id, "Group member lacks an attributable resolution; applicability alone cannot close it");
+    }
+  }
   for (const fact of report.facts) {
     try {
       const path = realpathSync(workspacePath(root, fact.path));
@@ -43,7 +59,7 @@ export function technicalProposalFindings(store: Store, project: string, level: 
     if (!consumers.has(gap.consumer) || !consumers.has(gap.target)) fail("research_consumer_missing", gap.id, "A gap needs an existing target and consumer");
     const target = graph.nodes.find(node => node.id === gap.target) ?? actors.find(actor => actor.id === gap.target);
     if (target && !Object.hasOwn(target, gap.field)) fail("research_field_missing", gap.id, "A node gap must identify an actual field of its target");
-    if (gap.requiredFor === "current" || (level === "R2" && !deferredGap(graph, gap))) fail("research_gap_unresolved", gap.id, gap.question);
+    if (gap.requiredFor === "current" || (level === "R2" && !scopeDefersGap(store, project, gap) && !deferredGap(graph, gap))) fail("research_gap_unresolved", gap.id, gap.question);
   }
   return findings;
 }

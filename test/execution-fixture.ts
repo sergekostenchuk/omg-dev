@@ -24,8 +24,8 @@ if(request.mode==='research') {
  const reply=research=>process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research}));
  if(c.role==='assess-answer') reply({verdict:'supported',reasons:[]});
  else {
-  const q=c.questions[0], source=c.inventory.sources.find(item=>item.ref.id.includes(':failure-'));
   const manifest=JSON.parse(readFileSync(journal+'.repair.json','utf8'));
+  const q=(manifest.researchGap?c.questions.find(q=>q.field!=='contractsAndConsumers'):null)??c.questions[0], source=c.inventory.sources.find(item=>item.ref.id.includes(':failure-'));
   const value=q.field==='layerDesign'?manifest.design:
    {applicability:'applicable',reason:'Repair the observed missing consumer refusal contract while retaining the accepted producer',facts:[],
     designs:[{id:q.field+'-repair',decision:'Add a consumer counterfactual that removes its input and requires input_missing, preserve the accepted producer and its data contract',benefit:'A caller receives a defined refusal instead of unchecked input',consumer:'p-consume-work'}],gaps:[]};

@@ -6,7 +6,7 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
-import { readPilotContext } from "./pilot-context.js";
+import { readResearchContext } from "./research-limits.js";
 
 interface Session { projectId: string; offset: number; notes: Json[]; focus: unknown; result: unknown }
 const instruction = "Evidence is sent in bounded pages. evidencePage.text is a fragment of the JSON-serialized COMPLETE observations array, at UTF-16 offsets; it is not a complete quote. observations, when populated, contains the whole array. All exact originals are in working.archive; you may request read_context with record,pointer,page. Keep intermediate judgments as {action:'assessment_checkpoint',notes:[string]} with source/requirement references in each note. Notes are unassessed judgments, not source substitutes. You may revisit any earlier page. A terminal verdict is accepted only after every evidence character has been supplied; examine applicable exceptions, global constraints and cross-page contradictions before the final judgment.";
@@ -38,7 +38,7 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
     if (response?.action === "read_context") {
       const action = researchAction(response);
       requireCondition(action.action === "read_context", "assessment_invalid", "Expected an addressed read");
-      focus = readPilotContext(store, draft, action.record, action.pointer, pilot.value.maxReadChars, action.page);
+      focus = readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page);
     } else if (response?.action === "assessment_checkpoint") {
       requireCondition(Object.keys(response).sort().join(",") === "action,notes" && Array.isArray(response.notes)
         && response.notes.every((n: unknown) => typeof n === "string"), "assessment_invalid", "Assessment checkpoint needs explicit notes");

@@ -1,0 +1,51 @@
+{
+  "id": "map-status:omg-live",
+  "kind": "map-status",
+  "revision": 1,
+  "hash": "34c9c6b1029e1a5bbb668f96c49deb67dedaa8ad8acbabeb9b51a1a4a554ee73",
+  "value": {
+    "actor": "owner:relayed-fable-seq9",
+    "base": {
+      "hash": "9c129aa5c1b7a4a7801b70dda5a797aa54df6d6a3cf649fd9ffc589ccfbbee48",
+      "id": "graph:omg-live",
+      "revision": 2
+    },
+    "nodes": [
+      {
+        "code": [
+          {
+            "access": "read",
+            "path": "ui/app.tsx",
+            "status": "existing"
+          },
+          {
+            "access": "read",
+            "path": "ui/plan.tsx",
+            "status": "existing"
+          },
+          {
+            "access": "read",
+            "path": "src/server.ts",
+            "status": "existing"
+          }
+        ],
+        "explanation": "UI уже существует: приложение, QuestionPanel и панель плана. Полнота доступности и известный тестовый пробел actors-g5 остаются открытыми; существование UI не означает их выполнения.",
+        "id": "n-ui",
+        "status": "existing"
+      },
+      {
+        "code": [],
+        "explanation": "Каталог пригодных самостоятельных результатов — спроектированный будущий блок; наличие сохранённых записей само по себе не доказывает реализацию каталога.",
+        "id": "n-results",
+        "status": "future"
+      },
+      {
+        "code": [],
+        "explanation": "Передача самостоятельных частей и будущие отложенные продолжения — спроектированный блок, не подтверждённая реализация.",
+        "id": "n-continuation",
+        "status": "future"
+      }
+    ],
+    "projectId": "omg-live"
+  }
+}

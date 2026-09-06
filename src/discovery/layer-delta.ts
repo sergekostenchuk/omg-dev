@@ -13,6 +13,7 @@ export type DeltaCollection = typeof DELTA_COLLECTIONS[number];
 export interface LayerDelta {
   base: Ref;
   revises?: Ref;
+  horizon?: string[];
   upserts: Partial<Record<DeltaCollection, { id: string; [key: string]: Json }[]>>;
   removes: Partial<Record<DeltaCollection, string[]>>;
 }
@@ -20,11 +21,12 @@ export interface LayerDelta {
 /** Build an unaccepted candidate for correction/display. Only expandLayerDelta
  * may turn it into a validated layer proposal. */
 export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, delta: LayerDelta): Json {
-  requireCondition(draft.value.stage === "om-g2" && draft.value.level === "R1" && question.value.draftId === draft.id
-    && question.value.spec.field === "layerDesign", "layer_delta_foreign", "This experiment applies deltas only to L2 design");
+  requireCondition(draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) && question.value.draftId === draft.id
+    && question.value.spec.field === "layerDesign", "layer_delta_foreign", "Deltas require a bound L2/L3 design question");
   const base = store.get<Graph>(`graph:${draft.value.projectId}`);
   requireCondition(base && canonical(reference(base)) === canonical(delta.base), "graph_stale", "The delta must bind the exact current graph");
-  const design = layerDesignOf(base.value, 2) as Record<string, Json>;
+  const level = draft.value.level === "R2" ? 3 : 2;
+  const design = layerDesignOf(base.value, level) as Record<string, Json>;
   const chain: LayerDelta[] = [delta], seen = new Set<string>();
   let previous = delta.revises;
   while (previous) {
@@ -39,6 +41,10 @@ export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft
     chain.push(action); previous = action.revises;
   }
   for (const patch of chain.reverse()) {
+    if (patch.horizon !== undefined) {
+      requireCondition(level === 3, "layer_delta_foreign", "Only L3 can set the atomic horizon");
+      design["horizon"] = patch.horizon;
+    }
     for (const collection of DELTA_COLLECTIONS) {
       const entries = (design[collection] ?? []) as { id: string; [key: string]: Json }[];
       const upserts = patch.upserts[collection] ?? [], removes = patch.removes[collection] ?? [];
@@ -59,12 +65,13 @@ export function expandLayerDelta(store: Store, draft: Revision<DiscoveryDraft>, 
   const base = store.get<Graph>(delta.base.id, delta.base.revision)!;
   // Validate the assembled graph, including unchanged upper layers and complete
   // L2 relationships. No graph or accepted draft is written by this expansion.
-  return layerDesignOf(composeLayer(base.value, 2, design), 2);
+  const level = draft.value.level === "R2" ? 3 : 2;
+  return layerDesignOf(composeLayer(base.value, level, design), level);
 }
 
-export function layerDeltaView(store: Store, project: string, value: Json) {
+export function layerDeltaView(store: Store, project: string, value: Json, level: 2 | 3 = 2) {
   const base = store.get<Graph>(`graph:${project}`)!;
-  const before = layerDesignOf(base.value, 2) as Record<string, Json>;
+  const before = layerDesignOf(base.value, level) as Record<string, Json>;
   const after = value as Record<string, Json>;
   const upserts: LayerDelta['upserts'] = {}, removes: LayerDelta['removes'] = {};
   for (const collection of DELTA_COLLECTIONS) {
@@ -80,5 +87,5 @@ export function layerDeltaView(store: Store, project: string, value: Json) {
     if (updated.length) upserts[collection] = updated;
     if (removed.length) removes[collection] = removed;
   }
-  return { base: reference(base), candidateHash: hashJson(value), upserts, removes };
+  return { ...(level === 3 ? { horizon: after["horizon"] as string[] } : {}), base: reference(base), candidateHash: hashJson(value), upserts, removes };
 }

@@ -1,3 +1,5 @@
+import { mapStatus } from "../graph/map-status.js";
+import { researchScope, scopeObligations } from "../graph/research-scope.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { readerResultCurrent, type ReaderResult } from "./reader.js";
@@ -19,11 +21,11 @@ export function contextCatalogue(store: Store, draft: Revision<DiscoveryDraft>) 
   const allowed = [reference(draft), ...draft.value.inputs];
   return allowed.flatMap(ref => {
     const record = store.get(ref.id, ref.revision);
-    if (!record || record.hash !== ref.hash || !["stage", "graph-layer", "discovery-draft"].includes(record.kind)) return [];
+    if (!record || record.hash !== ref.hash || !["stage", "graph-layer", "discovery-draft", "research-scope"].includes(record.kind)) return [];
     const value = record.value as Record<string, any>;
-    const fields = record.kind === "stage" ? value['content']?.fields : record.kind === "discovery-draft" ? value['fields'] : null;
+    const fields = record.kind === "stage" ? value['content']?.fields : record.kind === "discovery-draft" ? value['fields'] : record.kind === "research-scope" ? value : null;
     const entries = fields ? Object.entries(fields).map(([key, value]) => ({ field: key,
-      ...descriptor(`${record.kind === "stage" ? "/content" : ""}/fields/${escape(key)}`, value) })) : [];
+      ...descriptor(`${record.kind === "research-scope" ? "" : record.kind === "stage" ? "/content/fields" : "/fields"}/${escape(key)}`, value) })) : [];
     return [{ ref, kind: record.kind, stage: value['stage'] ?? null, fields: entries }];
   });
 }
@@ -59,6 +61,9 @@ export function retainPilotRead(store: Store, project: string, question: string,
 
 export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>) {
   const project = draft.value.projectId;
+  const annotations = mapStatus(store, project);
+  const scope = draft.value.level === "R2" ? researchScope(store, project) : null;
+  if (scope) requireCondition(draft.value.inputs.some(ref => canonical(ref) === canonical(reference(scope))), "research_scope_stale", "Prepare a draft bound to the current scope before continuing");
   const stage = (name: "discovery" | "concept" | "specification" | "features") => {
     const record = store.get<StageArtifact>(stageId(project, name));
     requireCondition(record && draft.value.inputs.some(ref => canonical(ref) === canonical(reference(record))),
@@ -102,6 +107,9 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     return action.action === "search"; // Search results are navigation hints, never evidence of a fact.
   };
   return {
+    mapStatus: annotations?.current ? annotations : null,
+    mapStatusFindings: annotations?.current === false ? [{ code: "map_status_stale", message: "Implementation annotations bind an older map and are excluded from this research context" }] : [],
+    researchScope: scope ? { ref: reference(scope), ...scope.value, obligations: scopeObligations(scope.value) } : null,
     role: "research", stage: draft.value.stage, level: draft.value.level, consumer: draft.value.consumer,
     contextEncoding: CONTEXT_ENCODING, allowedConsumers, gapFields,
     graphBase: reference(store.get<Graph>(`graph:${project}`)!),
@@ -124,7 +132,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
       journeys: contextTable((map.graph.journeys ?? []).map((journey, index) => ({ ...journey, pointer: `/projection/journeys/${index}` }))) },
     draft: reference(draft), question: { id: question.id, ...spec },
     currentProposal: question.value.spec.field === "layerDesign" && draft.value.fields['layerDesign']
-      ? layerDeltaView(store, project, draft.value.fields['layerDesign']) : draft.value.fields[question.value.spec.field],
+      ? layerDeltaView(store, project, draft.value.fields['layerDesign'], draft.value.level === 'R2' ? 3 : 2) : draft.value.fields[question.value.spec.field],
     catalogue,
     answers: draft.value.questions.map(id => store.get<Question>(id)!).map(q => ({ field: q.value.spec.field, status: q.value.status,
       pointer: `/fields/${escape(q.value.spec.field)}` })),

@@ -12,6 +12,7 @@ import { deriveFields, type Derivation } from "./derived-draft.js";
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
+  obligations?: { id: string; target: string; field: string; consumer: string }[];
   targets?: { target: string; field: string; consumer: string; question: string }[] }
 export interface DiscoveryDraft {
   projectId: string; createdAt: number; stage: Stage; level: ResearchLevel; consumer: string;

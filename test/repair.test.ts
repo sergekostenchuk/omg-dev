@@ -91,7 +91,7 @@ test("research cannot reissue an unchanged accepted prefix as new work", async t
   assert.equal(corrected.value.phase, "reissued", corrected.value.error ?? "Correction failed");
 });
 
-test("a technical consumer refusal reopens only its report and the next model call can repair it", async t => {
+test("an early technical refusal preserves accepted reports and the next model call can repair it", async t => {
   const f = executionFixture(t, "repair");
   const failed = (await f.engine.executor.run("p", reference(f.plan), f.options))[1]!;
   const graph = structuredClone(f.plan.value.graphSnapshot); graph.horizon = ["p-consume-work"];
@@ -100,12 +100,14 @@ test("a technical consumer refusal reopens only its report and the next model ca
   check.contract!.counterfactuals = [{ connector: "p-flow", mutation: "remove", expectedFailure: "input_missing", command: { executable: process.execPath, args: ["check.mjs", "consume-mutation"] } }];
   writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: true }));
   const rejected = await f.engine.repairs.run("p", reference(failed), 20);
-  assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /current consumer input remains unresolved/);
+  assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /Research turn allowance/);
+  assert.ok(f.store.list("research-turn").some(turn => JSON.stringify(turn.value).includes("research_gap_unresolved")));
   const draft = f.store.get<DiscoveryDraft>(rejected.value.draftId)!;
   const questions = draft.value.questions.map(id => f.store.get<Question>(id)!);
   assert.deepEqual(questions.filter(question => question.value.status === "open").map(question => question.value.spec.field), ["contractsAndConsumers"]);
   const accepted = questions.filter(question => question.value.status === "answered");
   const calls = f.calls().length;
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: false }));
   const corrected = await f.engine.repairs.run("p", reference(failed), 20);
   assert.equal(corrected.value.phase, "reissued", corrected.value.error ?? "Repair failed");
   assert.ok(f.calls().length > calls);
