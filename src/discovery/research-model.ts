@@ -12,14 +12,19 @@ export interface ResearchAssessment {
   reusedFrom?: Ref;
 }
 export interface ResearchAnswer { projectId: string; question: string; assessment: Ref; value: Json }
-export type ResearchAction =
-  | ({ action: "answer_delta"; question: string; citations: { source: Ref; selector: Selector }[] } & LayerDelta)
+export type ResearchRead =
   | { action: "read_bundle"; purpose: string; inputs: BundleInput[] }
   | { action: "read_context"; record: Ref; pointer: string; page?: ContextPage }
-  | { action: "checkpoint"; question: string; value: Json; citations: { source: Ref; selector: Selector }[]; unresolved: string[] }
   | { action: "search"; query: string }
   | { action: "read_source"; source: Ref; start: number; end: number }
-  | { action: "read"; path: string; media: "text/plain" | "application/json" }
+  | { action: "read"; path: string; media: "text/plain" | "application/json" };
+export type ResearchAction =
+  | ResearchRead
+  | { action: "read_plan"; question: string; reads: ResearchRead[] }
+  | { action: "synthesize"; question: string }
+  | { action: "need_research"; question: string; missing: string[] }
+  | ({ action: "answer_delta"; question: string; citations: { source: Ref; selector: Selector }[] } & LayerDelta)
+  | { action: "checkpoint"; question: string; value: Json; citations: { source: Ref; selector: Selector }[]; unresolved: string[] }
   | { action: "answer"; question: string; value: Json; citations: { source: Ref; selector: Selector }[] }
   | { action: "need_owner"; question: string; reason: string; searched: Ref[] }
   | { action: "pause"; reason: string };
@@ -35,4 +40,6 @@ export interface ResearchTurn {
   run: string; number: number; action: unknown; assessment: Ref | null; observation: unknown; error: string | null;
   status: "pending" | "completed"; question: Ref | null;
   replayedFrom?: Ref;
+  plannedBy?: Ref;
+  dispatchMode?: "planning" | "synthesis";
 }

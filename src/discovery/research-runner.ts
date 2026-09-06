@@ -18,6 +18,8 @@ import { pilotContext, readPilotContext, retainPilotRead } from "./pilot-context
 import { readBundle } from "./reader.js";
 import { expandLayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
+import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
+import type { ModelCall } from "../runtime/model-usage.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available.`;
@@ -74,10 +76,18 @@ export class Researcher {
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
           .sort((a, b) => a.value.number - b.value.number);
         const history = turns.slice(-8).map(item => item.value);
+        const planning = pilot?.value.planning?.fields.includes(pending[0]!.value.spec.field) ? pilot.value.planning : null;
+        const mode = planning ? dispatchMode(turns, pending[0]!) : null;
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
+          ...(mode ? { dispatchMode: mode, repositoryRoot: effective.root } : {}),
+          researchMissing: ([...turns].reverse().find(t => t.value.question?.id === pending[0]!.id
+            && (t.value.action as ResearchAction).action === "need_research")?.value.action as { missing?: string[] } | undefined)?.missing ?? [],
+          readPlanStatus: turns.filter(t => t.value.plannedBy && t.value.question?.id === pending[0]!.id).map(t => ({
+            ref: reference(t), action: t.value.action, status: t.value.status, error: t.value.error,
+            current: t.value.status === "completed" && !t.value.error && latestFocus(this.store, [t], pending[0]!) !== null })),
           focus: latestFocus(this.store, turns, pending[0]!), workingSelections: workingSelections(this.store, turns, pending[0]!), checkpoints,
           checkpoint: [...turns].reverse().find(t => (t.value.action as { action?: string })?.action === "checkpoint"
             && t.value.question?.id === pending[0]!.id && !t.value.error)?.value.observation ?? null,
@@ -104,21 +114,36 @@ export class Researcher {
         let action: ResearchAction;
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
+          if (mode === "planning") requireCondition(this.store.list<ModelCall>("model-call").filter(c => c.value.draftId === draftId
+            && c.value.questionId === pending[0]!.id && c.value.purpose === "reading-planner").length < planning!.maxRounds,
+            "planning_round_limit", "Reading expansion allowance reached; preserve the unresolved research for continuation");
           run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
-          action = researchAction(await researchCall(dispatch.implementer, dispatch, INSTRUCTION + (pilot ? PILOT_INSTRUCTION
-            + (pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "") : ""), context, signal,
-            { store: this.store, draftId, purpose: "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
+          const instruction = mode === "planning" ? PLANNING_INSTRUCTION : INSTRUCTION + (mode === "synthesis" ? "\n" + SYNTHESIS_INSTRUCTION : "") + (pilot ? PILOT_INSTRUCTION
+            + (pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "") : "");
+          action = researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
+            { store: this.store, draftId, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
           const questionId = "question" in action ? action.question : null;
           const question = questionId ? pending.find(item => item.id === questionId) : pilot ? pending[0] : null;
           pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
             value: { run: id, number: run.value.turns, action, assessment: null, observation: null, error: null,
-              status: "pending", question: question ? reference(question) : null } });
+              status: "pending", question: question ? reference(question) : null, ...(mode ? { dispatchMode: mode } : {}) } });
         }
         let observation: unknown = null; let assessment: Ref | null = null; let error: string | null = null;
         let stop: Partial<ResearchRun> | null = null;
         let stopGuards: Ref[] = [];
         try {
-          if (action.action === "read_bundle") {
+          if (planning && pendingTurn.value.dispatchMode && !pendingTurn.value.plannedBy) requireCondition(pendingTurn.value.dispatchMode === "planning"
+            ? ["read_plan", "synthesize", "pause"].includes(action.action)
+            : ["answer", "answer_delta", "checkpoint", "need_research", "need_owner", "pause"].includes(action.action),
+            "research_mode_invalid", "Planning only selects reads; synthesis answers or identifies explicit missing information");
+          if (action.action === "read_plan") {
+            requireCondition(planning, "reading_plan_disabled", "Grouped reading requires the planning preset");
+            const queued = queueReadingPlan(this.store, run, pendingTurn, draft, pending[0]!, action);
+            run = queued.run; observation = { state: "queued", children: queued.children };
+          } else if (action.action === "synthesize" || action.action === "need_research") {
+            requireCondition(planning && action.question === pending[0]!.id, "research_question_foreign", "Mode transition must target the current question");
+            observation = { nextMode: action.action === "synthesize" ? "synthesis" : "planning" };
+          } else if (action.action === "read_bundle") {
             requireCondition(pilot, "reader_pilot_required", "A source bundle needs the configured reader experiment");
             const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs, signal);
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };

@@ -11,6 +11,7 @@ export interface ReaderPilotSettings {
   reader: RoleBinding; agentCommand: Command;
   maxRequestChars: number; maxReadChars: number; maxReplyChars: number;
   maxCalls: number; maxReportedTokens: number;
+  planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
 }
 export interface ReaderPilot extends ReaderPilotSettings { projectId: string }
@@ -24,11 +25,15 @@ export const readerPilotSchema = object({ experimental: { const: true }, active:
   maxRequestChars: positive, maxReadChars: positive, maxReplyChars: positive, maxCalls: positive, maxReportedTokens: positive });
 readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object({ call: object({ id: text, revision: positive,
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
+readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
+  maxRequestChars: positive, maxRounds: positive });
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
 
 export function configureReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number): Revision<ReaderPilot> {
   if (!valid(settings)) throw new EngineError("reader_pilot_invalid", "The experiment requires explicit roles, limits and its L2 stop boundary", valid.errors);
   const env = environments.get(project).value;
+  requireCondition(!settings.planning || settings.planning.maxRequestChars <= settings.maxRequestChars,
+    "reader_pilot_invalid", "Planning cannot exceed the overall request ceiling");
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
     "reader_role_invalid", "The reader must have its own identity and cannot accept its extraction");
   executablePath(settings.reader.command, env.workspace); executablePath(settings.agentCommand, env.workspace);

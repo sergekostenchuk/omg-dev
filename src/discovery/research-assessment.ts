@@ -36,6 +36,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
   const pilotPacket = pilot ? pilotContext(store, draft, question) : null;
   const context = pilotPacket ? { ...pilotPacket, role: "assess-answer", question: question.value.spec,
+    sourceLocations: observations.map(o => ({ source: o.source, location: store.get<any>(o.source.id)!.value.origin.location })),
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations, consumerFeedback: consumerFeedback(store, draft.value) }

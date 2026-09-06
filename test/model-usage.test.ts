@@ -136,3 +136,21 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:30,output_
     }
   } finally { if (previousPath === undefined) delete process.env['PATH']; else process.env['PATH'] = previousPath; }
 });
+
+test("Codex reader uses an output schema with numeric source indices", async t => {
+  const { root, store, environment } = fixture(t);
+  writeFileSync(join(root,'codex'),`#!${process.execPath}\nimport {readFileSync,writeFileSync} from 'node:fs';readFileSync(0,'utf8');const args=process.argv.slice(2);
+writeFileSync('reader-schema-copy.json',readFileSync(args[args.indexOf('--output-schema')+1],'utf8'));
+writeFileSync(args[args.indexOf('-o')+1],JSON.stringify({selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]}));
+console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:2,cached_input_tokens:0,reasoning_output_tokens:0}}));`,{mode:0o700});
+  const previousPath=process.env['PATH'];process.env['PATH']=`${root}:${previousPath??''}`;
+  try{
+    const env=environment('normal');
+    env.implementer.command={executable:process.execPath,args:[fileURLToPath(new URL('../src/adapters/codex-stdio.js',import.meta.url)),'--compact-research']};
+    const result=await researchCall(env.implementer,env,'Select supplied sources',{role:'reader',sources:[]},undefined,{store,draftId:'draft-p',purpose:'reader'});
+    assert.deepEqual(result,{selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]});
+    const schema=JSON.parse(readFileSync(join(root,'reader-schema-copy.json'),'utf8'));
+    assert.deepEqual(schema.properties.selections.items.required,['sourceIndex','firstLine','lastLine']);
+    assert.equal(schema.properties.selections.items.properties.source,undefined);
+  }finally{if(previousPath===undefined)delete process.env['PATH'];else process.env['PATH']=previousPath;}
+});

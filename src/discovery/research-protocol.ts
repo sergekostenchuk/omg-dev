@@ -27,19 +27,24 @@ const bundleItem = (properties: Record<string, unknown>) => {
 };
 const contextRead = object({ action: { const: "read_context" }, record: ref, pointer: { type: "string" } });
 contextRead.properties['page'] = object({ offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } });
-const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
-  object({ action: { const: "answer_delta" }, question: text, base: ref,
-    upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
-    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
+const readSchemas = [
   object({ action: { const: "read_bundle" }, purpose: text, inputs: { type: "array", minItems: 1, items: { oneOf: [
     bundleItem({ path: text, media: { enum: ["text/plain", "application/json"] } }), bundleItem({ source: ref }),
-  ] } } }),
-  contextRead,
-  object({ action: { const: "checkpoint" }, question: text, value: {},
-    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
+  ] } } }), contextRead,
   object({ action: { const: "search" }, query: text }),
   object({ action: { const: "read_source" }, source: ref, start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 1 } }),
   object({ action: { const: "read" }, path: text, media: { enum: ["text/plain", "application/json"] } }),
+];
+const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
+  ...readSchemas,
+  object({ action: { const: "read_plan" }, question: text, reads: { type: "array", minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
+  object({ action: { const: "synthesize" }, question: text }),
+  object({ action: { const: "need_research" }, question: text, missing: { type: "array", minItems: 1, items: text } }),
+  object({ action: { const: "answer_delta" }, question: text, base: ref,
+    upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
+    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
+  object({ action: { const: "checkpoint" }, question: text, value: {},
+    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
   object({ action: { const: "answer" }, question: text, value: {}, citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
   object({ action: { const: "need_owner" }, question: text, reason: text, searched: { type: "array", minItems: 1, items: ref } }),
   object({ action: { const: "pause" }, reason: text }),
@@ -54,8 +59,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const requestId = randomUUID();
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt };
+  const requestLimit = audit?.purpose === "reading-planner" && audit.pilot?.value.planning
+    ? audit.pilot.value.planning.maxRequestChars : audit?.pilot?.value.maxRequestChars;
   const subject = audit?.pilot && audit.purpose !== "reader" ? workingContext(audit.store, environment.projectId,
-    audit.draftId, audit.questionId ?? "", context, audit.pilot.value.maxRequestChars - JSON.stringify({ ...envelope, subject: {} }).length)
+    audit.draftId, audit.questionId ?? "", context, requestLimit! - JSON.stringify({ ...envelope, subject: {} }).length)
     : context;
   audit?.onContext?.(subject as Record<string, any>);
   const input = JSON.stringify({ ...envelope, subject });

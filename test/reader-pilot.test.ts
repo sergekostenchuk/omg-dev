@@ -29,6 +29,7 @@ import { workingContext } from "../src/discovery/working-context.js";
 import { checkpoint, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
+import { ResearchSources } from "../src/discovery/research-sources.js";
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -51,9 +52,10 @@ function fixture(t: test.TestContext) {
 appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
-if(c.role!=='reader'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
+if(c.role!=='reader'&&c.dispatchMode!=='planning'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
 if(c.role==='reader')research={selections:[{source:c.sources[0].ref,firstLine:2,lastLine:3}],unresolved:[]};
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'Read runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]}]};
 else if(!c.readings.length)research={action:'read_bundle',purpose:'Read the scoped runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]};
 else if(c.question.field==='layerDesign')research={action:'answer_delta',question:c.question.id,base:c.graphBase,...JSON.parse(readFileSync('delta.json','utf8')),citations:c.readings[0].observations.map(o=>({source:o.source,selector:o.selector}))};
 else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'A scoped local product',facts:[{id:c.question.field+'-fact',claim:'README defines scope and rollback',path:'README.md'}],designs:[{id:c.question.field+'-design',decision:'Apply the defined scope and rollback',benefit:'Safe local output',consumer:'compilation'}],gaps:[]},citations:c.readings[0].observations.map(o=>({source:o.source,selector:o.selector}))};
@@ -241,7 +243,8 @@ test("shared pilot limits stop additional role calls without publishing an answe
 });
 
 test("L2 accepts a model delta, inherits exact L1, and gives the assessor changes rather than the full graph", async t => {
-  const { root, engine, store, full, draft: r1 } = fixture(t);
+  const { root, engine, store, full, settings, pilot, draft: r1 } = fixture(t);
+  configureReaderPilot(store, engine.environments, "p", { ...settings, planning: { fields: ["layerDesign"], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
   answerTechnicalFixture(engine, "p", r1);
   engine.refinement.finishResearch("p", "R1", reference(store.get(r1.id)!), 0);
   const draft = engine.refinement.prepareLayer("p", 2), question = store.get<Question>(draft.value.questions[0]!)!;
@@ -257,7 +260,7 @@ test("L2 accepts a model delta, inherits exact L1, and gives the assessor change
     "The delta preserves every node value; new nodes append without rewriting upper node order");
   assert.throws(() => expandLayerDelta(store, draft, question, { ...delta, base: { ...delta.base, revision: 999 } }), { code: "graph_stale" });
   const l1 = store.get("graph-layer:p:1")!;
-  const result = await engine.execute({ type: "research-phase", project: "p", phase: "L2", draftId: draft.id, maxTurns: 2 }) as ConsumerResult;
+  const result = await engine.execute({ type: "research-phase", project: "p", phase: "L2", draftId: draft.id, maxTurns: 3 }) as ConsumerResult;
   assert.equal(result.status, "accepted", JSON.stringify(result));
   assert.deepEqual(store.get(l1.id), l1);
   assert.deepEqual(engine.refinement.gate("p", "L2").findings, []);
@@ -266,6 +269,7 @@ test("L2 accepts a model delta, inherits exact L1, and gives the assessor change
   assert.equal(review.fullGraph, false); assert.equal(review.delta, true);
   assert.throws(() => engine.refinement.begin("p", "R2"), { code: "pilot_boundary_reached" });
   assert.equal(store.get("phase:p:R2"), null);
+  assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='reading-planner').length, 1);
 });
 
 test("raising a pilot allowance resumes the saved assessor candidate without another analyst call", async t => {
@@ -588,4 +592,95 @@ test("restoring paid readings checks every bundle source including unselected so
   assert.ok(engine.discovery.evidence.verify(reader.value.observations[0]!));
   assert.equal(pilotContext(store, draft, question).readings.length, 0);
   assert.equal(workingSelections(store, [turn], question).length, 0, "Stale bundle must not return as a generic focus either");
+});
+
+test("planning indexes all sources, requirements and nodes without carrying observations", t => {
+  const { root, store, engine, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.file("p", "index-source", root, "README.md", "text/plain", 0);
+  const base = pilotContext(store, draft, question);
+  const inventory = new ResearchSources(store, "p", root).inventory();
+  const body = { ...base, repositoryRoot: root, dispatchMode: "planning", inventory, readPlanStatus: [],
+    readings: [{ purpose: "Read source", coverage: [{ ref: reference(source), visibleRange: { start: 0, end: 10 } }], unresolved: ["Check exception"],
+      observations: [{ value: "LARGE_OBSERVATION_NOT_FOR_PLANNING".repeat(5000) }] }] };
+  const packet = workingContext(store, "p", draft.id, question.id, body, 50000);
+  assert.ok(JSON.stringify(packet).length < 50000);
+  assert.ok(!JSON.stringify(packet).includes("LARGE_OBSERVATION_NOT_FOR_PLANNING"));
+  assert.equal(packet.question.schema, undefined);
+  assert.deepEqual(packet.sources.map((s: any)=>inventory.sources[s.index]!.ref.id), inventory.sources.map(s=>s.ref.id));
+  assert.deepEqual(packet.requirements.map((r: any)=>r.id), base.core.requirements.flatMap((s: any)=>records<any>(s.requirements).map(r=>r.id)));
+  assert.deepEqual(packet.nodes.map((n: any)=>n.id), records<any>(base.map.nodes).map(n=>n.id));
+  assert.deepEqual(packet.constraints, base.core.constraints);
+  assert.deepEqual(packet.specificationConstraints, base.core.specificationConstraints);
+  assert.equal(readPilotContext(store, draft, packet.working.archive, "/body/readings/0/observations/0/value", 500, {offset:0,limit:32}).value,
+    body.readings[0]!.observations[0]!.value.slice(0,32));
+});
+
+test("planner cannot approve an answer from the index and its round count survives restart", async t => {
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.file("p", "planner-cite", root, "README.md", "text/plain", 0);
+  const command = join(root, "bad-planner.mjs");
+  const action = {action:'answer',question:question.id,value:{applicability:'applicable',reason:'valid shape',facts:[],designs:[{id:'d',decision:'Do work',benefit:'Benefit',consumer:'compilation'}],gaps:[]},
+    citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]};
+  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:${JSON.stringify(action)},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  await engine.researcher.run("p",draft.id,2);
+  const run = await engine.researcher.run("p",draft.id,5);
+  assert.equal(run.value.pauseCode,"planning_round_limit");
+  assert.equal(store.list("model-call").length,3);
+  assert.ok(store.list<ModelCall>("model-call").every(c=>c.value.purpose==='reading-planner'&&c.value.request.chars<=50000));
+  assert.equal(store.get<Question>(question.id)!.value.status,"open");
+});
+
+test("grouped reads resume only the failed child and then switch to substantive synthesis", async t => {
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  for(const path of ['a.txt','b.txt'])writeFileSync(join(root,path),`Header\n${path} condition\n${path} exception\n`);
+  const command=join(root,'batch-provider.mjs');
+  writeFileSync(join(root,'fail-b'),'once');
+  writeFileSync(command,`import {readFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='reader'){research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};if(c.purpose==='b'&&existsSync('fail-b'))process.exitCode=1;}
+else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
+else {if(!c.question.schema||c.readings.length!==2)throw Error('Synthesis needs real content');research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both groups read',facts:[],designs:[{id:'d',decision:'Respect both conditions',benefit:'Safe result',consumer:'compilation'}],gaps:[]},citations:c.readings.flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};}
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]};
+  configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  const first=await engine.researcher.run("p",draft.id,10);
+  assert.equal(first.value.pauseCode,'research_provider_failed');
+  assert.equal(store.list('reader-result').length,1);
+  const acceptedRead=store.list('reader-result')[0]!;
+  assert.equal(store.list<ResearchTurn>('research-turn').filter(t=>t.value.plannedBy&&t.value.status==='pending').length,1);
+  rmSync(join(root,'fail-b'));
+  await engine.researcher.run("p",draft.id,2);
+  assert.equal(store.get<Question>(question.id)!.value.status,'answered');
+  assert.deepEqual(store.get(acceptedRead.id),acceptedRead);
+  const calls=store.list<ModelCall>('model-call');
+  assert.equal(calls.filter(c=>c.value.purpose==='reading-planner').length,1);
+  assert.equal(calls.filter(c=>c.value.purpose==='analyst').length,1);
+  assert.equal(calls.filter(c=>c.value.purpose==='reader').length,3);
+  assert.equal(calls.length,6);
+});
+
+test("the permanent source catalogue retains every inventory field without retaining duplicate navigation payload", t => {
+  const { root, store, draft, question }=fixture(t);
+  const inventory=new ResearchSources(store,'p',root).inventory();
+  const body={...pilotContext(store,draft,question),inventory,workingSelections:[{kind:'context',key:'inventory',value:{pointer:'/body/inventory',value:inventory}}]};
+  const packet=workingContext(store,'p',draft.id,question.id,body,100000);
+  assert.deepEqual(records(packet.sourceCatalogue.sources),inventory.sources);
+  assert.deepEqual(packet.sourceCatalogue.files,inventory.files);
+  assert.equal(packet.sourceCatalogue.filesTruncated,inventory.filesTruncated);
+  assert.equal(packet.focus,undefined);assert.equal(packet.inventory,undefined);
+});
+
+test("reader source indices bind to exact supplied versions and reject ambiguous or foreign indices", t => {
+  const {root,store,engine}=fixture(t);
+  const source=engine.discovery.evidence.file('p','indexed',root,'README.md','text/plain',0);
+  const supplied=[numberedSource(source)];
+  const response={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};
+  const result=readerObservations(store,'p',supplied,response,10000);
+  assert.deepEqual(result.observations[0]!.source,reference(source));
+  assert.ok(engine.discovery.evidence.verify(result.observations[0]!));
+  assert.throws(()=>readerObservations(store,'p',supplied,{...response,selections:[{...response.selections[0],sourceIndex:1}]},10000),{code:'reader_selection_foreign'});
+  assert.throws(()=>readerObservations(store,'p',supplied,{...response,selections:[{...response.selections[0],source:reference(source)}]},10000),{code:'reader_response_invalid'});
+  writeFileSync(join(root,'README.md'),'changed');
+  assert.throws(()=>readerObservations(store,'p',supplied,response,10000),{code:'source_stale'});
 });

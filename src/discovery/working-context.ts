@@ -3,11 +3,13 @@ import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
+import { planningContext } from "./planning-context.js";
+import { contextTable } from "./context-tables.js";
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number }
 const escape = (s: string) => s.replaceAll("~", "~0").replaceAll("/", "~1");
-const instruction = "Full context is retained in working.archive in SQLite. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue is the complete inventory in column/row form, including exact source refs and locations; use it without reloading the inventory. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
 export function contextValue(value: unknown, pointer: string): unknown {
   requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
@@ -51,14 +53,19 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   const body = JSON.parse(JSON.stringify(context)) as Record<string, Json>;
+  const inventory = body['inventory'] as any;
+  if (inventory?.sources && inventory.files) body['sourceCatalogue'] = {
+    sources: contextTable(inventory.sources), files: inventory.files, filesTruncated: inventory.filesTruncated,
+  } as Json;
   body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
     Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
   const value: Archive = { projectId, draft: reference(draft), question: reference(question), body };
   const id = `research-context:${hashJson(value)}`;
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+  if (body['dispatchMode'] === "planning") return planningContext(body, reference(archive), maxChars);
   const mandatory = ["role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
-    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence"];
+    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations"];
   const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
   packet.working = { archive: reference(archive), instruction,
     sections: Object.entries(body).filter(([key]) => !mandatory.includes(key)).map(([key, v]) => ({
@@ -82,6 +89,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (!isAssessor && Array.isArray(body['workingSelections']) && body['workingSelections'].length) {
     packet.selectedContext = [];
     for (const [index, selection] of (body['workingSelections'] as any[]).entries()) {
+      if (body['sourceCatalogue'] && selection.value?.pointer === "/body/inventory"
+        && canonical(selection.value.value) === canonical(inventory)) continue;
       const included = selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
         : packet.focus === undefined ? add("focus", selection.value) : add("selectedContext", [...packet.selectedContext, selection.value]);
       if (!included && index === 0) {
@@ -96,6 +105,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     else add("focus", focus);
   }
   for (const key of isAssessor ? ["assessmentNotes"] : ["previousProposal", "currentProposal", "checkpoint", "inventory", "catalogue", "answers", "history", "openGaps", "failures"]) {
+    if (key === "inventory" && body['sourceCatalogue']) continue;
     if (Object.hasOwn(body, key) && add(key, body[key])) packet.working.omitted = packet.working.omitted.filter((k: string) => k !== key);
   }
   // Explicitly requested materials coexist while they fit. Oldest materials

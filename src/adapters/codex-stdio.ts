@@ -35,6 +35,15 @@ async function main() {
       } };
       const path = join(directory, "review-schema.json"); writeFileSync(path, JSON.stringify(schema)); args.push("--output-schema", path);
     }
+    if (request.mode === "research" && (request.subject as { role?: unknown } | null)?.role === "reader") {
+      const schema = { type: "object", additionalProperties: false, required: ["selections", "unresolved"], properties: {
+        selections: { type: "array", items: { type: "object", additionalProperties: false,
+          required: ["sourceIndex", "firstLine", "lastLine"], properties: { sourceIndex: { type: "integer", minimum: 0 },
+            firstLine: { type: "integer", minimum: 1 }, lastLine: { type: "integer", minimum: 1 } } } },
+        unresolved: { type: "array", items: { type: "string" } },
+      } };
+      const path = join(directory, "reader-schema.json"); writeFileSync(path, JSON.stringify(schema)); args.push("--output-schema", path);
+    }
     args.push("-");
     const instruction = request.mode === "implement"
       ? "Implement only the supplied task and its declared write paths. Do not commit or change Git metadata. The engine owns testing, independent review and commit. Return your final answer as JSON with exactly text (string) and artifacts (array of {id}); identify every implemented output contract. The engine derives a code manifest after acceptance; do not invent business artifact values.\n"
