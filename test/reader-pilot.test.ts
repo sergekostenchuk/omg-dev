@@ -655,6 +655,22 @@ test("planner cannot approve an answer from the index and its round count surviv
   assert.equal(store.get<Question>(question.id)!.value.status,"open");
 });
 
+test("a rejected planner target reaches the next planner as correction feedback", async t => {
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const command = join(root, "corrected-planner.mjs");
+  writeFileSync(command,`import {readFileSync,existsSync,writeFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(!existsSync('attempted')){writeFileSync('attempted','1');research={action:'read_plan',question:c.question.prompt,reads:[{action:'read',path:'README.md',media:'text/plain'}]};}
+else {if(c.dispatchMode!=='planning'||!c.corrections.some(x=>x.error.includes('target this question')))throw Error('The planner must see the rejected target');if(!req.prompt.includes('subject.question.id'))throw Error('Exact question target must be specified');research={action:'read_plan',question:c.question.id,reads:[{action:'read',path:'README.md',media:'text/plain'}]};}
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, "p", {...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  await engine.researcher.run("p",draft.id,3);
+  const turns=store.list<ResearchTurn>("research-turn");
+  assert.equal(turns.filter(t=>t.value.error).length,1);
+  assert.equal(turns.filter(t=>t.value.plannedBy&&t.value.status==='completed'&&!t.value.error).length,1);
+  assert.equal(store.list<ModelCall>("model-call").length,2);
+  assert.equal(store.get<Question>(question.id)!.value.status,'open');
+});
+
 test("grouped reads resume only the failed child and then switch to substantive synthesis", async t => {
   const { root, store, engine, pilot, settings, draft, question } = fixture(t);
   for(const path of ['a.txt','b.txt'])writeFileSync(join(root,path),`Header\n${path} condition\n${path} exception\n`);

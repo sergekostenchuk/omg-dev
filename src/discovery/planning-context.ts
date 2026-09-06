@@ -38,6 +38,10 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
       unresolvedCount: r.unresolved.length, unresolvedPointer: `/body/readings/${i}/unresolved` })),
     priorReads: body.directReadings.map((r: any, i: number) => ({ pointer: `/body/directReadings/${i}`, action: r.action })),
     answers: body.answers, missing: body.researchMissing ?? [], readPlanStatus: body.readPlanStatus,
+    corrections: (body.history ?? []).flatMap((turn: any, index: number) => turn.error ? [{
+      number: turn.number, action: turn.action, error: turn.error, feedback: turn.feedback,
+      pointer: `/body/history/${index}`,
+    }] : []),
     openGaps: body.openGaps, failures: body.failures, unresolvedEvidence: body.unresolvedEvidence,
     working: { archive, instruction: "This is a navigation index, not evidence or an answer context. Every requirement/node is indexed. Full criteria, schemas, evidence, checkpoints and histories remain in the archived body. Use its record and /body/... pointers. Original source refs are returned with reads; file paths are relative to the research workspace when possible. No new fact is inferred by this index.",
       sections: ["core", "map", "readings", "directReadings", "checkpoints", "question", "inventory"].map(k => ({ pointer: `/body/${pointer(k)}` })) },
