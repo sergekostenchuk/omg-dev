@@ -11,6 +11,7 @@ export interface ReaderPilotSettings {
   reader: RoleBinding; agentCommand: Command;
   maxRequestChars: number; maxReadChars: number; maxReplyChars: number;
   maxCalls: number; maxReportedTokens: number;
+  callTimeoutMs?: number;
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
 }
@@ -27,6 +28,7 @@ readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
+readerPilotSchema.properties['callTimeoutMs'] = { type: "integer", minimum: 1, maximum: 3_000_000 };
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
 
 export function configureReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number): Revision<ReaderPilot> {
@@ -65,6 +67,7 @@ export function assertPilotBoundary(store: Store, project: string, phase: string
 /** The source environment stays unchanged so accepted source/assessment history
  * retains its original references. New attempts record the pilot separately. */
 export function pilotEnvironment(environment: Environment, pilot: ReaderPilot): Environment {
-  return { ...environment, implementer: { ...environment.implementer, command: pilot.agentCommand },
+  return { ...environment, timeoutMs: pilot.callTimeoutMs ?? environment.timeoutMs,
+    implementer: { ...environment.implementer, command: pilot.agentCommand },
     reviewer: { ...environment.reviewer, command: pilot.agentCommand } };
 }

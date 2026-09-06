@@ -866,3 +866,12 @@ test("the latest proposal remains stable beyond the compact eight-turn history",
   const corrected={...proposal,value:{marker:'Corrected'}};turns.push(record(13,corrected));
   assert.deepEqual(latestProposal(turns,question.id),corrected);
 });
+
+test("a pilot timeout override leaves the accepted source environment unchanged", t => {
+  const {store,engine,environment,settings,pilot}=fixture(t);
+  assert.equal(pilotEnvironment(environment.value,pilot.value).timeoutMs,environment.value.timeoutMs);
+  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,callTimeoutMs:1800000},pilot.revision);
+  assert.equal(pilotEnvironment(environment.value,configured.value).timeoutMs,1800000);
+  assert.deepEqual(store.get(environment.id),environment);
+  for(const callTimeoutMs of [0,-1,1.5,3000001])assert.throws(()=>configureReaderPilot(store,engine.environments,'p',{...settings,callTimeoutMs},configured.revision),{code:'reader_pilot_invalid'});
+});
