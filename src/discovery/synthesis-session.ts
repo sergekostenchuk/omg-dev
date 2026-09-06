@@ -3,7 +3,7 @@ import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import type { ResearchAction } from "./research-model.js";
-import { hashJson, type Json } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
@@ -19,8 +19,16 @@ interface Session {
 }
 
 function basis(draft: Revision<DiscoveryDraft>, question: Revision<Question>, environment: Revision<Environment>, context: Record<string, any>) {
-  const materials = context.workingSelections?.length ? context.workingSelections
-    : (context.readings ?? []).map((value: any) => ({ kind: "reader", value }));
+  // New selections set the order, but do not replace the paid investigation.
+  // One question can need a prior reader result again after a rejected answer.
+  const seen = new Set<string>();
+  const materials = [...(context.workingSelections ?? []),
+    ...(context.readings ?? []).map((value: any) => ({ kind: "reader", value }))].filter(selection => {
+    const key = selection.kind === "reader" && isRef(selection.value?.ref)
+      ? canonical(["reader", selection.value.ref]) : canonical([selection.kind, selection.value]);
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
   return { materials, id: `synthesis-session:${hashJson([reference(question), reference(environment), draft.value.inputs,
     materials, context.previousProposal ?? null])}` };
 }

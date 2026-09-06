@@ -17,7 +17,7 @@ import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pil
 import { pilotContext, readPilotContext, retainPilotRead } from "./pilot-context.js";
 import { readBundle } from "./reader.js";
 import { expandLayerDelta } from "./layer-delta.js";
-import { checkpoint, latestFocus, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
+import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
 import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import type { ModelCall } from "../runtime/model-usage.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
@@ -97,8 +97,7 @@ export class Researcher {
           history: history.map(turn => ({ number: turn.number, action: (turn.action as { action?: string })?.action,
             error: turn.error, assessment: turn.assessment,
             feedback: turn.error || ["answer", "answer_delta"].includes(String((turn.action as { action?: string })?.action)) ? turn.observation : null })),
-          previousProposal: history.filter(turn => (turn.action as { question?: string })?.question === pending[0]!.id
-            && ["answer", "answer_delta"].includes(String((turn.action as { action?: string })?.action))).at(-1)?.action ?? null,
+          previousProposal: latestProposal(turns, pending[0]!.id),
           consumerFeedback: consumerFeedback(this.store, draft.value) }
           : { role: "research", stage: draft.value.stage, level: draft.value.level, consumer: draft.value.consumer,
           fields: draft.value.fields, questions: pending.map(item => ({ id: item.id, ...item.value.spec })),

@@ -26,7 +26,7 @@ import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
 import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
 import { workingContext } from "../src/discovery/working-context.js";
-import { checkpoint, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
+import { checkpoint, latestProposal, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
 import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-session.js";
@@ -831,4 +831,38 @@ test("an explicit synthesis pause does not become an unresumable cached result",
   store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'A changed question'}}});
   await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'input_stale'});
   assert.equal(store.list('model-call').length,2,'Cached answers cannot bypass changed inputs');
+});
+
+test("synthesis combines recent selections with older paid readings without duplicate evidence", async t => {
+  const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
+  writeFileSync(join(root,'older.txt'),'Header\nOlder necessary condition\nOlder exception\n');
+  const older=await readBundle(store,environment.value,pilot,reference(question),'Older evidence',[{path:'older.txt',media:'text/plain'}]);
+  const recent=await readBundle(store,environment.value,pilot,reference(question),'Recent evidence',[{path:'README.md',media:'text/plain'}]);
+  const view=(r:typeof older)=>({ref:reference(r),purpose:r.value.purpose,observations:r.value.observations,coverage:r.value.coverage,unresolved:r.value.unresolved});
+  const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory(),
+    workingSelections:[{kind:'reader',key:'recent',value:view(recent)}],readings:[view(older),view(recent)]};
+  const command=join(root,'complete-reader-context.mjs');
+  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;if(c.readings.length!==2||c.readings[0].purpose!=='Recent evidence'||c.readings[1].purpose!=='Older evidence')throw Error('Missing old evidence or duplicated recent evidence');console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'need_research',question:c.question.id,missing:['An actual new source is needed']},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]};
+  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd},pilot.revision);
+  const dispatch={...environment.value,implementer:{...environment.value.implementer,command:cmd}};
+  const result=await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON');
+  assert.equal(result.action,'need_research');
+  assert.equal(store.list('model-call').length,3,'Two paid reader results and one substantive call');
+  assert.equal(pendingSynthesis(store,draft,question,environment,context),false);
+});
+
+
+test("the latest proposal remains stable beyond the compact eight-turn history", t => {
+  const {store,question}=fixture(t);
+  const proposal={action:'answer',question:question.id,value:{marker:'Retain this proposal'},citations:[]};
+  const record=(number:number,action:unknown)=>store.write<ResearchTurn>({id:'proposal-history-'+number,kind:'research-turn',expected:0,
+    value:{run:'history-fixture',number,action,status:'completed',question:reference(question),assessment:null,observation:null,error:null}});
+  const turns=[record(1,proposal),...Array.from({length:10},(_,i)=>record(i+2,{action:'search',query:'source-'+i}))];
+  assert.deepEqual(latestProposal(turns,question.id),proposal);
+  assert.equal(latestProposal(turns.slice(-8),question.id),null,'Compact history alone cannot provide the resume identity');
+  turns.push(record(12,{action:'answer',question:'foreign-question',value:{},citations:[]}));
+  assert.deepEqual(latestProposal(turns,question.id),proposal);
+  const corrected={...proposal,value:{marker:'Corrected'}};turns.push(record(13,corrected));
+  assert.deepEqual(latestProposal(turns,question.id),corrected);
 });

@@ -8,6 +8,13 @@ import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent } from "./reader.js";
 
+/** Keep one latest proposal even after many reads push its turn out of the
+ * compact conversation history. Its identity also stabilizes synthesis resume. */
+export function latestProposal(turns: Revision<ResearchTurn>[], questionId: string) {
+  return [...turns].reverse().find(turn => (turn.value.action as { question?: string })?.question === questionId
+    && ["answer", "answer_delta"].includes(String((turn.value.action as { action?: string })?.action)))?.value.action ?? null;
+}
+
 export function checkpoint(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   action: Extract<ResearchAction, { action: "checkpoint" }>) {
   requireCondition(action.question === question.id && question.value.draftId === draft.id, "research_question_foreign", "Checkpoint belongs to another question");
