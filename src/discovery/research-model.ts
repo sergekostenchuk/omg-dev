@@ -28,6 +28,7 @@ export interface ResearchRun {
   turns: number; limit: number; inputs: Ref[];
   ownerQuestion: { question: string; reason: string; searched: Ref[] } | null;
   error: string | null;
+  pauseCode?: string | null;
   owner: { pid: number; started: string }; requestChars: number;
 }
 export interface ResearchTurn {

@@ -1,6 +1,6 @@
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ReaderResult } from "./reader.js";
+import { readerResultCurrent, type ReaderResult } from "./reader.js";
 import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
 import { reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -85,8 +85,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   };
   const allReadings = store.list<ReaderResult>("reader-result").filter(record => record.value.projectId === project
     && record.value.question.id === question.id);
-  const readings = allReadings.filter(record => record.value.sources.every(sourceCurrent)
-    && record.value.observations.every(observation => evidence.verify(observation)));
+  const readings = allReadings.filter(record => readerResultCurrent(store, project, record.value));
   const catalogue = contextCatalogue(store, draft);
   const directReadings = store.list<{ projectId: string; question: string; action: { action: string }; observation: any }>("pilot-reading")
     .filter(record => record.value.projectId === project && record.value.question === question.id);

@@ -3,9 +3,10 @@ import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAction, ResearchTurn } from "./research-model.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
 import { canonical, hashJson } from "../canonical.js";
-import { reference } from "../pipeline/contracts.js";
+import { reference, isRef } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
-import { archivedContext } from "./working-context.js";
+import { archivedContext, contextValue } from "./working-context.js";
+import { readerResultCurrent } from "./reader.js";
 
 export function checkpoint(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   action: Extract<ResearchAction, { action: "checkpoint" }>) {
@@ -26,6 +27,10 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
     if (turn.value.status !== "completed" || turn.value.error) return null;
     if (turn.value.question && canonical(turn.value.question) !== canonical(reference(question))) return null;
     const action = (turn.value.action as { action?: string })?.action;
+    const materialRef = observation?.value?.ref ?? observation?.ref;
+    const material = isRef(materialRef) ? store.get<any>(materialRef.id, materialRef.revision) : null;
+    if (material?.kind === "reader-result" && (material.hash !== materialRef.hash
+      || !readerResultCurrent(store, question.value.projectId, material.value))) return null;
     const evidence = new Evidence(store);
     if (action === "read_bundle" && !observation.observations.every((o: any) => evidence.verify(o))) return null;
     if (action === "read_source" && !evidence.verify(observation)) return null;
@@ -38,6 +43,66 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
       }
     }
     return ["read", "read_source", "read_context", "read_bundle", "search"].includes(action ?? "") ? turn.value.observation : null;
+  }
+  return null;
+}
+
+function readerSelection(store: Store, focus: any, question: Revision<Question>) {
+  const view = focus?.value?.ref ? focus.value : focus;
+  const ref = view?.ref;
+  const record = isRef(ref) ? store.get<any>(ref.id, ref.revision) : null;
+  if (record?.kind !== "reader-result" || record.hash !== ref.hash || record.value.question.id !== question.id
+    || record.value.projectId !== question.value.projectId || !view.observations
+    || canonical(view.observations) !== canonical(record.value.observations)) return null;
+  if (!readerResultCurrent(store, question.value.projectId, record.value)) return null;
+  return { key: canonical(reference(record)), kind: "reader", value: { ref: reference(record), purpose: record.value.purpose,
+    observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved } };
+}
+
+/** A comparison needs multiple explicitly requested materials at once. Use
+ * most-recent-first order; the wire packer, not a fixed item count, limits size. */
+export function workingSelections(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>) {
+  const selected: { key: string; kind: string; value: unknown }[] = [], seen = new Set<string>();
+  for (const turn of [...turns].reverse()) {
+    if (turn.value.question?.id === question.id && ["answer", "answer_delta", "checkpoint"].includes(String((turn.value.action as any)?.action))) break;
+    const focus = latestFocus(store, [turn], question);
+    if (!focus) continue;
+    const item = readerSelection(store, focus, question) ?? { key: canonical(focus), kind: "context", value: focus };
+    if (!seen.has(item.key)) { seen.add(item.key); selected.push(item); }
+  }
+  return selected;
+}
+
+function contextReadKey(store: Store, observation: any, action: Extract<ResearchAction, { action: "read_context" }>, question: Revision<Question>) {
+  const reading = readerSelection(store, observation, question);
+  if (reading) return reading.key;
+  const page = observation.page ?? null;
+  const archive = store.get<any>(action.record.id, action.record.revision);
+  if (archive?.kind !== "research-context") return canonical([action.record, action.pointer, page]);
+  const parts = action.pointer.split("/");
+  for (let end = parts.length; end > 1; end--) {
+    const parent = contextValue(archive.value, parts.slice(0, end).join("/")) as any;
+    const origin = parent?.source ?? parent?.ref;
+    if (isRef(origin)) return canonical([origin, parts.slice(end), page, observation.value]);
+  }
+  return canonical([archive.value.draft.id, archive.value.question.id, action.pointer, page, observation.value]);
+}
+
+/** Compare the underlying reading, not its newly generated archive wrapper.
+ * A/A and A/B/A both stop on the second unchanged request without a checkpoint. */
+export function repeatedContextRead(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>,
+  afterTurn: number, observation: unknown, action: Extract<ResearchAction, { action: "read_context" }>) {
+  const key = contextReadKey(store, observation, action, question);
+  for (const turn of [...turns].reverse()) {
+    if (turn.value.number <= afterTurn) break;
+    if (turn.value.question?.id !== question.id) continue;
+    const prior = turn.value.action as ResearchAction;
+    if (prior.action === "checkpoint" || prior.action === "answer" || prior.action === "answer_delta") break;
+    if (turn.value.error || turn.value.status !== "completed" || prior.action !== "read_context") continue;
+    const oldFocus = latestFocus(store, [turn], question);
+    if (!oldFocus) continue;
+    const previous = contextReadKey(store, oldFocus, prior, question);
+    if (key === previous) return reference(turn);
   }
   return null;
 }

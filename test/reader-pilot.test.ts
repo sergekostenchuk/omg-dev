@@ -26,7 +26,7 @@ import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
 import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
 import { workingContext } from "../src/discovery/working-context.js";
-import { checkpoint, recoverableAnswer } from "../src/discovery/research-continuation.js";
+import { checkpoint, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
 
@@ -496,4 +496,96 @@ test("assessment continuation never reuses a verdict after its supplied research
   assert.equal(store.list("model-call").length, 2);
   assert.equal(store.list("assessment-session").length, 2);
   assert.ok(readFileSync(join(root, "calls.jsonl"), "utf8").includes("assess-answer"));
+});
+
+test("two paid reading blocks coexist for comparison without archive ping-pong", async t => {
+  const { root, store, engine, environment, pilot, settings, draft, question } = fixture(t);
+  for (const name of ["a", "b"]) {
+    writeFileSync(join(root, `${name}.txt`), `Header\n${name.repeat(1800)}\nException ${name}\n`);
+    await readBundle(store, environment.value, pilot, reference(question), `Read ${name}`, [{ path: `${name}.txt`, media: "text/plain" }]);
+  }
+  const readers = store.list<any>("reader-result");
+  const command = join(root, "compare-provider.mjs");
+  writeFileSync(command, `import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.readings.length===2)research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Compared both originals',facts:[],designs:[{id:'d',decision:'Respect both exceptions',benefit:'Correct comparison',consumer:'compilation'}],gaps:[]},citations:c.readings.flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};
+else research={action:'read_context',record:c.working.archive,pointer:'/body/readings/'+(c.readings.some(r=>r.ref.id===${JSON.stringify(readers[0]!.id)})?1:0)};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, "p", { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  await engine.researcher.run("p", draft.id, 3);
+  assert.equal(store.get<Question>(question.id)!.value.status, "answered");
+  assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='analyst').length, 3);
+  assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='reader').length, 2, "Paid reading results are reused");
+});
+
+test("unchanged archive rereading pauses on the second request despite a new wrapper hash", async t => {
+  for (const alternating of [false, true]) {
+    const { root, store, engine, environment, pilot, settings, draft, question } = fixture(t);
+    for (const name of ["a", "b"]) {
+      writeFileSync(join(root, `${name}.txt`), `Header\nData ${name}\nException ${name}\n`);
+      await readBundle(store, environment.value, pilot, reference(question), `Read ${name}`, [{ path: `${name}.txt`, media: "text/plain" }]);
+    }
+    const command = join(root, "repeat-provider.mjs");
+    writeFileSync(command, `import {readFileSync,writeFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+const step=existsSync('repeat-step')?Number(readFileSync('repeat-step','utf8')):0;writeFileSync('repeat-step',String(step+1));
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'read_context',record:c.working.archive,pointer:'/body/readings/'+(${alternating}?step%2:0)},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+    configureReaderPilot(store, engine.environments, "p", { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+    const run = await engine.researcher.run("p", draft.id, 10);
+    assert.equal(run.value.status, "paused"); assert.equal(run.value.pauseCode, "research_no_progress");
+    const turns = store.list<ResearchTurn>("research-turn").sort((a,b)=>a.value.number-b.value.number);
+    assert.equal(turns.at(-1)!.value.status, "pending");
+    assert.equal((turns.at(-1)!.value.observation as any).code, "research_no_progress");
+    assert.notEqual((turns[0]!.value.action as any).record.id, (turns.at(-1)!.value.action as any).record.id);
+    assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='analyst').length, alternating ? 3 : 2);
+    assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  }
+});
+
+test("the oldest selected material is evicted before the newest without increasing the ceiling", t => {
+  const { store, draft, question } = fixture(t);
+  const base = pilotContext(store, draft, question);
+  const newest = { key: "new", kind: "context", value: { text: "new".repeat(3000) } };
+  const older = { key: "old", kind: "context", value: { text: "old".repeat(3000) } };
+  const oldest = { key: "oldest", kind: "context", value: { text: "oldest".repeat(6000) } };
+  const limit = JSON.stringify(base).length + 25000;
+  const packet = workingContext(store, "p", draft.id, question.id, { ...base, workingSelections: [newest, older, oldest] }, limit);
+  assert.ok(JSON.stringify(packet).length <= limit);
+  assert.deepEqual(packet.focus, newest.value);
+  assert.deepEqual(packet.selectedContext, [older.value]);
+  const oversized = { ...newest, value: { text: "X".repeat(limit * 2) } };
+  const continuation = workingContext(store, "p", draft.id, question.id, { ...base, workingSelections: [oversized, older] }, limit);
+  assert.ok(continuation.working.focusContinuation);
+  assert.equal(continuation.focus, undefined, "An older value cannot replace the requested newest value");
+});
+
+test("increasing page limit at end of unchanged context cannot evade repeat detection", async t => {
+  const { root, store, engine, pilot, settings, draft } = fixture(t);
+  const command = join(root, "end-page-provider.mjs");
+  writeFileSync(command, `import {readFileSync,writeFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+const step=existsSync('end-step')?Number(readFileSync('end-step','utf8')):0;writeFileSync('end-step',String(step+1));
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'read_context',record:c.working.archive,pointer:'/body/core/acceptance',page:{offset:0,limit:100+step}},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, "p", { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const run = await engine.researcher.run("p", draft.id, 10);
+  assert.equal(run.value.pauseCode, "research_no_progress");
+  assert.equal(store.list("model-call").length, 2);
+});
+
+test("restoring paid readings checks every bundle source including unselected sources", async t => {
+  const { root, store, engine, environment, pilot, draft, question } = fixture(t);
+  writeFileSync(join(root, "a.txt"), "Header\nSelected A\nException A\n");
+  writeFileSync(join(root, "b.txt"), "Header\nUnselected B\nException B\n");
+  const reader = await readBundle(store, environment.value, pilot, reference(question), "Read A and B", [
+    { path: "a.txt", media: "text/plain" }, { path: "b.txt", media: "text/plain" }]);
+  assert.equal(reader.value.sources.length, 2); assert.equal(reader.value.observations.length, 1);
+  const context = pilotContext(store, draft, question);
+  const packet = workingContext(store, "p", draft.id, question.id, context, 100000);
+  const action = { action: "read_context" as const, record: packet.working.archive, pointer: "/body/readings/0" };
+  const observation = readPilotContext(store, draft, action.record, action.pointer, 10000);
+  const turn = store.write<ResearchTurn>({ id: "fixture-archived-reading", kind: "research-turn", expected: 0,
+    value: { run: "fixture", number: 1, action, observation, assessment: null, error: null, status: "completed", question: reference(question) } });
+  assert.equal(workingSelections(store, [turn], question).length, 1);
+  writeFileSync(join(root, "b.txt"), "changed B");
+  assert.ok(engine.discovery.evidence.verify(reader.value.observations[0]!));
+  assert.equal(pilotContext(store, draft, question).readings.length, 0);
+  assert.equal(workingSelections(store, [turn], question).length, 0, "Stale bundle must not return as a generic focus either");
 });

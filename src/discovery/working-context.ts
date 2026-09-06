@@ -7,7 +7,7 @@ import { requireCondition } from "../errors.js";
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number }
 const escape = (s: string) => s.replaceAll("~", "~0").replaceAll("/", "~1");
-const instruction = "Full context is retained in working.archive in SQLite. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. focus is the latest requested material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+const instruction = "Full context is retained in working.archive in SQLite. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
 export function contextValue(value: unknown, pointer: string): unknown {
   requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
@@ -79,7 +79,18 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(length() <= maxChars, "pilot_core_limit", "Required context index exceeds the request limit");
   const isAssessor = Object.hasOwn(body, "assessmentState");
   packet.working.maxPageChars = Math.max(1, maxChars - length() - 512);
-  if (body['focus']) {
+  if (!isAssessor && Array.isArray(body['workingSelections']) && body['workingSelections'].length) {
+    packet.selectedContext = [];
+    for (const [index, selection] of (body['workingSelections'] as any[]).entries()) {
+      const included = selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
+        : packet.focus === undefined ? add("focus", selection.value) : add("selectedContext", [...packet.selectedContext, selection.value]);
+      if (!included && index === 0) {
+        packet.working.focusContinuation = { record: reference(archive), pointer: "/body/workingSelections/0/value",
+          reason: "The newest requested material needs a smaller page; older material must not displace it" };
+        break;
+      }
+    }
+  } else if (body['focus']) {
     const focus = body['focus'];
     if (!isAssessor && typeof focus === "object" && !Array.isArray(focus) && Object.hasOwn(focus, "observations")) add("readings", [focus]);
     else add("focus", focus);
@@ -87,8 +98,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   for (const key of isAssessor ? ["assessmentNotes"] : ["previousProposal", "currentProposal", "checkpoint", "inventory", "catalogue", "answers", "history", "openGaps", "failures"]) {
     if (Object.hasOwn(body, key) && add(key, body[key])) packet.working.omitted = packet.working.omitted.filter((k: string) => k !== key);
   }
-  // Readings are never accumulated automatically. The most recent explicitly
-  // requested bundle is enough for the next step; all others stay addressable.
+  // Explicitly requested materials coexist while they fit. Oldest materials
+  // yield first; the full archive remains addressable.
   // Evidence pages for the assessor: concatenate fragments to recover the exact
   // serialized observations. No fragment is presented as a complete observation.
   if (Array.isArray(body['observations'])) {

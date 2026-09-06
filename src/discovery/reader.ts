@@ -2,7 +2,7 @@ import { Ajv } from "ajv";
 import type { Store, Revision } from "../storage/store.js";
 import type { Environment } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
-import { Evidence, type Source, type Observation } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
 import { ResearchSources } from "./research-sources.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { researchCall } from "./research-protocol.js";
@@ -17,6 +17,14 @@ export interface ReaderResult {
 }
 export interface ReaderSource { ref: Ref; totalChars: number; visibleRange: { start: number; end: number };
   partial: boolean; lines: { line: number; start: number; end: number; text: string }[] }
+
+export function readerResultCurrent(store: Store, project: string, result: ReaderResult): boolean {
+  return result.projectId === project && result.sources.every(ref => {
+    const source = store.get<Source>(ref.id);
+    return source?.kind === "source" && source.value.projectId === project && canonical(reference(source)) === canonical(ref)
+      && sourceIsCurrent(source.value);
+  }) && result.observations.every(observation => new Evidence(store).verify(observation));
+}
 export type BundleInput = ({ path: string; media: Source['mediaType'] } | { source: Ref }) & { range?: { start: number; end: number } };
 const text = { type: "string", minLength: 1 };
 const positive = { type: "integer", minimum: 1 };
