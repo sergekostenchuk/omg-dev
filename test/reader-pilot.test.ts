@@ -606,17 +606,37 @@ test("planning indexes all sources, requirements and nodes without carrying obse
   assert.ok(JSON.stringify(packet).length < 50000);
   assert.ok(!JSON.stringify(packet).includes("LARGE_OBSERVATION_NOT_FOR_PLANNING"));
   assert.equal(packet.question.schema, undefined);
-  assert.deepEqual(packet.sources.map((s: any)=>inventory.sources[s.index]!.ref.id), inventory.sources.map(s=>s.ref.id));
-  assert.deepEqual(packet.requirements.map((r: any)=>r.id), base.core.requirements.flatMap((s: any)=>records<any>(s.requirements).map(r=>r.id)));
-  assert.deepEqual(packet.nodes.map((n: any)=>n.id), records<any>(base.map.nodes).map(n=>n.id));
+  assert.deepEqual(records<any>(packet.sources).map((s: any)=>inventory.sources[s.index]!.ref.id), inventory.sources.map(s=>s.ref.id));
+  assert.deepEqual(records<any>(packet.requirements).map((r: any)=>r.id), base.core.requirements.flatMap((s: any)=>records<any>(s.requirements).map(r=>r.id)));
+  assert.deepEqual(records<any>(packet.nodes).map((n: any)=>n.id), records<any>(base.map.nodes).map(n=>n.id));
   assert.deepEqual(packet.constraints, base.core.constraints);
   assert.deepEqual(packet.specificationConstraints, base.core.specificationConstraints);
-  assert.equal(packet.alreadyRead[0].unresolvedCount, 1);
-  assert.equal(packet.alreadyRead[0].unresolved, undefined);
-  assert.deepEqual(packet.unresolvedEvidence[0].unresolved, ["Check exception"]);
-  assert.equal(readPilotContext(store, draft, packet.working.archive, packet.alreadyRead[0].purposePointer, 1000).value, "Read source");
+  assert.equal(records<any>(packet.alreadyRead)[0].unresolvedCount, 1);
+  assert.equal(records<any>(packet.alreadyRead)[0].unresolved, undefined);
+  assert.deepEqual(records<any>(packet.unresolvedEvidence)[0].unresolved, ["Check exception"]);
+  assert.equal(readPilotContext(store, draft, packet.working.archive, records<any>(packet.alreadyRead)[0].purposePointer, 1000).value, "Read source");
   assert.equal(readPilotContext(store, draft, packet.working.archive, "/body/readings/0/observations/0/value", 500, {offset:0,limit:32}).value,
     body.readings[0]!.observations[0]!.value.slice(0,32));
+});
+
+test("planning table transport retains every navigation value and enforces the complete packet ceiling", t => {
+  const { root, store, draft, question } = fixture(t);
+  const base = pilotContext(store, draft, question);
+  const requirements = Array.from({length: 100}, (_, i) => ({id: `requirement-${i}`, statement: `Exact condition ${i}: preserve the adjacent exception`, outcome: "Useful result", beneficiary: "Owner"}));
+  const body = {...base, repositoryRoot: root, dispatchMode: "planning", inventory: new ResearchSources(store, "p", root).inventory(),
+    core: {...base.core, requirements: [{requirements}]}, researchMissing: ["Do not omit the exception"], readPlanStatus: []};
+  const packet = workingContext(store, "p", draft.id, question.id, body, 100000);
+  assert.ok(!Array.isArray(packet.requirements));
+  assert.deepEqual(records<any>(packet.requirements), requirements.map((r, i) => ({...r, pointer: `/content/fields/conceptSections/0/requirements/${i}`})));
+  assert.deepEqual(records<any>(packet.nodes), records<any>(base.map.nodes).map(n => JSON.parse(JSON.stringify({id:n.id,title:n.title,parent:n.parent,outcome:n.outcome,pointer:n.pointer}))));
+  assert.deepEqual(records<any>(packet.records).map(r => ({...r,fields:records(r.fields)})), base.catalogue.map(r => ({ref:r.ref,kind:r.kind,stage:r.stage,fields:r.fields.map(f => ({field:f.field,pointer:f.pointer,chars:f.chars}))})));
+  assert.deepEqual(packet.missing, body.researchMissing);
+  assert.deepEqual(packet.constraints, base.core.constraints);
+  assert.deepEqual(packet.specificationConstraints, base.core.specificationConstraints);
+  const chars = JSON.stringify(packet).length;
+  assert.deepEqual(workingContext(store, "p", draft.id, question.id, body, chars), packet);
+  assert.throws(() => workingContext(store, "p", draft.id, question.id, body, chars - 1), {code:"planning_context_limit"});
+  assert.deepEqual(readPilotContext(store, draft, packet.working.archive, "/body/core/requirements/0/requirements/99", 1000).value, requirements[99]);
 });
 
 test("planner cannot approve an answer from the index and its round count survives restart", async t => {
