@@ -52,10 +52,11 @@ export const TECHNICAL_RESEARCH: Record<"R1" | "R2", FieldSpec[]> = {
     question("connectivityAndProof", "Раскрой missing/extra/foreign/stale/forged/replay outcomes, положительные и контрфактические проверки, настоящие test entrypoints, OS-process/network/paid требования, локальные альтернативы, будущие зависимости, anchors и условия пробуждения.", "Результат нельзя доказать или интегрировать без будущей работы"),
   ],
 };
-export function refinementQuestions(level: "R1" | "R2", gaps: TechnicalGap[] = []): FieldSpec[] {
+export function refinementQuestions(level: "R1" | "R2", gaps: TechnicalGap[] = [], grouping: "target" | "target-field" = "target"): FieldSpec[] {
   const groups = new Map<string, TechnicalGap[]>();
   for (const gap of gaps) {
-    const key = canonical([gap.target, gap.field]); const group = groups.get(key) ?? [];
+    const key = canonical(level === "R2" && grouping === "target" ? [gap.target] : [gap.target, gap.field]);
+    const group = groups.get(key) ?? [];
     if (!group.some(item => canonical(item) === canonical(gap))) group.push(gap);
     groups.set(key, group);
   }

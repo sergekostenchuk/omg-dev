@@ -111,7 +111,7 @@ test("future gaps stay deferred only behind a complete sleeping connector and ou
   assert.equal(deferredGap(graph, gap), false, "A label alone cannot defer an obligation");
 });
 
-test("one field question preserves all distinct consumer obligations and has stable ordering", () => {
+test("one block question preserves all distinct consumer obligations and has stable ordering", () => {
   const first = { id: "g1", target: "p-produce-block", field: "ports", question: "Which schema does consumer A require?", consumer: "p-consume-work", requiredFor: "next" as const };
   const second = { ...first, id: "g2", question: "Which version does consumer B require?", consumer: "p-consume-operation" };
   const forward = refinementQuestions("R2", [first, second]);
@@ -120,6 +120,39 @@ test("one field question preserves all distinct consumer obligations and has sta
   const question = forward.at(-1)!;
   assert.equal(question.targets?.length, 2);
   assert.match(question.prompt, /consumer A/); assert.match(question.prompt, /consumer B/);
+});
+
+test("R2 groups fields of one target together without merging other targets or changing R1", () => {
+  const first={id:'g1',target:'block-a',field:'ports',question:'Required schema?',consumer:'consumer-a',requiredFor:'next' as const};
+  const second={...first,id:'g2',field:'authority',question:'Required permission?',consumer:'consumer-b'};
+  const third={...first,id:'g3',target:'block-b',question:'Independent contract?'};
+  const inputs=[first,second,third,first];
+  const grouped=refinementQuestions('R2',inputs);
+  assert.equal(grouped.length,TECHNICAL_RESEARCH.R2.length+2);
+  assert.deepEqual(grouped,refinementQuestions('R2',[...inputs].reverse()));
+  const targets=grouped.flatMap(spec=>spec.targets??[]);
+  for(const {target,field,consumer,question} of [first,second,third])assert.ok(targets.some(t=>t.target===target&&t.field===field&&t.consumer===consumer&&t.question===question));
+  assert.equal(targets.length,3);
+  assert.equal(grouped.filter(spec=>spec.targets?.some(t=>t.target==='block-a'))[0]!.targets!.length,2);
+  assert.equal(refinementQuestions('R2',inputs,'target-field').length,TECHNICAL_RESEARCH.R2.length+3);
+  assert.deepEqual(refinementQuestions('R1',inputs),refinementQuestions('R1',inputs,'target-field'));
+});
+
+test("legacy field-grouped R2 can complete and stay accepted without rewriting its questions", t => {
+  const {engine,store}=fixture(t);finishR0(engine);
+  const gap={id:'g1',target:'p-consume-operation',field:'ports',question:'Which input?',consumer:'p-consume-work',requiredFor:'next' as const};
+  const other={...gap,id:'g2',field:'outcome',question:'Which output?'};
+  const r1=engine.refinement.begin('p','R1');
+  answerTechnicalFixture(engine,'p',r1,(field,report)=>field==='integrations'?{...report,gaps:[gap,other]}:report);
+  engine.refinement.finishResearch('p','R1',reference(store.get(r1.id)!),0);deriveLayerFixture(engine,'p',2);engine.refinement.sealLayer('p',2,0);
+  const modern=engine.refinement.begin('p','R2');
+  assert.equal(modern.value.questions.length,TECHNICAL_RESEARCH.R2.length+1);
+  const legacy=engine.discovery.create('p','om-g2','R2','compilation',refinementQuestions('R2',[gap,other],'target-field'),modern.value.inputs,modern.value.contractVersion);
+  answerTechnicalFixture(engine,'p',legacy);
+  engine.refinement.finishResearch('p','R2',reference(store.get(legacy.id)!),0);
+  const accepted=store.get(legacy.id)!;
+  assert.deepEqual(engine.refinement.gate('p','R2').findings,[]);
+  assert.deepEqual(store.get(legacy.id),accepted);
 });
 
 test("activating a previously sleeping horizon gap invalidates R2 before L3 can be sealed", t => {

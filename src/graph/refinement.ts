@@ -59,8 +59,14 @@ export class Refinement {
     return Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
       .filter(gap => !graph || !deferredGap(graph.value, gap));
   }
-  #questions(project: string, level: "R1" | "R2", imported: Ref[] = []): FieldSpec[] {
-    return refinementQuestions(level, [...(level === "R2" ? this.#gaps(project) : []), ...defectGaps(this.store, project, imported)]);
+  #questions(project: string, level: "R1" | "R2", imported: Ref[] = [], grouping: "target" | "target-field" = "target"): FieldSpec[] {
+    return refinementQuestions(level, [...(level === "R2" ? this.#gaps(project) : []), ...defectGaps(this.store, project, imported)], grouping);
+  }
+  #matchesQuestions(project: string, level: "R1" | "R2", specs: unknown, imported: Ref[]): boolean {
+    // Stored field-grouped R2 remains valid for exactly the same obligations.
+    // A changed horizon must still invalidate both layouts; no history rewrite.
+    return canonical(specs) === canonical(this.#questions(project, level, imported))
+      || (level === "R2" && canonical(specs) === canonical(this.#questions(project, level, imported, "target-field")));
   }
   begin(project: string, level: Exclude<ResearchLevel, "R3">): Revision<DiscoveryDraft> {
     assertPilotBoundary(this.store, project, level);
@@ -83,7 +89,7 @@ export class Refinement {
       "research_contract_upgrade_required", "New research completion requires the enriched contract");
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     requireCondition((level === "R0" ? specs.length === 0 && canonical(draft.value.derivations) === canonical(this.#r0Entries(project))
-      : canonical(specs) === canonical(this.#questions(project, level, draft.value.inputs)))
+      : this.#matchesQuestions(project, level, specs, draft.value.inputs))
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
     if (level !== "R0") {
@@ -155,7 +161,7 @@ export class Refinement {
       if (phase === "R2" && milestone.value.draft) {
         const draft = this.store.get<DiscoveryDraft>(milestone.value.draft.id, milestone.value.draft.revision);
         const specs = draft?.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
-        if (!draft || canonical(specs) !== canonical(this.#questions(project, "R2", draft.value.inputs))) result.findings.push({
+        if (!draft || !this.#matchesQuestions(project, "R2", specs, draft.value.inputs)) result.findings.push({
           code: "research_horizon_changed", target: "R2", message: "Current horizon requires research obligations absent from the accepted R2 result" });
         const graph = this.store.get<Graph>(`graph:${project}`);
         if (draft && graph) for (const gap of Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)) {
