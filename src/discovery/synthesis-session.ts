@@ -30,7 +30,7 @@ function basis(draft: Revision<DiscoveryDraft>, question: Revision<Question>, en
     seen.add(key); return true;
   });
   return { materials, id: `synthesis-session:${hashJson([reference(question), reference(environment), draft.value.inputs,
-    materials, context.previousProposal ?? null])}` };
+    materials, context.previousProposal ?? null, context.previousProposalRef ?? null])}` };
 }
 
 /** An old need_research may describe data already read but evicted from the

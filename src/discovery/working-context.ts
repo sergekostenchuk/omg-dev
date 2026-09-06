@@ -65,7 +65,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   if (body['dispatchMode'] === "planning") return planningContext(body, reference(archive), maxChars);
   const mandatory = ["role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
-    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes"];
+    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
   const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
   packet.working = { archive: reference(archive), instruction,
     sections: Object.entries(body).filter(([key]) => !mandatory.includes(key)).map(([key, v]) => ({

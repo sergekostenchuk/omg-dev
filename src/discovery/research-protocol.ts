@@ -36,14 +36,16 @@ const readSchemas = [
   object({ action: { const: "read_source" }, source: ref, start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 1 } }),
   object({ action: { const: "read" }, path: text, media: { enum: ["text/plain", "application/json"] } }),
 ];
+const answerDelta = object({ action: { const: "answer_delta" }, question: text, base: ref,
+  upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
+  citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } });
+answerDelta.properties['revises'] = ref;
 const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   ...readSchemas,
   object({ action: { const: "read_plan" }, question: text, reads: { type: "array", minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
   object({ action: { const: "synthesize" }, question: text }),
   object({ action: { const: "need_research" }, question: text, missing: { type: "array", minItems: 1, items: text } }),
-  object({ action: { const: "answer_delta" }, question: text, base: ref,
-    upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
-    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
+  answerDelta,
   object({ action: { const: "checkpoint" }, question: text, value: {},
     citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
   object({ action: { const: "answer" }, question: text, value: {}, citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
