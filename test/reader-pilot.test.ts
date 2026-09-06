@@ -29,6 +29,7 @@ import { workingContext } from "../src/discovery/working-context.js";
 import { checkpoint, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
+import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-session.js";
 import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
 
@@ -769,4 +770,65 @@ test("reader source indices bind to exact supplied versions and reject ambiguous
   assert.throws(()=>readerObservations(store,'p',supplied,{...response,selections:[{...response.selections[0],source:reference(source)}]},10000),{code:'reader_response_invalid'});
   writeFileSync(join(root,'README.md'),'changed');
   assert.throws(()=>readerObservations(store,'p',supplied,response,10000),{code:'source_stale'});
+});
+
+
+test("synthesis resumes unshown materials after a budget pause without repeating the reading plan", async t => {
+  const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
+  const selections=['first','second','third'].map(name=>{
+    writeFileSync(join(root,name+'.txt'),name+' condition '+'.'.repeat(12000));
+    const source=engine.discovery.evidence.file('p',name,root,name+'.txt','text/plain',0);
+    return {kind:'context',value:engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:source.value.content.length})};
+  });
+  const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory(),workingSelections:selections};
+  const full=workingContext(store,'p',draft.id,question.id,{...context,synthesisMaterials:selections,synthesisState:{offset:0},synthesisNotes:[]},1000000);
+  const limit=JSON.stringify(full).length-16000;
+  const command=join(root,'paged-author.mjs');
+  writeFileSync(command,`import {readFileSync,appendFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+appendFileSync('pages.jsonl',JSON.stringify(c.synthesisPage)+'\\n');
+const seen=[...new Set([...c.synthesisNotes.flatMap(n=>n.proposal.value.seen),...c.selectedContext.map(o=>o.source.id)])];
+const research={action:'answer',question:c.question.id,value:{seen},citations:c.selectedContext.map(o=>({source:o.source,selector:o.selector}))};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]};
+  let configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxRequestChars:limit,maxCalls:1},pilot.revision);
+  const dispatch={...environment.value,implementer:{...environment.value.implementer,command:cmd}};
+  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'pilot_call_limit'});
+  const paused=store.list<any>('synthesis-session')[0]!;
+  assert.ok(paused.value.offset>0&&paused.value.offset<3);assert.equal(paused.value.result,null);
+  assert.equal(store.get<Question>(question.id)!.value.status,'open');
+  const first=store.list<ModelCall>('model-call')[0]!;
+  configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxRequestChars:limit,maxCalls:10},configured.revision);
+  const result=await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON');
+  assert.equal(result.action,'answer');
+  assert.deepEqual((result as any).value.seen,selections.map(s=>s.value.source.id));
+  assert.deepEqual(store.get(first.id),first);
+  const pages=readFileSync(join(root,'pages.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  assert.equal(pages[1].offset,pages[0].end);assert.equal(pages.at(-1).end,3);
+  assert.ok(store.list<ModelCall>('model-call').every(c=>c.value.request.chars<=limit));
+  assert.equal(pendingSynthesis(store,draft,question,environment,context),false);
+  const count=store.list('model-call').length;
+  writeFileSync(join(root,'first.txt'),'Changed after partial synthesis');
+  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'synthesis_evidence_stale'});
+  assert.equal(store.list('model-call').length,count,'Stale notes must fail before another model call');
+});
+
+test("an explicit synthesis pause does not become an unresumable cached result", async t => {
+  const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
+  const command=join(root,'pause-synthesis.mjs');
+  writeFileSync(command,`import {readFileSync,existsSync,writeFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8'));const paused=existsSync('paused-once');writeFileSync('paused-once','1');const research=paused?{action:'need_research',question:req.subject.question.id,missing:['An additional source is required']}:{action:'pause',reason:'Explicit pause before continuing'};console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]};
+  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd},pilot.revision);
+  const dispatch={...environment.value,implementer:{...environment.value.implementer,command:cmd}};
+  const source=engine.discovery.evidence.file('p','direct-synthesis-source',root,'README.md','text/plain',0);
+  const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory(),workingSelections:[{kind:'context',value:{ref:reference(source),length:source.value.content.length,excerpt:source.value.content}}]};
+  assert.equal((await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON')).action,'pause');
+  assert.equal(store.list<any>('synthesis-session')[0]!.value.result,null);
+  assert.equal((await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON')).action,'need_research');
+  assert.equal(store.list('model-call').length,2);
+  writeFileSync(join(root,'README.md'),'Changed directly-read source');
+  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'synthesis_evidence_stale'});
+  writeFileSync(join(root,'README.md'),source.value.content);
+  store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'A changed question'}}});
+  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'input_stale'});
+  assert.equal(store.list('model-call').length,2,'Cached answers cannot bypass changed inputs');
 });

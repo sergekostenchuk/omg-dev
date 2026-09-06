@@ -21,6 +21,7 @@ import { checkpoint, latestFocus, recoverableAnswer, workingSelections, repeated
 import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import type { ModelCall } from "../runtime/model-usage.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
+import { pendingSynthesis, synthesisSession } from "./synthesis-session.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available.`;
@@ -78,7 +79,7 @@ export class Researcher {
           .sort((a, b) => a.value.number - b.value.number);
         const history = turns.slice(-8).map(item => item.value);
         const planning = pilot?.value.planning?.fields.includes(pending[0]!.value.spec.field) ? pilot.value.planning : null;
-        const mode = planning ? dispatchMode(turns, pending[0]!) : null;
+        let mode = planning ? dispatchMode(turns, pending[0]!) : null;
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
@@ -103,6 +104,8 @@ export class Researcher {
           fields: draft.value.fields, questions: pending.map(item => ({ id: item.id, ...item.value.spec })),
           prerequisites: researchPrerequisites(this.store, draft.value), operationMap: researchGraphContext(this.store, draft.value),
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
+        if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
+          && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
         let pendingTurn = turns.find(item => item.value.status === "pending" && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
         const recoveredPlan = !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
@@ -135,8 +138,10 @@ export class Researcher {
           const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "";
           const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
             : INSTRUCTION + (pilot ? PILOT_INSTRUCTION + deltaInstruction : "");
-          action = researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
-            { store: this.store, draftId, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
+          action = mode === "synthesis" && pilot ? await synthesisSession(this.store, draft, pending[0]!, environment,
+            dispatch, pilot, context, instruction, signal)
+            : researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
+              { store: this.store, draftId, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
           const questionId = "question" in action ? action.question : null;
           const question = questionId ? pending.find(item => item.id === questionId) : pilot ? pending[0] : null;
           pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,

@@ -65,7 +65,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   if (body['dispatchMode'] === "planning") return planningContext(body, reference(archive), maxChars);
   const mandatory = ["role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
-    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations"];
+    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes"];
   const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
   packet.working = { archive: reference(archive), instruction,
     sections: Object.entries(body).filter(([key]) => !mandatory.includes(key)).map(([key, v]) => ({
@@ -73,6 +73,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       count: Array.isArray(v) || typeof v === "string" ? v.length : null })), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  if (body['synthesisState']) {
+    packet.previousProposal = body['previousProposal'] ?? null;
+    packet.history = body['history'] ?? [];
+  }
   const length = () => JSON.stringify(packet).length;
   requireCondition(length() <= maxChars, "pilot_core_limit", "Required intent, constraints or candidate exceed the request limit; split the research question, do not raise the ceiling");
   const add = (key: string, v: unknown) => {
@@ -86,6 +90,26 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(length() <= maxChars, "pilot_core_limit", "Required context index exceeds the request limit");
   const isAssessor = Object.hasOwn(body, "assessmentState");
   packet.working.maxPageChars = Math.max(1, maxChars - length() - 512);
+  if (body['synthesisState']) {
+    const materials = body['synthesisMaterials'] as any[];
+    const offset = (body['synthesisState'] as { offset: number }).offset;
+    requireCondition(Array.isArray(materials) && Number.isSafeInteger(offset) && offset >= 0 && offset <= materials.length,
+      "synthesis_cursor_invalid", "Invalid saved material cursor");
+    packet.selectedContext = [];
+    packet.synthesisPage = { offset, end: offset, total: materials.length, complete: offset === materials.length };
+    for (let index = offset; index < materials.length; index++) {
+      const selection = materials[index];
+      const included = selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
+        : add("selectedContext", [...packet.selectedContext, selection.value]);
+      if (!included) break;
+      packet.synthesisPage.end = index + 1;
+      packet.synthesisPage.complete = index + 1 === materials.length;
+    }
+    requireCondition(packet.synthesisPage.end > offset || offset === materials.length,
+      "synthesis_material_limit", "This material needs a smaller addressed page; the complete original is at /body/synthesisMaterials");
+    requireCondition(length() <= maxChars, "pilot_request_limit", "The synthesis page exceeds its fixed limit");
+    return packet;
+  }
   if (!isAssessor && Array.isArray(body['workingSelections']) && body['workingSelections'].length) {
     packet.selectedContext = [];
     for (const [index, selection] of (body['workingSelections'] as any[]).entries()) {
