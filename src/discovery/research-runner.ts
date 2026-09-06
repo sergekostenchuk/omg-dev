@@ -20,6 +20,7 @@ import { expandLayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
 import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import type { ModelCall } from "../runtime/model-usage.js";
+import { recoverableReadingPlan } from "./planning-recovery.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available.`;
@@ -104,6 +105,19 @@ export class Researcher {
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
         let pendingTurn = turns.find(item => item.value.status === "pending" && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
+        const recoveredPlan = !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
+        if (recoveredPlan) {
+          const number = run.value.turns + 1;
+          const saved = this.store.writeMany<ResearchRun | ResearchTurn>([{ id: run.id, kind: run.kind, expected: run.revision,
+            value: { ...run.value, turns: number } },
+          { id: `research-turn:${hashJson([id, number])}`, kind: "research-turn", expected: 0,
+            value: { ...recoveredPlan.original.value, number, action: recoveredPlan.action, status: "pending", error: null,
+              observation: null, question: reference(pending[0]!), replayedFrom: reference(recoveredPlan.original),
+              recoveredRequest: recoveredPlan.request } }],
+          [...recoveredPlan.guards, reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]);
+          run = saved[0]! as Revision<ResearchRun>;
+          pendingTurn = saved[1]! as Revision<ResearchTurn>;
+        }
         const recover = !pendingTurn && pilot ? recoverableAnswer(turns, pending[0]!) : null;
         if (recover) {
           run = this.save(run, { turns: run.value.turns + 1 });

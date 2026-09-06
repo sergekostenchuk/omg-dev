@@ -29,6 +29,7 @@ import { workingContext } from "../src/discovery/working-context.js";
 import { checkpoint, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
+import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
 
 function records<T>(value: T[] | ContextTable): T[] {
@@ -669,6 +670,51 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   assert.equal(turns.filter(t=>t.value.plannedBy&&t.value.status==='completed'&&!t.value.error).length,1);
   assert.equal(store.list<ModelCall>("model-call").length,2);
   assert.equal(store.get<Question>(question.id)!.value.status,'open');
+});
+
+test("an audited archive plan recovers its question binding without another planner call", async t => {
+  const {root,store,engine,pilot,settings,draft,question}=fixture(t);
+  const command=join(root,'archived-plan.mjs');
+  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+const research={action:'read_plan',question:c.question.prompt,reads:[{action:'read_context',record:c.working.archive,pointer:'/body/question/prompt'}]};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:1}},pilot.revision);
+  await engine.researcher.run('p',draft.id,1);
+  const original=store.list<ResearchTurn>('research-turn').at(-1)!;
+  const recovery=recoverableReadingPlan(store,[original],draft,question)!;
+  assert.ok(recovery);assert.equal(recovery.action.question,question.id);
+  assert.deepEqual(recovery.action.reads,(original.value.action as any).reads);
+  await engine.researcher.run('p',draft.id,2);
+  const turns=store.list<ResearchTurn>('research-turn').sort((a,b)=>a.value.number-b.value.number);
+  assert.deepEqual(store.get(original.id),original,'Original rejected turn remains immutable');
+  assert.equal(store.list('model-call').length,1,'Recovery consumes no new planning allowance');
+  assert.deepEqual(turns[1]!.value.replayedFrom,reference(original));
+  assert.deepEqual(turns[1]!.value.recoveredRequest,recovery.request);
+  assert.equal(turns[2]!.value.status,'completed');assert.equal(turns[2]!.value.error,null);
+  assert.equal(recoverableReadingPlan(store,turns,draft,question),null,'Never replay the same request twice');
+  assert.equal(store.get<Question>(question.id)!.value.status,'open','Reading recovery never accepts a question');
+});
+
+test("archive plan recovery rejects missing audit, forged response and foreign or changed question", async t => {
+  const {root,store,engine,pilot,settings,draft,question}=fixture(t);
+  const command=join(root,'recovery-audit.mjs');
+  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'read_plan',question:'A prose question',reads:[{action:'read_context',record:c.working.archive,pointer:'/body/question/prompt'}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:1}},pilot.revision);
+  await engine.researcher.run('p',draft.id,1);
+  const original=store.list<ResearchTurn>('research-turn').at(-1)!,call=store.list<ModelCall>('model-call')[0]!;
+  assert.ok(recoverableReadingPlan(store,[original],draft,question));
+  const altered=(patch:Partial<ModelCall>)=>{const current=store.get<ModelCall>(call.id)!;store.write({id:call.id,kind:call.kind,expected:current.revision,value:{...call.value,...patch}});};
+  for(const patch of [{questionId:'question:foreign'}, {response:null}, {status:'failed' as const}, {response:{...call.value.response!,record:{...call.value.response!.record!,hash:'0'.repeat(64)}}}]){
+    altered(patch);assert.equal(recoverableReadingPlan(store,[original],draft,question),null);
+  }
+  altered({});
+  const foreign={...original,value:{...original.value,action:{...(original.value.action as any),question:'question:foreign'}}};
+  assert.equal(recoverableReadingPlan(store,[foreign],draft,question),null);
+  const forged={...original,value:{...original.value,action:{...(original.value.action as any),reads:[{action:'read_context',record:(original.value.action as any).reads[0].record,pointer:'/body/inventory'}]}}};
+  assert.equal(recoverableReadingPlan(store,[forged],draft,question),null,'Changed selection does not match paid response');
+  const current=store.get<Question>(question.id)!;store.write({id:current.id,kind:current.kind,expected:current.revision,value:{...current.value,spec:{...current.value.spec,prompt:'Changed question'}}});
+  assert.equal(recoverableReadingPlan(store,[original],draft,store.get<Question>(question.id)!),null);
 });
 
 test("grouped reads resume only the failed child and then switch to substantive synthesis", async t => {
