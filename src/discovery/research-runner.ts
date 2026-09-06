@@ -118,8 +118,9 @@ export class Researcher {
             && c.value.questionId === pending[0]!.id && c.value.purpose === "reading-planner").length < planning!.maxRounds,
             "planning_round_limit", "Reading expansion allowance reached; preserve the unresolved research for continuation");
           run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
-          const instruction = mode === "planning" ? PLANNING_INSTRUCTION : INSTRUCTION + (mode === "synthesis" ? "\n" + SYNTHESIS_INSTRUCTION : "") + (pilot ? PILOT_INSTRUCTION
-            + (pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "") : "");
+          const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "";
+          const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
+            : INSTRUCTION + (pilot ? PILOT_INSTRUCTION + deltaInstruction : "");
           action = researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
             { store: this.store, draftId, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
           const questionId = "question" in action ? action.question : null;

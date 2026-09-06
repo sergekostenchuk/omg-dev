@@ -611,6 +611,10 @@ test("planning indexes all sources, requirements and nodes without carrying obse
   assert.deepEqual(packet.nodes.map((n: any)=>n.id), records<any>(base.map.nodes).map(n=>n.id));
   assert.deepEqual(packet.constraints, base.core.constraints);
   assert.deepEqual(packet.specificationConstraints, base.core.specificationConstraints);
+  assert.equal(packet.alreadyRead[0].unresolvedCount, 1);
+  assert.equal(packet.alreadyRead[0].unresolved, undefined);
+  assert.deepEqual(packet.unresolvedEvidence[0].unresolved, ["Check exception"]);
+  assert.equal(readPilotContext(store, draft, packet.working.archive, packet.alreadyRead[0].purposePointer, 1000).value, "Read source");
   assert.equal(readPilotContext(store, draft, packet.working.archive, "/body/readings/0/observations/0/value", 500, {offset:0,limit:32}).value,
     body.readings[0]!.observations[0]!.value.slice(0,32));
 });
@@ -640,7 +644,7 @@ test("grouped reads resume only the failed child and then switch to substantive 
 if(c.role==='reader'){research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};if(c.purpose==='b'&&existsSync('fail-b'))process.exitCode=1;}
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
-else {if(!c.question.schema||c.readings.length!==2)throw Error('Synthesis needs real content');research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both groups read',facts:[],designs:[{id:'d',decision:'Respect both conditions',benefit:'Safe result',consumer:'compilation'}],gaps:[]},citations:c.readings.flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};}
+else {if(!c.question.schema||c.readings.length!==2)throw Error('Synthesis needs real content');if(req.prompt.includes('"action":"read"')||req.prompt.includes('prefer one related bundle'))throw Error('Synthesis cannot carry planning instructions');research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both groups read',facts:[],designs:[{id:'d',decision:'Respect both conditions',benefit:'Safe result',consumer:'compilation'}],gaps:[]},citations:c.readings.flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};}
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const cmd={executable:process.execPath,args:[command]};
   configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
