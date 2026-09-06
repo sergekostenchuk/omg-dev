@@ -10,11 +10,12 @@ export interface TokenUsage {
 export interface ModelCall {
   projectId: string; draftId: string; purpose: string; requestId: string;
   profile?: Ref | null;
+  packet?: { archive: Ref; kind: string; maxChars: number };
   budget?: { segment: Ref; groups: string[]; estimate: import("./research-budget.js").CallEstimate };
   questionId?: string | null;
   startedAt: number; finishedAt: number | null; status: "running" | "succeeded" | "failed";
   requested: RoleBinding; confirmed: { model: string | null; effort: string | null; speed: string | null };
-  request: { chars: number; bytes: number; hash: string };
+  request: { chars: number; bytes: number; hash: string; record?: Ref };
   response: { chars: number; bytes: number; record?: Ref } | null;
   usage: TokenUsage | null; usageSource: "adapter" | "unavailable"; error: string | null;
 }

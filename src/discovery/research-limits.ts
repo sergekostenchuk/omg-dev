@@ -5,25 +5,17 @@ import type { Store, Revision } from '../storage/store.js';
 import type { Ref } from '../pipeline/contracts.js';
 import type { ReaderPilot } from './reader-pilot.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
-import { phasePolicy } from './phase-policy.js';
-import { accommodateMetric, budgetGroups, budgetSegment } from '../runtime/research-budget.js';
 import { requireCondition } from '../errors.js';
 
-export function researchReadLimit(store: Store, pilot: Revision<ReaderPilot>, questionId: string, metric: 'readChars' | 'extractedChars', required: number, basis: Ref[]) {
-  const initial = metric === 'readChars' ? pilot.value.maxReadChars : pilot.value.maxReplyChars;
-  const question = store.get<Question>(questionId);
-  const policy = phasePolicy(store, pilot.value.projectId);
-  if (!question || question.value.level !== 'R2' || !policy) return initial;
-  const draft = store.get<DiscoveryDraft>(question.value.draftId);
-  requireCondition(draft, 'research_context_missing', 'Addressed reads need their saved research draft');
-  const segment = budgetSegment(store, pilot.value.projectId, policy.value.budgetSegment!);
-  return accommodateMetric(store, segment, budgetGroups(store, draft.id, questionId).join(','), metric, initial,
-    required, draft, questionId, basis, 'Exact addressed source after duplicate-window removal exceeds the working read limit; original conditions must remain available', pilot.value.physicalLimits?.maxRequestChars);
+export function researchReadLimit(store: Store, pilot: Revision<ReaderPilot>, questionId: string, metric: 'readChars' | 'extractedChars', _required: number, _basis: Ref[]) {
+  const question=store.get<Question>(questionId);
+  requireCondition(question?.kind==='question' && question.value.projectId===pilot.value.projectId,'research_question_foreign','Reads require their bound question');
+  return metric==='readChars'?pilot.value.maxReadChars:pilot.value.maxReplyChars;
 }
 
-export function readResearchContext(store: Store, draft: Revision<DiscoveryDraft>, questionId: string, pilot: Revision<ReaderPilot>, ref: Ref, pointer: string, page?: ContextPage) {
+export function readResearchContext(store: Store, draft: Revision<DiscoveryDraft>, questionId: string, pilot: Revision<ReaderPilot> | undefined, ref: Ref, pointer: string, page?: ContextPage) {
   const result = readPilotContext(store, draft, ref, pointer, Number.MAX_SAFE_INTEGER, page);
-  const limit = researchReadLimit(store, pilot, questionId, 'readChars', canonical(result).length, [ref]);
+  const limit = pilot ? researchReadLimit(store, pilot, questionId, 'readChars', canonical(result).length, [ref]) : 60000;
   requireCondition(canonical(result).length <= limit, 'context_read_limit', 'Use a smaller addressed context page');
   return result;
 }

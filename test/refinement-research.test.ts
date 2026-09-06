@@ -21,11 +21,12 @@ import { answerTechnicalFixture } from "./technical-research-fixture.js";
 // These tests prove deterministic consumer correction, not model quality.
 const ADAPTER = `import {readFileSync} from 'node:fs';
 const request=JSON.parse(readFileSync(0,'utf8')),c=request.subject;
+if(!c.inventory)c.inventory={sources:c.originals?.sources??[]};
 let research;
 if(process.argv[3]==='fail')process.exit(1);
 if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else {
- const q=c.questions.find(q=>!['runtime','contractsAndConsumers'].includes(q.field))??c.questions[0],source=c.inventory.sources.find(s=>s.kind==='file'),feedback=c.consumerFeedback.some(f=>f.findings.some(x=>x.field===q.field))||c.history.some(t=>t.error&&t.action?.question===q.id);
+ const q=c.questions.find(q=>!['runtime','contractsAndConsumers'].includes(q.field))??c.questions[0],source=c.inventory.sources.find(s=>s.kind==='file'),feedback=c.consumerFeedback.some(f=>f.findings.some(x=>x.field===q.field))||c.history.some(t=>t.error&&t.action?.question===q.id)||(c.corrections??[]).some(t=>t.error&&t.question===q.id);
  let value;
  if(q.field==='layerDesign') {
   value=JSON.parse(readFileSync(process.argv[2],'utf8'))[c.level==='R1'?'2':'3'];
@@ -97,7 +98,7 @@ test("R1 early proposal feedback survives a cold database reopen and uses only t
   assert.ok(store.list<ResearchTurn>("research-turn").some(turn => JSON.stringify(turn.value.observation).includes("repository_evidence_required")));
   assert.equal(store.get("phase:p:R1"), null, "A supported model assessment cannot publish an invalid factual claim");
   assert.deepEqual(draft.value.questions.filter(id => store.get<Question>(id)!.value.status === "open")
-    .map(id => store.get<Question>(id)!.value.spec.field), ["runtime"]);
+    .map(id => store.get<Question>(id)!.value.spec.field), ["evidenceAndTests"]);
   const before = store.list("research-turn").length; store.close();
   const reopened = new Store(path);
   try {

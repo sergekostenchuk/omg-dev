@@ -9,7 +9,7 @@ import { ProductEngine } from '../dist/src/product/engine.js';
 import { configureReaderPilot, pilotEnvironment } from '../dist/src/discovery/reader-pilot.js';
 import { configurePhasePolicy } from '../dist/src/discovery/phase-policy.js';
 import { configureResearchScope, originalGaps, scopeObligations } from '../dist/src/graph/research-scope.js';
-import { configureBudgetSegment, budgetUsage, budgetGroups, workingLimit } from '../dist/src/runtime/research-budget.js';
+import { configureBudgetSegment, segmentId, budgetUsage, budgetGroups, workingLimit } from '../dist/src/runtime/research-budget.js';
 import { reference } from '../dist/src/pipeline/contracts.js';
 import { hashJson } from '../dist/src/canonical.js';
 const [sourcePath, outPath, option] = process.argv.slice(2);
@@ -40,8 +40,8 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   const command = { executable: process.execPath, args: [adapter] };
   const pilot = configureReaderPilot(store, engine.environments, project, { ...settings, agentCommand: command,
     reader: { ...settings.reader, command }, planning: { ...settings.planning, maxRounds: 5 } }, old.revision);
-  const segment = configureBudgetSegment(store, project, 'R2-L3');
-  configurePhasePolicy(store, project, 'L3', 'R2-L3', 0);
+  const segment = store.get(segmentId(project,'R2-L3')) ?? configureBudgetSegment(store, project, 'R2-L3');
+  configurePhasePolicy(store, project, 'L3', 'R2-L3', store.get(`phase-policy:${project}`)?.revision??0);
   const layer = store.get(`graph-layer:${project}:2`), gaps = originalGaps(store, project);
   const nodes = ['n-state','o-state-project','n-research','n-control','n-recovery','n-progress'];
   const boundaries = [...new Set(gaps.filter(g => g.id !== 'actors-g5' && !nodes.includes(g.target)).map(g => g.target))]
@@ -51,7 +51,7 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
     nodes, boundaries, expansions: [], changedPaths: [], uiRequired: option === "--include-ui",
     obligations: gaps.map(gap => ({ gap, state: gap.id === 'actors-g5' ? 'deferred' : 'active',
       reason: gap.id === 'actors-g5' ? 'UI исключён владельцем; ошибка QuestionPanel остаётся открытой.' : 'Необходимость для входов, потребителей, полномочий и восстановления проекций ещё требует адресного уточнения; сохраняем активным.',
-      wake: gap.id === 'actors-g5' ? { nodes: ['n-ui'], paths: ['ui/app.tsx'], uiRequired: true } : null })) }, 0);
+      wake: gap.id === 'actors-g5' ? { nodes: ['n-ui'], paths: ['ui/app.tsx'], uiRequired: true } : null })) }, store.get(`research-scope:${project}:R2`)?.revision??0);
   const environment = pilotEnvironment(engine.environments.get(project).value, pilot.value);
   // Synthetic calibration belongs only to this copy, visibly labelled fixture.
   for (const [purpose, role] of [['reading-planner',environment.implementer],['analyst',environment.implementer],['assessor',environment.reviewer],['reader',pilot.value.reader]]) {
@@ -75,20 +75,23 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   // response and an exhausted segment exercise the actual dispatch boundary.
   const probeQuestion = questions[0];
   engine.discovery.reopen(probeQuestion.id, probeQuestion.revision);
-  store.write({ id:'model-call:fixture-expensive-assessor',kind:'model-call',expected:0,value:{...store.get('model-call:fixture-assessor').value,
-    requestId:'fixture-expensive-assessor',request:{chars:1000000,bytes:1000000,hash:hashJson('fixture-expensive')},
-    usage:{inputTokens:700000,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}} });
-  await researchCall(environment.reviewer, environment, 'Deterministic budget probe only', {role:'budget-probe'}, undefined,
+  const groups=budgetGroups(store,draft.id,probeQuestion.id),beforeLimit=workingLimit(store,segment,groups[0],'tokens',700000);
+  await researchCall(environment.reviewer, environment, 'Deterministic unknown-usage probe', {role:'budget-probe'}, undefined,
     {store,draftId:draft.id,questionId:probeQuestion.id,purpose:'assessor',pilot});
-  const afterUnknown=budgetUsage(store,segment), groups=budgetGroups(store,draft.id,probeQuestion.id);
-  const expandedLimit=workingLimit(store,segment,groups[0],'tokens',700000);
-  assert.ok(expandedLimit>700000); assert.ok(afterUnknown.reserved>0);
+  const afterUnknown=budgetUsage(store,segment);
+  assert.ok(afterUnknown.reserved>0);
+  store.write({ id:'model-call:fixture-expensive-assessor',kind:'model-call',expected:0,value:{...store.get('model-call:fixture-assessor').value,
+    requestId:'fixture-expensive-assessor',request:{chars:1000,bytes:1000,hash:hashJson('fixture-expensive')},
+    usage:{inputTokens:700000,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}} });
+  await assert.rejects(researchCall(environment.reviewer,environment,'No automatic increase',{role:'budget-probe'},undefined,
+    {store,draftId:draft.id,questionId:probeQuestion.id,purpose:'assessor',pilot}),{code:'budget_question_limit'});
+  assert.equal(workingLimit(store,segment,groups[0],'tokens',700000),beforeLimit);
   const callsBeforeStop=store.list('model-call').length;
   const limited=store.write({id:segment.id,kind:segment.kind,expected:segment.revision,value:{...segment.value,limit:afterUnknown.measured+afterUnknown.reserved+1}});
   await assert.rejects(researchCall(environment.reviewer,environment,'Deterministic exhausted-budget probe',{role:'budget-probe'},undefined,
     {store,draftId:draft.id,questionId:probeQuestion.id,purpose:'assessor',pilot}),{code:'budget_segment_exhausted'});
   assert.equal(store.list('model-call').length,callsBeforeStop);
-  const budgetScenarios={fixtureOnly:true,expandedLimit,unknownReserved:afterUnknown.reserved,segmentStopBeforeDispatch:true,
+  const budgetScenarios={fixtureOnly:true,autoIncreaseRefused:true,workingLimit:beforeLimit,unknownReserved:afterUnknown.reserved,segmentStopBeforeDispatch:true,
     testedSegment:reference(limited),remaining:budgetUsage(store,limited).remaining};
   const report = { budgetScenarios, fixtureOnly:true, paidCalls:0, source:resolve(sourcePath), copy:db, run:run.value,
     scope:{ref:reference(scope),obligations:scopeObligations(scope.value).map(o=>({id:o.gap.id,state:o.state,reason:o.reason,wake:o.wake}))},

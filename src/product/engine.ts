@@ -29,6 +29,7 @@ import { StageResearch } from "./stage-research.js";
 import { RefinementResearch } from "./refinement-research.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
+import { configureSavedSynthesis } from "../discovery/saved-synthesis.js";
 
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
@@ -194,8 +195,17 @@ export class ProductEngine {
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
       case "configure-reader-pilot": this.#project(command.project); return configureReaderPilot(this.store, this.environments, command.project, command.settings, command.expected);
+      case "configure-saved-synthesis": {
+        this.#project(command.project);
+        const question = this.store.get<Question>(command.question);
+        const draft = question && this.store.get<DiscoveryDraft>(question.value.draftId);
+        requireCondition(question?.kind === "question" && question.value.projectId === command.project
+          && draft?.kind === "discovery-draft" && draft.value.projectId === command.project && draft.value.questions.includes(question.id),
+          "research_question_foreign", "Saved synthesis must target a question and draft of this project");
+        return configureSavedSynthesis(this.store, question.id, command.expected);
+      }
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
-      case "execute-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3"); return this.executor.run(command.project, command.plan, command);
+      case "execute-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "execution"); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
       case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
       case "repair-plan": this.#project(command.project); return this.repairs.run(command.project, command.run, command.maxTurns);

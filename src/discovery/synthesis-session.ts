@@ -1,3 +1,4 @@
+import { readResearchContext } from "./research-limits.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
@@ -13,7 +14,7 @@ import { readerResultCurrent } from "./reader.js";
 import { isRef } from "../pipeline/contracts.js";
 
 interface Session {
-  projectId: string; offset: number;
+  projectId: string; offset: number; materialOffset?: number; focus?: unknown;
   notes: { checkpoint: Ref; proposal: ResearchAction; page: { offset: number; end: number } }[];
   result: ResearchAction | null;
 }
@@ -22,8 +23,8 @@ function basis(draft: Revision<DiscoveryDraft>, question: Revision<Question>, en
   // New selections set the order, but do not replace the paid investigation.
   // One question can need a prior reader result again after a rejected answer.
   const seen = new Set<string>();
-  const materials = [...(context.workingSelections ?? []),
-    ...(context.readings ?? []).map((value: any) => ({ kind: "reader", value }))].filter(selection => {
+  const materials = (context.savedMaterials ?? [...(context.workingSelections ?? []),
+    ...(context.readings ?? []).map((value: any) => ({ kind: "reader", value }))]).filter((selection: any) => {
     const key = selection.kind === "reader" && isRef(selection.value?.ref)
       ? canonical(["reader", selection.value.ref]) : canonical([selection.kind, selection.value]);
     if (seen.has(key)) return false;
@@ -42,7 +43,7 @@ export function pendingSynthesis(store: Store, draft: Revision<DiscoveryDraft>, 
   return materials.length > 0 && !store.get<Session>(id)?.value.result;
 }
 
-const instruction = "\nSynthesis uses finite pages of the materials already requested. synthesisPage gives the range actually supplied; omitted pages are not missing research. If synthesisPage.complete is false, return checkpoint with findings from this page, exact citations and remaining uncertainties; do not ask the reading planner to retrieve later pages. The engine saves your checkpoint and supplies the next page. An early answer is only an unassessed checkpoint. synthesisNotes contains earlier proposed answers and source citations, not authoritative facts; reconcile exceptions and contradictions across them. After the last page, compose the complete answer using these notes and supplied evidence. Only then request new research if essential information is still absent. All original materials remain at working.archive /body/synthesisMaterials. Never infer absence from an unshown page.";
+const instruction = "\nmaterialPage may carry a finite JSON fragment of one large saved material; its cursor must advance before the next source. Synthesis uses finite pages of the materials already requested. synthesisPage gives the range actually supplied; omitted pages are not missing research. If synthesisPage.complete is false, return checkpoint with findings from this page, exact citations and remaining uncertainties; do not ask the reading planner to retrieve later pages. The engine saves your checkpoint and supplies the next page. An early answer is only an unassessed checkpoint. synthesisNotes contains earlier proposed answers and source citations, not authoritative facts; reconcile exceptions and contradictions across them. After the last page, compose the complete answer using these notes and supplied evidence. Only then request new research if essential information is still absent. All original materials remain at working.archive /body/synthesisMaterials. Never infer absence from an unshown page.";
 
 export async function synthesisSession(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot>,
@@ -81,10 +82,10 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     let sent: Record<string, any> | undefined;
     const action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction,
       { ...context, dispatchMode: "synthesis", synthesisMaterials: materials,
-        synthesisState: { offset: current.offset }, synthesisNotes: current.notes }, signal,
+        synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes, focus: current.focus ?? null }, signal,
       { store, draftId: draft.id, questionId: question.id, purpose: "analyst", pilot, onContext: packet => { sent = packet; } }));
     const page = sent?.synthesisPage;
-    requireCondition(["answer", "answer_delta", "checkpoint", "need_research", "need_owner", "pause"].includes(action.action),
+    requireCondition(["answer", "answer_delta", "checkpoint", "read_context", "need_research", "need_owner", "pause"].includes(action.action),
       "research_mode_invalid", "Synthesis must answer, checkpoint, or identify missing information");
     requireCondition(!("question" in action) || action.question === question.id,
       "research_question_foreign", "Synthesis must target its bound question");
@@ -93,18 +94,23 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     // A pause is control flow, not a reusable answer. Explicit resume must be
     // able to call again with the unchanged saved material cursor.
     if (action.action === "pause") return action;
+    if (action.action === "read_context") {
+      const focus=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
+      save({...current,focus});continue;
+    }
+    requireCondition(!context.savedOnly || action.action !== "need_research", "research_saved_only", "Finish from saved findings; new source reads are disabled for this recovery");
     if (page.complete && action.action !== "checkpoint") {
-      save({ ...current, offset: page.end, result: action }); return action;
+      save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, result: action }); return action;
     }
     requireCondition(["checkpoint", "answer", "answer_delta"].includes(action.action),
       "synthesis_checkpoint_required", "Save partial findings before continuing the remaining already-read materials");
-    requireCondition(page.end > current.offset, "synthesis_no_progress", "All material pages were supplied; compose the final answer instead of another checkpoint");
+    requireCondition(page.end > current.offset || (page.nextMaterialOffset ?? 0) > (current.materialOffset ?? 0), "synthesis_no_progress", "All material pages were supplied; compose the final answer instead of another checkpoint");
     const proposal = action as Extract<ResearchAction, { action: "checkpoint" | "answer" | "answer_delta" }>;
     requireCondition(proposal.question === question.id, "research_question_foreign", "Partial synthesis must target its bound question");
     const saved = checkpoint(store, draft, question, { action: "checkpoint", question: question.id,
       value: proposal as unknown as Json, citations: proposal.citations,
       unresolved: proposal.action === "checkpoint" ? proposal.unresolved : ["Complete the remaining material pages before accepting this proposal"] });
-    save({ ...current, offset: page.end, notes: [...current.notes,
+    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, notes: [...current.notes,
       { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: page.end } }] }, [reference(saved)]);
   }
 }

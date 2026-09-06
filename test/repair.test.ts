@@ -1,3 +1,4 @@
+import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -98,6 +99,10 @@ test("an early technical refusal preserves accepted reports and the next model c
   const check = graph.tests.find(test => test.node === "p-consume-work")!;
   check.covers = ["p-flow"];
   check.contract!.counterfactuals = [{ connector: "p-flow", mutation: "remove", expectedFailure: "input_missing", command: { executable: process.execPath, args: ["check.mjs", "consume-mutation"] } }];
+  const prepared=await f.engine.repairs.prepare("p",reference(failed));
+  const initialDraft=f.store.get<DiscoveryDraft>(prepared.value.draftId)!;
+  answerTechnicalFixture(f.engine,"p",{...initialDraft,value:{...initialDraft.value,
+    questions:initialDraft.value.questions.filter(id=>f.store.get<Question>(id)!.value.spec.field!=="contractsAndConsumers")}});
   writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: true }));
   const rejected = await f.engine.repairs.run("p", reference(failed), 20);
   assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /Research turn allowance/);

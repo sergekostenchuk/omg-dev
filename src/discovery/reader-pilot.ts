@@ -13,6 +13,7 @@ export interface ReaderPilotSettings {
   maxRequestChars: number; maxReadChars: number; maxReplyChars: number;
   maxCalls: number; maxReportedTokens: number;
   callTimeoutMs?: number;
+  maxContinuationChars?: number;
   physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
@@ -28,6 +29,7 @@ export const readerPilotSchema = object({ experimental: { const: true }, active:
   maxRequestChars: positive, maxReadChars: positive, maxReplyChars: positive, maxCalls: positive, maxReportedTokens: positive });
 readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object({ call: object({ id: text, revision: positive,
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
+readerPilotSchema.properties['maxContinuationChars'] = positive;
 readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: positive, maxReplyChars: positive, basis: text });
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
@@ -66,8 +68,8 @@ export function assertPilotBoundary(store: Store, project: string, phase: string
   const policy = phasePolicy(store, project);
   const pilot = readerPilot(store, project);
   const configured = store.get(`reader-pilot:${project}`);
-  if (policy?.value.stopAfter === "L3") requireCondition(pilot, "phase_protections_missing", "Continuation cannot disable its context and budget preset");
-  requireCondition(!(policy || configured) || !(policy?.value.stopAfter === "L3" ? ["R3"] : ["R2", "L3", "R3"]).includes(phase),
+  if (policy && policy.value.stopAfter !== "L2") requireCondition(pilot, "phase_protections_missing", "Continuation cannot disable its context and budget preset");
+  requireCondition(!(policy || configured) || !(policy?.value.stopAfter === "compilation" ? ["execution"] : policy?.value.stopAfter === "L3" ? ["R3", "execution"] : ["R2", "L3", "R3", "execution"]).includes(phase),
     "pilot_boundary_reached", "This phase is beyond the explicitly permitted continuation boundary");
 }
 

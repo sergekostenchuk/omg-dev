@@ -1,3 +1,4 @@
+import { FOUNDATION_FIELDS, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -48,11 +49,11 @@ export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, r
 /** The complete request is a product journal entry, not a replacement source.
  * Only its bounded working projection crosses the provider boundary. */
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
-  const body = JSON.parse(JSON.stringify(context)) as Record<string, Json>;
+  let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
   const inventory = body['inventory'] as any;
   if (inventory?.sources && inventory.files) body['sourceCatalogue'] = {
     sources: contextTable(inventory.sources), files: inventory.files, filesTruncated: inventory.filesTruncated,
@@ -63,10 +64,62 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const id = `research-context:${hashJson(value)}`;
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
-  if (body['dispatchMode'] === "planning") return planningContext(body, reference(archive), maxChars);
-  const mandatory = ["mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
+    const initial:Record<string,any>={...body,working:{archive:reference(archive),instruction,sections:Object.keys(body).map(key=>({pointer:`/body/${escape(key)}`}))}};
+    if (initial.inventory) delete initial.sourceCatalogue;
+    requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
+    return initial;
+  }
+  if (options.continuation) {
+    const previousBody=options.previous?store.get<Archive>(options.previous.id,options.previous.revision)?.value.body:undefined;
+    const originals=originalIndex(body,previousBody);
+    const dynamic: Record<string, any> = Object.fromEntries(Object.entries(body).filter(([key]) => !FOUNDATION_FIELDS.includes(key as typeof FOUNDATION_FIELDS[number])));
+    if (body['question'] && typeof body['question']==='object') {
+      const q=body['question'] as Record<string,Json>;
+      dynamic['question']={id:q['id']??question.id,field:q['field']??question.value.spec.field,kind:q['kind']??question.value.spec.kind,
+        prompt:q['prompt']??question.value.spec.prompt,schemaAddress:{record:reference(archive),pointer:'/body/question/schema'}};
+    }
+    if (body['questions']) dynamic['questions']=[dynamic['question']??{id:question.id,field:question.value.spec.field,kind:question.value.spec.kind,prompt:question.value.spec.prompt}];
+    if (body['previousProposal']) {
+      const changes=previousBody?candidateDelta(previousBody['previousProposal'],body['previousProposal']):[];
+      dynamic['proposalChanges']={current:{record:reference(archive),pointer:'/body/previousProposal'},base:options.previous??null,changes};
+    }
+    if (Object.hasOwn(body,'value')) {
+      const previous=options.previous ? store.get<Archive>(options.previous.id, options.previous.revision) : null;
+      if(previous) requireCondition(previous.hash===options.previous!.hash && previous.value.projectId===projectId
+        && previous.value.question.id===questionId,'continuation_foreign','Candidate delta requires the same question');
+      dynamic['candidate']={current:{record:reference(archive),pointer:'/body/value'},
+        previous:options.previous??null,changes:previous?candidateDelta(previous.value.body['value'],body['value']):[],
+        instruction:'Only changed candidate fields are supplied; exact full candidates remain at their addresses.'};
+    }
+    dynamic['originals']=originals;
+    const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'];
+    const original=body;
+    body = replaceFoundationCopies(dynamic, body, reference(archive), store);
+    if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
+    if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
+  }
+  if (options.common && options.continuation && body['dispatchMode']==='planning') {
+    body['corrections']=(body['history'] as any[] ?? []).filter(t=>t.error).map(t=>({number:t.number,action:t.action,error:t.error,feedback:t.feedback}));
+    delete body['history'];
+  }
+  if (options.common) {
+    const conclusions=compactConclusions(body['synthesisNotes'] ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===questionId && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
+    body['conclusions']=conclusions.items; body['conclusionCitations']=conclusions.citations;
+    if(body['history']) {
+      const history=body['history'] as any[];
+      const read=[...history].reverse().find(h=>h.action && typeof h.action==='object' && ['read','read_source','read_context','search'].includes(h.action.action));
+      if(read) body['currentRead']=read;
+      body['corrections']=correctionIndex(history,reference(archive));delete body['history'];
+    }
+    delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
+  }
+  if (body['dispatchMode'] === "planning" && !options.continuation) return planningContext(body, reference(archive), maxChars);
+  const mandatory = ["conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
-  const packet: Record<string, any> = Object.fromEntries(mandatory.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
+  const ordered = options.common && !options.continuation
+    ? [...mandatory.filter(key=>FOUNDATION_FIELDS.includes(key as any)),...mandatory.filter(key=>!FOUNDATION_FIELDS.includes(key as any))] : mandatory;
+  const packet: Record<string, any> = Object.fromEntries(ordered.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
   packet.working = { archive: reference(archive), instruction,
     sections: Object.entries(body).filter(([key]) => !mandatory.includes(key)).map(([key, v]) => ({
       pointer: `/body/${escape(key)}`, chars: JSON.stringify(v).length,
@@ -74,9 +127,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   if (body['synthesisState']) {
-    packet.previousProposal = body['previousProposal'] ?? null;
-    packet.history = body['history'] ?? [];
+    if (!options.common) {packet.previousProposal = body['previousProposal'] ?? null; packet.history = body['history'] ?? [];}
   }
+  if (options.common && body['synthesisState'] && body['focus']) packet.focus=body['focus'];
   const length = () => JSON.stringify(packet).length;
   if (length() > maxChars) throw new EngineError("pilot_core_limit", "Required intent, constraints or candidate exceed the working limit", { required: length() });
   const add = (key: string, v: unknown) => {
@@ -93,22 +146,41 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (body['synthesisState']) {
     const materials = body['synthesisMaterials'] as any[];
     const offset = (body['synthesisState'] as { offset: number }).offset;
+    const materialOffset = (body['synthesisState'] as { materialOffset?: number }).materialOffset ?? 0;
     requireCondition(Array.isArray(materials) && Number.isSafeInteger(offset) && offset >= 0 && offset <= materials.length,
       "synthesis_cursor_invalid", "Invalid saved material cursor");
     packet.selectedContext = [];
     packet.synthesisPage = { offset, end: offset, total: materials.length, complete: offset === materials.length };
     for (let index = offset; index < materials.length; index++) {
       const selection = materials[index];
-      const included = selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
-        : add("selectedContext", [...packet.selectedContext, selection.value]);
+      const included = materialOffset === 0 && (selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
+        : add("selectedContext", [...packet.selectedContext, selection.value]));
       if (!included) break;
       packet.synthesisPage.end = index + 1;
       packet.synthesisPage.complete = index + 1 === materials.length;
     }
     if (packet.synthesisPage.end === offset && offset !== materials.length) {
       const first = materials[offset];
-      const minimal = { ...packet, ...(first.kind === "reader" ? { readings: [first.value] } : { selectedContext: [first.value] }) };
-      throw new EngineError("synthesis_material_limit", "One addressed material does not fit beside mandatory context", { required: JSON.stringify(minimal).length + 512 });
+      if (!options.common) {
+        const minimal = { ...packet, ...(first.kind === "reader" ? { readings: [first.value] } : { selectedContext: [first.value] }) };
+        throw new EngineError("synthesis_material_limit", "One addressed material does not fit beside mandatory context", { required: JSON.stringify(minimal).length + 512 });
+      }
+      const encoded = JSON.stringify(first.value);
+      requireCondition(Number.isSafeInteger(materialOffset) && materialOffset >= 0 && materialOffset < encoded.length,
+        "synthesis_cursor_invalid", "Invalid character cursor in a saved material");
+      let lo = 0, hi = encoded.length - materialOffset;
+      const piece = (n: number) => ({ index: offset, offset: materialOffset, end: materialOffset + n, total: encoded.length,
+        encoding: "json-string-fragment", original: { record: reference(archive), pointer: `/body/synthesisMaterials/${offset}/value` },
+        text: encoded.slice(materialOffset, materialOffset + n) });
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (add("materialPage", piece(mid))) lo = mid; else hi = mid - 1;
+      }
+      requireCondition(lo > 0, "continuation_carry_limit", "Saved conclusions leave no room for the next material; compact conclusions instead of increasing the ceiling");
+      add("materialPage", piece(lo));
+      packet.synthesisPage.nextMaterialOffset = materialOffset + lo === encoded.length ? 0 : materialOffset + lo;
+      packet.synthesisPage.end = packet.synthesisPage.nextMaterialOffset === 0 ? offset + 1 : offset;
+      packet.synthesisPage.complete = packet.synthesisPage.end === materials.length;
     }
     requireCondition(length() <= maxChars, "pilot_request_limit", "The synthesis page exceeds its fixed limit");
     return packet;
@@ -131,7 +203,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (!isAssessor && typeof focus === "object" && !Array.isArray(focus) && Object.hasOwn(focus, "observations")) add("readings", [focus]);
     else add("focus", focus);
   }
-  for (const key of isAssessor ? ["assessmentNotes"] : ["previousProposal", "currentProposal", "checkpoint", "inventory", "catalogue", "answers", "history", "openGaps", "failures"]) {
+  for (const key of isAssessor ? (options.common ? [] : ["assessmentNotes"]) : ["previousProposal", "currentProposal", "checkpoint", "inventory", "catalogue", "answers", "history", "openGaps", "failures"]) {
+    if (options.continuation && FOUNDATION_FIELDS.includes(key as typeof FOUNDATION_FIELDS[number])) continue;
     if (key === "inventory" && body['sourceCatalogue']) continue;
     if (Object.hasOwn(body, key) && add(key, body[key])) packet.working.omitted = packet.working.omitted.filter((k: string) => k !== key);
   }

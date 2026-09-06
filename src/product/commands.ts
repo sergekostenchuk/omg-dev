@@ -15,6 +15,7 @@ export type ProductCommand =
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
   | { type: "model-usage"; project: string; since: number }
   | { type: "configure-reader-pilot"; project: string; expected: number; settings: ReaderPilotSettings }
+  | { type: "configure-saved-synthesis"; project: string; question: string; expected: number }
   | { type: "research-draft"; project: string; draftId: string; maxTurns: number }
   | { type: "execute-plan"; project: string; plan: Ref; retry: boolean; maxContextChars: number; maxCorrections: number }
   | { type: "stop-execution"; project: string }
@@ -68,6 +69,7 @@ const schema = { oneOf: [
   command("research-phase", { project, phase: { enum: ["R1", "R2", "L2", "L3"] }, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("model-usage", { project, since: expected }),
   command("configure-reader-pilot", { project, expected, settings: readerPilotSchema }),
+  command("configure-saved-synthesis", { project, question: string, expected }),
   command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),

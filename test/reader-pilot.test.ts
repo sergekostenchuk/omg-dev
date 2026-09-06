@@ -57,7 +57,7 @@ function fixture(t: test.TestContext) {
 appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field,fullGraph:Boolean(c.value?.nodes),delta:Boolean(c.value?.upserts)})+'\\n');
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
-if(c.role!=='reader'&&c.dispatchMode!=='planning'&&(!c.contextEncoding||JSON.stringify(c).indexOf('"core":')>JSON.stringify(c).indexOf('"question":')))throw Error('Stable product context must precede the question');
+if(c.role!=='reader'&&c.dispatchMode!=='planning'&&c.continuation?.kind!=='continuation'&&(!c.contextEncoding||Object.keys(c).indexOf('core')>Object.keys(c).indexOf('question')))throw Error('Stable product context must precede the question');
 if(c.role==='reader')research={selections:[{source:c.sources[0].ref,firstLine:2,lastLine:3}],unresolved:[]};
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'Read runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]}]};
@@ -225,7 +225,7 @@ test("R1 pilot routes reading to its configured reader, assesses originals, and 
   const first = await engine.researcher.run("p", draft.id, 4);
   assert.equal(first.value.status, "paused");
   const answered = draft.value.questions.slice(0, 2).map(id => store.get<Question>(id)!);
-  assert.ok(answered.every(q => q.value.status === "answered"));
+  assert.ok(answered.every(q => q.value.status === "answered"), JSON.stringify({error:first.value.error,pauseCode:first.value.pauseCode}));
   const calls = store.list<ModelCall>("model-call");
   assert.equal(calls.length, 8); assert.equal(calls.filter(c => c.value.purpose === "reader").length, 2);
   assert.ok(calls.filter(c => c.value.purpose === "reader").every(c => c.value.requested.model === "fixture-reader" && c.value.requested.speed === "fast"));
@@ -789,7 +789,7 @@ test("synthesis resumes unshown materials after a budget pause without repeating
   const command=join(root,'paged-author.mjs');
   writeFileSync(command,`import {readFileSync,appendFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
 appendFileSync('pages.jsonl',JSON.stringify(c.synthesisPage)+'\\n');
-const seen=[...new Set([...c.synthesisNotes.flatMap(n=>n.proposal.value.seen),...c.selectedContext.map(o=>o.source.id)])];
+const seen=[...new Set([...(c.conclusions??c.synthesisNotes).flatMap(n=>n.proposal.value.seen),...c.selectedContext.map(o=>o.source.id)])];
 const research={action:'answer',question:c.question.id,value:{seen},citations:c.selectedContext.map(o=>({source:o.source,selector:o.selector}))};
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const cmd={executable:process.execPath,args:[command]};
@@ -1017,4 +1017,39 @@ test('declared physical envelope capacity refuses the actual call before the ada
   await assert.rejects(researchCall(environment.value.implementer,environment.value,'Fixture',pilotContext(store,draft,question),undefined,
     {store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:bounded}),{code:'budget_transport_limit'});
   assert.equal(store.list('model-call').length,0);
+});
+
+test('an identical reader request reuses its paid extraction without another invocation',async t=>{
+ const {store,environment,pilot,question,root,engine}=fixture(t);
+ const source=engine.discovery.evidence.file('p','reuse-reader',root,'README.md','text/plain',0);
+ const first=await readBundle(store,environment.value,pilot,reference(question),'same purpose',[{source:reference(source)}]);
+ const count=store.list('model-call').length;
+ const again=await readBundle(store,environment.value,pilot,reference(question),'same purpose',[{source:reference(source)}]);
+ assert.deepEqual(reference(again),reference(first));assert.equal(store.list('model-call').length,count);
+});
+
+test('assessor context lookup does not skip the evidence page in a stateless continuation',async t=>{
+ const {root,store,engine,environment,pilot,draft,question}=fixture(t);
+ const source=engine.discovery.evidence.file('p','assessment-lookup',root,'README.md','text/plain',0);
+ const observation=engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:10});
+ const adapter=join(root,'lookup-assessor.mjs');
+ writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('lookup-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,core:Boolean(c.core)})+'\\n');const research=c.focus?{verdict:'supported',reasons:[]}:{action:'read_context',record:c.working.archive,pointer:'/body/value'};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+ const dispatch={...environment.value,reviewer:{...environment.value.reviewer,command:{executable:process.execPath,args:[adapter]}}};
+ const result=await assessmentSession(store,draft,question,environment,dispatch,pilot,{...pilotContext(store,draft,question),role:'assess-answer',value:{ok:'fixture'},observations:[observation]},'Assess') as any;
+ assert.equal(result.verdict,'supported');
+ const pages=readFileSync(join(root,'lookup-pages.jsonl'),'utf8').trim().split('\n').map(s=>JSON.parse(s));
+ assert.deepEqual(pages,[{offset:0,core:true},{offset:0,core:false}]);
+});
+
+test('assessor can inspect distinct original pointers with equal values without a false no-progress refusal',async t=>{
+ const {root,store,engine,environment,pilot,draft,question}=fixture(t);
+ const source=engine.discovery.evidence.file('p','equal-lookup',root,'README.md','text/plain',0);
+ const observation=engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:10});
+ const adapter=join(root,'equal-lookup-assessor.mjs');
+ writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('equal-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,pointer:c.focus?.pointer??null})+'\\n');const research=!c.focus?{action:'read_context',record:c.working.archive,pointer:'/body/value/a'}:c.focus.pointer.endsWith('/a')?{action:'read_context',record:c.focus.record,pointer:'/body/value/b'}:{verdict:'supported',reasons:[]};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+ const dispatch={...environment.value,reviewer:{...environment.value.reviewer,command:{executable:process.execPath,args:[adapter]}}};
+ const result=await assessmentSession(store,draft,question,environment,dispatch,pilot,{...pilotContext(store,draft,question),role:'assess-answer',value:{a:'same',b:'same'},observations:[observation]},'Assess') as any;
+ assert.equal(result.verdict,'supported');
+ const pages=readFileSync(join(root,'equal-pages.jsonl'),'utf8').trim().split('\n').map(s=>JSON.parse(s));
+ assert.deepEqual(pages,[{offset:0,pointer:null},{offset:0,pointer:'/body/value/a'},{offset:0,pointer:'/body/value/b'}]);
 });

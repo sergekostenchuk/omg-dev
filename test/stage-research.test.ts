@@ -19,6 +19,7 @@ import type { Json } from "../src/canonical.js";
 // Controlled process provider proves routing/acceptance, not live model quality.
 const ADAPTER = `import {readFileSync,appendFileSync} from 'node:fs';
 const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+if(!c.inventory)c.inventory={sources:c.originals?.sources??[]};
 appendFileSync(process.argv[3],JSON.stringify({role:c.role,field:c.questions?.[0]?.field,feedback:c.consumerFeedback})+'\\n');
 if(process.argv[4]==='fail')process.exit(1);
 let research;

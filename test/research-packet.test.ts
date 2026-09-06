@@ -43,7 +43,7 @@ const reply=research=>console.log(JSON.stringify({protocol:req.protocol,requestI
 if(c.role==='assess-answer')reply({verdict:'supported',reasons:[]});
 else {
  appendFileSync(process.argv[2],JSON.stringify(c)+'\\n');
- const source=c.inventory.sources[0],full=c.history.find(t=>t.action.action==='read_source');
+ const source=(c.inventory??c.originals).sources[0],full=c.currentRead??c.history.find(t=>t.action.action==='read_source');
  if(!full)reply({action:'read_source',source:source.ref,start:0,end:source.length});
  else {const q=c.questions[0],values=JSON.parse(full.observation.value);
   reply({action:'answer',question:q.id,value:values[q.field],citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field.replaceAll('~','~0').replaceAll('/','~1')}}]});}

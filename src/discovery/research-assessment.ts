@@ -7,7 +7,6 @@ import { hashJson } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Question, DiscoveryDraft } from "./discovery.js";
 import type { ResearchAction, ResearchAssessment } from "./research-model.js";
-import { researchCall } from "./research-protocol.js";
 import { researchPrerequisites, researchGraphContext } from "./research-context.js";
 import { consumerFeedback } from "./consumer-feedback.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
@@ -44,9 +43,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
       prerequisites: researchPrerequisites(store, draft.value), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
   const prompt = "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions.";
-  const response = (pilot ? await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal)
-    : await researchCall(dispatch.reviewer, dispatch, prompt, context, signal,
-      { store, draftId: draft.id, questionId: question.id, purpose: "assessor" })) as { verdict?: unknown; reasons?: unknown } | null;
+  const response = (await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal)) as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response && ["supported", "insufficient", "conflicting"].includes(String(response.verdict))
     && Array.isArray(response.reasons) && response.reasons.every(item => typeof item === "string")
     && (response.verdict === "supported" || response.reasons.length > 0), "assessment_invalid", "Assessment must explicitly classify support and explain unresolved evidence");

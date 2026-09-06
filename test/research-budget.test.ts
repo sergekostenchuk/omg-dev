@@ -1,13 +1,13 @@
 import { estimateCliCall } from "../src/adapters/codex-estimate.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/storage/store.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { hashJson } from '../src/canonical.js';
-import { configureBudgetSegment, reserveResearchCall, budgetUsage, raiseWorkingLimit, workingLimit, accommodateMetric, budgetGroups, type Optimization } from '../src/runtime/research-budget.js';
+import { configureBudgetSegment, reserveResearchCall, budgetUsage, raiseWorkingLimit, workingLimit, assertQuestionBudget, budgetGroups, type Optimization } from '../src/runtime/research-budget.js';
 import { assertPilotBoundary } from '../src/discovery/reader-pilot.js';
 import { configurePhasePolicy } from '../src/discovery/phase-policy.js';
 import { scopeObligations, type ResearchScope } from '../src/graph/research-scope.js';
@@ -19,7 +19,7 @@ function fixture(t: test.TestContext) {
   t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
   const segment = configureBudgetSegment(store,'p','R2-L3',1000,700);
   const basis = store.write({id:'basis',kind:'source',expected:0,value:{proof:'fixture'}});
-  return {store,segment,basis};
+  return {store,segment,basis,root};
 }
 const role = {actor:'a',model:'fixture',effort:'high' as const,command:{executable:process.execPath,args:[]}};
 function call(id: string): ModelCall { return {projectId:'p',draftId:'d',purpose:'analyst',requestId:id,startedAt:1,finishedAt:null,status:'running',requested:role,
@@ -46,7 +46,7 @@ test('working limit uses required need plus ten percent, rejects missing excepti
   const {store,basis}=fixture(t), segment=configureBudgetSegment(store,'p','large');
   const decision: Optimization={reason:'necessary remaining work',progress:'new-source',required:800000,obligations:['exception','external-consumer'],forecast:'measured plus remaining roles',basis:[reference(basis)],
     options:[{method:'exact-dedup',saved:100,decision:'accept',quality:'all original obligations retained',preserved:['exception','external-consumer']}]};
-  const changed=raiseWorkingLimit(store,segment,'g','tokens',700000,decision);
+  const changed=raiseWorkingLimit(store,segment,'g','tokens',700000,decision,900000);
   assert.equal(changed.value.limit,880000);
 });
 
@@ -57,8 +57,8 @@ test('foreign/missing estimates and loss of constraints are typed refusals',t=>{
     options:[{method:'drop-consumer',saved:50,decision:'accept',quality:'claim only',preserved:['exception']}]};
   assert.throws(()=>raiseWorkingLimit(store,segment,'g','tokens',700,decision),{code:'budget_quality_loss'});
   decision.options[0]!.decision='reject';
-  assert.equal(raiseWorkingLimit(store,segment,'g','tokens',700,decision).value.limit,880);
-  assert.throws(()=>raiseWorkingLimit(store,segment,'g','tokens',700,{...decision,required:900}),{code:'budget_no_progress'});
+  assert.equal(raiseWorkingLimit(store,segment,'g','tokens',700,decision,1000).value.limit,880);
+  assert.throws(()=>raiseWorkingLimit(store,segment,'g','tokens',700,{...decision,required:900},1000),{code:'budget_no_progress'});
   assert.equal(store.get(segment.id)!.revision,1);
 });
 
@@ -117,8 +117,55 @@ test('actual usage beyond the reserve remains visible and blocks future calls',t
 
 test('declared physical capacity blocks working expansion before a provider call and groups retain metric history',t=>{
   const {store,segment,basis}=fixture(t);
-  const draft=store.write<import('../src/discovery/discovery.js').DiscoveryDraft>({id:'metric-draft',kind:'discovery-draft',expected:0,value:{projectId:'p',questions:['q']}});
-  assert.throws(()=>accommodateMetric(store,segment,'g','requestChars',70,80,draft,'q',[reference(basis)],'measured mandatory size',85),{code:'budget_transport_limit'});
-  assert.equal(accommodateMetric(store,segment,'g','requestChars',70,80,draft,'q',[reference(basis)],'measured mandatory size',100),88);
+  const decision:Optimization={reason:'measured mandatory size',progress:'one',required:80,obligations:['g'],forecast:'80 chars',basis:[reference(basis)],options:[{method:'exact dedup',saved:0,decision:'reject',quality:'No further safe reduction',preserved:[]}]};
+  assert.throws(()=>raiseWorkingLimit(store,segment,'g','requestChars',70,decision),{code:'budget_ceiling_required'});
+  assert.throws(()=>raiseWorkingLimit(store,segment,'g','requestChars',70,decision,85),{code:'budget_transport_limit'});
+  assert.equal(raiseWorkingLimit(store,segment,'g','requestChars',70,decision,100).value.limit,88);
   assert.equal(workingLimit(store,segment,'g,new-target','requestChars',70),88);
+});
+
+test('permission to compile permits R3 but never permits executing the resulting tasks',t=>{
+  const {store}=fixture(t);
+  store.write({id:'reader-pilot:p',kind:'reader-pilot',expected:0,value:{projectId:'p',experimental:true,active:true,stopAfter:'L2',reader:{...role,actor:'reader',speed:'fast'},agentCommand:role.command,maxRequestChars:300000,maxReadChars:60000,maxReplyChars:100000,maxCalls:100,maxReportedTokens:10000000}});
+  configurePhasePolicy(store,'p','compilation','R2-L3',0);
+  for (const phase of ['R2','L3','R3']) assert.doesNotThrow(()=>assertPilotBoundary(store,'p',phase));
+  assert.throws(()=>assertPilotBoundary(store,'p','execution'),{code:'pilot_boundary_reached'});
+});
+
+test('actual question overshoot pauses and cannot be legalized retrospectively by an automatic increase',t=>{
+  const {store,segment,basis}=fixture(t);
+  const estimate={kind:'estimated' as const,tokens:100,basis:[reference(basis)],explanation:'test'};
+  const reservation=reserveResearchCall(store,segment,'overshoot',['g'],estimate);
+  store.writeMany([{id:'overshoot',kind:'model-call',expected:0,value:{...call('overshoot'),status:'succeeded',usage:{inputTokens:750,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}},...reservation.writes],reservation.guards);
+  assert.throws(()=>assertQuestionBudget(store,segment,['g']),{code:'budget_question_overrun'});
+  assert.throws(()=>reserveResearchCall(store,segment,'next',['g'],estimate),{code:'budget_question_limit'});
+  assert.equal(workingLimit(store,segment,'g','tokens',700),700);
+});
+
+test('identical Codex adapter bytes remain comparable across temporary build directories',t=>{
+  const {store,root}=fixture(t);
+  const a=join(root,'a'),b=join(root,'b');mkdirSync(a);mkdirSync(b);
+  const left=join(a,'codex-stdio.js'),right=join(b,'codex-stdio.js');
+  writeFileSync(left,'// same adapter');writeFileSync(right,'// same adapter');
+  const oldRole={...role,command:{executable:process.execPath,args:[left,'--compact-research']}};
+  store.write({id:'relocated-sample',kind:'model-call',expected:0,value:{...call('relocated-sample'),requested:oldRole,status:'succeeded',finishedAt:2,usage:{inputTokens:200,outputTokens:100,cachedInputTokens:0,reasoningOutputTokens:0}}});
+  const newRole={...oldRole,command:{...oldRole.command,args:[right,'--compact-research']}};
+  assert.equal(estimateCliCall(store,'p',newRole,'analyst',1000).tokens,330);
+  writeFileSync(right,'// different adapter');
+  assert.throws(()=>estimateCliCall(store,'p',newRole,'analyst',1000),{code:'budget_estimate_missing'});
+});
+
+test('smaller continuations use measured input density without pretending output or overhead vanishes',t=>{
+ const {store}=fixture(t);
+ for(const [id,chars,input] of [['small',1000,1000],['large',10000,5000]] as const)
+  store.write({id,kind:'model-call',expected:0,value:{...call(id),request:{chars,bytes:chars,hash:hashJson(id)},status:'succeeded',usage:{inputTokens:input,outputTokens:100,cachedInputTokens:0,reasoningOutputTokens:0}}});
+ const estimate=estimateCliCall(store,'p',role,'analyst',2000,'continuation');
+ assert.equal(estimate.kind,'estimated');assert.equal(estimate.tokens,2310);
+ assert.equal(estimateCliCall(store,'p',role,'analyst',10,'continuation').tokens,1210);
+});
+
+test('zero measured input cannot become an output-only continuation estimate',t=>{
+ const {store}=fixture(t);
+ store.write({id:'zero-input',kind:'model-call',expected:0,value:{...call('zero-input'),status:'succeeded',usage:{inputTokens:0,outputTokens:100,cachedInputTokens:0,reasoningOutputTokens:0}}});
+ assert.throws(()=>estimateCliCall(store,'p',role,'analyst',1000,'continuation'),{code:'budget_estimate_missing'});
 });

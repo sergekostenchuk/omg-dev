@@ -1,3 +1,4 @@
+import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
 import { Store, type Revision } from "../storage/store.js";
@@ -74,7 +75,7 @@ export class Researcher {
         if (gate.findings.length === 0) return this.save(run, { status: "completed" });
         requireCondition(!gate.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed during the run");
         const unresolved = draft.value.questions.map(id => this.store.get<Question>(id)!).filter(question => question.value.status !== "answered");
-        const pending = pilot ? unresolved.slice(0, 1) : unresolved;
+        const pending = unresolved.slice(0, 1);
         requireCondition(pending.length > 0, "research_answers_stale", "Existing answers need targeted reopening before research can continue");
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
           .sort((a, b) => a.value.number - b.value.number);
@@ -89,8 +90,10 @@ export class Researcher {
             previousProposal = { ...prior, ...resolved };
           } catch { /* Retain the failed raw proposal and its typed feedback. */ }
         }
+        const savedMaterials = savedSynthesisMaterials(this.store, draft, pending[0]!);
+        requireCondition(!savedMaterials || pilot, "reader_pilot_required", "Saved synthesis requires its active bounded continuation preset");
         const planning = planningForQuestion(this.store, draft, pending[0]!, pilot);
-        let mode = planning ? dispatchMode(turns, pending[0]!) : null;
+        let mode = savedMaterials ? "synthesis" as const : planning ? dispatchMode(turns, pending[0]!) : null;
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
@@ -115,11 +118,12 @@ export class Researcher {
           fields: draft.value.fields, questions: pending.map(item => ({ id: item.id, ...item.value.spec })),
           prerequisites: researchPrerequisites(this.store, draft.value), operationMap: researchGraphContext(this.store, draft.value),
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
+        if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
-        let pendingTurn = turns.find(item => item.value.status === "pending" && (!item.value.question
+        let pendingTurn = turns.find(item => item.value.status === "pending" && (!savedMaterials || !item.value.plannedBy) && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
-        const recoveredPlan = !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
+        const recoveredPlan = !savedMaterials && !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
         if (recoveredPlan) {
           const number = run.value.turns + 1;
           const saved = this.store.writeMany<ResearchRun | ResearchTurn>([{ id: run.id, kind: run.kind, expected: run.revision,
@@ -150,7 +154,7 @@ export class Researcher {
           action = mode === "synthesis" && pilot ? await synthesisSession(this.store, draft, pending[0]!, environment,
             dispatch, pilot, context, instruction, signal)
             : researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
-              { store: this.store, draftId, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot, questionId: pending[0]!.id } : {}) }));
+              { store: this.store, draftId, questionId: pending[0]!.id, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot } : {}) }));
           const questionId = "question" in action ? action.question : null;
           const question = questionId ? pending.find(item => item.id === questionId) : pilot ? pending[0] : null;
           pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
@@ -163,7 +167,7 @@ export class Researcher {
         try {
           if (planning && pendingTurn.value.dispatchMode && !pendingTurn.value.plannedBy) requireCondition(pendingTurn.value.dispatchMode === "planning"
             ? ["read_plan", "synthesize", "pause"].includes(action.action)
-            : ["answer", "answer_delta", "checkpoint", "need_research", "need_owner", "pause"].includes(action.action),
+            : ["answer", "answer_delta", "checkpoint", "read_context", "need_research", "need_owner", "pause"].includes(action.action),
             "research_mode_invalid", "Planning only selects reads; synthesis answers or identifies explicit missing information");
           if (action.action === "read_plan") {
             requireCondition(planning, "reading_plan_disabled", "Grouped reading requires the planning preset");
@@ -177,8 +181,7 @@ export class Researcher {
             const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs, signal);
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
-            requireCondition(pilot, "reader_pilot_required", "Addressed context reads need the configured experiment");
-            observation = readResearchContext(this.store, draft, pending[0]!.id, pilot, action.record, action.pointer, action.page);
+            observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page);
             const repeated = repeatedContextRead(this.store, turns, pending[0]!, startTurn, observation, action);
             if (repeated) {
               this.store.write<ResearchTurn>({ id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
@@ -186,7 +189,6 @@ export class Researcher {
               throw new EngineError("research_no_progress", "The same unchanged page was requested again without a checkpoint; research is paused", repeated);
             }
           } else if (action.action === "checkpoint") {
-            requireCondition(pilot, "reader_pilot_required", "Checkpoints need the configured experiment");
             const saved = checkpoint(this.store, draft, pending[0]!, action);
             observation = { ref: reference(saved), ...saved.value as object };
           } else if (action.action === "search") observation = sources.search(action.query);

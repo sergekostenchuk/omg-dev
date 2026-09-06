@@ -14,7 +14,7 @@ export interface Optimization {
   options: { method: string; saved: number; decision: 'accept' | 'reject'; quality: string; preserved: string[] }[];
   obligations: string[]; forecast: string; basis: Ref[];
 }
-interface WorkingLimit { projectId: string; segment: string; group: string; metric: string; limit: number; decisions: Optimization[] }
+interface WorkingLimit { projectId: string; segment: string; group: string; metric: string; limit: number; ceiling?: number; decisions: Optimization[] }
 const positive = (n: number) => Number.isSafeInteger(n) && n > 0;
 export const segmentId = (project: string, key: string) => `research-budget:${hashJson([project, key])}`;
 export function configureBudgetSegment(store: Store, projectId: string, key: string, limit = 10_000_000, initialGroupLimit = 700_000) {
@@ -61,10 +61,13 @@ export function raiseWorkingLimit(store: Store, segment: Revision<BudgetSegment>
     && (option.decision === 'reject' || decision.obligations.every(o => option.preserved.includes(o))),
   'budget_quality_loss', 'An accepted reduction must retain every named obligation including exceptions and external consumers');
   requireCondition(!previous?.value.decisions.some(d => d.progress === decision.progress), 'budget_no_progress', 'The same progress cannot repeatedly justify increases');
+  requireCondition(physicalMaximum !== undefined && positive(physicalMaximum), 'budget_ceiling_required',
+    'A limit increase needs an explicit finite ceiling; it is never an automatic continuation strategy');
+  const ceiling = Math.min(physicalMaximum, previous?.value.ceiling ?? physicalMaximum);
   const limit = Number((BigInt(decision.required) * 11n + 9n) / 10n);
-  requireCondition(positive(limit) && (physicalMaximum === undefined || limit <= physicalMaximum), 'budget_transport_limit', 'A working increase cannot enlarge a physical model/transport limit');
+  requireCondition(positive(limit) && limit <= ceiling, 'budget_transport_limit', 'A working increase cannot enlarge a physical model/transport limit');
   return store.writeMany<WorkingLimit>([{ id, kind: 'research-limit', expected: previous?.revision ?? 0,
-    value: { projectId: segment.value.projectId, segment: segment.id, group, metric, limit, decisions: [...(previous?.value.decisions ?? []), decision] } }],
+    value: { projectId: segment.value.projectId, segment: segment.id, group, metric, limit, ceiling, decisions: [...(previous?.value.decisions ?? []), decision] } }],
   [reference(segment), ...decision.basis])[0]!;
 }
 export function budgetUsage(store: Store, segment: Revision<BudgetSegment>) {
@@ -104,54 +107,11 @@ export function reserveResearchCall(store: Store, segment: Revision<BudgetSegmen
     value: { projectId: segment.value.projectId, segment: segment.id, assignments: [...(usage.ledger?.value.assignments ?? []), { call, groups, estimate }] } }],
     guards: [...usage.guards, ...estimate.basis] };
 }
-/** Engine-owned progress fingerprint excludes new attempts and budget records:
- * failed repeats cannot manufacture progress just by spending more tokens. */
-export function researchProgress(store: Store, draft: DiscoveryDraft, questionId: string) {
-  const records = ['reader-result', 'pilot-reading', 'research-checkpoint'].flatMap(kind => store.list<any>(kind))
-    .filter(r => r.value.projectId === draft.projectId && (r.value.question === questionId || r.value.question?.id === questionId));
-  return { hash: hashJson(records.map(r => [r.kind, r.value])), basis: records.map(reference) };
-}
-export function accommodateQuestion(store: Store, segment: Revision<BudgetSegment>, groups: string[], estimate: CallEstimate,
-  draft: Revision<DiscoveryDraft>, questionId: string, remainingEstimate: number) {
+export function assertQuestionBudget(store: Store, segment: Revision<BudgetSegment>, groups: string[]) {
   const usage = budgetUsage(store, segment);
-  const progress = researchProgress(store, draft.value, questionId);
   for (const group of groups) {
-    const row = usage.groups[group] ?? { measured: 0, reserved: 0 };
-    const required = row.measured + row.reserved + estimate.tokens + remainingEstimate;
-    const old = workingLimit(store, segment, group, 'tokens', segment.value.initialGroupLimit);
-    if (required <= old) continue;
-    requireCondition(progress.basis.length > 0, 'budget_no_progress', 'A cost forecast alone cannot justify repeated expansion without preserved research');
-    requireCondition(usage.measured + usage.reserved + estimate.tokens + remainingEstimate <= segment.value.limit,
-      'budget_segment_exhausted', 'Required remaining work exceeds the overall segment');
-    raiseWorkingLimit(store, segment, group, 'tokens', segment.value.initialGroupLimit, {
-      reason: 'Measured question cost plus reserved and forecast remaining work exceeds its working threshold',
-      progress: progress.hash, required, obligations: [group], basis: [...estimate.basis, ...progress.basis],
-      forecast: `Next invocation ${estimate.tokens}; remaining known roles ${remainingEstimate}. Both are estimates; no output quality or provider cap is guaranteed.`,
-      options: [
-        { method: 'existing-pagination-and-replay', saved: 0, decision: 'accept', quality: 'The engine has already retained the exact originals, paged context, and attempted saved-response replay before this boundary.', preserved: [group] },
-        { method: 'drop-constraints-or-external-consumers', saved: 0, decision: 'reject', quality: 'No demonstrated preservation of requirements, exceptions, authority, recovery or source meaning; do not discard these materials.', preserved: [] },
-        { method: 'switch-model', saved: 0, decision: 'reject', quality: 'No evidence that another authorized role is suitable for this required reasoning; keep the selected role.', preserved: [] },
-      ],
-    });
+    const measured = usage.groups[group]?.measured ?? 0;
+    const limit = workingLimit(store, segment, group, 'tokens', segment.value.initialGroupLimit);
+    requireCondition(measured <= limit, 'budget_question_overrun', 'Actual question usage exceeded its working limit; pause and report before any continuation');
   }
-}
-
-export function accommodateMetric(store: Store, segment: Revision<BudgetSegment>, group: string, metric: string, initial: number,
-  required: number, draft: Revision<DiscoveryDraft>, questionId: string, evidence: Ref[], explanation: string, physicalMaximum?: number): number {
-  if (group.includes(',')) return Math.max(...group.split(',').map(g => accommodateMetric(store, segment, g, metric, initial,
-    required, draft, questionId, evidence, explanation, physicalMaximum)));
-  requireCondition(physicalMaximum === undefined || required <= physicalMaximum, 'budget_transport_limit', 'Required material exceeds the declared transport capacity');
-  const previous = workingLimit(store, segment, group, metric, initial);
-  if (required <= previous) return previous;
-  const progress = researchProgress(store, draft.value, questionId);
-  const basis = [...evidence, ...progress.basis];
-  requireCondition(basis.length > 0 && (metric !== 'rounds' || progress.basis.length > 0), 'budget_no_progress', 'Expansion needs concrete saved material, not repeated failed attempts');
-  return raiseWorkingLimit(store, segment, group, metric, initial, {
-    reason: explanation, progress: hashJson([progress.hash, evidence]), required, obligations: [group], basis,
-    forecast: `Required ${required} ${metric} after lossless packing; this does not enlarge the model or transport window.`,
-    options: [
-      { method: 'existing-pagination-and-replay', saved: 0, decision: 'accept', quality: 'Exact original remains in the SQLite archive. Existing compact tables, page cursor and replay remain enabled.', preserved: [group] },
-      { method: 'remove-required-material', saved: 0, decision: 'reject', quality: 'Would remove required meaning, exception or consumer; preservation has not been established.', preserved: [] },
-    ],
-  }, physicalMaximum).value.limit;
 }

@@ -12,7 +12,7 @@ interface Session { projectId: string; offset: number; notes: Json[]; focus: unk
 const instruction = "Evidence is sent in bounded pages. evidencePage.text is a fragment of the JSON-serialized COMPLETE observations array, at UTF-16 offsets; it is not a complete quote. observations, when populated, contains the whole array. All exact originals are in working.archive; you may request read_context with record,pointer,page. Keep intermediate judgments as {action:'assessment_checkpoint',notes:[string]} with source/requirement references in each note. Notes are unassessed judgments, not source substitutes. You may revisit any earlier page. A terminal verdict is accepted only after every evidence character has been supplied; examine applicable exceptions, global constraints and cross-page contradictions before the final judgment.";
 
 export async function assessmentSession(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
-  environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot>, context: Record<string, any>,
+  environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot> | undefined, context: Record<string, any>,
   prompt: string, signal?: AbortSignal): Promise<unknown> {
   // Additional readings and contradictions can change a verdict even when the
   // proposed value and its citations did not change.
@@ -29,7 +29,7 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
     const response = await researchCall(dispatch.reviewer, dispatch, prompt + "\n" + instruction,
       { ...context, assessmentState: { offset: current.offset, total: JSON.stringify(context.observations).length },
         assessmentNotes: current.notes, focus: current.focus }, signal,
-      { store, draftId: draft.id, questionId: question.id, purpose: "assessor", pilot, onContext: packet => { sent = packet; } }) as any;
+      { store, draftId: draft.id, questionId: question.id, purpose: "assessor", ...(pilot?{pilot}:{}), onContext: packet => { sent = packet; } }) as any;
     requireCondition(sent?.evidencePage && sent.evidencePage.offset === current.offset,
       "assessment_invalid", "Assessment did not receive its expected evidence continuation");
     const offset = sent.evidencePage.end;
@@ -39,6 +39,10 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
       const action = researchAction(response);
       requireCondition(action.action === "read_context", "assessment_invalid", "Expected an addressed read");
       focus = readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page);
+      requireCondition(current.focus === null || canonical(current.focus) !== canonical(focus),
+        "assessment_no_progress", "The same addressed context was requested again without assessing the current evidence page");
+      save({ ...current, focus });
+      continue; // A context lookup is not an assessment of the evidence page just sent.
     } else if (response?.action === "assessment_checkpoint") {
       requireCondition(Object.keys(response).sort().join(",") === "action,notes" && Array.isArray(response.notes)
         && response.notes.every((n: unknown) => typeof n === "string"), "assessment_invalid", "Assessment checkpoint needs explicit notes");

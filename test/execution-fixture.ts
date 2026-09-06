@@ -20,6 +20,7 @@ const raw=readFileSync(0,'utf8'), request=JSON.parse(raw), context=request.subje
 const previous=existsSync(journal)?readFileSync(journal,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse):[];
 if(request.mode==='research') {
  const c=request.subject;
+ if(!c.inventory)c.inventory={sources:c.originals?.sources??[]};
  appendFileSync(journal,JSON.stringify({mode:'research',role:c.role})+'\n');
  const reply=research=>process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research}));
  if(c.role==='assess-answer') reply({verdict:'supported',reasons:[]});
