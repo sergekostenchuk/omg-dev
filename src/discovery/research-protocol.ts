@@ -12,6 +12,7 @@ import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { DELTA_COLLECTIONS } from "./layer-delta.js";
 import { workingContext } from "./working-context.js";
+import { replayLimitedResponse } from "./response-replay.js";
 
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const text = { type: "string", minLength: 1 };
@@ -66,6 +67,14 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     : context;
   audit?.onContext?.(subject as Record<string, any>);
   const input = JSON.stringify({ ...envelope, subject });
+  const replay = audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
+    audit.questionId, audit.purpose, input) : null;
+  if (replay) return replay.research;
+  if (audit?.purpose === "reading-planner" && audit.pilot?.value.planning) {
+    requireCondition(audit.store.list<ModelCall>("model-call").filter(call => call.value.draftId === audit.draftId
+      && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length < audit.pilot.value.planning.maxRounds,
+      "planning_round_limit", "Reading expansion allowance reached; preserve the unresolved research for continuation");
+  }
   const reservation = audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
   let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,

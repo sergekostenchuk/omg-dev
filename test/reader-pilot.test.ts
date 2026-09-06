@@ -29,6 +29,8 @@ import { workingContext } from "../src/discovery/working-context.js";
 import { checkpoint, latestProposal, recoverableAnswer, workingSelections } from "../src/discovery/research-continuation.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import { assessmentSession } from "../src/discovery/assessment-session.js";
+import { researchCall } from "../src/discovery/research-protocol.js";
+import { replayLimitedResponse } from "../src/discovery/response-replay.js";
 import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-session.js";
 import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
@@ -874,4 +876,45 @@ test("a pilot timeout override leaves the accepted source environment unchanged"
   assert.equal(pilotEnvironment(environment.value,configured.value).timeoutMs,1800000);
   assert.deepEqual(store.get(environment.id),environment);
   for(const callTimeoutMs of [0,-1,1.5,3000001])assert.throws(()=>configureReaderPilot(store,engine.environments,'p',{...settings,callTimeoutMs},configured.revision),{code:'reader_pilot_invalid'});
+});
+
+
+test("an oversized paid response is replayed only for its exact current request without another generation", async t => {
+  const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
+  const command=join(root,'oversized-provider.mjs');
+  writeFileSync(command,`import {readFileSync,writeFileSync} from 'node:fs';const input=readFileSync(0,'utf8'),req=JSON.parse(input);writeFileSync('original-request.json',input);console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'answer',question:req.subject.question.id,value:'x'.repeat(4000),citations:[]},usage:{inputTokens:10,outputTokens:1000,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]},role={...environment.value.implementer,command:cmd};
+  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxReplyChars:128},pilot.revision);
+  const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory()};
+  const audit={store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:configured};
+  await assert.rejects(researchCall(role,environment.value,'Return JSON',context,undefined,audit),{code:'pilot_reply_limit'});
+  const original=store.list<ModelCall>('model-call')[0]!,input=readFileSync(join(root,'original-request.json'),'utf8');
+  await assert.rejects(researchCall(role,environment.value,'Return JSON',context,undefined,audit),{code:'pilot_reply_limit'});
+  assert.equal(store.list('model-call').length,1,'Do not buy another oversized response with an unchanged ceiling');
+  const expanded=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxReplyChars:5000},configured.revision);
+  const response=await researchCall({...role,command:{executable:'/usr/bin/false',args:[]}},environment.value,'Return JSON',context,undefined,{...audit,pilot:expanded}) as any;
+  assert.equal(response.value.length,4000);assert.deepEqual(store.get(original.id),original);
+  assert.equal(store.list('model-call').length,1);assert.equal(store.list('research-response-replay').length,1);
+  const changed=JSON.parse(input);changed.prompt='Different instruction';
+  assert.equal(replayLimitedResponse(store,expanded,role,draft.id,question.id,'analyst',JSON.stringify(changed)),null);
+  assert.equal(replayLimitedResponse(store,expanded,{...role,actor:'foreign'},draft.id,question.id,'analyst',input),null);
+  assert.equal(replayLimitedResponse(store,expanded,role,draft.id,question.id,'assessor',input),null);
+  store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'Changed basis'}}});
+  assert.throws(()=>replayLimitedResponse(store,expanded,role,draft.id,question.id,'analyst',input),{code:'context_reference_stale'});
+});
+
+test("the last allowed planner response can be replayed before checking generation quota", async t => {
+  const {root,store,engine,pilot,settings,draft,question}=fixture(t);
+  const command=join(root,'last-planner.mjs');
+  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;const research=c.role==='reader'?{selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]}:{action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'Read the condition '+'.'.repeat(4000),inputs:[{path:'README.md',media:'text/plain'}]}]};console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:20,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd={executable:process.execPath,args:[command]};
+  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},maxReplyChars:256,planning:{fields:[question.value.spec.field],maxRequestChars:100000,maxRounds:1}},pilot.revision);
+  const first=await engine.researcher.run('p',draft.id,1);assert.equal(first.value.pauseCode,'pilot_reply_limit');
+  const {projectId:_projectId,...resumedSettings}=configured.value;
+  configureReaderPilot(store,engine.environments,'p',{...resumedSettings,maxReplyChars:10000},configured.revision);
+  const resumed=await engine.researcher.run('p',draft.id,2);
+  assert.equal(resumed.value.pauseCode,null);
+  assert.equal(store.list<ModelCall>('model-call').filter(c=>c.value.purpose==='reading-planner').length,1);
+  assert.equal(store.list('research-response-replay').length,1);
+  assert.equal(store.list('reader-result').length,1);
 });

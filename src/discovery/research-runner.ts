@@ -19,7 +19,6 @@ import { readBundle } from "./reader.js";
 import { expandLayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
 import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
-import type { ModelCall } from "../runtime/model-usage.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { pendingSynthesis, synthesisSession } from "./synthesis-session.js";
 
@@ -130,9 +129,6 @@ export class Researcher {
         let action: ResearchAction;
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
-          if (mode === "planning") requireCondition(this.store.list<ModelCall>("model-call").filter(c => c.value.draftId === draftId
-            && c.value.questionId === pending[0]!.id && c.value.purpose === "reading-planner").length < planning!.maxRounds,
-            "planning_round_limit", "Reading expansion allowance reached; preserve the unresolved research for continuation");
           run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
           const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign" ? DELTA_INSTRUCTION : "";
           const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
