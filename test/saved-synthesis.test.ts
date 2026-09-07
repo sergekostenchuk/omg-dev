@@ -14,6 +14,8 @@ import { configurePhasePolicy } from "../src/discovery/phase-policy.js";
 import { configureBudgetSegment } from "../src/runtime/research-budget.js";
 import { configureResearchScope } from "../src/graph/research-scope.js";
 import { checkpoint } from "../src/discovery/research-continuation.js";
+import {savedSynthesisMaterials} from '../src/discovery/saved-synthesis.js';
+import {readPilotContext} from '../src/discovery/pilot-context.js';
 import { preparedFeatures } from "./product-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
@@ -127,6 +129,21 @@ test("saved-only R2 rejects need_research without buying a reading or accepting 
   assert.equal(f.store.get<Question>(f.question.id)!.value.status, "open");
   assert.deepEqual(f.store.list<ModelCall>("model-call").filter(c => c.value.draftId === f.draft.id).map(c => c.value.purpose), ["analyst"]);
   assert.equal(f.store.list("reader-result").length, 0);
+});
+
+test('saved synthesis exposes direct verified observation addresses and refuses stale/foreign checkpoint reads',t=>{
+ const f=fixture(t);f.enable();f.configure();
+ const materials=savedSynthesisMaterials(f.store,f.draft,f.question)!;
+ const address=materials[0]!.value.evidence[0]!.original;
+ const read=readPilotContext(f.store,f.draft,address.record,address.pointer,20000) as any;
+ assert.deepEqual(read.value,(f.pieces[0]!.value as any).observations[0]);
+ assert.ok(!address.pointer.includes('directReadings'));
+ assert.throws(()=>readPilotContext(f.store,f.draft,{...address.record,hash:'0'.repeat(64)},address.pointer,20000));
+ assert.throws(()=>readPilotContext(f.store,{...f.draft,value:{...f.draft.value,projectId:'foreign'}},address.record,address.pointer,20000));
+ writeFileSync(join(f.root,'README.md'),'Source changed after the paid checkpoint');
+ assert.throws(()=>savedSynthesisMaterials(f.store,f.draft,f.question),{code:'synthesis_evidence_stale'});
+ assert.throws(()=>readPilotContext(f.store,f.draft,address.record,address.pointer,20000),{code:'research_evidence_stale'});
+ assert.equal(f.calls().length,0);
 });
 
 for (const pilot of ["absent", "disabled"] as const) test(`saved synthesis refuses an ${pilot} pilot before any model call`, async t => {

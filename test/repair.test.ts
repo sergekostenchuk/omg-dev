@@ -105,7 +105,7 @@ test("an early technical refusal preserves accepted reports and the next model c
     questions:initialDraft.value.questions.filter(id=>f.store.get<Question>(id)!.value.spec.field!=="contractsAndConsumers")}});
   writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: true }));
   const rejected = await f.engine.repairs.run("p", reference(failed), 20);
-  assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /Research turn allowance/);
+  assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /no durable progress/);
   assert.ok(f.store.list("research-turn").some(turn => JSON.stringify(turn.value).includes("research_gap_unresolved")));
   const draft = f.store.get<DiscoveryDraft>(rejected.value.draftId)!;
   const questions = draft.value.questions.map(id => f.store.get<Question>(id)!);
@@ -113,6 +113,11 @@ test("an early technical refusal preserves accepted reports and the next model c
   const accepted = questions.filter(question => question.value.status === "answered");
   const calls = f.calls().length;
   writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: false }));
+  const stillPaused=await f.engine.repairs.run('p',reference(failed),20);
+  assert.equal(stillPaused.value.phase,'research');
+  assert.equal(f.calls().length,calls,'An ordinary resume cannot reset the no-progress guard');
+  const open=questions.find(question=>question.value.status==='open')!;
+  f.engine.execute({type:'reopen-question',question:open.id,expected:open.revision});
   const corrected = await f.engine.repairs.run("p", reference(failed), 20);
   assert.equal(corrected.value.phase, "reissued", corrected.value.error ?? "Repair failed");
   assert.ok(f.calls().length > calls);

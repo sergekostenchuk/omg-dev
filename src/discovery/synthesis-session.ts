@@ -1,3 +1,4 @@
+import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext } from "./research-limits.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -6,7 +7,7 @@ import type { ReaderPilot } from "./reader-pilot.js";
 import type { ResearchAction } from "./research-model.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { checkpoint } from "./research-continuation.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
@@ -14,7 +15,8 @@ import { readerResultCurrent } from "./reader.js";
 import { isRef } from "../pipeline/contracts.js";
 
 interface Session {
-  projectId: string; offset: number; materialOffset?: number; focus?: unknown;
+  projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
+  binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] };
   notes: { checkpoint: Ref; proposal: ResearchAction; page: { offset: number; end: number } }[];
   result: ResearchAction | null;
 }
@@ -52,7 +54,8 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
   let session = store.get<Session>(id);
   const guards = [reference(draft), reference(question), reference(environment), ...draft.value.inputs];
   const save = (value: Session, extra: Ref[] = []) => session = store.writeMany<Session>([
-    { id, kind: "synthesis-session", expected: session?.revision ?? 0, value }], [...guards, ...extra])[0]!;
+    { id, kind: "synthesis-session", expected: session?.revision ?? 0,
+      value: {...value,binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs}} }], [...guards, ...extra])[0]!;
   if (!session) save({ projectId: draft.value.projectId, offset: 0, notes: [], result: null });
   for (;;) {
     requireCondition(guards.every(ref => {
@@ -79,11 +82,18 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     verify(materials);
     if (session!.value.result) return session!.value.result!;
     const current = session!.value;
+    const workspace=contextWorkspace(current.workspace,current.focus);
+    requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved context session is blocked');
+    verify(workspace.entries);
     let sent: Record<string, any> | undefined;
     const action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction,
       { ...context, dispatchMode: "synthesis", synthesisMaterials: materials,
-        synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes, focus: current.focus ?? null }, signal,
-      { store, draftId: draft.id, questionId: question.id, purpose: "analyst", pilot, onContext: packet => { sent = packet; } }));
+        synthesisSession:id, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes,
+        contextWorkspace:workspace.entries.map(e=>e.result), focus:null }, signal,
+      { store, draftId: draft.id, questionId: question.id, purpose: "analyst", pilot, session:reference(session!), onContext: packet => { sent = packet; } }).catch(error=>{
+        if(error instanceof EngineError&&error.code==='research_context_undelivered')save({...current,workspace:{...workspace,blocked:error.message}});
+        throw error;
+      }));
     const page = sent?.synthesisPage;
     requireCondition(["answer", "answer_delta", "checkpoint", "read_context", "need_research", "need_owner", "pause"].includes(action.action),
       "research_mode_invalid", "Synthesis must answer, checkpoint, or identify missing information");
@@ -95,12 +105,18 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     // able to call again with the unchanged saved material cursor.
     if (action.action === "pause") return action;
     if (action.action === "read_context") {
-      const focus=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
-      save({...current,focus});continue;
+      try {
+        const result=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
+        save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups)});
+      } catch(error) {
+        save({...current,workspace:{...workspace,blocked:error instanceof Error?error.message:'Context lookup refused'}});
+        throw error;
+      }
+      continue;
     }
     requireCondition(!context.savedOnly || action.action !== "need_research", "research_saved_only", "Finish from saved findings; new source reads are disabled for this recovery");
     if (page.complete && action.action !== "checkpoint") {
-      save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, result: action }); return action;
+      save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace), result: action }); return action;
     }
     requireCondition(["checkpoint", "answer", "answer_delta"].includes(action.action),
       "synthesis_checkpoint_required", "Save partial findings before continuing the remaining already-read materials");
@@ -110,7 +126,7 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     const saved = checkpoint(store, draft, question, { action: "checkpoint", question: question.id,
       value: proposal as unknown as Json, citations: proposal.citations,
       unresolved: proposal.action === "checkpoint" ? proposal.unresolved : ["Complete the remaining material pages before accepting this proposal"] });
-    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, notes: [...current.notes,
+    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace), notes: [...current.notes,
       { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: page.end } }] }, [reference(saved)]);
   }
 }

@@ -8,8 +8,13 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.j
 import type { DetailSelector } from "../compiler/context.js";
 import type { Environment } from "../runtime/environment.js";
 import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader-pilot.js";
+import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 
 export type ProductCommand =
+  | {type:'recover-context-session';project:string;session:Ref;selector:ContextRecoverySelector}
+  | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
+  | {type:"recover-model-call";project:string;call:Ref}
+  | {type:"continue-preparation";project:string;maxCalls:number}
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
@@ -60,7 +65,13 @@ const processCommand = object({ executable: string, args: { type: "array", items
 const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
 role.properties['speed'] = { enum: ["inherited", "fast"] };
 const researchLevel = { enum: ["R0", "R1", "R2"] };
+const recoverySelector=object({record:ref,pointer:{type:'string'}});
+recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const schema = { oneOf: [
+  command('recover-context-session',{project,session:ref,selector:recoverySelector}),
+  command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),
+  command("recover-model-call", {project,call:ref}),
+  command("continue-preparation", {project,maxCalls:{type:"integer",minimum:1,maximum:100}}),
   command("set-map-status", { project, expected, base: ref, nodes: { type: "array", minItems: 1, items: object({
     id: string, status: { enum: ["existing", "future"] }, explanation: string,
     code: { type: "array", items: object({ path: string, access: { enum: ["read", "write"] }, status: { const: "existing" } }) },

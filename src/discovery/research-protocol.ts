@@ -1,3 +1,6 @@
+import { processStart } from "../runtime/process-identity.js";
+import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
+import { requireContextDelivery } from "./context-workspace.js";
 import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt, DEFAULT_CONTINUATION_CHARS } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
@@ -15,7 +18,7 @@ import type { ResearchAction } from "./research-model.js";
 import type { Store, Revision } from "../storage/store.js";
 import { tokenUsage, type ModelCall } from "../runtime/model-usage.js";
 import { digest, hashJson } from "../canonical.js";
-import { reference } from "../pipeline/contracts.js";
+import { reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { DELTA_COLLECTIONS } from "./layer-delta.js";
@@ -67,7 +70,7 @@ export function researchAction(value: unknown): ResearchAction {
 }
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
-    onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
+    session?: Ref; onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
@@ -106,8 +109,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     : initialRequestLimit ?? 300000;
   const overhead = JSON.stringify({ ...envelope, subject: {} }).length + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
-    requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}) }) : context;
+    requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
+      ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}) }) : context;
   if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive);
+  if (context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
+    requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
   audit?.onContext?.(subject as Record<string, any>);
   const input = JSON.stringify({ ...envelope, subject });
   requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
@@ -133,6 +139,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length;
     requireCondition(rounds < audit.pilot.value.planning.maxRounds, "planning_round_limit", "The planning guard is reached; preserve the paid work instead of increasing rounds");
   }
+  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,context as Record<string,any>):null;
   const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
   if (segment && audit && estimate) {
@@ -141,15 +148,40 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     reservation.writes.push(...reserved.writes);
     reservation.guards.push(...reserved.guards, reference(policy!), reference(audit.pilot!), reference(draft!), reference(protectedQuestion!), ...draft!.value.inputs);
   }
+  if(audit){
+    const projectCounterId=`project-dispatch:${hashJson(environment.projectId)}`;
+    const projectCounter=audit.store.get<{projectId:string;serial:number}>(projectCounterId);
+    requireCondition(!projectCounter||(projectCounter.kind==='project-dispatch'&&projectCounter.value.projectId===environment.projectId
+      &&Number.isSafeInteger(projectCounter.value.serial)&&projectCounter.value.serial>=0),
+    'research_dispatch_invalid','Invalid project dispatch counter');
+    reservation.writes.push({id:projectCounterId,kind:'project-dispatch',expected:projectCounter?.revision??0,
+      value:{projectId:environment.projectId,serial:(projectCounter?.value.serial??0)+1}});
+    if(projectCounter)reservation.guards.push(reference(projectCounter));
+    if(policy)reservation.guards.push(reference(policy));
+  }
   if (packetState) {
+    const questionCounterId=`question-dispatch:${hashJson(audit!.questionId!)}`;
+    const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number}>(questionCounterId);
+    requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
+      &&questionCounter.value.question===audit!.questionId&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
+    'research_dispatch_invalid','Invalid question dispatch counter');
+    reservation.writes.push({id:questionCounterId,kind:'question-dispatch',expected:questionCounter?.revision??0,
+      value:{projectId:environment.projectId,question:audit!.questionId,serial:(questionCounter?.value.serial??0)+1}});
+    if(questionCounter) reservation.guards.push(reference(questionCounter));
+    if(audit!.session) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, `model-call:${requestId}`);
-    reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards);
+    reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]));
     reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
       value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
   }
+  const ownerProcess=packetState?{pid:process.pid,started:processStart(process.pid)}:null;
+  requireCondition(!ownerProcess||ownerProcess.started,'model_call_identity_missing','Research owner identity must be saved before dispatch');
+  consumeInvocationAllowance();
   let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
+      ...(progress?{progressKey:progress.key}:{}),
+      ...(ownerProcess?{ownerProcess}:{}),
       profile: audit.pilot ? reference(audit.pilot) : null,
       questionId: audit.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
@@ -160,7 +192,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
   try {
-    const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, signal);
+    const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, signal, true, pid=>{
+      if(call&&audit&&packetState){const started=processStart(pid);requireCondition(started,'model_call_identity_missing','Provider identity could not be recorded');
+        call=audit.store.write<ModelCall>({id:call.id,kind:call.kind,expected:call.revision,value:{...call.value,providerProcess:{pid,started}}});}
+    });
     rawResponse = result.stdout;
     patch.response = { chars: result.stdout.length, bytes: Buffer.byteLength(result.stdout) };
     let response: { protocol?: unknown; requestId?: unknown; research?: unknown; usage?: unknown; confirmed?: unknown } | null = null;

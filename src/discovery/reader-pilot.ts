@@ -14,6 +14,7 @@ export interface ReaderPilotSettings {
   maxCalls: number; maxReportedTokens: number;
   callTimeoutMs?: number;
   maxContinuationChars?: number;
+  contextLimits?: { maxLookups: number; maxChars: number };
   physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
@@ -30,6 +31,7 @@ export const readerPilotSchema = object({ experimental: { const: true }, active:
 readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object({ call: object({ id: text, revision: positive,
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
 readerPilotSchema.properties['maxContinuationChars'] = positive;
+readerPilotSchema.properties['contextLimits'] = object({ maxLookups: positive, maxChars: positive });
 readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: positive, maxReplyChars: positive, basis: text });
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
@@ -41,6 +43,8 @@ export function configureReaderPilot(store: Store, environments: Environments, p
   const env = environments.get(project).value;
   requireCondition(!settings.planning || settings.planning.maxRequestChars <= settings.maxRequestChars,
     "reader_pilot_invalid", "Planning cannot exceed the overall request ceiling");
+  requireCondition(!settings.contextLimits || settings.contextLimits.maxChars <= Math.min(settings.maxRequestChars,settings.maxContinuationChars??settings.maxRequestChars),
+    'reader_pilot_invalid','Addressed context cannot exceed the declared continuation envelope');
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
     "reader_role_invalid", "The reader must have its own identity and cannot accept its extraction");
   executablePath(settings.reader.command, env.workspace); executablePath(settings.agentCommand, env.workspace);

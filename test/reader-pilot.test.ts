@@ -473,7 +473,7 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   } finally { reopened.close(); }
 });
 
-test("an assessor checkpoint cannot forget requested context that did not fit the wire", async t => {
+test("oversized requested assessment context pauses before another call instead of being forgotten", async t => {
   const { root, store, engine, environment, settings, pilot, draft, question } = fixture(t);
   const source = engine.discovery.evidence.file("p", "focus-source", root, "README.md", "text/plain", 0);
   const observations = [engine.discovery.evidence.observe("p", reference(source), { kind: "text-range", start: 0, end: source.value.content.length })];
@@ -486,10 +486,11 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
     agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
   const context = { ...pilotContext(store, draft, question), role: "assess-answer", observations, value: "candidate", extra: "exception ".repeat(10000) };
   await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
-    { code: "assessment_invalid" });
+    { code: "research_context_undelivered" });
   const session = store.list<any>("assessment-session")[0]!.value;
   assert.equal(session.result, null);
-  assert.equal(session.focus.value, context.extra);
+  assert.ok(session.workspace.blocked);
+  assert.equal(store.list("model-call").length, 1);
   assert.equal(store.get<Question>(question.id)!.value.status, "open");
 });
 
@@ -542,7 +543,8 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
     const run = await engine.researcher.run("p", draft.id, 10);
     assert.equal(run.value.status, "paused"); assert.equal(run.value.pauseCode, "research_no_progress");
     const turns = store.list<ResearchTurn>("research-turn").sort((a,b)=>a.value.number-b.value.number);
-    assert.equal(turns.at(-1)!.value.status, "pending");
+    assert.equal(turns.at(-1)!.value.status, "completed");
+    assert.ok(turns.at(-1)!.value.error, 'A refused lookup is recorded, not queued for automatic replay');
     assert.equal((turns.at(-1)!.value.observation as any).code, "research_no_progress");
     assert.notEqual((turns[0]!.value.action as any).record.id, (turns.at(-1)!.value.action as any).record.id);
     assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='analyst').length, alternating ? 3 : 2);
@@ -1033,7 +1035,7 @@ test('assessor context lookup does not skip the evidence page in a stateless con
  const source=engine.discovery.evidence.file('p','assessment-lookup',root,'README.md','text/plain',0);
  const observation=engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:10});
  const adapter=join(root,'lookup-assessor.mjs');
- writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('lookup-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,core:Boolean(c.core)})+'\\n');const research=c.focus?{verdict:'supported',reasons:[]}:{action:'read_context',record:c.working.archive,pointer:'/body/value'};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+ writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('lookup-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,core:Boolean(c.core)})+'\\n');const research=c.contextWorkspace?.length?{verdict:'supported',reasons:[]}:{action:'read_context',record:c.working.archive,pointer:'/body/value'};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const dispatch={...environment.value,reviewer:{...environment.value.reviewer,command:{executable:process.execPath,args:[adapter]}}};
  const result=await assessmentSession(store,draft,question,environment,dispatch,pilot,{...pilotContext(store,draft,question),role:'assess-answer',value:{ok:'fixture'},observations:[observation]},'Assess') as any;
  assert.equal(result.verdict,'supported');
@@ -1046,7 +1048,7 @@ test('assessor can inspect distinct original pointers with equal values without 
  const source=engine.discovery.evidence.file('p','equal-lookup',root,'README.md','text/plain',0);
  const observation=engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:10});
  const adapter=join(root,'equal-lookup-assessor.mjs');
- writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('equal-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,pointer:c.focus?.pointer??null})+'\\n');const research=!c.focus?{action:'read_context',record:c.working.archive,pointer:'/body/value/a'}:c.focus.pointer.endsWith('/a')?{action:'read_context',record:c.focus.record,pointer:'/body/value/b'}:{verdict:'supported',reasons:[]};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+ writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync('equal-pages.jsonl',JSON.stringify({offset:c.evidencePage.offset,pointer:c.contextWorkspace?.at(-1)?.pointer??null})+'\\n');const focus=c.contextWorkspace?.at(-1);const research=!focus?{action:'read_context',record:c.working.archive,pointer:'/body/value/a'}:focus.pointer.endsWith('/a')?{action:'read_context',record:focus.record,pointer:'/body/value/b'}:{verdict:'supported',reasons:[]};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const dispatch={...environment.value,reviewer:{...environment.value.reviewer,command:{executable:process.execPath,args:[adapter]}}};
  const result=await assessmentSession(store,draft,question,environment,dispatch,pilot,{...pilotContext(store,draft,question),role:'assess-answer',value:{a:'same',b:'same'},observations:[observation]},'Assess') as any;
  assert.equal(result.verdict,'supported');

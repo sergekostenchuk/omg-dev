@@ -1,0 +1,36 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { Store } from '../storage/store.js';
+import { hashJson } from '../canonical.js';
+import { requireCondition } from '../errors.js';
+import type { ModelCall } from '../runtime/model-usage.js';
+import { reference } from '../pipeline/contracts.js';
+import {contextLookupKey} from './context-workspace.js';
+
+/** Only engine-owned progress contributes. Focus, archive ids, model prose,
+ * error messages and budget changes cannot reset this per-invocation guard. */
+export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>) {
+  const question=store.get(questionId);
+  requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
+  let step:unknown;
+  const originals=(context.contextWorkspace??[]).map(contextLookupKey);
+  if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals};
+  else if(context.assessmentState)step={session:context.assessmentSession??null,cursor:context.assessmentState,originals};
+  else if(purpose==='reader')step={sources:context.sources?.map((s:any)=>({ref:s.ref??null,range:s.visibleRange??null,content:hashJson(s)}))??[]};
+  else {
+    const evidence=['reader-result','pilot-reading'].flatMap(kind=>store.list<any>(kind))
+      .filter(r=>r.value.question===questionId||r.value.question?.id===questionId).map(reference);
+    step={evidence};
+  }
+  const key=hashJson({version:1,question:reference(question),purpose,step});
+  const calls=store.list<ModelCall>('model-call').filter(c=>c.value.questionId===questionId&&c.value.purpose===purpose&&c.value.progressKey===key);
+  requireCondition(calls.length<3,'research_no_progress','Three invocations made no durable progress on this step; the next paid call is forbidden');
+  return {key,guards:calls.map(reference)};
+}
+
+const allowance=new AsyncLocalStorage<{remaining:number}>();
+export function withInvocationAllowance<T>(limit:number,work:()=>Promise<T>):Promise<T>{return allowance.run({remaining:limit},work);}
+export function consumeInvocationAllowance(){
+ const current=allowance.getStore();if(!current)return;
+ requireCondition(current.remaining>0,'research_call_allowance','The preparation call allowance is exhausted; all inner-role invocations count');
+ current.remaining--;
+}

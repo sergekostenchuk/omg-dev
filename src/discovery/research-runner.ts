@@ -20,7 +20,8 @@ import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pil
 import { pilotContext, retainPilotRead } from "./pilot-context.js";
 import { readBundle } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
-import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead } from "./research-continuation.js";
+import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead, addressedWorkspace } from "./research-continuation.js";
+import { addContextLookup } from './context-workspace.js';
 import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { pendingSynthesis, synthesisSession } from "./synthesis-session.js";
@@ -50,7 +51,6 @@ export class Researcher {
     const sources = new ResearchSources(this.store, project, effective.root);
     const id = `research-run:${hashJson([project, draftId])}`;
     let run = this.store.get<ResearchRun>(id);
-    const startTurn = run?.value.turns ?? 0;
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
     const checked = this.discovery.gate(project, reference(draft));
@@ -97,6 +97,7 @@ export class Researcher {
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
+        const workspace=addressedWorkspace(this.store,turns,pending[0]!);
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
           ...(mode ? { dispatchMode: mode, repositoryRoot: effective.root } : {}),
           researchMissing: ([...turns].reverse().find(t => t.value.question?.id === pending[0]!.id
@@ -105,6 +106,7 @@ export class Researcher {
             ref: reference(t), action: t.value.action, status: t.value.status, error: t.value.error,
             current: t.value.status === "completed" && !t.value.error && latestFocus(this.store, [t], pending[0]!) !== null })),
           focus: latestFocus(this.store, turns, pending[0]!), workingSelections: workingSelections(this.store, turns, pending[0]!), checkpoints,
+          contextWorkspace:workspace.entries.map(entry=>entry.result),
           checkpoint: [...turns].reverse().find(t => (t.value.action as { action?: string })?.action === "checkpoint"
             && t.value.question?.id === pending[0]!.id && !t.value.error)?.value.observation ?? null,
           inventory: { ...inventory, sources: inventory.sources.map(source => ({ ...source, excerpt: "", truncated: source.length > 0 })) },
@@ -117,6 +119,7 @@ export class Researcher {
           : { role: "research", stage: draft.value.stage, level: draft.value.level, consumer: draft.value.consumer,
           fields: draft.value.fields, questions: pending.map(item => ({ id: item.id, ...item.value.spec })),
           prerequisites: researchPrerequisites(this.store, draft.value), operationMap: researchGraphContext(this.store, draft.value),
+          contextWorkspace:workspace.entries.map(entry=>entry.result),
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
@@ -144,6 +147,7 @@ export class Researcher {
             [reference(recover), reference(pending[0]!), reference(draft), reference(environment), ...draft.value.inputs])[0]!;
         }
         let action: ResearchAction;
+        let sent:Record<string,any>|undefined;
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
           run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
@@ -154,9 +158,9 @@ export class Researcher {
           action = mode === "synthesis" && pilot ? await synthesisSession(this.store, draft, pending[0]!, environment,
             dispatch, pilot, context, instruction, signal)
             : researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
-              { store: this.store, draftId, questionId: pending[0]!.id, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot } : {}) }));
+              { store: this.store, draftId, questionId: pending[0]!.id, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot } : {}),onContext:packet=>{sent=packet;} }));
           const questionId = "question" in action ? action.question : null;
-          const question = questionId ? pending.find(item => item.id === questionId) : pilot ? pending[0] : null;
+          const question = questionId ? pending.find(item => item.id === questionId) : pending[0];
           pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
             value: { run: id, number: run.value.turns, action, assessment: null, observation: null, error: null,
               status: "pending", question: question ? reference(question) : null, ...(mode ? { dispatchMode: mode } : {}) } });
@@ -182,7 +186,18 @@ export class Researcher {
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
             observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page);
-            const repeated = repeatedContextRead(this.store, turns, pending[0]!, startTurn, observation, action);
+            // Resuming a pending turn does not imply that its old requested
+            // original was delivered again. Validate the actual packet set.
+            if(sent) {
+              try { addContextLookup(workspace,observation as any,sent.contextWorkspace,pilot?.value.contextLimits?.maxLookups); }
+              catch(failure) {
+                this.store.write<ResearchTurn>({id:pendingTurn.id,kind:pendingTurn.kind,expected:pendingTurn.revision,
+                  value:{...pendingTurn.value,status:'completed',error:failure instanceof Error?failure.message:'Context lookup refused',
+                    observation:{code:failure instanceof EngineError?failure.code:'research_context_invalid',requested:observation}}});
+                throw failure;
+              }
+            }
+            const repeated = !sent ? repeatedContextRead(this.store, turns, pending[0]!, 0, observation, action) : null;
             if (repeated) {
               this.store.write<ResearchTurn>({ id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
                 value: { ...pendingTurn.value, observation: { code: "research_no_progress", previous: repeated }, status: "pending" } });
@@ -231,7 +246,9 @@ export class Researcher {
           }
         } catch (failure) {
           if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
-            "research_response_invalid", "assessment_invalid"].includes(failure.code) || failure.code.startsWith("pilot_"))) throw failure;
+            "research_response_invalid", "assessment_invalid", "research_call_allowance"].includes(failure.code)
+            || ["pilot_", "budget_", "continuation_", "research_context_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
+            || failure.code.endsWith("_no_progress"))) throw failure;
           error = failure instanceof Error ? failure.message : "Research action failed";
           if (failure instanceof EngineError && failure.details !== null) observation = { code: failure.code, details: failure.details };
         }

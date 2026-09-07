@@ -30,6 +30,7 @@ export function savedSynthesisMaterials(store: Store, draft: Revision<DiscoveryD
     requireCondition(record?.kind==='research-checkpoint' && record.hash===ref.hash
       && record.value.observations.every((o:any)=>new Evidence(store).verify(o)), 'synthesis_evidence_stale','Saved findings lost their original evidence');
     return {kind:'saved-findings',value:{checkpoint:ref,proposal:record.value.proposal,unresolved:record.value.unresolved,
+      evidence:record.value.observations.map((o:any,index:number)=>({source:o.source,selector:o.selector,original:{record:ref,pointer:`/observations/${index}`}})),
       instruction:'Already paid proposed findings; reconcile all saved pieces. Page-pending notices are not new research questions.'}};
   });
 }

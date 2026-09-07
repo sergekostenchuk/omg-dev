@@ -6,7 +6,7 @@ import type { ModelCall } from './model-usage.js';
 import type { DiscoveryDraft, Question } from '../discovery/discovery.js';
 
 export interface CallEstimate { kind: 'estimated' | 'guaranteed'; tokens: number; basis: Ref[]; explanation: string }
-export interface BudgetSegment { projectId: string; key: string; limit: number; initialGroupLimit: number }
+export interface BudgetSegment { projectId: string; key: string; limit: number; initialGroupLimit: number; ownerGroupCeiling?: number }
 interface Assignment { call: string; groups: string[]; estimate: CallEstimate }
 interface Ledger { projectId: string; segment: string; assignments: Assignment[] }
 export interface Optimization {
@@ -17,18 +17,38 @@ export interface Optimization {
 interface WorkingLimit { projectId: string; segment: string; group: string; metric: string; limit: number; ceiling?: number; decisions: Optimization[] }
 const positive = (n: number) => Number.isSafeInteger(n) && n > 0;
 export const segmentId = (project: string, key: string) => `research-budget:${hashJson([project, key])}`;
-export function configureBudgetSegment(store: Store, projectId: string, key: string, limit = 10_000_000, initialGroupLimit = 700_000) {
+export function configureBudgetSegment(store: Store, projectId: string, key: string, limit = 10_000_000, initialGroupLimit = 700_000, ownerGroupCeiling?: number) {
   requireCondition(key.trim() && positive(limit) && positive(initialGroupLimit) && initialGroupLimit <= limit,
     'budget_invalid', 'Explicit positive segment and question limits are required');
+  requireCondition(ownerGroupCeiling === undefined || (positive(ownerGroupCeiling) && initialGroupLimit <= ownerGroupCeiling && ownerGroupCeiling <= limit),
+    'budget_owner_ceiling_invalid', 'An owner block ceiling must be a positive integer between the initial group limit and segment limit');
   // A segment cannot be reset by replacing a profile or recreating a draft.
   return store.write<BudgetSegment>({ id: segmentId(projectId, key), kind: 'research-budget', expected: 0,
-    value: { projectId, key, limit, initialGroupLimit } });
+    value: { projectId, key, limit, initialGroupLimit, ...(ownerGroupCeiling === undefined ? {} : { ownerGroupCeiling }) } });
 }
 export function budgetSegment(store: Store, project: string, key: string) {
   const s = store.get<BudgetSegment>(segmentId(project, key));
   requireCondition(s?.kind === 'research-budget' && s.value.projectId === project && s.value.key === key
     && positive(s.value.limit) && positive(s.value.initialGroupLimit), 'budget_missing', 'Continuation needs its existing budget segment');
+  segmentOwnerCeiling(store, s);
   return s;
+}
+/** New segments bind the owner ceiling at creation. Its absence on an original
+ * legacy segment retains that segment's existing working-limit policy. */
+function segmentOwnerCeiling(store: Store, segment: Revision<BudgetSegment>): number | undefined {
+  const saved = store.get<BudgetSegment>(segment.id, segment.revision);
+  const original = store.get<BudgetSegment>(segment.id, 1);
+  requireCondition(saved?.kind === 'research-budget' && saved.hash === segment.hash && hashJson(segment.value) === segment.hash
+    && original?.kind === 'research-budget' && segment.id === segmentId(segment.value.projectId, segment.value.key),
+  'budget_segment_invalid', 'Budget limits must come from the exact saved segment');
+  const ceiling = original.value.ownerGroupCeiling;
+  requireCondition(Object.hasOwn(original.value, 'ownerGroupCeiling') === Object.hasOwn(segment.value, 'ownerGroupCeiling')
+    && ceiling === segment.value.ownerGroupCeiling,
+  'budget_owner_ceiling_changed', 'A segment cannot remove or replace its owner block ceiling');
+  requireCondition(!Object.hasOwn(original.value, 'ownerGroupCeiling') || (typeof ceiling === 'number' && positive(ceiling)
+    && original.value.initialGroupLimit <= ceiling && ceiling <= original.value.limit),
+  'budget_owner_ceiling_invalid', 'The saved owner block ceiling is missing or invalid');
+  return ceiling;
 }
 /** Target identity survives question/draft regeneration and field grouping changes.
  * A call spanning several obligations is charged once to the segment and to each
@@ -44,9 +64,12 @@ export function budgetGroups(store: Store, draftId: string, questionId: string):
 const limitId = (segment: string, group: string, metric: string) => `research-limit:${hashJson([segment, group, metric])}`;
 export function workingLimit(store: Store, segment: Revision<BudgetSegment>, group: string, metric: string, initial: number): number {
   if (group.includes(',')) return Math.max(...group.split(',').map(g => workingLimit(store, segment, g, metric, initial)));
-  return store.get<WorkingLimit>(limitId(segment.id, group, metric))?.value.limit ?? initial;
+  const limit = store.get<WorkingLimit>(limitId(segment.id, group, metric))?.value.limit ?? initial;
+  const ceiling = metric === 'tokens' ? segmentOwnerCeiling(store, segment) : undefined;
+  return ceiling === undefined ? limit : Math.min(limit, ceiling);
 }
 export function raiseWorkingLimit(store: Store, segment: Revision<BudgetSegment>, group: string, metric: string, initial: number, decision: Optimization, physicalMaximum?: number) {
+  const ownerCeiling = metric === 'tokens' ? segmentOwnerCeiling(store, segment) : undefined;
   requireCondition(decision && typeof decision === 'object' && typeof decision.reason === 'string' && typeof decision.progress === 'string'
     && typeof decision.forecast === 'string' && Array.isArray(decision.options) && Array.isArray(decision.obligations)
     && decision.obligations.every(o => typeof o === 'string' && o.length > 0) && Array.isArray(decision.basis),
@@ -63,8 +86,10 @@ export function raiseWorkingLimit(store: Store, segment: Revision<BudgetSegment>
   requireCondition(!previous?.value.decisions.some(d => d.progress === decision.progress), 'budget_no_progress', 'The same progress cannot repeatedly justify increases');
   requireCondition(physicalMaximum !== undefined && positive(physicalMaximum), 'budget_ceiling_required',
     'A limit increase needs an explicit finite ceiling; it is never an automatic continuation strategy');
-  const ceiling = Math.min(physicalMaximum, previous?.value.ceiling ?? physicalMaximum);
   const limit = Number((BigInt(decision.required) * 11n + 9n) / 10n);
+  requireCondition(ownerCeiling === undefined || limit <= ownerCeiling,
+    'budget_owner_group_limit', 'An automatic working increase cannot exceed the owner block ceiling');
+  const ceiling = Math.min(physicalMaximum, previous?.value.ceiling ?? physicalMaximum, ownerCeiling ?? physicalMaximum);
   requireCondition(positive(limit) && limit <= ceiling, 'budget_transport_limit', 'A working increase cannot enlarge a physical model/transport limit');
   return store.writeMany<WorkingLimit>([{ id, kind: 'research-limit', expected: previous?.revision ?? 0,
     value: { projectId: segment.value.projectId, segment: segment.id, group, metric, limit, ceiling, decisions: [...(previous?.value.decisions ?? []), decision] } }],
@@ -89,6 +114,7 @@ export function budgetUsage(store: Store, segment: Revision<BudgetSegment>) {
   return { ledger, measured, reserved, groups, guards, remaining: segment.value.limit - measured - reserved };
 }
 export function reserveResearchCall(store: Store, segment: Revision<BudgetSegment>, call: string, groups: string[], estimate: CallEstimate): { writes: Write[]; guards: ReadGuard[] } {
+  const ownerCeiling = segmentOwnerCeiling(store, segment);
   requireCondition(positive(estimate.tokens) && ['estimated', 'guaranteed'].includes(estimate.kind) && estimate.explanation.trim() && estimate.basis.length > 0,
     'budget_estimate_missing', 'Unknown usage never means a zero reserve');
   const usage = budgetUsage(store, segment);
@@ -97,6 +123,8 @@ export function reserveResearchCall(store: Store, segment: Revision<BudgetSegmen
     'budget_segment_exhausted', 'The next reserve does not fit the owner-approved segment; reduce the call or request an owner decision');
   for (const group of groups) {
     const row = usage.groups[group] ?? { measured: 0, reserved: 0 };
+    requireCondition(ownerCeiling === undefined || row.measured + row.reserved + estimate.tokens <= ownerCeiling,
+      'budget_owner_group_limit', 'The next call does not fit the owner block ceiling; other segment funds cannot enlarge it');
     const limit = store.get<WorkingLimit>(limitId(segment.id, group, 'tokens'));
     if (limit) usage.guards.push(reference(limit));
     requireCondition(row.measured + row.reserved + estimate.tokens <= (limit?.value.limit ?? segment.value.initialGroupLimit),
@@ -108,9 +136,12 @@ export function reserveResearchCall(store: Store, segment: Revision<BudgetSegmen
     guards: [...usage.guards, ...estimate.basis] };
 }
 export function assertQuestionBudget(store: Store, segment: Revision<BudgetSegment>, groups: string[]) {
+  const ownerCeiling = segmentOwnerCeiling(store, segment);
   const usage = budgetUsage(store, segment);
   for (const group of groups) {
     const measured = usage.groups[group]?.measured ?? 0;
+    requireCondition(ownerCeiling === undefined || measured <= ownerCeiling,
+      'budget_owner_group_overrun', 'Actual block usage exceeded the owner ceiling; further calls for this block are forbidden');
     const limit = workingLimit(store, segment, group, 'tokens', segment.value.initialGroupLimit);
     requireCondition(measured <= limit, 'budget_question_overrun', 'Actual question usage exceeded its working limit; pause and report before any continuation');
   }

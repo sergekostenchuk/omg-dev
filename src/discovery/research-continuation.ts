@@ -7,6 +7,7 @@ import { reference, isRef } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent } from "./reader.js";
+import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 
 /** Keep one latest proposal even after many reads push its turn out of the
  * compact conversation history. Its identity also stabilizes synthesis resume. */
@@ -78,6 +79,23 @@ export function workingSelections(store: Store, turns: Revision<ResearchTurn>[],
     if (!seen.has(item.key)) { seen.add(item.key); selected.push(item); }
   }
   return selected;
+}
+
+/** Reconstruct this question's addressed originals across run boundaries.
+ * Old turns are read as history, not re-executed or retroactively rejected. */
+export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],question:Revision<Question>):ContextWorkspace {
+  let workspace:ContextWorkspace={entries:[],sinceProgress:0};
+  for(const turn of turns){
+    if(turn.value.question?.id!==question.id||turn.value.status!=='completed'||turn.value.error)continue;
+    const action=(turn.value.action as ResearchAction).action;
+    if(['checkpoint','answer','answer_delta','read_bundle','read_source'].includes(action))workspace=contextProgress(workspace);
+    if(action!=='read_context')continue;
+    const result=latestFocus(store,[turn],question) as ContextLookup|null;
+    if(!result)continue;
+    const key=contextLookupKey(result);
+    workspace={entries:[...workspace.entries.filter(e=>e.key!==key),{key,result}],sinceProgress:workspace.sinceProgress+1};
+  }
+  return workspace;
 }
 
 function contextReadKey(store: Store, observation: any, action: Extract<ResearchAction, { action: "read_context" }>, question: Revision<Question>) {

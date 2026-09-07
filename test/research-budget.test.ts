@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Store } from '../src/storage/store.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { hashJson } from '../src/canonical.js';
-import { configureBudgetSegment, reserveResearchCall, budgetUsage, raiseWorkingLimit, workingLimit, assertQuestionBudget, budgetGroups, type Optimization } from '../src/runtime/research-budget.js';
+import { configureBudgetSegment, budgetSegment, reserveResearchCall, budgetUsage, raiseWorkingLimit, workingLimit, assertQuestionBudget, budgetGroups, type BudgetSegment, type Optimization } from '../src/runtime/research-budget.js';
 import { assertPilotBoundary } from '../src/discovery/reader-pilot.js';
 import { configurePhasePolicy } from '../src/discovery/phase-policy.js';
 import { scopeObligations, type ResearchScope } from '../src/graph/research-scope.js';
@@ -168,4 +168,104 @@ test('zero measured input cannot become an output-only continuation estimate',t=
  const {store}=fixture(t);
  store.write({id:'zero-input',kind:'model-call',expected:0,value:{...call('zero-input'),status:'succeeded',usage:{inputTokens:0,outputTokens:100,cachedInputTokens:0,reasoningOutputTokens:0}}});
  assert.throws(()=>estimateCliCall(store,'p',role,'analyst',1000,'continuation'),{code:'budget_estimate_missing'});
+});
+
+test('owner block ceilings are explicit, validated and immutable while original legacy segments remain compatible', t => {
+  const { store, basis, segment: legacy } = fixture(t);
+  assert.equal(Object.hasOwn(budgetSegment(store, 'p', 'R2-L3').value, 'ownerGroupCeiling'), false);
+  assert.equal(workingLimit(store, legacy, 'g', 'tokens', 900), 900);
+  for (const invalid of [0, -1, 1.5, 699_999, 20_000_001, NaN, null]) {
+    assert.throws(() => configureBudgetSegment(store, 'p', 'invalid', 20_000_000, 700_000, invalid as number),
+      { code: 'budget_owner_ceiling_invalid' });
+  }
+  const segment = configureBudgetSegment(store, 'p', 'owner-capped', 20_000_000, 700_000, 800_000);
+  assert.equal(budgetSegment(store, 'p', 'owner-capped').value.ownerGroupCeiling, 800_000);
+  assert.throws(() => configureBudgetSegment(store, 'p', 'owner-capped', 20_000_000, 700_000, 900_000),
+    { code: 'revision_conflict' });
+  const estimate = { kind: 'estimated' as const, tokens: 1, basis: [reference(basis)], explanation: 'fixture' };
+  const masquerade = { ...segment, value: { ...segment.value, ownerGroupCeiling: 900_000 } };
+  assert.throws(() => reserveResearchCall(store, masquerade, 'forged-call', ['g'], estimate), { code: 'budget_segment_invalid' });
+  const { ownerGroupCeiling: _removed, ...withoutCeiling } = segment.value;
+  store.write({ id: segment.id, kind: segment.kind, expected: segment.revision, value: withoutCeiling });
+  assert.throws(() => budgetSegment(store, 'p', 'owner-capped'), { code: 'budget_owner_ceiling_changed' });
+  const changed = store.write<BudgetSegment>({ id: segment.id, kind: segment.kind, expected: 2,
+    value: { ...segment.value, ownerGroupCeiling: 900_000 } });
+  assert.throws(() => reserveResearchCall(store, changed, 'changed-call', ['g'], estimate), { code: 'budget_owner_ceiling_changed' });
+  assert.equal(store.get('forged-call'), null);
+  assert.equal(store.get('changed-call'), null);
+});
+
+test('working increases include their safety margin inside the owner ceiling and cannot raise it with a larger physical maximum', t => {
+  const { store, basis } = fixture(t);
+  const segment = configureBudgetSegment(store, 'p', 'raises', 20_000_000, 700_000, 800_000);
+  const decision: Optimization = { reason: 'remaining synthesis', progress: 'new exact evidence', required: 720_000,
+    obligations: ['exceptions', 'consumers'], forecast: 'remaining roles included', basis: [reference(basis)],
+    options: [{ method: 'deduplicate originals', saved: 100, decision: 'accept', quality: 'all obligations retained', preserved: ['exceptions', 'consumers'] }] };
+  const raised = raiseWorkingLimit(store, segment, 'g', 'tokens', 700_000, decision, 2_000_000);
+  assert.equal(raised.value.limit, 792_000);
+  assert.equal(raised.value.ceiling, 800_000);
+  assert.throws(() => raiseWorkingLimit(store, segment, 'other', 'tokens', 700_000,
+    { ...decision, required: 730_000 }, 2_000_000), { code: 'budget_owner_group_limit' });
+  assert.throws(() => raiseWorkingLimit(store, segment, 'g', 'tokens', 700_000,
+    { ...decision, progress: 'additional evidence', required: 800_000 }, 20_000_000), { code: 'budget_owner_group_limit' });
+  assert.equal(workingLimit(store, segment, 'g', 'tokens', 700_000), 792_000);
+  assert.equal(store.get(segment.id)!.revision, 1);
+  // Character limits are a different unit and retain their declared transport policy.
+  assert.equal(raiseWorkingLimit(store, segment, 'g', 'requestChars', 700_000,
+    { ...decision, required: 800_000 }, 1_000_000).value.limit, 880_000);
+});
+
+test('all roles, failed calls and unknown usage share one block ceiling even with unused stage funds', t => {
+  const { store, basis } = fixture(t);
+  const segment = configureBudgetSegment(store, 'p', 'all-roles', 20_000_000, 800_000, 800_000);
+  const estimate = { kind: 'estimated' as const, tokens: 200_000, basis: [reference(basis)], explanation: 'full role cost' };
+  for (const [index, purpose] of ['reading-planner', 'reader', 'analyst', 'assessor'].entries()) {
+    const id = `role-${purpose}`;
+    const reservation = reserveResearchCall(store, segment, id, ['stable-block', 'shared-consumer'], estimate);
+    store.writeMany([{ id, kind: 'model-call', expected: 0, value: { ...call(id), purpose,
+      ...(index < 3 ? { status: index === 2 ? 'failed' : 'succeeded', finishedAt: 2,
+        usage: { inputTokens: 150_000, outputTokens: 50_000, cachedInputTokens: 50_000, reasoningOutputTokens: 20_000 } } : {}) } },
+    ...reservation.writes], reservation.guards);
+  }
+  const usage = budgetUsage(store, segment);
+  assert.deepEqual(usage.groups['stable-block'], { measured: 600_000, reserved: 200_000 });
+  assert.deepEqual(usage.groups['shared-consumer'], usage.groups['stable-block']);
+  assert.equal(usage.measured, 600_000); assert.equal(usage.reserved, 200_000);
+  assert.equal(usage.remaining, 19_200_000);
+  assert.throws(() => reserveResearchCall(store, segment, 'retry', ['stable-block'], { ...estimate, tokens: 1 }),
+    { code: 'budget_owner_group_limit' });
+  const assessor = store.get<ModelCall>('role-assessor')!;
+  store.write({ id: assessor.id, kind: assessor.kind, expected: assessor.revision,
+    value: { ...assessor.value, status: 'failed', finishedAt: 2 } });
+  assert.throws(() => reserveResearchCall(store, segment, 'retry-after-failure', ['stable-block'], { ...estimate, tokens: 1 }),
+    { code: 'budget_owner_group_limit' });
+  const failed = store.get<ModelCall>(assessor.id)!;
+  store.write({ id: failed.id, kind: failed.kind, expected: failed.revision, value: { ...failed.value,
+    usage: { inputTokens: 100_000, outputTokens: 50_000, cachedInputTokens: 0, reasoningOutputTokens: 0 } } });
+  assert.doesNotThrow(() => assertQuestionBudget(store, segment, ['stable-block']));
+  const last = reserveResearchCall(store, segment, 'last', ['stable-block'], { ...estimate, tokens: 50_000 });
+  store.writeMany([{ id: 'last', kind: 'model-call', expected: 0, value: call('last') }, ...last.writes], last.guards);
+  assert.throws(() => reserveResearchCall(store, segment, 'extra', ['stable-block'], { ...estimate, tokens: 1 }),
+    { code: 'budget_owner_group_limit' });
+  assert.equal(store.get('extra'), null);
+  assert.doesNotThrow(() => reserveResearchCall(store, segment, 'other-block', ['other-block'], estimate));
+});
+
+test('an oversized saved working limit cannot hide a block overrun or admit another call', t => {
+  const { store, basis } = fixture(t);
+  const segment = configureBudgetSegment(store, 'p', 'reconcile', 20_000_000, 800_000, 800_000);
+  const id = `research-limit:${hashJson([segment.id, 'g', 'tokens'])}`;
+  store.write({ id, kind: 'research-limit', expected: 0,
+    value: { projectId: 'p', segment: segment.id, group: 'g', metric: 'tokens', limit: 2_000_000, ceiling: 2_000_000, decisions: [] } });
+  assert.equal(workingLimit(store, segment, 'g', 'tokens', 2_000_000), 800_000);
+  assert.equal(workingLimit(store, segment, 'g,fresh', 'tokens', 2_000_000), 800_000);
+  const estimate = { kind: 'estimated' as const, tokens: 800_001, basis: [reference(basis)], explanation: 'fixture' };
+  assert.throws(() => reserveResearchCall(store, segment, 'too-large', ['g'], estimate), { code: 'budget_owner_group_limit' });
+  const reservation = reserveResearchCall(store, segment, 'overrun', ['g'], { ...estimate, tokens: 100_000 });
+  store.writeMany([{ id: 'overrun', kind: 'model-call', expected: 0, value: { ...call('overrun'), status: 'succeeded', finishedAt: 2,
+    usage: { inputTokens: 800_000, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 } } }, ...reservation.writes], reservation.guards);
+  assert.equal(budgetUsage(store, segment).measured, 800_001);
+  assert.equal(budgetUsage(store, segment).remaining, 19_199_999);
+  assert.throws(() => assertQuestionBudget(store, segment, ['g']), { code: 'budget_owner_group_overrun' });
+  assert.throws(() => reserveResearchCall(store, segment, 'after-overrun', ['g'], { ...estimate, tokens: 1 }), { code: 'budget_owner_group_limit' });
 });

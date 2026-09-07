@@ -6,6 +6,7 @@ import { reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { planningContext } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
+import { packContextWorkspace } from "./context-workspace.js";
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number }
@@ -49,7 +50,7 @@ export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, r
 /** The complete request is a product journal entry, not a replacement source.
  * Only its bounded working projection crosses the provider boundary. */
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref } = {}): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
@@ -67,6 +68,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
     const initial:Record<string,any>={...body,working:{archive:reference(archive),instruction,sections:Object.keys(body).map(key=>({pointer:`/body/${escape(key)}`}))}};
     if (initial.inventory) delete initial.sourceCatalogue;
+    packContextWorkspace(initial,maxChars,options.contextChars);
     requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
     return initial;
   }
@@ -77,14 +79,14 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (body['question'] && typeof body['question']==='object') {
       const q=body['question'] as Record<string,Json>;
       dynamic['question']={id:q['id']??question.id,field:q['field']??question.value.spec.field,kind:q['kind']??question.value.spec.kind,
-        prompt:q['prompt']??question.value.spec.prompt,schemaAddress:{record:reference(archive),pointer:'/body/question/schema'}};
+        prompt:q['prompt']??question.value.spec.prompt,schema:question.value.spec.schema,obligations:question.value.spec.obligations??[],schemaAddress:{record:reference(archive),pointer:'/body/question/schema'}};
     }
     if (body['questions']) dynamic['questions']=[dynamic['question']??{id:question.id,field:question.value.spec.field,kind:question.value.spec.kind,prompt:question.value.spec.prompt}];
     if (body['previousProposal']) {
       const changes=previousBody?candidateDelta(previousBody['previousProposal'],body['previousProposal']):[];
       dynamic['proposalChanges']={current:{record:reference(archive),pointer:'/body/previousProposal'},base:options.previous??null,changes};
     }
-    if (Object.hasOwn(body,'value')) {
+    if (Object.hasOwn(body,'value') && !body['assessmentState']) {
       const previous=options.previous ? store.get<Archive>(options.previous.id, options.previous.revision) : null;
       if(previous) requireCondition(previous.hash===options.previous!.hash && previous.value.projectId===projectId
         && previous.value.question.id===questionId,'continuation_foreign','Candidate delta requires the same question');
@@ -92,10 +94,15 @@ export function workingContext(store: Store, projectId: string, draftId: string,
         previous:options.previous??null,changes:previous?candidateDelta(previous.value.body['value'],body['value']):[],
         instruction:'Only changed candidate fields are supplied; exact full candidates remain at their addresses.'};
     }
+    if(body['assessmentState']) dynamic['value']=body['value'];
+    dynamic['answerContext']={allowedConsumers:body['allowedConsumers']??[],gapFields:body['gapFields']??[],
+      scope:body['researchScope']?{outcome:body['researchScope'].outcome,nodes:body['researchScope'].nodes,
+        deferred:body['researchScope'].obligations.filter((o:any)=>o.state==='deferred').map((o:any)=>({id:o.gap.id,target:o.gap.target,wake:o.wake}))}:null};
     dynamic['originals']=originals;
-    const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'];
+    const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'],assessmentValue=dynamic['value'];
     const original=body;
     body = replaceFoundationCopies(dynamic, body, reference(archive), store);
+    if(original['assessmentState'])body['value']=assessmentValue;
     if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
   }
@@ -114,9 +121,16 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     }
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
-  if (body['dispatchMode'] === "planning" && !options.continuation) return planningContext(body, reference(archive), maxChars);
-  const mandatory = ["conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  if (body['dispatchMode'] === "planning" && !options.continuation) {
+    const planned=planningContext(body,reference(archive),maxChars);
+    if(Object.hasOwn(body,'contextWorkspace'))planned.contextWorkspace=body['contextWorkspace'];
+    packContextWorkspace(planned,maxChars,options.contextChars);
+    requireCondition(JSON.stringify(planned).length<=maxChars,'pilot_core_limit','Planning context and addressed originals exceed the declared envelope');
+    return planned;
+  }
+  const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
+  if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
     ? [...mandatory.filter(key=>FOUNDATION_FIELDS.includes(key as any)),...mandatory.filter(key=>!FOUNDATION_FIELDS.includes(key as any))] : mandatory;
   const packet: Record<string, any> = Object.fromEntries(ordered.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
@@ -126,10 +140,11 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       count: Array.isArray(v) || typeof v === "string" ? v.length : null })), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  packContextWorkspace(packet,maxChars,options.contextChars);
   if (body['synthesisState']) {
     if (!options.common) {packet.previousProposal = body['previousProposal'] ?? null; packet.history = body['history'] ?? [];}
   }
-  if (options.common && body['synthesisState'] && body['focus']) packet.focus=body['focus'];
+  if (options.common && body['synthesisState'] && body['focus'] && !body['contextWorkspace']) packet.focus=body['focus'];
   const length = () => JSON.stringify(packet).length;
   if (length() > maxChars) throw new EngineError("pilot_core_limit", "Required intent, constraints or candidate exceed the working limit", { required: length() });
   const add = (key: string, v: unknown) => {
@@ -210,6 +225,21 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   }
   // Explicitly requested materials coexist while they fit. Oldest materials
   // yield first; the full archive remains addressable.
+  if(isAssessor && Object.hasOwn(body,'value')) {
+    const encoded=JSON.stringify(body['value']);
+    const offset=(body['assessmentState'] as {candidateOffset?:number}).candidateOffset??0;
+    requireCondition(Number.isSafeInteger(offset)&&offset>=0&&offset<=encoded.length,'assessment_cursor_invalid','Invalid candidate cursor');
+    if(encoded.length+length()+512<maxChars/1.2 && add('value',body['value'])) {
+      packet.candidatePage={offset:0,end:encoded.length,total:encoded.length,complete:true};
+    }else{
+      const limit=length()+Math.max(0,Math.floor((maxChars-length()-1024)/2));
+      let lo=0,hi=encoded.length-offset;
+      const piece=(n:number)=>({offset,end:offset+n,total:encoded.length,complete:offset+n===encoded.length,encoding:'json-string-fragment',text:encoded.slice(offset,offset+n),original:{record:reference(archive),pointer:'/body/value'}});
+      while(lo<hi){const mid=Math.ceil((lo+hi)/2);packet.candidatePage=piece(mid);if(length()<=limit)lo=mid;else hi=mid-1;}
+      packet.candidatePage=piece(lo);
+      requireCondition(lo>0||offset===encoded.length,'continuation_packet_limit','No room for candidate evidence; split the assessment contract');
+    }
+  }
   // Evidence pages for the assessor: concatenate fragments to recover the exact
   // serialized observations. No fragment is presented as a complete observation.
   if (Array.isArray(body['observations'])) {
@@ -224,11 +254,11 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       let lo = 0, hi = Math.max(0, Math.min(encoded.length - offset, room));
       while (lo < hi) {
         const mid = Math.ceil((lo + hi) / 2);
-        if (add("evidencePage", { offset, end: offset + mid, total: encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + mid) })) lo = mid;
+        if (add("evidencePage", { offset, end: offset + mid, total: encoded.length, complete:offset+mid===encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + mid) })) lo = mid;
         else hi = mid - 1;
       }
       requireCondition(lo > 0 || offset === encoded.length, "pilot_evidence_limit", "No room for evidence; continue with a smaller working selection");
-      add("evidencePage", { offset, end: offset + lo, total: encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + lo) });
+      add("evidencePage", { offset, end: offset + lo, total: encoded.length, complete:offset+lo===encoded.length, encoding: "json-string-fragment", text: encoded.slice(offset, offset + lo) });
     }
   }
   requireCondition(length() <= maxChars, "pilot_request_limit", "The working request exceeds its fixed limit");

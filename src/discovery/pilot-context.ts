@@ -31,6 +31,17 @@ export function contextCatalogue(store: Store, draft: Revision<DiscoveryDraft>) 
 }
 
 export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref, pointer: string, maxChars: number, page?: ContextPage) {
+  if (store.get(ref.id, ref.revision)?.kind === 'research-checkpoint') {
+    const saved=store.get<any>(ref.id,ref.revision);
+    requireCondition(saved?.hash===ref.hash&&saved.value.projectId===draft.value.projectId
+      &&draft.value.questions.includes(saved.value.question.id)&&canonical(saved.value.draft.id)===canonical(draft.id),
+      'context_reference_foreign','Saved evidence must belong to this question and draft');
+    requireCondition(saved.value.observations.every((o:Observation)=>new Evidence(store).verify(o)),
+      'research_evidence_stale','Saved checkpoint evidence changed');
+    const result={record:ref,pointer,...contextPage(contextValue(saved.value,pointer),page)};
+    requireCondition(canonical(result).length<=maxChars,'context_read_limit','Select a smaller saved evidence fragment');
+    return result;
+  }
   if (store.get(ref.id, ref.revision)?.kind === "research-context") {
     const value = contextValue(archivedContext(store, draft, ref), pointer);
     const result = { record: ref, pointer, ...contextPage(value, page) };

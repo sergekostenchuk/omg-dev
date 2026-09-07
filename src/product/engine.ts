@@ -1,3 +1,7 @@
+import { recoverModelCall } from "../discovery/model-call-recovery.js";
+import { recoverContextSession } from '../discovery/context-recovery.js';
+import { allocateResearchTrial } from '../discovery/research-trial.js';
+import { continuePreparation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
@@ -177,6 +181,7 @@ export class ProductEngine {
       runs: this.store.list<TaskRun>("task-run").filter(item => item.value.projectId === project),
       executionRoot: this.store.get<ExecutionRoot>(`execution-root:${project}`),
       executionRunning: this.executor.isRunning(project),
+      preparationRun: this.store.get(`preparation-run:${project}`),
       researchRuns: this.store.list<ResearchRun>("research-run").filter(item => item.value.projectId === project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
     };
@@ -189,6 +194,10 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case "recover-model-call": this.#project(command.project); return recoverModelCall(this.store,command.project,command.call);
+      case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
+      case 'allocate-research-trial': this.#project(command.project); return allocateResearchTrial(this.store,command.project,command);
+      case "continue-preparation": this.#project(command.project); return continuePreparation(this,command.project,command.maxCalls);
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
         { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);

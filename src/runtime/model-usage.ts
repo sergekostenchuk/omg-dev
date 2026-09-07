@@ -2,6 +2,7 @@ import type { Store, Revision } from "../storage/store.js";
 import type { RoleBinding } from "./environment.js";
 import { requireCondition } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
+import { budgetUsage, workingLimit, type BudgetSegment } from './research-budget.js';
 
 export interface TokenUsage {
   inputTokens: number; outputTokens: number;
@@ -10,6 +11,9 @@ export interface TokenUsage {
 export interface ModelCall {
   projectId: string; draftId: string; purpose: string; requestId: string;
   profile?: Ref | null;
+  progressKey?: string;
+  ownerProcess?: {pid:number;started:string};
+  providerProcess?: {pid:number;started:string};
   packet?: { archive: Ref; kind: string; maxChars: number };
   budget?: { segment: Ref; groups: string[]; estimate: import("./research-budget.js").CallEstimate };
   questionId?: string | null;
@@ -51,6 +55,18 @@ export function modelUsage(store: Store, project: string, since: number) {
   const keys = [...new Set(calls.map(record => JSON.stringify([record.value.purpose, record.value.requested.model,
     record.value.requested.effort, record.value.requested.speed ?? "inherited"])))];
   return { project, since, cumulative: summarize(calls), period: summarize(recent),
+    budgets:store.list<BudgetSegment>('research-budget').filter(segment=>segment.value.projectId===project).map(segment=>{
+      const usage=budgetUsage(store,segment),assignments=usage.ledger?.value.assignments??[];
+      const details=(selected:typeof assignments)=>({calls:selected.length,
+        unmeasuredCalls:selected.filter(item=>!calls.find(call=>call.id===item.call)?.value.usage).length});
+      return {segment:{id:segment.id,revision:segment.revision,hash:segment.hash},key:segment.value.key,limit:segment.value.limit,
+        measured:usage.measured,reserved:usage.reserved,remaining:usage.remaining,...details(assignments),
+        groups:Object.entries(usage.groups).map(([group,row])=>{
+          const limit=workingLimit(store,segment,group,'tokens',segment.value.initialGroupLimit);
+          return {group,limit,...row,remaining:limit-row.measured-row.reserved,
+            ...details(assignments.filter(item=>item.groups.includes(group)))};
+        })};
+    }),
     roles: keys.map(key => {
       const [purpose, model, effort, speed] = JSON.parse(key) as string[];
       const selected = calls.filter(record => record.value.purpose === purpose && record.value.requested.model === model
