@@ -3,6 +3,7 @@ import { researchScope, scopeObligations } from "../graph/research-scope.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { readerResultCurrent, type ReaderResult } from "./reader.js";
+import { priorReaderMaterial } from './reader-reuse.js';
 import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
 import { reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -101,7 +102,10 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   };
   const allReadings = store.list<ReaderResult>("reader-result").filter(record => record.value.projectId === project
     && record.value.question.id === question.id);
-  const readings = allReadings.filter(record => readerResultCurrent(store, project, record.value));
+  const currentReadings=allReadings.filter(record=>readerResultCurrent(store,project,record.value));
+  const childParts=new Set(currentReadings.flatMap(record=>(record.value.parts??[]).map(ref=>canonical(ref))));
+  const readings=currentReadings.filter(record=>!childParts.has(canonical(reference(record))));
+  const prior=draft.value.level==='R2'?priorReaderMaterial(store,project,question.id):null;
   const catalogue = contextCatalogue(store, draft);
   const directReadings = store.list<{ projectId: string; question: string; action: { action: string }; observation: any }>("pilot-reading")
     .filter(record => record.value.projectId === project && record.value.question === question.id);
@@ -147,9 +151,9 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     catalogue,
     answers: draft.value.questions.map(id => store.get<Question>(id)!).map(q => ({ field: q.value.spec.field, status: q.value.status,
       pointer: `/fields/${escape(q.value.spec.field)}` })),
-    readings: readings.map(record => ({ ref: reference(record), purpose: record.value.purpose,
-      observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved })),
-    staleReaderReadings: allReadings.filter(record => !readings.includes(record)).map(record => ({ ref: reference(record),
+    readings: [...readings.map(record => ({ ref: reference(record), purpose: record.value.purpose,
+      observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved })),...(prior?[prior]:[])],
+    staleReaderReadings: allReadings.filter(record => !currentReadings.includes(record)).map(record => ({ ref: reference(record),
       purpose: record.value.purpose, sources: record.value.sources })),
     directReadings: directReadings.filter(currentRead).map(record => ({ ref: reference(record), ...record.value,
       navigationOnly: record.value.action.action === "search" })),

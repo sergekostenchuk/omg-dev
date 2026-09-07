@@ -22,7 +22,7 @@ import { readBundle } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead, addressedWorkspace } from "./research-continuation.js";
 import { addContextLookup } from './context-workspace.js';
-import { dispatchMode, queueReadingPlan, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
+import { dispatchMode, queueReadingPlan, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { pendingSynthesis, synthesisSession } from "./synthesis-session.js";
 
@@ -185,7 +185,14 @@ export class Researcher {
             const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs, signal);
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
-            observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page);
+            try { observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page); }
+            catch(failure){
+              if(failure instanceof EngineError&&failure.code==='context_read_limit'&&pendingTurn.value.plannedBy){
+                const split=splitPlannedContextRead(this.store,run,pendingTurn,draft,pending[0]!);
+                run=split.run;continue;
+              }
+              throw failure;
+            }
             // Resuming a pending turn does not imply that its old requested
             // original was delivered again. Validate the actual packet set.
             if(sent) {

@@ -1,6 +1,7 @@
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverContextSession } from '../discovery/context-recovery.js';
 import { allocateResearchTrial } from '../discovery/research-trial.js';
+import { retryPlannedRead } from '../discovery/reading-plan.js';
 import { continuePreparation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision } from "../storage/store.js";
@@ -196,6 +197,7 @@ export class ProductEngine {
     switch (command.type) {
       case "recover-model-call": this.#project(command.project); return recoverModelCall(this.store,command.project,command.call);
       case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
+      case 'retry-planned-read': this.#project(command.project); return retryPlannedRead(this.store,command.project,command.child);
       case 'allocate-research-trial': this.#project(command.project); return allocateResearchTrial(this.store,command.project,command);
       case "continue-preparation": this.#project(command.project); return continuePreparation(this,command.project,command.maxCalls);
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,

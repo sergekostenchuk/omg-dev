@@ -40,6 +40,7 @@ export interface ResearchTurn {
   run: string; number: number; action: unknown; assessment: Ref | null; observation: unknown; error: string | null;
   status: "pending" | "completed"; question: Ref | null;
   replayedFrom?: Ref;
+  splitFrom?: Ref;
   recoveredRequest?: Ref;
   plannedBy?: Ref;
   dispatchMode?: "planning" | "synthesis";

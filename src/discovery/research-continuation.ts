@@ -30,6 +30,7 @@ export function checkpoint(store: Store, draft: Revision<DiscoveryDraft>, questi
 export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>) {
   for (const turn of [...turns].reverse()) {
     const observation = turn.value.observation as any;
+    if(observation?.splitInto)continue; // Queue expansion is not a delivered reading.
     const reader = observation?.ref ? store.get<any>(observation.ref.id) : null;
     if (turn.value.question?.id !== question.id && reader?.value.question?.id !== question.id) continue;
     if (turn.value.status !== "completed" || turn.value.error) return null;

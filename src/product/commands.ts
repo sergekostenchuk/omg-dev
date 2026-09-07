@@ -11,6 +11,7 @@ import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 
 export type ProductCommand =
+  | {type:'retry-planned-read';project:string;child:Ref}
   | {type:'recover-context-session';project:string;session:Ref;selector:ContextRecoverySelector}
   | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
   | {type:"recover-model-call";project:string;call:Ref}
@@ -68,6 +69,7 @@ const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const schema = { oneOf: [
+  command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),
   command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),
   command("recover-model-call", {project,call:ref}),

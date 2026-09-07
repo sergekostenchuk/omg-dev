@@ -50,7 +50,7 @@ export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, r
 /** The complete request is a product journal entry, not a replacement source.
  * Only its bounded working projection crosses the provider boundary. */
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number } = {}): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
@@ -168,6 +168,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     packet.synthesisPage = { offset, end: offset, total: materials.length, complete: offset === materials.length };
     for (let index = offset; index < materials.length; index++) {
       const selection = materials[index];
+      if(selection.kind==='reader'&&JSON.stringify(selection.value).length>(options.extractedChars??Number.MAX_SAFE_INTEGER))break;
       const included = materialOffset === 0 && (selection.kind === "reader" ? add("readings", [...packet.readings, selection.value])
         : add("selectedContext", [...packet.selectedContext, selection.value]));
       if (!included) break;
@@ -181,6 +182,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
         throw new EngineError("synthesis_material_limit", "One addressed material does not fit beside mandatory context", { required: JSON.stringify(minimal).length + 512 });
       }
       const encoded = JSON.stringify(first.value);
+      const pageLimit=first.kind==='reader'?(options.extractedChars??Number.MAX_SAFE_INTEGER):Number.MAX_SAFE_INTEGER;
       requireCondition(Number.isSafeInteger(materialOffset) && materialOffset >= 0 && materialOffset < encoded.length,
         "synthesis_cursor_invalid", "Invalid character cursor in a saved material");
       let lo = 0, hi = encoded.length - materialOffset;
@@ -189,7 +191,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
         text: encoded.slice(materialOffset, materialOffset + n) });
       while (lo < hi) {
         const mid = Math.ceil((lo + hi) / 2);
-        if (add("materialPage", piece(mid))) lo = mid; else hi = mid - 1;
+        if (JSON.stringify(piece(mid)).length<=pageLimit&&add("materialPage", piece(mid))) lo = mid; else hi = mid - 1;
       }
       requireCondition(lo > 0, "continuation_carry_limit", "Saved conclusions leave no room for the next material; compact conclusions instead of increasing the ceiling");
       add("materialPage", piece(lo));

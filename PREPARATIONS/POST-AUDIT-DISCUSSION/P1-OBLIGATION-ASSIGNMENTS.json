@@ -1,0 +1,966 @@
+{
+  "status": "proposed-for-fable-review",
+  "sourceScope": {
+    "id": "research-scope:omg-live:R2",
+    "revision": 1,
+    "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+  },
+  "approvedRule": "owner confirmation in POST AUDIT OMG, 2026-09-08",
+  "note": "Classification does not resolve obligations or assert evidence. Parent node is not a generated task id; L3 must bind any task-result obligation to a concrete task/test before compilation can accept it. Current requiredFor values and old history are unchanged.",
+  "obligations": [
+    {
+      "obligation": "actors-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/0/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "actors-g1",
+        "question": "При L2/R2 определить по src/storage/store.ts, src/pipeline/pipeline.ts, src/discovery/discovery.ts и src/discovery/research-runner.ts точные записи, атомарные группы и точки подключения проекций, включая прямых производителей, PlanRepairs и повторное открытие базы. Диспетчеризация установлена, но она не доказывает охват всех канонических записей или наличие восстановления пропущенных файлов.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-state",
+      "rationale": "Нужны существующие записи и точки подключения до проектирования; подтверждаются реализациями перечисленных производителей.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "actors-g2",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/1/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "boundary",
+        "id": "actors-g2",
+        "question": "Для исполнимого контракта установить фактические ограничения question без project, старого plan/run, повтора, stop и recover внутри Discovery, Executor и механизмов восстановления. Уточнить, как проектные stop-execution/recover-execution адресуют конкретный запуск и сохраняют остановку между процессами. Наличие проверки проекта в ProductEngine не доказывает эти свойства.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-control",
+      "rationale": "Проверяются существующие ограничения адресации и пути stop/recover; наличие одной проверки проекта недостаточно.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "actors-g3",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/2/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "boundary",
+        "id": "actors-g3",
+        "question": "Определить применимые границы выбора directories, чтения материалов, configure и собственных адаптеров по действующим требованиям и src/runtime/environment.ts, src/runtime/process.ts, src/evidence/evidence.ts и исследовательским источникам. Для реального Codex установить фактическую изоляцию файлов, секретов и дочерних процессов; флаги sandbox и инструкции адаптера её полностью не доказывают. Дополнить точные HTTP-пути недостающим содержанием обработчика providers, если его возможности затрагиваются выбранным горизонтом.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-runtime",
+      "rationale": "Смешанное обязательство: фактическая изоляция влияет на выбор допустимой границы исполнения. Консервативно не переносим всё обязательство за R2.",
+      "status": "proposed",
+      "resolutionSource": {
+        "kind": "document-observation",
+        "status": "exact runtime evidence still required",
+        "route": "Bind the actual adapter/runtime version and documented boundaries; use relevant existing observations or a bounded check on benign fixtures if within authorized scope",
+        "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
+        "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
+      }
+    },
+    {
+      "obligation": "actors-g4",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/3/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "actors-g4",
+        "question": "Установить гарантии повторной и конкурентной коррекции после раннего возврата существующего PlanRepair, сохранность parked-кандидата и поведение после сбоя между фазовыми эффектами и записью repair. Связать src/product/repairs.ts с execution/lock.ts, execution/park.ts, product/repair-feedback.ts и применимыми тестами; отдельно уточнить ограничения CLI backup/restore в storage/snapshots.ts.",
+        "requiredFor": "next",
+        "target": "n-recovery"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-recovery",
+      "rationale": "Нужен текущий контракт repair/park/snapshot по реализациям и относящимся assertions.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "actors-g5",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/4/gap"
+      },
+      "gap": {
+        "consumer": "n-ui",
+        "field": "tests",
+        "id": "actors-g5",
+        "question": "При включении UI в будущий горизонт определить и проверить корректное представление и отправку design во всех экземплярах QuestionPanel, а также точное существующее основание известного красного UI-теста. Отложенность UI не делает обнаруженную ошибку неприменимой и не разрешает распространять исключение на другие ошибки.",
+        "requiredFor": "next",
+        "target": "n-ui"
+      },
+      "originalState": "deferred",
+      "originalWake": {
+        "nodes": [
+          "n-ui"
+        ],
+        "paths": [
+          "ui/app.tsx"
+        ],
+        "uiRequired": true
+      },
+      "proposedKind": "post-implementation-proof",
+      "proposedMoment": "task-result",
+      "responsibleConsumer": "n-ui",
+      "responsibleNode": "n-ui",
+      "rationale": "UI исключён владельцем из текущей работы. Проверка QuestionPanel возвращается при включении UI и относится к результату соответствующей UI-задачи; исходный wake сохраняется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "effective-runtime-isolation",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/5/gap"
+      },
+      "gap": {
+        "consumer": "n-implement",
+        "field": "boundary",
+        "id": "effective-runtime-isolation",
+        "question": "Для подготовки исполнимого контракта установить по точной используемой версии Codex и ОС фактические ограничения read-only/workspace-write на HOME, credentials, сеть, Git metadata и дочерние процессы и доступный способ ограничить запись task.writePaths. Прочитанные адаптер и runtime показывают параметры запуска, но не реализацию sandbox. Получить адресные сведения о реальном runtime и техническое подтверждение требуемой изоляции; отсутствие доступной среды означает техническую паузу зависимого исполнения, а не предметный вопрос владельцу.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-implement",
+      "responsibleNode": "n-runtime",
+      "rationale": "Фактическая граница sandbox явно нужна для исполнимого контракта. Не подменяем её флагами адаптера и не объявляем доступной изоляцией до подтверждения.",
+      "status": "proposed",
+      "resolutionSource": {
+        "kind": "document-observation",
+        "status": "exact runtime evidence still required",
+        "route": "Bind the actual adapter/runtime version and documented boundaries; use relevant existing observations or a bounded check on benign fixtures if within authorized scope",
+        "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
+        "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
+      }
+    },
+    {
+      "obligation": "delivery-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/6/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "delivery-g1",
+        "question": "Какая точная среда фактически проверена для ближайшего запуска: Node/npm, ОС/архитектура, Git и Codex CLI? Сопоставить сохранённые ограничения POSIX, ps и групп процессов с результатами исполнения. Декларация Node и optional-пакеты esbuild не устанавливают платформенную матрицу. Браузерную матрицу оставить открытой для будущего UI.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R3",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-runtime",
+      "rationale": "Требуется подтверждение точной среды перед заявлением готовности R3. R2 может задать проверяемые требования к среде, не утверждая успешный запуск.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "delivery-g2",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/7/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "ports",
+        "id": "delivery-g2",
+        "question": "Какие установленная версия Codex CLI, model/effort и разрешённая конфигурация реально поддерживают аргументы адаптера и протокол omg-agent/v1? Нужен результат совместимого вызова в действующей среде; executablePath и models_cache.json этого не доказывают.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R3",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-runtime",
+      "rationale": "Работоспособность установленного CLI/протокола подтверждается фактическим вызовом до ready R3; кэш и X_OK недостаточны.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "delivery-g3",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/8/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "code",
+        "id": "delivery-g3",
+        "question": "Какие физические и предметные версии имеются в существующей постоянной базе самого OMG, и затрагивает ли их выбранное изменение? Получить безопасную проекцию без открытия через изменяющий Store. В прочитанной реализации поддержана физическая v1; перечень реально существующих legacy-версий и необходимость их миграции не установлены. Отсутствие upgrade-кода не доказывает отсутствие старых данных.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-state",
+      "rationale": "Физические и предметные версии действующей базы влияют на проект проекций сейчас. Применимы безопасная метапроекция и принятые результаты аудита 4.13; это не разрешение миграции.",
+      "status": "proposed",
+      "resolutionSource": {
+        "kind": "document-observation",
+        "source": "/Users/kostenchuksergey/OMG/PREPARATIONS/TOKEN-AUDIT/4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+        "known": "Physical user_version=1 and discovery-draft contractVersion 1/2/3 at the audited event2346",
+        "limits": "Partial metadata projection, not full integrity proof or permission/need to migrate history",
+        "ifInsufficient": "Read the required current metadata safely in read-only mode; never open the working database through Store"
+      }
+    },
+    {
+      "obligation": "delivery-g4",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/9/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "delivery-g4",
+        "question": "Какие тесты подтверждают исходы открытия старой, будущей и несовместимой схемы и неизменность оригинала при отказе? Предоставленные storage-фрагменты не показывают отдельного теста будущей user_version или успешного межверсионного обновления. До включения миграции определить поддерживаемые исходные версии, прерывание и повтор; если схема не меняется, сохранить миграцию будущей работой, не считать её реализованной.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-state",
+      "rationale": "Определяются имеющиеся тесты и поддерживаемый контракт схемы. Будущая миграция не объявляется существующей, если схема не меняется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "delivery-g5",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/10/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "delivery-g5",
+        "question": "Каков точный применимый полный прогон поставки без отложенного UI? Использовать содержимое scripts/check-backend.mjs и точное основание известного UI-исключения; package.json показывает только команду запуска. Установить, какие проверки TypeScript, backend и совместимости CLI/API включены, не распространяя исключение на остальные ошибки.",
+        "requiredFor": "next",
+        "target": "n-check"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-check",
+      "rationale": "Точный runner и состав проверок нужны для задач; владельческое исключение UI теперь прямо известно и не распространяется на другие ошибки.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "delivery-g6",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/11/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "delivery-g6",
+        "question": "Какие фактические результаты подтверждают запуск собранной версии с постоянной SQLite, перезапуск того же OMG-запуска и продолжение без повторной публикации? Существующие исходники и assertions storage-тестов не подтверждают этот живой результат. Перед заявлением завершённой поставки нужны связанные результаты реального прохода.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "post-implementation-proof",
+      "proposedMoment": "task-result",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-control",
+      "rationale": "Это требование результатов живого завершённого прохода и возобновления. R2 задаёт проверку, а не предоставляет будущий результат реализации.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-stage-validation-connection",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/12/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-stage-validation-connection",
+        "question": "Перед детализацией зависимой задачи установить тело ProductEngine.validateStage и точный путь от supported-ответа через draft-stage/accept-stage к preparationFindings: какой код и target возвращаются, где сохраняется отказ и что запускает адресную коррекцию? Конструктор подтверждает подключение validateStage, но его тело в приведённых фрагментах отсутствует. Не переносить гарантии PlanRepairs на обычные стадии.",
+        "requiredFor": "next",
+        "target": "n-research"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-research",
+      "rationale": "Тело validateStage и маршрут supported→приёмка нужны перед детализацией; отсутствовавший фрагмент можно получить адресно.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-general-resume-test",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/13/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-general-resume-test",
+        "question": "Какой существующий или минимально добавляемый публичный вызов продолжает обычную отклонённую стадию после перезапуска, сохраняя идентичность запуска и независимые ответы? Нужны сценарии повтора и конкурентной команды, а также отказа между сохранением коррекции и переходом. Подтверждённое продолжение специального repair не закрывает этот общий контракт.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-control",
+      "rationale": "Требуется выбрать существующий или минимально добавляемый общий resume-контракт и сценарии; нельзя закрыть его специальным repair.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-fixture-and-runner-details",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/14/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-fixture-and-runner-details",
+        "question": "Для выбранного горизонта сопоставить сохранённые материалы test/product.test.ts, test/server.test.ts, test/product-fixture.ts, test/preparation-fixture.ts, test/research.test.ts, test/execution.test.ts и test/execution-fixture.ts с соответствующими runners: какие модельные ответы, оценки, стадии и команды подставлены, какие реальные OS/Git/SQLite-границы пересекаются и какие assertions доходят до следующего потребителя? Не считать отсутствие этих фрагментов в текущем ответе отсутствием исследования или тестов.",
+        "requiredFor": "next",
+        "target": "n-check"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-check",
+      "rationale": "Нужно установить реальные и подставленные границы существующих fixtures/runners и assertions.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-full-run-ui-exception",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/15/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-full-run-ui-exception",
+        "question": "Перед назначением исполнимой проверки определить точный состав полного применимого прогона по package.json и scripts/check-backend.mjs и сопоставить UI-исключение с конкретным тестом, наблюдавшимся отказом и существующим владельческим основанием. Предоставленные сведения сохраняют исключение, но не устанавливают здесь идентичность отказавшего теста или результат текущего прогона.",
+        "requiredFor": "next",
+        "target": "n-check"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-check",
+      "rationale": "Нужен точный состав применимого прогона и происхождение UI-исключения; прямое решение владельца и журнал P2 доступны как отдельные основания.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-execution-candidate-proof",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/16/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-execution-candidate-proof",
+        "question": "Для задачи исполнения сопоставить сохранённые исходники runner.ts, commit.ts и recovery.ts с assertions execution.test.ts: как результаты полного прогона и независимого ревью связаны с точными итоговыми байтами и parent/tree/commit, что происходит при изменении кандидата и при аварии после публикации до регистрации? Ранее предложенные findings recovery дают направление, но сами не заменяют исходные цитаты и наблюдаемое выполнение.",
+        "requiredFor": "next",
+        "target": "n-publish"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-publish",
+      "rationale": "Контракт привязки проверок к candidate/parent/tree устанавливается по существующим runner/commit/recovery и тестам; произвольный вывод об успешной реализации не добавляется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-live-results",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/17/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-live-results",
+        "question": "Какие доступные результаты фактического выполнения подтверждают живой проход OMG, реальную работу настроенных моделей, продолжение того же запуска после перезапуска и полезное опубликованное изменение? Сопоставить live-pipeline-observations и сохранённые runtime-записи с точными версиями кода и среды. Исходники и assertions этого ответа не устанавливают успешное завершение; будущий результат не требовать как уже существующий вход R3.",
+        "requiredFor": "next",
+        "target": "n-product"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "post-implementation-proof",
+      "proposedMoment": "task-result",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-product",
+      "rationale": "Сам текст запрещает требовать будущий живой результат как существующий вход R3; проверить его нужно у результата реализующей задачи.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "integration-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/18/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "integration-g1",
+        "question": "Перед R3 зависимого исполнения получить безопасную проекцию действующей environment и сведения о фактически используемых Node, Codex, ОС, командах ролей, fullCheck и разрешённых лимитах. Сопоставить их с package.json, src/runtime/environment.ts и src/adapters/codex-stdio.ts, включая семантику sandbox для сети, HOME, credentials, task.writePaths и потомков. Переиспользовать точные доступные результаты реальных вызовов; не запускать платный probe в рамках этого исследования. Исполнимость команды и кеш моделей не доказывают работоспособность провайдера. Техническая недоступность приостанавливает зависимое действие.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "environment-confirmation",
+      "proposedMoment": "R3",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-runtime",
+      "rationale": "Срок задан исходным текстом: до R3 зависимого исполнения. Новые платные probes исследованием не разрешаются; используются точные имеющиеся результаты и безопасные сведения о среде.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "integration-g2",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/19/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "code",
+        "id": "integration-g2",
+        "question": "Установить точное место реализации reader-расширений read_bundle/read_context/checkpoint в действующем экспериментальном runtime: найти обработчики по именам действий и сопоставить с src/discovery/research-protocol.ts. Прочитанный валидатор их не перечисляет, хотя текущий исследовательский контракт предоставляет эти действия. До включения reader-расширений в исполнимую задачу определить принадлежащую runtime версию схемы, границу между источником и context record и совместимый путь чтения; не считать эксперимент доказательством поддержки расширений основным адаптером.",
+        "requiredFor": "next",
+        "target": "n-research"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-research",
+      "rationale": "Нужно различить код исследуемого снимка и действующего движка и найти точные обработчики до назначения реализации.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "persistence-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/20/gap"
+      },
+      "gap": {
+        "consumer": "implementer",
+        "field": "code",
+        "id": "persistence-g1",
+        "question": "При подготовке задачи автоматических проекций определить конкретную общую точку запуска после commit и при старте для CLI/API, а также охват записей stage/discovery, выполняемых фоновыми Researcher и Executor. Прочитанные Store, Pipeline, Discovery и runner показывают канонические записи, но не готовую связку публикации файлов; адресно исследовать оставшиеся участки src/product/engine.ts, src/cli.ts и src/server.ts. Результат — место подключения предложенного модуля без пропуска фонового завершения.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "implementer",
+      "responsibleNode": "n-state",
+      "rationale": "Выбирается общая точка подключения нового проектора на основании существующих производителей; наличие готового проектора не требуется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "persistence-g2",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/21/gap"
+      },
+      "gap": {
+        "consumer": "implementer",
+        "field": "code",
+        "id": "persistence-g2",
+        "question": "Для восстановления неопределённого модельного вызова установить, поддерживает ли действующий адаптер поиск ответа или идемпотентный повтор по сохранённой идентичности запроса: адресно прочитать src/adapters/codex-stdio.ts, src/discovery/research-assessment.ts и связанные вызовы провайдера. research-runner сохраняет действие после ответа, поэтому имеющиеся сведения не доказывают отсутствие повторного вызова при аварии в этом окне. До разрешения использовать явно неопределённый исход, не обещать exactly-once.",
+        "requiredFor": "next",
+        "target": "n-recovery"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "implementer",
+      "responsibleNode": "n-recovery",
+      "rationale": "Поддержка идентификатора/поиска ответа устанавливается по действующему адаптеру; отсутствие поддержки выражается как неизвестный исход без exactly-once.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "domain-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/22/gap"
+      },
+      "gap": {
+        "consumer": "implementer",
+        "field": "code",
+        "id": "domain-g1",
+        "question": "До назначения операций и writePaths для автоматических проекций определить фактические точки подключения после успешной канонической записи и согласования при старте, включая CLI/API и самостоятельное завершение Researcher. Использовать сохранённые ответы persistence и recovery, затем адресно прочитать недостающие участки src/product/engine.ts, src/cli.ts, src/server.ts и вызываемых точек записи в src/pipeline/pipeline.ts, src/discovery/discovery.ts, src/discovery/research-runner.ts и src/storage/store.ts. Установить, где обеспечиваются согласованный набор исходных версий, принадлежащая проектору область и защита от запоздавшей публикации. Не предполагать, что все изменения проходят через ProductEngine.execute; готовая связка публикации представленными здесь исходными фрагментами не подтверждена.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "implementer",
+      "responsibleNode": "n-state",
+      "rationale": "До назначения операций и writePaths нужен обоснованный проект подключения и защиты публикации; его нельзя перенести на исполнителя как неопределённый вход.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-store-guarantees",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/23/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "code",
+        "id": "g-recovery-store-guarantees",
+        "question": "Перед компиляцией зависимой задачи извлечь из сохранённых чтений src/storage/store.ts и src/storage/schema.ts точные границы writeMany, expected/guards, rollback, режим durability и ошибки открытия повреждённой либо несовместимой базы. Какие гарантии относятся к транзакции, а какие — к обнаружению повреждения при cold reopen? Тестовые assertions не заменяют реализацию этих границ.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-state",
+      "rationale": "Границы writeMany, rollback и открытия базы нужны для проектного решения до компиляции и доступны в сохранённых источниках.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-snapshot-publication",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/24/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "code",
+        "id": "g-recovery-snapshot-publication",
+        "question": "Уточнить по сохранённому чтению src/storage/snapshots.ts исходы после renameSync при публикации слота и после linkSync при restore: синхронизацию файла и каталога, выбор пригодного снимка, повтор при существующем destination и наличие связи опубликованного снимка с каноном. Разделить гибель процесса и потерю питания; автоматический выбор и замену рабочего SQLite не считать доказанными.",
+        "requiredFor": "next",
+        "target": "n-backup"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-backup",
+      "rationale": "Исследуются существующие ветви snapshot/restore, синхронизация и повтор; различие process-crash/power-loss остаётся явным.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-engine-repair-routing",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/25/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "code",
+        "id": "g-recovery-engine-repair-routing",
+        "question": "Сопоставить сохранённые реализации src/product/engine.ts и src/product/repairs.ts со схемой команд: точные ветви execute/recover/stop/repair, владение блокировкой, сохранение коррекции и продолжение частично завершённого repair. Старые unresolved об отсутствии retry и recoverCommits уже перекрыты сохранёнными находками; остаются маршрутизация и полный путь repairs.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-control",
+      "rationale": "Нужно сопоставить существующие ветви управления и полноту repair; повторная добыча уже имеющихся исходников не требуется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-stop-idempotency",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/26/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "ports",
+        "id": "g-recovery-stop-idempotency",
+        "question": "Как существующие записи могут обеспечить идентичность всего запуска, ключ действия и основания, сохраняемую остановку, её подтверждение и область бюджета retry? Определить минимальный общий контракт CLI/API и атомарное исключение второй активной попытки. this.active и проектная блокировка не доказывают сохраняемый межпроцессный stop.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-control",
+      "rationale": "Минимальный сохраняемый stop/retry-контракт нужно определить сейчас; in-memory active не выдаётся за межпроцессное доказательство.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-partial-worktree",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/27/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-recovery-partial-worktree",
+        "question": "Какие сценарии подтверждают повтор materializeWorktree и preparing-парковки после частичного git worktree add, после создания archiveRef и до записи нового root? Нужны исходы для оставшихся регистрационных данных Git, чужого пути и изменённых файлов. Reopen после готовой parked-парковки эти окна не закрывает; парковка interrupted также требует отдельного контракта.",
+        "requiredFor": "next",
+        "target": "n-recovery"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-recovery",
+      "rationale": "Нужно определить наличие и содержание сценариев аварийных окон в коде тестов. Отсутствующий сценарий не считается успешно выполненным.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-concurrent-execution",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/28/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-recovery-concurrent-execution",
+        "question": "Есть ли сценарий двух действительно конкурентных executor-процессов, захвата устаревшей блокировки и повторной команды во время эффекта? CAS двух Store проверяет другой уровень и не подтверждает отсутствие дублирующего исполнения.",
+        "requiredFor": "next",
+        "target": "n-control"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-control",
+      "rationale": "Вопрос о наличии реально конкурентного сценария решается чтением теста и его границ; CAS двух Store не подменяет такой сценарий.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-model-unknown-outcome",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/29/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "ports",
+        "id": "g-recovery-model-unknown-outcome",
+        "question": "Поддерживает ли действующий адаптер получение исхода или идемпотентный повтор по сохранённому идентификатору запроса? При отсутствии поддержки определить сохраняемую диагностику неизвестного исхода и разрешённый бюджет повтора без обещания exactly-once.",
+        "requiredFor": "next",
+        "target": "n-research"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-research",
+      "rationale": "Если у адаптера нет идемпотентного повтора, контракт неизвестного исхода и разрешённого retry должен быть определён до задачи.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "g-recovery-live-evidence",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/30/gap"
+      },
+      "gap": {
+        "consumer": "compilation",
+        "field": "tests",
+        "id": "g-recovery-live-evidence",
+        "question": "Какие результаты фактического запуска подтверждают cold reopen самого OMG, сохранение того же запуска и отсутствие повторной публикации? Доступные находки описывают тестовые сценарии, но не подтверждают их успешный запуск и живое сквозное восстановление. До получения соответствующих результатов завершение нельзя объявлять доказанным.",
+        "requiredFor": "next",
+        "target": "n-recovery"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "post-implementation-proof",
+      "proposedMoment": "task-result",
+      "responsibleConsumer": "compilation",
+      "responsibleNode": "n-recovery",
+      "rationale": "Требуются фактические результаты cold reopen и публикации, а не только assertions. Они проверяются при приёмке соответствующей реализации.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "runtime-g1",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/31/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "runtime-g1",
+        "question": "Для уточнения реализации управляемого запуска n-runtime на L2/R2 сопоставить test/execution.test.ts и test/research.test.ts с прочитанными src/execution/process.ts, src/execution/supervisor.ts, src/runtime/process-identity.ts, src/discovery/research-protocol.ts и src/adapters/codex-stdio.ts. Установить покрытие смерти владельца, смерти supervisor, вложенного потомка с открытыми pipe, отделения процессной группы, недоступного ps и гонки stop/start. Определить поддерживаемый платформенный контракт принадлежности и точное место сохранённого допуска к старту во взаимодействии с n-control; комментарий о потомках не считать доказательством.",
+        "requiredFor": "next",
+        "target": "n-runtime"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-runtime",
+      "rationale": "Покрытие subprocess/stop/start и место сохраняемого допуска устанавливаются по исходникам и тестам до выбора рабочего контракта.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "runtime-g2",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/32/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "runtime-g2",
+        "question": "Для уточнения подключения файловых проекций к записи канона n-state на L2/R2 дочитать src/storage/store.ts, src/pipeline/pipeline.ts и src/discovery/discovery.ts, сопоставить прямые записи Executor и PlanRepairs. Определить атомарные группы исходных записей, момент вызова проектора после commit, поведение повторного входа и конкурентных публикаций, cold reopen и восстановление удалённого производного файла. До R3 назначить точные операции, writePaths и наблюдаемые тесты без обязательного фонового worker.",
+        "requiredFor": "next",
+        "target": "n-state"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "design-decision",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-state",
+      "rationale": "Нужно назначить точки подключения, атомарные исходные группы и тестовый контракт проекций до R3; готовый результат проектора не требуется.",
+      "status": "proposed"
+    },
+    {
+      "obligation": "runtime-g3",
+      "original": {
+        "record": {
+          "id": "research-scope:omg-live:R2",
+          "revision": 1,
+          "hash": "642777127d67ef56dbfb9214a68df9b8b0e2e14f37c217155ecbad1aaeb64bf6"
+        },
+        "pointer": "/obligations/33/gap"
+      },
+      "gap": {
+        "consumer": "n-refine",
+        "field": "code",
+        "id": "runtime-g3",
+        "question": "Для уточнения реализации восстановления эффектов и сохранения кандидата n-recovery на L2/R2 прочитать src/execution/commit.ts, src/execution/park.ts, src/execution/worktree.ts, src/product/repair-feedback.ts и оставшиеся части src/product/repairs.ts вместе с относящимися test/execution.test.ts и test/repair.test.ts. Установить восстановление окна Git/SQLite, принадлежность эффекта, повтор коррекции, сохранность припаркованного кандидата и поведение смены среды. Прочитанный recoverCommits определяет маршрут, но не доказывает внутреннюю атомарность вызываемых функций.",
+        "requiredFor": "next",
+        "target": "n-recovery"
+      },
+      "originalState": "active",
+      "originalWake": null,
+      "proposedKind": "repository-fact",
+      "proposedMoment": "R2",
+      "responsibleConsumer": "n-refine",
+      "responsibleNode": "n-recovery",
+      "rationale": "Внутренние гарантии commit/park/worktree/repair нужны для проектирования восстановления и устанавливаются по реализациям, не по одному вызову recoverCommits.",
+      "status": "proposed"
+    }
+  ],
+  "review": {
+    "reviewer": "fable",
+    "grade": 9,
+    "round": 1,
+    "channelSeq": 15,
+    "status": "accepted-classification; resolution routes added"
+  }
+}

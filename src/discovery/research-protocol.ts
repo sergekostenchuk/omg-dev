@@ -110,7 +110,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const overhead = JSON.stringify({ ...envelope, subject: {} }).length + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
     requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
-      ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}) }) : context;
+      ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}),
+      ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxExtractedChars??audit!.pilot.value.maxReadChars}:{}) }) : context;
   if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive);
   if (context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);

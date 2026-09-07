@@ -35,6 +35,7 @@ import { replayLimitedResponse } from "../src/discovery/response-replay.js";
 import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-session.js";
 import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
+import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -58,7 +59,7 @@ appendFileSync('calls.jsonl',JSON.stringify({role:c.role,field:c.question?.field
 let research;
 if(c.role==='reader'&&c.sources.some(s=>JSON.stringify(s.lineColumns)!=='["line","text"]'||s.lines.some(line=>!Array.isArray(line)||line.length!==2)))throw Error('Reader wire must use explicit line/text columns');
 if(c.role!=='reader'&&c.dispatchMode!=='planning'&&c.continuation?.kind!=='continuation'&&(!c.contextEncoding||Object.keys(c).indexOf('core')>Object.keys(c).indexOf('question')))throw Error('Stable product context must precede the question');
-if(c.role==='reader')research={selections:[{source:c.sources[0].ref,firstLine:2,lastLine:3}],unresolved:[]};
+if(c.role==='reader'){const lines=c.sources[0].lines.filter(line=>line[0]>=2&&line[0]<=3);research={selections:lines.length?[{source:c.sources[0].ref,firstLine:lines[0][0],lastLine:lines.at(-1)[0]}]:[],unresolved:lines.length?[]:['No additional runtime conditions in this supplied window']};}
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'Read runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]}]};
 else if(!c.readings.length)research={action:'read_bundle',purpose:'Read the scoped runtime conditions',inputs:[{path:'README.md',media:'text/plain'}]};
@@ -550,6 +551,28 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
     assert.equal(store.list<ModelCall>("model-call").filter(c=>c.value.purpose==='analyst').length, alternating ? 3 : 2);
     assert.equal(store.get<Question>(question.id)!.value.status, "open");
   }
+});
+
+test('an oversized planned context array is delivered in smaller children before another paid call',async t=>{
+  const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
+  for(let n=0;n<4;n++){
+    const path=`part-${n}.txt`;writeFileSync(join(root,path),`Header\n${'X'.repeat(120)}\nException ${n}\n`);
+    await readBundle(store,environment.value,pilot,reference(question),`Read part ${n}`,[{path,media:'text/plain'}]);
+  }
+  const adapter=join(root,'oversized-plan.mjs');
+  writeFileSync(adapter,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
+if(c.dispatchMode!=='planning')throw Error('Unexpected paid consumer');
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_plan',question:c.question.id,reads:[{action:'read_context',record:c.working.archive,pointer:'/body/readings',page:{offset:0,limit:4}}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store,engine.environments,'p',{...settings,maxReadChars:1800,agentCommand:{executable:process.execPath,args:[adapter]},planning:{fields:['productDomain'],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  const before=store.list('model-call').length;
+  const run=await withInvocationAllowance(1,()=>engine.researcher.run('p',draft.id,100));
+  assert.equal(run.value.pauseCode,'research_call_allowance',run.value.error??'Missing bounded stop');
+  assert.equal(store.list('model-call').length,before+1,'Only the original planner was paid');
+  const turns=store.list<ResearchTurn>('research-turn');
+  assert.ok(turns.some(turn=>(turn.value.observation as any)?.splitInto?.length===2));
+  const delivered=turns.filter(turn=>turn.value.splitFrom&&turn.value.status==='completed'&&!turn.value.error
+    &&Array.isArray((turn.value.observation as any)?.value));
+  assert.equal(delivered.reduce((sum,turn)=>sum+(turn.value.observation as any).value.length,0),4);
 });
 
 test("the oldest selected material is evicted before the newest without increasing the ceiling", t => {
