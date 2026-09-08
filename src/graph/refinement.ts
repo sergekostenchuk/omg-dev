@@ -23,7 +23,7 @@ import { readinessObligations, type ReadinessObligations } from './obligation-re
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
 interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number;
-  carried?: CarriedObligation[] }
+  carried?: CarriedObligation[]; carriedContract?: 'r3-v1' }
 export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'];
   obligations?: ReadinessObligations }
 
@@ -118,7 +118,7 @@ export class Refinement {
     const guards = uniqueRefs([...inputs, ...checked.guards]);
     return this.#milestone(`phase:${project}:${level}`, expected,
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null,
-        ...(scope?.value.policy ? { carried: carriedObligations(scope) } : {}) },
+        ...(scope?.value.policy ? { carried: carriedObligations(scope), carriedContract: 'r3-v1' as const } : {}) },
       uniqueRefs([...guards,...runtimeAdmissionGuards, ...(graphAtStart ? [reference(graphAtStart)] : [])]));
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
@@ -220,7 +220,7 @@ export class Refinement {
     if (record.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && record.value.contractVersion === undefined)) return {
       findings: [{ code: "refinement_upgrade_required", target: project, message: "New compilation requires enriched R0/R1/R2 and current R3" }], guards: [] };
     const result: GateResult = { findings: [], guards: [reference(record)] };
-    const obligations = readinessObligations(this.store, project, record.value.inputs, record.value.obligations, 'consume');
+    const obligations = readinessObligations(this.store, project, record.value.inputs, record.value.obligations, 'consume', allowHistorical);
     result.findings.push(...obligations.findings);
     if (obligations.guards.length) result.admissionGuards = obligations.guards;
     for (const input of uniqueRefs(record.value.inputs)) {

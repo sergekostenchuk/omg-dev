@@ -26,6 +26,7 @@ import type { ReaderPilot } from "./reader-pilot.js";
 import { DELTA_COLLECTIONS } from "./layer-delta.js";
 import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
+import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
 
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const text = { type: "string", minLength: 1 };
@@ -144,6 +145,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     requireCondition(rounds < audit.pilot.value.planning.maxRounds, "planning_round_limit", "The planning guard is reached; preserve the paid work instead of increasing rounds");
   }
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,context as Record<string,any>):null;
+  const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
   const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
   if (segment && audit && estimate) {
@@ -191,6 +193,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       profile: audit.pilot ? reference(audit.pilot) : null,
       questionId: audit.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
+      ...(runtime ? { runtime } : {}),
       confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(packetState ? {record:{id:`model-request:${requestId}`,revision:1,
         hash:hashJson({projectId:environment.projectId,draftId:audit.draftId,text:input})}} : {}) },
       ...(packetState ? {packet:{archive:(subject as any).working.archive,kind:packetState.initial?"initial":"continuation",maxChars:requestLimit}} : {}),
@@ -238,13 +241,27 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
       call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision,
-        value: { ...call.value, ...patch, finishedAt: Date.now() } }, ...responseWrites])[0]!;
+        value: { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
+          ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) } }, ...responseWrites])[0]!;
       if (segment && budgetUsage(audit.store, segment).measured > segment.value.limit) {
         audit.store.write({ id: `budget-incident:${requestId}`, kind: "budget-incident", expected: 0,
           value: { projectId: environment.projectId, segment: reference(segment), call: reference(call), reason: "Actual provider usage exceeded the experimental forecast and the owner budget; further calls are forbidden" } });
         throw new EngineError("budget_actual_overrun", "Actual usage exceeded the owner budget; the incident is recorded and further calls are blocked");
       }
       if (segment) assertQuestionBudget(audit.store, segment, groups);
+      // Persist the paid response and usage before hashing runtime files. If
+      // telemetry is interrupted, accounting survives and R3 sees explicit
+      // unavailable evidence; it must never trigger another paid invocation.
+      if (runtime?.status === 'captured') {
+        const measured = await finishCallRuntime(audit.store, environment.projectId, runtime);
+        try { call = audit.store.write<ModelCall>({ id: call.id, kind: call.kind, expected: call.revision,
+          value: { ...call.value, runtime: measured } }); }
+        catch (error) {
+          if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
+          // A concurrent record update wins; the already saved paid result is
+          // not repeated solely to complete runtime telemetry.
+        }
+      }
     }
   }
 }

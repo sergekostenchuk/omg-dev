@@ -9,6 +9,7 @@ export interface TokenUsage {
   cachedInputTokens: number | null; reasoningOutputTokens: number | null;
 }
 export interface ModelCall {
+  runtime?: import('./call-runtime.js').CallRuntimeEvidence;
   projectId: string; draftId: string; purpose: string; requestId: string;
   profile?: Ref | null;
   progressKey?: string;

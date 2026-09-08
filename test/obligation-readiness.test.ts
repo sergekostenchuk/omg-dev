@@ -186,3 +186,14 @@ test('transient dispatch guards protect stage acceptance without becoming perman
   assert.deepEqual(f.engine.compiler.gate('p', reference(plan)).findings, []);
   assert.equal(f.engine.pipeline.inspect('p', 'om-g2').state, 'accepted');
 });
+
+test('historical admission follows the sealed producing R2 era, not a missing new R3 field', t => {
+  const f = fixture(t), inputs = [reference(f.r2Phase)];
+  assert.ok(readinessObligations(f.store, 'p', inputs, undefined, 'consume', true).findings.some(item => item.code === 'obligation_handoff_missing'));
+  const { carriedContract: _contract, ...old } = f.r2Phase.value as any;
+  const historical = f.store.write({ id: f.r2Phase.id, kind: f.r2Phase.kind, expected: f.r2Phase.revision, value: old });
+  assert.deepEqual(readinessObligations(f.store, 'p', [reference(historical)], undefined, 'consume', true).findings, []);
+  assert.ok(readinessObligations(f.store, 'p', [reference(historical)], undefined, 'consume').findings.some(item => item.code === 'obligation_handoff_missing'));
+  assert.ok(readinessObligations(f.store, 'p', inputs, undefined, 'consume', true).findings.some(item => item.code === 'obligation_handoff_missing'),
+    'A later head cannot erase the era marker from an immutable bound R2');
+});

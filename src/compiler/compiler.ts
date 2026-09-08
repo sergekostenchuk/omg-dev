@@ -72,7 +72,7 @@ export class Compiler {
     if (plan.value.version !== 2 && !allowHistorical) result.findings.push({ code: "plan_version_upgrade_required", target: ref.id,
       message: "New plan admission requires version 2 write grants; historical accepted plans remain readable" });
     const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
-    const obligations = readinessObligations(this.store, project, basis.value.inputs, basis.value.obligations, 'consume');
+    const obligations = readinessObligations(this.store, project, basis.value.inputs, basis.value.obligations, 'consume', allowHistorical);
     result.findings.push(...obligations.findings);
     if (obligations.guards.length) result.admissionGuards = obligations.guards;
     if (basis.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && basis.value.contractVersion === undefined))

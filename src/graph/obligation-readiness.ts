@@ -36,7 +36,8 @@ function confirmation(store: Store, project: string, obligation: CarriedObligati
 /** Machine readiness consumes an explicitly declared pass predicate. Merely
  * running a version command (even exit zero) or quoting an owner report cannot
  * certify the condition. No provider call or command is launched by this gate. */
-export function readinessObligations(store: Store, project: string, inputs: Ref[], saved?: ReadinessObligations, mode: 'assess' | 'consume' = 'assess') {
+export function readinessObligations(store: Store, project: string, inputs: Ref[], saved?: ReadinessObligations,
+  mode: 'assess' | 'consume' = 'assess', allowHistorical = false) {
   const findings: Finding[] = [], guards: Ref[] = [], dependencies: Ref[] = [], confirmations: ObligationConfirmation[] = [];
   let handoff: ObligationHandoff | null;
   try { handoff = obligationHandoff(store, project, inputs); }
@@ -49,6 +50,11 @@ export function readinessObligations(store: Store, project: string, inputs: Ref[
     return { findings, guards, dependencies, value: undefined };
   }
   const due = handoff.obligations.filter(obligation => obligation.moment === 'R3');
+  // The immutable producing R2 establishes the era. The missing R3 field by
+  // itself is never sufficient to waive the new handoff contract.
+  const producer = store.get<{ carriedContract?: string }>(handoff.r2.id, handoff.r2.revision)!;
+  if (mode === 'consume' && saved === undefined && allowHistorical && producer.value.carriedContract === undefined)
+    return { findings, guards, dependencies, value: undefined };
   if (mode === 'consume' && saved === undefined) {
     findings.push({ code: 'obligation_handoff_missing', target: 'R3', message: 'This scoped R3 result omitted its required obligation handoff; do not infer it as accepted' });
     return { findings, guards, dependencies, value: undefined };
