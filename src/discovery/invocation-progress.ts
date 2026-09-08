@@ -6,14 +6,14 @@ import type { ModelCall } from '../runtime/model-usage.js';
 import { reference } from '../pipeline/contracts.js';
 import {contextLookupKey} from './context-workspace.js';
 
-/** Only engine-owned progress contributes. Focus, archive ids, model prose,
- * error messages and budget changes cannot reset this per-invocation guard. */
+/** Preserve the engine-owned progress identity for accounting. Distinct calls
+ * are governed by their token budget, not a fixed invocation count. Repeated
+ * delivered lookup keys are rejected by the context consumer. */
 export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>) {
   const question=store.get(questionId);
   requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
   let step:unknown;
   const originals=(context.contextWorkspace??[]).map(contextLookupKey);
-  const bounded = context.consolidation?.format === 2 || context.contextControls?.mode === 'finalization';
   if(context.dispatchMode==='consolidation')step={session:context.synthesisSession,cursor:context.synthesisState,operation:'consolidation',
     ...(context.consolidation?.format === 2 ? {format:2,notes:context.synthesisNotes?.map((n:any)=>n.checkpoint)??[]} : {})};
   else if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals,
@@ -27,9 +27,6 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   }
   const key=hashJson({version:1,question:reference(question),purpose,step});
   const calls=store.list<ModelCall>('model-call').filter(c=>c.value.questionId===questionId&&c.value.purpose===purpose&&c.value.progressKey===key);
-  requireCondition(calls.length < (bounded ? 1 : 3),'research_no_progress',bounded
-    ? 'The bounded finalization or compaction attempt already ran without durable progress; another paid call is forbidden'
-    : 'Three invocations made no durable progress on this step; the next paid call is forbidden');
   return {key,guards:calls.map(reference)};
 }
 

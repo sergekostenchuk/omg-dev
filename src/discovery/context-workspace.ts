@@ -4,8 +4,6 @@ import { requireCondition } from '../errors.js';
 
 export interface ContextLookup { record: Ref; pointer: string; value: unknown; page?: {offset:number;end:number;total:number;unit:string;next:number|null} }
 export interface ContextWorkspace { entries: { key: string; result: ContextLookup }[]; sinceProgress: number; checkpointedKeys?: string[]; blocked?: string }
-export const CONTEXT_WORKSPACE_CHARS=60_000;
-export const CONTEXT_LOOKUPS_PER_STEP=3;
 
 /** Packet archives change on every invocation. A lookup's identity belongs to
  * the selected original value and selector, not the envelope containing it. */
@@ -30,12 +28,10 @@ export function contextWorkspace(value?: ContextWorkspace, legacyFocus?: unknown
   return {entries:[],sinceProgress:0};
 }
 export function addContextLookup(state: ContextWorkspace, result: ContextLookup,
-  delivered: ContextLookup[] = state.entries.map(entry => entry.result), maxLookups = CONTEXT_LOOKUPS_PER_STEP): ContextWorkspace {
+  delivered: ContextLookup[] = state.entries.map(entry => entry.result), _legacyMaxLookups?: number): ContextWorkspace {
   requireCondition(!state.blocked,'research_no_progress',state.blocked??'Context session requires recovery');
   const key=contextLookupKey(result);
   requireCondition(!delivered.some(item=>contextLookupKey(item)===key),'research_no_progress','Requested context is already delivered; repeating its archive cannot justify another model call');
-  requireCondition(Number.isSafeInteger(maxLookups)&&maxLookups>0,'research_context_invalid','The lookup allowance must be a positive integer');
-  requireCondition(state.sinceProgress<maxLookups,'research_no_progress','Too many context lookups without advancing evidence or resolving the current step');
   // Keep the exact paid originals in the session; the packet builder decides
   // which values fit and exposes an address for every omitted value.
   return {...state,entries:[...state.entries.filter(entry=>entry.key!==key),{key,result}],sinceProgress:state.sinceProgress+1};
@@ -63,7 +59,7 @@ export function requireContextDelivery(expected: ContextLookup[], packet: Record
 
 /** Full originals remain in the saved archive. Omitted values are represented
  * by selectors and are eligible for delivery again if explicitly requested. */
-export function packContextWorkspace(packet: Record<string, any>, maxChars: number, contextChars = CONTEXT_WORKSPACE_CHARS, retention?: { checkpointedKeys: string[] }): void {
+export function packContextWorkspace(packet: Record<string, any>, maxChars: number, contextChars = maxChars, retention?: { checkpointedKeys: string[] }): void {
   if (!Object.hasOwn(packet,'contextWorkspace')) return;
   const originals = packet.contextWorkspace as ContextLookup[];
   requireCondition(Array.isArray(originals),'research_context_invalid','Context originals must be an array');
@@ -75,7 +71,7 @@ export function packContextWorkspace(packet: Record<string, any>, maxChars: numb
   // checkpointed originals may yield to addresses; new ones must coexist.
   const room = Math.min(contextChars, Math.max(0, retention
     ? maxChars - JSON.stringify(packet).length - 2048
-    : Math.floor((maxChars - JSON.stringify(packet).length - 1024) / 2)));
+    : maxChars - JSON.stringify(packet).length - 1024));
   const chosen: ContextLookup[] = [];
   if (retention) {
     const done = new Set(retention.checkpointedKeys);

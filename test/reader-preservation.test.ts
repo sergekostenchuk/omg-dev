@@ -15,7 +15,7 @@ import {workingContext} from '../src/discovery/working-context.js';
 import {reference} from '../src/pipeline/contracts.js';
 import type {Question} from '../src/discovery/discovery.js';
 
-function fixture(t:test.TestContext,maxReadChars=20000){
+function fixture(t:test.TestContext,maxRequestChars=30000){
  const root=mkdtempSync(join(tmpdir(),'omg-reader-preserve-')),store=new Store(join(root,'db.sqlite'));
  t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
  const engine=new ProductEngine(store);engine.execute({type:'create-project',project:'p',title:'Reader fixture'});
@@ -27,7 +27,7 @@ const selections=c.sources.map((s,i)=>({sourceIndex:i,firstLine:fail?99999:s.lin
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{selections,unresolved:['Old purpose is not a verdict for the next question']},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const command={executable:process.execPath,args:[adapter]};
  const env=engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:5000},0);
- const pilot=configureReaderPilot(store,engine.environments,'p',{experimental:true,active:true,stopAfter:'L2',reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},agentCommand:command,maxCalls:200,maxReportedTokens:100000,maxRequestChars:30000,maxContinuationChars:30000,maxReadChars,maxReplyChars:500,maxExtractedChars:1200},0);
+ const pilot=configureReaderPilot(store,engine.environments,'p',{experimental:true,active:true,stopAfter:'L2',reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},agentCommand:command,maxCalls:200,maxReportedTokens:100000,maxRequestChars,maxContinuationChars:30000,maxReadChars:20000,maxReplyChars:500,maxExtractedChars:1200},0);
  const question=()=>{
   const draft=engine.discovery.create('p','discovery','R0','compilation',[{field:'result',kind:'design',prompt:'Use the exact original',risk:'Missing evidence',schema:{type:'object'}}]);
   return {draft,q:store.get<Question>(draft.value.questions[0]!)!};
@@ -37,12 +37,12 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
  return {root,store,engine,env,pilot,question,read,packets};
 }
 
-test('paid extraction survives a small reply budget and is delivered in bounded exact pages',async t=>{
+test('paid extraction is accepted despite a former reply discipline and is delivered in bounded exact pages',async t=>{
  const f=fixture(t);writeFileSync(join(f.root,'source.txt'),'A'.repeat(6000));
  const {draft,q}=f.question();const result=await f.read(q);
  assert.ok(JSON.stringify(result.value.observations).length>f.pilot.value.maxReplyChars);
  assert.equal(f.store.list('model-call').length,1);
- assert.equal(researchReadLimit(f.store,f.pilot,q.id,'extractedChars',1,[]),1200);
+ assert.equal(researchReadLimit(f.store,f.pilot,q.id,'extractedChars',1,[]),30000);
  const material={kind:'reader',value:{ref:reference(result),...result.value}};
  let offset=0,materialOffset=0,joined='';
  for(let page=0;page<100;page++){
@@ -102,22 +102,22 @@ test('a changed source version cannot inherit earlier observation coverage',asyn
 });
 
 test('oversized connected input splits before payment and preserves every selected source byte',async t=>{
- const f=fixture(t,1600),text='0123456789'.repeat(600);writeFileSync(join(f.root,'source.txt'),text);
+ const f=fixture(t,30000),text='0123456789'.repeat(6000);writeFileSync(join(f.root,'source.txt'),text);
  const result=await f.read(f.question().q);
  assert.ok(f.packets().length>1);
- assert.ok(f.packets().every(c=>JSON.stringify({role:c.role,purpose:c.purpose,sources:c.sources}).length<=1600));
+ assert.ok(f.packets().every(c=>JSON.stringify({role:c.role,purpose:c.purpose,sources:c.sources}).length<=30000));
  assert.equal(result.value.observations.map(o=>o.value).join(''),text);
  assert.ok(result.value.parts!.length>0);
 });
 
 test('a failed later chunk does not discard or repurchase the completed first chunk',async t=>{
- const f=fixture(t,1600);writeFileSync(join(f.root,'source.txt'),'Z'.repeat(6000));writeFileSync(join(f.root,'reject-later'),'fixture');
+ const f=fixture(t,30000);writeFileSync(join(f.root,'source.txt'),'Z'.repeat(60000));writeFileSync(join(f.root,'reject-later'),'fixture');
  const {q}=f.question();await assert.rejects(f.read(q),{code:'reader_selection_foreign'});
  const completed=f.store.list<any>('reader-result')[0]!;
  const firstEnd=completed.value.coverage[0].visibleRange.end;
  const before=f.packets().length;rmSync(join(f.root,'reject-later'));
  const result=await f.read(q);
  assert.ok(f.packets().slice(before).every(c=>c.sources[0].visibleRange.start>=firstEnd));
- assert.equal(result.value.observations.map(o=>o.value).join(''),'Z'.repeat(6000));
+ assert.equal(result.value.observations.map(o=>o.value).join(''),'Z'.repeat(60000));
  assert.deepEqual(f.store.get(completed.id),completed);
 });

@@ -237,7 +237,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     }
     if (packet.contextControls?.version === 2 && packet.synthesisPage.complete) {
       packet.contextControls = {...packet.contextControls,stage:'final',
-        mode:packet.contextControls.remainingLookups === 0 ? 'finalization' : 'research'};
+        mode:'finalization'};
     }
     requireCondition(length() <= maxChars, "pilot_request_limit", "The synthesis page exceeds its fixed limit");
     return packet;

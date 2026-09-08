@@ -57,10 +57,10 @@ test('all uncheckpointed originals remain together; capacity failure is explicit
   assert.throws(()=>contextWorkspace({entries:[],sinceProgress:0,checkpointedKeys:['foreign']}),{code:'research_context_invalid'});
 });
 
-test('a final checkpoint records newly delivered context without moving the material cursor or refreshing final lookup quota',async t=>{
+test('a final checkpoint records newly delivered context without moving the material cursor; lookup accounting remains observational',async t=>{
   const f=await fixture(t,20),originals=addressed(f);atFinal(f,originals,3);
   const citations=(f.notes[0]!.proposal as any).citations;
-  adapter(f,`if(c.contextControls.mode!=='finalization'||c.contextControls.remainingLookups!==0)throw Error('Expected terminal mode');
+  adapter(f,`if(c.contextControls.mode!=='finalization'||c.contextControls.remainingLookups!==null)throw Error('Expected unbounded finalization mode');
 if(!existsSync('checkpoint-sent')){writeFileSync('checkpoint-sent','1');research={action:'checkpoint',question:c.question.id,value:{finding:'New exact context resolves the named condition'},citations:[],unresolved:[]};}
 else research={action:'answer',question:c.question.id,value:{result:'Ready for ordinary assessment'},citations:${JSON.stringify(citations)}};`);
   const result=await f.invoke();assert.equal(result.action,'answer');
@@ -71,14 +71,14 @@ else research={action:'answer',question:c.question.id,value:{result:'Ready for o
   assert.ok(f.wires().slice(1).every(w=>w.subject.contextWorkspace.length===3));
 });
 
-test('an ordinary final-stage search after the declared allowance is refused before payment; a terminal answer path remains',async t=>{
+test('a final-stage read is allowed with a purpose after material completion, and finalization advertises it',async t=>{
   const f=await fixture(t,20),originals=addressed(f);const session=atFinal(f,originals,3);
   const env=pilotEnvironment(f.engine.environments.get('p').value,f.pilot.value);
-  await assert.rejects(researchCall(env.implementer,env,'',{...f.context,contextControls:{version:2,stage:'final',mode:'research',remainingLookups:0}},undefined,
-    {store:f.store,draftId:f.draft.id,questionId:f.question.id,purpose:'analyst',pilot:f.pilot,session:reference(session)}),{code:'research_no_progress'});
-  assert.equal(f.store.list('model-call').length,1);
+  await researchCall(env.implementer,env,'',{...f.context,contextControls:{version:2,stage:'final',mode:'finalization',remainingLookups:null}},undefined,
+    {store:f.store,draftId:f.draft.id,questionId:f.question.id,purpose:'analyst',pilot:f.pilot,session:reference(session)});
+  assert.equal(f.store.list('model-call').length,2);
   const p=JSON.parse((await previewResearch(f.invoke)).input);
-  assert.equal(p.subject.contextControls.mode,'finalization');assert.ok(p.prompt.includes('need_research'));assert.ok(p.prompt.includes('read_context is unavailable'));
+  assert.equal(p.subject.contextControls.mode,'finalization');assert.equal(p.subject.contextControls.remainingLookups,null);assert.ok(p.prompt.includes('need_research'));assert.ok(p.prompt.includes('read_context'));
 });
 
 test('a final-stage lookup requires a concrete purpose; a paid invalid response is retained without another invocation',async t=>{
@@ -90,16 +90,15 @@ test('a final-stage lookup requires a concrete purpose; a paid invalid response 
   await assert.rejects(f.invoke(),{code:'research_no_progress'});assert.equal(f.store.list('model-call').length,2);
 });
 
-test('terminal pauses and repeated checkpoints cannot buy an unbounded retry with unchanged knowledge',async t=>{
-  for(const response of ['pause','checkpoint']){
-    const f=await fixture(t,20);atFinal(f,addressed(f),3);
-    adapter(f,response==='pause'?`research={action:'pause',reason:'No result from this attempt'};`:`research={action:'checkpoint',question:c.question.id,value:{finding:'The same proposed finding'},citations:[],unresolved:[]};`);
-    if(response==='pause')assert.equal((await f.invoke()).action,'pause');
-    else await assert.rejects(f.invoke(),{code:'synthesis_no_progress'});
-    const calls=f.store.list('model-call').length;
-    assert.equal(calls,response==='pause'?2:3);
-    await assert.rejects(f.invoke(),{code:'research_no_progress'});assert.equal(f.store.list('model-call').length,calls);
-  }
+test('a pause remains resumable, while a repeated final checkpoint without new context is refused',async t=>{
+  const paused=await fixture(t,20);atFinal(paused,addressed(paused),3);
+  adapter(paused,`research={action:'pause',reason:'Awaiting an operator-selected missing original'};`);
+  assert.equal((await paused.invoke()).action,'pause');assert.equal((await paused.invoke()).action,'pause');
+  assert.equal(paused.store.list('model-call').length,3);
+  const repeated=await fixture(t,20);atFinal(repeated,addressed(repeated),3);
+  adapter(repeated,`research={action:'checkpoint',question:c.question.id,value:{finding:'The same proposed finding'},citations:[],unresolved:[]};`);
+  await assert.rejects(repeated.invoke(),{code:'synthesis_no_progress'});
+  assert.equal(repeated.store.list('model-call').length,3);
 });
 
 test('a pending legacy summary that fits the actual packet continues without a format upgrade',async t=>{
@@ -113,7 +112,7 @@ test('a pending legacy summary that fits the actual packet continues without a f
   assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,0);
 });
 
-test('context recovery preserves exhausted final-stage accounting instead of granting another search round',async t=>{
+test('context recovery preserves final-stage lookup observations while allowing more distinct context',async t=>{
   const f=await fixture(t,20),originals=addressed(f,2);const s=atFinal(f,originals.slice(0,1),3);
   const blocked=f.store.write<any>({id:s.id,kind:s.kind,expected:s.revision,value:{...s.value,workspace:{...s.value.workspace,blocked:'Too many context lookups'}}});
   const recovered=await f.engine.execute({type:'recover-context-session',project:'p',session:reference(blocked),selector:{record:originals[1]!.record,pointer:originals[1]!.pointer}}) as any;
@@ -152,7 +151,7 @@ test('delivering the last page enters finalization even before its cursor is ack
   const packet=JSON.parse((await previewResearch(f.invoke)).input);
   assert.equal(packet.subject.synthesisState.offset,0);assert.equal(packet.subject.synthesisPage.complete,true);
   assert.equal(packet.subject.contextControls.stage,'final');assert.equal(packet.subject.contextControls.mode,'finalization');
-  assert.ok(packet.prompt.includes('read_context is unavailable'));
+  assert.ok(packet.prompt.includes('read_context'));
   assert.equal(f.store.list('model-call').length,1);
 });
 

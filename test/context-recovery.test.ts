@@ -148,12 +148,12 @@ test('a running call on the bound question blocks recovery across sessions and p
   assert.deepEqual(f.store.get(f.session.id), f.session);
 });
 
-test('identical, empty, foreign and oversized selections cannot clear a block', t => {
+test('identical, empty, foreign and transport-oversized selections cannot clear a block', t => {
   const f = fixture(t);
   assert.throws(() => recoverContextSession(f.store, 'p', reference(f.session), f.selection), { code: 'context_recovery_unchanged' });
   assert.throws(() => recoverContextSession(f.store, 'p', reference(f.session), { ...f.next, page: { offset: 10, limit: 4 } }), { code: 'context_recovery_empty' });
   assert.throws(() => recoverContextSession(f.store, 'p', reference(f.session), { ...f.next, record: reference(f.environment) }), { code: 'context_reference_foreign' });
-  f.store.write({ id: f.pilot.id, kind: f.pilot.kind, expected: f.pilot.revision, value: { ...f.pilot.value, maxReadChars: 1 } });
+  f.store.write({ id: f.pilot.id, kind: f.pilot.kind, expected: f.pilot.revision, value: { ...f.pilot.value, maxRequestChars: 1, maxReadChars: 1 } });
   assert.throws(() => recoverContextSession(f.store, 'p', reference(f.session), f.next), { code: 'context_read_limit' });
   assert.deepEqual(f.store.get(f.session.id), f.session);
 });

@@ -33,8 +33,8 @@ export function replayLimitedResponse(store: Store, pilot: Revision<ReaderPilot>
     const payload = JSON.parse(response.value.text);
     requireCondition(payload?.protocol === "omg-agent/v1" && payload.requestId === call.value.requestId
       && Object.hasOwn(payload, "research"), "research_replay_invalid", "The saved response has a foreign request envelope");
-    requireCondition(JSON.stringify(payload.research).length <= pilot.value.maxReplyChars,
-      "pilot_reply_limit", "The paid response still exceeds the reply limit; preserve it instead of regenerating");
+    requireCondition(!pilot.value.physicalLimits || JSON.stringify(payload.research).length <= pilot.value.physicalLimits.maxReplyChars,
+      "budget_transport_limit", "The paid response exceeds the declared physical response capacity");
     const draft = store.get<DiscoveryDraft>(draftId), question = questionId ? store.get<Question>(questionId) : null;
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === pilot.value.projectId
       && (!questionId || (question?.kind === "question" && question.value.draftId === draftId)),

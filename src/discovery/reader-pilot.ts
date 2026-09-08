@@ -45,10 +45,6 @@ const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPi
 export function configureReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number): Revision<ReaderPilot> {
   if (!valid(settings)) throw new EngineError("reader_pilot_invalid", "The experiment requires explicit roles, limits and its L2 stop boundary", valid.errors);
   const env = environments.get(project).value;
-  requireCondition(!settings.planning || settings.planning.maxRequestChars <= settings.maxRequestChars,
-    "reader_pilot_invalid", "Planning cannot exceed the overall request ceiling");
-  requireCondition(!settings.contextLimits || settings.contextLimits.maxChars <= settings.maxRequestChars,
-    'reader_pilot_invalid','Addressed context cannot exceed the declared continuation envelope');
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
     "reader_role_invalid", "The reader must have its own identity and cannot accept its extraction");
   executablePath(settings.reader.command, env.workspace); executablePath(settings.agentCommand, env.workspace);

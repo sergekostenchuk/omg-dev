@@ -62,12 +62,11 @@ for(const role of ['analyst','assessor'] as const){
   assert.equal(readFileSync(f.wire,'utf8'),before);
  });
 }
-test('the common dispatch guard counts unchanged inner calls even when their archive/context changes',async t=>{
+test('distinct inner calls are governed by their transport budget rather than an invocation-count ceiling',async t=>{
  const f=fixture(t,'analyst');
  writeFileSync(f.env.value.implementer.command.args[0]!,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'unchanged'},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
- for(let n=0;n<3;n++)await researchCall(f.env.value.implementer,f.env.value,'fixture',{...f.context,focus:{randomArchive:n}},undefined,{store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',pilot:f.pilot});
- await assert.rejects(researchCall(f.env.value.implementer,f.env.value,'fixture',{...f.context,focus:{randomArchive:4}},undefined,{store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',pilot:f.pilot}),{code:'research_no_progress'});
- assert.equal(f.store.list('model-call').length,3);
+ for(let n=0;n<4;n++)await researchCall(f.env.value.implementer,f.env.value,'fixture',{...f.context,focus:{randomArchive:n}},undefined,{store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',pilot:f.pilot});
+ assert.equal(f.store.list('model-call').length,4);
 });
 
 test('outer analyst retains both addressed originals and rejects A/B/A before another paid dispatch',async t=>{
@@ -95,7 +94,7 @@ test('addressed context omitted before dispatch produces no paid model call',asy
   {store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',pilot:f.pilot}),{code:'research_context_undelivered'});
  assert.equal(f.store.list('model-call').length,0);
 });
-test('the invocation allowance covers different inner roles, not just outer research turns',async t=>{
+test('explicit caller-owned invocation allowance still stops a bounded preparation loop',async t=>{
  const f=fixture(t,'analyst');
  writeFileSync(f.env.value.implementer.command.args[0]!,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'fixture'},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  await assert.rejects(withInvocationAllowance(2,async()=>{for(const purpose of ['reader','analyst','assessor'])await researchCall(f.env.value.implementer,f.env.value,'fixture',f.context,undefined,{store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose,pilot:f.pilot});}),{code:'research_call_allowance'});

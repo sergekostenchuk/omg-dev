@@ -50,7 +50,7 @@ export function pendingSynthesis(store: Store, draft: Revision<DiscoveryDraft>, 
 }
 
 const instruction = "\nmaterialPage may carry a finite JSON fragment of one large saved material; its cursor must advance before the next source. Synthesis uses finite pages of the materials already requested. synthesisPage gives the range actually supplied; omitted pages are not missing research. If synthesisPage.complete is false, return checkpoint with findings from this page, exact citations and remaining uncertainties; do not ask the reading planner to retrieve later pages. The engine saves your checkpoint and supplies the next page. An early answer is only an unassessed checkpoint. synthesisNotes contains earlier proposed answers and source citations, not authoritative facts; reconcile exceptions and contradictions across them. After the last page, compose the complete answer using these notes and supplied evidence. Only then request new research if essential information is still absent. All original materials remain at working.archive /body/synthesisMaterials. Never infer absence from an unshown page.";
-const checkpointInstruction = " A checkpoint is an unassessed note and may explicitly use citations:[] for a context-only page without Source evidence. Do not invent or borrow an irrelevant citation to satisfy its format. This does not waive the citations and evidence required for a final answer.";
+const checkpointInstruction = " A context-only page without primary Source evidence may use citations:[] only to record substantive missing-primary-text questions in unresolved, not to establish findings. Do not invent or borrow an irrelevant citation. Keep progress counts out of unresolved; the engine records them. Final answers still require sufficient primary citations and evidence.";
 
 export async function synthesisSession(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot>,
@@ -168,13 +168,12 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     if (action.action === "read_context") {
       try {
         if (controls?.version === 2 && controls.stage === 'final') {
-          requireCondition(controls.remainingLookups > 0,'research_no_progress','Finalization cannot purchase another context search after its declared allowance');
           requireCondition(typeof action.purpose === 'string' && action.purpose.trim().length > 0,
             'synthesis_context_purpose_missing','A final-stage lookup must identify the concrete missing fact or exception before another lookup can be delivered');
         }
         const result=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
         save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups),
-          ...(controls?.stage === 'final' ? {finalization:{lookups:(pilot.value.contextLimits?.maxLookups??3)-controls.remainingLookups+1}} : final ? {finalization:{lookups:(current.finalization?.lookups??workspace.sinceProgress)+1}} : {})});
+          ...(controls?.stage === 'final' || final ? {finalization:{lookups:(current.finalization?.lookups??workspace.sinceProgress)+1}} : {})});
       } catch(error) {
         save({...current,workspace:{...workspace,blocked:error instanceof Error?error.message:'Context lookup refused'}});
         throw error;
@@ -197,8 +196,7 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
       value: proposal as unknown as Json, citations: proposal.citations,
       unresolved: proposal.action === "checkpoint" ? proposal.unresolved : ["Complete the remaining material pages before accepting this proposal"] });
     save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace),
-      ...(page.end === materials.length ? {finalization:{lookups:controls?.version === 2 && controls.stage === 'final'
-        ? (pilot.value.contextLimits?.maxLookups??3)-controls.remainingLookups : final ? current.finalization?.lookups??workspace.sinceProgress : 0}} : {}), notes: [...current.notes,
+      ...(page.end === materials.length ? {finalization:{lookups:current.finalization?.lookups??workspace.sinceProgress}} : {}), notes: [...current.notes,
       { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: page.end } }] }, [reference(saved)]);
   }
 }

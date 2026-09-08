@@ -4,21 +4,21 @@ import {addContextLookup,contextWorkspace,contextLookupKey,packContextWorkspace,
 
 const lookup=(name:string,value:unknown,revision=1):ContextLookup=>({record:{id:`source:${name}`,revision,hash:String(revision).repeat(64)},pointer:'/content',value});
 
-test('capacity evicts only the packet value; a retained selector can restore its exact original',()=>{
- const a=lookup('a','A'.repeat(550)),b=lookup('b','B'.repeat(550));
- const state=addContextLookup(addContextLookup(contextWorkspace(),a),b);
+test('capacity evicts only packet values, while distinct originals remain unbounded and an exact repeat is refused',()=>{
+ const a=lookup('a','A'.repeat(550)),b=lookup('b','B'.repeat(550)),c=lookup('c','C'.repeat(550)),d=lookup('d','D'.repeat(550));
+ const state=addContextLookup(addContextLookup(addContextLookup(addContextLookup(contextWorkspace(),a),b),c),d);
+ assert.equal(state.entries.length,4);
  const packet={contextWorkspace:state.entries.map(entry=>entry.result)} as Record<string,any>;
  packContextWorkspace(packet,6000,900);
- assert.deepEqual(packet.contextWorkspace,[b]);
- assert.equal(packet.contextIndex.length,2);
- assert.deepEqual(state.entries.map(entry=>entry.result),[a,b]);
- const restored=addContextLookup(state,a,packet.contextWorkspace,4);
+ assert.deepEqual(packet.contextWorkspace,[d]);
+ assert.equal(packet.contextIndex.length,4);
+ assert.deepEqual(state.entries.map(entry=>entry.result),[a,b,c,d]);
+ const restored=addContextLookup(state,a,packet.contextWorkspace);
  const next={contextWorkspace:restored.entries.map(entry=>entry.result)};
  packContextWorkspace(next,6000,900);
  assert.deepEqual(next.contextWorkspace,[a]);
- assert.equal(restored.sinceProgress,3);
- assert.throws(()=>addContextLookup(restored,a,next.contextWorkspace,4),{code:'research_no_progress'});
- assert.throws(()=>addContextLookup(restored,b,next.contextWorkspace,3),{code:'research_no_progress'});
+ assert.equal(restored.sinceProgress,5);
+ assert.throws(()=>addContextLookup(restored,a,next.contextWorkspace),{code:'research_no_progress'});
 });
 
 test('a context projection must deliver its newest original and retain the addresses of omitted values',()=>{

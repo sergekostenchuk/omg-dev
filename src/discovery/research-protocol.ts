@@ -1,3 +1,4 @@
+import { normalizeResearchAction } from './research-action-normalization.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { processStart } from "../runtime/process-identity.js";
@@ -72,6 +73,7 @@ const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   object({ action: { const: "pause" }, reason: text }),
 ] });
 export function researchAction(value: unknown): ResearchAction {
+  value = normalizeResearchAction(value);
   if (!validate(value)) throw new EngineError("research_response_invalid", "Research action has missing or invalid fields", validate.errors);
   if (value.action === 'checkpoint' && value.citations.length === 0) {
     const note = value.value;
@@ -118,8 +120,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
-  requireCondition(consolidating || controls?.version !== 2 || controls.stage !== 'final' || controls.remainingLookups > 0 || finalizing,
-    'research_no_progress','The final-stage lookup allowance is exhausted; an ordinary context-search dispatch is forbidden');
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const requestLimit = audit?.pilot?.value.maxRequestChars ?? 300000;
@@ -127,8 +127,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
     requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
-      ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}),
-      ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxExtractedChars??audit!.pilot.value.maxReadChars}:{}) }) : context;
+      ...(audit!.pilot?{contextChars:audit!.pilot.value.maxRequestChars}:{}),
+      ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxRequestChars}:{}) }) : context;
   if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive);
   if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
@@ -156,11 +156,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const replay = audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
     audit.questionId, audit.purpose, input) : null;
   if (replay) return replay.research;
-  if (audit?.purpose === "reading-planner" && audit.pilot?.value.planning) {
-    const rounds = audit.store.list<ModelCall>("model-call").filter(call => call.value.draftId === audit.draftId
-      && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length;
-    requireCondition(rounds < audit.pilot.value.planning.maxRounds, "planning_round_limit", "The planning guard is reached; preserve the paid work instead of increasing rounds");
-  }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
@@ -241,11 +236,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     requireCondition(response, "research_response_invalid", "Research adapter must return a protocol response");
     requireCondition(response.protocol === "omg-agent/v1" && response.requestId === requestId && Object.hasOwn(response, "research"),
       "research_response_foreign", "Research response is missing or belongs to another invocation");
-    const replyLimit = audit?.pilot?.value.maxReplyChars;
     requireCondition(!audit?.pilot?.value.physicalLimits || JSON.stringify(response.research).length <= audit.pilot.value.physicalLimits.maxReplyChars,
       "budget_transport_limit", "Response exceeds the declared physical response capacity");
-    requireCondition(!audit?.pilot || JSON.stringify(response.research).length <= replyLimit!,
-      "pilot_reply_limit", "The generated response exceeds the configured limit; its usage has been recorded");
     patch.status = "succeeded"; return response.research;
   } catch (error) {
     patch.status = "failed"; patch.error = error instanceof EngineError ? error.code : "research_call_failed"; throw error;

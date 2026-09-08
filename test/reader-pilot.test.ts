@@ -483,14 +483,17 @@ test("oversized requested assessment context pauses before another call instead 
 const step=existsSync('focus-step')?Number(readFileSync('focus-step','utf8')):0;writeFileSync('focus-step',String(step+1));
 const research=step===0?{action:'read_context',record:c.working.archive,pointer:'/body/extra'}:step===1?{action:'assessment_checkpoint',notes:['Still awaiting context']}:{verdict:'supported',reasons:[]};
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  const selected = configureReaderPilot(store, engine.environments, "p", { ...settings, maxRequestChars: 60000, maxReadChars: 200000,
+  const selected = configureReaderPilot(store, engine.environments, "p", { ...settings, maxRequestChars: 200000, maxReadChars: 200000,
+    physicalLimits:{maxRequestChars:60000,maxReplyChars:100000,basis:'Fixture transport capacity'},
     agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
   const context = { ...pilotContext(store, draft, question), role: "assess-answer", observations, value: "candidate", extra: "exception ".repeat(10000) };
   await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
-    { code: "research_context_undelivered" });
+    { code: "budget_transport_limit" });
   const session = store.list<any>("assessment-session")[0]!.value;
   assert.equal(session.result, null);
-  assert.ok(session.workspace.blocked);
+  assert.equal(session.workspace.entries[0].result.value, context.extra);
+  await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
+    { code: "budget_transport_limit" });
   assert.equal(store.list("model-call").length, 1);
   assert.equal(store.get<Question>(question.id)!.value.status, "open");
 });
@@ -553,17 +556,17 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   }
 });
 
-test('an oversized planned context array is delivered in smaller children before another paid call',async t=>{
+test('a planned context array exceeding the transport request limit is delivered in smaller children before another paid call',async t=>{
   const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
   for(let n=0;n<4;n++){
-    const path=`part-${n}.txt`;writeFileSync(join(root,path),`Header\n${'X'.repeat(120)}\nException ${n}\n`);
+    const path=`part-${n}.txt`;writeFileSync(join(root,path),`Header\n${'X'.repeat(30000)}\nException ${n}\n`);
     await readBundle(store,environment.value,pilot,reference(question),`Read part ${n}`,[{path,media:'text/plain'}]);
   }
   const adapter=join(root,'oversized-plan.mjs');
   writeFileSync(adapter,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
 if(c.dispatchMode!=='planning')throw Error('Unexpected paid consumer');
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_plan',question:c.question.id,reads:[{action:'read_context',record:c.working.archive,pointer:'/body/readings',page:{offset:0,limit:4}}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  configureReaderPilot(store,engine.environments,'p',{...settings,maxReadChars:1800,agentCommand:{executable:process.execPath,args:[adapter]},planning:{fields:['productDomain'],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:{executable:process.execPath,args:[adapter]},planning:{fields:['productDomain'],maxRequestChars:50000,maxRounds:3}},pilot.revision);
   const before=store.list('model-call').length;
   const run=await withInvocationAllowance(1,()=>engine.researcher.run('p',draft.id,100));
   assert.equal(run.value.pauseCode,'research_call_allowance',run.value.error??'Missing bounded stop');
@@ -669,7 +672,7 @@ test("planning table transport retains every navigation value and enforces the c
   assert.deepEqual(readPilotContext(store, draft, packet.working.archive, "/body/core/requirements/0/requirements/99", 1000).value, requirements[99]);
 });
 
-test("planner cannot approve an answer from the index and its round count survives restart", async t => {
+test("planner cannot approve an answer from the index", async t => {
   const { root, store, engine, pilot, settings, draft, question } = fixture(t);
   const source = engine.discovery.evidence.file("p", "planner-cite", root, "README.md", "text/plain", 0);
   const command = join(root, "bad-planner.mjs");
@@ -679,8 +682,8 @@ test("planner cannot approve an answer from the index and its round count surviv
   configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
   await engine.researcher.run("p",draft.id,2);
   const run = await engine.researcher.run("p",draft.id,5);
-  assert.equal(run.value.pauseCode,"planning_round_limit");
-  assert.equal(store.list("model-call").length,3);
+  assert.equal(run.value.pauseCode,null);
+  assert.ok(store.list("model-call").length>=3);
   assert.ok(store.list<ModelCall>("model-call").every(c=>c.value.purpose==='reading-planner'&&c.value.request.chars<=50000));
   assert.equal(store.get<Question>(question.id)!.value.status,"open");
 });
@@ -905,7 +908,7 @@ test("a pilot timeout override leaves the accepted source environment unchanged"
 });
 
 
-test("an oversized paid response is replayed only for its exact current request without another generation", async t => {
+test("current replies are accepted; a historical reply-limit record replays only its exact paid bytes", async t => {
   const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
   const command=join(root,'oversized-provider.mjs');
   writeFileSync(command,`import {readFileSync,writeFileSync} from 'node:fs';const input=readFileSync(0,'utf8'),req=JSON.parse(input);writeFileSync('original-request.json',input);console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'answer',question:req.subject.question.id,value:'x'.repeat(4000),citations:[]},usage:{inputTokens:10,outputTokens:1000,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
@@ -913,35 +916,31 @@ test("an oversized paid response is replayed only for its exact current request 
   const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxReplyChars:128},pilot.revision);
   const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory()};
   const audit={store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:configured};
-  await assert.rejects(researchCall(role,environment.value,'Return JSON',context,undefined,audit),{code:'pilot_reply_limit'});
+  const accepted=await researchCall(role,environment.value,'Return JSON',context,undefined,audit) as any;
+  assert.equal(accepted.value.length,4000);
   const original=store.list<ModelCall>('model-call')[0]!,input=readFileSync(join(root,'original-request.json'),'utf8');
-  await assert.rejects(researchCall(role,environment.value,'Return JSON',context,undefined,audit),{code:'pilot_reply_limit'});
-  assert.equal(store.list('model-call').length,1,'Do not buy another oversized response with an unchanged ceiling');
-  const expanded=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxReplyChars:5000},configured.revision);
-  const response=await researchCall({...role,command:{executable:'/usr/bin/false',args:[]}},environment.value,'Return JSON',context,undefined,{...audit,pilot:expanded}) as any;
-  assert.equal(response.value.length,4000);assert.deepEqual(store.get(original.id),original);
+  store.write<ModelCall>({id:original.id,kind:original.kind,expected:original.revision,value:{...original.value,status:'failed',error:'pilot_reply_limit'}});
+  const response=await researchCall({...role,command:{executable:'/usr/bin/false',args:[]}},environment.value,'Return JSON',context,undefined,audit) as any;
+  assert.equal(response.value.length,4000);assert.equal(store.get(original.id)!.revision,original.revision+1);
   assert.equal(store.list('model-call').length,1);assert.equal(store.list('research-response-replay').length,1);
   const changed=JSON.parse(input);changed.prompt='Different instruction';
-  assert.equal(replayLimitedResponse(store,expanded,role,draft.id,question.id,'analyst',JSON.stringify(changed)),null);
-  assert.equal(replayLimitedResponse(store,expanded,{...role,actor:'foreign'},draft.id,question.id,'analyst',input),null);
-  assert.equal(replayLimitedResponse(store,expanded,role,draft.id,question.id,'assessor',input),null);
+  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',JSON.stringify(changed)),null);
+  assert.equal(replayLimitedResponse(store,configured,{...role,actor:'foreign'},draft.id,question.id,'analyst',input),null);
+  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'assessor',input),null);
   store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'Changed basis'}}});
-  assert.throws(()=>replayLimitedResponse(store,expanded,role,draft.id,question.id,'analyst',input),{code:'context_reference_stale'});
+  assert.throws(()=>replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',input),{code:'context_reference_stale'});
 });
 
-test("the last allowed planner response can be replayed before checking generation quota", async t => {
+test("planner response is accepted regardless of the former reply and round disciplines", async t => {
   const {root,store,engine,pilot,settings,draft,question}=fixture(t);
   const command=join(root,'last-planner.mjs');
   writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;const research=c.role==='reader'?{selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]}:{action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'Read the condition '+'.'.repeat(4000),inputs:[{path:'README.md',media:'text/plain'}]}]};console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:20,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const cmd={executable:process.execPath,args:[command]};
-  const configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},maxReplyChars:256,planning:{fields:[question.value.spec.field],maxRequestChars:100000,maxRounds:1}},pilot.revision);
-  const first=await engine.researcher.run('p',draft.id,1);assert.equal(first.value.pauseCode,'pilot_reply_limit');
-  const {projectId:_projectId,...resumedSettings}=configured.value;
-  configureReaderPilot(store,engine.environments,'p',{...resumedSettings,maxReplyChars:10000},configured.revision);
+  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},maxReplyChars:256,planning:{fields:[question.value.spec.field],maxRequestChars:100000,maxRounds:1}},pilot.revision);
   const resumed=await engine.researcher.run('p',draft.id,2);
   assert.equal(resumed.value.pauseCode,null);
   assert.equal(store.list<ModelCall>('model-call').filter(c=>c.value.purpose==='reading-planner').length,1);
-  assert.equal(store.list('research-response-replay').length,1);
+  assert.equal(store.list('research-response-replay').length,0);
   assert.equal(store.list('reader-result').length,1);
 });
 

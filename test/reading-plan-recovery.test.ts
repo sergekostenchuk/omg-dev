@@ -80,7 +80,7 @@ test('a concurrent question dispatch cannot race the idle check and reset a chil
 test('oversized planned context pages split to complete original coverage without buying another call',t=>{
  const text='0123456789'.repeat(600),f=fixture(t,text);
  retryPlannedRead(f.store,'p',reference(f.child));
- const pilot={value:{projectId:'p',maxReadChars:1300}} as Revision<ReaderPilot>;
+ const pilot={value:{projectId:'p',maxRequestChars:1300}} as Revision<ReaderPilot>;
  let run=f.run;
  const pieces:{offset:number;text:string}[]=[];
  for(let attempts=0;attempts<100;attempts++){
