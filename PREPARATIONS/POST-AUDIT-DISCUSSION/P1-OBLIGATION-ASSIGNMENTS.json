@@ -98,19 +98,55 @@
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
       },
       "returnCondition": null,
-      "runtimeCheckPreparation": {
-        "status": "design-only; module and exact Source Ref not yet created",
-        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
-        "module": "isolation-observation",
+      "runtimeModule": {
+        "path": "scripts/runtime-checks/omg-runtime-check.mjs",
+        "sha256": "16871063dc921913c5454b2344e1740fe867a303578d7d5fb63af9f169a450ad",
+        "source": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "mode": "isolation"
+      },
+      "runtimeCheck": {
+        "script": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "dependencies": [],
+        "subjects": [
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+          "dist/src/adapters/codex-stdio.js",
+          "dist/src/canonical.js",
+          "dist/src/errors.js",
+          "dist/src/graph/topology.js",
+          "dist/src/pipeline/contracts.js",
+          "dist/src/runtime/environment.js",
+          "dist/src/runtime/process.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+          "/Users/kostenchuksergey/.codex/config.toml"
+        ],
         "executables": [
           "codex",
+          "node",
+          "git",
           "ps"
         ],
-        "evidenceRequirement": "Actual Codex sandbox behavior on own canary files, network endpoint and descendant processes; inspect relevant provider paths. Never read actual credentials.",
-        "successMeaning": "exit 0 means the observation matrix completed, not that every attempted access was denied. R2 assesses the observed limits.",
-        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
-        "satisfies": null,
-        "newPaidProbe": false
+        "args": [
+          "isolation"
+        ],
+        "timeoutMs": 60000,
+        "purpose": "Определить применимые границы выбора directories, чтения материалов, configure и собственных адаптеров по действующим требованиям и src/runtime/environment.ts, src/runtime/process.ts, src/evidence/evidence.ts и исследовательским источникам. Для реального Codex установить фактическую изоляцию файлов, секретов и дочерних процессов; флаги sandbox и инструкции адаптера её полностью не доказывают. Дополнить точные HTTP-пути недостающим содержанием обработчика providers, если его возможности затрагиваются выбранным горизонтом."
       }
     },
     {
@@ -211,19 +247,55 @@
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
       },
       "returnCondition": null,
-      "runtimeCheckPreparation": {
-        "status": "design-only; module and exact Source Ref not yet created",
-        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
-        "module": "isolation-observation",
+      "runtimeModule": {
+        "path": "scripts/runtime-checks/omg-runtime-check.mjs",
+        "sha256": "16871063dc921913c5454b2344e1740fe867a303578d7d5fb63af9f169a450ad",
+        "source": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "mode": "isolation"
+      },
+      "runtimeCheck": {
+        "script": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "dependencies": [],
+        "subjects": [
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+          "dist/src/adapters/codex-stdio.js",
+          "dist/src/canonical.js",
+          "dist/src/errors.js",
+          "dist/src/graph/topology.js",
+          "dist/src/pipeline/contracts.js",
+          "dist/src/runtime/environment.js",
+          "dist/src/runtime/process.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+          "/Users/kostenchuksergey/.codex/config.toml"
+        ],
         "executables": [
           "codex",
+          "node",
+          "git",
           "ps"
         ],
-        "evidenceRequirement": "Bound read-only/workspace-write observations for HOME canaries, outside writes, Git metadata canaries, network and descendants; demonstrate the task.writePaths limitation rather than infer it from flags.",
-        "successMeaning": "exit 0 means complete measurements, including allowed access. No automatic readiness claim.",
-        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
-        "satisfies": null,
-        "newPaidProbe": false
+        "args": [
+          "isolation"
+        ],
+        "timeoutMs": 60000,
+        "purpose": "Для подготовки исполнимого контракта установить по точной используемой версии Codex и ОС фактические ограничения read-only/workspace-write на HOME, credentials, сеть, Git metadata и дочерние процессы и доступный способ ограничить запись task.writePaths. Прочитанные адаптер и runtime показывают параметры запуска, но не реализацию sandbox. Получить адресные сведения о реальном runtime и техническое подтверждение требуемой изоляции; отсутствие доступной среды означает техническую паузу зависимого исполнения, а не предметный вопрос владельцу."
       }
     },
     {
@@ -253,21 +325,57 @@
       "rationale": "Требуется подтверждение точной среды перед заявлением готовности R3. R2 может задать проверяемые требования к среде, не утверждая успешный запуск.",
       "status": "proposed",
       "returnCondition": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI.",
-      "runtimeCheckPreparation": {
-        "status": "design-only; module and exact Source Ref not yet created",
-        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
-        "module": "runtime-readiness",
-        "executables": [
-          "npm",
-          "git",
-          "codex",
-          "ps"
+      "runtimeModule": {
+        "path": "scripts/runtime-checks/omg-runtime-check.mjs",
+        "sha256": "16871063dc921913c5454b2344e1740fe867a303578d7d5fb63af9f169a450ad",
+        "source": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "mode": "platform"
+      },
+      "runtimeCheck": {
+        "script": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "dependencies": [],
+        "subjects": [
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+          "dist/src/adapters/codex-stdio.js",
+          "dist/src/canonical.js",
+          "dist/src/errors.js",
+          "dist/src/graph/topology.js",
+          "dist/src/pipeline/contracts.js",
+          "dist/src/runtime/environment.js",
+          "dist/src/runtime/process.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+          "/Users/kostenchuksergey/.codex/config.toml"
         ],
-        "evidenceRequirement": "Observed Node/npm/OS/architecture/Git/Codex and exercised POSIX process identity and process-group termination. Provider compatibility comes from the bound ordinary R2 invocation. Browser matrix remains outside scope.",
-        "successMeaning": "exit 0 only if the entire returnCondition is certified; missing or failed evidence returns nonzero.",
-        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
-        "satisfies": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI.",
-        "newPaidProbe": false
+        "executables": [
+          "codex",
+          "node",
+          "git",
+          "ps",
+          "npm"
+        ],
+        "args": [
+          "platform"
+        ],
+        "timeoutMs": 60000,
+        "purpose": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI.",
+        "satisfies": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI."
       }
     },
     {
@@ -297,18 +405,57 @@
       "rationale": "Работоспособность установленного CLI/протокола подтверждается фактическим вызовом до ready R3; кэш и X_OK недостаточны.",
       "status": "proposed",
       "returnCondition": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат.",
-      "runtimeCheckPreparation": {
-        "status": "design-only; module and exact Source Ref not yet created",
-        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
-        "module": "provider-compatibility",
-        "executables": [
-          "codex"
+      "runtimeModule": {
+        "path": "scripts/runtime-checks/omg-runtime-check.mjs",
+        "sha256": "16871063dc921913c5454b2344e1740fe867a303578d7d5fb63af9f169a450ad",
+        "source": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "mode": "provider"
+      },
+      "runtimeCheck": {
+        "script": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "dependencies": [],
+        "subjects": [
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+          "dist/src/adapters/codex-stdio.js",
+          "dist/src/canonical.js",
+          "dist/src/errors.js",
+          "dist/src/graph/topology.js",
+          "dist/src/pipeline/contracts.js",
+          "dist/src/runtime/environment.js",
+          "dist/src/runtime/process.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+          "/Users/kostenchuksergey/.codex/config.toml"
         ],
-        "evidenceRequirement": "Existing successful ordinary R2 omg-agent/v1 request/response with exact requested model/effort/configuration, adapter bytes and runtime identity captured when it ran. Old succeeded status without this binding is insufficient. No additional paid probe.",
-        "successMeaning": "exit 0 only for a compatible bound actual call; unavailable runtime binding or protocol evidence returns nonzero.",
-        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
-        "satisfies": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат.",
-        "newPaidProbe": false
+        "executables": [
+          "codex",
+          "node",
+          "git",
+          "ps"
+        ],
+        "args": [
+          "provider",
+          "/Users/kostenchuksergey/OMG/.omg/state.sqlite"
+        ],
+        "timeoutMs": 60000,
+        "purpose": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат.",
+        "satisfies": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат."
       }
     },
     {
@@ -345,11 +492,24 @@
         "ifInsufficient": "Read the required current metadata safely in read-only mode; never open the working database through Store"
       },
       "returnCondition": null,
-      "documentaryAllowancePreparation": {
-        "status": "exact Source Ref after approved import, before policy application",
-        "sourceId": "source:omg-live:audit-4.13-r2-gap-n-state",
-        "path": "PREPARATIONS/TOKEN-AUDIT/4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+      "documentaryAllowance": {
+        "sources": [
+          {
+            "id": "source:omg-live:audit-4.13-r2-gap-n-state",
+            "revision": 1,
+            "hash": "efa46a366a9e341b2b4e338c370664214f8abe2cca41b67b8667c3a79f8b8fe0"
+          }
+        ],
         "claimLimit": "Partial metadata projection, not full integrity proof or permission/need to migrate history"
+      },
+      "documentSource": {
+        "path": "PREPARATIONS/TOKEN-AUDIT/4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+        "sha256": "aad1c7f184620d322ca61a4db6c8a8a8b6a7be24ffc2b54f2fec12e8b6f430a7",
+        "source": {
+          "id": "source:omg-live:audit-4.13-r2-gap-n-state",
+          "revision": 1,
+          "hash": "efa46a366a9e341b2b4e338c370664214f8abe2cca41b67b8667c3a79f8b8fe0"
+        }
       }
     },
     {
@@ -631,19 +791,57 @@
       "rationale": "Срок задан исходным текстом: до R3 зависимого исполнения. Новые платные probes исследованием не разрешаются; используются точные имеющиеся результаты и безопасные сведения о среде.",
       "status": "proposed",
       "returnCondition": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие.",
-      "runtimeCheckPreparation": {
-        "status": "design-only; module and exact Source Ref not yet created",
-        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
-        "module": "runtime-integration",
+      "runtimeModule": {
+        "path": "scripts/runtime-checks/omg-runtime-check.mjs",
+        "sha256": "16871063dc921913c5454b2344e1740fe867a303578d7d5fb63af9f169a450ad",
+        "source": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "mode": "integration"
+      },
+      "runtimeCheck": {
+        "script": {
+          "id": "source:omg-live:runtime-check-module-16871063dc921913",
+          "revision": 1,
+          "hash": "6f2dce08d72453de28e81fc1554372d1ae1678d88d53b0323c5185ba2442fd3b"
+        },
+        "dependencies": [],
+        "subjects": [
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+          "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+          "dist/src/adapters/codex-stdio.js",
+          "dist/src/canonical.js",
+          "dist/src/errors.js",
+          "dist/src/graph/topology.js",
+          "dist/src/pipeline/contracts.js",
+          "dist/src/runtime/environment.js",
+          "dist/src/runtime/process.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+          "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+          "/Users/kostenchuksergey/.codex/config.toml"
+        ],
         "executables": [
           "codex",
+          "node",
+          "git",
           "ps"
         ],
-        "evidenceRequirement": "Safe effective environment projection matched to actual adapter/Node/Codex and configured limits, plus exact isolation observations and ordinary provider-call evidence. Never infer provider success from executable availability or model cache.",
-        "successMeaning": "exit 0 only when all parts of returnCondition have current bound evidence. No additional paid probe.",
-        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
-        "satisfies": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие.",
-        "newPaidProbe": false
+        "args": [
+          "integration",
+          "/Users/kostenchuksergey/OMG/.omg/state.sqlite"
+        ],
+        "timeoutMs": 60000,
+        "purpose": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие.",
+        "satisfies": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие."
       }
     },
     {
@@ -1074,5 +1272,37 @@
     "channelSeq": 15,
     "status": "accepted-classification; resolution routes added"
   },
-  "runtimePreparationStatus": "Five check designs recorded for review. These preparation fields are not applied RuntimeCheck objects; no source refs or successful observations are fabricated. Materialize reviewed modules and exact refs before applying scope r2 once."
+  "runtimePreparationStatus": "Modules and deterministic expected source refs materialized. Import exact bytes and compare actual refs before applying policy once; no import or observation was executed by this preparation.",
+  "runtimeAssets": {
+    "module": {
+      "path": "scripts/runtime-checks/omg-runtime-check.mjs"
+    },
+    "document": {
+      "path": "PREPARATIONS/TOKEN-AUDIT/4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+      "sourceId": "audit-4.13-r2-gap-n-state"
+    },
+    "database": "/Users/kostenchuksergey/OMG/.omg/state.sqlite",
+    "subjects": [
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-stdio.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/adapters/codex-usage.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/canonical.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/errors.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/graph/topology.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/pipeline/contracts.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/environment.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/model-usage.js",
+      "/private/var/folders/1k/sfc7yvss1jq2sl134vfwy0dc0000gn/T/omg-layer-revisions-cri0r7a_/dist/src/runtime/process.js",
+      "dist/src/adapters/codex-stdio.js",
+      "dist/src/canonical.js",
+      "dist/src/errors.js",
+      "dist/src/graph/topology.js",
+      "dist/src/pipeline/contracts.js",
+      "dist/src/runtime/environment.js",
+      "dist/src/runtime/process.js",
+      "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/bin/codex.js",
+      "/Users/kostenchuksergey/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+      "/Users/kostenchuksergey/.codex/config.toml"
+    ],
+    "note": "Paths resolved from the installed launcher and the actual environment/pilot adapters. config.toml is hashed only; secret contents are not copied. No live probe has been executed."
+  }
 }
