@@ -29,6 +29,7 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
       instruction: "Complete original gap questions and deferral reasons remain at ref /obligations/index; this is an address index, not evidence of irrelevance." } : null,
     role: body.role, dispatchMode: "planning", stage: body.stage, level: body.level, consumer: body.consumer,
     draft: body.draft, question: { id: body.question.id, field: body.question.field, kind: body.question.kind,
+      ...(body.question.basisContract ? {basisContract:body.question.basisContract} : {}),
       prompt: body.question.prompt, risk: body.question.risk },
     objective: body.core.objective, problem: body.core.problem, actors: body.core.actors,
     constraints: body.core.constraints, specificationConstraints: body.core.specificationConstraints,

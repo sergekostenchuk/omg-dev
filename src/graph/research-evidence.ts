@@ -8,6 +8,7 @@ import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath } from "../runtime/environment.js";
 import type { Graph } from "./model.js";
 import { deferredGap, type TechnicalReport } from "./research-contracts.js";
+import { resolveResearchBasis } from './research-basis.js';
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
@@ -25,9 +26,14 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
   const actors = (initial?.value.content as unknown as { fields?: { preparation?: { actors?: { id: string }[] } } })?.fields?.preparation?.actors ?? [];
   const consumers = new Set(researchConsumerIds(store, project, graph));
-  const files = observations.map(observation => store.get<Source>(observation.source.id)!).filter(source => source.value.origin.kind === "file");
+  const files = observations.map(observation => store.get<Source>(observation.source.id)).filter((source): source is NonNullable<typeof source> => source?.value.origin.kind === "file");
+  const question = store.get<Question>(questionId);
+  const draft = question?.value.draftId ? store.get<DiscoveryDraft>(question.value.draftId) : null;
+  const typed = question?.value.spec.basisContract === 'typed-v1';
+  if (typed !== (draft?.value.basisContract === 'typed-v1')) fail('research_contract_mismatch', questionId, 'Question and draft must retain the same basis contract');
+  if (typed) findings.push(...resolveResearchBasis(store, project, report, observations, root, field).findings);
   if (report.applicability === "applicable" && !report.facts.length && !report.designs.length) fail("research_report_empty", questionId, "An applicable domain needs concrete facts or explicit design decisions");
-  if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
+  if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length || report.documents?.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
   if (field.startsWith("gap_") && report.applicability !== "applicable") fail("research_gap_unresolved", questionId, "An inherited gap needs a concrete resolution, including when research disproves its premise");
   const obligations = store.get<Question>(questionId)?.value.spec.obligations;
   if (obligations?.length) {
@@ -44,9 +50,9 @@ export function technicalProposalFindings(store: Store, project: string, level: 
         fail("research_group_coverage_missing", obligation.id, "Group member lacks an attributable resolution; applicability alone cannot close it");
     }
   }
-  for (const fact of report.facts) {
+  for (const fact of typed ? [] : report.facts) {
     try {
-      const path = realpathSync(workspacePath(root, fact.path));
+      const path = realpathSync(workspacePath(root, fact.path ?? ''));
       if (!files.some(source => source.value.origin.location === path)) fail("repository_evidence_required", fact.id, "A repository fact must cite its actual source file");
     } catch { fail("repository_evidence_required", fact.id, "The factual source path is unavailable or outside the repository"); }
   }

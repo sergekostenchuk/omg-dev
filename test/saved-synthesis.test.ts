@@ -75,7 +75,8 @@ function fixture(t: test.TestContext, scenario = "answer", level: "R1" | "R2" = 
   const pieces = ["Publish only a complete validated output", "Reject invalid input without publishing a result"].map((decision, index) =>
     checkpoint(store, draft, question, { action: "checkpoint", question: question.id,
       value: { action: "answer", question: question.id, value: { applicability: "applicable", reason: "A local stateless transformation",
-        facts: [], designs: [{ id: `saved-design-${index}`, decision, benefit: "One valid consumer result", consumer: "compilation" }], gaps: [] }, citations } as unknown as Json,
+        facts: [], designs: [{ id: `saved-design-${index}`, decision, benefit: "One valid consumer result", consumer: "compilation" }], gaps: [],
+        ...(question.value.spec.basisContract === "typed-v1" ? { documents: [] } : {}) }, citations } as unknown as Json,
       citations, unresolved: ["Combine the saved findings"] }));
   const settings: ReaderPilotSettings = { experimental: true, active: true, stopAfter: "L2",
     reader: { actor: "reader", model: "fixture", effort: "high", speed: "inherited", command }, agentCommand: command,

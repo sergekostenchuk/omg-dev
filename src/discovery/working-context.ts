@@ -84,9 +84,11 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (body['question'] && typeof body['question']==='object') {
       const q=body['question'] as Record<string,Json>;
       dynamic['question']={id:q['id']??question.id,field:q['field']??question.value.spec.field,kind:q['kind']??question.value.spec.kind,
+        ...(question.value.spec.basisContract ? {basisContract:question.value.spec.basisContract} : {}),
         prompt:q['prompt']??question.value.spec.prompt,schema:question.value.spec.schema,obligations:question.value.spec.obligations??[],schemaAddress:{record:reference(archive),pointer:'/body/question/schema'}};
     }
-    if (body['questions']) dynamic['questions']=[dynamic['question']??{id:question.id,field:question.value.spec.field,kind:question.value.spec.kind,prompt:question.value.spec.prompt}];
+    if (body['questions']) dynamic['questions']=[dynamic['question']??{id:question.id,field:question.value.spec.field,kind:question.value.spec.kind,prompt:question.value.spec.prompt,
+      ...(question.value.spec.basisContract ? {basisContract:question.value.spec.basisContract} : {})}];
     if (body['previousProposal']) {
       const changes=previousBody?candidateDelta(previousBody['previousProposal'],body['previousProposal']):[];
       dynamic['proposalChanges']={current:{record:reference(archive),pointer:'/body/previousProposal'},base:options.previous??null,changes};
@@ -130,7 +132,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     return planningContext(body,reference(archive),maxChars,options.contextChars);
   }
   const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
-    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
+    "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
     ? [...mandatory.filter(key=>FOUNDATION_FIELDS.includes(key as any)),...mandatory.filter(key=>!FOUNDATION_FIELDS.includes(key as any))] : mandatory;

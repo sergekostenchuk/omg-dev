@@ -29,7 +29,8 @@ if(request.mode==='research') {
   const q=(manifest.researchGap?c.questions.find(q=>q.field!=='contractsAndConsumers'):null)??c.questions[0], source=c.inventory.sources.find(item=>item.ref.id.includes(':failure-'));
   const value=q.field==='layerDesign'?manifest.design:
    {applicability:'applicable',reason:'Repair the observed missing consumer refusal contract while retaining the accepted producer',facts:[],
-    designs:[{id:q.field+'-repair',decision:'Add a consumer counterfactual that removes its input and requires input_missing, preserve the accepted producer and its data contract',benefit:'A caller receives a defined refusal instead of unchecked input',consumer:'p-consume-work'}],gaps:[]};
+    designs:[{id:q.field+'-repair',decision:'Add a consumer counterfactual that removes its input and requires input_missing, preserve the accepted producer and its data contract',benefit:'A caller receives a defined refusal instead of unchecked input',consumer:'p-consume-work'}],gaps:[],
+    ...(q.basisContract==='typed-v1'?{documents:[]}:{})};
   if(manifest.researchGap&&q.field==='contractsAndConsumers'&&!c.inventory.sources.some(item=>item.ref.id.includes(':repair-feedback-')))
    value.gaps=[{id:'unresolved-consumer',target:'p-consume-work',field:'ports',consumer:'p-consume-work',requiredFor:'current',question:'The current consumer input remains unresolved'}];
   reply({action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:''}}]});

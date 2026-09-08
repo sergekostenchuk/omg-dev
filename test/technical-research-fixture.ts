@@ -8,6 +8,7 @@ import { reference } from "../src/pipeline/contracts.js";
 import { hashJson, type Json } from "../src/canonical.js";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
+import { resolveResearchBasis } from '../src/graph/research-basis.js';
 
 const DESIGNS: Record<string, string> = {
   productDomain: "Model input, validated intermediate data and terminal result as distinct values; one transformation owns each output.",
@@ -39,12 +40,16 @@ export function answerTechnicalFixture(engine: ProductEngine, project: string, d
     const question = engine.store.get<Question>(id)!;
     if (question.value.status === "answered") continue;
     const report = transform(question.value.spec.field, { applicability: "applicable", reason: "The accepted fixture describes a new local stateless product",
-      facts: [{ id: `${question.value.spec.field}-baseline`, claim: `Baseline documentation contains: ${source.value.content.trim()}`, path: "README.md" }],
+      facts: [{ id: `${question.value.spec.field}-baseline`, claim: `Baseline documentation contains: ${source.value.content.trim()}`,
+        ...(question.value.spec.basisContract === 'typed-v1' ? { evidence: { kind: 'repository-file' as const, citation: 0 } } : { path: 'README.md' }) }],
       designs: [{ id: `${question.value.spec.field}-design`, decision: DESIGNS[question.value.spec.field] ?? "Resolve the inherited gap using the declared producer and consumer contract before proceeding.",
-        benefit: "The consumer receives a bounded validated transformation result", consumer: "compilation" }], gaps: [] });
+        benefit: "The consumer receives a bounded validated transformation result", consumer: "compilation" }], gaps: [],
+      ...(question.value.spec.basisContract === 'typed-v1' ? { documents: [] } : {}) });
     const value: ResearchAssessment = { projectId: project, question: reference(question), value: report as unknown as Json,
       observations: [engine.discovery.evidence.observe(project, reference(source), { kind: "text-range", start: 0, end: source.value.content.length })],
       verdict: "supported", reasons: [], researcher: environment.value.implementer.actor, assessor: environment.value.reviewer.actor, environment: reference(environment) };
+    if (question.value.spec.basisContract === 'typed-v1') value.bases = resolveResearchBasis(engine.store, project, report,
+      value.observations, root, question.value.spec.field).bases;
     const assessment = engine.store.write<ResearchAssessment>({ id: `research-assessment:${hashJson(value)}`, kind: "research-assessment", expected: 0, value });
     engine.discovery.researched(id, question.revision, reference(assessment));
   }

@@ -32,8 +32,11 @@ else {
   value=JSON.parse(readFileSync(process.argv[2],'utf8'))[c.level==='R1'?'2':'3'];
   if(!feedback)value.nodes.find(n=>n.kind==='block').purpose='Unresearched replacement of accepted upper meaning';
  } else value={applicability:'applicable',reason:'The fixture product has a local runtime',
-   facts:[{id:q.field+'-fact',claim:'Baseline runtime documentation exists',path:!feedback&&['runtime','contractsAndConsumers'].includes(q.field)?'absent.ts':'README.md'}],
-   designs:[{id:q.field+'-design',decision:'Keep the transformation stateless and scoped to its output',benefit:'The consumer receives one validated result',consumer:'compilation'}],gaps:[]};
+   facts:[{id:q.field+'-fact',claim:'Baseline runtime documentation exists',...(q.basisContract==='typed-v1'
+    ?{evidence:{kind:'repository-file',citation:!feedback&&q.field==='contractsAndConsumers'?99:0}}
+    :{path:!feedback&&['runtime','contractsAndConsumers'].includes(q.field)?'absent.ts':'README.md'})}],
+   designs:[{id:q.field+'-design',decision:'Keep the transformation stateless and scoped to its output',benefit:'The consumer receives one validated result',consumer:'compilation'}],gaps:[],
+   ...(q.basisContract==='typed-v1'?{documents:[]}:{})};
  research={action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'text-range',start:0,end:source.length}}]};
 }console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research}));`;
 
@@ -77,7 +80,8 @@ test("R1/R2 and L2/L3 consumers autonomously correct only rejected fields for tw
         assert.ok(feedback[0]!.value.findings.some(finding => finding.code === "upper_layer_drift"));
       } else {
         assert.equal(feedback.length, 0, "Invalid facts must be refused before paid assessment and final consumption");
-        assert.ok(early.some(turn => JSON.stringify(turn.value.observation).includes("repository_evidence_required")));
+        assert.ok(early.some(turn => JSON.stringify(turn.value.observation).includes(
+          phase === "R2" ? "research_basis_invalid" : "repository_evidence_required")));
       }
       const affected = new Set(phase.startsWith("L") ? feedback[0]!.value.questions.map(ref => ref.id) : early.map(turn => turn.value.question?.id ?? (turn.value.action as {question:string}).question));
       assert.equal(affected.size, 1);

@@ -7,6 +7,7 @@ import { REFINEMENT_CONTRACT_VERSION, refinementQuestions, deferredGap } from '.
 import { researchScope, scopedQuestions, originalGaps } from '../graph/research-scope.js';
 import { defectGaps } from '../graph/plan-defects.js';
 import { layerDesignSpec, LAYER_DESIGN_VERSION } from '../graph/layer-design.js';
+import { withTypedBasis } from '../graph/research-basis.js';
 
 export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, pilot?: Revision<ReaderPilot> | null) {
   if (!pilot) return null;
@@ -29,6 +30,7 @@ export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft
     requireCondition(draft.value.contractVersion === LAYER_DESIGN_VERSION, 'research_contract_mismatch', 'L3 needs its layer design contract');
     specs = [layerDesignSpec(3)];
   }
+  if (draft.value.basisContract === 'typed-v1') specs = specs.map(withTypedBasis);
   requireCondition(specs.some(s => canonical(s) === canonical(question.value.spec)), 'research_contract_mismatch', 'Changed or forged question cannot select a mode by its field name');
   if (!pilot) return null;
   requireCondition(pilot.value.planning, 'planning_settings_missing', 'R2 continuation must retain explicit compact planning settings');

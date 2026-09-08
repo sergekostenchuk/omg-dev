@@ -11,9 +11,11 @@ const list = (items: Json): Json => ({ type: "array", items });
 export interface TechnicalGap { id: string; target: string; field: string; question: string; consumer: string; requiredFor: "current" | "next" }
 export interface TechnicalReport {
   applicability: "applicable" | "not_applicable"; reason: string;
-  facts: { id: string; claim: string; path: string }[];
+  facts: { id: string; claim: string; path?: string; evidence?: { kind: 'repository-file'; citation: number } }[];
   designs: { id: string; decision: string; benefit: string; consumer: string }[];
   gaps: TechnicalGap[];
+  documents?: { id: string; claim: string; kind: 'owner-document' | 'document-observation'; citation: number;
+    quote: string; designs: string[]; gaps: string[] }[];
   coverage?: { obligation: string; facts: string[]; designs: string[]; gaps: string[] }[];
 }
 export function deferredGap(graph: Graph, gap: TechnicalGap): boolean {

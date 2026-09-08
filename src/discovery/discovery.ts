@@ -9,9 +9,13 @@ import type { Graph } from "../graph/model.js";
 import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "./requirements.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import { deriveFields, type Derivation } from "./derived-draft.js";
+import { resolveResearchBasis } from '../graph/research-basis.js';
+import type { TechnicalReport } from '../graph/research-contracts.js';
+import { Environments } from '../runtime/environment.js';
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
+  basisContract?: 'typed-v1';
   obligations?: { id: string; target: string; field: string; consumer: string }[];
   targets?: { target: string; field: string; consumer: string; question: string }[] }
 export interface DiscoveryDraft {
@@ -19,6 +23,7 @@ export interface DiscoveryDraft {
   fields: Record<string, Json>; questions: string[];
   inputs: Ref[];
   contractVersion?: number;
+  basisContract?: 'typed-v1';
   derivations?: Derivation[];
 }
 export interface Question {
@@ -51,11 +56,14 @@ export class Discovery {
       && typeof spec.risk === "string" && spec.risk.trim() && Object.hasOwn(spec, "schema"))
       && new Set(specs.map(spec => spec.field)).size === specs.length, "question_invalid", "Questions need unique fields, a type, prompt and risk");
     for (const spec of specs) ajv.compile(spec.schema as object);
+    const typedBasis = specs.some(spec => spec.basisContract !== undefined);
+    requireCondition(!typedBasis || (stage === 'om-g2' && level === 'R2' && consumer === 'compilation'
+      && specs.every(spec => spec.basisContract === 'typed-v1')), 'research_contract_mismatch', 'Typed technical bases require a complete R2 question set');
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
     const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs), ...(contractVersion === undefined ? {} : { contractVersion }),
-      fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
+      ...(typedBasis ? { basisContract: 'typed-v1' as const } : {}), fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
         value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }))];
@@ -105,6 +113,16 @@ export class Discovery {
       && canonical(assessment.value.question) === canonical(reference(question))
       && assessment.value.researcher !== assessment.value.assessor && assessment.value.observations.length > 0
       && assessment.value.observations.every(item => this.evidence.verify(item)), "research_not_supported", "An exact supported assessment with current evidence is required");
+    const draft = this.store.get<DiscoveryDraft>(question.value.draftId);
+    requireCondition(question.value.spec.basisContract === draft?.value.basisContract,
+      'research_contract_mismatch', 'Answer must retain the basis contract of its draft');
+    if (question.value.spec.basisContract === 'typed-v1') {
+      requireCondition(ajv.compile(question.value.spec.schema as object)(assessment.value.value), 'answer_invalid', 'Typed answer must match its recorded schema');
+      const result = resolveResearchBasis(this.store, question.value.projectId, assessment.value.value as unknown as TechnicalReport,
+        assessment.value.observations, new Environments(this.store).effective(question.value.projectId).root, question.value.spec.field);
+      requireCondition(result.findings.length === 0 && Array.isArray(assessment.value.bases)
+        && canonical(result.bases) === canonical(assessment.value.bases), 'research_basis_invalid', 'Assessment must retain the exact machine-resolved bases and their proof limits');
+    }
     const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
     return this.#answer(question, answer.value, answer, "research-answer", [assessmentRef, assessment.value.environment,
       ...assessment.value.observations.map(item => item.source)]);

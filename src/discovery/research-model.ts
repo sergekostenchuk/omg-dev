@@ -6,6 +6,7 @@ import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
 
 export interface ResearchAssessment {
+  bases?: import('../graph/research-basis.js').ResolvedResearchBasis[];
   projectId: string; question: Ref; value: Json; observations: Observation[];
   verdict: "supported" | "insufficient" | "conflicting"; reasons: string[];
   researcher: string; assessor: string; environment: Ref;

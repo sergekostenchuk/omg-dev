@@ -16,6 +16,7 @@ import { technicalProposalFindings } from "../graph/research-evidence.js";
 import type { TechnicalReport } from "../graph/research-contracts.js";
 import type { Graph } from "../graph/model.js";
 import { assessmentSession } from "./assessment-session.js";
+import { resolveResearchBasis } from '../graph/research-basis.js';
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
@@ -33,13 +34,18 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     if (findings.length) throw new EngineError("research_proposal_invalid", "Correct the typed proposal findings before model assessment", findings);
   }
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
+  const bases = question.value.spec.basisContract === 'typed-v1'
+    ? resolveResearchBasis(store, draft.value.projectId, action.value as unknown as TechnicalReport, observations, root, question.value.spec.field).bases : undefined;
+  // Exact quotes are already in the paged candidate and observations. Keep only
+  // machine bindings mandatory instead of duplicating every quote on every page.
+  const basisBindings = bases?.map(({ quote: _quote, ...binding }) => binding);
   const pilotPacket = pilot ? pilotContext(store, draft, question) : null;
-  const context = pilotPacket ? { ...pilotPacket, role: "assess-answer", question: question.value.spec,
+  const context = pilotPacket ? { ...pilotPacket, ...(basisBindings ? { bases: basisBindings } : {}), role: "assess-answer", question: question.value.spec,
     sourceLocations: observations.map(o => ({ source: o.source, location: store.get<any>(o.source.id)!.value.origin.location })),
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations, consumerFeedback: consumerFeedback(store, draft.value) }
-    : { role: "assess-answer", question: question.value.spec, value: action.value, observations,
+    : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), question: question.value.spec, value: action.value, observations,
       prerequisites: researchPrerequisites(store, draft.value), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
   const prompt = "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions.";
@@ -48,7 +54,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     && Array.isArray(response.reasons) && response.reasons.every(item => typeof item === "string")
     && (response.verdict === "supported" || response.reasons.length > 0), "assessment_invalid", "Assessment must explicitly classify support and explain unresolved evidence");
   const value: ResearchAssessment = { projectId: question.value.projectId, question: reference(question), value: action.value,
-    observations, verdict: response.verdict as ResearchAssessment['verdict'], reasons: response.reasons,
+    ...(bases ? { bases } : {}), observations, verdict: response.verdict as ResearchAssessment['verdict'], reasons: response.reasons,
     researcher: environment.value.implementer.actor, assessor: environment.value.reviewer.actor, environment: reference(environment) };
   const id = `research-assessment:${hashJson(value)}`;
   return store.get<ResearchAssessment>(id) ?? store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value }],
