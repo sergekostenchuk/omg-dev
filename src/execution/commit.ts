@@ -3,17 +3,18 @@ import { git, type Environment, type ExecutionRoot } from "../runtime/environmen
 import { treeFile } from "../runtime/git-files.js";
 import { digest, hashJson } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
-import { requireCondition } from "../errors.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { receiptId, type ArtifactReceipt, type MachinePlan, type CompiledTask } from "../compiler/model.js";
 import type { TaskRun } from "./model.js";
 import { requireWorktree } from "./worktree.js";
+import { requirePlanTaskObligations, requireTaskObligationProofs, taskResultProofs, requireCurrentTaskResult } from './task-obligations.js';
 
 export const subjectHash = (plan: Ref, task: string, parent: string, tree: string): string => hashJson({ plan, task, parent, tree });
 export function checkCommands(task: CompiledTask, environment: Environment) {
   return [...new Map([...task.tests.flatMap(test => [test.command, ...(test.contract?.counterfactuals.map(item => item.command) ?? [])]), environment.fullCheck]
     .map(command => [hashJson(command), command])).values()];
 }
-export function requireGates(run: TaskRun, task: CompiledTask, environment: Environment): void {
+export function requireGates(run: TaskRun, task: CompiledTask, environment: Environment, store: Store): void {
   requireCondition(run.artifacts.length === task.produces.length && new Set(run.artifacts.map(item => item.id)).size === task.produces.length
     && task.produces.every(id => run.artifacts.some(item => item.id === id)), "artifact_set_invalid", "Acceptance must preserve all implemented contracts");
   requireCondition(run.tree && run.checks.length === checkCommands(task, environment).length
@@ -22,16 +23,32 @@ export function requireGates(run: TaskRun, task: CompiledTask, environment: Envi
   requireCondition(run.review?.verdict === "pass" && run.review.kind === "none" && run.review.findings.length === 0
     && run.reviewSubject === subjectHash(run.plan, task.id, run.parent, run.tree),
     "review_not_passed", "Independent review must pass on this exact candidate");
+  requireTaskObligationProofs(store, run, task);
 }
 export function commitIntent(store: Store, root: Revision<ExecutionRoot>, run: Revision<TaskRun>, plan: MachinePlan,
   task: CompiledTask, environment: Environment, guards: Ref[]): Revision<TaskRun> {
-  requireGates(run.value, task, environment); requireWorktree(root.value, run.value.parent);
+  requirePlanTaskObligations(store, plan, task);
+  const proof = taskResultProofs(store, run.value, task);
+  const candidate = { ...run.value, ...(task.researchObligations !== undefined ? { obligationResultProofs: proof.proofs } : {}) };
+  requireGates(candidate, task, environment, store); requireWorktree(root.value, run.value.parent);
   const commit = git(root.value.path, ["-c", "user.name=OMG Engine", "-c", "user.email=engine@omg.local", "commit-tree", run.value.tree!, "-p", run.value.parent],
     `${task.title}\n\nOMG plan: ${plan.hash}\nOMG task: ${task.id}\n`);
-  return store.writeMany<TaskRun>([{ id: run.id, kind: run.kind, expected: run.revision,
-    value: { ...run.value, state: "commit_pending", commit, updatedAt: Date.now() } }], [reference(root), reference(run), ...run.value.inputs, ...guards])[0]!;
+  try {
+    return store.writeMany<TaskRun>([{ id: run.id, kind: run.kind, expected: run.revision,
+      value: { ...candidate, state: "commit_pending", commit, updatedAt: Date.now() } }], [reference(root), reference(run), ...run.value.inputs, ...guards, ...proof.guards])[0]!;
+  } catch (error) {
+    // A changed late confirmation is a pause, never an automatic code retry.
+    if (error instanceof EngineError && error.code === 'input_stale') {
+      requireCondition(!proof.guards.some(ref => {
+        const current = store.get(ref.id);
+        return !current || current.revision !== ref.revision || current.hash !== ref.hash;
+      }), 'task_obligation_result_required', 'A result-confirmation input changed before acceptance; preserve the checked candidate');
+      requireCurrentTaskResult(store, candidate, task);
+    }
+    throw error;
+  }
 }
-export function publishCommit(root: ExecutionRoot, run: TaskRun): void {
+export function publishCommit(root: ExecutionRoot, run: TaskRun, store: Store, task: CompiledTask): void {
   requireCondition(run.commit && run.tree, "commit_intent_missing", "Recovery needs an exact commit intent");
   const head = git(root.path, ["rev-parse", "HEAD"]);
   requireWorktree(root, head);
@@ -39,11 +56,12 @@ export function publishCommit(root: ExecutionRoot, run: TaskRun): void {
     && git(root.path, ["rev-parse", `${run.commit}^{tree}`]) === run.tree, "commit_foreign", "Commit does not match its recorded parent and reviewed tree");
   if (head === run.commit) return;
   requireCondition(head === run.parent, "commit_parent_changed", "Branch changed outside this commit intent; no reset was performed");
+  requireCurrentTaskResult(store, run, task);
   git(root.path, ["update-ref", `refs/heads/${root.branch}`, run.commit, run.parent]);
 }
 export function finishCommit(store: Store, root: Revision<ExecutionRoot>, run: Revision<TaskRun>, plan: MachinePlan,
   task: CompiledTask, environment: Environment): Revision<TaskRun> {
-  requireGates(run.value, task, environment);
+  requireGates(run.value, task, environment, store);
   requireCondition(run.value.state === "commit_pending" && run.value.commit && run.value.tree, "commit_intent_missing", "An exact pending commit is required");
   requireWorktree(root.value, run.value.commit);
   const accepted: TaskRun = { ...run.value, state: "committed", child: null, updatedAt: Date.now() };

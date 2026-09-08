@@ -10,6 +10,8 @@ import { projectGraph } from "./project.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { continuityFindings } from "./semantics.js";
 import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
+import { obligationHandoff } from './obligation-handoff.js';
+import { requireTaskObligations } from './task-obligations.js';
 
 interface Obligation { node: string; field: string; valueHash: string; inputs: Ref[] }
 interface LayerProof { level: 1 | 2 | 3; hash: string; inputs: Ref[] }
@@ -92,15 +94,17 @@ export class GraphRepository {
     const questions = draft.value.questions.map(id => this.store.get<Question>(id)!);
     const research = this.store.get(`phase:${projectId}:R${level - 1}`);
     const upper = this.store.get(`graph-layer:${projectId}:${level - 1}`);
+    const handoff = level === 3 && research ? obligationHandoff(this.store, projectId, [reference(research)]) : null;
     requireCondition(draft.value.stage === "om-g2" && draft.value.level === `R${level - 1}`
       && draft.value.consumer === current.value.nodes.find(node => node.kind === "product")?.id
       && draft.value.contractVersion === LAYER_DESIGN_VERSION
-      && canonical(questions.map(question => question.value.spec)) === canonical([layerDesignSpec(level)])
+      && canonical(questions.map(question => question.value.spec)) === canonical([layerDesignSpec(level, handoff)])
       && research && upper && [research, upper].every(record => draft.value.inputs.some(ref => canonical(ref) === canonical(reference(record)))),
     "layer_research_foreign", "Layer design must use its exact contract, accepted research and upper layer");
     requireCondition(questions.every(question => question.value.answer && this.store.get(question.value.answer.id)?.kind === "research-answer"),
       "research_assessment_required", "Layer construction requires assessed model research, not a manual graph declaration");
     const graph = composeLayer(current.value, level, draft.value.fields['layerDesign']);
+    if (handoff) requireTaskObligations(this.store, projectId, graph, handoff);
     const prior = this.store.get<Binding>(`graph-binding:${projectId}`);
     const proofs = [...(prior?.value.layerProofs ?? []).filter(proof => proof.level < level),
       { level, hash: hashJson(projectGraph(graph, level)), inputs: checked.guards }];

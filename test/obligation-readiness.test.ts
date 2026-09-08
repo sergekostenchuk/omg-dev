@@ -16,6 +16,9 @@ import type { RuntimeObservationResult } from '../src/runtime/runtime-observatio
 import type { Feasibility } from '../src/graph/refinement.js';
 import { readinessObligations } from '../src/graph/obligation-readiness.js';
 import { obligationHandoff } from '../src/graph/obligation-handoff.js';
+import { taskBindingId } from '../src/graph/task-obligations.js';
+import type { Graph } from '../src/graph/model.js';
+import { hashJson } from '../src/canonical.js';
 
 function fixture(t: test.TestContext, { exit = 0, certifies = true } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-readiness-'))), workspace = join(root, 'repo'); mkdirSync(workspace);
@@ -50,6 +53,12 @@ function fixture(t: test.TestContext, { exit = 0, certifies = true } = {}) {
   const scope = configureResearchScope(store, { ...original.value, policy }, 1);
   const r2 = engine.refinement.begin('p', 'R2'); answerTechnicalFixture(engine, 'p', r2);
   const r2Phase = engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  // New L3 assigns the future proof to concrete work/tests. It still does not
+  // require the implementation result before compiling the plan that assigns it.
+  const carried = obligationHandoff(store, 'p', [reference(r2Phase)])!.obligations.find(item => item.obligation === 'future-result')!;
+  const graph = store.get<Graph>('graph:p')!;
+  engine.graphs.save('p', { ...graph.value, researchObligations: [{ id: taskBindingId(carried), scope: carried.scope,
+    obligation: carried.obligation, consumers: [{ node: 'p-consume-work', tests: ['p-consume-work-test'] }] }] }, graph.revision, 'fixture');
   deriveLayerFixture(engine, 'p', 3); const l3 = engine.refinement.sealLayer('p', 3, 0);
   const observe = (key = 'ready') => engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope), obligation: 'runtime-ready', key }) as Promise<RuntimeObservationResult>;
   const assess = () => engine.refinement.assess('p', store.get('feasibility:p')?.revision ?? 0);
@@ -70,6 +79,15 @@ test('R3 requires actual declared confirmation and retains future result debt wi
   assert.ok(ready.value.inputs.some(ref => ref.id === observed.observation.id));
   const stage = f.engine.refinement.publish('p', reference(ready), 0); f.engine.pipeline.accept('p', 'om-g2', stage.revision);
   const plan = f.engine.compiler.compile('p'); assert.deepEqual(f.engine.compiler.gate('p', reference(plan)).findings, []);
+  const task = plan.value.tasks.find(item => item.node === 'p-consume-work')!;
+  assert.equal(task.researchObligations!.length, 1);
+  assert.equal(task.researchObligations![0]!.requirement.obligation, 'future-result');
+  const context = f.engine.compiler.context('p', reference(plan), task.id, 50000);
+  assert.deepEqual(JSON.parse(context.text).criteria.researchObligations, task.researchObligations);
+  const { hash: _hash, ...body } = structuredClone(plan.value);
+  delete body.tasks.find(item => item.id === task.id)!.researchObligations;
+  const forged = f.store.write({ id: 'plan:p:missing-task-obligations', kind: 'plan', expected: 0, value: { ...body, hash: hashJson(body) } });
+  assert.throws(() => f.engine.compiler.read(forged.id), { code: 'plan_derivation_mismatch' });
   assert.equal(f.store.list('task-run').length, 0, 'A plan assigning future work is accepted before its implementation');
   assert.equal(f.store.list('model-call').length, 0, 'R3 and compilation launch no new probe or model call');
 });

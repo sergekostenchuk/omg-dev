@@ -19,11 +19,13 @@ import { withTypedBasis } from './research-basis.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
 import { withObligationEvidence } from './obligation-evidence.js';
 import { readinessObligations, type ReadinessObligations } from './obligation-readiness.js';
+import { obligationHandoff } from './obligation-handoff.js';
+import { requireTaskObligations, TASK_OBLIGATION_CONTRACT } from './task-obligations.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
 interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number;
-  carried?: CarriedObligation[]; carriedContract?: 'r3-v1' }
+  carried?: CarriedObligation[]; carriedContract?: 'r3-v1'; taskObligationContract?: string }
 export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'];
   obligations?: ReadinessObligations }
 
@@ -131,12 +133,15 @@ export class Refinement {
     requireCondition(checked.findings.length === 0, "layer_not_ready", "Graph layer is missing or stale");
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && (level !== 3 || graph.value.horizon.length > 0), "horizon_empty", "Choose the nearest L3 execution horizon");
+    const handoff = level === 3 ? obligationHandoff(this.store, project, inputs) : null;
+    if (handoff) requireTaskObligations(this.store, project, graph.value, handoff);
     requireCondition(graph.value.version !== 2 || level === 1 || this.graphs.layerIsDerived(project, level),
       "layer_design_required", "Build this layer from assessed research before sealing it");
     const layer = this.store.get(`graph-layer:${project}:${level}`)!;
     const guards = uniqueRefs([...inputs, ...checked.guards]);
     return this.#milestone(`phase:${project}:${phase}`, expected,
-      { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase, inputs: guards, draft: null, layer: reference(layer) },
+      { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase, inputs: guards, draft: null, layer: reference(layer),
+        ...(handoff ? { taskObligationContract: TASK_OBLIGATION_CONTRACT } : {}) },
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
   }
   prepareLayer(project: string, level: 2 | 3): Revision<DiscoveryDraft> {
@@ -149,7 +154,7 @@ export class Refinement {
     const scope = level === 3 ? researchScope(this.store, project) : null;
     if (scope) inputs.push(reference(scope));
     return this.discovery.create(project, "om-g2", level === 2 ? "R1" : "R2", graph.value.nodes.find(node => node.kind === "product")!.id,
-      [layerDesignSpec(level)], uniqueRefs([...inputs, reference(upper), ...effective.guards]), LAYER_DESIGN_VERSION);
+      [layerDesignSpec(level, level === 3 ? obligationHandoff(this.store, project, inputs) : null)], uniqueRefs([...inputs, reference(upper), ...effective.guards]), LAYER_DESIGN_VERSION);
   }
   buildLayer(project: string, level: 2 | 3, draft: Ref, expected: number, actor: string): Revision<Graph> {
     assertPilotBoundary(this.store, project, `L${level}`);

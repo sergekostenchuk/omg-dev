@@ -51,7 +51,7 @@ export class Owners {
     const environment = this.store.get<Environment>(plan.value.environment.id, plan.value.environment.revision);
     requireCondition(environment?.kind === "environment" && environment.hash === plan.value.environment.hash,
       "ownership_proof_foreign", "The accepted writer has no matching check environment");
-    requireGates(latest.value, latest.task, environment.value);
+    requireGates(latest.value, latest.task, environment.value, this.store);
     const bytes = treeFile(this.repository.root, latest.value.commit!, path);
     const current = treeFile(this.repository.root, this.repository.head, path);
     const hash = bytes === null ? null : digest(bytes);

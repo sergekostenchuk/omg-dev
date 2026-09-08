@@ -16,6 +16,7 @@ import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 import { Owners } from "../ownership/owners.js";
 import { readinessObligations } from '../graph/obligation-readiness.js';
+import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
 export type { MachinePlan } from "./model.js";
 
 export class Compiler {
@@ -31,8 +32,11 @@ export class Compiler {
     const record = this.store.get<Graph>(`graph:${project}`)!; const graph = requireGraph(record.value);
     const environment = this.environments.get(project);
     const owners = new Owners(this.store, project, feasibility.value.repository!);
+    const handoff = taskObligationHandoff(this.store, project, feasibility.value.inputs);
+    const researchObligations = handoff ? requireTaskObligations(this.store, project, graph, handoff) : undefined;
     const derived = deriveTasks(project, record.hash, graph, (producer, artifact) =>
-      resolveArtifact(this.store, project, graph, feasibility.value.repository!, producer, artifact), { version: 2, owner: path => owners.latest(path) });
+      resolveArtifact(this.store, project, graph, feasibility.value.repository!, producer, artifact), { version: 2, owner: path => owners.latest(path),
+        ...(researchObligations ? { researchObligations } : {}) });
     const guards = [...new Map([...stage.guards, ...checked.guards, ...derived.guards].map(ref => [`${ref.id}:${ref.revision}`, ref])).values()];
     const body = { version: 2 as const, projectId: project, graph: reference(record), environment: reference(environment),
       stage: reference(stage.artifact), feasibility: feasibilityRef, base: feasibility.value.repository,
@@ -57,9 +61,12 @@ export class Compiler {
     requireCondition(graph?.kind === "graph" && graph.hash === plan.value.graph.hash
       && hashJson(graph.value) === hashJson(plan.value.graphSnapshot), "plan_foreign", "Plan must bind its exact graph version");
     const owners = plan.value.version === 2 ? new Owners(this.store, plan.value.projectId, plan.value.base) : null;
+    const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
+    const handoff = taskObligationHandoff(this.store, plan.value.projectId, basis.value.inputs);
+    const researchObligations = handoff ? requireTaskObligations(this.store, plan.value.projectId, graph.value, handoff) : undefined;
     const derived = deriveTasks(plan.value.projectId, graph.hash, requireGraph(graph.value), (producer, artifact) =>
       resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards),
-    { version: plan.value.version, owner: path => owners?.latest(path) ?? null });
+    { version: plan.value.version, owner: path => owners?.latest(path) ?? null, ...(researchObligations ? { researchObligations } : {}) });
     requireCondition(hashJson(derived.tasks) === hashJson(plan.value.tasks), "plan_derivation_mismatch", "Tasks must be derived from the bound map without manual edits");
     return plan;
   }

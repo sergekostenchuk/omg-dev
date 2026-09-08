@@ -8,6 +8,7 @@ import type { ResearchScope } from './research-scope.js';
 import { obligationAssignment, type CarriedObligation } from './obligation-policy.js';
 import { obligationHandoff, type ObligationHandoff } from './obligation-handoff.js';
 import { runtimeSupport } from './runtime-evidence.js';
+import { runtimeSource } from '../runtime/runtime-observation-model.js';
 
 export interface ObligationConfirmation { obligation: string; source: Ref; observation: Ref }
 export interface ReadinessObligations { handoff: ObligationHandoff; confirmations: ObligationConfirmation[] }
@@ -31,6 +32,37 @@ function confirmation(store: Store, project: string, obligation: CarriedObligati
   if (!dispatch) return null;
   return { proof: { obligation: obligation.obligation, source, observation: reference(found.record) },
     guards: [...found.guards, reference(dispatch)], dependencies: uniqueRefs([source, reference(found.record), ...found.code.map(code => code.source)]) };
+}
+
+export function findObligationConfirmation(store: Store, project: string, obligation: CarriedObligation, pinned?: ObligationConfirmation) {
+  const sources = pinned ? [pinned.source] : store.list<Source>('source')
+    .filter(source => source.value.projectId === project && source.value.provenance?.kind === 'runtime-observation')
+    .sort((a, b) => a.id.localeCompare(b.id)).map(reference);
+  const found = sources.map(source => confirmation(store, project, obligation, source)).find(Boolean);
+  return found && (!pinned || canonical(found.proof) === canonical(pinned)) ? found : null;
+}
+
+/** A sealed task admission is checked against immutable records. Later runtime
+ * changes do not rewrite the fact that the condition was met at task start. */
+export function frozenObligationConfirmation(store: Store, project: string, obligation: CarriedObligation, proof: ObligationConfirmation): boolean {
+  try {
+    if (obligation.kind !== 'environment-confirmation' || !obligation.returnCondition
+      || obligation.runtimeCheck?.satisfies !== obligation.returnCondition || proof.obligation !== obligation.obligation
+      || !isRef(proof.source) || !isRef(proof.observation)) return false;
+    const record = store.get<RuntimeObservation>(proof.observation.id, proof.observation.revision);
+    const source = store.get<Source>(proof.source.id, proof.source.revision);
+    if (record?.kind !== 'runtime-observation' || source?.kind !== 'source' || record.value.projectId !== project
+      || source.value.projectId !== project || canonical(reference(record)) !== canonical(proof.observation)
+      || canonical(reference(source)) !== canonical(proof.source) || record.value.version !== 1 || record.value.status !== 'observed'
+      || record.value.requestedFor !== obligation.obligation || record.value.result?.exitCode !== 0 || record.value.result.signal !== null
+      || canonical(record.value.check) !== canonical(obligation.runtimeCheck)) return false;
+    const rendered = runtimeSource(record);
+    if (source.id !== rendered.id || canonical(source.value) !== canonical(rendered.value)) return false;
+    const scope = store.get<ResearchScope>(record.value.scope.id, record.value.scope.revision);
+    if (scope?.kind !== 'research-scope' || scope.value.projectId !== project || scope.id !== obligation.scope.id || scope.hash !== record.value.scope.hash) return false;
+    const { scope: _scope, wake: _wake, ...expected } = obligation;
+    return canonical(obligationAssignment(scope.value, obligation.obligation)) === canonical(expected);
+  } catch { return false; }
 }
 
 /** Machine readiness consumes an explicitly declared pass predicate. Merely

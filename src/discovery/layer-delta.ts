@@ -7,8 +7,10 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import type { ResearchTurn } from "./research-model.js";
 import { layerDesignOf, composeLayer } from "../graph/layer-design.js";
 import { requireCondition } from "../errors.js";
+import { obligationHandoff } from '../graph/obligation-handoff.js';
+import { requireTaskObligations } from '../graph/task-obligations.js';
 
-export const DELTA_COLLECTIONS = ["nodes", "connectors", "contracts", "artifacts", "edges", "journeys", "joins", "anchors", "tests", "packets", "transfers"] as const;
+export const DELTA_COLLECTIONS = ["nodes", "connectors", "contracts", "artifacts", "edges", "journeys", "joins", "anchors", "tests", "packets", "transfers", "researchObligations"] as const;
 export type DeltaCollection = typeof DELTA_COLLECTIONS[number];
 export interface LayerDelta {
   base: Ref;
@@ -46,6 +48,11 @@ export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft
       design["horizon"] = patch.horizon;
     }
     for (const collection of DELTA_COLLECTIONS) {
+      if (collection === 'researchObligations') {
+        if (!Object.hasOwn(design, collection) && !Object.hasOwn(patch.upserts, collection) && !Object.hasOwn(patch.removes, collection)
+          && !(question.value.spec.schema as { required?: string[] }).required?.includes(collection)) continue;
+        requireCondition(level === 3, 'layer_delta_foreign', 'Only L3 binds future work and test consumers');
+      }
       const entries = (design[collection] ?? []) as { id: string; [key: string]: Json }[];
       const upserts = patch.upserts[collection] ?? [], removes = patch.removes[collection] ?? [];
       requireCondition(new Set(upserts.map(entry => entry.id)).size === upserts.length
@@ -66,7 +73,12 @@ export function expandLayerDelta(store: Store, draft: Revision<DiscoveryDraft>, 
   // Validate the assembled graph, including unchanged upper layers and complete
   // L2 relationships. No graph or accepted draft is written by this expansion.
   const level = draft.value.level === "R2" ? 3 : 2;
-  return layerDesignOf(composeLayer(base.value, level, design), level);
+  const graph = composeLayer(base.value, level, design);
+  if (level === 3) {
+    const handoff = obligationHandoff(store, draft.value.projectId, draft.value.inputs);
+    if (handoff) requireTaskObligations(store, draft.value.projectId, graph, handoff);
+  }
+  return layerDesignOf(graph, level);
 }
 
 export function layerDeltaView(store: Store, project: string, value: Json, level: 2 | 3 = 2) {

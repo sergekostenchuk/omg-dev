@@ -71,7 +71,7 @@ if(mode==='overflow-produce') {const {produce}=await import('./produce.mjs');ass
 if(mode==='overflow-consume') {const {consume}=await import('./consume.mjs');assert.throws(()=>consume(Number.MAX_SAFE_INTEGER-1),/result_overflow/);}
 `;
 
-export function executionFixture(t: TestContext, behavior = "normal") {
+export function executionFixture(t: TestContext, behavior = "normal", refine = (engine: ProductEngine) => refinedLayers(engine, "p")) {
   const directory = mkdtempSync(join(tmpdir(), "omg-execution-")), workspace = join(directory, "repo"); mkdirSync(workspace);
   const journal = join(directory, "calls.jsonl"), agent = join(directory, "agent.mjs"); writeFileSync(agent, AGENT);
   git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "A local numeric transformation product");
@@ -100,7 +100,7 @@ export function executionFixture(t: TestContext, behavior = "normal") {
   const command = { executable: process.execPath, args: [agent, journal, behavior] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "protocol-fixture", effort: "high", command },
     reviewer: { actor: "reviewer", model: "protocol-fixture", effort: "high", command }, fullCheck: { executable: process.execPath, args: ["check.mjs", "all"] }, timeoutMs: 10_000 }, 0);
-  refinedLayers(engine, "p"); const feasibility = engine.refinement.assess("p", 0);
+  refine(engine); const feasibility = engine.refinement.assess("p", 0);
   const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
   const plan = engine.compiler.compile("p"); const compilation = engine.compiler.publish("p", reference(plan), 0); engine.pipeline.accept("p", "compilation", compilation.revision);
   return { get store() { return store; }, get engine() { return engine; }, directory, workspace, initial, plan,

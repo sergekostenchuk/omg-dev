@@ -1,3 +1,4 @@
+import { taskObligationBindingSchema } from './task-obligation-model.js';
 const text = { type: "string", minLength: 1, maxLength: 4000 };
 const id = { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$" };
 const ids = { type: "array", uniqueItems: true, maxItems: 10000, items: id };
@@ -32,6 +33,7 @@ export const graphSchema = object({
 
 export const graphV2Schema = structuredClone(graphSchema) as { type: string; additionalProperties: boolean; required: string[]; properties: Record<string, any> };
 graphV2Schema.properties['version'] = { const: 2 };
+graphV2Schema.properties['researchObligations'] = array(taskObligationBindingSchema);
 const properties = graphV2Schema.properties;
 const texts = { type: "array", items: text, minItems: 1 };
 const addRequired = (schema: { properties: Record<string, unknown>; required: string[] }, fields: Record<string, unknown>) => {

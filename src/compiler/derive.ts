@@ -8,10 +8,11 @@ import { nodeSignature, type CompiledTask, type TaskInput } from "./model.js";
 import { controlPredecessors } from "../graph/dependencies.js";
 import { writeGrants } from "./ownership.js";
 import type { WriterProof } from "../ownership/owners.js";
+import type { BoundTaskObligation } from '../graph/task-obligation-model.js';
 
 export function deriveTasks(project: string, graphHash: string, graph: Graph,
   resolveInput: (producer: string, artifact: string) => Pick<TaskInput, "receipt" | "source">,
-  rules: { version: 1 | 2; owner: (path: string) => WriterProof | null } = { version: 1, owner: () => null }) {
+  rules: { version: 1 | 2; owner: (path: string) => WriterProof | null; researchObligations?: Map<string, BoundTaskObligation[]> } = { version: 1, owner: () => null }) {
     const nodes = graph.nodes.filter(node => graph.horizon.includes(node.id));
     requireCondition(nodes.length > 0, "horizon_empty", "There are no current work nodes to compile");
     const ids = new Map(nodes.map(node => [node.id, `task:${hashJson([project, graphHash, node.id]).slice(0,40)}`]));
@@ -55,6 +56,7 @@ export function deriveTasks(project: string, graphHash: string, graph: Graph,
         if (grant.producerTask) edges.push([grant.producerTask, ids.get(node.id)!]);
       }
       return { id: ids.get(node.id)!, node: node.id, title: node.title, outcome: node.outcome, signature: nodeSignature(graph, node),
+        ...(rules.researchObligations ? { researchObligations: rules.researchObligations.get(node.id) ?? [] } : {}),
         boundary: node.boundary, writePaths: [...new Set(node.code.filter(ref => ref.access === "write").map(ref => ref.path))].sort(),
         readPaths: [...new Set(node.code.filter(ref => ref.access === "read").map(ref => ref.path))].sort(), tests, inputs,
         produces: [...new Set([node.outcome, ...graph.connectors.filter(connector => connector.bindings.some(binding => binding.level === 3 && binding.producer.node === node.id)).map(connector => connector.artifact)])].sort(),

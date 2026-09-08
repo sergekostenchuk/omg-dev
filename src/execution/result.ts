@@ -22,7 +22,7 @@ export function resultGate(store: Store, project: string, ref: Ref): GateResult 
       || hashJson(run.value.plan) !== hashJson(result.value.plan) || run.value.taskId !== plan.value.tasks[index]?.id
       || run.value.parent !== parent || !run.value.commit) return rejected("execution_incomplete");
     try {
-      requireGates(run.value, plan.value.tasks[index]!, environment.value);
+      requireGates(run.value, plan.value.tasks[index]!, environment.value, store);
       if (git(plan.value.base.root, ["rev-list", "--parents", "-n", "1", run.value.commit]) !== `${run.value.commit} ${parent}`
         || git(plan.value.base.root, ["rev-parse", `${run.value.commit}^{tree}`]) !== run.value.tree) return rejected("execution_commit_foreign");
     } catch { return rejected("execution_proof_invalid"); }

@@ -15,6 +15,7 @@ export interface Endpoint { node: string; port: string; codeRef?: CodeRef }
 export interface Binding { level: 1 | 2 | 3; producer: Endpoint; consumers: Endpoint[]; anchor: string | null }
 export interface Connector { id: string; artifact: string; bindings: Binding[]; returnsTo: string; wakeTest: string | null }
 export interface Graph {
+  researchObligations?: import('./task-obligation-model.js').TaskObligationBinding[];
   version: 1 | 2; id: string; title: string; horizon: string[];
   contracts: { id: string; schema: Json }[];
   nodes: Node[];

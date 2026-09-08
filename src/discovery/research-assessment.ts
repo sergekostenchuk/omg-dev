@@ -19,6 +19,9 @@ import { assessmentSession } from "./assessment-session.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence } from '../graph/runtime-evidence.js';
+import { obligationHandoff } from '../graph/obligation-handoff.js';
+import { requireTaskObligations } from '../graph/task-obligations.js';
+import { composeLayer } from '../graph/layer-design.js';
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
@@ -30,6 +33,13 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const draft = store.get<DiscoveryDraft>(question.value.draftId);
   requireCondition(draft?.kind === "discovery-draft", "draft_missing", "The research context is missing");
   requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor, "assessor_not_independent", "Research assessment requires a separate actor");
+  if (draft.value.stage === 'om-g2' && draft.value.level === 'R2' && question.value.spec.field === 'layerDesign') {
+    const handoff = obligationHandoff(store, draft.value.projectId, draft.value.inputs);
+    if (handoff) {
+      const base = store.get<Graph>(`graph:${draft.value.projectId}`)!;
+      requireTaskObligations(store, draft.value.projectId, composeLayer(base.value, 3, action.value), handoff);
+    }
+  }
   const runtime=collectRuntimeEvidence(store,question.value.projectId,question.value.spec,action.value as unknown as TechnicalReport,observations);
   if (draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) && draft.value.consumer === "compilation") {
     const graph = store.get<Graph>(`graph:${draft.value.projectId}`)!;

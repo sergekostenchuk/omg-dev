@@ -6,7 +6,7 @@ import { projectGraph } from "./project.js";
 import type { Graph } from "./model.js";
 
 export const mapDesignSchema = structuredClone(graphV2Schema);
-for (const field of ["version", "id", "title", "actors", "requirements"]) {
+for (const field of ["version", "id", "title", "actors", "requirements", "researchObligations"]) {
   delete mapDesignSchema.properties[field]; mapDesignSchema.required = mapDesignSchema.required.filter(item => item !== field);
 }
 mapDesignSchema.properties['horizon'] = { type: "array", maxItems: 0 };

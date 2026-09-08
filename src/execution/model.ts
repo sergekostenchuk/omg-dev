@@ -1,13 +1,15 @@
 import type { Ref } from "../pipeline/contracts.js";
 import type { ProcessResult } from "../runtime/process.js";
 
-export type RunState = "implementing" | "checking" | "reviewing" | "commit_pending" | "committed" | "needs_code" | "needs_plan" | "interrupted";
+export type RunState = "implementing" | "checking" | "reviewing" | "commit_pending" | "committed" | "needs_code" | "needs_plan" | "interrupted" | "awaiting_obligation";
 export interface ReviewResult { verdict: "pass" | "request_changes"; kind: "none" | "code" | "plan"; findings: string[] }
 export interface ArtifactValue { id: string }
 export interface AgentUsage { mode: "implement" | "review"; model: string; effort: string; requestHash: string; requestChars: number; requestBytes: number; responseChars: number | null; responseBytes: number | null }
 export interface ExecutionOptions { retry: boolean; maxContextChars: number; maxCorrections: number }
 export interface CheckResult { command: { executable: string; args: string[] }; result: ProcessResult }
 export interface TaskRun {
+  obligationStartProofs?: import('./task-obligations.js').TaskRuntimeProof[];
+  obligationResultProofs?: import('./task-obligations.js').TaskObligationProof[];
   projectId: string; plan: Ref; taskId: string; attempt: number; state: RunState;
   parent: string; tree: string | null; commit: string | null;
   implementation: string | null; artifacts: ArtifactValue[]; checks: CheckResult[];

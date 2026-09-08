@@ -6,16 +6,28 @@ import { LEVEL, type Graph } from "./model.js";
 import { projectGraph } from "./project.js";
 import { requireGraph } from "./validate.js";
 import { RefinementRelations } from "./relations.js";
+import type { ObligationHandoff } from './obligation-handoff.js';
+import { taskObligationBindingSchema } from './task-obligation-model.js';
+import { taskBindingId, taskObligations } from './task-obligations.js';
 
 export const LAYER_DESIGN_VERSION = 1;
-export function layerDesignSpec(level: 2 | 3): FieldSpec {
+export function layerDesignSpec(level: 2 | 3, handoff: ObligationHandoff | null = null): FieldSpec {
   const schema = structuredClone(mapDesignSchema);
   if (level === 3) schema.properties['horizon'] = { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } };
+  const carried = level === 3 && handoff ? taskObligations(handoff) : null;
+  if (carried) {
+    schema.properties['researchObligations'] = { type: 'array', maxItems: carried.length, items: carried.length ? { oneOf: carried.map(item => {
+      const binding = structuredClone(taskObligationBindingSchema);
+      binding.properties.id = { const: taskBindingId(item) }; binding.properties.scope = { const: item.scope }; binding.properties.obligation = { const: item.obligation };
+      return binding;
+    }) } : false };
+    schema.required.push('researchObligations');
+  }
   return { field: "layerDesign", kind: "design", proof: "assessment", schema: schema as Json,
     risk: "Исследование не превращается в полную связную декомпозицию с проверяемыми результатами",
     prompt: `Построй L${level} той же карты по принятым результатам R${level - 1}, ТЗ и фичам. Верни полный граф до L${level}, без полей version/id/title/actors/requirements: их наследует движок. Сохрани верхние уровни без изменения. ${level === 2
       ? "Раскрой операции, полномочия, данные, входы/выходы и пути отказа. Не придумывай атомарные задачи L3 заранее."
-      : "Раскрой текущий горизонт атомарных результатов с точными code refs, тестовыми контрактами, ресурсами, последовательными и отложенными связями. Planned код обозначай planned. Не подставляй фиктивные доказательства существующего кода."} Внутренние связи допустимы внутри одного родителя; межблочные связи уточняют прежние connectors. Не закрывай пробелы статусом ready: сохрани неизвестное в исследовании и верни его в R${level - 1}.`,
+      : "Раскрой текущий горизонт атомарных результатов с точными code refs, тестовыми контрактами, ресурсами, последовательными и отложенными связями. Planned код обозначай planned. Не подставляй фиктивные доказательства существующего кода."} Внутренние связи допустимы внутри одного родителя; межблочные связи уточняют прежние connectors. Не закрывай пробелы статусом ready: сохрани неизвестное в исследовании и верни его в R${level - 1}.` + (carried ? `\nresearchObligations связывает исходные переносы с конкретными work и их тестами. Используй только выданные id/scope/obligation. Сохрани kind, moment, ответственного, wake и полный returnCondition; модель их не меняет. Для post-implementation-proof выбери тестовые контракты, действительно проверяющие всё условие при приёмке соответствующей реализации; доказательство исполнения сейчас не требуется. Не пробуждённое обязательство остаётся в исходном handoff и не требует реализации вне текущей области. Назначения: ${JSON.stringify(carried.map(item => ({ id: taskBindingId(item), requirement: item })))}` : ''),
   };
 }
 

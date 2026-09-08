@@ -23,14 +23,14 @@ export function artifactProgress(store: Store, plan: Revision<MachinePlan>, root
   if (!consumers.length) return null;
   const guards = [reference(current), receipt.run];
   try {
-    requireGates(run.value, producer, environment.value);
+    requireGates(run.value, producer, environment.value, store);
     resolveArtifact(store, plan.value.projectId, plan.value.graphSnapshot,
       { root: root.path, head: root.head, tree: git(root.path, ["rev-parse", `${root.head}^{tree}`]), files: [] }, receipt.node, receipt.artifact);
     for (const task of consumers) {
       const consumed = store.get<TaskRun>(runId(plan.value.hash, task.id));
       if (consumed?.value.state !== "committed" || canonical(consumed.value.plan) !== canonical(reference(plan))
         || !consumed.value.inputs.some(input => canonical(input) === canonical(original)) || !consumed.value.commit) return null;
-      requireGates(consumed.value, task, environment.value);
+      requireGates(consumed.value, task, environment.value, store);
       git(root.path, ["merge-base", "--is-ancestor", consumed.value.commit, root.head]);
       guards.push(reference(consumed));
     }

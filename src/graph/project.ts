@@ -15,6 +15,7 @@ export function projectGraph(graph: Graph, level: 1 | 2 | 3) {
     anchors: graph.anchors.filter(anchor => nodeIds.has(anchor.owner)),
     joins: graph.joins.filter(join => nodeIds.has(join.consumer)),
     tests: graph.tests.filter(test => nodeIds.has(test.node)), horizon: level === 3 ? graph.horizon : [],
+    ...(level === 3 && graph.researchObligations !== undefined ? { researchObligations: graph.researchObligations } : {}),
     ...(graph.version === 2 ? { version: 2 as const, actors: graph.actors!, requirements: graph.requirements!,
       edges: graph.edges!.filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target)),
       journeys: graph.journeys!.filter(journey => journey.path.every(node => nodeIds.has(node))),

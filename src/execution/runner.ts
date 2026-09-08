@@ -16,6 +16,7 @@ import { taskContext } from "../compiler/context.js";
 import { canonical } from "../canonical.js";
 import { recoverCommits } from "./recovery.js";
 import { executionOwnership } from "./ownership.js";
+import { taskStartProofs, requireCurrentTaskStart, requirePlanTaskObligations } from './task-obligations.js';
 
 export class Executor {
   private readonly active = new Map<string, AbortController>();
@@ -31,6 +32,7 @@ export class Executor {
     try {
       await recoverCommits(this.store, this.compiler, project);
       const plan = this.compiler.read(planRef.id);
+      requirePlanTaskObligations(this.store, plan.value);
       requireCondition(plan.value.projectId === project && plan.hash === planRef.hash && plan.revision === planRef.revision,
         "plan_foreign", "Execution must use the exact generated plan");
       const stage = this.store.get<StageArtifact>(stageId(project, "compilation"));
@@ -61,27 +63,48 @@ export class Executor {
         }
         if (run && (run.value.state === "needs_plan" || !options.retry && !corrections.has(task.id))) { results.push(run); return results; }
         const guards = currentBasis(this.store, plan, root.value);
+        const actual = { ...environment.value, workspace: root.value.path };
+        if (run?.value.state === 'awaiting_obligation' && run.value.tree) {
+          // The candidate, complete checks and independent review are already
+          // paid work. A missing late confirmation must not regenerate them.
+          try {
+            requireCondition(capture(root.value, parent, task) === run.value.tree,
+              'task_obligation_candidate_changed', 'The waiting candidate changed; do not reuse its accepted checks/review');
+            run = commitIntent(this.store, root, run, plan.value, task, actual, [reference(lock), ...guards]);
+            publishCommit(root.value, run.value, this.store, task); this.afterGitPublish?.(run.value);
+            run = finishCommit(this.store, root, run, plan.value, task, actual);
+            root = this.store.get<ExecutionRoot>(root.id)!; parent = run.value.commit!; results.push(run); continue;
+          } catch (error) {
+            if (run.value.state === 'commit_pending') throw error;
+            const code = error instanceof EngineError ? error.code : 'task_obligation_resume_failed';
+            run = this.save(run, { state: code === 'task_obligation_result_required' ? 'awaiting_obligation' : 'interrupted',
+              error: `${code}: ${error instanceof Error ? error.message : 'Unable to accept the waiting result'}` });
+            results.push(run); return results;
+          }
+        }
         if (!run) requireCondition(!git(root.value.path, ["status", "--porcelain", "--untracked-files=all"]),
           "worktree_dirty", "The managed worktree contains an unfinished change; recover that attempt first");
         const previous = run?.value;
+        const candidate: TaskRun = { projectId: project, plan: reference(plan), taskId: task.id, attempt: (previous?.attempt ?? 0) + 1,
+          state: "implementing", parent, tree: null, commit: null, implementation: null, artifacts: [], checks: [], review: null,
+          reviewSubject: null, child: null, error: null, inputs: [], usage: previous?.usage ?? [], createdAt: previous?.createdAt ?? Date.now(), updatedAt: Date.now() };
+        const starts = taskStartProofs(this.store, candidate, task);
         run = this.store.writeMany<TaskRun>([{ id: runId(plan.value.hash, task.id), kind: "task-run", expected: run?.revision ?? 0,
-          value: { projectId: project, plan: reference(plan), taskId: task.id, attempt: (previous?.attempt ?? 0) + 1,
-            state: "implementing", parent, tree: null, commit: null, implementation: null, artifacts: [], checks: [], review: null,
-            reviewSubject: null, child: null, error: null, inputs: [], usage: previous?.usage ?? [], createdAt: previous?.createdAt ?? Date.now(), updatedAt: Date.now() } }],
-        [reference(lock), reference(root), ...guards])[0]!;
+          value: { ...candidate, ...(task.researchObligations !== undefined ? { obligationStartProofs: starts.proofs } : {}) } }],
+        [reference(lock), reference(root), ...guards, ...starts.guards])[0]!;
         const observe: ProcessObserver = child => { run = this.save(run!, { child }); };
         const measure = (value: AgentUsage) => {
           const usage = [...run!.value.usage]; const index = usage.findIndex(item => item.requestHash === value.requestHash);
           if (index < 0) usage.push(value); else usage[index] = value;
           run = this.save(run!, { usage });
         };
-        const actual = { ...environment.value, workspace: root.value.path };
         try {
           requireWritePaths(root.value.path, task.writePaths);
           const inputs = executionInputs(this.store, plan, task, root.value);
           const ownership = executionOwnership(this.store, plan, task, root.value);
           run = this.save(run, { inputs: [...inputs.guards, ...ownership.guards] });
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, options.maxContextChars).text);
+          requireCurrentTaskStart(this.store, run.value, task);
           const response = await callAgent(actual.implementer, actual, "implement", "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.",
             { context, parent, inputs: inputs.inputs, ownership: ownership.grants, correction: previous ? { error: previous.error, review: previous.review } : null },
             options.maxContextChars, measure, observe, signal);
@@ -105,7 +128,7 @@ export class Executor {
             throw new EngineError(verdict.kind === "plan" ? "plan_review_failed" : "code_review_failed", verdict.findings.join("\n"));
           }
           run = commitIntent(this.store, root, run, plan.value, task, actual, [reference(lock), ...currentBasis(this.store, plan, root.value)]);
-          publishCommit(root.value, run.value);
+          publishCommit(root.value, run.value, this.store, task);
           this.afterGitPublish?.(run.value);
           run = finishCommit(this.store, root, run, plan.value, task, actual);
           root = this.store.get<ExecutionRoot>(root.id)!;
@@ -117,8 +140,9 @@ export class Executor {
           const interrupted = ["process_cancelled", "process_timeout", "process_failed", "executor_failed", "executor_protocol_invalid", "executor_response_foreign", "process_output_limit",
             "context_budget_exceeded", "write_scope_exceeded", "worktree_changed", "candidate_bytes_mismatch", "candidate_bytes_changed", "candidate_entry_unsupported"].includes(code);
           const planDefect = ["plan_review_failed", "plan_stale", "execution_input_missing", "execution_input_foreign", "producer_not_ready", "implementation_proof_foreign", "artifact_stale"].includes(code);
-          run = this.save(run, { state: interrupted ? "interrupted" : planDefect ? "needs_plan" : "needs_code",
-            child: null, error: error instanceof Error ? error.message : "Execution failed" });
+          const obligationPause = ['task_obligation_start_stale', 'task_obligation_result_required'].includes(code);
+          run = this.save(run, { state: obligationPause ? 'awaiting_obligation' : interrupted ? "interrupted" : planDefect ? "needs_plan" : "needs_code",
+            child: null, error: obligationPause ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}` : error instanceof Error ? error.message : "Execution failed" });
           if (run.value.state === "needs_code" && (corrections.get(task.id) ?? 0) < options.maxCorrections) {
             corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
           }
