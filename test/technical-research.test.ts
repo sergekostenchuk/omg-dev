@@ -210,3 +210,35 @@ test("a deferred gap first found by R2 is re-researched when its consumer enters
   assert.deepEqual(engine.refinement.gate("p", "R2").findings, []);
   deriveLayerFixture(engine, "p", 3); engine.refinement.sealLayer("p", 3, 0);
 });
+
+test('R2 accepts present knowledge and carries later proof with exact scope identities while old R2 becomes stale',async t=>{
+ const {configureResearchScope}=await import('../src/graph/research-scope.js');
+ const {engine,store}=fixture(t);finishR0(engine);
+ const gaps=[{id:'now',target:'p-produce-block',field:'ports',question:'Existing producer contract',consumer:'compilation',requiredFor:'next' as const},
+  {id:'later',target:'p-consume-block',field:'ports',question:'Actual runtime compatibility before R3',consumer:'compilation',requiredFor:'next' as const}];
+ const r1=engine.refinement.begin('p','R1');
+ answerTechnicalFixture(engine,'p',r1,(field,report)=>field==='runtime'?{...report,gaps}:report);
+ engine.refinement.finishResearch('p','R1',reference(store.get(r1.id)!),0);deriveLayerFixture(engine,'p',2);engine.refinement.sealLayer('p',2,0);
+ const old=configureResearchScope(store,{projectId:'p',layer:reference(store.get('graph-layer:p:2')!),r1:reference(store.get('phase:p:R1')!),
+  outcome:'Preserve the producer and verify the consumer',nodes:gaps.map(g=>g.target),boundaries:[],expansions:[],changedPaths:[],uiRequired:false,
+  obligations:gaps.map(gap=>({gap,state:'active',reason:'Original',wake:null}))},0);
+ const prior=engine.refinement.begin('p','R2');
+ const scope=configureResearchScope(store,{...old.value,policy:{version:1,sourceScope:reference(old),assignments:gaps.map((gap,i)=>({obligation:gap.id,
+  original:{record:reference(old),pointer:`/obligations/${i}/gap`},kind:i===0?'repository-fact':'environment-confirmation',moment:i===0?'R2':'R3',
+  responsibleNode:gap.target,responsibleConsumer:gap.consumer,neededForR2:i===0,reason:'Owner-approved deadline',returnCondition:i===0?null:'Before R3 readiness'}))}},old.revision);
+ const r2=engine.refinement.begin('p','R2');
+ assert.ok(engine.discovery.gate('p',reference(prior)).findings.some(x=>x.code==='research_context_stale'));
+ assert.ok(!r2.value.questions.some(id=>store.get<any>(id)!.value.spec.obligations?.some((o:any)=>o.id==='later')));
+ answerTechnicalFixture(engine,'p',r2,(field,report)=>{
+  const q=r2.value.questions.map(id=>store.get<any>(id)!).find(q=>q.value.spec.field===field)!;
+  return q.value.spec.obligations?{...report,coverage:q.value.spec.obligations.map((o:any)=>({obligation:o.id,facts:report.facts.map(f=>f.id),designs:[],gaps:[]}))}:report;
+ });
+ const result=engine.refinement.finishResearch('p','R2',reference(store.get(r2.id)!),0);
+ assert.equal(result.value.carried?.length,1);
+ assert.deepEqual(result.value.carried![0],{...scope.value.policy!.assignments[1]!,scope:reference(scope),wake:null});
+ assert.deepEqual(engine.refinement.gate('p','R2').findings,[]);
+ assert.deepEqual(store.get(old.id,old.revision),old);
+ const {carried,...lost}=result.value;
+ store.write({id:result.id,kind:result.kind,expected:result.revision,value:lost});
+ assert.ok(engine.refinement.gate('p','R2').findings.some(x=>x.code==='research_obligation_handoff_invalid'));
+});

@@ -4,9 +4,11 @@ import { requireCondition } from '../errors.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import type { Graph } from './model.js';
 import type { DiscoveryDraft, FieldSpec } from '../discovery/discovery.js';
-import { refinementQuestions, type TechnicalGap, type TechnicalReport } from './research-contracts.js';
+import { refinementQuestions, deferredGap, type TechnicalGap, type TechnicalReport } from './research-contracts.js';
+import { validateObligationPolicy, obligationAssignment, type ObligationPolicy } from './obligation-policy.js';
 
 export interface ResearchScope {
+  policy?: ObligationPolicy;
   projectId: string; layer: Ref; r1: Ref; outcome: string; nodes: string[];
   boundaries: { node: string; reason: string }[];
   expansions: { node: string; reason: string }[];
@@ -40,13 +42,16 @@ export function configureResearchScope(store: Store, value: ResearchScope, expec
     && new Set(value.obligations.map(o => o.gap.id)).size === gaps.length
     && gaps.every(g => value.obligations.some(o => canonical(o.gap) === canonical(g))),
   'scope_gap_missing', 'Every original gap must retain its exact identity and contents');
+  const policyGuards = validateObligationPolicy(store, value);
+  requireCondition(!store.get<ResearchScope>(`research-scope:${value.projectId}:R2`)?.value.policy || value.policy,
+    'obligation_policy_missing', 'Updating scope cannot silently remove the explicit obligation policy');
   for (const o of value.obligations) requireCondition(['active', 'deferred'].includes(o.state) && typeof o.reason === 'string' && o.reason.trim()
-    && (o.state === 'active' || (o.wake && Array.isArray(o.wake.nodes) && o.wake.nodes.every(n => nodes.has(n))
+    && (o.state === 'active' || (o.gap.requiredFor==='next' && o.wake && Array.isArray(o.wake.nodes) && o.wake.nodes.every(n => nodes.has(n))
       && Array.isArray(o.wake.paths) && o.wake.paths.every(p => typeof p === 'string' && p.length > 0) && typeof o.wake.uiRequired === 'boolean'
       && (o.wake.nodes.length > 0 || o.wake.paths.length > 0 || o.wake.uiRequired))),
   'scope_deferral_invalid', 'Research deferral requires an explicit reason and a testable return condition');
   return store.writeMany<ResearchScope>([{ id: `research-scope:${value.projectId}:R2`, kind: 'research-scope', expected, value }],
-    [reference(layer), reference(store.get(`phase:${value.projectId}:R1`)!)])[0]!;
+    [reference(layer), reference(store.get(`phase:${value.projectId}:R1`)!), ...policyGuards])[0]!;
 }
 export function researchScope(store: Store, project: string): Revision<ResearchScope> | null {
   const scope = store.get<ResearchScope>(`research-scope:${project}:R2`);
@@ -56,9 +61,14 @@ export function researchScope(store: Store, project: string): Revision<ResearchS
   requireCondition(scope.kind === 'research-scope' && scope.value.projectId === project && layer?.id === `graph-layer:${project}:2`
     && canonical(reference(layer)) === canonical(scope.value.layer) && r1 && isRef(scope.value.r1)
     && canonical(reference(r1)) === canonical(scope.value.r1), 'scope_basis_foreign', 'Research scope belongs to another or changed L2');
+  validateObligationPolicy(store, scope.value);
   return scope;
 }
 export function scopeObligations(scope: ResearchScope) {
+  if (scope.policy) return scope.obligations.map(o => {
+    const assignment = obligationAssignment(scope, o.gap.id)!;
+    return { ...o, assignment, state: assignment.moment === 'R2' ? 'active' as const : 'deferred' as const };
+  });
   const active = new Set([...scope.nodes, ...scope.boundaries.map(b => b.node), ...scope.expansions.map(b => b.node)]);
   return scope.obligations.map(o => ({ ...o, state: o.state === 'active' || active.has(o.gap.target) || active.has(o.gap.consumer)
     || (o.wake && (o.wake.nodes.some(n => active.has(n)) || (o.wake.uiRequired && scope.uiRequired)
@@ -74,6 +84,14 @@ export function scopeDefersGap(store: Store, project: string, gap: TechnicalGap)
   return gap.requiredFor === 'next' && Boolean(scope && scopeObligations(scope.value).some(o => o.state === 'deferred' && canonical(o.gap) === canonical(gap)));
 }
 
+export function researchGapDeferred(store: Store, project: string, graph: Graph, gap: TechnicalGap): boolean {
+  const scope = researchScope(store, project);
+  const original = scope?.value.obligations.find(o => o.gap.id === gap.id);
+  if (scope?.value.policy && original) return canonical(original.gap) === canonical(gap)
+    && obligationAssignment(scope.value, gap.id)!.moment !== 'R2';
+  return scopeDefersGap(store, project, gap) || deferredGap(graph, gap);
+}
+
 export function expandResearchScope(store: Store, project: string, expected: number, node: string, reason: string,
   changedPaths: string[] = [], uiRequired = false) {
   const current = researchScope(store, project);
@@ -87,7 +105,8 @@ function groupCoverageSpec(scope: ResearchScope, spec: FieldSpec, extra: Technic
   if (!spec.targets?.length) return spec;
   const obligations = [...scopeObligations(scope).filter(o => o.state === 'active').map(o => o.gap), ...extra].filter(g => spec.targets!.some(t =>
     t.target === g.target && t.field === g.field && t.consumer === g.consumer))
-    .map(g => ({ id: g.id, target: g.target, field: g.field, consumer: g.consumer }));
+    .map(g => ({ id: g.id, target: g.target, field: g.field, consumer: g.consumer,
+      ...(scope.policy && scope.obligations.some(o => o.gap.id === g.id) ? { assignment: obligationAssignment(scope, g.id)! } : {}) }));
   if (!obligations.length) return spec;
   const schema = structuredClone(spec.schema) as { required: string[]; properties: Record<string, import('../canonical.js').Json> };
   schema.required.push('coverage');

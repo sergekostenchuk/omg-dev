@@ -104,7 +104,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if(body['assessmentState']) dynamic['value']=body['value'];
     dynamic['answerContext']={allowedConsumers:body['allowedConsumers']??[],gapFields:body['gapFields']??[],
       scope:body['researchScope']?{outcome:body['researchScope'].outcome,nodes:body['researchScope'].nodes,
-        deferred:body['researchScope'].obligations.filter((o:any)=>o.state==='deferred').map((o:any)=>({id:o.gap.id,target:o.gap.target,wake:o.wake}))}:null};
+        deferred:body['researchScope'].obligations.filter((o:any)=>o.state==='deferred').map((o:any)=>({id:o.gap.id,target:o.gap.target,wake:o.wake,
+          ...(o.assignment?{moment:o.assignment.moment,consumer:o.assignment.responsibleConsumer,returnCondition:o.assignment.returnCondition}: {})}))}:null};
     dynamic['originals']=originals;
     const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'],assessmentValue=dynamic['value'];
     const original=body;

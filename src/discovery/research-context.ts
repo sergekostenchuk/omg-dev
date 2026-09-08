@@ -3,7 +3,8 @@ import { STAGES, reference, type StageArtifact } from "../pipeline/contracts.js"
 import type { DiscoveryDraft } from "./discovery.js";
 import type { Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
-import { deferredGap, REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
+import { REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
+import { researchGapDeferred } from '../graph/research-scope.js';
 import type { PlanDefect } from "../graph/plan-defects.js";
 import { projectGraph } from "../graph/project.js";
 
@@ -44,7 +45,7 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
   const previous = draft.level === "R2" ? store.get<{ draft: Ref | null }>(`phase:${draft.projectId}:R2`) : null;
   const earlier = previous?.value.draft ? store.get<DiscoveryDraft>(previous.value.draft.id, previous.value.draft.revision) : null;
   const openGaps = earlier?.value.contractVersion === REFINEMENT_CONTRACT_VERSION ? Object.values(earlier.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
-    .map(gap => ({ ...gap, deferred: Boolean(graph && deferredGap(graph.value, gap)) })) : [];
+    .map(gap => ({ ...gap, deferred: Boolean(graph && researchGapDeferred(store, draft.projectId, graph.value, gap)) })) : [];
   const currentHorizon = graph?.value.nodes.filter(node => graph.value.horizon.includes(node.id))
     .map(node => ({ id: node.id, parent: node.parent, outcome: node.outcome, code: node.code })) ?? [];
   const research = draft.inputs.flatMap(ref => {

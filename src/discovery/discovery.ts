@@ -16,7 +16,8 @@ import { Environments } from '../runtime/environment.js';
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
   basisContract?: 'typed-v1';
-  obligations?: { id: string; target: string; field: string; consumer: string }[];
+  obligations?: { id: string; target: string; field: string; consumer: string;
+    assignment?: import('../graph/obligation-policy.js').ObligationAssignment }[];
   targets?: { target: string; field: string; consumer: string; question: string }[] }
 export interface DiscoveryDraft {
   projectId: string; createdAt: number; stage: Stage; level: ResearchLevel; consumer: string;

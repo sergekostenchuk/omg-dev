@@ -1,4 +1,4 @@
-import { scopeDefersGap } from "./research-scope.js";
+import { researchGapDeferred } from "./research-scope.js";
 import { realpathSync } from "node:fs";
 import { relative } from "node:path";
 import { Store } from "../storage/store.js";
@@ -7,7 +7,7 @@ import { STAGES, stageId, type StageArtifact, type Finding } from "../pipeline/c
 import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath } from "../runtime/environment.js";
 import type { Graph } from "./model.js";
-import { deferredGap, type TechnicalReport } from "./research-contracts.js";
+import type { TechnicalReport } from "./research-contracts.js";
 import { resolveResearchBasis } from './research-basis.js';
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
@@ -42,6 +42,8 @@ export function technicalProposalFindings(store: Store, project: string, level: 
       fail("research_group_coverage_missing", questionId, "Every original group obligation needs its own explicit evidence/design/gap resolution");
     for (const obligation of obligations) {
       const item = coverage?.find(c => c.obligation === obligation.id);
+      if (obligation.assignment?.moment === 'R2' && item?.gaps?.length)
+        fail('research_gap_unresolved', obligation.id, 'An obligation due in R2 cannot be resolved by renaming an unresolved or sleeping gap');
       if (!item || !Array.isArray(item.facts) || !Array.isArray(item.designs) || !Array.isArray(item.gaps)
         || item.facts.length + item.designs.length + item.gaps.length === 0
         || !item.facts.every(id => report.facts.some(f => f.id === id))
@@ -65,7 +67,7 @@ export function technicalProposalFindings(store: Store, project: string, level: 
     if (!consumers.has(gap.consumer) || !consumers.has(gap.target)) fail("research_consumer_missing", gap.id, "A gap needs an existing target and consumer");
     const target = graph.nodes.find(node => node.id === gap.target) ?? actors.find(actor => actor.id === gap.target);
     if (target && !Object.hasOwn(target, gap.field)) fail("research_field_missing", gap.id, "A node gap must identify an actual field of its target");
-    if (gap.requiredFor === "current" || (level === "R2" && !scopeDefersGap(store, project, gap) && !deferredGap(graph, gap))) fail("research_gap_unresolved", gap.id, gap.question);
+    if (gap.requiredFor === "current" || (level === "R2" && !researchGapDeferred(store, project, graph, gap))) fail("research_gap_unresolved", gap.id, gap.question);
   }
   return findings;
 }

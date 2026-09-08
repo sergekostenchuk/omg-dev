@@ -44,6 +44,18 @@ test('scope preserves every gap; absence, foreign L2 and missing wake conditions
   assert.equal(store.get<ResearchScope>(scope.id,1)!.value.obligations[1]!.state,'deferred');
 });
 
+test('a current-phase gap cannot be disguised as an optional deferred obligation',t=>{
+ const {store,value}=fixture(t);
+ value.obligations[1]!.gap.requiredFor='current';
+ const old=store.get<any>('r1')!;
+ const updated=store.write({id:old.id,kind:old.kind,expected:old.revision,value:{...old.value,fields:{technical:{gaps:value.obligations.map(o=>o.gap)}}}});
+ const phase=store.get('phase:p:R1')!;
+ const changed=store.write({id:phase.id,kind:phase.kind,expected:phase.revision,value:{draft:reference(updated)}});
+ value.r1=reference(changed);
+ assert.throws(()=>configureResearchScope(store,value,0),{code:'scope_deferral_invalid'});
+ assert.equal(store.get('research-scope:p:R2'),null);
+});
+
 test('R2 routing accepts generated contracts, refuses schema/target masquerades and missing settings',t=>{
   const {store,value}=fixture(t);
   configureResearchScope(store,value,0);

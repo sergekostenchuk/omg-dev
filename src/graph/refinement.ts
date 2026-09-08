@@ -1,4 +1,4 @@
-import { researchScope, scopedQuestions, scopeDefersGap } from "./research-scope.js";
+import { researchScope, scopedQuestions, researchGapDeferred, type ResearchScope } from "./research-scope.js";
 import { Store, type Revision } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
 import { GraphRepository } from "./repository.js";
@@ -16,10 +16,12 @@ import { layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 import { defectGaps, defectInputs } from "./plan-defects.js";
 import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { withTypedBasis } from './research-basis.js';
+import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
-interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number }
+interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number;
+  carried?: CarriedObligation[] }
 export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'] }
 
 export class Refinement {
@@ -110,7 +112,8 @@ export class Refinement {
     }
     const guards = uniqueRefs([...inputs, ...checked.guards]);
     return this.#milestone(`phase:${project}:${level}`, expected,
-      { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null },
+      { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null,
+        ...(scope?.value.policy ? { carried: carriedObligations(scope) } : {}) },
       [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
@@ -170,12 +173,18 @@ export class Refinement {
       }
       if (phase === "R2" && milestone.value.draft) {
         const draft = this.store.get<DiscoveryDraft>(milestone.value.draft.id, milestone.value.draft.revision);
+        const policyRef = draft?.value.inputs.find(ref => ref.id === `research-scope:${project}:R2`);
+        const policyScope = policyRef ? this.store.get<ResearchScope>(policyRef.id, policyRef.revision) : null;
+        if (policyScope?.hash === policyRef?.hash && policyScope?.value.policy
+          && (!Array.isArray(milestone.value.carried) || canonical(milestone.value.carried) !== canonical(carriedObligations(policyScope))))
+          result.findings.push({ code: 'research_obligation_handoff_invalid', target: 'R2',
+            message: 'R2 must retain every exact carried obligation from its own scope revision, including its owner and deadline' });
         const specs = draft?.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
         if (!draft || !this.#matchesQuestions(project, "R2", specs, draft.value.inputs, draft.value.basisContract === 'typed-v1')) result.findings.push({
           code: "research_horizon_changed", target: "R2", message: "Current horizon requires research obligations absent from the accepted R2 result" });
         const graph = this.store.get<Graph>(`graph:${project}`);
         if (draft && graph) for (const gap of Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)) {
-          if (!scopeDefersGap(this.store, project, gap) && !deferredGap(graph.value, gap)) result.findings.push({ code: "research_horizon_changed", target: gap.id,
+          if (!researchGapDeferred(this.store, project, graph.value, gap)) result.findings.push({ code: "research_horizon_changed", target: gap.id,
             message: "A gap reported by R2 is now required by the current horizon and must be resolved" });
         }
       }

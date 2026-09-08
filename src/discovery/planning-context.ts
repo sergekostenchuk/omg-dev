@@ -25,8 +25,11 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
       uiRequired: body.researchScope.uiRequired, changedPaths: body.researchScope.changedPaths,
       obligations: contextTable(body.researchScope.obligations.map((o: any, index: number) => ({ id: o.gap.id,
         target: o.gap.target, field: o.gap.field, consumer: o.gap.consumer, state: o.state, wake: o.wake,
+        ...(o.assignment ? {kind:o.assignment.kind,moment:o.assignment.moment,neededForR2:o.assignment.neededForR2,
+          assignmentPointer:`/policy/assignments/${body.researchScope.policy.assignments.findIndex((a:any)=>a.obligation===o.gap.id)}`} : {}),
         pointer: `/obligations/${index}` }))),
-      instruction: "Complete original gap questions and deferral reasons remain at ref /obligations/index; this is an address index, not evidence of irrelevance." } : null,
+      instruction: "Complete original gap questions and deferral reasons remain at ref /obligations/index; this is an address index, not evidence of irrelevance."
+        + (body.researchScope.policy ? " The approved kind, owner and resolution moment are fixed at assignmentPointer. Deferred proof remains owed at R3 or the named task boundary; entering the scope does not move that deadline to R2." : '') } : null,
     role: body.role, dispatchMode: "planning", stage: body.stage, level: body.level, consumer: body.consumer,
     draft: body.draft, question: { id: body.question.id, field: body.question.field, kind: body.question.kind,
       ...(body.question.basisContract ? {basisContract:body.question.basisContract} : {}),
