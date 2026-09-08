@@ -8,6 +8,7 @@ import type { Source } from '../evidence/evidence.js';
 
 export const KNOWLEDGE_KINDS = ['repository-fact', 'design-decision', 'owner-decision', 'environment-confirmation', 'post-implementation-proof'] as const;
 export const RESOLUTION_MOMENTS = ['R2', 'R3', 'task-start', 'task-result'] as const;
+export interface RuntimeCheck { script: Ref; dependencies: Ref[]; subjects: string[]; executables: string[]; args: string[]; timeoutMs: number; purpose: string }
 export interface ObligationAssignment {
   obligation: string;
   original: { record: Ref; pointer: string };
@@ -17,6 +18,7 @@ export interface ObligationAssignment {
   neededForR2: boolean; reason: string;
   returnCondition: string | null;
   documentaryAllowance?: { sources: Ref[]; claimLimit: string };
+  runtimeCheck?: RuntimeCheck;
 }
 export interface ObligationPolicy { version: 1; sourceScope: Ref; assignments: ObligationAssignment[] }
 export interface CarriedObligation extends ObligationAssignment { scope: Ref; wake: ResearchScope['obligations'][number]['wake'] }
@@ -29,6 +31,9 @@ const assignmentSchema = object({
   returnCondition: { anyOf: [text, { type: 'null' }] },
 });
 assignmentSchema.properties['documentaryAllowance'] = object({ sources: { type: 'array', minItems: 1, uniqueItems: true, items: ref }, claimLimit: text });
+assignmentSchema.properties['runtimeCheck'] = object({ script:ref,dependencies:{type:'array',uniqueItems:true,items:ref},
+  subjects:{type:'array',uniqueItems:true,items:text},executables:{type:'array',uniqueItems:true,items:text},
+  args:{type:'array',items:{type:'string'}},timeoutMs:{type:'integer',minimum:100,maximum:60000},purpose:text });
 export const obligationPolicySchema = object({ version: { const: 1 }, sourceScope: ref, assignments: { type: 'array', items: assignmentSchema } });
 const valid = new Ajv({ allErrors: true }).compile<ObligationPolicy>(obligationPolicySchema);
 
@@ -68,6 +73,21 @@ export function validateObligationPolicy(store: Store, scope: ResearchScope): Re
         requireCondition(document?.kind === 'source' && document.hash === ref.hash && document.value.projectId === scope.projectId
           && document.value.origin.kind === 'owner-document', 'obligation_document_allowance_invalid',
         'An allowance must bind exact document sources of this project; a filename or an owner assertion is not sufficient');
+      }
+    }
+    if (assignment.runtimeCheck) {
+      requireCondition(!assignment.documentaryAllowance,'obligation_confirmation_ambiguous','Choose a bounded documentary allowance or an actual runtime check; a report must not bypass the declared check');
+      requireCondition(assignment.kind === 'environment-confirmation' && assignment.runtimeCheck.purpose.trim(),
+        'obligation_runtime_check_invalid','A declared local runtime check must serve an environment obligation');
+      for (const ref of [assignment.runtimeCheck.script,...assignment.runtimeCheck.dependencies]) {
+        const code = store.get<Source>(ref.id,ref.revision);
+        const script=canonical(ref)===canonical(assignment.runtimeCheck.script);
+        requireCondition(code?.kind === 'source' && code.hash === ref.hash && code.value.projectId === scope.projectId
+          && ['text/plain','application/json'].includes(code.value.mediaType) && code.value.content.trim()
+          && (script ? code.value.mediaType==='text/plain' && (code.value.origin.kind==='file'&&code.value.origin.location.endsWith('.mjs')
+            ||code.value.origin.kind==='owner-document'&&!code.value.provenance&&assignment.runtimeCheck.dependencies.length===0)
+            :code.value.origin.kind==='file'),
+        'obligation_runtime_check_invalid','Declare exact repository modules or a self-contained operator module; do not change the accepted source snapshot to install tooling');
       }
     }
   }

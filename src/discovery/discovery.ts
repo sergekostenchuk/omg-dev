@@ -13,6 +13,7 @@ import { resolveResearchBasis } from '../graph/research-basis.js';
 import type { TechnicalReport } from '../graph/research-contracts.js';
 import { Environments } from '../runtime/environment.js';
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
+import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
@@ -124,18 +125,22 @@ export class Discovery {
     const draft = this.store.get<DiscoveryDraft>(question.value.draftId);
     requireCondition(question.value.spec.basisContract === draft?.value.basisContract && question.value.spec.obligationContract === draft?.value.obligationContract,
       'research_contract_mismatch', 'Answer must retain the basis contract of its draft');
+    const runtimeGuards:Ref[]=[];
     if (question.value.spec.basisContract === 'typed-v1') {
       requireCondition(ajv.compile(question.value.spec.schema as object)(assessment.value.value), 'answer_invalid', 'Typed answer must match its recorded schema');
       const result = resolveResearchBasis(this.store, question.value.projectId, assessment.value.value as unknown as TechnicalReport,
         assessment.value.observations, new Environments(this.store).effective(question.value.projectId).root, question.value.spec.field);
       requireCondition(result.findings.length === 0 && Array.isArray(assessment.value.bases)
         && canonical(result.bases) === canonical(assessment.value.bases), 'research_basis_invalid', 'Assessment must retain the exact machine-resolved bases and their proof limits');
-      const obligations = obligationEvidenceFindings(question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations);
+      const runtime = collectRuntimeEvidence(this.store,question.value.projectId,question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations);
+      requireCondition(canonical(runtime.proofs)===canonical(assessment.value.runtimeProofs??[]),'research_runtime_evidence_invalid','Runtime provenance must remain exact at acceptance');
+      runtimeGuards.push(...runtime.guards);
+      const obligations = obligationEvidenceFindings(question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations,runtime.proofs);
       if (obligations.length) throw new EngineError('research_obligation_evidence_invalid','An assessed value still must satisfy its assigned knowledge kind',obligations);
     }
     const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
     return this.#answer(question, answer.value, answer, "research-answer", [assessmentRef, assessment.value.environment,
-      ...assessment.value.observations.map(item => item.source)]);
+      ...assessment.value.observations.map(item => item.source),...runtimeGuards]);
   }
   observations(questionId: string): Observation[] {
     const question = this.store.get<Question>(questionId);
@@ -209,6 +214,12 @@ export class Discovery {
           || assessment.value.observations.length === 0 || !assessment.value.observations.every(item => this.evidence.verify(item))
           || canonical(assessment.value.value) !== canonical(research.value)) {
           fail("research_evidence_stale", id, "Research assessment or its supporting sources are stale or foreign"); continue;
+        }
+        for(const dependency of runtimeEvidenceDependencies(assessment.value.runtimeProofs??[])){
+          const current=this.store.get(dependency.id);
+          if(!current||current.hash!==dependency.hash||current.revision!==dependency.revision)
+            fail('research_evidence_stale',id,'A runtime evidence dependency changed');
+          else guards.push(dependency);
         }
         guards.push(reference(assessment), ...assessment.value.observations.map(item => item.source)); value = research.value;
       } else if (answer.kind === "fact") {

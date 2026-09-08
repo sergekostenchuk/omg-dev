@@ -15,13 +15,13 @@ const instruction = "candidatePage may contain an exact serialized fragment of t
 
 export async function assessmentSession(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot> | undefined, context: Record<string, any>,
-  prompt: string, signal?: AbortSignal): Promise<unknown> {
+  prompt: string, signal?: AbortSignal, extraGuards:Ref[]=[]): Promise<unknown> {
   // Additional readings and contradictions can change a verdict even when the
   // proposed value and its citations did not change.
   const basis = JSON.parse(JSON.stringify(context));
   const id = `assessment-session:${hashJson([reference(question), reference(environment), draft.value.inputs, basis])}`;
   let session = store.get<Session>(id);
-  const guards = [reference(question), reference(environment), ...draft.value.inputs, ...context.observations.map((o: any) => o.source)];
+  const guards = [reference(question), reference(environment), ...draft.value.inputs, ...context.observations.map((o: any) => o.source),...extraGuards];
   const save = (value: Session) => session = store.writeMany<Session>([{ id, kind: "assessment-session", expected: session?.revision ?? 0,
     value:{...value,binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs}} }], guards)[0]!;
   if (!session) save({ projectId: draft.value.projectId, offset: 0, notes: [], focus: null, result: null });

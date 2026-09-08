@@ -2,6 +2,7 @@ import { processStart } from "../runtime/process-identity.js";
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview } from './research-preview.js';
+import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt, DEFAULT_CONTINUATION_CHARS } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
@@ -154,6 +155,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if(audit){
     const projectCounterId=`project-dispatch:${hashJson(environment.projectId)}`;
     const projectCounter=audit.store.get<{projectId:string;serial:number}>(projectCounterId);
+    requireCondition(!audit.store.list<RuntimeObservation>('runtime-observation').some(observation=>observation.value.projectId===environment.projectId&&observation.value.status==='running'),
+      'runtime_observation_busy','Wait for the declared runtime observation before spending another model call');
     requireCondition(!projectCounter||(projectCounter.kind==='project-dispatch'&&projectCounter.value.projectId===environment.projectId
       &&Number.isSafeInteger(projectCounter.value.serial)&&projectCounter.value.serial>=0),
     'research_dispatch_invalid','Invalid project dispatch counter');

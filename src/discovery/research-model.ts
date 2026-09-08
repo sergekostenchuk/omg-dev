@@ -6,6 +6,7 @@ import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
 
 export interface ResearchAssessment {
+  runtimeProofs?: import('../graph/runtime-evidence.js').RuntimeEvidence[];
   bases?: import('../graph/research-basis.js').ResolvedResearchBasis[];
   projectId: string; question: Ref; value: Json; observations: Observation[];
   verdict: "supported" | "insufficient" | "conflicting"; reasons: string[];

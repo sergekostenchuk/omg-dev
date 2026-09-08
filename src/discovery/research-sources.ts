@@ -20,6 +20,7 @@ export class ResearchSources {
       // Repeating every captured code header in every request wastes context.
       const excerpt = item.value.origin.kind === "file" ? "" : item.value.content.slice(0, 3000);
       return { ref: reference(item), kind: item.value.origin.kind, location: item.value.origin.location,
+        ...(item.value.provenance?{provenance:item.value.provenance}:{}),
         media: item.value.mediaType, length: item.value.content.length, excerpt, truncated: item.value.content.length > excerpt.length };
     }),
       files: files.slice(0, 2000), filesTruncated: files.length > 2000 };

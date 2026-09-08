@@ -28,7 +28,7 @@ export function executablePath(command: Command, cwd: string): string {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
     && Array.isArray(command.args) && command.args.every(arg => typeof arg === "string"), "command_unavailable", "Executable and argument array are required");
   const candidates = isAbsolute(command.executable) || /[\\/]/.test(command.executable)
-    ? [resolve(cwd, command.executable)] : (process.env['PATH'] ?? "").split(delimiter).map(path => resolve(path || cwd, command.executable));
+    ? [resolve(cwd, command.executable)] : (process.env['PATH'] ?? "").split(delimiter).map(path => resolve(cwd, path || '.', command.executable));
   for (const candidate of candidates) {
     try { accessSync(candidate, constants.X_OK); if (statSync(candidate).isFile()) return realpathSync(candidate); } catch { /* try next PATH entry */ }
   }

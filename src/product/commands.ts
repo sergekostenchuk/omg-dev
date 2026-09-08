@@ -12,6 +12,8 @@ import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligation-policy.js';
 
 export type ProductCommand =
+  | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
+  | {type:'recover-runtime-observation';project:string;observation:Ref}
   | {type:'apply-obligation-policy';project:string;scope:Ref;policy:ObligationPolicy}
   | {type:'retry-planned-read';project:string;child:Ref}
   | {type:'recover-context-session';project:string;session:Ref;selector:ContextRecoverySelector}
@@ -71,6 +73,8 @@ const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const schema = { oneOf: [
+  command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
+  command('recover-runtime-observation',{project,observation:ref}),
   command('apply-obligation-policy',{project,scope:ref,policy:obligationPolicySchema}),
   command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),

@@ -5,6 +5,7 @@ import type { Store, Revision } from '../storage/store.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { prepareScopeWrite, researchScope, type ResearchScope } from './research-scope.js';
 import { validateObligationPolicy, type ObligationPolicy } from './obligation-policy.js';
+import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 
 /** Applying owner policy changes one scope revision, never the old run or budget.
  * The immutable successor itself is the retry receipt; no extra status record. */
@@ -32,7 +33,8 @@ export function applyObligationPolicy(store: Store, project: string, expectedSco
   requireCondition(!counter || (counter.kind === 'project-dispatch' && counter.value.projectId === project
     && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0 && counter.value.serial < Number.MAX_SAFE_INTEGER),
   'obligation_application_dispatch_invalid', 'Application requires a valid project dispatch counter');
-  requireCondition(!store.list<ModelCall>('model-call').some(call => call.value.projectId === project && call.value.status === 'running'),
+  requireCondition(!store.list<ModelCall>('model-call').some(call => call.value.projectId === project && call.value.status === 'running')
+    && !store.list<RuntimeObservation>('runtime-observation').some(call => call.value.projectId === project && call.value.status === 'running'),
     'obligation_application_busy', 'Preserve the active call; finish or recover it before changing the research scope');
   try {
     return store.writeMany<ResearchScope>([prepared.write,

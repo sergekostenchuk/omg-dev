@@ -7,6 +7,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { safeRelativePath } from "../graph/topology.js";
 
 export interface Source {
+  provenance?: { kind: 'runtime-observation'; record: Ref };
   projectId: string; origin: { kind: "file" | "owner-document"; location: string };
   content: string; mediaType: "text/plain" | "application/json"; sha256: string;
 }

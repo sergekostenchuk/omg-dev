@@ -104,11 +104,12 @@ export class Refinement {
       : this.#matchesQuestions(project, level, specs, draft.value.inputs, draft.value.basisContract === 'typed-v1', draft.value.obligationContract === 'evidence-v1'))
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
+    const runtimeAdmissionGuards:Ref[]=[];
     if (level !== "R0") {
       const effective = this.environments.effective(project);
       const graph = this.store.get<Graph>(`graph:${project}`);
       requireCondition(graph, "graph_missing", "Technical research needs the current operation map");
-      const findings = technicalResearchFindings(this.store, this.discovery, draft.value, graph.value, effective.root);
+      const findings = technicalResearchFindings(this.store, this.discovery, draft.value, graph.value, effective.root,runtimeAdmissionGuards);
       if (findings.length) throw new EngineError("technical_research_incomplete", findings.map(item => `${item.code}: ${item.message}`).join("; "), findings);
       inputs.push(reference(this.store.get(`workspace:${project}`)!), ...effective.guards);
     }
@@ -116,7 +117,7 @@ export class Refinement {
     return this.#milestone(`phase:${project}:${level}`, expected,
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null,
         ...(scope?.value.policy ? { carried: carriedObligations(scope) } : {}) },
-      [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
+      uniqueRefs([...guards,...runtimeAdmissionGuards, ...(graphAtStart ? [reference(graphAtStart)] : [])]));
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
     assertPilotBoundary(this.store, project, `L${level}`);

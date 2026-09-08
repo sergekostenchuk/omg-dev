@@ -71,7 +71,8 @@ export function resolveResearchBasis(store: Store, project: string, report: Tech
     const selected = observed(document.id, document.citation);
     if (!selected) continue;
     const { source, observation } = selected;
-    if (!['owner-document', 'document-observation'].includes(document.kind) || source.value.origin.kind !== 'owner-document') {
+    if (!['owner-document', 'document-observation'].includes(document.kind) || source.value.origin.kind !== 'owner-document'
+      || source.value.provenance && document.kind==='owner-document') {
       fail('document_evidence_required', document.id, 'Documentary basis requires a document source and an explicit proof limit'); continue;
     }
     const original = typeof observation.value === 'string' ? observation.value : canonical(observation.value);

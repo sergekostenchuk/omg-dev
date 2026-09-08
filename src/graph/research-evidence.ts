@@ -3,13 +3,14 @@ import { realpathSync } from "node:fs";
 import { relative } from "node:path";
 import { Store } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { STAGES, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
+import { STAGES, stageId, type StageArtifact, type Finding, type Ref } from "../pipeline/contracts.js";
 import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath } from "../runtime/environment.js";
 import type { Graph } from "./model.js";
 import type { TechnicalReport } from "./research-contracts.js";
 import { resolveResearchBasis } from './research-basis.js';
 import { obligationEvidenceFindings } from './obligation-evidence.js';
+import { collectRuntimeEvidence } from './runtime-evidence.js';
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
@@ -20,7 +21,8 @@ export function researchConsumerIds(store: Store, project: string, graph: Pick<G
 /** Deterministic proposal checks run before paying an assessor and are reused
  * by the final consumer; an accepted model verdict cannot bypass them. */
 export function technicalProposalFindings(store: Store, project: string, level: string, questionId: string, field: string,
-  report: TechnicalReport, observations: Observation[], graph: Graph, root: string): Finding[] {
+  report: TechnicalReport, observations: Observation[], graph: Graph, root: string,
+  runtime?:ReturnType<typeof collectRuntimeEvidence>): Finding[] {
   root = realpathSync(root);
   const findings: Finding[] = [];
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, message, field });
@@ -35,7 +37,8 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   if (question?.value.spec.obligationContract !== draft?.value.obligationContract)
     fail('research_contract_mismatch',questionId,'Question and draft must retain the same obligation evidence contract');
   if (typed) findings.push(...resolveResearchBasis(store, project, report, observations, root, field).findings);
-  if (question) findings.push(...obligationEvidenceFindings(question.value.spec,report,observations));
+  if (question) findings.push(...obligationEvidenceFindings(question.value.spec,report,observations,
+    (runtime??collectRuntimeEvidence(store,project,question.value.spec,report,observations)).proofs));
   if (report.applicability === "applicable" && !report.facts.length && !report.designs.length) fail("research_report_empty", questionId, "An applicable domain needs concrete facts or explicit design decisions");
   if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length || report.documents?.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
   if (field.startsWith("gap_") && report.applicability !== "applicable") fail("research_gap_unresolved", questionId, "An inherited gap needs a concrete resolution, including when research disproves its premise");
@@ -76,14 +79,16 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   return findings;
 }
 
-export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string): Finding[] {
+export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string, admissionGuards:Ref[]=[]): Finding[] {
   return draft.questions.flatMap(questionId => {
-    const question = store.get<{ spec: { field: string }; answer: { id: string } | null }>(questionId)!;
+    const question = store.get<Question>(questionId)!;
     const field = question.value.spec.field;
     const answer = question.value.answer ? store.get(question.value.answer.id) : null;
     if (answer?.kind !== "research-answer") return [{ code: "research_assessment_required", target: questionId, field,
       message: "Technical research requires an evidence-assessed report; a manual declaration is insufficient" }];
-    return technicalProposalFindings(store, draft.projectId, draft.level, questionId, field,
-      draft.fields[field] as unknown as TechnicalReport, discovery.observations(questionId), graph, root);
+    const report=draft.fields[field] as unknown as TechnicalReport,observations=discovery.observations(questionId);
+    const runtime=collectRuntimeEvidence(store,draft.projectId,question.value.spec,report,observations);
+    admissionGuards.push(...runtime.guards);
+    return technicalProposalFindings(store, draft.projectId, draft.level, questionId, field,report,observations,graph,root,runtime);
   });
 }
