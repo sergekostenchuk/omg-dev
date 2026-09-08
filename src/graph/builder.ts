@@ -6,6 +6,8 @@ import { projectGraph } from "./project.js";
 import type { Graph } from "./model.js";
 
 export const mapDesignSchema = structuredClone(graphV2Schema);
+// New L3 join semantics must not rewrite accepted L1/L2 authoring schemas.
+for (const field of ['condition', 'required', 'optional']) delete mapDesignSchema.properties['joins'].items.properties[field];
 for (const field of ["version", "id", "title", "actors", "requirements", "researchObligations"]) {
   delete mapDesignSchema.properties[field]; mapDesignSchema.required = mapDesignSchema.required.filter(item => item !== field);
 }

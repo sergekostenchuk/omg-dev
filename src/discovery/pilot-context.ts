@@ -155,6 +155,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
       specification: specification.ref, specificationConstraints: specification.fields['constraints'],
       features: features.ref, featureIndex: contextTable(features.fields['features']) },
     map: { ref: map.ref, level: map.level,
+      ...('relationContext' in map && map.relationContext ? { relationContext: map.relationContext } : {}),
       nodes: contextTable(map.graph.nodes.map((node, index) => ({ id: node.id, title: node.title, kind: node.kind, parent: node.parent,
         outcome: node.outcome, boundary: node.boundary, pointer: `/projection/nodes/${index}` }))),
       connectors: contextTable(map.graph.connectors.map((connector, index) => ({ id: connector.id, artifact: connector.artifact,
@@ -166,7 +167,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
       journeys: contextTable((map.graph.journeys ?? []).map((journey, index) => ({ ...journey, pointer: `/projection/journeys/${index}` }))) },
     draft: reference(draft), question: { id: question.id, ...spec },
     currentProposal: question.value.spec.field === "layerDesign" && draft.value.fields['layerDesign']
-      ? layerDeltaView(store, project, draft.value.fields['layerDesign'], draft.value.level === 'R2' ? 3 : 2) : draft.value.fields[question.value.spec.field],
+      ? layerDeltaView(store, project, draft.value.fields['layerDesign'], draft.value.level === 'R2' ? 3 : 2, question.value.spec.layerAssembly) : draft.value.fields[question.value.spec.field],
     catalogue,
     answers: draft.value.questions.map(id => store.get<Question>(id)!).map(q => ({ field: q.value.spec.field, status: q.value.status,
       pointer: `/fields/${escape(q.value.spec.field)}` })),

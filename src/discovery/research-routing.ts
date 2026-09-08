@@ -9,6 +9,7 @@ import { defectGaps } from '../graph/plan-defects.js';
 import { layerDesignSpec, LAYER_DESIGN_VERSION } from '../graph/layer-design.js';
 import { withTypedBasis } from '../graph/research-basis.js';
 import { withObligationEvidence } from '../graph/obligation-evidence.js';
+import { obligationHandoff } from '../graph/obligation-handoff.js';
 
 export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, pilot?: Revision<ReaderPilot> | null) {
   if (!pilot) return null;
@@ -29,7 +30,7 @@ export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft
     }
   } else {
     requireCondition(draft.value.contractVersion === LAYER_DESIGN_VERSION, 'research_contract_mismatch', 'L3 needs its layer design contract');
-    specs = [layerDesignSpec(3)];
+    specs = [layerDesignSpec(3, obligationHandoff(store, draft.value.projectId, draft.value.inputs))];
   }
   if (draft.value.basisContract === 'typed-v1') specs = specs.map(withTypedBasis);
   if (draft.value.obligationContract === 'evidence-v1') specs = specs.map(withObligationEvidence);

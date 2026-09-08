@@ -22,7 +22,8 @@ export interface Graph {
   artifacts: { id: string; contract: string; external: boolean; terminal: boolean; kind?: string; purpose?: string; durability?: Durability; sensitivity?: "public" | "project_internal" | "restricted" }[];
   connectors: Connector[];
   anchors: { id: string; owner: string; outcome: string; test: string }[];
-  joins: { id: string; consumer: string; connectors: string[]; failures?: JoinFailures }[];
+  joins: { id: string; consumer: string; connectors: string[]; failures?: JoinFailures;
+    condition?: string; required?: string[]; optional?: string[] }[];
   tests: { id: string; node: string; command: Command; covers: string[]; obligations?: Obligation[]; contract?: ProductTestContract }[];
   actors?: Actor[]; requirements?: Requirement[]; edges?: ControlEdge[]; journeys?: Journey[];
   transfers?: OwnershipTransfer[]; packets?: WorkPacket[];

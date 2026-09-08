@@ -103,7 +103,7 @@ export class GraphRepository {
     "layer_research_foreign", "Layer design must use its exact contract, accepted research and upper layer");
     requireCondition(questions.every(question => question.value.answer && this.store.get(question.value.answer.id)?.kind === "research-answer"),
       "research_assessment_required", "Layer construction requires assessed model research, not a manual graph declaration");
-    const graph = composeLayer(current.value, level, draft.value.fields['layerDesign']);
+    const graph = composeLayer(current.value, level, draft.value.fields['layerDesign'], questions[0]!.value.spec.layerAssembly);
     if (handoff) requireTaskObligations(this.store, projectId, graph, handoff);
     const prior = this.store.get<Binding>(`graph-binding:${projectId}`);
     const proofs = [...(prior?.value.layerProofs ?? []).filter(proof => proof.level < level),

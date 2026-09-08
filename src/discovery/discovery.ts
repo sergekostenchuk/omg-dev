@@ -17,6 +17,7 @@ import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/ru
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
+  layerAssembly?: import('../graph/layer-assembly.js').LayerAssembly;
   basisContract?: 'typed-v1';
   obligationContract?: 'evidence-v1';
   obligations?: { id: string; target: string; field: string; consumer: string;

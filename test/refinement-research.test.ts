@@ -10,6 +10,7 @@ import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { projectGraph } from "../src/graph/project.js";
 import { layerDesignOf } from "../src/graph/layer-design.js";
+import { L3_ASSEMBLY } from "../src/graph/layer-assembly.js";
 import { reference } from "../src/pipeline/contracts.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import type { ConsumerResult } from "../src/discovery/consumer-research.js";
@@ -51,7 +52,7 @@ function fixture(t: test.TestContext, project: string, scenario = "normal") {
   const { level: _level, ...initial } = projectGraph(full, 1);
   engine.graphs.save(project, initial, store.get(`graph:${project}`)!.revision, "fixture");
   const values = join(workspace, "designs.json");
-  writeFileSync(values, JSON.stringify({ 2: layerDesignOf(full, 2), 3: layerDesignOf(full, 3) }));
+  writeFileSync(values, JSON.stringify({ 2: layerDesignOf(full, 2), 3: layerDesignOf(full, 3, L3_ASSEMBLY) }));
   const command = { executable: process.execPath, args: [join(workspace, "adapter.mjs"), values, scenario] };
   engine.environments.configure(project, { workspace, implementer: { actor: "author", model: "fixture", effort: "high", command },
     reviewer: { actor: "assessor", model: "fixture", effort: "high", command },
@@ -75,15 +76,15 @@ test("R1/R2 and L2/L3 consumers autonomously correct only rejected fields for tw
       assert.deepEqual(engine.refinement.gate(project, phase).findings, []);
       const feedback = store.list<ConsumerFeedback>("research-feedback").filter(item => item.value.draft.id === draft.id);
       const early = store.list<ResearchTurn>("research-turn").filter(turn => turn.value.run === result.research?.id && turn.value.error);
-      if (phase.startsWith("L")) {
+      if (phase === "L2") {
         assert.equal(feedback.length, 1);
         assert.ok(feedback[0]!.value.findings.some(finding => finding.code === "upper_layer_drift"));
       } else {
-        assert.equal(feedback.length, 0, "Invalid facts must be refused before paid assessment and final consumption");
+        assert.equal(feedback.length, 0, "Invalid facts and typed L3 structural defects must be refused before paid assessment and final consumption");
         assert.ok(early.some(turn => JSON.stringify(turn.value.observation).includes(
-          phase === "R2" ? "research_basis_invalid" : "repository_evidence_required")));
+          phase === "L3" ? "upper_layer_drift" : phase === "R2" ? "research_basis_invalid" : "repository_evidence_required")));
       }
-      const affected = new Set(phase.startsWith("L") ? feedback[0]!.value.questions.map(ref => ref.id) : early.map(turn => turn.value.question?.id ?? (turn.value.action as {question:string}).question));
+      const affected = new Set(phase === "L2" ? feedback[0]!.value.questions.map(ref => ref.id) : early.map(turn => turn.value.question?.id ?? (turn.value.action as {question:string}).question));
       assert.equal(affected.size, 1);
       assert.ok(draft.value.questions.filter(id => !affected.has(id)).every(id => store.get<Question>(id)!.revision === 2));
       const turns = store.list("research-turn").length;

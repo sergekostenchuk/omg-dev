@@ -48,6 +48,7 @@ addRequired(properties['artifacts'].items, { kind: id, purpose: text,
   durability: { enum: ["durable_source", "durable_draft", "versioned", "immutable", "reconstructible", "evidence", "recoverable", "capability"] },
   sensitivity: { enum: ["public", "project_internal", "restricted"] } });
 addRequired(properties['joins'].items, { failures: object({ missing: text, extra: text, foreign: text, stale: text, duplicate: text, returnsTo: id }) });
+Object.assign(properties['joins'].items.properties, { condition: text, required: ids, optional: ids });
 addRequired(properties['tests'].items, { contract: object({ given: texts, when: text, then: texts, forbiddenEffects: texts,
   entrypoint: object({ kind: { enum: ["cli", "api", "route", "product_caller"] }, path: text, symbol: { anyOf: [text, { type: "null" }] }, status: { enum: ["existing", "planned"] } }),
   counterfactuals: array(object({ connector: id, mutation: { enum: ["remove", "revoke", "substitute"] }, expectedFailure: text, command: commandSchema })),

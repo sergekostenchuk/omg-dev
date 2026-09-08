@@ -35,10 +35,9 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor, "assessor_not_independent", "Research assessment requires a separate actor");
   if (draft.value.stage === 'om-g2' && draft.value.level === 'R2' && question.value.spec.field === 'layerDesign') {
     const handoff = obligationHandoff(store, draft.value.projectId, draft.value.inputs);
-    if (handoff) {
-      const base = store.get<Graph>(`graph:${draft.value.projectId}`)!;
-      requireTaskObligations(store, draft.value.projectId, composeLayer(base.value, 3, action.value), handoff);
-    }
+    const base = store.get<Graph>(`graph:${draft.value.projectId}`)!;
+    const assembled = composeLayer(base.value, 3, action.value, question.value.spec.layerAssembly);
+    if (handoff) requireTaskObligations(store, draft.value.projectId, assembled, handoff);
   }
   const runtime=collectRuntimeEvidence(store,question.value.projectId,question.value.spec,action.value as unknown as TechnicalReport,observations);
   if (draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) && draft.value.consumer === "compilation") {
@@ -59,7 +58,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const assessmentObservations=[...observations,...runtime.supporting];
   const context = pilotPacket ? { ...pilotPacket, ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), role: "assess-answer", question: question.value.spec,
     sourceLocations: observations.map(o => ({ source: o.source, location: store.get<any>(o.source.id)!.value.origin.location })),
-    value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2) : action.value,
+    value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2, question.value.spec.layerAssembly) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations:assessmentObservations, consumerFeedback: consumerFeedback(store, draft.value) }
     : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), question: question.value.spec, value: action.value, observations:assessmentObservations,

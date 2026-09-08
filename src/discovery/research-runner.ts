@@ -88,7 +88,8 @@ export class Researcher {
           try {
             const { revises: _revises, ...prior } = previousProposal as LayerDelta;
             const { candidateHash: _candidateHash, ...resolved } = layerDeltaView(this.store, project,
-              layerDeltaCandidate(this.store, draft, pending[0]!, previousProposal as LayerDelta), draft.value.level === "R2" ? 3 : 2);
+              layerDeltaCandidate(this.store, draft, pending[0]!, previousProposal as LayerDelta), draft.value.level === "R2" ? 3 : 2,
+              pending[0]!.value.spec.layerAssembly);
             previousProposal = { ...prior, ...resolved };
           } catch { /* Retain the failed raw proposal and its typed feedback. */ }
         }
@@ -264,7 +265,7 @@ export class Researcher {
             || ["pilot_", "budget_", "continuation_", "research_context_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
             || failure.code.endsWith("_no_progress"))) throw failure;
           error = failure instanceof Error ? failure.message : "Research action failed";
-          if (failure instanceof EngineError && failure.details !== null) observation = { code: failure.code, details: failure.details };
+          if (failure instanceof EngineError) observation = { code: failure.code, details: failure.details };
         }
         if (pilot && !error && ["read", "read_source", "read_context", "search"].includes(action.action))
           retainPilotRead(this.store, project, pending[0]!.id, action, observation);

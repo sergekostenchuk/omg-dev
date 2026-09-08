@@ -7,6 +7,7 @@ import { REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/rese
 import { researchGapDeferred } from '../graph/research-scope.js';
 import type { PlanDefect } from "../graph/plan-defects.js";
 import { projectGraph } from "../graph/project.js";
+import { layerRelationContext } from '../graph/layer-assembly.js';
 
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
@@ -60,5 +61,6 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
     return defect?.kind === "plan-defect" && defect.hash === ref.hash ? [{ ref, ...defect.value }] : [];
   });
   return { ref: reference(layer), level, graph: layer.value.projection, currentHorizon, research, failures,
+    ...(draft.level === 'R2' && draft.consumer !== 'compilation' ? { relationContext: layerRelationContext(layer.value.projection, level) } : {}),
     previousResearch: earlier ? reference(earlier) : null, openGaps };
 }

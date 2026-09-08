@@ -11,7 +11,7 @@ import { git } from "../runtime/environment.js";
 import type { Source } from "../evidence/evidence.js";
 import type { PlanDefect, PlanReissue } from "../graph/plan-defects.js";
 import type { Graph } from "../graph/model.js";
-import type { DiscoveryDraft } from "../discovery/discovery.js";
+import type { DiscoveryDraft, Question } from "../discovery/discovery.js";
 import type { ResearchRun } from "../discovery/research-model.js";
 import type { Feasibility } from "../graph/refinement.js";
 import { composeLayer } from "../graph/layer-design.js";
@@ -91,7 +91,9 @@ export class PlanRepairs {
             const layer = level === 1 ? 2 : 3;
             const graph = store.get<Graph>(`graph:${project}`)!;
             if (layer === 3) {
-              const proposed = composeLayer(graph.value, 3, draft.value.fields['layerDesign']);
+              const question = draft.value.questions.map(id => store.get<Question>(id)).find(item => item?.value.spec.field === 'layerDesign');
+              requireCondition(question, 'research_contract_mismatch', 'Repair must retain the producing layer-design question');
+              const proposed = composeLayer(graph.value, 3, draft.value.fields['layerDesign'], question.value.spec.layerAssembly);
               const failed = store.get<TaskRun>(runRef.id, runRef.revision)!;
               const oldPlan = compiler.read(failed.value.plan.id);
               for (const task of oldPlan.value.tasks) if (store.get<TaskRun>(runId(oldPlan.value.hash, task.id))?.value.state === "committed" && proposed.horizon.includes(task.node)) {

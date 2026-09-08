@@ -7,6 +7,7 @@ import { executionFixture } from "./execution-fixture.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { git, type ExecutionRoot } from "../src/runtime/environment.js";
 import { layerDesignOf } from "../src/graph/layer-design.js";
+import { L3_ASSEMBLY } from "../src/graph/layer-assembly.js";
 import type { ParkedCandidate } from "../src/execution/park.js";
 import type { PlanRepair } from "../src/product/repairs.js";
 import type { Revision } from "../src/storage/store.js";
@@ -24,7 +25,7 @@ test("a failed plan is researched, rebuilt and executed without repeating the ac
   const consumerTest = design.tests.find(test => test.node === "p-consume-work")!;
   consumerTest.covers.push("p-flow");
   consumerTest.contract!.counterfactuals.push({ connector: "p-flow", mutation: "remove", expectedFailure: "input_missing", command: { executable: process.execPath, args: ["check.mjs", "consume-mutation"] } });
-  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3) }));
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3, L3_ASSEMBLY) }));
   const first = await f.engine.execute({ type: "repair-plan", project: "p", run: reference(failed), maxTurns: 1 }) as Revision<PlanRepair>;
   assert.equal(first.value.phase, "research"); assert.ok(first.value.error);
   const parked = f.store.get<ParkedCandidate>(first.value.parked.id)!;
@@ -76,7 +77,7 @@ test("research cannot reissue an unchanged accepted prefix as new work", async t
   const f = executionFixture(t, "repair");
   const runs = await f.engine.executor.run("p", reference(f.plan), f.options);
   const design = structuredClone(f.plan.value.graphSnapshot);
-  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3) }));
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3, L3_ASSEMBLY) }));
   const result = await f.engine.repairs.run("p", reference(runs[1]!), 20);
   assert.equal(result.value.phase, "design"); assert.match(result.value.error!, /repeat an unchanged accepted unit/);
   assert.equal(f.store.list("plan-reissue").length, 0);
@@ -87,7 +88,7 @@ test("research cannot reissue an unchanged accepted prefix as new work", async t
   const check = design.tests.find(test => test.node === "p-consume-work")!;
   check.covers = ["p-flow"];
   check.contract!.counterfactuals = [{ connector: "p-flow", mutation: "remove", expectedFailure: "input_missing", command: { executable: process.execPath, args: ["check.mjs", "consume-mutation"] } }];
-  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3) }));
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(design, 3, L3_ASSEMBLY) }));
   const corrected = await f.engine.repairs.run("p", reference(runs[1]!), 10);
   assert.equal(corrected.value.phase, "reissued", corrected.value.error ?? "Correction failed");
 });
@@ -103,7 +104,7 @@ test("an early technical refusal preserves accepted reports and the next model c
   const initialDraft=f.store.get<DiscoveryDraft>(prepared.value.draftId)!;
   answerTechnicalFixture(f.engine,"p",{...initialDraft,value:{...initialDraft.value,
     questions:initialDraft.value.questions.filter(id=>f.store.get<Question>(id)!.value.spec.field!=="contractsAndConsumers")}});
-  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: true }));
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3, L3_ASSEMBLY), researchGap: true }));
   const rejected = await f.engine.repairs.run("p", reference(failed), 20);
   assert.equal(rejected.value.phase, "research"); assert.match(rejected.value.error!, /no durable progress/);
   assert.ok(f.store.list("research-turn").some(turn => JSON.stringify(turn.value).includes("research_gap_unresolved")));
@@ -112,7 +113,7 @@ test("an early technical refusal preserves accepted reports and the next model c
   assert.deepEqual(questions.filter(question => question.value.status === "open").map(question => question.value.spec.field), ["contractsAndConsumers"]);
   const accepted = questions.filter(question => question.value.status === "answered");
   const calls = f.calls().length;
-  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3), researchGap: false }));
+  writeFileSync(join(f.directory, "calls.jsonl.repair.json"), JSON.stringify({ design: layerDesignOf(graph, 3, L3_ASSEMBLY), researchGap: false }));
   const stillPaused=await f.engine.repairs.run('p',reference(failed),20);
   assert.equal(stillPaused.value.phase,'research');
   assert.equal(f.calls().length,calls,'An ordinary resume cannot reset the no-progress guard');

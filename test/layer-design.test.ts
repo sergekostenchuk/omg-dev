@@ -7,7 +7,7 @@ import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { reference } from "../src/pipeline/contracts.js";
 import type { Graph } from "../src/graph/model.js";
-import type { DiscoveryDraft } from "../src/discovery/discovery.js";
+import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import type { Revision } from "../src/storage/store.js";
 import { composeLayer, layerDesignOf } from "../src/graph/layer-design.js";
 import { projectGraph } from "../src/graph/project.js";
@@ -18,6 +18,7 @@ import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import { answerLayerFixture } from "./layer-design-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
+import { pilotContext } from '../src/discovery/pilot-context.js';
 
 function fixture(t: test.TestContext, project: string) {
   const root = mkdtempSync(join(tmpdir(), "omg-layers-")); const workspace = join(root, "repo"); mkdirSync(workspace);
@@ -51,6 +52,11 @@ test("two products build L2 then L3 through commands from assessed designs, pres
       const draft = engine.execute({ type: "prepare-layer", project, level }) as Revision<DiscoveryDraft>;
       const context = researchGraphContext(store, draft.value)!;
       assert.equal(context.level, level - 1); assert.equal(context.research.length, 1);
+      if (level === 3) {
+        assert.ok('relationContext' in context && context.relationContext);
+        assert.ok(context.relationContext.connectors.every(item => item.kind === 'connector'));
+        assert.deepEqual(pilotContext(store, draft, store.get<Question>(draft.value.questions[0]!)!).map.relationContext, context.relationContext);
+      }
       assert.ok(Object.hasOwn(context.research[0]!.fields, level === 2 ? "runtime" : "contractsAndConsumers"));
       const answered = answerLayerFixture(engine, project, draft, level, full);
       const graph = store.get<Graph>(`graph:${project}`)!;

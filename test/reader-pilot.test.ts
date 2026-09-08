@@ -1016,11 +1016,11 @@ test("L3 delta preserves L2, carries its atomic horizon and refuses an empty hor
   engine.graphs.save("p", upper, store.get("graph:p")!.revision, "fixture");
   const draft = engine.discovery.create("p", "om-g2", "R2", full.nodes.find(n => n.kind === "product")!.id, [layerDesignSpec(3)], [], 1);
   const question = store.get<Question>(draft.value.questions[0]!)!;
-  const target = layerDesignOf(full, 3), delta = layerDeltaView(store, "p", target, 3);
+  const target = layerDesignOf(full, 3, question.value.spec.layerAssembly), delta = layerDeltaView(store, "p", target, 3, question.value.spec.layerAssembly);
   const result = expandLayerDelta(store, draft, question, delta) as Record<string, Json>;
   assert.deepEqual(result['horizon'], full.horizon);
   assert.equal((result['nodes'] as {id:string}[]).length, full.nodes.length);
-  assert.throws(() => expandLayerDelta(store, draft, question, {...delta, horizon: []}), {code: "horizon_empty"});
+  assert.throws(() => expandLayerDelta(store, draft, question, {...delta, horizon: []}), {code: "answer_invalid"});
   assert.throws(() => expandLayerDelta(store, draft, question, {...delta, base: {...delta.base, revision: 999}}), {code: "graph_stale"});
 });
 

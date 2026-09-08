@@ -18,6 +18,8 @@ import { assessAnswer } from '../src/discovery/research-assessment.js';
 import { nodeSignature } from '../src/compiler/model.js';
 import type { Graph } from '../src/graph/model.js';
 import type { Question } from '../src/discovery/discovery.js';
+import { planningForQuestion } from '../src/discovery/research-routing.js';
+import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 
 function fixture(t: test.TestContext, responsible = 'p-produce-block') {
   const root = mkdtempSync(join(tmpdir(), 'omg-task-obligations-')), store = new Store(join(root, 'db.sqlite')), engine = new ProductEngine(store);
@@ -142,12 +144,40 @@ test('missing concrete consumers are rejected on full-answer and delta paths bef
   const draft = f.engine.discovery.create('p', 'om-g2', 'R2', 'p-product', [layerDesignSpec(3, f.handoff)], [reference(f.r2), reference(f.scope)], 1);
   const question = f.store.get<Question>(draft.value.questions[0]!)!;
   const graph = { ...f.graph.value, researchObligations: [] };
-  await assert.rejects(assessAnswer(f.store, question, { action: 'answer', question: question.id, value: layerDesignOf(graph, 3),
+  await assert.rejects(assessAnswer(f.store, question, { action: 'answer', question: question.id, value: layerDesignOf(graph, 3, question.value.spec.layerAssembly),
     citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }, f.environment, f.root),
   { code: 'task_obligation_bindings_invalid' });
   const delta = { base: reference(f.graph), upserts: {}, removes: {} };
   assert.deepEqual((layerDeltaCandidate(f.store, draft, question, delta) as any).researchObligations, []);
   assert.throws(() => expandLayerDelta(f.store, draft, question, delta), { code: 'task_obligation_bindings_invalid' });
+  assert.equal(f.store.list('model-call').length, 0);
+});
+
+test('L3 routing uses the actual carried contract and rejects a schema without its obligations before dispatch', t => {
+  const f = fixture(t), command = { executable: process.execPath, args: ['--version'] };
+  const pilot = configureReaderPilot(f.store, f.engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
+    maxRequestChars: 100000, maxReadChars: 20000, maxReplyChars: 30000, maxCalls: 20, maxReportedTokens: 800000,
+    planning: { fields: ['old-R1'], maxRequestChars: 90000, maxRounds: 5 } }, 0);
+  const draft = f.engine.discovery.create('p', 'om-g2', 'R2', 'p-product', [layerDesignSpec(3, f.handoff)], [reference(f.r2), reference(f.scope)], 1);
+  const question = f.store.get<Question>(draft.value.questions[0]!)!;
+  assert.equal(planningForQuestion(f.store, draft, question, pilot), pilot.value.planning);
+  assert.throws(() => planningForQuestion(f.store, draft, { ...question, value: { ...question.value, spec: layerDesignSpec(3) } }, pilot), { code: 'research_contract_mismatch' });
+  assert.equal(f.store.list('model-call').length, 0);
+});
+
+test('full L3 answers and deltas reject journey references before invoking a paid assessor', async t => {
+  const f = fixture(t);
+  const draft = f.engine.discovery.create('p', 'om-g2', 'R2', 'p-product', [layerDesignSpec(3, f.handoff)], [reference(f.r2), reference(f.scope)], 1);
+  const question = f.store.get<Question>(draft.value.questions[0]!)!;
+  const value = layerDesignOf(f.bound, 3, question.value.spec.layerAssembly) as any;
+  const chosen = value.tests.find((item: any) => item.covers.length);
+  chosen.covers[0] = { kind: 'journey', id: f.bound.journeys![0]!.id };
+  await assert.rejects(assessAnswer(f.store, question, { action: 'answer', question: question.id, value,
+    citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }, f.environment, f.root),
+  { code: 'answer_invalid' });
+  assert.throws(() => expandLayerDelta(f.store, draft, question, { base: reference(f.graph), removes: {},
+    upserts: { tests: [{ id: chosen.id, covers: chosen.covers }], researchObligations: value.researchObligations } }), { code: 'answer_invalid' });
   assert.equal(f.store.list('model-call').length, 0);
 });
 

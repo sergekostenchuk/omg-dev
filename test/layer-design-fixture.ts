@@ -13,7 +13,7 @@ export function answerLayerFixture(engine: ProductEngine, project: string, draft
   const environment = engine.environments.get(project);
   const source = engine.discovery.evidence.document(project, `layer-fixture-${level}`, "Fixture design based on the accepted product brief", "text/plain",
     engine.store.get(`source:${project}:layer-fixture-${level}`)?.revision ?? 0);
-  const value: ResearchAssessment = { projectId: project, question: reference(question), value: layerDesignOf(graph, level),
+  const value: ResearchAssessment = { projectId: project, question: reference(question), value: layerDesignOf(graph, level, question.value.spec.layerAssembly),
     observations: [engine.discovery.evidence.observe(project, reference(source), { kind: "text-range", start: 0, end: source.value.content.length })],
     verdict: "supported", reasons: [], researcher: environment.value.implementer.actor, assessor: environment.value.reviewer.actor, environment: reference(environment) };
   const assessment = engine.store.write<ResearchAssessment>({ id: `research-assessment:${hashJson(value)}`, kind: "research-assessment", expected: 0, value });
