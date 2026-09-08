@@ -135,16 +135,16 @@ test('the summary target is reduced to the space left after exact context, and a
   assert.ok(JSON.stringify(next).length<=80000);
 });
 
-test('new unresolved content counts against the complete compact target and cannot buy a second overlarge summary',async t=>{
+test('irreducible unresolved content exceeding packet capacity stops before a pointless tightening',async t=>{
   const f=await fixture(t,12000,80000);atFinal(f,addressed(f,3,18000),3);
   adapter(f,`if(c.dispatchMode!=='consolidation')throw Error('Oversized compaction must stop before ordinary generation');
 research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'The conditions remain distinct'}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['Z'.repeat(30000)]};`);
-  await assert.rejects(f.invoke(),{code:'consolidation_target_limit'});
+  await assert.rejects(f.invoke(),{code:'research_context_capacity'});
   const active=activeSynthesisNotes(f.store.get<any>(f.before.id)!.value.notes),note=active[0]!,packed=compactConclusions(active);
   assert.ok(JSON.stringify(packed.items).length<note.consolidated!.targetChars!);
   assert.ok(JSON.stringify(packed).length>note.consolidated!.fullTargetChars!);
   assert.equal(f.store.list('model-call').length,2);
-  await assert.rejects(f.invoke(),{code:'consolidation_target_limit'});assert.equal(f.store.list('model-call').length,2);
+  await assert.rejects(f.invoke(),{code:'research_context_capacity'});assert.equal(f.store.list('model-call').length,2);
 });
 
 test('delivering the last page enters finalization even before its cursor is acknowledged by a checkpoint',async t=>{
@@ -163,4 +163,39 @@ test('a lookup from the just-delivered final page also requires purpose before i
   await assert.rejects(f.invoke(),{code:'synthesis_context_purpose_missing'});
   assert.equal(f.store.list('model-call').length,2);
   assert.equal(f.store.get<any>(f.before.id)!.value.offset,0);
+});
+
+
+test('one unsuccessful tightening is terminal and never loses original notes, citations or unresolved items',async t=>{
+  const f=await fixture(t,5000,60000);f.context.request={immutableCondition:'x'.repeat(35000)};
+  adapter(f,`if(c.dispatchMode!=='consolidation')throw Error('No ordinary generation while the packet does not fit');
+research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(14000)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
+  await assert.rejects(f.invoke(),{code:'consolidation_capacity_exhausted'});
+  const session=f.store.get<any>(f.before.id)!;
+  assert.equal(f.store.list('model-call').length,3);assert.equal(session.value.notes.length,5);
+  assert.deepEqual(session.value.notes.slice(0,3),f.notes);
+  const active=activeSynthesisNotes(session.value.notes),note=active[0]!;
+  assert.deepEqual(note.consolidated!.tightenedFrom,session.value.notes[3].checkpoint);
+  assert.deepEqual((note.proposal as any).citations,(f.notes[0]!.proposal as any).citations);
+  assert.deepEqual((note.proposal as any).unresolved,['Keep unresolved-0','Keep unresolved-1','Keep unresolved-2']);
+  assert.equal(f.wires().filter(w=>w.subject.consolidation?.tightening).length,1);
+  await assert.rejects(f.invoke(),{code:'consolidation_capacity_exhausted'});assert.equal(f.store.list('model-call').length,3);
+});
+
+test('a paid tightening recovers through the ordinary consumer once, preserving its terminal retry boundary',async t=>{
+  const f=await fixture(t,5000,60000);f.context.request={immutableCondition:'x'.repeat(35000)};
+  adapter(f,`research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(14000)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
+  const write=f.store.writeMany.bind(f.store);let interrupted=false;
+  f.store.writeMany=((writes:any[],guards:any[]=[])=>{
+    if(!interrupted&&writes.some(w=>w.kind==='synthesis-session'&&w.value.notes.length===5)){interrupted=true;throw Error('fixture tightening crash');}
+    return write(writes,guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.invoke(),/fixture tightening crash/);f.store.writeMany=write;
+  const call=f.store.list<any>('model-call').find(c=>JSON.parse(f.store.get<any>(c.value.request.record.id)!.value.text).subject.consolidation?.tightening)!;
+  assert.ok(call);const session=f.store.get<any>(f.before.id)!;
+  const receipt=await f.engine.execute({type:'recover-research-response',project:'p',call:reference(call),session:reference(session)}) as any;
+  assert.equal(receipt.value.state,'applied');assert.equal(f.store.list('model-call').length,3);
+  const active=activeSynthesisNotes(f.store.get<any>(f.before.id)!.value.notes);
+  assert.deepEqual(active[0]!.consolidated!.tightenedFrom,session.value.notes.at(-1).checkpoint);
+  await assert.rejects(f.invoke(),{code:'consolidation_capacity_exhausted'});assert.equal(f.store.list('model-call').length,3);
 });

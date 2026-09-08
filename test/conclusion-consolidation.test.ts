@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fixture } from './synthesis-session-fixture.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { researchAction } from '../src/discovery/research-protocol.js';
@@ -80,25 +82,37 @@ test('an unfit next fragment triggers consolidation even below the configurable 
   assert.equal(f.store.get(f.pilot.id)!.revision, f.pilot.revision); assert.equal(f.store.list('research-limit').length, 0);
 });
 
-test('an oversized paid summary is saved once and repeated invokes do not buy another consolidation', async t => {
-  const f = await fixture(t, 5000, 30000, 0.35, 10000);
-  assert.equal(f.store.list('model-call').length, 1);
-  await assert.rejects(withInvocationAllowance(1, f.invoke), error =>
-    error instanceof EngineError && ['consolidation_target_limit'].includes(error.code));
-  assert.equal(f.store.list('model-call').length, 2);
-  const session = f.store.list<any>('synthesis-session')[0]!;
-  const active = activeSynthesisNotes(session.value.notes);
-  assert.equal(active.length, 1);
-  assert.ok(active[0]!.proposal.action === 'checkpoint');
-  if (active[0]!.proposal.action !== 'checkpoint') throw Error();
-  assert.ok(JSON.stringify(active[0]!.proposal.value).length > f.pilot.value.maxContinuationChars!);
-  assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'consolidation').length, 1);
-  await assert.rejects(f.invoke(), error =>
-    error instanceof EngineError && ['consolidation_target_limit'].includes(error.code));
-  assert.equal(f.store.list('model-call').length, 2);
-  await assert.rejects(f.invoke(), error =>
-    error instanceof EngineError && ['consolidation_target_limit'].includes(error.code));
-  assert.equal(f.store.list('model-call').length, 2);
+test('a paid summary that misses its goal but fits the actual packet continues without another compaction', async t => {
+  const f=await fixture(t,5000,100000,0.1,3000);
+  assert.equal((await f.invoke()).action,'pause');
+  const session=f.store.get<any>(f.before.id)!;
+  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,1);
+  assert.equal(f.store.list('model-call').length,3);
+  assert.equal(session.value.notices.length,1);assert.equal(session.value.notices[0].code,'consolidation_target_exceeded');
+  assert.deepEqual(session.value.notes.slice(0,3),f.notes);
+  const active=activeSynthesisNotes(session.value.notes);assert.equal(active.length,1);
+  assert.ok(active[0]!.consolidated!.targetChars!<JSON.stringify(active[0]!.proposal).length);
+  const packet=JSON.parse((await previewResearch(f.invoke)).input);
+  assert.equal(packet.subject.dispatchMode,'synthesis');assert.ok(JSON.stringify(packet).length<=100000);
+  assert.equal(f.store.get<any>(f.before.id)!.value.notices.length,1);
+});
+
+test('a non-fitting paid summary gets one tightening and then the fitting material packet continues', async t => {
+  const f=await fixture(t,5000,60000,0.2);f.context.request={immutableCondition:'x'.repeat(5000)};
+  writeFileSync(f.path,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
+appendFileSync(${JSON.stringify(join(f.root,'wire.ndjson'))},JSON.stringify(r)+'\\n');
+const chars=c.consolidation.tightening?14000:42000,research=c.dispatchMode==='consolidation'?{action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(chars)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]}:{action:'pause',reason:'Tightened packet fits'};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  await assert.rejects(withInvocationAllowance(2,f.invoke),{code:'research_call_allowance'});
+  const session=f.store.get<any>(f.before.id)!;
+  assert.equal(f.store.list('model-call').length,3);
+  assert.deepEqual(session.value.notes.slice(0,3),f.notes);
+  const active=activeSynthesisNotes(session.value.notes);assert.equal(active.length,1);
+  assert.deepEqual(active[0]!.consolidated!.tightenedFrom,session.value.notes[3].checkpoint);
+  const compactions=f.wires().filter(w=>w.subject.dispatchMode==='consolidation');assert.equal(compactions.length,2);
+  assert.ok(compactions[1].subject.consolidation.tightening.deficitChars>0);
+  const next=JSON.parse((await previewResearch(f.invoke)).input);
+  assert.equal(next.subject.dispatchMode,'synthesis');assert.ok(JSON.stringify(next).length<=60000);
 });
 
 test('an oversized notes-only input stops before payment and never increases transport limits', async t => {

@@ -1,5 +1,5 @@
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
-import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION } from './conclusion-consolidation.js';
+import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { processStart } from "../runtime/process-identity.js";
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
@@ -121,7 +121,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   requireCondition(consolidating || controls?.version !== 2 || controls.stage !== 'final' || controls.remainingLookups > 0 || finalizing,
     'research_no_progress','The final-stage lookup allowance is exhausted; an ordinary context-search dispatch is forbidden');
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const plannerRequestLimit = audit?.purpose === 'reading-planner' ? audit.pilot?.value.planning?.maxRequestChars : undefined;
   const initialRequestLimit = plannerRequestLimit ?? audit?.pilot?.value.maxRequestChars;
   const requestLimit = packetState && !packetState.initial

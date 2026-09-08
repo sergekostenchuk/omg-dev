@@ -1,6 +1,6 @@
 import { synthesisControls, type FinalizationState } from './synthesis-controls.js';
 import { compactConclusions } from './continuation-packet.js';
-import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote } from './conclusion-consolidation.js';
+import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, consolidationNotice, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote, type ConsolidationNotice } from './conclusion-consolidation.js';
 import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision, Write } from "../storage/store.js";
@@ -21,7 +21,7 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] };
-  notes: SynthesisNote[]; finalization?: FinalizationState;
+  notes: SynthesisNote[]; notices?: ConsolidationNotice[]; finalization?: FinalizationState;
   result: ResearchAction | null;
 }
 
@@ -93,6 +93,12 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     };
     verify(materials);
     if (session!.value.result) return session!.value.result!;
+    if (recoveryConsolidationMode() === undefined) {
+      const value=session!.value;
+      requireCondition(value.notices===undefined||Array.isArray(value.notices),'consolidation_state_invalid','Saved consolidation notices must remain an array');
+      const notice=activeSynthesisNotes(value.notes).map(consolidationNotice).find(n=>n && !(value.notices??[]).some(old=>canonical(old.checkpoint)===canonical(n.checkpoint)));
+      if(notice){save({...value,notices:[...(value.notices??[]),notice]});continue;}
+    }
     const current = session!.value;
     const workspace=contextWorkspace(current.workspace,current.focus);
     requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved context session is blocked');
@@ -105,30 +111,33 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
       contextWorkspace: workspace.entries.map(e => e.result), focus: null,
       ...(controls ? {contextControls:controls} : {}),
       ...(!recovering || Object.hasOwn(context,'contextCheckpointedKeys') ? {contextCheckpointedKeys:workspace.checkpointedKeys??[]} : {}) };
-    const consolidate = async (target = consolidationLimits(pilot.value).target, fullTarget?: number) => {
-      requireCondition(consolidationNeeded(current.notes, pilot.value, true), 'consolidation_no_progress',
-        'The current compact format already ran without new findings; preserve the notes instead of paying to compress them again');
-      requireCondition(Number.isSafeInteger(target) && target > 0,'research_context_capacity',
+    const consolidate = async (target = consolidationLimits(pilot.value).target, fullTarget?: number, allowTightening = false, packetDeficit = 0) => {
+      const active=activeSynthesisNotes(current.notes),regular=consolidationNeeded(current.notes,pilot.value,true);
+      const candidate=active.length===1?active[0]:undefined;
+      const tightening=recovering?context.consolidation.tightening:!regular && allowTightening && candidate?.consolidated?.format===2 && !candidate.consolidated.tightenedFrom
+        ? {from:candidate.checkpoint,currentItemsChars:JSON.stringify(compactConclusions(active).items).length,
+          currentFullChars:JSON.stringify(compactConclusions(active)).length,targetChars:target,fullTargetChars:fullTarget!,
+          packetDeficitChars:packetDeficit,deficitChars:Math.max(1,packetDeficit,JSON.stringify(compactConclusions(active).items).length-target,JSON.stringify(compactConclusions(active)).length-fullTarget!)} : undefined;
+      requireCondition(recovering || regular || tightening, 'consolidation_capacity_exhausted',
+        'The paid summary still does not fit after its one tightening; no further compaction is allowed without new findings');
+      requireCondition(Number.isSafeInteger(target) && target > 0 && (recovering || Number.isSafeInteger(fullTarget) && fullTarget!>0),'research_context_capacity',
         'Exact context and unresolved obligations leave no summary capacity inside the fixed limit');
+      const goal=recovering?context.consolidation:{targetChars:tightening?target:Math.min(target,consolidationLimits(pilot.value).target),fullTargetChars:fullTarget!,format:2,
+        ...(tightening?{tightening}:{})};
       const response = researchAction(await researchCall(dispatch.implementer, dispatch, '',
-        { ...callContext, dispatchMode: 'consolidation', consolidation: recovering ? context.consolidation : { targetChars: target, fullTargetChars: fullTarget!, format: 2 } }, signal,
+        { ...callContext, dispatchMode: 'consolidation', consolidation: goal }, signal,
         { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot, session: reference(session!) }));
       const proposal = consolidatedProposal(response, question.id, current.notes);
       const saved = checkpoint(store, draft, question, { ...proposal, value: proposal as unknown as Json });
       const note: SynthesisNote = { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: current.offset },
-        consolidated: { replaces: activeSynthesisNotes(current.notes).map(note => note.checkpoint),
-          ...(!recovering || context.consolidation?.format === 2 ? {format:2 as const,targetChars:target,fullTargetChars:recovering?context.consolidation.fullTargetChars:fullTarget!} : {}) } };
-      save({ ...current, notes: [...current.notes, note] }, [reference(saved)]);
-      const packed = compactConclusions([note]);
-      requireCondition(!note.consolidated?.format || JSON.stringify(packed.items).length <= target && JSON.stringify(packed).length <= note.consolidated.fullTargetChars!,'consolidation_target_limit',
-        'The paid summary exceeds its complete compact target; it is preserved, but another automatic compaction is forbidden');
+        consolidated: { replaces: active.map(note => note.checkpoint),
+          ...(!recovering || goal.format === 2 ? {format:2 as const,targetChars:goal.targetChars,fullTargetChars:goal.fullTargetChars} : {}),
+          ...(tightening?{tightenedFrom:tightening.from}:{}) } };
+      const notice=consolidationNotice(note);
+      save({ ...current, notes: [...current.notes, note],...(notice?{notices:[...(current.notices??[]),notice]}:{}) }, [reference(saved)]);
+      // A size goal is observational. The next real packet decides admission;
+      // it retains mandatory context and is checked before any next payment.
     };
-    if (!recovering) for (const note of activeSynthesisNotes(current.notes)) if (note.consolidated?.format === 2) {
-      const packed = compactConclusions([note]);
-      requireCondition(typeof note.consolidated.targetChars === 'number' && typeof note.consolidated.fullTargetChars === 'number'
-        && JSON.stringify(packed.items).length <= note.consolidated.targetChars && JSON.stringify(packed).length <= note.consolidated.fullTargetChars,
-        'consolidation_target_limit','The saved summary did not meet its bound; do not pay to repeat the same compaction');
-    }
     if (recoveryConsolidationMode()) { await consolidate(context.consolidation.targetChars,context.consolidation.fullTargetChars); continue; }
     let sent: Record<string, any> | undefined, action: ResearchAction;
     try {
@@ -143,8 +152,8 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
           } }));
     } catch (error) {
       if (error instanceof EngineError && ['continuation_carry_limit','consolidation_required'].includes(error.code)) {
-        const capacity = error.details as {targetChars?:number;fullTargetChars?:number}|null;
-        await consolidate(capacity?.targetChars === undefined ? undefined : Math.min(capacity.targetChars,consolidationLimits(pilot.value).target),capacity?.fullTargetChars??pilot.value.maxRequestChars); continue;
+        const capacity = error.details as {targetChars?:number;fullTargetChars?:number;deficitChars?:number}|null;
+        await consolidate(capacity?.targetChars,capacity?.fullTargetChars??Math.min(pilot.value.maxRequestChars,pilot.value.maxContinuationChars??100000),true,capacity?.deficitChars??0); continue;
       }
       if (error instanceof EngineError && ['research_context_undelivered','research_context_capacity'].includes(error.code)) save({ ...current, workspace: { ...workspace, blocked: error.message } });
       throw error;

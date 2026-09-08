@@ -75,7 +75,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
     const packet = { dispatchMode: 'consolidation', question: { id: question.id, ...question.value.spec },
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
-      consolidation: consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
+      consolidation: {...consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
+        ...(body['consolidation'].tightening ? {tightening:body['consolidation'].tightening} : {})},
       working: { archive: reference(archive), instruction: 'Original notes are immutable at /body/synthesisNotes. No new material is delivered in this step.',
         sections: [{ pointer: '/body/synthesisNotes' }] } };
     requireCondition(JSON.stringify(packet).length <= maxChars, 'consolidation_input_limit',
@@ -173,7 +174,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     Object.assign(packet,carry);
     packet.conclusionCapacity = {total,items};
     if (JSON.stringify(packet).length > maxChars-1024) throw new EngineError('consolidation_required',
-      'Preserve the delivered context and compact the conclusions before the next paid call', {targetChars:items,fullTargetChars:total});
+      'Preserve the delivered context and compact the conclusions before the next paid call', {targetChars:items,fullTargetChars:total,requiredChars:JSON.stringify(packet).length,maxChars,limitChars:maxChars-1024,deficitChars:JSON.stringify(packet).length-(maxChars-1024)});
   }
   packPriorEvidence(packet,priorSources,reference(archive),maxChars);
   if (body['synthesisState']) {
