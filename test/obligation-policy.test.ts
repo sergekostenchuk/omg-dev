@@ -131,7 +131,7 @@ test('the approved 34-obligation fixture is applied by the real policy validator
  const policy:ObligationPolicy={version:1,sourceScope:reference(source),assignments:matrix.obligations.map((o:any,i:number)=>({
   obligation:o.obligation,original:{record:reference(source),pointer:`/obligations/${i}/gap`},kind:o.proposedKind,moment:o.proposedMoment,
   responsibleNode:o.responsibleNode,responsibleConsumer:o.responsibleConsumer,neededForR2:o.proposedMoment==='R2',reason:o.rationale,
-  returnCondition:o.proposedMoment==='R2'?null:o.rationale}))};
+  returnCondition:o.returnCondition}))};
  const applied=configureResearchScope(f.store,{...source.value,policy},source.revision);
  assert.equal(applied.revision,source.revision+1);
  assert.deepEqual(applied.value.obligations,source.value.obligations);

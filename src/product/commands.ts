@@ -9,8 +9,10 @@ import type { DetailSelector } from "../compiler/context.js";
 import type { Environment } from "../runtime/environment.js";
 import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader-pilot.js";
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
+import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligation-policy.js';
 
 export type ProductCommand =
+  | {type:'apply-obligation-policy';project:string;scope:Ref;policy:ObligationPolicy}
   | {type:'retry-planned-read';project:string;child:Ref}
   | {type:'recover-context-session';project:string;session:Ref;selector:ContextRecoverySelector}
   | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
@@ -69,6 +71,7 @@ const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const schema = { oneOf: [
+  command('apply-obligation-policy',{project,scope:ref,policy:obligationPolicySchema}),
   command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),
   command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),

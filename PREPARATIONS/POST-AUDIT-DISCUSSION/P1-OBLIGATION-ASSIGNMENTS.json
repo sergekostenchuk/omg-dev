@@ -33,7 +33,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-state",
       "rationale": "Нужны существующие записи и точки подключения до проектирования; подтверждаются реализациями перечисленных производителей.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "actors-g2",
@@ -60,7 +61,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-control",
       "rationale": "Проверяются существующие ограничения адресации и пути stop/recover; наличие одной проверки проекта недостаточно.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "actors-g3",
@@ -94,7 +96,8 @@
         "route": "Bind the actual adapter/runtime version and documented boundaries; use relevant existing observations or a bounded check on benign fixtures if within authorized scope",
         "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
-      }
+      },
+      "returnCondition": null
     },
     {
       "obligation": "actors-g4",
@@ -121,7 +124,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-recovery",
       "rationale": "Нужен текущий контракт repair/park/snapshot по реализациям и относящимся assertions.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "actors-g5",
@@ -156,7 +160,8 @@
       "responsibleConsumer": "n-ui",
       "responsibleNode": "n-ui",
       "rationale": "UI исключён владельцем из текущей работы. Проверка QuestionPanel возвращается при включении UI и относится к результату соответствующей UI-задачи; исходный wake сохраняется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "Когда UI включён в горизонт и принимается результат соответствующей UI-задачи: проверить представление и отправку design во всех экземплярах QuestionPanel и связать результат с точным основанием ранее красного UI-теста. Сохраняются исходные wake.nodes, wake.paths и wake.uiRequired."
     },
     {
       "obligation": "effective-runtime-isolation",
@@ -190,7 +195,8 @@
         "route": "Bind the actual adapter/runtime version and documented boundaries; use relevant existing observations or a bounded check on benign fixtures if within authorized scope",
         "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
-      }
+      },
+      "returnCondition": null
     },
     {
       "obligation": "delivery-g1",
@@ -217,7 +223,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-runtime",
       "rationale": "Требуется подтверждение точной среды перед заявлением готовности R3. R2 может задать проверяемые требования к среде, не утверждая успешный запуск.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI."
     },
     {
       "obligation": "delivery-g2",
@@ -244,7 +251,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-runtime",
       "rationale": "Работоспособность установленного CLI/протокола подтверждается фактическим вызовом до ready R3; кэш и X_OK недостаточны.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат."
     },
     {
       "obligation": "delivery-g3",
@@ -278,7 +286,8 @@
         "known": "Physical user_version=1 and discovery-draft contractVersion 1/2/3 at the audited event2346",
         "limits": "Partial metadata projection, not full integrity proof or permission/need to migrate history",
         "ifInsufficient": "Read the required current metadata safely in read-only mode; never open the working database through Store"
-      }
+      },
+      "returnCondition": null
     },
     {
       "obligation": "delivery-g4",
@@ -305,7 +314,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-state",
       "rationale": "Определяются имеющиеся тесты и поддерживаемый контракт схемы. Будущая миграция не объявляется существующей, если схема не меняется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "delivery-g5",
@@ -332,7 +342,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-check",
       "rationale": "Точный runner и состав проверок нужны для задач; владельческое исключение UI теперь прямо известно и не распространяется на другие ошибки.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "delivery-g6",
@@ -359,7 +370,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-control",
       "rationale": "Это требование результатов живого завершённого прохода и возобновления. R2 задаёт проверку, а не предоставляет будущий результат реализации.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "При принятии результата задачи, обеспечивающей поставку и продолжение OMG: связать фактический запуск собранной версии с постоянной SQLite, перезапуск того же запуска и продолжение без повторной публикации с точными версиями реализации и среды."
     },
     {
       "obligation": "g-stage-validation-connection",
@@ -386,7 +398,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-research",
       "rationale": "Тело validateStage и маршрут supported→приёмка нужны перед детализацией; отсутствовавший фрагмент можно получить адресно.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-general-resume-test",
@@ -413,7 +426,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-control",
       "rationale": "Требуется выбрать существующий или минимально добавляемый общий resume-контракт и сценарии; нельзя закрыть его специальным repair.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-fixture-and-runner-details",
@@ -440,7 +454,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-check",
       "rationale": "Нужно установить реальные и подставленные границы существующих fixtures/runners и assertions.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-full-run-ui-exception",
@@ -467,7 +482,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-check",
       "rationale": "Нужен точный состав применимого прогона и происхождение UI-исключения; прямое решение владельца и журнал P2 доступны как отдельные основания.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-execution-candidate-proof",
@@ -494,7 +510,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-publish",
       "rationale": "Контракт привязки проверок к candidate/parent/tree устанавливается по существующим runner/commit/recovery и тестам; произвольный вывод об успешной реализации не добавляется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-live-results",
@@ -521,7 +538,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-product",
       "rationale": "Сам текст запрещает требовать будущий живой результат как существующий вход R3; проверить его нужно у результата реализующей задачи.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "При принятии результата задачи, обеспечивающей живой проход OMG: предъявить связанные результаты работы настроенных моделей, продолжения того же запуска после перезапуска и полезного опубликованного изменения для точных версий кода и среды. До этого результат исполнения остаётся недоказанным."
     },
     {
       "obligation": "integration-g1",
@@ -548,7 +566,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-runtime",
       "rationale": "Срок задан исходным текстом: до R3 зависимого исполнения. Новые платные probes исследованием не разрешаются; используются точные имеющиеся результаты и безопасные сведения о среде.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие."
     },
     {
       "obligation": "integration-g2",
@@ -575,7 +594,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-research",
       "rationale": "Нужно различить код исследуемого снимка и действующего движка и найти точные обработчики до назначения реализации.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "persistence-g1",
@@ -602,7 +622,8 @@
       "responsibleConsumer": "implementer",
       "responsibleNode": "n-state",
       "rationale": "Выбирается общая точка подключения нового проектора на основании существующих производителей; наличие готового проектора не требуется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "persistence-g2",
@@ -629,7 +650,8 @@
       "responsibleConsumer": "implementer",
       "responsibleNode": "n-recovery",
       "rationale": "Поддержка идентификатора/поиска ответа устанавливается по действующему адаптеру; отсутствие поддержки выражается как неизвестный исход без exactly-once.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "domain-g1",
@@ -656,7 +678,8 @@
       "responsibleConsumer": "implementer",
       "responsibleNode": "n-state",
       "rationale": "До назначения операций и writePaths нужен обоснованный проект подключения и защиты публикации; его нельзя перенести на исполнителя как неопределённый вход.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-store-guarantees",
@@ -683,7 +706,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-state",
       "rationale": "Границы writeMany, rollback и открытия базы нужны для проектного решения до компиляции и доступны в сохранённых источниках.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-snapshot-publication",
@@ -710,7 +734,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-backup",
       "rationale": "Исследуются существующие ветви snapshot/restore, синхронизация и повтор; различие process-crash/power-loss остаётся явным.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-engine-repair-routing",
@@ -737,7 +762,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-control",
       "rationale": "Нужно сопоставить существующие ветви управления и полноту repair; повторная добыча уже имеющихся исходников не требуется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-stop-idempotency",
@@ -764,7 +790,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-control",
       "rationale": "Минимальный сохраняемый stop/retry-контракт нужно определить сейчас; in-memory active не выдаётся за межпроцессное доказательство.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-partial-worktree",
@@ -791,7 +818,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-recovery",
       "rationale": "Нужно определить наличие и содержание сценариев аварийных окон в коде тестов. Отсутствующий сценарий не считается успешно выполненным.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-concurrent-execution",
@@ -818,7 +846,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-control",
       "rationale": "Вопрос о наличии реально конкурентного сценария решается чтением теста и его границ; CAS двух Store не подменяет такой сценарий.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-model-unknown-outcome",
@@ -845,7 +874,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-research",
       "rationale": "Если у адаптера нет идемпотентного повтора, контракт неизвестного исхода и разрешённого retry должен быть определён до задачи.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "g-recovery-live-evidence",
@@ -872,7 +902,8 @@
       "responsibleConsumer": "compilation",
       "responsibleNode": "n-recovery",
       "rationale": "Требуются фактические результаты cold reopen и публикации, а не только assertions. Они проверяются при приёмке соответствующей реализации.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": "При принятии результата задачи восстановления OMG: предъявить фактический cold reopen с сохранением идентичности того же запуска и отсутствием повторной публикации. Наличие исходников или assertions без результата выполнения не закрывает обязательство."
     },
     {
       "obligation": "runtime-g1",
@@ -899,7 +930,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-runtime",
       "rationale": "Покрытие subprocess/stop/start и место сохраняемого допуска устанавливаются по исходникам и тестам до выбора рабочего контракта.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "runtime-g2",
@@ -926,7 +958,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-state",
       "rationale": "Нужно назначить точки подключения, атомарные исходные группы и тестовый контракт проекций до R3; готовый результат проектора не требуется.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     },
     {
       "obligation": "runtime-g3",
@@ -953,7 +986,8 @@
       "responsibleConsumer": "n-refine",
       "responsibleNode": "n-recovery",
       "rationale": "Внутренние гарантии commit/park/worktree/repair нужны для проектирования восстановления и устанавливаются по реализациям, не по одному вызову recoverCommits.",
-      "status": "proposed"
+      "status": "proposed",
+      "returnCondition": null
     }
   ],
   "review": {

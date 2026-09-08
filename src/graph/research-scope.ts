@@ -1,4 +1,4 @@
-import type { Store, Revision } from '../storage/store.js';
+import type { Store, Revision, Write } from '../storage/store.js';
 import { canonical } from '../canonical.js';
 import { requireCondition } from '../errors.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
@@ -24,7 +24,7 @@ export function originalGaps(store: Store, project: string): TechnicalGap[] {
     'scope_basis_missing', 'Scope needs the exact accepted R1 report');
   return Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps);
 }
-export function configureResearchScope(store: Store, value: ResearchScope, expected: number): Revision<ResearchScope> {
+export function prepareScopeWrite(store: Store, value: ResearchScope, expected: number): { write: Write; guards: Ref[] } {
   requireCondition(value && typeof value === 'object' && typeof value.projectId === 'string' && isRef(value.layer) && isRef(value.r1), 'scope_invalid', 'Explicit project and exact L2 reference are required');
   const layer = isRef(value.layer) && store.get<{ projection: Graph }>(value.layer.id);
   requireCondition(layer && layer.id === `graph-layer:${value.projectId}:2` && layer.kind === 'graph-layer'
@@ -50,8 +50,12 @@ export function configureResearchScope(store: Store, value: ResearchScope, expec
       && Array.isArray(o.wake.paths) && o.wake.paths.every(p => typeof p === 'string' && p.length > 0) && typeof o.wake.uiRequired === 'boolean'
       && (o.wake.nodes.length > 0 || o.wake.paths.length > 0 || o.wake.uiRequired))),
   'scope_deferral_invalid', 'Research deferral requires an explicit reason and a testable return condition');
-  return store.writeMany<ResearchScope>([{ id: `research-scope:${value.projectId}:R2`, kind: 'research-scope', expected, value }],
-    [reference(layer), reference(store.get(`phase:${value.projectId}:R1`)!), ...policyGuards])[0]!;
+  return { write: { id: `research-scope:${value.projectId}:R2`, kind: 'research-scope', expected, value },
+    guards: [reference(layer), reference(store.get(`phase:${value.projectId}:R1`)!), ...policyGuards] };
+}
+export function configureResearchScope(store: Store, value: ResearchScope, expected: number): Revision<ResearchScope> {
+  const prepared = prepareScopeWrite(store, value, expected);
+  return store.writeMany<ResearchScope>([prepared.write], prepared.guards)[0]!;
 }
 export function researchScope(store: Store, project: string): Revision<ResearchScope> | null {
   const scope = store.get<ResearchScope>(`research-scope:${project}:R2`);
