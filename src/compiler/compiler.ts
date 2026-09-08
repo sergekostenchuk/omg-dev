@@ -6,7 +6,7 @@ import { requireGraph } from "../graph/validate.js";
 import type { Graph } from "../graph/model.js";
 import { hashJson, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
-import { isRef, reference, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import type { MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
@@ -15,6 +15,7 @@ import { requireBasis } from "./basis.js";
 import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 import { Owners } from "../ownership/owners.js";
+import { readinessObligations } from '../graph/obligation-readiness.js';
 export type { MachinePlan } from "./model.js";
 
 export class Compiler {
@@ -44,7 +45,7 @@ export class Compiler {
       { id, kind: "plan", expected: 0, value },
       { id: `current-plan:${project}`, kind: "current-plan", expected: pointer?.revision ?? 0,
         value: { id, revision: 1, hash: hashJson(value) } },
-    ], guards)[0]!;
+    ], uniqueRefs([...guards, ...(stage.admissionGuards ?? []), ...(checked.admissionGuards ?? [])]))[0]!;
   }
   read(id: string): Revision<MachinePlan> {
     const plan = this.store.get<MachinePlan>(id);
@@ -71,6 +72,9 @@ export class Compiler {
     if (plan.value.version !== 2 && !allowHistorical) result.findings.push({ code: "plan_version_upgrade_required", target: ref.id,
       message: "New plan admission requires version 2 write grants; historical accepted plans remain readable" });
     const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
+    const obligations = readinessObligations(this.store, project, basis.value.inputs, basis.value.obligations, 'consume');
+    result.findings.push(...obligations.findings);
+    if (obligations.guards.length) result.admissionGuards = obligations.guards;
     if (basis.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && basis.value.contractVersion === undefined))
       result.findings.push({ code: "refinement_upgrade_required", target: plan.value.feasibility.id, message: "New plan admission requires the enriched refinement contract" });
     for (const input of plan.value.guards) {
@@ -83,7 +87,8 @@ export class Compiler {
   }
   publish(project: string, planRef: Ref, expected: number) {
     const checked = this.gate(project, planRef); requireCondition(checked.findings.length === 0, "plan_stale", "Plan inputs are not current");
-    return this.pipeline.draft(project, "compilation", { plan: planRef } as unknown as Json, expected);
+    return this.pipeline.draft(project, "compilation", { plan: planRef } as unknown as Json, expected,
+      uniqueRefs([...checked.guards, ...(checked.admissionGuards ?? [])]));
   }
   #contextPlan(project: string, planRef: Ref, task: string): Revision<MachinePlan> {
     const checked = this.gate(project, planRef);

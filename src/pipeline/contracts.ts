@@ -20,10 +20,10 @@ export interface GateContext {
   inputs: ReadonlyArray<Revision<StageArtifact>>;
   accepted?: boolean;
 }
-export interface GateResult { findings: Finding[]; guards: Ref[] }
+export interface GateResult { findings: Finding[]; guards: Ref[]; admissionGuards?: Ref[] }
 export type StageValidator = (context: GateContext) => GateResult;
 export type StageValidators = Record<Stage, StageValidator>;
-export interface StageProjection { stage: Stage; state: StageState; artifact: Revision<StageArtifact> | null; findings: Finding[]; guards: Ref[] }
+export interface StageProjection { stage: Stage; state: StageState; artifact: Revision<StageArtifact> | null; findings: Finding[]; guards: Ref[]; admissionGuards?: Ref[] }
 
 export const stageId = (project: string, stage: Stage): string => `stage:${project}:${stage}`;
 export const reference = (record: Revision<unknown>): Ref => ({ id: record.id, revision: record.revision, hash: record.hash });

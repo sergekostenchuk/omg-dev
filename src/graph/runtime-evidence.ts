@@ -14,7 +14,7 @@ export interface RuntimeEvidence {
   obligation: string; document: string; observation: Ref; source: Ref; authorization: Ref; code: Ref[];
 }
 
-function support(store:Store,project:string,assignment:ObligationAssignment,sourceRef:Ref){
+export function runtimeSupport(store:Store,project:string,assignment:ObligationAssignment,sourceRef:Ref){
   if(!assignment.runtimeCheck)return null;
   try{
     const source=store.get<Source>(sourceRef.id),ref=source?.value.provenance?.record;
@@ -54,7 +54,7 @@ export function collectRuntimeEvidence(store:Store,project:string,spec:FieldSpec
       if(document.kind!=='document-observation'||!document.designs.some(id=>designs.some(d=>d.id===id))
         ||!Number.isSafeInteger(document.citation)||document.citation<0)continue;
       const observation=observations[document.citation];if(!observation)continue;
-      const found=support(store,project,assignment,observation.source);if(!found)continue;
+      const found=runtimeSupport(store,project,assignment,observation.source);if(!found)continue;
       proofs.push({obligation:obligation.id,document:document.id,observation:reference(found.record),source:observation.source,
         authorization:found.record.value.scope,code:found.code.map(o=>o.source)});
       guards.push(...found.guards);

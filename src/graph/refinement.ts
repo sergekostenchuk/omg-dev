@@ -18,12 +18,14 @@ import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { withTypedBasis } from './research-basis.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
 import { withObligationEvidence } from './obligation-evidence.js';
+import { readinessObligations, type ReadinessObligations } from './obligation-readiness.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
 interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number;
   carried?: CarriedObligation[] }
-export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'] }
+export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'];
+  obligations?: ReadinessObligations }
 
 export class Refinement {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly graphs: GraphRepository,
@@ -201,11 +203,13 @@ export class Refinement {
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && graph.kind === "graph", "graph_missing", "Operation map is missing");
     const graphGate = this.graphs.gate(project); const inspected = inspectRepository({ ...environment.value, workspace: effective.root }, graph.value);
-    const findings = [...graphGate.findings, ...inspected.findings];
-    const guards = uniqueRefs([...inputs, reference(environment), ...graphGate.guards, ...effective.guards]);
+    const obligations = readinessObligations(this.store, project, inputs);
+    const findings = [...graphGate.findings, ...inspected.findings, ...obligations.findings];
+    const guards = uniqueRefs([...inputs, reference(environment), ...graphGate.guards, ...effective.guards, ...obligations.dependencies]);
     return this.store.writeMany<Feasibility>([{ id: `feasibility:${project}`, kind: "feasibility", expected,
       value: { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, ready: findings.length === 0, graph: reference(graph), environment: reference(environment),
-        repository: inspected.state, inputs: guards, findings } }], guards)[0]!;
+        repository: inspected.state, inputs: guards, findings, ...(obligations.value ? { obligations: obligations.value } : {}) } }],
+      uniqueRefs([...guards, ...obligations.guards]))[0]!;
   }
   feasibilityGate(project: string, ref: Ref, allowHistorical = false): GateResult {
     if (!isRef(ref)) return { findings: [{ code: "feasibility_missing", target: project, message: "R3 result reference is required" }], guards: [] };
@@ -216,6 +220,9 @@ export class Refinement {
     if (record.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && record.value.contractVersion === undefined)) return {
       findings: [{ code: "refinement_upgrade_required", target: project, message: "New compilation requires enriched R0/R1/R2 and current R3" }], guards: [] };
     const result: GateResult = { findings: [], guards: [reference(record)] };
+    const obligations = readinessObligations(this.store, project, record.value.inputs, record.value.obligations, 'consume');
+    result.findings.push(...obligations.findings);
+    if (obligations.guards.length) result.admissionGuards = obligations.guards;
     for (const input of uniqueRefs(record.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash
@@ -235,6 +242,7 @@ export class Refinement {
     assertPilotBoundary(this.store, project, "R3");
     const result = this.feasibilityGate(project, ref);
     requireCondition(result.findings.length === 0, "feasibility_not_ready", "The current R3 result is not ready");
-    return this.pipeline.draft(project, "om-g2", { feasibility: ref } as unknown as Json, expected);
+    return this.pipeline.draft(project, "om-g2", { feasibility: ref } as unknown as Json, expected,
+      uniqueRefs([...result.guards, ...(result.admissionGuards ?? [])]));
   }
 }

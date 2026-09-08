@@ -97,7 +97,21 @@
         "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
       },
-      "returnCondition": null
+      "returnCondition": null,
+      "runtimeCheckPreparation": {
+        "status": "design-only; module and exact Source Ref not yet created",
+        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
+        "module": "isolation-observation",
+        "executables": [
+          "codex",
+          "ps"
+        ],
+        "evidenceRequirement": "Actual Codex sandbox behavior on own canary files, network endpoint and descendant processes; inspect relevant provider paths. Never read actual credentials.",
+        "successMeaning": "exit 0 means the observation matrix completed, not that every attempted access was denied. R2 assesses the observed limits.",
+        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
+        "satisfies": null,
+        "newPaidProbe": false
+      }
     },
     {
       "obligation": "actors-g4",
@@ -196,7 +210,21 @@
         "limits": "CLI flags, an owner assertion or source-code comments alone do not prove actual isolation",
         "ifInsufficient": "Typed pause of dependent work; ask the owner only for a concrete unavailable configuration, access/permission decision or a known evidence source, not to invent a sandbox fact"
       },
-      "returnCondition": null
+      "returnCondition": null,
+      "runtimeCheckPreparation": {
+        "status": "design-only; module and exact Source Ref not yet created",
+        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
+        "module": "isolation-observation",
+        "executables": [
+          "codex",
+          "ps"
+        ],
+        "evidenceRequirement": "Bound read-only/workspace-write observations for HOME canaries, outside writes, Git metadata canaries, network and descendants; demonstrate the task.writePaths limitation rather than infer it from flags.",
+        "successMeaning": "exit 0 means complete measurements, including allowed access. No automatic readiness claim.",
+        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
+        "satisfies": null,
+        "newPaidProbe": false
+      }
     },
     {
       "obligation": "delivery-g1",
@@ -224,7 +252,23 @@
       "responsibleNode": "n-runtime",
       "rationale": "Требуется подтверждение точной среды перед заявлением готовности R3. R2 может задать проверяемые требования к среде, не утверждая успешный запуск.",
       "status": "proposed",
-      "returnCondition": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI."
+      "returnCondition": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI.",
+      "runtimeCheckPreparation": {
+        "status": "design-only; module and exact Source Ref not yet created",
+        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
+        "module": "runtime-readiness",
+        "executables": [
+          "npm",
+          "git",
+          "codex",
+          "ps"
+        ],
+        "evidenceRequirement": "Observed Node/npm/OS/architecture/Git/Codex and exercised POSIX process identity and process-group termination. Provider compatibility comes from the bound ordinary R2 invocation. Browser matrix remains outside scope.",
+        "successMeaning": "exit 0 only if the entire returnCondition is certified; missing or failed evidence returns nonzero.",
+        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
+        "satisfies": "Перед объявлением R3 готовым для ближайшего исполнения: зафиксировать фактически проверенные Node/npm, ОС/архитектуру, Git и Codex CLI и сопоставить их с результатами исполнения и ограничениями POSIX, ps и групп процессов. Браузерная матрица остаётся обязательством будущего UI.",
+        "newPaidProbe": false
+      }
     },
     {
       "obligation": "delivery-g2",
@@ -252,7 +296,20 @@
       "responsibleNode": "n-runtime",
       "rationale": "Работоспособность установленного CLI/протокола подтверждается фактическим вызовом до ready R3; кэш и X_OK недостаточны.",
       "status": "proposed",
-      "returnCondition": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат."
+      "returnCondition": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат.",
+      "runtimeCheckPreparation": {
+        "status": "design-only; module and exact Source Ref not yet created",
+        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
+        "module": "provider-compatibility",
+        "executables": [
+          "codex"
+        ],
+        "evidenceRequirement": "Existing successful ordinary R2 omg-agent/v1 request/response with exact requested model/effort/configuration, adapter bytes and runtime identity captured when it ran. Old succeeded status without this binding is insufficient. No additional paid probe.",
+        "successMeaning": "exit 0 only for a compatible bound actual call; unavailable runtime binding or protocol evidence returns nonzero.",
+        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
+        "satisfies": "Перед объявлением R3 готовым: предъявить результат совместимого вызова фактически установленного Codex CLI с выбранными model/effort, разрешённой конфигурацией и протоколом omg-agent/v1. Проверка исполнимости файла и кэш моделей не заменяют этот результат.",
+        "newPaidProbe": false
+      }
     },
     {
       "obligation": "delivery-g3",
@@ -287,7 +344,13 @@
         "limits": "Partial metadata projection, not full integrity proof or permission/need to migrate history",
         "ifInsufficient": "Read the required current metadata safely in read-only mode; never open the working database through Store"
       },
-      "returnCondition": null
+      "returnCondition": null,
+      "documentaryAllowancePreparation": {
+        "status": "exact Source Ref after approved import, before policy application",
+        "sourceId": "source:omg-live:audit-4.13-r2-gap-n-state",
+        "path": "PREPARATIONS/TOKEN-AUDIT/4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+        "claimLimit": "Partial metadata projection, not full integrity proof or permission/need to migrate history"
+      }
     },
     {
       "obligation": "delivery-g4",
@@ -567,7 +630,21 @@
       "responsibleNode": "n-runtime",
       "rationale": "Срок задан исходным текстом: до R3 зависимого исполнения. Новые платные probes исследованием не разрешаются; используются точные имеющиеся результаты и безопасные сведения о среде.",
       "status": "proposed",
-      "returnCondition": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие."
+      "returnCondition": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие.",
+      "runtimeCheckPreparation": {
+        "status": "design-only; module and exact Source Ref not yet created",
+        "carrier": "self-contained operator module imported as owner-document; accepted .omg/live-source remains unchanged",
+        "module": "runtime-integration",
+        "executables": [
+          "codex",
+          "ps"
+        ],
+        "evidenceRequirement": "Safe effective environment projection matched to actual adapter/Node/Codex and configured limits, plus exact isolation observations and ordinary provider-call evidence. Never infer provider success from executable availability or model cache.",
+        "successMeaning": "exit 0 only when all parts of returnCondition have current bound evidence. No additional paid probe.",
+        "subjects": "Exact effective compiled adapter files and declared relevant config/evidence files; resolve from actual environment before one policy application",
+        "satisfies": "До R3 зависимого исполнения: получить безопасную проекцию действующей environment и фактически используемых Node, Codex, ОС, команд ролей, fullCheck и разрешённых лимитов; сопоставить с контрактами и подтверждённой семантикой sandbox. Использовать точные имеющиеся результаты, без нового платного probe в этом исследовании; техническая недоступность приостанавливает зависимое действие.",
+        "newPaidProbe": false
+      }
     },
     {
       "obligation": "integration-g2",
@@ -996,5 +1073,6 @@
     "round": 1,
     "channelSeq": 15,
     "status": "accepted-classification; resolution routes added"
-  }
+  },
+  "runtimePreparationStatus": "Five check designs recorded for review. These preparation fields are not applied RuntimeCheck objects; no source refs or successful observations are fabricated. Materialize reviewed modules and exact refs before applying scope r2 once."
 }

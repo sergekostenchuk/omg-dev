@@ -8,7 +8,9 @@ import type { Source } from '../evidence/evidence.js';
 
 export const KNOWLEDGE_KINDS = ['repository-fact', 'design-decision', 'owner-decision', 'environment-confirmation', 'post-implementation-proof'] as const;
 export const RESOLUTION_MOMENTS = ['R2', 'R3', 'task-start', 'task-result'] as const;
-export interface RuntimeCheck { script: Ref; dependencies: Ref[]; subjects: string[]; executables: string[]; args: string[]; timeoutMs: number; purpose: string }
+export interface RuntimeCheck { script: Ref; dependencies: Ref[]; subjects: string[]; executables: string[]; args: string[]; timeoutMs: number; purpose: string;
+  /** Explicit owner contract: exit zero certifies this entire return condition. */
+  satisfies?: string }
 export interface ObligationAssignment {
   obligation: string;
   original: { record: Ref; pointer: string };
@@ -34,6 +36,7 @@ assignmentSchema.properties['documentaryAllowance'] = object({ sources: { type: 
 assignmentSchema.properties['runtimeCheck'] = object({ script:ref,dependencies:{type:'array',uniqueItems:true,items:ref},
   subjects:{type:'array',uniqueItems:true,items:text},executables:{type:'array',uniqueItems:true,items:text},
   args:{type:'array',items:{type:'string'}},timeoutMs:{type:'integer',minimum:100,maximum:60000},purpose:text });
+(assignmentSchema.properties['runtimeCheck'] as ReturnType<typeof object>).properties['satisfies'] = text;
 export const obligationPolicySchema = object({ version: { const: 1 }, sourceScope: ref, assignments: { type: 'array', items: assignmentSchema } });
 const valid = new Ajv({ allErrors: true }).compile<ObligationPolicy>(obligationPolicySchema);
 
@@ -79,6 +82,9 @@ export function validateObligationPolicy(store: Store, scope: ResearchScope): Re
       requireCondition(!assignment.documentaryAllowance,'obligation_confirmation_ambiguous','Choose a bounded documentary allowance or an actual runtime check; a report must not bypass the declared check');
       requireCondition(assignment.kind === 'environment-confirmation' && assignment.runtimeCheck.purpose.trim(),
         'obligation_runtime_check_invalid','A declared local runtime check must serve an environment obligation');
+      if (assignment.runtimeCheck.satisfies !== undefined) requireCondition(assignment.moment !== 'R2'
+        && assignment.runtimeCheck.satisfies === assignment.returnCondition,
+      'obligation_runtime_condition_invalid', 'An automatic readiness check must explicitly certify the exact approved return condition; an observation alone is not a pass');
       for (const ref of [assignment.runtimeCheck.script,...assignment.runtimeCheck.dependencies]) {
         const code = store.get<Source>(ref.id,ref.revision);
         const script=canonical(ref)===canonical(assignment.runtimeCheck.script);
