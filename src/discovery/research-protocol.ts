@@ -1,3 +1,4 @@
+import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION } from './conclusion-consolidation.js';
 import { processStart } from "../runtime/process-identity.js";
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
@@ -43,6 +44,7 @@ const bundleItem = (properties: Record<string, unknown>) => {
   return schema;
 };
 const contextRead = object({ action: { const: "read_context" }, record: ref, pointer: { type: "string" } });
+contextRead.properties['purpose'] = text;
 contextRead.properties['page'] = object({ offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } });
 const readSchemas = [
   object({ action: { const: "read_bundle" }, purpose: text, inputs: { type: "array", minItems: 1, items: { oneOf: [
@@ -114,14 +116,19 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     audit.questionId, audit.purpose, role.actor) : null;
   const requestId = randomUUID();
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
+  const controls = (context as any)?.contextControls;
+  const finalizing = !consolidating && controls?.mode === 'finalization';
+  requireCondition(consolidating || controls?.version !== 2 || controls.stage !== 'final' || controls.remainingLookups > 0 || finalizing,
+    'research_no_progress','The final-stage lookup allowance is exhausted; an ordinary context-search dispatch is forbidden');
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? CONSOLIDATION_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const plannerRequestLimit = audit?.purpose === 'reading-planner' ? audit.pilot?.value.planning?.maxRequestChars : undefined;
   const initialRequestLimit = plannerRequestLimit ?? audit?.pilot?.value.maxRequestChars;
   const requestLimit = packetState && !packetState.initial
     ? plannerRequestLimit ?? Math.min(initialRequestLimit ?? 300000, audit?.pilot?.value.maxContinuationChars ?? DEFAULT_CONTINUATION_CHARS)
     : initialRequestLimit ?? 300000;
-  const overhead = JSON.stringify({ ...envelope, subject: {} }).length + (packetState ? 4000 : 0);
+  const overhead = Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
+    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
     requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
       ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}),
@@ -130,6 +137,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
   audit?.onContext?.(subject as Record<string, any>);
+  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
   const input = JSON.stringify({ ...envelope, subject });
   requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
   requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
@@ -157,7 +165,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       && call.value.questionId === audit.questionId && call.value.purpose === "reading-planner").length;
     requireCondition(rounds < audit.pilot.value.planning.maxRounds, "planning_round_limit", "The planning guard is reached; preserve the paid work instead of increasing rounds");
   }
-  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,context as Record<string,any>):null;
+  const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
+  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
   const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;

@@ -3,7 +3,7 @@ import { isRef, type Ref } from '../pipeline/contracts.js';
 import { requireCondition } from '../errors.js';
 
 export interface ContextLookup { record: Ref; pointer: string; value: unknown; page?: {offset:number;end:number;total:number;unit:string;next:number|null} }
-export interface ContextWorkspace { entries: { key: string; result: ContextLookup }[]; sinceProgress: number; blocked?: string }
+export interface ContextWorkspace { entries: { key: string; result: ContextLookup }[]; sinceProgress: number; checkpointedKeys?: string[]; blocked?: string }
 export const CONTEXT_WORKSPACE_CHARS=60_000;
 export const CONTEXT_LOOKUPS_PER_STEP=3;
 
@@ -19,6 +19,9 @@ export function contextWorkspace(value?: ContextWorkspace, legacyFocus?: unknown
   if(value){
     requireCondition(Array.isArray(value.entries)&&Number.isSafeInteger(value.sinceProgress)&&value.sinceProgress>=0
       &&value.entries.every(e=>e.key===contextLookupKey(e.result)),'research_context_invalid','Saved context workspace is invalid');
+    requireCondition(value.checkpointedKeys === undefined || Array.isArray(value.checkpointedKeys)
+      && value.checkpointedKeys.every(key => typeof key === 'string' && value.entries.some(entry => entry.key === key)),
+    'research_context_invalid', 'Checkpointed context identities must belong to the saved workspace');
     return value;
   }
   if(legacyFocus && typeof legacyFocus==='object' && isRef((legacyFocus as ContextLookup).record)){
@@ -35,9 +38,9 @@ export function addContextLookup(state: ContextWorkspace, result: ContextLookup,
   requireCondition(state.sinceProgress<maxLookups,'research_no_progress','Too many context lookups without advancing evidence or resolving the current step');
   // Keep the exact paid originals in the session; the packet builder decides
   // which values fit and exposes an address for every omitted value.
-  return {entries:[...state.entries.filter(entry=>entry.key!==key),{key,result}],sinceProgress:state.sinceProgress+1};
+  return {...state,entries:[...state.entries.filter(entry=>entry.key!==key),{key,result}],sinceProgress:state.sinceProgress+1};
 }
-export function contextProgress(state: ContextWorkspace): ContextWorkspace {return {...state,sinceProgress:0};}
+export function contextProgress(state: ContextWorkspace): ContextWorkspace {return {...state,sinceProgress:0,checkpointedKeys:state.entries.map(entry=>entry.key)};}
 
 /** The newest requested original must cross the actual dispatch boundary.
  * Older originals may be replaced by explicit addresses, never by empty data. */
@@ -60,7 +63,7 @@ export function requireContextDelivery(expected: ContextLookup[], packet: Record
 
 /** Full originals remain in the saved archive. Omitted values are represented
  * by selectors and are eligible for delivery again if explicitly requested. */
-export function packContextWorkspace(packet: Record<string, any>, maxChars: number, contextChars = CONTEXT_WORKSPACE_CHARS): void {
+export function packContextWorkspace(packet: Record<string, any>, maxChars: number, contextChars = CONTEXT_WORKSPACE_CHARS, retention?: { checkpointedKeys: string[] }): void {
   if (!Object.hasOwn(packet,'contextWorkspace')) return;
   const originals = packet.contextWorkspace as ContextLookup[];
   requireCondition(Array.isArray(originals),'research_context_invalid','Context originals must be an array');
@@ -68,10 +71,21 @@ export function packContextWorkspace(packet: Record<string, any>, maxChars: numb
     ...(result.page?{page:result.page}:{}),chars:canonical(result.value).length}));
   packet.contextWorkspace=[];
   packet.contextIndex=index;
-  // Reserve room for the ordinary evidence page beside addressed lookups.
-  const room = Math.min(contextChars,Math.max(0,Math.floor((maxChars-JSON.stringify(packet).length-1024)/2)));
-  const chosen: ContextLookup[]=[];
-  for (let i=originals.length-1;i>=0;i--) {
+  // New synthesis packets reserve current originals before conclusions. Earlier
+  // checkpointed originals may yield to addresses; new ones must coexist.
+  const room = Math.min(contextChars, Math.max(0, retention
+    ? maxChars - JSON.stringify(packet).length - 2048
+    : Math.floor((maxChars - JSON.stringify(packet).length - 1024) / 2)));
+  const chosen: ContextLookup[] = [];
+  if (retention) {
+    const done = new Set(retention.checkpointedKeys);
+    const required = originals.filter((item, i) => !done.has(contextLookupKey(item)) || i === originals.length - 1);
+    requireCondition(canonical(required).length <= room, 'research_context_capacity',
+      'The required addressed originals cannot coexist inside the fixed packet; select a bounded page before paying the consumer');
+    chosen.push(...required);
+    for (const item of originals) if (!required.includes(item) && canonical([...chosen, item]).length <= room) chosen.push(item);
+    chosen.sort((a, b) => originals.indexOf(a) - originals.indexOf(b));
+  } else for (let i=originals.length-1;i>=0;i--) {
     const result=originals[i]!;
     if (canonical([result,...chosen]).length<=room) chosen.unshift(result);
   }

@@ -1,5 +1,7 @@
+import { synthesisControls, type FinalizationState } from './synthesis-controls.js';
+import { compactConclusions } from './continuation-packet.js';
 import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote } from './conclusion-consolidation.js';
-import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
+import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision, Write } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -19,7 +21,7 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] };
-  notes: SynthesisNote[];
+  notes: SynthesisNote[]; finalization?: FinalizationState;
   result: ResearchAction | null;
 }
 
@@ -95,30 +97,56 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     const workspace=contextWorkspace(current.workspace,current.focus);
     requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved context session is blocked');
     verify(workspace.entries);
+    const recovering = recoveryConsolidationMode() !== undefined;
+    const final = current.offset === materials.length;
+    let controls = recovering ? context.contextControls : synthesisControls(final, workspace, pilot.value.contextLimits?.maxLookups ?? 3, current.finalization);
     const callContext = { ...context, dispatchMode: 'synthesis', synthesisMaterials: materials,
       synthesisSession: id, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes,
-      contextWorkspace: workspace.entries.map(e => e.result), focus: null };
-    const consolidate = async () => {
+      contextWorkspace: workspace.entries.map(e => e.result), focus: null,
+      ...(controls ? {contextControls:controls} : {}),
+      ...(!recovering || Object.hasOwn(context,'contextCheckpointedKeys') ? {contextCheckpointedKeys:workspace.checkpointedKeys??[]} : {}) };
+    const consolidate = async (target = consolidationLimits(pilot.value).target, fullTarget?: number) => {
       requireCondition(consolidationNeeded(current.notes, pilot.value, true), 'consolidation_no_progress',
-        'Consolidation already ran without new material; preserve the notes and stop instead of paying to compress them again');
+        'The current compact format already ran without new findings; preserve the notes instead of paying to compress them again');
+      requireCondition(Number.isSafeInteger(target) && target > 0,'research_context_capacity',
+        'Exact context and unresolved obligations leave no summary capacity inside the fixed limit');
       const response = researchAction(await researchCall(dispatch.implementer, dispatch, '',
-        { ...callContext, dispatchMode: 'consolidation', consolidation: { targetChars: consolidationLimits(pilot.value).target } }, signal,
+        { ...callContext, dispatchMode: 'consolidation', consolidation: recovering ? context.consolidation : { targetChars: target, fullTargetChars: fullTarget!, format: 2 } }, signal,
         { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot, session: reference(session!) }));
       const proposal = consolidatedProposal(response, question.id, current.notes);
       const saved = checkpoint(store, draft, question, { ...proposal, value: proposal as unknown as Json });
-      save({ ...current, notes: [...current.notes, { checkpoint: reference(saved), proposal,
-        page: { offset: current.offset, end: current.offset },
-        consolidated: { replaces: activeSynthesisNotes(current.notes).map(note => note.checkpoint) } }] }, [reference(saved)]);
+      const note: SynthesisNote = { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: current.offset },
+        consolidated: { replaces: activeSynthesisNotes(current.notes).map(note => note.checkpoint),
+          ...(!recovering || context.consolidation?.format === 2 ? {format:2 as const,targetChars:target,fullTargetChars:recovering?context.consolidation.fullTargetChars:fullTarget!} : {}) } };
+      save({ ...current, notes: [...current.notes, note] }, [reference(saved)]);
+      const packed = compactConclusions([note]);
+      requireCondition(!note.consolidated?.format || JSON.stringify(packed.items).length <= target && JSON.stringify(packed).length <= note.consolidated.fullTargetChars!,'consolidation_target_limit',
+        'The paid summary exceeds its complete compact target; it is preserved, but another automatic compaction is forbidden');
     };
-    if (recoveryConsolidationMode() ?? consolidationNeeded(current.notes, pilot.value)) { await consolidate(); continue; }
+    if (!recovering) for (const note of activeSynthesisNotes(current.notes)) if (note.consolidated?.format === 2) {
+      const packed = compactConclusions([note]);
+      requireCondition(typeof note.consolidated.targetChars === 'number' && typeof note.consolidated.fullTargetChars === 'number'
+        && JSON.stringify(packed.items).length <= note.consolidated.targetChars && JSON.stringify(packed).length <= note.consolidated.fullTargetChars,
+        'consolidation_target_limit','The saved summary did not meet its bound; do not pay to repeat the same compaction');
+    }
+    if (recoveryConsolidationMode()) { await consolidate(context.consolidation.targetChars,context.consolidation.fullTargetChars); continue; }
     let sent: Record<string, any> | undefined, action: ResearchAction;
     try {
       action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction + checkpointInstruction + COMPACT_CHECKPOINT_INSTRUCTION,
         callContext, signal, { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot,
-          session: reference(session!), onContext: packet => { sent = packet; } }));
+          session: reference(session!), onContext: packet => {
+            sent = packet;
+            if (packet.contextControls) {controls=packet.contextControls;callContext.contextControls=controls;}
+            if (!recovering && consolidationNeeded(current.notes,pilot.value)) throw new EngineError('consolidation_required',
+              'Compact findings within the capacity remaining after exact addressed context',
+              {targetChars:packet.conclusionCapacity?.items??consolidationLimits(pilot.value).target,fullTargetChars:packet.conclusionCapacity?.total??pilot.value.maxRequestChars});
+          } }));
     } catch (error) {
-      if (error instanceof EngineError && error.code === 'continuation_carry_limit') { await consolidate(); continue; }
-      if (error instanceof EngineError && error.code === 'research_context_undelivered') save({ ...current, workspace: { ...workspace, blocked: error.message } });
+      if (error instanceof EngineError && ['continuation_carry_limit','consolidation_required'].includes(error.code)) {
+        const capacity = error.details as {targetChars?:number;fullTargetChars?:number}|null;
+        await consolidate(capacity?.targetChars === undefined ? undefined : Math.min(capacity.targetChars,consolidationLimits(pilot.value).target),capacity?.fullTargetChars??pilot.value.maxRequestChars); continue;
+      }
+      if (error instanceof EngineError && ['research_context_undelivered','research_context_capacity'].includes(error.code)) save({ ...current, workspace: { ...workspace, blocked: error.message } });
       throw error;
     }
     const page = sent?.synthesisPage;
@@ -133,8 +161,14 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     if (action.action === "pause") return action;
     if (action.action === "read_context") {
       try {
+        if (controls?.version === 2 && controls.stage === 'final') {
+          requireCondition(controls.remainingLookups > 0,'research_no_progress','Finalization cannot purchase another context search after its declared allowance');
+          requireCondition(typeof action.purpose === 'string' && action.purpose.trim().length > 0,
+            'synthesis_context_purpose_missing','A final-stage lookup must identify the concrete missing fact or exception before another lookup can be delivered');
+        }
         const result=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
-        save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups)});
+        save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups),
+          ...(controls?.stage === 'final' ? {finalization:{lookups:(pilot.value.contextLimits?.maxLookups??3)-controls.remainingLookups+1}} : final ? {finalization:{lookups:(current.finalization?.lookups??workspace.sinceProgress)+1}} : {})});
       } catch(error) {
         save({...current,workspace:{...workspace,blocked:error instanceof Error?error.message:'Context lookup refused'}});
         throw error;
@@ -147,13 +181,18 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     }
     requireCondition(["checkpoint", "answer", "answer_delta"].includes(action.action),
       "synthesis_checkpoint_required", "Save partial findings before continuing the remaining already-read materials");
-    requireCondition(page.end > current.offset || (page.nextMaterialOffset ?? 0) > (current.materialOffset ?? 0), "synthesis_no_progress", "All material pages were supplied; compose the final answer instead of another checkpoint");
+    const deliveredKeys = (sent?.contextWorkspace ?? []).map(contextLookupKey);
+    const newContext = controls?.version === 2 && deliveredKeys.some((key:string) => !(workspace.checkpointedKeys??[]).includes(key));
+    requireCondition(page.end > current.offset || (page.nextMaterialOffset ?? 0) > (current.materialOffset ?? 0) || newContext,
+      'synthesis_no_progress','A checkpoint must advance material or record newly delivered context; repeated prose is not progress');
     const proposal = action as Extract<ResearchAction, { action: "checkpoint" | "answer" | "answer_delta" }>;
     requireCondition(proposal.question === question.id, "research_question_foreign", "Partial synthesis must target its bound question");
     const saved = checkpoint(store, draft, question, { action: "checkpoint", question: question.id,
       value: proposal as unknown as Json, citations: proposal.citations,
       unresolved: proposal.action === "checkpoint" ? proposal.unresolved : ["Complete the remaining material pages before accepting this proposal"] });
-    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace), notes: [...current.notes,
+    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace),
+      ...(page.end === materials.length ? {finalization:{lookups:controls?.version === 2 && controls.stage === 'final'
+        ? (pilot.value.contextLimits?.maxLookups??3)-controls.remainingLookups : final ? current.finalization?.lookups??workspace.sinceProgress : 0}} : {}), notes: [...current.notes,
       { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: page.end } }] }, [reference(saved)]);
   }
 }

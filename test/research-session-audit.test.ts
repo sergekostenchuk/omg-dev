@@ -27,7 +27,9 @@ if(!c.question.schema?.properties?.result)throw Error('Response contract was los
 const entries=c.contextWorkspace??[],a=entries.find(e=>e.pointer==='/body/resources/a'),b=entries.find(e=>e.pointer==='/body/resources/b');
 let research;
 if(!a||!b||${JSON.stringify(scenario)}==='alternate'){
- const pointer=!a?'/body/resources/a':!b?'/body/resources/b':'/body/resources/a';research={action:'read_context',record:c.working.archive,pointer};
+ const pointer=!a?'/body/resources/a':!b?'/body/resources/b':'/body/resources/a';
+ const purpose=!a?'Retrieve original A, which is required to compute the combined result':!b?'Retrieve original B, which is required to compute the combined result':'Check original A for an exception that would change the combined result';
+ research={action:'read_context',record:c.working.archive,pointer,purpose};
 }else if(c.role==='assess-answer'){
  if(c.value.result!==a.value+b.value)throw Error('Candidate does not match both originals');research={verdict:'supported',reasons:[]};
 }else research={action:'answer',question:c.question.id,value:{result:a.value+b.value},citations:${JSON.stringify(citations)}};
@@ -73,7 +75,8 @@ test('outer analyst retains both addressed originals and rejects A/B/A before an
  writeFileSync(f.env.value.implementer.command.args[0]!,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
 appendFileSync(${JSON.stringify(f.wire)},JSON.stringify(r)+'\\n');
 const entries=c.contextWorkspace??[],pointer=entries.length===1?'/body/level':'/body/stage';
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_context',record:c.working.archive,pointer},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+const purpose=pointer==='/body/level'?'Retrieve the required level before deciding the draft':'Retrieve the required stage before deciding the draft';
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_context',record:c.working.archive,pointer,purpose},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const engine=new ProductEngine(f.store);
  const run=await engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:10}) as any;
  assert.equal(run.value.pauseCode,'research_no_progress');
@@ -103,7 +106,7 @@ test('three distinct required originals are real progress and can be combined in
  const f=fixture(t,'analyst');
  writeFileSync(f.env.value.implementer.command.args[0]!,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
 const entries=c.contextWorkspace??[],missing=['a','b','c'].find(key=>!entries.some(e=>e.pointer==='/body/resources/'+key));
-const research=missing?{action:'read_context',record:c.working.archive,pointer:'/body/resources/'+missing}:{action:'answer',question:c.question.id,value:{result:entries.map(e=>e.value).join('')},citations:${JSON.stringify(f.context.observations.map(o=>({source:o.source,selector:o.selector})))} };
+const research=missing?{action:'read_context',record:c.working.archive,pointer:'/body/resources/'+missing,purpose:'Retrieve original '+missing.toUpperCase()+' required to compute the three-original result'}:{action:'answer',question:c.question.id,value:{result:entries.map(e=>e.value).join('')},citations:${JSON.stringify(f.context.observations.map(o=>({source:o.source,selector:o.selector})))} };
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const result=await synthesisSession(f.store,f.draft,f.q,f.env,f.env.value,f.pilot,{...f.context,resources:{a:'A',b:'B',c:'C'}},'Combine all three');
  assert.equal((result as any).value.result,'ABC');assert.equal(f.store.list('model-call').length,4);

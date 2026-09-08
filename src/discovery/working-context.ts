@@ -1,5 +1,5 @@
 import { activeSynthesisNotes, consolidationInput } from './conclusion-consolidation.js';
-import { FOUNDATION_FIELDS, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, correctionIndex } from "./continuation-packet.js";
+import { FOUNDATION_FIELDS, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -75,7 +75,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
     const packet = { dispatchMode: 'consolidation', question: { id: question.id, ...question.value.spec },
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
-      consolidation: consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars),
+      consolidation: consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
       working: { archive: reference(archive), instruction: 'Original notes are immutable at /body/synthesisNotes. No new material is delivered in this step.',
         sections: [{ pointer: '/body/synthesisNotes' }] } };
     requireCondition(JSON.stringify(packet).length <= maxChars, 'consolidation_input_limit',
@@ -137,6 +137,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (options.common) {
     const conclusions=compactConclusions((body['synthesisNotes'] ? activeSynthesisNotes(body['synthesisNotes']) : undefined) ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===questionId && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
     body['conclusions']=conclusions.items; body['conclusionCitations']=conclusions.citations;
+    body['conclusionRefs']=conclusions.references; body['conclusionUnresolved']=conclusions.unresolved; body['conclusionEncoding']=CONCLUSION_ENCODING;
     if(body['history']) {
       const history=body['history'] as any[];
       const read=[...history].reverse().find(h=>h.action && typeof h.action==='object' && ['read','read_source','read_context','search'].includes(h.action.action));
@@ -148,7 +149,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (body['dispatchMode'] === "planning" && !options.continuation) {
     return planningContext(body,reference(archive),maxChars,options.contextChars);
   }
-  const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
@@ -160,7 +161,20 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       count: Array.isArray(v) || typeof v === "string" ? v.length : null })), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
-  packContextWorkspace(packet,maxChars,options.contextChars);
+  const retained = body['contextControls']?.version === 2 && body['synthesisState'];
+  const conclusionKeys = ['conclusions','conclusionCitations','conclusionRefs','conclusionUnresolved','conclusionEncoding'];
+  const carry = Object.fromEntries(conclusionKeys.filter(key => Object.hasOwn(packet,key)).map(key => [key,packet[key]]));
+  if (retained) for (const key of conclusionKeys) delete packet[key];
+  packContextWorkspace(packet,maxChars,options.contextChars,retained ? {checkpointedKeys:body['contextCheckpointedKeys']??[]} : undefined);
+  if (retained) {
+    const total = Math.max(0,maxChars-JSON.stringify(packet).length-2176);
+    const dictionaries = {...carry}; delete dictionaries['conclusions'];
+    const items = Math.max(0,total-JSON.stringify(dictionaries).length-128);
+    Object.assign(packet,carry);
+    packet.conclusionCapacity = {total,items};
+    if (JSON.stringify(packet).length > maxChars-1024) throw new EngineError('consolidation_required',
+      'Preserve the delivered context and compact the conclusions before the next paid call', {targetChars:items,fullTargetChars:total});
+  }
   packPriorEvidence(packet,priorSources,reference(archive),maxChars);
   if (body['synthesisState']) {
     if (!options.common) {packet.previousProposal = body['previousProposal'] ?? null; packet.history = body['history'] ?? [];}
@@ -219,6 +233,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       packet.synthesisPage.nextMaterialOffset = materialOffset + lo === encoded.length ? 0 : materialOffset + lo;
       packet.synthesisPage.end = packet.synthesisPage.nextMaterialOffset === 0 ? offset + 1 : offset;
       packet.synthesisPage.complete = packet.synthesisPage.end === materials.length;
+    }
+    if (packet.contextControls?.version === 2 && packet.synthesisPage.complete) {
+      packet.contextControls = {...packet.contextControls,stage:'final',
+        mode:packet.contextControls.remainingLookups === 0 ? 'finalization' : 'research'};
     }
     requireCondition(length() <= maxChars, "pilot_request_limit", "The synthesis page exceeds its fixed limit");
     return packet;

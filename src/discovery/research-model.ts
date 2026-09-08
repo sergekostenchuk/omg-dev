@@ -16,7 +16,7 @@ export interface ResearchAssessment {
 export interface ResearchAnswer { projectId: string; question: string; assessment: Ref; value: Json }
 export type ResearchRead =
   | { action: "read_bundle"; purpose: string; inputs: BundleInput[] }
-  | { action: "read_context"; record: Ref; pointer: string; page?: ContextPage }
+  | { action: "read_context"; purpose?: string; record: Ref; pointer: string; page?: ContextPage }
   | { action: "search"; query: string }
   | { action: "read_source"; source: Ref; start: number; end: number }
   | { action: "read"; path: string; media: "text/plain" | "application/json" };

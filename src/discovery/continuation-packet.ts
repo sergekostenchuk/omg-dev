@@ -1,3 +1,4 @@
+import { contextTable } from './context-tables.js';
 import { Evidence, type Source } from "../evidence/evidence.js";
 import type { Store, Revision, Write, ReadGuard } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
@@ -116,29 +117,41 @@ export function originalIndex(body: Record<string, any>, previous?: Record<strin
     for(const child of Object.values(value))visit(child);
   };
   for(const [key,value] of Object.entries(body))if(!FOUNDATION_FIELDS.includes(key as any))visit(value);
-  return {sources:(body.inventory?.sources??[]).filter((s:any)=>ids.has(s.ref.id)).map((s:any)=>{
+  return {sources:contextTable((body.inventory?.sources??[]).filter((s:any)=>ids.has(s.ref.id)).map((s:any)=>{
     const before=previous?.inventory?.sources?.find((p:any)=>p.ref.id===s.ref.id);
     const changed=Boolean(before && before.ref.hash!==s.ref.hash);
     return {ref:s.ref,kind:s.kind,location:s.location,media:s.media,length:s.length,changed,
       truncated:changed?s.truncated:true,excerpt:changed?s.excerpt:''};
-  })};
+  })), encoding:'Sources in columns/rows retain every complete field; row[i] is columns[i].'};
 }
 
-export function compactConclusions(value: unknown) {
-  const citations:any[]=[],ids=new Map<string,number>();
-  const visit=(v:any):any=>{
-    if(Array.isArray(v))return v.map(visit);
-    if(!v||typeof v!=='object')return v;
-    const result:Record<string,any>={};
-    for(const [key,child] of Object.entries(v)){
-      if(key==='observations'&&Object.hasOwn(v,'proposal'))continue;
-      if(key==='citations'&&Array.isArray(child)){
-        result.citationIds=child.map(c=>{const hash=hashJson(c);if(!ids.has(hash)){ids.set(hash,citations.length);citations.push(c);}return ids.get(hash);});
-      }else result[key]=visit(child);
+export const CONCLUSION_ENCODING = 'In conclusions, {refId:n} addresses conclusionRefs[n]; citationIds address conclusionCitations; unresolvedIds address conclusionUnresolved. All dictionary values are exact originals, never summaries. {literal:value} preserves a literal reserved-shaped object. No unresolved item is resolved by compression. In answers, citations and read_context actions, expand dictionary references to complete {id,revision,hash}; transport indexes are never substitute evidence.';
+export function compactConclusions(value: unknown, format: 1 | 2 = 2) {
+  const citations: any[] = [], references: Ref[] = [], unresolved: string[] = [];
+  const citationIds = new Map<string, number>(), refIds = new Map<string, number>(), unresolvedIds = new Map<string, number>();
+  const index = <T>(item: T, values: T[], ids: Map<string, number>) => {
+    const key = hashJson(item); if (!ids.has(key)) { ids.set(key, values.length); values.push(item); }
+    return ids.get(key)!;
+  };
+  const visit = (v: any): any => {
+    if (Array.isArray(v)) return v.map(visit);
+    if (!v || typeof v !== 'object') return v;
+    if (format === 2 && isRef(v) && Object.keys(v).sort().join(',') === 'hash,id,revision') return { refId: index(v, references, refIds) };
+    // Reserved-shaped user JSON is escaped, so dictionary markers cannot
+    // silently reinterpret a literal checkpoint value or its nested contents.
+    if (format === 2 && (Object.keys(v).length === 1 && Object.hasOwn(v,'literal')
+      || ['refId','citationIds','unresolvedIds'].some(key=>Object.hasOwn(v,key)))) return { literal: v };
+    const result: Record<string, any> = Object.create(null);
+    for (const [key, child] of Object.entries(v)) {
+      if (key === 'observations' && Object.hasOwn(v, 'proposal')) continue;
+      if (key === 'citations' && Array.isArray(child)) result.citationIds = child.map(c => index(c, citations, citationIds));
+      else if (format === 2 && key === 'unresolved' && Array.isArray(child) && child.every(c => typeof c === 'string'))
+        result.unresolvedIds = child.map(c => index(c, unresolved, unresolvedIds));
+      else result[key] = visit(child);
     }
     return result;
   };
-  return {items:visit(value),citations};
+  return { items: visit(value), citations, references, unresolved };
 }
 export function correctionIndex(history:any[],archive:Ref){
   return history.flatMap((h,index)=>h.error||h.feedback?[{number:h.number,question:h.action?.question??h.question?.id??null,action:typeof h.action==='object'?h.action.action:h.action,error:h.error??null,

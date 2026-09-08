@@ -92,9 +92,14 @@ export function recoverContextSession(store: Store, project: string, sessionRef:
     const parent = contextValue(record.value, parts.slice(0, end).join('/'));
     if (parent && typeof parent === 'object') { source((parent as Record<string, unknown>)['source']); source((parent as Record<string, unknown>)['ref']); }
   }
+  const previousFinalization = session.value['finalization'] as {lookups:number} | undefined;
+  requireCondition(previousFinalization === undefined || previousFinalization && Number.isSafeInteger(previousFinalization.lookups) && previousFinalization.lookups >= 0,
+    'context_recovery_invalid','Recovery cannot replace malformed final-stage lookup accounting');
+  const finalization = session.kind === 'synthesis-session'
+    ? {lookups:Math.max(previousFinalization?.lookups??0,workspace.sinceProgress)} : undefined;
   const { blocked, ...unblocked } = workspace;
   return store.writeMany<RecoverableContextSession>([{ id: session.id, kind: session.kind, expected: session.revision,
-    value: { ...session.value, workspace: { ...unblocked, entries: [...workspace.entries, { key, result }], sinceProgress: 0 },
+    value: { ...session.value, ...(finalization ? {finalization} : {}), workspace: { ...unblocked, entries: [...workspace.entries, { key, result }], sinceProgress: 0 },
       recoveries: [...(session.value.recoveries ?? []), { origin: 'operator', session: sessionRef, reason: blocked, selector, key }] } }],
   uniqueRefs([sessionRef, ...bindingRefs, selector.record, reference(pilot), reference(dispatch), ...sourceRefs]))[0]!;
 }

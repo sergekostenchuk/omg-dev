@@ -145,7 +145,7 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
       && canonical(request.subject.synthesisState) === canonical(state)
       && request.subject.synthesisSession === session.id
       && canonical(request.subject.question) === canonical({ id: question.id, ...question.value.spec })
-      && canonical(request.subject.consolidation) === canonical(consolidationInput(body.synthesisNotes, body.consolidation.targetChars))
+      && canonical(request.subject.consolidation) === canonical(consolidationInput(body.synthesisNotes, body.consolidation.targetChars, body.consolidation.format === 2 ? 2 : 1))
       && !request.subject.synthesisPage && !request.subject.materialPage && !request.subject.selectedContext && !request.subject.readings,
     'response_recovery_page_foreign', 'The consolidation must contain exactly the saved notes and contract, without claiming material progress');
   } else if (synthesis) {

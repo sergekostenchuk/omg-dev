@@ -13,8 +13,11 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
   let step:unknown;
   const originals=(context.contextWorkspace??[]).map(contextLookupKey);
-  if(context.dispatchMode==='consolidation')step={session:context.synthesisSession,cursor:context.synthesisState,operation:'consolidation'};
-  else if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals};
+  const bounded = context.consolidation?.format === 2 || context.contextControls?.mode === 'finalization';
+  if(context.dispatchMode==='consolidation')step={session:context.synthesisSession,cursor:context.synthesisState,operation:'consolidation',
+    ...(context.consolidation?.format === 2 ? {format:2,notes:context.synthesisNotes?.map((n:any)=>n.checkpoint)??[]} : {})};
+  else if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals,
+    ...(context.contextControls?.mode === 'finalization' ? {mode:'finalization',notes:context.synthesisNotes?.map((n:any)=>n.checkpoint)??[]} : {})};
   else if(context.assessmentState)step={session:context.assessmentSession??null,cursor:context.assessmentState,originals};
   else if(purpose==='reader')step={sources:context.sources?.map((s:any)=>({ref:s.ref??null,range:s.visibleRange??null,content:hashJson(s)}))??[]};
   else {
@@ -24,7 +27,9 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   }
   const key=hashJson({version:1,question:reference(question),purpose,step});
   const calls=store.list<ModelCall>('model-call').filter(c=>c.value.questionId===questionId&&c.value.purpose===purpose&&c.value.progressKey===key);
-  requireCondition(calls.length<3,'research_no_progress','Three invocations made no durable progress on this step; the next paid call is forbidden');
+  requireCondition(calls.length < (bounded ? 1 : 3),'research_no_progress',bounded
+    ? 'The bounded finalization or compaction attempt already ran without durable progress; another paid call is forbidden'
+    : 'Three invocations made no durable progress on this step; the next paid call is forbidden');
   return {key,guards:calls.map(reference)};
 }
 
