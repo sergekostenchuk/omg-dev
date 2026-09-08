@@ -1,5 +1,5 @@
 import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
-import { readResearchContext } from "./research-limits.js";
+import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
@@ -64,6 +64,8 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     }), "input_stale", "The question or research inputs changed before synthesis continued");
     const verify = (value: any): void => {
       if (!value || typeof value !== "object") return;
+      if(isRef(value.record)&&typeof value.pointer==='string'&&Object.hasOwn(value,'value'))
+        requireCurrentPriorContext(store,draft,value);
       if (isRef(value.source) && value.selector && Object.hasOwn(value, "value")) {
         requireCondition(new Evidence(store).verify(value), "synthesis_evidence_stale", "A material source changed; do not reuse stale synthesis notes");
       }

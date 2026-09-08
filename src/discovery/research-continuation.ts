@@ -8,6 +8,7 @@ import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent } from "./reader.js";
 import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
+import { requireCurrentPriorContext } from './research-limits.js';
 
 /** Keep one latest proposal even after many reads push its turn out of the
  * compact conversation history. Its identity also stabilizes synthesis resume. */
@@ -47,6 +48,9 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
     if (action === "read_context") {
       const record = store.get(observation.record.id);
       if (!record || canonical(reference(record)) !== canonical(observation.record)) return null;
+      if(record.kind==='reader-result'){
+        try{requireCurrentPriorContext(store,store.get<DiscoveryDraft>(question.value.draftId)!,observation);}catch{return null;}
+      }
       if (record.kind === "research-context") {
         try { archivedContext(store, store.get<DiscoveryDraft>(question.value.draftId)!, observation.record); } catch { return null; }
       }

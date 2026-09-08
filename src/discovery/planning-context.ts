@@ -2,13 +2,15 @@ import { relative, isAbsolute } from "node:path";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { contextTable } from "./context-tables.js";
+import { packPriorEvidence, priorEvidenceSources } from './prior-evidence-summary.js';
+import { packContextWorkspace } from './context-workspace.js';
 
 const rows = (v: any): any[] => Array.isArray(v) ? v : v?.rows?.map((r: unknown[]) => Object.fromEntries(v.columns.map((k: string, i: number) => [k, r[i]]))) ?? [];
 const pointer = (s: string) => s.replaceAll("~", "~0").replaceAll("/", "~1");
 
 /** Exact statements, structural identifiers and addresses; never a generated
  * summary of code or evidence. Synthesis still receives the full working view. */
-export function planningContext(body: Record<string, any>, archive: Ref, maxChars: number) {
+export function planningContext(body: Record<string, any>, archive: Ref, maxChars: number, contextChars?:number) {
   const root = body.repositoryRoot as string;
   requireCondition(typeof root === "string" && isAbsolute(root), "planning_context_invalid", "Planning requires its bound repository root");
   const sourceLocations = new Map((body.inventory?.sources ?? []).map((s: any) => [s.ref.id, s.location]));
@@ -62,6 +64,9 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
   for (const key of ["requirements", "nodes", "sources", "records", "alreadyRead", "priorReads", "unresolvedEvidence"]) {
     packet[key] = contextTable(packet[key]);
   }
+  if(Object.hasOwn(body,'contextWorkspace'))packet.contextWorkspace=body.contextWorkspace;
+  packContextWorkspace(packet,maxChars,contextChars);
+  packPriorEvidence(packet,body.priorEvidenceSources??priorEvidenceSources(body.priorEvidence??[]),archive,maxChars);
   if (JSON.stringify(packet).length > maxChars) throw new EngineError("planning_context_limit", "Lossless planning index exceeds its working ceiling", { required: JSON.stringify(packet).length });
   return packet;
 }

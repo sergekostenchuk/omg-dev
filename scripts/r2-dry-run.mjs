@@ -12,14 +12,28 @@ import { configureResearchScope, originalGaps, scopeObligations } from '../dist/
 import { configureBudgetSegment, segmentId, budgetUsage, budgetGroups, workingLimit } from '../dist/src/runtime/research-budget.js';
 import { reference } from '../dist/src/pipeline/contracts.js';
 import { hashJson } from '../dist/src/canonical.js';
-const [sourcePath, outPath, option] = process.argv.slice(2);
-if (!sourcePath || !outPath) throw Error('Usage: node scripts/r2-dry-run.mjs SOURCE_SQLITE NEW_OUTPUT_DIRECTORY');
+import { previewResearch } from '../dist/src/discovery/research-preview.js';
+const [sourcePath, outPath, option, previewDraft] = process.argv.slice(2);
+if (!sourcePath || !outPath) throw Error('Usage: node scripts/r2-dry-run.mjs SOURCE_SQLITE NEW_OUTPUT_DIRECTORY [--preview EXACT_R2_DRAFT_ID]');
 const out = resolve(outPath); mkdirSync(out, { recursive: false });
 const db = join(out, 'copy.sqlite');
 const source = new DatabaseSync(resolve(sourcePath), { readOnly: true });
+source.exec('PRAGMA query_only=ON');
 try { await backup(source, db); } finally { source.close(); }
 const store = new Store(db), engine = new ProductEngine(store), project = 'omg-live';
 try {
+  if(option==='--preview'){
+    if(!previewDraft)throw Error('Preview requires the exact prepared R2 draft ID in the source copy');
+    const draft=store.get(previewDraft);
+    if(draft?.kind!=='discovery-draft'||draft.value.stage!=='om-g2'||draft.value.level!=='R2'||draft.value.consumer!=='compilation')throw Error('Preview must name a technical R2 draft');
+    const before=store.list('model-call').length;
+    const captured=await previewResearch(()=>engine.researcher.run(draft.value.projectId,draft.id,1));
+    assert.equal(store.list('model-call').length,before,'Preview must not create model-call or synthetic usage');
+    const request=join(out,'request.json');writeFileSync(request,captured.input);
+    const {input:_input,...metadata}=captured;
+    const report={previewOnly:true,paidCalls:0,source:resolve(sourcePath),copy:db,request,...metadata};
+    writeFileSync(join(out,'result.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));
+  }else{
   const log = join(out, 'envelopes.ndjson'), adapter = join(out, 'fixture.mjs');
   writeFileSync(adapter, `import { readFileSync, appendFileSync } from 'node:fs';
 const req=JSON.parse(readFileSync(0,'utf8')), c=req.subject;
@@ -101,4 +115,5 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   writeFileSync(join(out,'result.json'),JSON.stringify(report,null,2));
   console.log(JSON.stringify({run:run.value.status,pause:run.value.pauseCode,error:run.value.error,questions:report.questions,budget:report.budget,result:join(out,'result.json')}));
   if(run.value.status!=='completed' || questions.some(q=>q.value.status!=='answered')) process.exitCode=1;
+  }
 } finally { store.close(); }

@@ -7,7 +7,7 @@ import { hashJson, type Json } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
-import { readResearchContext } from "./research-limits.js";
+import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 
 interface Session { projectId: string; offset: number; candidateOffset?:number; notes: Json[]; focus: unknown; workspace?: ContextWorkspace; result: unknown;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] } }
@@ -29,6 +29,7 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
   for (;;) {
     const current = session!.value;
     const workspace=contextWorkspace(current.workspace,current.focus);
+    for(const entry of workspace.entries)requireCurrentPriorContext(store,draft,entry.result);
     requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved assessment is blocked');
     let sent: Record<string, any> | undefined;
     const response = await researchCall(dispatch.reviewer, dispatch, prompt + "\n" + instruction,

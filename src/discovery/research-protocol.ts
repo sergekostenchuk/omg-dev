@@ -1,6 +1,7 @@
 import { processStart } from "../runtime/process-identity.js";
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
+import { interceptResearchPreview } from './research-preview.js';
 import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt, DEFAULT_CONTINUATION_CHARS } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
@@ -102,10 +103,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const requestId = randomUUID();
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: packetState && !packetState.initial ? continuationPrompt(audit!.purpose) : prompt };
-  const initialRequestLimit = audit?.purpose === "reading-planner" && audit.pilot?.value.planning
-    ? audit.pilot.value.planning.maxRequestChars : audit?.pilot?.value.maxRequestChars;
+  const plannerRequestLimit = audit?.purpose === 'reading-planner' ? audit.pilot?.value.planning?.maxRequestChars : undefined;
+  const initialRequestLimit = plannerRequestLimit ?? audit?.pilot?.value.maxRequestChars;
   const requestLimit = packetState && !packetState.initial
-    ? Math.min(initialRequestLimit ?? 300000, audit?.pilot?.value.maxContinuationChars ?? DEFAULT_CONTINUATION_CHARS)
+    ? plannerRequestLimit ?? Math.min(initialRequestLimit ?? 300000, audit?.pilot?.value.maxContinuationChars ?? DEFAULT_CONTINUATION_CHARS)
     : initialRequestLimit ?? 300000;
   const overhead = JSON.stringify({ ...envelope, subject: {} }).length + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
@@ -120,6 +121,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
   requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
     "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
+  interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
   if (audit?.pilot && packetState) {
     const previous = audit.store.list<ModelCall>("model-call").filter(c => c.value.status === "failed" && c.value.error === "pilot_reply_limit"
       && c.value.questionId === audit.questionId && c.value.purpose === audit.purpose && c.value.requested.actor === role.actor

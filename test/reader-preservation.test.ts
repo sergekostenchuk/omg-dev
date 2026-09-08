@@ -7,7 +7,9 @@ import {Store} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import {readBundle} from '../src/discovery/reader.js';
-import {priorReaderMaterial} from '../src/discovery/reader-reuse.js';
+import {priorReaderIndex} from '../src/discovery/reader-reuse.js';
+import {readPilotContext} from '../src/discovery/pilot-context.js';
+import {requireCurrentPriorContext} from '../src/discovery/research-limits.js';
 import {researchReadLimit} from '../src/discovery/research-limits.js';
 import {workingContext} from '../src/discovery/working-context.js';
 import {reference} from '../src/pipeline/contracts.js';
@@ -62,8 +64,17 @@ test('another question reuses full exact originals without copying old unresolve
  assert.deepEqual(reused.value.observations,original.value.observations);
  assert.deepEqual(reused.value.unresolved,[]);
  assert.ok(reused.value.reusedFrom?.some(ref=>ref.id===original.id));
- const available=priorReaderMaterial(f.store,'p',second.q.id)!;
- assert.deepEqual(available.unresolved,[]);assert.deepEqual(available.observations,original.value.observations);
+ const index=priorReaderIndex(f.store,'p',second.q.id);
+ assert.equal(index.length,1);assert.ok(!Object.hasOwn(index[0]!,'value')&&!Object.hasOwn(index[0]!,'unresolved'));
+ const address=index[0]!.original;
+ const available=readPilotContext(f.store,second.draft,address.record,address.pointer,20000);
+ assert.deepEqual(available.value,original.value.observations[0]);
+ assert.throws(()=>readPilotContext(f.store,second.draft,address.record,'/unresolved',20000),{code:'context_reference_foreign'});
+ assert.throws(()=>readPilotContext(f.store,{...second.draft,value:{...second.draft.value,projectId:'foreign'}},address.record,address.pointer,20000),{code:'context_reference_foreign'});
+ const value=readPilotContext(f.store,second.draft,address.record,address.pointer+'/value',20000);
+ writeFileSync(join(f.root,'source.txt'),'Changed after indexing');
+ assert.throws(()=>requireCurrentPriorContext(f.store,second.draft,value),{code:'research_evidence_stale'});
+ assert.deepEqual(priorReaderIndex(f.store,'p',second.q.id),[]);
 });
 
 test('partial prior coverage keeps enclosing conditions visible and deduplicates only the output',async t=>{

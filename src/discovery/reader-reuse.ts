@@ -36,26 +36,21 @@ export function reusableReaderRanges(store: Store, project: string, supplied: Re
     covered:[...new Map(covered.map(item=>[canonical([item.source,item.start,item.end]),item])).values()]};
 }
 
-/** Make prior originals visible before the new question buys another reading.
- * This is an evidence projection, never a copied answer or a completeness claim. */
-export function priorReaderMaterial(store:Store,project:string,question:string){
-  const evidence=new Evidence(store),observations=new Map<string,Observation>(),origins=new Map<string,Ref>();
+/** Index the originals before another question buys extraction. Their bodies
+ * remain at exact addresses; no old proposal, verdict or purpose is imported. */
+export function priorReaderIndex(store:Store,project:string,question:string){
+  const evidence=new Evidence(store),seen=new Set<string>();
+  const index:{source:Ref;selector:Observation['selector'];chars:number;location:string;original:{record:Ref;pointer:string}}[]=[];
   for(const record of store.list<ReaderResult>('reader-result')){
     if(record.value.projectId!==project||record.value.question.id===question)continue;
-    for(const observation of record.value.observations){
+    for(const [offset,observation] of record.value.observations.entries()){
       if(observation.projectId!==project||observation.selector.kind!=='text-range'||!evidence.verify(observation))continue;
-      const key=hashJson(observation);
-      if(observations.has(key))continue;
-      observations.set(key,observation);origins.set(record.id,reference(record));
+      const key=hashJson([observation.source,observation.selector]);
+      if(seen.has(key))continue;seen.add(key);
+      index.push({source:observation.source,selector:observation.selector,chars:observation.selector.end-observation.selector.start,
+        location:store.get<Source>(observation.source.id,observation.source.revision)!.value.origin.location,
+        original:{record:reference(record),pointer:`/observations/${offset}`}});
     }
   }
-  if(!observations.size)return null;
-  return {purpose:'Exact originals from earlier reading; evaluate them for this question. Previous unresolved, conclusions and judgments are not transferred.',
-    observations:[...observations.values()],unresolved:[] as string[],reusedFrom:[...origins.values()],
-    coverage:[...observations.values()].map(observation=>{
-      const source=store.get<Source>(observation.source.id)!;
-      const selector=observation.selector as {kind:'text-range';start:number;end:number};
-      return {ref:observation.source,totalChars:source.value.content.length,visibleRange:{start:selector.start,end:selector.end},
-        partial:selector.start!==0||selector.end!==source.value.content.length};
-    })};
+  return index;
 }

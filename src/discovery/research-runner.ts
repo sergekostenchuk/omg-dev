@@ -253,7 +253,7 @@ export class Researcher {
           }
         } catch (failure) {
           if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
-            "research_response_invalid", "assessment_invalid", "research_call_allowance"].includes(failure.code)
+            "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
             || ["pilot_", "budget_", "continuation_", "research_context_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
             || failure.code.endsWith("_no_progress"))) throw failure;
           error = failure instanceof Error ? failure.message : "Research action failed";

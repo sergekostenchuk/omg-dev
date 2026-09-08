@@ -3,7 +3,7 @@ import { researchScope, scopeObligations } from "../graph/research-scope.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { readerResultCurrent, type ReaderResult } from "./reader.js";
-import { priorReaderMaterial } from './reader-reuse.js';
+import { priorReaderIndex } from './reader-reuse.js';
 import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
 import { reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -32,6 +32,18 @@ export function contextCatalogue(store: Store, draft: Revision<DiscoveryDraft>) 
 }
 
 export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref, pointer: string, maxChars: number, page?: ContextPage) {
+  if(store.get(ref.id,ref.revision)?.kind==='reader-result'){
+    const saved=store.get<ReaderResult>(ref.id,ref.revision)!;
+    const match=typeof pointer==='string'&&/^\/observations\/(0|[1-9]\d*)(?:\/.*)?$/.exec(pointer);
+    requireCondition(saved.hash===ref.hash&&saved.value.projectId===draft.value.projectId&&match,
+      'context_reference_foreign','Prior reading access is limited to exact observations of this project');
+    const observation=saved.value.observations[Number(match[1])];
+    requireCondition(observation?.projectId===draft.value.projectId&&new Evidence(store).verify(observation),
+      'research_evidence_stale','The requested prior observation is missing or no longer current');
+    const result={record:ref,pointer,...contextPage(contextValue(saved.value,pointer),page)};
+    requireCondition(canonical(result).length<=maxChars,'context_read_limit','Use a smaller prior-observation page');
+    return result;
+  }
   if (store.get(ref.id, ref.revision)?.kind === 'research-checkpoint') {
     const saved=store.get<any>(ref.id,ref.revision);
     requireCondition(saved?.hash===ref.hash&&saved.value.projectId===draft.value.projectId
@@ -105,7 +117,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
   const currentReadings=allReadings.filter(record=>readerResultCurrent(store,project,record.value));
   const childParts=new Set(currentReadings.flatMap(record=>(record.value.parts??[]).map(ref=>canonical(ref))));
   const readings=currentReadings.filter(record=>!childParts.has(canonical(reference(record))));
-  const prior=draft.value.level==='R2'?priorReaderMaterial(store,project,question.id):null;
+  const priorEvidence=draft.value.level==='R2'?priorReaderIndex(store,project,question.id):[];
   const catalogue = contextCatalogue(store, draft);
   const directReadings = store.list<{ projectId: string; question: string; action: { action: string }; observation: any }>("pilot-reading")
     .filter(record => record.value.projectId === project && record.value.question === question.id);
@@ -114,6 +126,13 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     if (action.action === "read_source") return evidence.verify(observation as Observation);
     if (action.action === "read") return sourceCurrent(observation.ref);
     if (action.action === "read_context") {
+      if(store.get(observation.record.id)?.kind==='reader-result'){
+        try{
+          readPilotContext(store,draft,observation.record,observation.pointer,Number.MAX_SAFE_INTEGER,
+            observation.page?{offset:observation.page.offset,limit:observation.page.end-observation.page.offset}:undefined);
+          return true;
+        }catch{return false;}
+      }
       if (store.get(observation.record.id)?.kind === "research-context") {
         try { archivedContext(store, draft, observation.record); return true; } catch { return false; }
       }
@@ -151,8 +170,9 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     catalogue,
     answers: draft.value.questions.map(id => store.get<Question>(id)!).map(q => ({ field: q.value.spec.field, status: q.value.status,
       pointer: `/fields/${escape(q.value.spec.field)}` })),
-    readings: [...readings.map(record => ({ ref: reference(record), purpose: record.value.purpose,
-      observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved })),...(prior?[prior]:[])],
+    readings: readings.map(record => ({ ref: reference(record), purpose: record.value.purpose,
+      observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved })),
+    priorEvidence,
     staleReaderReadings: allReadings.filter(record => !currentReadings.includes(record)).map(record => ({ ref: reference(record),
       purpose: record.value.purpose, sources: record.value.sources })),
     directReadings: directReadings.filter(currentRead).map(record => ({ ref: reference(record), ...record.value,

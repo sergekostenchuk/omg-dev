@@ -7,6 +7,7 @@ import { requireCondition, EngineError } from "../errors.js";
 import { planningContext } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
 import { packContextWorkspace } from "./context-workspace.js";
+import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summary.js';
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number }
@@ -55,6 +56,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  const priorSources=priorEvidenceSources(body['priorEvidence']??[]);
+  if(priorSources.length)body['priorEvidenceSources']=priorSources;
   const inventory = body['inventory'] as any;
   if (inventory?.sources && inventory.files) body['sourceCatalogue'] = {
     sources: contextTable(inventory.sources), files: inventory.files, filesTruncated: inventory.filesTruncated,
@@ -66,9 +69,11 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
-    const initial:Record<string,any>={...body,working:{archive:reference(archive),instruction,sections:Object.keys(body).map(key=>({pointer:`/body/${escape(key)}`}))}};
+    const {priorEvidence:_priorEvidence,priorEvidenceSources:_priorEvidenceSources,...initialBody}=body;
+    const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),instruction,sections:Object.keys(body).map(key=>({pointer:`/body/${escape(key)}`}))}};
     if (initial.inventory) delete initial.sourceCatalogue;
     packContextWorkspace(initial,maxChars,options.contextChars);
+    packPriorEvidence(initial,priorSources,reference(archive),maxChars);
     requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
     return initial;
   }
@@ -122,11 +127,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
-    const planned=planningContext(body,reference(archive),maxChars);
-    if(Object.hasOwn(body,'contextWorkspace'))planned.contextWorkspace=body['contextWorkspace'];
-    packContextWorkspace(planned,maxChars,options.contextChars);
-    requireCondition(JSON.stringify(planned).length<=maxChars,'pilot_core_limit','Planning context and addressed originals exceed the declared envelope');
-    return planned;
+    return planningContext(body,reference(archive),maxChars,options.contextChars);
   }
   const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "synthesisState", "synthesisNotes", "previousProposalRef"];
@@ -141,6 +142,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   packContextWorkspace(packet,maxChars,options.contextChars);
+  packPriorEvidence(packet,priorSources,reference(archive),maxChars);
   if (body['synthesisState']) {
     if (!options.common) {packet.previousProposal = body['previousProposal'] ?? null; packet.history = body['history'] ?? [];}
   }
