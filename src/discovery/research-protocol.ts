@@ -27,6 +27,7 @@ import { DELTA_COLLECTIONS } from "./layer-delta.js";
 import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
+import { recoveryDispatchBoundary, operatorReplayedResponse } from './response-recovery.js';
 
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const text = { type: "string", minLength: 1 };
@@ -62,18 +63,26 @@ const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   object({ action: { const: "need_research" }, question: text, missing: { type: "array", minItems: 1, items: text } }),
   answerDelta,
   object({ action: { const: "checkpoint" }, question: text, value: {},
-    citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
+    citations: { type: "array", items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
   object({ action: { const: "answer" }, question: text, value: {}, citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
   object({ action: { const: "need_owner" }, question: text, reason: text, searched: { type: "array", minItems: 1, items: ref } }),
   object({ action: { const: "pause" }, reason: text }),
 ] });
 export function researchAction(value: unknown): ResearchAction {
   if (!validate(value)) throw new EngineError("research_response_invalid", "Research action has missing or invalid fields", validate.errors);
+  if (value.action === 'checkpoint' && value.citations.length === 0) {
+    const note = value.value;
+    const meaningful = typeof note === 'string' ? note.trim().length > 0 : Array.isArray(note) ? note.length > 0
+      : note !== null && (typeof note !== 'object' || Object.keys(note).length > 0);
+    requireCondition(meaningful || value.unresolved.some(text => text.trim().length > 0),
+      'research_checkpoint_empty', 'An uncited checkpoint needs actual proposed content or an explicit unresolved question');
+  }
   return value;
 }
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
     session?: Ref; onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
+  recoveryDispatchBoundary();
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
@@ -123,6 +132,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
   requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
     "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
+  const recovered = operatorReplayedResponse(role, input, audit);
+  if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
   if (audit?.pilot && packetState) {
     const previous = audit.store.list<ModelCall>("model-call").filter(c => c.value.status === "failed" && c.value.error === "pilot_reply_limit"

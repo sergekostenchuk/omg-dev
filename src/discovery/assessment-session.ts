@@ -1,5 +1,5 @@
 import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, Write } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
@@ -8,6 +8,7 @@ import { reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
+import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten } from './response-recovery.js';
 
 interface Session { projectId: string; offset: number; candidateOffset?:number; notes: Json[]; focus: unknown; workspace?: ContextWorkspace; result: unknown;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] } }
@@ -19,14 +20,20 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
   // Additional readings and contradictions can change a verdict even when the
   // proposed value and its citations did not change.
   const basis = JSON.parse(JSON.stringify(context));
-  const id = `assessment-session:${hashJson([reference(question), reference(environment), draft.value.inputs, basis])}`;
+  const id = recoveryAssessmentSessionId(`assessment-session:${hashJson([reference(question), reference(environment), draft.value.inputs, basis])}`);
   let session = store.get<Session>(id);
   const guards = [reference(question), reference(environment), ...draft.value.inputs, ...context.observations.map((o: any) => o.source),...extraGuards];
-  const save = (value: Session) => session = store.writeMany<Session>([{ id, kind: "assessment-session", expected: session?.revision ?? 0,
-    value:{...value,binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs}} }], guards)[0]!;
+  const save = (value: Session) => {
+    const write: Write = { id, kind: 'assessment-session', expected: session?.revision ?? 0,
+      value: { ...value, binding: { draft: reference(draft), question: reference(question), environment: reference(environment), inputs: draft.value.inputs } } };
+    const recovery = recoverySessionWrites(write);
+    session = store.writeMany<Session>([write, ...recovery.writes], [...guards, ...recovery.guards])[0]!;
+    markRecoveredSessionWritten(recovery); return session;
+  };
   if (!session) save({ projectId: draft.value.projectId, offset: 0, notes: [], focus: null, result: null });
   if (session!.value.result) return session!.value.result;
   for (;;) {
+    recoveredResponseBoundary();
     const current = session!.value;
     const workspace=contextWorkspace(current.workspace,current.focus);
     for(const entry of workspace.entries)requireCurrentPriorContext(store,draft,entry.result);

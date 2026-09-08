@@ -1,6 +1,6 @@
 import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, Write } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
@@ -13,6 +13,7 @@ import { checkpoint } from "./research-continuation.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
 import { readerResultCurrent } from "./reader.js";
 import { isRef } from "../pipeline/contracts.js";
+import { recoveredResponseBoundary, recoverySessionWrites, markRecoveredSessionWritten } from './response-recovery.js';
 
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
@@ -46,6 +47,7 @@ export function pendingSynthesis(store: Store, draft: Revision<DiscoveryDraft>, 
 }
 
 const instruction = "\nmaterialPage may carry a finite JSON fragment of one large saved material; its cursor must advance before the next source. Synthesis uses finite pages of the materials already requested. synthesisPage gives the range actually supplied; omitted pages are not missing research. If synthesisPage.complete is false, return checkpoint with findings from this page, exact citations and remaining uncertainties; do not ask the reading planner to retrieve later pages. The engine saves your checkpoint and supplies the next page. An early answer is only an unassessed checkpoint. synthesisNotes contains earlier proposed answers and source citations, not authoritative facts; reconcile exceptions and contradictions across them. After the last page, compose the complete answer using these notes and supplied evidence. Only then request new research if essential information is still absent. All original materials remain at working.archive /body/synthesisMaterials. Never infer absence from an unshown page.";
+const checkpointInstruction = " A checkpoint is an unassessed note and may explicitly use citations:[] for a context-only page without Source evidence. Do not invent or borrow an irrelevant citation to satisfy its format. This does not waive the citations and evidence required for a final answer.";
 
 export async function synthesisSession(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot>,
@@ -53,11 +55,16 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
   const { id, materials } = basis(draft, question, environment, context);
   let session = store.get<Session>(id);
   const guards = [reference(draft), reference(question), reference(environment), ...draft.value.inputs];
-  const save = (value: Session, extra: Ref[] = []) => session = store.writeMany<Session>([
-    { id, kind: "synthesis-session", expected: session?.revision ?? 0,
-      value: {...value,binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs}} }], [...guards, ...extra])[0]!;
+  const save = (value: Session, extra: Ref[] = []) => {
+    const write: Write = { id, kind: 'synthesis-session', expected: session?.revision ?? 0,
+      value: { ...value, binding: { draft: reference(draft), question: reference(question), environment: reference(environment), inputs: draft.value.inputs } } };
+    const recovery = recoverySessionWrites(write);
+    session = store.writeMany<Session>([write, ...recovery.writes], [...guards, ...extra, ...recovery.guards])[0]!;
+    markRecoveredSessionWritten(recovery); return session;
+  };
   if (!session) save({ projectId: draft.value.projectId, offset: 0, notes: [], result: null });
   for (;;) {
+    recoveredResponseBoundary();
     requireCondition(guards.every(ref => {
       const current = store.get(ref.id);
       return current?.revision === ref.revision && current.hash === ref.hash;
@@ -88,7 +95,7 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved context session is blocked');
     verify(workspace.entries);
     let sent: Record<string, any> | undefined;
-    const action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction,
+    const action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction + checkpointInstruction,
       { ...context, dispatchMode: "synthesis", synthesisMaterials: materials,
         synthesisSession:id, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes,
         contextWorkspace:workspace.entries.map(e=>e.result), focus:null }, signal,
