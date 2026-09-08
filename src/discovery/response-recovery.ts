@@ -1,3 +1,4 @@
+import { consolidationInput } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Store, Revision, Write } from '../storage/store.js';
 import type { ModelCall } from '../runtime/model-usage.js';
@@ -30,6 +31,9 @@ const boundary = () => new EngineError('response_recovery_boundary', 'The select
  * permission from this scope and follows its normal dispatch path. */
 export function recoveredResponseBoundary(): void { if (current.getStore()?.applied) throw boundary(); }
 export function recoveryDispatchBoundary(): void { if (current.getStore()?.delivered) throw boundary(); }
+export function recoveryConsolidationMode(): boolean | undefined {
+  const scope = current.getStore(); return scope ? scope.subject.dispatchMode === 'consolidation' : undefined;
+}
 export function recoveryAssessmentSessionId(computed: string): string {
   const scope = current.getStore(); return scope?.purpose === 'assessor' ? scope.session.id : computed;
 }
@@ -135,7 +139,16 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
     && canonical(body.contextWorkspace ?? []) === canonical(workspace.entries.map(entry => entry.result))
     && !workspace.blocked && (!body.repositoryRoot || body.repositoryRoot === effective.root),
   'response_recovery_cursor_stale', 'The archived cursor, notes, materials context or workspace was already changed');
-  if (synthesis) {
+  if (synthesis && body.dispatchMode === 'consolidation') {
+    requireCondition(body.consolidation && Number.isSafeInteger(body.consolidation.targetChars) && body.consolidation.targetChars > 0
+      && request.subject.dispatchMode === 'consolidation'
+      && canonical(request.subject.synthesisState) === canonical(state)
+      && request.subject.synthesisSession === session.id
+      && canonical(request.subject.question) === canonical({ id: question.id, ...question.value.spec })
+      && canonical(request.subject.consolidation) === canonical(consolidationInput(body.synthesisNotes, body.consolidation.targetChars))
+      && !request.subject.synthesisPage && !request.subject.materialPage && !request.subject.selectedContext && !request.subject.readings,
+    'response_recovery_page_foreign', 'The consolidation must contain exactly the saved notes and contract, without claiming material progress');
+  } else if (synthesis) {
     const page = request.subject.synthesisPage, materials = body.synthesisMaterials, fragment = request.subject.materialPage;
     requireCondition(Array.isArray(materials) && page && page.offset === state.offset && Number.isSafeInteger(page.end)
       && page.end >= page.offset && page.end <= materials.length && page.total === materials.length

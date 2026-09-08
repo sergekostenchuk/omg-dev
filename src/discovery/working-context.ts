@@ -1,3 +1,4 @@
+import { activeSynthesisNotes, consolidationInput } from './conclusion-consolidation.js';
 import { FOUNDATION_FIELDS, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -68,6 +69,19 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const id = `research-context:${hashJson(value)}`;
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+  if (body['dispatchMode'] === 'consolidation') {
+    requireCondition(Array.isArray(body['synthesisNotes']) && body['consolidation']
+      && Number.isSafeInteger(body['consolidation'].targetChars) && body['consolidation'].targetChars > 0,
+    'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
+    const packet = { dispatchMode: 'consolidation', question: { id: question.id, ...question.value.spec },
+      synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
+      consolidation: consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars),
+      working: { archive: reference(archive), instruction: 'Original notes are immutable at /body/synthesisNotes. No new material is delivered in this step.',
+        sections: [{ pointer: '/body/synthesisNotes' }] } };
+    requireCondition(JSON.stringify(packet).length <= maxChars, 'consolidation_input_limit',
+      'The notes-only consolidation request exceeds the fixed ceiling; do not raise it or repeat a paid call');
+    return packet;
+  }
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
     const {priorEvidence:_priorEvidence,priorEvidenceSources:_priorEvidenceSources,...initialBody}=body;
     const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),instruction,sections:Object.keys(body).map(key=>({pointer:`/body/${escape(key)}`}))}};
@@ -121,7 +135,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     delete body['history'];
   }
   if (options.common) {
-    const conclusions=compactConclusions(body['synthesisNotes'] ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===questionId && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
+    const conclusions=compactConclusions((body['synthesisNotes'] ? activeSynthesisNotes(body['synthesisNotes']) : undefined) ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===questionId && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
     body['conclusions']=conclusions.items; body['conclusionCitations']=conclusions.citations;
     if(body['history']) {
       const history=body['history'] as any[];

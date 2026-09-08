@@ -15,6 +15,7 @@ export interface ReaderPilotSettings {
   maxCalls: number; maxReportedTokens: number;
   callTimeoutMs?: number;
   maxContinuationChars?: number;
+  conclusionShare?: number;
   contextLimits?: { maxLookups: number; maxChars: number };
   physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
@@ -32,6 +33,7 @@ export const readerPilotSchema = object({ experimental: { const: true }, active:
 readerPilotSchema.properties['unknownReserves'] = { type: "array", items: object({ call: object({ id: text, revision: positive,
   hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }), tokens: positive }) };
 readerPilotSchema.properties['maxContinuationChars'] = positive;
+readerPilotSchema.properties['conclusionShare'] = { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1 };
 readerPilotSchema.properties['maxExtractedChars'] = positive;
 readerPilotSchema.properties['contextLimits'] = object({ maxLookups: positive, maxChars: positive });
 readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: positive, maxReplyChars: positive, basis: text });

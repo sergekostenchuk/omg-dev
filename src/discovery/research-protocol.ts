@@ -1,3 +1,4 @@
+import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION } from './conclusion-consolidation.js';
 import { processStart } from "../runtime/process-identity.js";
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
@@ -112,8 +113,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor) : null;
   const requestId = randomUUID();
+  const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: packetState && !packetState.initial ? continuationPrompt(audit!.purpose) : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? CONSOLIDATION_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const plannerRequestLimit = audit?.purpose === 'reading-planner' ? audit.pilot?.value.planning?.maxRequestChars : undefined;
   const initialRequestLimit = plannerRequestLimit ?? audit?.pilot?.value.maxRequestChars;
   const requestLimit = packetState && !packetState.initial
@@ -125,7 +127,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       ...(audit!.pilot?.value.contextLimits?{contextChars:audit!.pilot.value.contextLimits.maxChars}:{}),
       ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxExtractedChars??audit!.pilot.value.maxReadChars}:{}) }) : context;
   if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive);
-  if (context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
+  if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
   audit?.onContext?.(subject as Record<string, any>);
   const input = JSON.stringify({ ...envelope, subject });

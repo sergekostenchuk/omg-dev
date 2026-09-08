@@ -1,3 +1,4 @@
+import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote } from './conclusion-consolidation.js';
 import { contextWorkspace, addContextLookup, contextProgress, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision, Write } from "../storage/store.js";
@@ -13,12 +14,12 @@ import { checkpoint } from "./research-continuation.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
 import { readerResultCurrent } from "./reader.js";
 import { isRef } from "../pipeline/contracts.js";
-import { recoveredResponseBoundary, recoverySessionWrites, markRecoveredSessionWritten } from './response-recovery.js';
+import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWrites, markRecoveredSessionWritten } from './response-recovery.js';
 
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] };
-  notes: { checkpoint: Ref; proposal: ResearchAction; page: { offset: number; end: number } }[];
+  notes: SynthesisNote[];
   result: ResearchAction | null;
 }
 
@@ -94,15 +95,32 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     const workspace=contextWorkspace(current.workspace,current.focus);
     requireCondition(!workspace.blocked,'research_no_progress',workspace.blocked??'Saved context session is blocked');
     verify(workspace.entries);
-    let sent: Record<string, any> | undefined;
-    const action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction + checkpointInstruction,
-      { ...context, dispatchMode: "synthesis", synthesisMaterials: materials,
-        synthesisSession:id, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes,
-        contextWorkspace:workspace.entries.map(e=>e.result), focus:null }, signal,
-      { store, draftId: draft.id, questionId: question.id, purpose: "analyst", pilot, session:reference(session!), onContext: packet => { sent = packet; } }).catch(error=>{
-        if(error instanceof EngineError&&error.code==='research_context_undelivered')save({...current,workspace:{...workspace,blocked:error.message}});
-        throw error;
-      }));
+    const callContext = { ...context, dispatchMode: 'synthesis', synthesisMaterials: materials,
+      synthesisSession: id, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 }, synthesisNotes: current.notes,
+      contextWorkspace: workspace.entries.map(e => e.result), focus: null };
+    const consolidate = async () => {
+      requireCondition(consolidationNeeded(current.notes, pilot.value, true), 'consolidation_no_progress',
+        'Consolidation already ran without new material; preserve the notes and stop instead of paying to compress them again');
+      const response = researchAction(await researchCall(dispatch.implementer, dispatch, '',
+        { ...callContext, dispatchMode: 'consolidation', consolidation: { targetChars: consolidationLimits(pilot.value).target } }, signal,
+        { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot, session: reference(session!) }));
+      const proposal = consolidatedProposal(response, question.id, current.notes);
+      const saved = checkpoint(store, draft, question, { ...proposal, value: proposal as unknown as Json });
+      save({ ...current, notes: [...current.notes, { checkpoint: reference(saved), proposal,
+        page: { offset: current.offset, end: current.offset },
+        consolidated: { replaces: activeSynthesisNotes(current.notes).map(note => note.checkpoint) } }] }, [reference(saved)]);
+    };
+    if (recoveryConsolidationMode() ?? consolidationNeeded(current.notes, pilot.value)) { await consolidate(); continue; }
+    let sent: Record<string, any> | undefined, action: ResearchAction;
+    try {
+      action = researchAction(await researchCall(dispatch.implementer, dispatch, prompt + instruction + checkpointInstruction + COMPACT_CHECKPOINT_INSTRUCTION,
+        callContext, signal, { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot,
+          session: reference(session!), onContext: packet => { sent = packet; } }));
+    } catch (error) {
+      if (error instanceof EngineError && error.code === 'continuation_carry_limit') { await consolidate(); continue; }
+      if (error instanceof EngineError && error.code === 'research_context_undelivered') save({ ...current, workspace: { ...workspace, blocked: error.message } });
+      throw error;
+    }
     const page = sent?.synthesisPage;
     requireCondition(["answer", "answer_delta", "checkpoint", "read_context", "need_research", "need_owner", "pause"].includes(action.action),
       "research_mode_invalid", "Synthesis must answer, checkpoint, or identify missing information");

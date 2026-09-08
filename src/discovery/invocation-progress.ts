@@ -13,7 +13,8 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
   let step:unknown;
   const originals=(context.contextWorkspace??[]).map(contextLookupKey);
-  if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals};
+  if(context.dispatchMode==='consolidation')step={session:context.synthesisSession,cursor:context.synthesisState,operation:'consolidation'};
+  else if(context.synthesisState)step={session:context.synthesisSession??null,cursor:context.synthesisState,originals};
   else if(context.assessmentState)step={session:context.assessmentSession??null,cursor:context.assessmentState,originals};
   else if(purpose==='reader')step={sources:context.sources?.map((s:any)=>({ref:s.ref??null,range:s.visibleRange??null,content:hashJson(s)}))??[]};
   else {
