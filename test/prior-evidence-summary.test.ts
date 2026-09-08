@@ -28,7 +28,7 @@ function fixture(t:test.TestContext){
  return {root,store,engine,env,pilot,draft,q};
 }
 
-test('44 source records and 321 observations fit the real 70000 planner envelope without embedding the 262-entry index',async t=>{
+test('44 source records and 321 observations fit the global 300000 request envelope without embedding the 262-entry index',async t=>{
  const f=fixture(t),sources=[];
  let count=0;
  for(let i=0;i<44;i++){
@@ -49,7 +49,7 @@ test('44 source records and 321 observations fit the real 70000 planner envelope
  const preview=await previewResearch(()=>researchCall(f.env.value.implementer,f.env.value,'Actual planner request',body,undefined,
   {store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'reading-planner',pilot:f.pilot}));
  const packet=JSON.parse(preview.input).subject;
- assert.equal(preview.limit,70000);assert.ok(preview.chars<=70000);
+ assert.equal(preview.limit,300000);assert.ok(preview.chars<=300000);
  assert.equal(packet.priorEvidence.totalSources,44);assert.equal(packet.priorEvidence.totalObservations,262);
  assert.equal(packet.priorEvidence.sources.length,44);assert.equal(packet.priorEvidence.nextSource,null);
  assert.ok(!preview.input.includes('ORIGINAL_BODY_SENTINEL'));

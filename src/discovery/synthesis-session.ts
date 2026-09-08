@@ -146,14 +146,11 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
           session: reference(session!), onContext: packet => {
             sent = packet;
             if (packet.contextControls) {controls=packet.contextControls;callContext.contextControls=controls;}
-            if (!recovering && consolidationNeeded(current.notes,pilot.value)) throw new EngineError('consolidation_required',
-              'Compact findings within the capacity remaining after exact addressed context',
-              {targetChars:packet.conclusionCapacity?.items??consolidationLimits(pilot.value).target,fullTargetChars:packet.conclusionCapacity?.total??pilot.value.maxRequestChars});
           } }));
     } catch (error) {
       if (error instanceof EngineError && ['continuation_carry_limit','consolidation_required'].includes(error.code)) {
         const capacity = error.details as {targetChars?:number;fullTargetChars?:number;deficitChars?:number}|null;
-        await consolidate(capacity?.targetChars,capacity?.fullTargetChars??Math.min(pilot.value.maxRequestChars,pilot.value.maxContinuationChars??100000),true,capacity?.deficitChars??0); continue;
+        await consolidate(capacity?.targetChars,capacity?.fullTargetChars??pilot.value.maxRequestChars,true,capacity?.deficitChars??0); continue;
       }
       if (error instanceof EngineError && ['research_context_undelivered','research_context_capacity'].includes(error.code)) save({ ...current, workspace: { ...workspace, blocked: error.message } });
       throw error;

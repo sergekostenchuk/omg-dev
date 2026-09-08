@@ -78,7 +78,7 @@ test('missing/foreign question and competing bootstrap reservations cannot bypas
 test('an oversized mandatory continuation stops before the adapter and cannot grow its ceiling',async t=>{
  const f=fixture(t),{draft,q}=question(f.store,'discovery','R0','oversize');
  await researchCall(f.role,f.env,'fixture',body(q,f.root,'analyst'),undefined,{store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst'});
- await assert.rejects(researchCall(f.role,f.env,'fixture',{...body(q,f.root,'analyst'),request:{piece:'x'.repeat(110000)}},undefined,
+ await assert.rejects(researchCall(f.role,f.env,'fixture',{...body(q,f.root,'analyst'),request:{piece:'x'.repeat(350000)}},undefined,
   {store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst'}));
  assert.equal(readFileSync(f.log,'utf8').trim().split('\n').length,1);
  assert.equal(f.store.list('research-limit').length,0);
@@ -100,7 +100,7 @@ test('oversized saved material is sent in bounded exact fragments without repeat
  assert.ok(finished);assert.deepEqual(JSON.parse(fragments.join('')),value);
  const wires=readFileSync(f.log,'utf8').trim().split('\n').map(s=>JSON.parse(s));
  assert.equal(wires.filter(w=>JSON.stringify(w).includes('FOUNDATION_SENTINEL')).length,1);
- assert.ok(wires.slice(1).every(w=>JSON.stringify(w).length<=100000));
+ assert.ok(wires.slice(1).every(w=>JSON.stringify(w).length<=300000));
 });
 
 test('real evidence remains exact, while a forged observation cannot smuggle a repeated foundation',t=>{

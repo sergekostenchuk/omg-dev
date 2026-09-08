@@ -5,7 +5,7 @@ import { invocationProgress, consumeInvocationAllowance } from "./invocation-pro
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
-import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt, DEFAULT_CONTINUATION_CHARS } from "./continuation-packet.js";
+import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
@@ -122,11 +122,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     'research_no_progress','The final-stage lookup allowance is exhausted; an ordinary context-search dispatch is forbidden');
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
-  const plannerRequestLimit = audit?.purpose === 'reading-planner' ? audit.pilot?.value.planning?.maxRequestChars : undefined;
-  const initialRequestLimit = plannerRequestLimit ?? audit?.pilot?.value.maxRequestChars;
-  const requestLimit = packetState && !packetState.initial
-    ? plannerRequestLimit ?? Math.min(initialRequestLimit ?? 300000, audit?.pilot?.value.maxContinuationChars ?? DEFAULT_CONTINUATION_CHARS)
-    : initialRequestLimit ?? 300000;
+  const requestLimit = audit?.pilot?.value.maxRequestChars ?? 300000;
   const overhead = Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,

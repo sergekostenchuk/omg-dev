@@ -64,7 +64,7 @@ test('the real researcher path exposes its first request through preview without
  assert.equal(existsSync(f.wire),false);
 });
 
-test('the explicit planner limit applies to initial and continuation requests without a hidden smaller continuation cap',async t=>{
+test('the global ReaderPilot request limit applies to initial and continuation requests while legacy planner and continuation limits are inert',async t=>{
  const f=fixture(t),command=f.environment.value.implementer.command;
  const settings={experimental:true as const,active:true,stopAfter:'L2' as const,reader:{actor:'reader',model:'fixture',effort:'high' as const,speed:'inherited' as const,command},
   agentCommand:command,maxRequestChars:300000,maxContinuationChars:100000,maxReadChars:60000,maxReplyChars:10000,maxCalls:100,maxReportedTokens:20000000,
@@ -75,11 +75,11 @@ test('the explicit planner limit applies to initial and continuation requests wi
   {...f.audit,purpose:'reading-planner',pilot:selected});
  await call();
  const first=f.store.list<any>('model-call')[0]!;
- assert.equal(first.value.packet.maxChars,120000);assert.ok(first.value.request.chars>100000);
+ assert.equal(first.value.packet.maxChars,300000);assert.ok(first.value.request.chars>100000);
  const preview=await previewResearch(()=>call());
- assert.equal(preview.limit,120000);assert.ok(preview.chars>100000&&preview.chars<=120000);
+ assert.equal(preview.limit,300000);assert.ok(preview.chars>100000&&preview.chars<=300000);
  assert.equal(JSON.parse(preview.input).subject.continuation.kind,'continuation');
- await assert.rejects(previewResearch(()=>call(pilot,{...f.context,request:{text:'X'.repeat(125000)}})),{code:'pilot_core_limit'});
+ await assert.rejects(previewResearch(()=>call(pilot,{...f.context,request:{text:'X'.repeat(350000)}})),{code:'pilot_core_limit'});
  const physical=configureReaderPilot(f.store,f.engine.environments,'p',{...settings,physicalLimits:{maxRequestChars:100000,maxReplyChars:10000,basis:'Fixture transport capacity'}},pilot.revision);
  await assert.rejects(previewResearch(()=>call(physical)),{code:'budget_transport_limit'});
  assert.equal(f.store.list('model-call').length,1);

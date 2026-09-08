@@ -102,16 +102,15 @@ test('terminal pauses and repeated checkpoints cannot buy an unbounded retry wit
   }
 });
 
-test('a pending legacy oversized summary gets one bounded format upgrade without rereading or altering its originals',async t=>{
+test('a pending legacy summary that fits the actual packet continues without a format upgrade',async t=>{
   const f=await fixture(t,20),proposal={action:'checkpoint' as const,question:f.question.id,value:{finding:'x'.repeat(22000)},citations:[],unresolved:['Preserve this uncertainty']};
   const saved=checkpoint(f.store,f.draft,f.question,{...proposal,value:proposal as unknown as Json});
   const legacy={checkpoint:reference(saved),proposal,page:{offset:0,end:0},consolidated:{replaces:f.notes.map(n=>n.checkpoint)}};
   const s=f.store.get<any>(f.before.id)!;f.store.write({id:s.id,kind:s.kind,expected:s.revision,value:{...s.value,notes:[...s.value.notes,legacy]}});
   assert.equal((await f.invoke()).action,'pause');
   const after=f.store.get<any>(f.before.id)!;assert.deepEqual(after.value.notes.slice(0,4),[...f.notes,legacy]);
-  const active=activeSynthesisNotes(after.value.notes);assert.equal(active.length,1);assert.equal(active[0]!.consolidated!.format,2);
-  assert.ok(JSON.stringify(compactConclusions(active).items).length<=active[0]!.consolidated!.targetChars!);
-  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,1);
+  const active=activeSynthesisNotes(after.value.notes);assert.equal(active.length,1);assert.equal(active[0]!.consolidated!.format,undefined);
+  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,0);
 });
 
 test('context recovery preserves exhausted final-stage accounting instead of granting another search round',async t=>{
@@ -167,7 +166,7 @@ test('a lookup from the just-delivered final page also requires purpose before i
 
 
 test('one unsuccessful tightening is terminal and never loses original notes, citations or unresolved items',async t=>{
-  const f=await fixture(t,5000,60000);f.context.request={immutableCondition:'x'.repeat(35000)};
+  const f=await fixture(t,5000,60000,0.35,0,{},35000);
   adapter(f,`if(c.dispatchMode!=='consolidation')throw Error('No ordinary generation while the packet does not fit');
 research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(14000)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
   await assert.rejects(f.invoke(),{code:'consolidation_capacity_exhausted'});
@@ -183,7 +182,7 @@ research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.
 });
 
 test('a paid tightening recovers through the ordinary consumer once, preserving its terminal retry boundary',async t=>{
-  const f=await fixture(t,5000,60000);f.context.request={immutableCondition:'x'.repeat(35000)};
+  const f=await fixture(t,5000,60000,0.35,0,{},35000);
   adapter(f,`research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(14000)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
   const write=f.store.writeMany.bind(f.store);let interrupted=false;
   f.store.writeMany=((writes:any[],guards:any[]=[])=>{

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Store } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { preparedFeatures } from './product-fixture.js';
-import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
+import { configureReaderPilot, pilotEnvironment, type ReaderPilotSettings } from '../src/discovery/reader-pilot.js';
 import { pilotContext } from '../src/discovery/pilot-context.js';
 import { readResearchContext } from '../src/discovery/research-limits.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
@@ -17,7 +17,7 @@ import { reference } from '../src/pipeline/contracts.js';
 import type { Question } from '../src/discovery/discovery.js';
 import type { Json } from '../src/canonical.js';
 
-export async function fixture(t: test.TestContext, noteChars = 18000, limit = 100000, share = 0.35, consolidationTextChars = 0) {
+export async function fixture(t: test.TestContext, noteChars = 18000, limit = 100000, share = 0.35, consolidationTextChars = 0, settings: Partial<ReaderPilotSettings> = {}, requestPadding = 0) {
   const root = mkdtempSync(join(tmpdir(), 'omg-consolidation-')), store = new Store(join(root, 'db.sqlite')), engine = new ProductEngine(store, 'codex');
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); }); preparedFeatures(engine, 'p');
   const path = join(root, 'fixture.mjs'), log = join(root, 'wire.ndjson');
@@ -31,11 +31,12 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:c
   const pilot = configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
     reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
     maxRequestChars: limit, maxContinuationChars: limit, conclusionShare: share,
-    maxReadChars: 60000, maxReplyChars: 100000, maxCalls: 20, maxReportedTokens: 100000 }, 0);
+    maxReadChars: 60000, maxReplyChars: 100000, maxCalls: 20, maxReportedTokens: 100000, ...settings }, 0);
   const r0 = engine.refinement.begin('p', 'R0'); engine.refinement.finishResearch('p', 'R0', reference(r0), 0); engine.refinement.sealLayer('p', 1, 0);
   const draft = engine.refinement.begin('p', 'R1'), question = store.get<Question>(draft.value.questions[0]!)!;
   const material = readResearchContext(store, draft, question.id, pilot, reference(store.get('graph-layer:p:1')!), '/projection/title');
-  const context: Record<string, any> = { ...pilotContext(store, draft, question), workingSelections: [{ kind: 'context', value: material }] };
+  const context: Record<string, any> = { ...pilotContext(store, draft, question), workingSelections: [{ kind: 'context', value: material }],
+    ...(requestPadding ? { request: { immutableCondition: 'x'.repeat(requestPadding) } } : {}) };
   const dispatch = pilotEnvironment(environment.value, pilot.value);
   const invoke = () => synthesisSession(store, draft, question, environment, dispatch, pilot, context, 'Return the declared research action');
   await previewResearch(invoke);
@@ -57,4 +58,3 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:c
   const wires = () => readFileSync(log, 'utf8').trim().split('\n').map(s => JSON.parse(s));
   return { root, store, engine, draft, question, pilot, context, invoke, notes, before, wires, path, material };
 }
-

@@ -12,7 +12,6 @@ import { requireCondition } from '../errors.js';
 export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allowedConsumers','gapFields',
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
-export const DEFAULT_CONTINUATION_CHARS = 100_000;
 // This row serializes attempts; successful model-call records establish delivery.
 interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number }
 export interface ContinuationPacketState {

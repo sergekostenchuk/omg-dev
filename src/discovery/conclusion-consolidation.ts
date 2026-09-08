@@ -3,7 +3,7 @@ import { requireCondition } from '../errors.js';
 import type { Ref } from '../pipeline/contracts.js';
 import type { ResearchAction } from './research-model.js';
 import type { ReaderPilotSettings } from './reader-pilot.js';
-import { compactConclusions, DEFAULT_CONTINUATION_CHARS } from './continuation-packet.js';
+import { compactConclusions } from './continuation-packet.js';
 
 export interface SynthesisNote {
   checkpoint: Ref; proposal: ResearchAction; page: { offset: number; end: number };
@@ -23,7 +23,7 @@ export function activeSynthesisNotes(notes: SynthesisNote[]): SynthesisNote[] {
 }
 export function consolidationLimits(settings: ReaderPilotSettings) {
   const share = settings.conclusionShare ?? 0.35;
-  const carry = Math.floor(Math.min(settings.maxRequestChars, settings.maxContinuationChars ?? DEFAULT_CONTINUATION_CHARS) * share);
+  const carry = Math.floor(settings.maxRequestChars * share);
   return { carry, target: Math.max(1, Math.min(Math.floor(settings.maxReplyChars * share), Math.floor(carry / 2))) };
 }
 export function consolidationNeeded(notes: SynthesisNote[], settings: ReaderPilotSettings, noMaterialRoom = false) {

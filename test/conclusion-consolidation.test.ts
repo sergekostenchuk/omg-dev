@@ -4,6 +4,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture } from './synthesis-session-fixture.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
+import { checkpoint } from '../src/discovery/research-continuation.js';
 import { researchAction } from '../src/discovery/research-protocol.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
 import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
@@ -14,7 +15,7 @@ import type { Question } from '../src/discovery/discovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 
 test('growing notes consolidate once with exact citations and unresolved items, history survives, and the same fragment resumes', async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, 18000, 100000, 0.35, 0, {}, 45000);
   await assert.rejects(withInvocationAllowance(1, f.invoke), { code: 'research_call_allowance' });
   const after = f.store.get<any>(f.before.id)!;
   assert.equal(after.value.offset, f.before.value.offset); assert.equal(after.value.materialOffset, 5);
@@ -83,22 +84,25 @@ test('an unfit next fragment triggers consolidation even below the configurable 
 });
 
 test('a paid summary that misses its goal but fits the actual packet continues without another compaction', async t => {
-  const f=await fixture(t,5000,100000,0.1,3000);
+  const f=await fixture(t,20),proposal={action:'checkpoint' as const,question:f.question.id,value:{finding:'x'.repeat(3000)},citations:[],unresolved:['Preserve this uncertainty']};
+  const saved=checkpoint(f.store,f.draft,f.question,{...proposal,value:proposal as unknown as import('../src/canonical.js').Json});
+  const paid={checkpoint:reference(saved),proposal,page:{offset:0,end:0},consolidated:{replaces:f.notes.map(note=>note.checkpoint),format:2 as const,targetChars:10,fullTargetChars:100}};
+  const session=f.store.get<any>(f.before.id)!;f.store.write({id:session.id,kind:session.kind,expected:session.revision,value:{...session.value,notes:[...session.value.notes,paid]}});
+  const consolidations=f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length;
   assert.equal((await f.invoke()).action,'pause');
-  const session=f.store.get<any>(f.before.id)!;
-  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,1);
-  assert.equal(f.store.list('model-call').length,3);
-  assert.equal(session.value.notices.length,1);assert.equal(session.value.notices[0].code,'consolidation_target_exceeded');
-  assert.deepEqual(session.value.notes.slice(0,3),f.notes);
-  const active=activeSynthesisNotes(session.value.notes);assert.equal(active.length,1);
+  const after=f.store.get<any>(f.before.id)!;
+  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,consolidations);
+  assert.equal(f.store.list('model-call').length,2);
+  assert.deepEqual(after.value.notes.slice(0,4),[...f.notes,paid]);
+  const active=activeSynthesisNotes(after.value.notes);assert.equal(active.length,1);
   assert.ok(active[0]!.consolidated!.targetChars!<JSON.stringify(active[0]!.proposal).length);
   const packet=JSON.parse((await previewResearch(f.invoke)).input);
   assert.equal(packet.subject.dispatchMode,'synthesis');assert.ok(JSON.stringify(packet).length<=100000);
-  assert.equal(f.store.get<any>(f.before.id)!.value.notices.length,1);
+  assert.equal(after.value.notices.length,1);assert.equal(after.value.notices[0].code,'consolidation_target_exceeded');
 });
 
 test('a non-fitting paid summary gets one tightening and then the fitting material packet continues', async t => {
-  const f=await fixture(t,5000,60000,0.2);f.context.request={immutableCondition:'x'.repeat(5000)};
+  const f=await fixture(t,5000,60000,0.2,0,{},30000);
   writeFileSync(f.path,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
 appendFileSync(${JSON.stringify(join(f.root,'wire.ndjson'))},JSON.stringify(r)+'\\n');
 const chars=c.consolidation.tightening?14000:42000,research=c.dispatchMode==='consolidation'?{action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(chars)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]}:{action:'pause',reason:'Tightened packet fits'};
@@ -122,7 +126,7 @@ test('an oversized notes-only input stops before payment and never increases tra
 });
 
 test('paid consolidation has the same explicit recovery door across the checkpoint/session write window', async t => {
-  const f = await fixture(t), original = f.store.writeMany.bind(f.store); let injected = false;
+  const f = await fixture(t, 18000, 100000, 0.35, 0, {}, 45000), original = f.store.writeMany.bind(f.store); let injected = false;
   f.store.writeMany = ((writes: any[], guards: any[] = []) => {
     if (!injected && writes.some(write => write.kind === 'synthesis-session' && write.value.notes.length === 4)) {
       injected = true; throw new EngineError('fixture_consolidation_crash', 'Paid summary survived, session write was interrupted');

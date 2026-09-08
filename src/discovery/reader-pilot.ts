@@ -47,7 +47,7 @@ export function configureReaderPilot(store: Store, environments: Environments, p
   const env = environments.get(project).value;
   requireCondition(!settings.planning || settings.planning.maxRequestChars <= settings.maxRequestChars,
     "reader_pilot_invalid", "Planning cannot exceed the overall request ceiling");
-  requireCondition(!settings.contextLimits || settings.contextLimits.maxChars <= Math.min(settings.maxRequestChars,settings.maxContinuationChars??settings.maxRequestChars),
+  requireCondition(!settings.contextLimits || settings.contextLimits.maxChars <= settings.maxRequestChars,
     'reader_pilot_invalid','Addressed context cannot exceed the declared continuation envelope');
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
     "reader_role_invalid", "The reader must have its own identity and cannot accept its extraction");
