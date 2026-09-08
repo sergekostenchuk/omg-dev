@@ -17,9 +17,11 @@ import type { TechnicalReport } from "../graph/research-contracts.js";
 import type { Graph } from "../graph/model.js";
 import { assessmentSession } from "./assessment-session.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
+import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>): Promise<Revision<ResearchAssessment>> {
+  requireDocumentarySources(store,question.value.projectId,question.value.spec);
   requireCondition(new Ajv({ strict: true, allowUnionTypes: true }).compile(question.value.spec.schema as object)(action.value),
     "answer_invalid", "Proposed research result does not satisfy its consumer contract");
   const evidence = new Evidence(store);
@@ -31,6 +33,8 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     const graph = store.get<Graph>(`graph:${draft.value.projectId}`)!;
     const findings = technicalProposalFindings(store, draft.value.projectId, draft.value.level, question.id, question.value.spec.field,
       action.value as unknown as TechnicalReport, observations, graph.value, root);
+    const pause = findings.find(finding => OBLIGATION_EVIDENCE_PAUSES.has(finding.code));
+    if (pause) throw new EngineError(pause.code,`[${pause.target}] ${pause.message}`,findings);
     if (findings.length) throw new EngineError("research_proposal_invalid", "Correct the typed proposal findings before model assessment", findings);
   }
   const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: root };
@@ -48,7 +52,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), question: question.value.spec, value: action.value, observations,
       prerequisites: researchPrerequisites(store, draft.value), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
-  const prompt = "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "");
+  const prompt = "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (question.value.spec.obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "");
   const response = (await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal)) as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response && ["supported", "insufficient", "conflicting"].includes(String(response.verdict))
     && Array.isArray(response.reasons) && response.reasons.every(item => typeof item === "string")

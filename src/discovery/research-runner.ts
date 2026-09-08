@@ -11,6 +11,7 @@ import type { ResearchAction, ResearchRun, ResearchTurn } from "./research-model
 import { researchAction, researchCall } from "./research-protocol.js";
 import { ResearchSources } from "./research-sources.js";
 import { assessAnswer } from "./research-assessment.js";
+import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { processStart } from "../runtime/process-identity.js";
 import { reuseResearch } from "./research-reuse.js";
 import { researchPrerequisites, researchGraphContext } from "./research-context.js";
@@ -77,6 +78,7 @@ export class Researcher {
         const unresolved = draft.value.questions.map(id => this.store.get<Question>(id)!).filter(question => question.value.status !== "answered");
         const pending = unresolved.slice(0, 1);
         requireCondition(pending.length > 0, "research_answers_stale", "Existing answers need targeted reopening before research can continue");
+        requireDocumentarySources(this.store,project,pending[0]!.value.spec);
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
           .sort((a, b) => a.value.number - b.value.number);
         const history = turns.slice(-8).map(item => item.value);
@@ -252,6 +254,11 @@ export class Researcher {
             }
           }
         } catch (failure) {
+          if (failure instanceof EngineError && OBLIGATION_EVIDENCE_PAUSES.has(failure.code)) {
+            this.store.write<ResearchTurn>({id:pendingTurn.id,kind:pendingTurn.kind,expected:pendingTurn.revision,
+              value:{...pendingTurn.value,observation:{code:failure.code,details:failure.details},error:failure.message}});
+            throw failure; // Keep the paid action pending: unchanged resume needs no new model call.
+          }
           if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
             "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
             || ["pilot_", "budget_", "continuation_", "research_context_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))

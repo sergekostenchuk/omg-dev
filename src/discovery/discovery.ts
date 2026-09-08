@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Store, type Revision } from "../storage/store.js";
 import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
 import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "./requirements.js";
@@ -12,10 +12,12 @@ import { deriveFields, type Derivation } from "./derived-draft.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
 import type { TechnicalReport } from '../graph/research-contracts.js';
 import { Environments } from '../runtime/environment.js';
+import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
   basisContract?: 'typed-v1';
+  obligationContract?: 'evidence-v1';
   obligations?: { id: string; target: string; field: string; consumer: string;
     assignment?: import('../graph/obligation-policy.js').ObligationAssignment }[];
   targets?: { target: string; field: string; consumer: string; question: string }[] }
@@ -25,6 +27,7 @@ export interface DiscoveryDraft {
   inputs: Ref[];
   contractVersion?: number;
   basisContract?: 'typed-v1';
+  obligationContract?: 'evidence-v1';
   derivations?: Derivation[];
 }
 export interface Question {
@@ -60,11 +63,15 @@ export class Discovery {
     const typedBasis = specs.some(spec => spec.basisContract !== undefined);
     requireCondition(!typedBasis || (stage === 'om-g2' && level === 'R2' && consumer === 'compilation'
       && specs.every(spec => spec.basisContract === 'typed-v1')), 'research_contract_mismatch', 'Typed technical bases require a complete R2 question set');
+    const obligationEvidence = specs.some(spec => spec.obligationContract !== undefined);
+    requireCondition(!obligationEvidence || (typedBasis && specs.every(spec => spec.obligationContract === 'evidence-v1')),
+      'research_contract_mismatch', 'Obligation evidence rules apply to the complete typed R2 draft');
     const id = `discovery:${projectId}:${randomUUID()}`;
     const questions = specs.map(() => `question:${projectId}:${randomUUID()}`);
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
     const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs), ...(contractVersion === undefined ? {} : { contractVersion }),
-      ...(typedBasis ? { basisContract: 'typed-v1' as const } : {}), fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
+      ...(typedBasis ? { basisContract: 'typed-v1' as const } : {}), ...(obligationEvidence ? { obligationContract: 'evidence-v1' as const } : {}),
+      fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
     const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
       ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
         value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }))];
@@ -115,7 +122,7 @@ export class Discovery {
       && assessment.value.researcher !== assessment.value.assessor && assessment.value.observations.length > 0
       && assessment.value.observations.every(item => this.evidence.verify(item)), "research_not_supported", "An exact supported assessment with current evidence is required");
     const draft = this.store.get<DiscoveryDraft>(question.value.draftId);
-    requireCondition(question.value.spec.basisContract === draft?.value.basisContract,
+    requireCondition(question.value.spec.basisContract === draft?.value.basisContract && question.value.spec.obligationContract === draft?.value.obligationContract,
       'research_contract_mismatch', 'Answer must retain the basis contract of its draft');
     if (question.value.spec.basisContract === 'typed-v1') {
       requireCondition(ajv.compile(question.value.spec.schema as object)(assessment.value.value), 'answer_invalid', 'Typed answer must match its recorded schema');
@@ -123,6 +130,8 @@ export class Discovery {
         assessment.value.observations, new Environments(this.store).effective(question.value.projectId).root, question.value.spec.field);
       requireCondition(result.findings.length === 0 && Array.isArray(assessment.value.bases)
         && canonical(result.bases) === canonical(assessment.value.bases), 'research_basis_invalid', 'Assessment must retain the exact machine-resolved bases and their proof limits');
+      const obligations = obligationEvidenceFindings(question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations);
+      if (obligations.length) throw new EngineError('research_obligation_evidence_invalid','An assessed value still must satisfy its assigned knowledge kind',obligations);
     }
     const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
     return this.#answer(question, answer.value, answer, "research-answer", [assessmentRef, assessment.value.environment,

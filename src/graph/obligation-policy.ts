@@ -4,6 +4,7 @@ import { requireCondition } from '../errors.js';
 import { reference, type Ref } from '../pipeline/contracts.js';
 import type { Store, Revision } from '../storage/store.js';
 import type { ResearchScope } from './research-scope.js';
+import type { Source } from '../evidence/evidence.js';
 
 export const KNOWLEDGE_KINDS = ['repository-fact', 'design-decision', 'owner-decision', 'environment-confirmation', 'post-implementation-proof'] as const;
 export const RESOLUTION_MOMENTS = ['R2', 'R3', 'task-start', 'task-result'] as const;
@@ -15,17 +16,20 @@ export interface ObligationAssignment {
   responsibleNode: string; responsibleConsumer: string;
   neededForR2: boolean; reason: string;
   returnCondition: string | null;
+  documentaryAllowance?: { sources: Ref[]; claimLimit: string };
 }
 export interface ObligationPolicy { version: 1; sourceScope: Ref; assignments: ObligationAssignment[] }
 export interface CarriedObligation extends ObligationAssignment { scope: Ref; wake: ResearchScope['obligations'][number]['wake'] }
 const text = { type: 'string', minLength: 1 };
 const object = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties });
 const ref = object({ id: text, revision: { type: 'integer', minimum: 1 }, hash: { type: 'string', pattern: '^[a-f0-9]{64}$' } });
-export const obligationPolicySchema = object({ version: { const: 1 }, sourceScope: ref, assignments: { type: 'array', items: object({
+const assignmentSchema = object({
   obligation: text, original: object({ record: ref, pointer: text }), kind: { enum: KNOWLEDGE_KINDS }, moment: { enum: RESOLUTION_MOMENTS },
   responsibleNode: text, responsibleConsumer: text, neededForR2: { type: 'boolean' }, reason: text,
   returnCondition: { anyOf: [text, { type: 'null' }] },
-}) } });
+});
+assignmentSchema.properties['documentaryAllowance'] = object({ sources: { type: 'array', minItems: 1, uniqueItems: true, items: ref }, claimLimit: text });
+export const obligationPolicySchema = object({ version: { const: 1 }, sourceScope: ref, assignments: { type: 'array', items: assignmentSchema } });
 const valid = new Ajv({ allErrors: true }).compile<ObligationPolicy>(obligationPolicySchema);
 
 /** The owner supplies the complete policy once; a model answer cannot amend it. */
@@ -56,6 +60,16 @@ export function validateObligationPolicy(store: Store, scope: ResearchScope): Re
       && (assignment.moment === 'R2' ? assignment.returnCondition === null
         : current.gap.requiredFor === 'next' && typeof assignment.returnCondition === 'string' && assignment.returnCondition.trim()),
     'obligation_deadline_invalid', 'Anything needed for R2 stays due now; transfer needs a reason, return condition and named consumer');
+    if (assignment.documentaryAllowance) {
+      requireCondition(assignment.kind === 'environment-confirmation' && assignment.documentaryAllowance.claimLimit.trim(),
+        'obligation_document_allowance_invalid', 'A documentary allowance is a bounded metadata confirmation, never a repository fact or implementation proof');
+      for (const ref of assignment.documentaryAllowance.sources) {
+        const document = store.get<Source>(ref.id, ref.revision);
+        requireCondition(document?.kind === 'source' && document.hash === ref.hash && document.value.projectId === scope.projectId
+          && document.value.origin.kind === 'owner-document', 'obligation_document_allowance_invalid',
+        'An allowance must bind exact document sources of this project; a filename or an owner assertion is not sufficient');
+      }
+    }
   }
   // Historical origins are immutable; only their current head is a transaction
   // guard when the policy is first applied to that same scope entity.

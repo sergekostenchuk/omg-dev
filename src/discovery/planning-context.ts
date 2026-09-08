@@ -33,6 +33,7 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
     role: body.role, dispatchMode: "planning", stage: body.stage, level: body.level, consumer: body.consumer,
     draft: body.draft, question: { id: body.question.id, field: body.question.field, kind: body.question.kind,
       ...(body.question.basisContract ? {basisContract:body.question.basisContract} : {}),
+      ...(body.question.obligationContract ? {obligationContract:body.question.obligationContract} : {}),
       prompt: body.question.prompt, risk: body.question.risk },
     objective: body.core.objective, problem: body.core.problem, actors: body.core.actors,
     constraints: body.core.constraints, specificationConstraints: body.core.specificationConstraints,

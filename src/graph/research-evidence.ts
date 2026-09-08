@@ -9,6 +9,7 @@ import { workspacePath } from "../runtime/environment.js";
 import type { Graph } from "./model.js";
 import type { TechnicalReport } from "./research-contracts.js";
 import { resolveResearchBasis } from './research-basis.js';
+import { obligationEvidenceFindings } from './obligation-evidence.js';
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
@@ -31,7 +32,10 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   const draft = question?.value.draftId ? store.get<DiscoveryDraft>(question.value.draftId) : null;
   const typed = question?.value.spec.basisContract === 'typed-v1';
   if (typed !== (draft?.value.basisContract === 'typed-v1')) fail('research_contract_mismatch', questionId, 'Question and draft must retain the same basis contract');
+  if (question?.value.spec.obligationContract !== draft?.value.obligationContract)
+    fail('research_contract_mismatch',questionId,'Question and draft must retain the same obligation evidence contract');
   if (typed) findings.push(...resolveResearchBasis(store, project, report, observations, root, field).findings);
+  if (question) findings.push(...obligationEvidenceFindings(question.value.spec,report,observations));
   if (report.applicability === "applicable" && !report.facts.length && !report.designs.length) fail("research_report_empty", questionId, "An applicable domain needs concrete facts or explicit design decisions");
   if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length || report.documents?.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
   if (field.startsWith("gap_") && report.applicability !== "applicable") fail("research_gap_unresolved", questionId, "An inherited gap needs a concrete resolution, including when research disproves its premise");

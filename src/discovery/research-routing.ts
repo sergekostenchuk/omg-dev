@@ -8,6 +8,7 @@ import { researchScope, scopedQuestions, originalGaps } from '../graph/research-
 import { defectGaps } from '../graph/plan-defects.js';
 import { layerDesignSpec, LAYER_DESIGN_VERSION } from '../graph/layer-design.js';
 import { withTypedBasis } from '../graph/research-basis.js';
+import { withObligationEvidence } from '../graph/obligation-evidence.js';
 
 export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, pilot?: Revision<ReaderPilot> | null) {
   if (!pilot) return null;
@@ -31,6 +32,7 @@ export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft
     specs = [layerDesignSpec(3)];
   }
   if (draft.value.basisContract === 'typed-v1') specs = specs.map(withTypedBasis);
+  if (draft.value.obligationContract === 'evidence-v1') specs = specs.map(withObligationEvidence);
   requireCondition(specs.some(s => canonical(s) === canonical(question.value.spec)), 'research_contract_mismatch', 'Changed or forged question cannot select a mode by its field name');
   if (!pilot) return null;
   requireCondition(pilot.value.planning, 'planning_settings_missing', 'R2 continuation must retain explicit compact planning settings');

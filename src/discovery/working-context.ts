@@ -85,10 +85,12 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       const q=body['question'] as Record<string,Json>;
       dynamic['question']={id:q['id']??question.id,field:q['field']??question.value.spec.field,kind:q['kind']??question.value.spec.kind,
         ...(question.value.spec.basisContract ? {basisContract:question.value.spec.basisContract} : {}),
+        ...(question.value.spec.obligationContract ? {obligationContract:question.value.spec.obligationContract} : {}),
         prompt:q['prompt']??question.value.spec.prompt,schema:question.value.spec.schema,obligations:question.value.spec.obligations??[],schemaAddress:{record:reference(archive),pointer:'/body/question/schema'}};
     }
     if (body['questions']) dynamic['questions']=[dynamic['question']??{id:question.id,field:question.value.spec.field,kind:question.value.spec.kind,prompt:question.value.spec.prompt,
-      ...(question.value.spec.basisContract ? {basisContract:question.value.spec.basisContract} : {})}];
+      ...(question.value.spec.basisContract ? {basisContract:question.value.spec.basisContract} : {}),
+      ...(question.value.spec.obligationContract ? {obligationContract:question.value.spec.obligationContract} : {})}];
     if (body['previousProposal']) {
       const changes=previousBody?candidateDelta(previousBody['previousProposal'],body['previousProposal']):[];
       dynamic['proposalChanges']={current:{record:reference(archive),pointer:'/body/previousProposal'},base:options.previous??null,changes};
