@@ -10,8 +10,10 @@ import type { Environment } from "../runtime/environment.js";
 import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader-pilot.js";
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligation-policy.js';
+import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
 
 export type ProductCommand =
+  | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
   | {type:'recover-runtime-observation';project:string;observation:Ref}
   | {type:'apply-obligation-policy';project:string;scope:Ref;policy:ObligationPolicy}
@@ -78,6 +80,8 @@ const schema = { oneOf: [
   command('apply-obligation-policy',{project,scope:ref,policy:obligationPolicySchema}),
   command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),
+  command('declare-adapter-lineage', { project, path: string, sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+    basis: { type: 'array', minItems: 1, items: string } }),
   command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),
   command("recover-model-call", {project,call:ref}),
   command("continue-preparation", {project,maxCalls:{type:"integer",minimum:1,maximum:100}}),

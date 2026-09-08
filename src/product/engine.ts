@@ -1,4 +1,5 @@
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
+import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';
 import { allocateResearchTrial } from '../discovery/research-trial.js';
 import { retryPlannedRead } from '../discovery/reading-plan.js';
@@ -197,6 +198,7 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);
       case 'recover-runtime-observation': this.#project(command.project); return recoverRuntimeObservation(this.store,command.project,command.observation);
       case 'apply-obligation-policy': this.#project(command.project); return applyObligationPolicy(this.store,command.project,command.scope,command.policy);
