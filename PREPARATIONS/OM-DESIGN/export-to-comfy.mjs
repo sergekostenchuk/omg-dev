@@ -1,16 +1,9 @@
 // om-design.json -> воркфлоу ComfyUI. Позиции берутся из схемы; у узлов без позиции считается сетка по группам.
 import { readFileSync, writeFileSync } from "node:fs";
-import { TYPES, EDGE_KINDS } from "./vocab.mjs";
+import { TYPES, EDGE_KINDS, W, heightOf } from "./vocab.mjs";
 const [specPath, outPath, flag] = process.argv.slice(2);
 const spec = JSON.parse(readFileSync(specPath, "utf8"));
 const RELAYOUT = flag === "--relayout";
-// Размер карточки от объёма текста: ширина 620, ~82 символа в строке, строка 17px; входы по 20px, заголовок 40.
-const W = 620, CPL = 82, LINE = 17;
-// ComfyUI делит свободную высоту поровну между многострочными полями, поэтому каждому полю даём столько, сколько нужно самому длинному.
-const heightOf = (type, fields) => { const T = TYPES[type]; let h = 40 + T.nIn * 20 + 24; let multi = 0, need = 0;
-  for (const f of T.fields) { const text = String(fields?.[f] ?? ""); const isMulti = text.length > 60 || text.includes("\n");
-    if (!isMulti) { h += 30; continue; } multi++; const lines = text.split("\n").reduce((s, p) => s + Math.max(1, Math.ceil(p.length / CPL)), 0); need = Math.max(need, lines * LINE + 30); }
-  return Math.max(T.size[1], Math.round(h + multi * Math.max(need, 60))); };
 for (const n of spec.nodes) if (RELAYOUT || !n.size) n.size = [W, heightOf(n.type, n.fields)];
 if (RELAYOUT) { // колонки по группам в порядке появления, стопка по высоте
   const cols = [...new Set(spec.nodes.map(n => n.group ?? ""))]; const y = new Map(cols.map(c => [c, 0]));

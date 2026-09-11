@@ -21,11 +21,11 @@ const consumers = new Map(nodes.map(n => [n.id, 0])); for (const e of edges) con
 for (const n of nodes) {
   const f = n.fields; const title = f["название"] || f["стадия"] || f["артефакт"] || f["вопрос"] || f["цель"] || f["запись"] || n.id;
   const isTerminalConsumer = n.type === "stage" && edges.some(e => e.to === n.id && nodes.find(x => x.id === e.from)?.type === "output");
-  if (!["output", "goal", "owner"].includes(n.type) && !isTerminalConsumer && (consumers.get(n.id) ?? 0) === 0) problems.push(`нет потребителя: ${n.type} «${title.slice(0, 60)}»`);
+  if (!["output", "goal", "owner", "store"].includes(n.type) && !isTerminalConsumer && (consumers.get(n.id) ?? 0) === 0) problems.push(`нет потребителя: ${n.type} «${title.slice(0, 60)}»`);
   if (n.type === "mechanism" && !f["цель"].trim()) problems.push(`механизм без цели: «${title.slice(0, 60)}»`);
   if (n.type === "model") { if (!f["почему невыводимо"].trim()) problems.push(`вызов модели без обоснования: «${title.slice(0, 60)}»`); if (!f["потребитель"].trim()) problems.push(`вызов модели без потребителя: «${title.slice(0, 60)}»`); }
   if (n.type === "gate" && !f["коды отказа"].trim()) problems.push(`ворота без кодов отказа: «${title.slice(0, 60)}»`);
-  if (n.type === "owner" && f["статус"].trim() !== "решено") problems.push(`открытое решение владельца: «${f["вопрос"].slice(0, 70)}»`);
+  if (n.type === "owner" && !["решено", "по ходу"].includes(f["статус"].trim())) problems.push(`открытое решение владельца: «${f["вопрос"].slice(0, 70)}»`);
 }
 const changed = { added: nodes.filter(n => !prev.nodes.some(p => p.id === n.id)).map(n => n.id), removed: prev.nodes.filter(p => !nodes.some(n => n.id === p.id)).map(p => p.id),
   edited: nodes.filter(n => { const p = prev.nodes.find(p => p.id === n.id); return p && JSON.stringify(p.fields) !== JSON.stringify(n.fields); }).map(n => n.id) };

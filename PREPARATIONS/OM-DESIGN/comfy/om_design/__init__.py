@@ -30,7 +30,7 @@ SPEC = {
 }
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
-N_IN = {"goal": 8, "stage": 3, "input": 2, "mechanism": 6, "model": 4, "gate": 3, "owner": 1, "store": 2, "output": 2}
+N_IN = {"goal": 8, "stage": 3, "input": 2, "mechanism": 6, "model": 4, "gate": 3, "owner": 1, "store": 8, "output": 2}
 for key, (cls_name, display, fields, outs, names) in SPEC.items():
     cls = _node(cls_name, display, fields, outs, names, N_IN[key], output_node=(key == "output"))
     NODE_CLASS_MAPPINGS[cls_name] = cls
