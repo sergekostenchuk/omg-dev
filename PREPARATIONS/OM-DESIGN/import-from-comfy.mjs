@@ -13,7 +13,7 @@ for (const n of wf.nodes) { const type = CLS_TO_TYPE[n.type]; if (!type) { if (n
 const edges = [];
 for (const l of wf.links ?? []) { const [, s, slot, t, , ltype] = l; const from = byComfyId.get(s), to = byComfyId.get(t); if (!from || !to) continue;
   const src = nodes.find(n => n.id === from); const outName = TYPES[src.type].outputs[slot];
-  const kind = src.type === "gate" ? (slot === 1 ? "gate_fail" : "gate_pass") : (ltype === "RECORD" || ["запись", "выход", "ответ"].includes(outName)) ? "record" : "flow";
+  const kind = src.type === "gate" ? (slot === 1 ? "gate_fail" : "gate_pass") : (ltype === "RECORD" || ["запись", "выход", "ответ", "к потребителю"].includes(outName)) ? "record" : "flow";
   edges.push({ from, to, kind }); }
 const groups = (wf.groups ?? []).map(g => ({ id: g.title, title: g.title, bounding: g.bounding }));
 // ---- проверка хлеба ----

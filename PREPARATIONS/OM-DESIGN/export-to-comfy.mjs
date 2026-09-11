@@ -30,7 +30,7 @@ for (const e of spec.edges) {
   outLinks.set(`${s}:${slot}`, [...(outLinks.get(`${s}:${slot}`) ?? []), lid]);
 }
 const nodes = spec.nodes.map((n, i) => { const id = i + 1; const T = TYPES[n.type];
-  const outputs = T.outputs.map((name, k) => ({ name, type: name === "запись" || name === "выход" || name === "ответ" ? "RECORD" : "FLOW", links: outLinks.get(`${id}:${k}`) ?? [], slot_index: k }));
+  const outputs = T.outputs.map((name, k) => ({ name, type: ["запись", "выход", "ответ", "к потребителю"].includes(name) ? "RECORD" : "FLOW", links: outLinks.get(`${id}:${k}`) ?? [], slot_index: k }));
   const ins = inputsOf.get(id) ?? []; for (let k = ins.length; k < T.nIn; k++) ins.push({ name: `in_${k + 1}`, type: "*", link: null });
   return { id, type: T.cls, pos: n.pos ?? [0, 0], size: n.size ?? T.size, flags: {}, order: i, mode: 0, inputs: ins, outputs, properties: { "Node name for S&R": T.cls, omd_id: n.id, omd_group: n.group ?? "" }, widgets_values: T.fields.map(f => n.fields?.[f] ?? ""), color: T.color, bgcolor: T.color }; });
 const groups = (spec.groups ?? []).map(g => ({ title: g.title, bounding: g.bounding, color: "#3f4a5a", font_size: 26, flags: {} }));
