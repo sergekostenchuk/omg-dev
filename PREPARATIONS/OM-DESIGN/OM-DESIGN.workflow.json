@@ -473,7 +473,7 @@
      "name": "in_1",
      "type": "*",
      "link": 7,
-     "label": "ссылки id/revision/hash"
+     "label": "record"
     },
     {
      "name": "in_2",
@@ -1016,7 +1016,7 @@
   },
   "omd": {
    "version": 1,
-   "exported": "2026-09-11T22:10:02.790Z"
+   "exported": "2026-09-11T22:10:33.854Z"
   }
  },
  "version": 0.4
