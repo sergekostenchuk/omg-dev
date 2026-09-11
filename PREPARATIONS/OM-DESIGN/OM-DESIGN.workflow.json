@@ -1,0 +1,1347 @@
+{
+ "id": "om-design",
+ "revision": 0,
+ "last_node_id": 14,
+ "last_link_id": 14,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "OMD_Stage",
+   "pos": [
+    0,
+    0
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 8,
+     "label": "изменение"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-discovery",
+    "omd_group": "Предшественники"
+   },
+   "widgets_values": [
+    "Дискавери (discovery)",
+    "Раскрыть потребности, участников, результаты и сценарии; собрать проверяемые источники с версиями.",
+    "brief; objective; preparation: actors, constraints, existingSituation, externalSystems, journeys, outcomes, problem, risks, unknowns (omg-live, ревизия 2).",
+    "1. Инвентарь репозитория кодом: модули, точки входа, экспорты, тесты, версии — как источник с хэшем. Сейчас это добывает модель в R1 (~8,9 млн токенов).\n2. unknowns превращаются в типизированные пробелы с потребителем, а не в прозу.",
+    "Как сейчас, плюс: если указан репозиторий, инвентарь обязателен; пробел без потребителя не принимается."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 2,
+   "type": "OMD_Stage",
+   "pos": [
+    0,
+    460
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 9,
+     "label": "изменение"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [
+      2
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-concept",
+    "omd_group": "Предшественники"
+   },
+   "widgets_values": [
+    "Концепция (concept)",
+    "Сформировать устойчивые требования с пользой, получателем и критериями.",
+    "acceptance: 18 критериев плоским списком; audience; conceptSections: 11 разделов с требованиями; outcome (ревизия 3). В карте: 25 требований с разделом, исходом, получателем.",
+    "Каждый критерий приёмки привязать к требованию и к виду проверки: тест, полный прогон, наблюдение среды. Критерий без привязки не считается проверяемым.",
+    "критерий → требование → вид проверки; требование без критерия не принимается."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 3,
+   "type": "OMD_Stage",
+   "pos": [
+    0,
+    920
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 13,
+     "label": "изменение"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": 14,
+     "label": "изменение"
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-map",
+    "omd_group": "Предшественники"
+   },
+   "widgets_values": [
+    "Операционная карта, уровень L1 (operation-map)",
+    "Построить одну карту полного продукта: блоки, исходы, коннекторы, границы полномочий, пути участников.",
+    "mapDesign: nodes, artifacts, connectors, contracts, edges, horizon, joins, journeys, anchors, packets; journey: 18; operationRequirements: conceptCoverage, outcomes (ревизия 2). Сейчас 25 блоков, 32 артефакта, 28 коннекторов, 87 переходов, 23 соединения, 41 путь.",
+    "1. Вычисляемые поля блока: вес (потребители исхода, путь к результату, состояние/полномочия, пробелы валидатора) и передача; переопределение владельца хранится отдельно.\n2. Проверка хлеба в воротах: закрываемый вопрос результата, потребитель исхода, что сломается при удалении.\n3. Три будущих блока убрать (решение 11.09).",
+    "map_design_drift как сейчас + хлеб + вес и передача у каждого блока."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 4,
+   "type": "OMD_Stage",
+   "pos": [
+    0,
+    1380
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 10,
+     "label": "изменение"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [
+      4
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-spec",
+    "omd_group": "Предшественники"
+   },
+   "widgets_values": [
+    "Спецификация, ТЗ (specification)",
+    "Определить наблюдаемое поведение и адресные отказы.",
+    "behavior: 20; behaviorContracts: 20 (actor, entry, inputs, outcome, failures, forbiddenEffects, compatibility); constraints: 23 (ревизия 2).",
+    "Контракт поведения привязать к узлу карты явно, по id, а не через совпадение исхода. failures → правила отказов соединений (нет входа, лишний, чужой, устаревший, повтор). forbiddenEffects → запреты пакета задачи.",
+    "каждый контракт → узел карты; каждый узел горизонта → хотя бы один контракт."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 5,
+   "type": "OMD_Stage",
+   "pos": [
+    0,
+    1840
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 11,
+     "label": "изменение"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [
+      5
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-features",
+    "omd_group": "Предшественники"
+   },
+   "widgets_values": [
+    "Фичи (features)",
+    "Выделить самостоятельную пользу фич и их зависимости.",
+    "features: 20 (title, outcome, requirements); featurePreparation: 20 (benefit, beneficiary, interactions, failures, behaviorContracts, remainingQuestions) (ревизия 2).",
+    "1. remainingQuestions становятся первым источником вопросов исследования; у каждого вопроса потребитель.\n2. Горизонт выбирается из фич как единиц самостоятельной пользы, а не из блоков.",
+    "каждый remainingQuestion либо имеет потребителя в горизонте, либо отложен с причиной."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 6,
+   "type": "OMD_Goal",
+   "pos": [
+    560,
+    200
+   ],
+   "size": [
+    380,
+    300
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 1,
+     "label": "выход стадии"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": 2,
+     "label": "выход стадии"
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": 3,
+     "label": "выход стадии"
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": 4,
+     "label": "выход стадии"
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": 5,
+     "label": "выход стадии"
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": 12,
+     "label": "изменение"
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      6
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Goal",
+    "omd_id": "goal-om",
+    "omd_group": "Блок OM"
+   },
+   "widgets_values": [
+    "Из принятых замысла, дискавери, ТЗ и фич построить одну карту продукта и довести выбранный горизонт до глубины, на которой компилятор без участия модели выводит атомарные задачи с достаточным контекстом. Каждый элемент карты опирается на основание с происхождением. Стоимость пропорциональна весу блоков.",
+    "1. Компилятор выдаёт задачи горизонта без ручного авторства.\n2. Пакет контекста каждой задачи помещается в бюджет исполнителя.\n3. У каждого узла есть требование, потребитель и тест.\n4. R3 подтверждает карту против настоящего репозитория и среды.\n5. Расход по блоку не превысил долю от веса.\n6. Ни одного открытого вопроса без потребителя в горизонте.",
+    "Задача вернулась из исполнения с «нужна коррекция карты». Это дефект OM, а не исполнителя."
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 7,
+   "type": "OMD_Output",
+   "pos": [
+    560,
+    900
+   ],
+   "size": [
+    380,
+    300
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 6,
+     "label": "flow"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "к потребителю",
+     "type": "FLOW",
+     "links": [
+      7
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Output",
+    "omd_id": "output-map",
+    "omd_group": "Блок OM"
+   },
+   "widgets_values": [
+    "Карта горизонта, достаточная для компиляции: graph + проекция уровня 3 + feasibility",
+    "Атомарность узла уровня «работа»: один производитель, один артефакт, один писатель состояния, ограниченные пути записи, один тест, пакет контекста в бюджете исполнителя.\nУ каждого узла: требование, потребитель, тест. Горизонт непуст. R3 без замечаний. Вопросов без потребителя нет."
+   ],
+   "color": "#1f3a2a",
+   "bgcolor": "#1f3a2a"
+  },
+  {
+   "id": 8,
+   "type": "OMD_Stage",
+   "pos": [
+    560,
+    1300
+   ],
+   "size": [
+    380,
+    420
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": 7,
+     "label": "к компилятору"
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "выход",
+     "type": "RECORD",
+     "links": [],
+     "slot_index": 0
+    },
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Stage",
+    "omd_id": "stage-compile",
+    "omd_group": "Блок OM"
+   },
+   "widgets_values": [
+    "Машинный план (compilation), потребитель выхода OM",
+    "Собрать достаточный контекст и сохранить машинный план.",
+    "machine-plan: задачи с обязательствами, тестами и пакетами контекста.",
+    "Бюджет пакета контекста становится воротами компиляции: превышение — дефект карты, задача не выпускается.",
+    "пакет контекста задачи ≤ бюджет исполнителя; задача выведена, а не написана."
+   ],
+   "color": "#2a2d33",
+   "bgcolor": "#2a2d33"
+  },
+  {
+   "id": 9,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    0
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      8
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-inventory",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Инвентарь репозитория делать кодом на стадии дискавери, а не моделью в R1?",
+    "а) код в дискавери\nб) код в R0\nв) оставить модели",
+    "",
+    "открыто"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 10,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    380
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      9
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-acceptance",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Критерии приёмки концепции привязать к требованиям и виду проверки?",
+    "а) да, ворота концепции\nб) оставить плоским списком",
+    "",
+    "открыто"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 11,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    760
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      10
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-contracts",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Контракты поведения ТЗ привязать к узлам карты явно, по id?",
+    "а) да, ворота ТЗ\nб) через совпадение исхода, как сейчас",
+    "",
+    "открыто"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 12,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    1140
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      11,
+      12
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-questions",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Убрать девять типовых областей R1; вопросы только из remainingQuestions фич и пробелов валидатора с потребителем в горизонте?",
+    "а) да\nб) оставить типовые области как дополнение\nв) оставить как сейчас",
+    "",
+    "открыто"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 13,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    1520
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      13
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-gearbox",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Передачу и вес блока считает код из структуры, владелец только переключает?",
+    "автомат / ручная коробка",
+    "Принято 11.09.2026: автомат. Четыре признака веса: потребители исхода, путь к результату, состояние и полномочия, пробелы валидатора.",
+    "решено"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  },
+  {
+   "id": 14,
+   "type": "OMD_Owner",
+   "pos": [
+    1120,
+    1900
+   ],
+   "size": [
+    380,
+    340
+   ],
+   "flags": {},
+   "order": 13,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "in_1",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_2",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_3",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_4",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_5",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_6",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_7",
+     "type": "*",
+     "link": null
+    },
+    {
+     "name": "in_8",
+     "type": "*",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "дальше",
+     "type": "FLOW",
+     "links": [
+      14
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OMD_Owner",
+    "omd_id": "d-future",
+    "omd_group": "Решения владельца"
+   },
+   "widgets_values": [
+    "Делать ли работы «на будущее» в карте?",
+    "задел с реестром перспектив / отказ и четыре инварианта",
+    "Принято 11.09.2026: отказ. Охраняются четыре инварианта: одна SQLite с ревизиями, контракты артефактов, один командный API, проекции только читают. Заглушек не бывает.",
+    "решено"
+   ],
+   "color": "#22303f",
+   "bgcolor": "#22303f"
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   0,
+   6,
+   0,
+   "RECORD"
+  ],
+  [
+   2,
+   2,
+   0,
+   6,
+   1,
+   "RECORD"
+  ],
+  [
+   3,
+   3,
+   0,
+   6,
+   2,
+   "RECORD"
+  ],
+  [
+   4,
+   4,
+   0,
+   6,
+   3,
+   "RECORD"
+  ],
+  [
+   5,
+   5,
+   0,
+   6,
+   4,
+   "RECORD"
+  ],
+  [
+   6,
+   6,
+   0,
+   7,
+   0,
+   "FLOW"
+  ],
+  [
+   7,
+   7,
+   0,
+   8,
+   0,
+   "FLOW"
+  ],
+  [
+   8,
+   9,
+   0,
+   1,
+   0,
+   "FLOW"
+  ],
+  [
+   9,
+   10,
+   0,
+   2,
+   0,
+   "FLOW"
+  ],
+  [
+   10,
+   11,
+   0,
+   4,
+   0,
+   "FLOW"
+  ],
+  [
+   11,
+   12,
+   0,
+   5,
+   0,
+   "FLOW"
+  ],
+  [
+   12,
+   12,
+   0,
+   6,
+   5,
+   "FLOW"
+  ],
+  [
+   13,
+   13,
+   0,
+   3,
+   0,
+   "FLOW"
+  ],
+  [
+   14,
+   14,
+   0,
+   3,
+   1,
+   "FLOW"
+  ]
+ ],
+ "groups": [
+  {
+   "title": "Предшественники: что отдают и что менять под OM",
+   "bounding": [
+    -30,
+    -60,
+    440,
+    2300
+   ],
+   "color": "#3f4a5a",
+   "font_size": 26,
+   "flags": {}
+  },
+  {
+   "title": "Блок OM: цель, выход, потребитель",
+   "bounding": [
+    530,
+    140,
+    440,
+    1620
+   ],
+   "color": "#3f4a5a",
+   "font_size": 26,
+   "flags": {}
+  },
+  {
+   "title": "Решения владельца: открытые и принятые",
+   "bounding": [
+    1090,
+    -60,
+    440,
+    2300
+   ],
+   "color": "#3f4a5a",
+   "font_size": 26,
+   "flags": {}
+  }
+ ],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.3,
+   "offset": [
+    0,
+    0
+   ]
+  },
+  "omd": {
+   "version": 1,
+   "exported": "2026-09-11T19:35:48.158Z"
+  }
+ },
+ "version": 0.4
+}

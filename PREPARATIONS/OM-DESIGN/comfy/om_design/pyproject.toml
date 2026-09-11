@@ -1,0 +1,7 @@
+[project]
+name = "om_design"
+version = "0.1.0"
+description = "Проектная схема блока OM (OMG) как узлы ComfyUI"
+
+[tool.comfy]
+DisplayName = "OM design"
