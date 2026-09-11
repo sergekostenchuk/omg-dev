@@ -3,15 +3,13 @@
 class AnyType(str):
     def __ne__(self, other): return False
 ANY = AnyType("*")
-N_IN = 8
-
-def _inputs(fields):
+def _inputs(fields, n_in):
     req = {name: ("STRING", {"multiline": multi, "default": ""}) for name, multi in fields}
-    opt = {f"in_{i}": (ANY, {}) for i in range(1, N_IN + 1)}
+    opt = {f"in_{i}": (ANY, {}) for i in range(1, n_in + 1)}
     return {"required": req, "optional": opt}
 
-def _node(cls_name, display, fields, outputs, output_names, output_node=False):
-    def INPUT_TYPES(s): return _inputs(fields)
+def _node(cls_name, display, fields, outputs, output_names, n_in, output_node=False):
+    def INPUT_TYPES(s): return _inputs(fields, n_in)
     def run(self, **kw): return tuple(kw.get(fields[0][0], "") for _ in outputs) if outputs else {}
     attrs = {"INPUT_TYPES": classmethod(INPUT_TYPES), "RETURN_TYPES": tuple(outputs), "RETURN_NAMES": tuple(output_names),
              "FUNCTION": "run", "CATEGORY": "OM/схема", "run": run, "DISPLAY": display, "FIELDS": [f for f, _ in fields]}
@@ -32,7 +30,8 @@ SPEC = {
 }
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
+N_IN = {"goal": 8, "stage": 3, "input": 2, "mechanism": 6, "model": 4, "gate": 3, "owner": 1, "store": 2, "output": 2}
 for key, (cls_name, display, fields, outs, names) in SPEC.items():
-    cls = _node(cls_name, display, fields, outs, names, output_node=(key == "output"))
+    cls = _node(cls_name, display, fields, outs, names, N_IN[key], output_node=(key == "output"))
     NODE_CLASS_MAPPINGS[cls_name] = cls
     NODE_DISPLAY_NAME_MAPPINGS[cls_name] = display

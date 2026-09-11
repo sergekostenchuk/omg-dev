@@ -12,8 +12,8 @@
     0
    ],
    "size": [
-    380,
-    420
+    620,
+    478
    ],
    "flags": {},
    "order": 0,
@@ -32,31 +32,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -97,11 +72,11 @@
    "type": "OMD_Stage",
    "pos": [
     0,
-    510
+    588
    ],
    "size": [
-    380,
-    420
+    620,
+    478
    ],
    "flags": {},
    "order": 1,
@@ -120,31 +95,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -185,11 +135,11 @@
    "type": "OMD_Stage",
    "pos": [
     0,
-    1020
+    1176
    ],
    "size": [
-    380,
-    420
+    620,
+    682
    ],
    "flags": {},
    "order": 2,
@@ -209,31 +159,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -274,11 +199,11 @@
    "type": "OMD_Stage",
    "pos": [
     0,
-    1530
+    1968
    ],
    "size": [
-    380,
-    420
+    620,
+    427
    ],
    "flags": {},
    "order": 3,
@@ -297,31 +222,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -362,11 +262,11 @@
    "type": "OMD_Stage",
    "pos": [
     0,
-    2040
+    2505
    ],
    "size": [
-    380,
-    420
+    620,
+    427
    ],
    "flags": {},
    "order": 4,
@@ -385,31 +285,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -449,12 +324,12 @@
    "id": 6,
    "type": "OMD_Goal",
    "pos": [
-    560,
-    200
+    840,
+    0
    ],
    "size": [
-    380,
-    336
+    620,
+    620
    ],
    "flags": {},
    "order": 5,
@@ -534,12 +409,12 @@
    "id": 7,
    "type": "OMD_Output",
    "pos": [
-    560,
-    660
+    840,
+    730
    ],
    "size": [
-    380,
-    300
+    620,
+    334
    ],
    "flags": {},
    "order": 6,
@@ -553,36 +428,6 @@
     },
     {
      "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -613,11 +458,11 @@
    "id": 8,
    "type": "OMD_Stage",
    "pos": [
-    560,
-    1080
+    840,
+    1174
    ],
    "size": [
-    380,
+    620,
     420
    ],
    "flags": {},
@@ -637,31 +482,6 @@
     },
     {
      "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -699,11 +519,11 @@
    "id": 9,
    "type": "OMD_Owner",
    "pos": [
-    1120,
+    1680,
     0
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -712,41 +532,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -779,11 +564,11 @@
    "id": 10,
    "type": "OMD_Owner",
    "pos": [
-    1120,
-    450
+    1680,
+    470
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -792,41 +577,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -859,11 +609,11 @@
    "id": 11,
    "type": "OMD_Owner",
    "pos": [
-    1120,
-    900
+    1680,
+    940
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -872,41 +622,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -939,11 +654,11 @@
    "id": 12,
    "type": "OMD_Owner",
    "pos": [
-    1120,
-    1350
+    1680,
+    1410
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -952,41 +667,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -1020,11 +700,11 @@
    "id": 13,
    "type": "OMD_Owner",
    "pos": [
-    1120,
-    1800
+    1680,
+    1880
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -1033,41 +713,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -1100,11 +745,11 @@
    "id": 14,
    "type": "OMD_Owner",
    "pos": [
-    1120,
-    2250
+    1680,
+    2350
    ],
    "size": [
-    380,
+    620,
     360
    ],
    "flags": {},
@@ -1113,41 +758,6 @@
    "inputs": [
     {
      "name": "in_1",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_2",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_3",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_4",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_5",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_6",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_7",
-     "type": "*",
-     "link": null
-    },
-    {
-     "name": "in_8",
      "type": "*",
      "link": null
     }
@@ -1295,10 +905,10 @@
   {
    "title": "Предшественники: что отдают и что менять под OM",
    "bounding": [
-    -30,
-    -60,
-    440,
-    2560
+    -40,
+    -80,
+    700,
+    3072
    ],
    "color": "#3f4a5a",
    "font_size": 26,
@@ -1307,10 +917,10 @@
   {
    "title": "Блок OM: цель, выход, потребитель",
    "bounding": [
-    530,
-    140,
-    440,
-    1420
+    800,
+    -80,
+    700,
+    1734
    ],
    "color": "#3f4a5a",
    "font_size": 26,
@@ -1319,10 +929,10 @@
   {
    "title": "Решения владельца: открытые и принятые",
    "bounding": [
-    1090,
-    -60,
-    440,
-    2720
+    1640,
+    -80,
+    700,
+    2850
    ],
    "color": "#3f4a5a",
    "font_size": 26,
@@ -1340,7 +950,7 @@
   },
   "omd": {
    "version": 1,
-   "exported": "2026-09-11T19:46:11.906Z"
+   "exported": "2026-09-11T19:52:05.055Z"
   }
  },
  "version": 0.4
