@@ -431,7 +431,7 @@
      "name": "in_2",
      "type": "*",
      "link": 46,
-     "label": "ссылки id/revision/hash"
+     "label": "record"
     }
    ],
    "outputs": [
@@ -1086,25 +1086,25 @@
      "name": "in_1",
      "type": "*",
      "link": 15,
-     "label": "инвентарь"
+     "label": "record"
     },
     {
      "name": "in_2",
      "type": "*",
      "link": 16,
-     "label": "записи стадий"
+     "label": "record"
     },
     {
      "name": "in_3",
      "type": "*",
      "link": 17,
-     "label": "вопросы"
+     "label": "record"
     },
     {
      "name": "in_4",
      "type": "*",
      "link": 54,
-     "label": "начало блока"
+     "label": "flow"
     },
     {
      "name": "in_5",
@@ -1284,7 +1284,7 @@
      "name": "in_2",
      "type": "*",
      "link": 21,
-     "label": "выбор фич"
+     "label": "flow"
     },
     {
      "name": "in_3",
@@ -1429,7 +1429,7 @@
      "name": "in_2",
      "type": "*",
      "link": 33,
-     "label": "пробелы → пересчёт веса"
+     "label": "record"
     },
     {
      "name": "in_3",
@@ -1512,7 +1512,7 @@
      "name": "in_2",
      "type": "*",
      "link": 29,
-     "label": "дельта слоя"
+     "label": "record"
     },
     {
      "name": "in_3",
@@ -1657,7 +1657,7 @@
      "name": "in_2",
      "type": "*",
      "link": 42,
-     "label": "дефект карты → пробел"
+     "label": "gate_fail"
     },
     {
      "name": "in_3",
@@ -1797,7 +1797,7 @@
      "name": "in_1",
      "type": "*",
      "link": 28,
-     "label": "разбиение неоднозначно"
+     "label": "gate_fail"
     },
     {
      "name": "in_2",
@@ -1948,13 +1948,13 @@
      "name": "in_1",
      "type": "*",
      "link": 34,
-     "label": "невыводимое"
+     "label": "flow"
     },
     {
      "name": "in_2",
      "type": "*",
      "link": 36,
-     "label": "передача и бюджет"
+     "label": "record"
     },
     {
      "name": "in_3",
@@ -2018,7 +2018,7 @@
      "name": "in_1",
      "type": "*",
      "link": 35,
-     "label": "решение владельца"
+     "label": "flow"
     }
    ],
    "outputs": [
@@ -2064,19 +2064,19 @@
      "name": "in_1",
      "type": "*",
      "link": 37,
-     "label": "выведенные ответы"
+     "label": "record"
     },
     {
      "name": "in_2",
      "type": "*",
      "link": 38,
-     "label": "ответы с основаниями"
+     "label": "record"
     },
     {
      "name": "in_3",
      "type": "*",
      "link": 39,
-     "label": "ответы владельца"
+     "label": "flow"
     },
     {
      "name": "in_4",
@@ -2581,12 +2581,12 @@
    "id": 42,
    "type": "Note",
    "pos": [
-    -1019.3617255429438,
-    44.64488636363629
+    -1060,
+    -80
    ],
    "size": [
     820,
-    2350
+    2450
    ],
    "flags": {},
    "order": 41,
@@ -2608,11 +2608,11 @@
    "id": 43,
    "type": "Note",
    "pos": [
-    -1006.8477960106142,
-    602.3289110562703
+    -1060,
+    2460
    ],
    "size": [
-    853.640625,
+    820,
     1819.34375
    ],
    "flags": {},
@@ -3070,10 +3070,10 @@
   {
    "title": "Контекст и обсуждение (Codex / Claude Code)",
    "bounding": [
-    -1040,
+    -1100,
     -160,
-    920.3506521709953,
-    3919.7628415010054
+    900,
+    4499.34375
    ],
    "color": "#3f4a5a",
    "font_size": 26,
@@ -3187,7 +3187,7 @@
   },
   "omd": {
    "version": 1,
-   "exported": "2026-09-11T23:34:34.127Z"
+   "exported": "2026-09-11T23:34:58.334Z"
   }
  },
  "version": 0.4

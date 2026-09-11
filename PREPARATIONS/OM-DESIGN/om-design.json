@@ -1,7 +1,7 @@
 {
  "version": 1,
  "title": "Схема блока OM",
- "importedAt": "2026-09-11T23:34:34.173Z",
+ "importedAt": "2026-09-11T23:34:58.370Z",
  "source": "/Users/kostenchuksergey/ComfyUI-Installs/CFUI FIRST/ComfyUI/user/default/workflows/OM-DESIGN.json",
  "nodes": [
   {
@@ -1076,10 +1076,10 @@
    "id": "Контекст и обсуждение (Codex / Claude Code)",
    "title": "Контекст и обсуждение (Codex / Claude Code)",
    "bounding": [
-    -1040,
+    -1100,
     -160,
-    920.3506521709953,
-    3919.7628415010054
+    900,
+    4499.34375
    ]
   },
   {
@@ -1168,12 +1168,12 @@
    "id": 42,
    "type": "Note",
    "pos": [
-    -1019.3617255429438,
-    44.64488636363629
+    -1060,
+    -80
    ],
    "size": [
     820,
-    2350
+    2450
    ],
    "flags": {},
    "order": 41,
@@ -1195,11 +1195,11 @@
    "id": 43,
    "type": "Note",
    "pos": [
-    -1006.8477960106142,
-    602.3289110562703
+    -1060,
+    2460
    ],
    "size": [
-    853.640625,
+    820,
     1819.34375
    ],
    "flags": {},
