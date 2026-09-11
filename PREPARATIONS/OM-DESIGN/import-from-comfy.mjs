@@ -5,7 +5,8 @@ const [wfPath, specPath] = process.argv.slice(2);
 const wf = JSON.parse(readFileSync(wfPath, "utf8"));
 const prev = existsSync(specPath) ? JSON.parse(readFileSync(specPath, "utf8")) : { version: 1, nodes: [], edges: [], groups: [] };
 const byComfyId = new Map(); const nodes = []; const problems = [];
-for (const n of wf.nodes) { const type = CLS_TO_TYPE[n.type]; if (!type) { problems.push(`чужой узел ${n.type} #${n.id}, пропущен`); continue; }
+const notes = wf.nodes.filter(n => n.type === "Note" || n.type === "MarkdownNote");
+for (const n of wf.nodes) { const type = CLS_TO_TYPE[n.type]; if (!type) { if (n.type !== "Note" && n.type !== "MarkdownNote") problems.push(`чужой узел ${n.type} #${n.id}, пропущен`); continue; }
   const T = TYPES[type]; const fields = Object.fromEntries(T.fields.map((f, i) => [f, String(n.widgets_values?.[i] ?? "")]));
   const id = n.properties?.omd_id || `${type}-${n.id}`; byComfyId.set(n.id, id);
   nodes.push({ id, type, fields, pos: n.pos, size: n.size, group: n.properties?.omd_group || undefined }); }
@@ -28,7 +29,7 @@ for (const n of nodes) {
 }
 const changed = { added: nodes.filter(n => !prev.nodes.some(p => p.id === n.id)).map(n => n.id), removed: prev.nodes.filter(p => !nodes.some(n => n.id === p.id)).map(p => p.id),
   edited: nodes.filter(n => { const p = prev.nodes.find(p => p.id === n.id); return p && JSON.stringify(p.fields) !== JSON.stringify(n.fields); }).map(n => n.id) };
-writeFileSync(specPath, JSON.stringify({ version: prev.version ?? 1, title: prev.title ?? "Схема блока OM", importedAt: new Date().toISOString(), source: wfPath, nodes, edges, groups }, null, 1));
+writeFileSync(specPath, JSON.stringify({ version: prev.version ?? 1, title: prev.title ?? "Схема блока OM", importedAt: new Date().toISOString(), source: wfPath, nodes, edges, groups, notes }, null, 1));
 console.log(`импорт: узлов ${nodes.length}, рёбер ${edges.length}; добавлено ${changed.added.length}, удалено ${changed.removed.length}, изменено ${changed.edited.length}`);
 if (changed.added.length) console.log("  добавлено:", changed.added.join(", ")); if (changed.removed.length) console.log("  удалено:", changed.removed.join(", ")); if (changed.edited.length) console.log("  изменено:", changed.edited.join(", "));
 console.log(problems.length ? `проверка хлеба: ${problems.length} замечаний\n  - ` + problems.join("\n  - ") : "проверка хлеба: замечаний нет");
