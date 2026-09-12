@@ -1,0 +1,11 @@
+import { readFileSync, writeFileSync } from "node:fs";
+import { W, heightOf } from "./vocab.mjs";
+const s = JSON.parse(readFileSync("om-design.json", "utf8")); const by = id => s.nodes.find(n => n.id === id);
+if (!by("d-new-code")) { const ns = s.nodes.filter(n => n.group === "Решения владельца"); const y = Math.max(...ns.map(n => n.pos[1] + n.size[1])) + 110;
+  const fields = { "вопрос": "Где живёт код блока OM: новый модуль или доработка om-g2?", "варианты": "новый модуль без легаси / замена om-g2 на месте / надстройка над refinement.ts",
+    "решение": "Принято 12.09.2026: блок OM пишется заново, новым модулем со своими записями, командами и контрактами. Никакого легаси: новый код не зависит от R0–R3, refinement.ts, черновиков исследования и layerDesign. Готовые решения и блоки из старого кода берутся копированием туда, где подходят, с тестами. Инфраструктура остаётся: Store с ревизиями и guards, canonical, схемы, валидаторы графа, git-хелперы, адаптеры моделей. Стадия om-g2 и её прогоны остаются в истории и проверяются правилами своей эры.", "статус": "решено" };
+  s.nodes.push({ id: "d-new-code", type: "owner", fields, pos: [ns[0].pos[0], y], size: [W, heightOf("owner", fields)], group: "Решения владельца" });
+  const all = s.nodes.filter(n => n.group === "Решения владельца"); const g = s.groups.find(g => String(g.title).startsWith("Решения владельца")); const y0 = Math.min(...all.map(n => n.pos[1])), y1 = Math.max(...all.map(n => n.pos[1] + n.size[1])); g.bounding = [ns[0].pos[0] - 40, y0 - 80, W + 80, y1 - y0 + 140]; }
+const ctx = s.notes.find(n => (n.title || "").includes("Контекст"));
+if (!ctx.widgets_values[0].includes("• Новый код, без легаси")) ctx.widgets_values[0] = ctx.widgets_values[0].replace("• Цель и критерии приняты в редакции 12.09; атомарность — ворота компиляции.", "• Цель и критерии приняты в редакции 12.09; атомарность — ворота компиляции.\n• Новый код, без легаси (12.09): блок OM — новый модуль со своими записями, командами и контрактами; из старого кода берём готовые блоки копированием; инфраструктура (Store, canonical, схемы, валидаторы графа, git, адаптеры) остаётся; om-g2 остаётся в истории по правилу эры.");
+writeFileSync("om-design.json", JSON.stringify(s, null, 1)); console.log("решение о новом коде записано");
