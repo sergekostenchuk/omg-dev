@@ -1,7 +1,7 @@
 {
  "version": 1,
  "title": "Схема блока OM",
- "importedAt": "2026-09-12T01:30:53.654Z",
+ "importedAt": "2026-09-12T01:35:42.040Z",
  "source": "/Users/kostenchuksergey/ComfyUI-Installs/CFUI FIRST/ComfyUI/user/default/workflows/OM-DESIGN.json",
  "nodes": [
   {
@@ -1225,12 +1225,12 @@
  ],
  "groups": [
   {
-   "id": "Контекст и обсуждение (Codex / Claude Code)",
-   "title": "Контекст и обсуждение (Codex / Claude Code)",
+   "id": "Контекст, обсуждение и оценка (Codex / Claude Code)",
+   "title": "Контекст, обсуждение и оценка (Codex / Claude Code)",
    "bounding": [
-    -1100,
+    -1980,
     -160,
-    900,
+    1780,
     5880
    ]
   },
@@ -1375,12 +1375,12 @@
    "type": "Note",
    "title": "OM · Вес блоков omg-live, политика v1",
    "pos": [
-    2420,
-    4230
+    -1940,
+    2460
    ],
    "size": [
     760,
-    780
+    900
    ],
    "flags": {},
    "order": 47,
