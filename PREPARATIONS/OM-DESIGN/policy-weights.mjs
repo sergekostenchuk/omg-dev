@@ -1,7 +1,9 @@
 // Расчёт политики веса: базовые веса (признаки 1–3) и сценарии с конкретными наборами пробелов (признак 4).
 // Использование: node policy-weights.mjs <graph.json> [--json out]
 import { readFileSync, writeFileSync } from "node:fs";
-const g = JSON.parse(readFileSync(process.argv[2], "utf8")); const outJson = process.argv.includes("--json") ? process.argv[process.argv.indexOf("--json") + 1] : null;
+const graphPath = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : process.env.OMG_GRAPH;
+if (!graphPath) throw new Error("укажите путь к graph.json аргументом или переменной OMG_GRAPH");
+const g = JSON.parse(readFileSync(graphPath, "utf8")); const outJson = process.argv.includes("--json") ? process.argv[process.argv.indexOf("--json") + 1] : null;
 const blocks = g.nodes.filter(n => n.kind === "block"); const ids = new Set(blocks.map(b => b.id));
 const path = new Set(g.journeys.find(j => j.id === "jy-owner-success").path);
 const dep = Object.fromEntries(blocks.map(b => [b.id, new Set()]));
