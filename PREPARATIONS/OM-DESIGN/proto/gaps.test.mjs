@@ -1,4 +1,4 @@
-// Тесты исполняемой спецификации M5 «пробелы». Живые стадии и верхний слой omg-live — ТОЛЬКО на чтение; уровень работ — тестовый граф garden-plus.
+// Тесты исполняемой спецификации M5 «пробелы», редакция 2. Живые стадии и верхний слой omg-live — ТОЛЬКО на чтение; уровень работ — тестовый граф garden-plus.
 // Запуск: node --test PREPARATIONS/OM-DESIGN/proto/gaps.test.mjs
 import test from "node:test"; import assert from "node:assert/strict"; import { DatabaseSync } from "node:sqlite"; import { homedir } from "node:os"; import { join } from "node:path";
 import { projectGraph } from "../../../dist/src/graph/project.js";
@@ -7,58 +7,69 @@ const db = new DatabaseSync(join(homedir(), "OMG/.omg/state.sqlite"), { readOnly
 const load = () => Object.fromEntries(["discovery", "concept", "operation-map", "specification", "features"].map(st => { const r = head(`stage:omg-live:${st}`); const body = JSON.parse(r.body); const d = body.content.draft;
   const draft = d ? db.prepare(`SELECT body FROM revisions WHERE entity_id=? AND revision=?`).get(d.id, d.revision) : null; return [st, { ref: { id: r.id, revision: r.revision, hash: r.hash }, fields: body.content.fields, contractVersion: draft ? JSON.parse(draft.body).contractVersion : undefined }]; }));
 const UPPER = (({ level, ...g }) => g)(JSON.parse(head("graph-layer:omg-live:1").body).projection); const UI = { block: "n-ui", reason: "сначала бэкенд (решение владельца 21.09.2026)", returnCondition: "понятно, как работает бэкенд" };
-const INPUT = buildOmInput(load()); const HOR = closeHorizon(UPPER, { choiceVersion: "c1", features: [{ outcome: "autonomous-knowledge" }], excluded: [UI] }).horizon; const H = new Set(HOR.nodes);
-const OB = F.frameObligations(UPPER, H); const OPEN = F.fillObligations(UPPER, OB, null, [], H, { graph: null, frame: null }).open; const FRAME_GAPS = F.openObligationsToGaps(OB, OPEN);
-const live = () => G.collectGaps({ inputResult: INPUT, frameGaps: FRAME_GAPS, horizon: HOR, graph: UPPER });
+const INPUT = buildOmInput(load()); const horizonOf = (outcome, v = "c1") => closeHorizon(UPPER, { choiceVersion: v, features: [{ outcome }], excluded: [UI] }).horizon;
+const sourcesFor = (hor, inputResult = INPUT) => { const H = new Set(hor.nodes); const ob = F.frameObligations(UPPER, H); const open = F.fillObligations(UPPER, ob, null, [], H, { graph: null, frame: null }).open;
+  return { inputResult, frameGaps: F.openObligationsToGaps(ob, open), horizon: hor, graph: UPPER }; };
+const HOR = horizonOf("autonomous-knowledge"); const H = new Set(HOR.nodes); const SRC = sourcesFor(HOR); const live = () => G.collectGaps(SRC); const ref = (i, h = "a") => ({ id: `om-answer:${i}`, revision: 1, hash: h.repeat(64) });
 
-test("живые данные omg-live: пробелы входа и каркаса сведены к одной записи; у каждого — потребитель в горизонте, механизм или отсрочка с моментом; ворота G4 пройдены", () => {
-  const r = live(); assert.deepEqual(r.refusals, []); assert.deepEqual(G.gateGaps(r, HOR), { passed: true, codes: [], findings: [] }); assert.equal(r.gaps.length, INPUT.gaps.length + FRAME_GAPS.length + INPUT.input.questions.length);
-  assert.ok(FRAME_GAPS.length > 0 && r.gaps.filter(g => g.origin === "frame").every(g => g.blocking && g.kind === "design-decision" && g.consumers.every(b => H.has(b))), "незаполненное обязательство горизонта блокирует сборку");
+test("живые данные omg-live: четыре источника сведены к одной записи; у каждого пробела — потребитель в горизонте, механизм или отсрочка с условием возвращения; ворота G4 пройдены", () => {
+  const r = live(); assert.deepEqual(r.refusals, []); assert.deepEqual(G.gateGaps(r, SRC), { passed: true, codes: [], findings: [] }); assert.equal(r.gaps.length, INPUT.gaps.length + SRC.frameGaps.length + INPUT.input.questions.length);
+  assert.ok(SRC.frameGaps.length > 0 && r.gaps.filter(g => g.origins.includes("frame")).every(g => g.blocking && g.kind === "design-decision" && g.consumers.every(b => H.has(b))), "незаполненное обязательство горизонта блокирует сборку");
   const deferred = r.gaps.filter(g => g.deferral); assert.ok(deferred.length > 0, "пробелы фич вне горизонта отложены, а не потеряны"); assert.ok(deferred.every(g => !g.blocking && g.deferral.until === "horizon-entry" && g.deferral.blocks.length && !g.deferral.blocks.some(b => H.has(b))));
-  const inv = r.gaps.find(g => g.code === "inventory_missing"); assert.deepEqual([inv.kind, inv.moment, inv.blocking, inv.routes], ["repository-fact", "feasibility", false, ["code", "research"]], "инвентарь нужен проверке реализуемости, сборку слоя не блокирует");
-  assert.equal(new Set(r.gaps.map(g => g.id)).size, r.gaps.length); });
+  const inv = r.gaps.find(g => g.code === "inventory_missing"); assert.deepEqual([inv.kind, inv.moment, inv.blocking, inv.routes], ["repository-fact", "feasibility", false, ["code", "research"]], "инвентарь нужен проверке реализуемости, сборку слоя не блокирует"); });
 
-test("вопросы предыдущих стадий — четвёртый источник: записанный прозой сначала адресуется, адресованный становится пробелом своего вида с потребителем-блоком", () => {
-  const r = live(); const qs = r.gaps.filter(g => g.origin === "question"); assert.equal(qs.length, 10); assert.ok(qs.every(g => g.code === "question_unaddressed" && g.blocking && g.mechanism && g.routes[0] === "design"), "потребитель прозой узлом не считается");
-  const addressed = structuredClone(INPUT); const inside = HOR.nodes[0], outside = UPPER.nodes.find(n => n.kind === "block" && !H.has(n.id) && n.id !== "n-ui").id;
-  addressed.input.questions = [{ id: "q-in", question: "?", consumer: inside, kind: "repository-fact" }, { id: "q-out", question: "?", consumer: outside, kind: "owner-decision" }, { id: "q-env", question: "?", consumer: inside, kind: "environment-confirmation" }];
-  const a = G.collectGaps({ inputResult: addressed, horizon: HOR, graph: UPPER }); assert.equal(G.gateGaps(a, HOR).passed, true); const q = id => a.gaps.find(g => g.target === id);
-  assert.deepEqual([q("q-in").consumers, q("q-in").routes, q("q-in").blocking], [[inside], ["code", "research"], true]); assert.deepEqual([q("q-out").blocking, q("q-out").deferral.until], [false, "horizon-entry"]);
-  assert.deepEqual([q("q-env").moment, q("q-env").blocking], ["task-start", false], "подтверждение среды — на старте задачи, сборку не держит");
-  addressed.input.questions = [{ id: "q-bad", question: "?", consumer: inside, kind: "сам придумал" }]; assert.equal(G.collectGaps({ inputResult: addressed, horizon: HOR, graph: UPPER }).gaps.find(g => g.target === "q-bad").code, "question_unaddressed"); });
+test("вердикт №1 п.4: вид знания и адрес вопроса проходят через НАСТОЯЩИЙ стык F1.1 → F5.1; принятое решение об адресации делает вопрос обязательством своего вида, а не ответом", () => {
+  const prose = live().gaps.filter(g => g.origins.includes("question")); assert.equal(prose.length, 10); assert.ok(prose.every(g => g.code === "question_unaddressed" && g.blocking && g.mechanism && g.routes[0] === "design"), "потребитель прозой узлом не считается");
+  const stages = load(); const u = stages.discovery.fields.preparation.unknowns[0]; u.consumer = HOR.nodes[0]; u.kind = "repository-fact"; const joined = buildOmInput(stages); assert.deepEqual(joined.refusals, []);
+  const q = G.collectGaps(sourcesFor(HOR, joined)).gaps.find(g => g.target === `discovery:${u.id}`); assert.deepEqual([q.code, q.field, q.kind, q.routes, q.consumers, q.blocking], ["predecessor_question", "answer", "repository-fact", ["code", "research"], [HOR.nodes[0]], true], "сценарий ревью: вид от производителя не теряется");
+  const target = INPUT.input.questions[1].id, outside = UPPER.nodes.find(n => n.kind === "block" && !H.has(n.id) && n.id !== "n-ui").id; const bad = d => G.applyAddressing(INPUT, [d], UPPER).refusals.map(x => x.code);
+  assert.deepEqual(bad({ question: target, consumer: "нет-такого-узла", kind: "owner-decision", basis: ref(1) }), ["addressing_invalid"]); assert.deepEqual(bad({ question: target, consumer: outside, kind: "сам придумал", basis: ref(1) }), ["addressing_invalid"]);
+  assert.deepEqual(bad({ question: target, consumer: outside, kind: "owner-decision", basis: { id: "x", revision: -1, hash: "x" } }), ["addressing_invalid"]); assert.deepEqual(bad({ question: "нет-такого-вопроса", consumer: outside, kind: "owner-decision", basis: ref(1) }), ["addressing_invalid"]);
+  const done = G.applyAddressing(INPUT, [{ question: target, consumer: outside, kind: "environment-confirmation", basis: ref(7) }], UPPER); assert.deepEqual(done.refusals, []); assert.notEqual(done.result.hash, INPUT.hash, "адресация меняет версию входа");
+  const after = G.collectGaps(sourcesFor(HOR, done.result)); const a = after.gaps.find(g => g.target === target); assert.deepEqual([a.code, a.field, a.kind, a.moment, a.blocking, a.addressedBy, a.deferral.until], ["predecessor_question", "answer", "environment-confirmation", "task-start", false, ref(7), "horizon-entry"]);
+  assert.ok(!after.gaps.some(g => g.id === G.gapId(target, "address")), "пробел адресации ушёл, но появился пробел ответа: вопрос не считается разрешённым"); assert.equal(G.gateGaps(after, sourcesFor(HOR, done.result)).passed, true); });
 
-test("горизонт меняет статус, а не состав: при другой фиче те же пробелы, отложенные становятся действующими", () => {
-  const wide = closeHorizon(UPPER, { choiceVersion: "c2", features: [{ outcome: "verified-change" }], excluded: [UI] }).horizon; const a = live(); const b = G.collectGaps({ inputResult: INPUT, frameGaps: [], horizon: wide, graph: UPPER });
-  const ids = r => new Set(r.gaps.filter(g => g.origin === "input").map(g => g.id)); assert.deepEqual([...ids(a)].sort(), [...ids(b)].sort());
+test("горизонт меняет статус, а не состав пробелов входа: при другой фиче те же пробелы, отложенные становятся действующими", () => {
+  const wide = horizonOf("verified-change", "c2"); const a = live(); const b = G.collectGaps({ ...SRC, frameGaps: [], horizon: wide }); const ids = r => r.gaps.filter(g => !g.origins.includes("frame")).map(g => g.id).sort(); assert.deepEqual(ids(a), ids(b));
   const woke = b.gaps.filter(g => !g.deferral && a.gaps.find(x => x.id === g.id)?.deferral); assert.ok(woke.length > 0, "блок вошёл в горизонт — его отложенные пробелы проснулись"); assert.ok(woke.every(g => g.blocking)); });
 
 test("каркас работ: потребитель пробела — операция, горизонт — блоки; пробел привязан к блоку операции, сосед сохранён", () => {
   const g3 = gardenPlus(); const acc2 = (({ level, ...g }) => g)(projectGraph(g3, 2)); const upper = F.upperOf(acc2, 3); const zone = new Set(["garden-prep-operation", "garden-produce-operation", "garden-consume-operation"]);
-  const ob = F.frameObligations(upper, zone, 3); const open = F.fillObligations(upper, ob, null, [], zone, { graph: null, frame: null }, 3).open; const hor = { nodes: ["garden-consume-block", "garden-produce-block"] };
-  const r = G.collectGaps({ frameGaps: F.openObligationsToGaps(ob, open), horizon: hor, graph: acc2 }); assert.deepEqual(r.refusals, []); assert.equal(G.gateGaps(r, hor).passed, true); assert.equal(r.gaps.length, open.length);
+  const ob = F.frameObligations(upper, zone, 3); const open = F.fillObligations(upper, ob, null, [], zone, { graph: null, frame: null }, 3).open; const src = { frameGaps: F.openObligationsToGaps(ob, open), horizon: { nodes: ["garden-consume-block", "garden-produce-block"] }, graph: acc2 };
+  const r = G.collectGaps(src); assert.deepEqual(r.refusals, []); assert.equal(G.gateGaps(r, src).passed, true); assert.equal(r.gaps.length, open.length);
   const end = r.gaps.find(g => g.node === "garden-produce-operation" && g.neighbors?.length); assert.deepEqual(end.consumers, ["garden-produce-block"]); assert.ok(end.neighbors.some(n => n.node === "garden-prep-operation" || n.node === "garden-consume-operation"), "в пробеле назван сосед по связи"); });
 
-test("линия пробела: тот же target и field — тот же пробел со счётчиком проходов; исчез — закрыт; вернулся — открыт заново; порядок и новые поля линию не меняют", () => {
-  const r = live(); const p1 = G.mergeLines([], r.gaps, 1); assert.ok(p1.every(l => l.passes === 1 && l.firstPass === 1)); const shuffled = [...r.gaps].reverse().map(g => ({ ...g, message: "другое время и текст" }));
-  const p2 = G.mergeLines(p1, shuffled, 2); assert.equal(p2.length, p1.length); assert.ok(p2.every(l => l.passes === 2 && l.firstPass === 1)); const gone = r.gaps[0].id;
-  const p3 = G.mergeLines(p2, r.gaps.slice(1), 3); assert.deepEqual([p3.find(l => l.id === gone).status, p3.find(l => l.id === gone).closedPass, p3.find(l => l.id === gone).passes], ["closed", 3, 2]);
-  const p4 = G.mergeLines(p3, r.gaps, 4); assert.deepEqual([p4.find(l => l.id === gone).reopened, p4.find(l => l.id === gone).passes, p4.find(l => l.id === gone).firstPass], [1, 3, 1]); assert.notEqual(p4.find(l => l.id === gone).status, "closed"); });
+test("вердикт №1 п.3: выход блока из горизонта НЕ закрывает незаполненные обязательства — линия отложена «вне области проверки»; закрытие только с основанием; фиксация прохода идемпотентна", () => {
+  const wideSrc = sourcesFor(horizonOf("verified-change")); const wide = G.collectGaps(wideSrc).gaps; const p1 = G.mergeLines([], wide, 1); assert.deepEqual(p1.refusals, []); const narrow = live().gaps; const p2 = G.mergeLines(p1.lines, narrow, 2);
+  const lost = p1.lines.filter(l => !narrow.some(g => g.id === l.id)); assert.ok(lost.length > 50, `сценарий ревью: из набора ушло ${lost.length} незаполненных обязательств`);
+  assert.ok(lost.every(l => { const x = p2.lines.find(y => y.id === l.id); return x.status === "deferred" && x.scope === "absent" && x.closedPass === undefined; }), "ни одно не закрыто"); assert.equal(p2.lines.filter(l => l.status === "closed").length, 0);
+  const again = G.mergeLines(p2.lines, narrow, 2); assert.deepEqual(again.lines, p2.lines, "повтор того же прохода ничего не меняет"); const p3 = G.mergeLines(p2.lines, wide, 3); const back = p3.lines.find(l => l.id === lost[0].id);
+  assert.deepEqual([back.status, back.scope, back.passes, back.reopened], ["open", undefined, 2, 0], "вернулся в область проверки — та же линия, не новая и не «открытая заново»");
+  const gone = lost[0].id, here = narrow[0].id; const c = G.mergeLines(p2.lines, narrow, 3, [{ id: gone, reason: "filled", basis: ref(1) }]); assert.deepEqual(c.refusals, []);
+  assert.deepEqual((({ status, closedBy, closedPass, basis }) => [status, closedBy, closedPass, basis])(c.lines.find(l => l.id === gone)), ["closed", "filled", 3, ref(1)]);
+  const re = G.mergeLines(c.lines, wide, 4).lines.find(l => l.id === gone); assert.deepEqual([re.status, re.reopened, re.closedBy], ["open", 1, undefined], "закрытый и вернувшийся — открыт заново, возвращение учтено");
+  for (const bad of [{ id: here, reason: "filled", basis: ref(1) }, { id: gone, reason: "надоел", basis: ref(1) }, { id: gone, reason: "cancelled", basis: { id: "x", revision: -1, hash: "x" } }, { id: "f".repeat(64), reason: "filled", basis: ref(1) }])
+    assert.deepEqual(G.mergeLines(p2.lines, narrow, 3, [bad]).refusals.map(x => x.code), ["closure_invalid"], JSON.stringify(bad)); });
 
-test("G4, отсутствие и маскарад: неизвестный код, пробел без потребителя, дубль, подделанные id, вид, признак «блокирует» и отсрочка — типизированные отказы", () => {
-  const bad = (gaps, frameGaps = []) => G.gateGaps(G.collectGaps({ inputResult: { input: INPUT.input, gaps }, frameGaps, horizon: HOR, graph: UPPER }), HOR).codes;
+test("вердикт №1 п.2: ворота не доверяют присланной записи — набор выводится заново из источников; подмена момента, маршрута, признака «блокирует», вида, id, отсрочки, пропуск, лишний и дубль видны", () => {
+  const forge = change => { const r = live(); change(r.gaps.find(x => x.blocking), r); return G.gateGaps(r, SRC).codes; };
+  assert.deepEqual(forge(g => { g.moment = "task-result"; g.blocking = false; }), ["gap_record_forged"], "сценарий ревью: блокирующий проектный пробел не уходит «на потом»"); assert.deepEqual(forge(g => { g.routes = ["code"]; }), ["gap_record_forged"], "сценарий ревью: маршрут не подменяется");
+  assert.deepEqual(forge(g => { g.blocking = false; }), ["gap_record_forged"]); assert.deepEqual(forge(g => { g.kind = "repository-fact"; }), ["gap_record_forged"]); assert.deepEqual(forge(g => { g.deferral = { reason: "так удобнее", until: "horizon-entry" }; }), ["gap_record_forged"]);
+  assert.deepEqual(forge(g => { g.consumers = []; }), ["gap_record_forged"]); assert.deepEqual(forge(g => { g.id = "0".repeat(64); }), ["gap_foreign", "gap_missing"]); assert.deepEqual(forge((g, r) => { r.gaps.pop(); }), ["gap_missing"]);
+  assert.deepEqual(forge((g, r) => { r.gaps.push(structuredClone(g)); }), ["gap_duplicate"]); assert.deepEqual(forge((g, r) => { r.gaps.push({ ...structuredClone(g), id: G.gapId("выдуманная цель", "fill"), target: "выдуманная цель" }); }), ["gap_foreign"]);
+  const bad = (gaps, questions = []) => { const src = { ...SRC, frameGaps: [], inputResult: { ...INPUT, input: { ...INPUT.input, questions }, gaps } }; return G.gateGaps(G.collectGaps(src), src).codes; };
   assert.deepEqual(bad([{ code: "made_up_code", target: "x", consumer: { features: [] } }]), ["gap_class_unknown"]); assert.deepEqual(bad([{ code: "contract_node_unbound", target: "x", consumer: { features: [] } }]), ["gap_consumer_missing"]);
-  assert.deepEqual(bad([{ code: "contract_node_unbound", target: "x", consumer: "нет-такого-узла" }]), ["gap_consumer_missing"]); assert.deepEqual(bad([], [FRAME_GAPS[0], FRAME_GAPS[0]]), ["gap_duplicate"]);
-  const forge = change => { const r = live(); const g = r.gaps.find(x => x.blocking); change(g, r); return G.gateGaps(r, HOR).codes; };
-  assert.deepEqual(forge(g => { g.blocking = false; }), ["gap_blocking_forged"], "блокирующий пробел не проскальзывает мимо G4b"); assert.deepEqual(forge(g => { g.id = "0".repeat(64); }), ["gap_identity_forged"]);
-  assert.deepEqual(forge(g => { g.kind = "сам придумал"; }), ["gap_kind_unknown"]); assert.deepEqual(forge(g => { g.deferral = { reason: "так удобнее", until: "horizon-entry" }; }), ["deferral_without_moment"], "действующий пробел отложить нельзя");
-  assert.deepEqual(forge((g, r) => { const d = r.gaps.find(x => x.deferral); delete d.deferral; }), ["gap_outside_horizon"]); assert.deepEqual(forge((g, r) => { r.gaps.find(x => x.deferral).deferral.until = ""; }), ["deferral_without_moment"]); });
+  assert.deepEqual(bad([{ code: "contract_node_unbound", target: "x", consumer: "нет-такого-узла" }]), ["gap_consumer_missing"]); const inside = HOR.nodes[0], other = HOR.nodes[1];
+  assert.deepEqual(bad([], [{ id: "q", consumer: inside, kind: "repository-fact" }, { id: "q", consumer: inside, kind: "owner-decision" }]), ["gap_class_conflict"], "два источника с разной классификацией одного поля — явный отказ, первый молча не выигрывает");
+  const src = { ...SRC, frameGaps: [], inputResult: { ...INPUT, gaps: [], input: { ...INPUT.input, questions: [{ id: "q", consumer: inside, kind: "repository-fact" }, { id: "q", consumer: other, kind: "repository-fact" }] } } }; const merged = G.collectGaps(src);
+  assert.deepEqual([merged.refusals, merged.gaps.length, merged.gaps[0].consumers], [[], 1, [inside, other].sort()], "одинаковая классификация — одна запись с объединёнными потребителями"); });
 
-test("G4b: у каждого блокирующего пробела — один результат законным маршрутом, для текущей версии входа, с точной ссылкой или отсрочкой с моментом", () => {
-  const gaps = live().gaps; const blocking = gaps.filter(g => g.blocking); const ref = i => ({ id: `om-answer:${i}`, revision: 1, hash: "a".repeat(64) }); const all = blocking.map((g, i) => ({ gap: g.id, route: g.routes[0], inputHash: INPUT.hash, answerRef: ref(i) }));
-  assert.deepEqual(G.gateAnswers(gaps, all, INPUT.hash), { passed: true, codes: [], findings: [] }); assert.deepEqual(G.gateAnswers(gaps, all.slice(1), INPUT.hash).codes, ["answer_missing_for_blocking_gap"]);
-  assert.deepEqual(G.gateAnswers(gaps, all, "другая версия входа").codes, ["answer_version_stale"]); const swap = change => all.map((r, i) => (i === 0 ? change({ ...r }) : r));
-  assert.deepEqual(G.gateAnswers(gaps, swap(r => ({ ...r, route: "code" })), INPUT.hash).codes, ["answer_route_foreign"], "проектное решение нельзя объявить фактом репозитория");
-  assert.deepEqual(G.gateAnswers(gaps, swap(r => ({ ...r, answerRef: { id: "x" } })), INPUT.hash).codes, ["route_result_missing"]); assert.deepEqual(G.gateAnswers(gaps, swap(r => ({ gap: r.gap, route: r.route, inputHash: r.inputHash, deferral: { until: "" } })), INPUT.hash).codes, ["deferral_without_moment"]);
-  assert.deepEqual(G.gateAnswers(gaps, swap(r => ({ gap: r.gap, route: r.route, inputHash: r.inputHash, deferral: { until: "task-start" } })), INPUT.hash).passed, true);
-  assert.deepEqual(G.gateAnswers(gaps, [...all, all[0]], INPUT.hash).codes, ["answer_duplicate"]); assert.deepEqual(G.gateAnswers(gaps, [...all, { ...all[0], gap: "f".repeat(64) }], INPUT.hash).codes, ["answer_gap_unknown"]);
-  const calm = gaps.filter(g => !g.blocking); assert.equal(G.gateAnswers(calm, [], INPUT.hash).passed, true, "неблокирующие и отложенные пробелы готовности сборки не держат"); });
+test("вердикт №1 п.1: G4b — у каждого блокирующего пробела один результат законным маршрутом со СТРОГОЙ ссылкой; отсрочку блокирующего пробела результат маршрута дать не может; пробелы берутся из источников, а не у вызывающего", () => {
+  const blocking = live().gaps.filter(g => g.blocking); assert.ok(blocking.length > 40); const all = blocking.map((g, i) => ({ gap: g.id, route: g.routes[0], inputHash: INPUT.hash, answerRef: ref(i) }));
+  assert.deepEqual(G.gateAnswers(SRC, all), { passed: true, codes: [], findings: [] }); assert.deepEqual(G.gateAnswers(SRC, all.slice(1)).codes, ["answer_missing_for_blocking_gap"]);
+  assert.deepEqual(G.gateAnswers(SRC, blocking.map(g => ({ gap: g.id, route: g.routes[0], inputHash: INPUT.hash, deferral: { until: "never" } }))).codes, ["deferral_not_permitted"], "сценарий ревью: все блокирующие «отложены навсегда» — отказ");
+  const swap = change => all.map((r, i) => (i === 0 ? change({ ...r }) : r)); assert.deepEqual(G.gateAnswers(SRC, swap(r => ({ ...r, answerRef: { id: "x", revision: -1, hash: "x" } }))).codes, ["route_result_missing"], "сценарий ревью: неточная ссылка не проходит");
+  assert.deepEqual(G.gateAnswers(SRC, swap(r => ({ ...r, deferral: { until: "task-start" } }))).codes, ["deferral_not_permitted"]); assert.deepEqual(G.gateAnswers(SRC, swap(r => ({ ...r, route: "code" }))).codes, ["answer_route_foreign"], "проектное решение нельзя объявить фактом репозитория");
+  assert.deepEqual(G.gateAnswers(SRC, swap(r => ({ ...r, inputHash: "другая версия входа" }))).codes, ["answer_version_stale"]); assert.deepEqual(G.gateAnswers(SRC, [...all, all[0]]).codes, ["answer_duplicate"]);
+  assert.deepEqual(G.gateAnswers(SRC, [...all, { ...all[0], gap: "f".repeat(64) }]).codes, ["answer_gap_unknown"]);
+  const calm = { ...SRC, frameGaps: [], inputResult: { ...INPUT, gaps: INPUT.gaps.filter(g => g.code === "inventory_missing"), input: { ...INPUT.input, questions: [] } } }; assert.equal(G.gateAnswers(calm, []).passed, true, "инвентарь остаётся обязательством M8, но готовности сборки не держит"); });

@@ -4,6 +4,7 @@
 import { hashJson } from "../../../dist/src/canonical.js";
 
 import { controlPredecessors } from "../../../dist/src/graph/dependencies.js";
+import { isRef } from "../../../dist/src/pipeline/contracts.js";
 
 /** available — блоки, чей РЕЗУЛЬТАТ уже доступен: блок → { артефакт: ссылка на квитанцию }. Основание называет КАЖДЫЙ результат блока, нужный горизонту
  *  (вердикт №1 по M7, п.3: «любая квитанция блока» основанием не считается); непокрытый нужный результат — отказ horizon_available_uncovered.
@@ -13,7 +14,7 @@ export function closeHorizon(upper, { choiceVersion, features, excluded = [], re
   const refusals = []; const blocks = new Map(upper.nodes.filter(n => n.kind === "block").map(n => [n.id, n])); const external = new Set(upper.artifacts.filter(a => a.external).map(a => a.id));
   for (const e of excluded) { if (!blocks.has(e.block)) refusals.push({ code: "horizon_exclusion_unknown", target: e.block });
     if (!String(e.reason ?? "").trim() || !String(e.returnCondition ?? "").trim()) refusals.push({ code: "horizon_exclusion_unjustified", target: e.block }); }
-  const proven = r => r && typeof r.id === "string" && r.id && Number.isInteger(r.revision) && typeof r.hash === "string" && r.hash;
+  const proven = isRef;      // действующий строгий контракт ссылки: id, revision > 0, hash из 64 шестнадцатеричных знаков
   for (const [block, basis] of available) if (!blocks.has(block) || !basis || typeof basis !== "object" || !Object.keys(basis).length || !Object.values(basis).every(proven)) refusals.push({ code: "horizon_available_unproven", target: block });
   const out = new Set(excluded.map(e => e.block)); const roots = [];
   for (const f of features) { const producers = [...blocks.values()].filter(b => b.outcome === f.outcome); if (!producers.length) refusals.push({ code: "horizon_feature_unknown", target: f.outcome }); roots.push(...producers.map(b => b.id)); }

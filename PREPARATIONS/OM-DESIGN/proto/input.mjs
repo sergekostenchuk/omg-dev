@@ -54,8 +54,8 @@ export function buildOmInput(stages, { inventory = null, nodesRequiredSince = NO
     return { index: i, title: f.title, outcome: f.outcome, behaviorIndexes: [...(f.requirements ?? [])].sort((a, b) => a - b), requirementIds: [...(p.requirements ?? [])].sort(), contracts: [...(p.behaviorContracts ?? [])].sort() }; }).filter(Boolean);
 
   // вопросы предшественников: у каждого — потребитель; вопрос без потребителя не создаётся
-  const questions = [...unknowns.map(u => ({ id: `discovery:${u.id}`, question: u.question, consumer: u.consumer, blocks: !!u.blocksCurrentStage })),
-    ...feats.flatMap((f, i) => prepOf(f).length === 1 ? (prepOf(f)[0].remainingQuestions ?? []).map((q, k) => ({ id: `feature:${i}:${k + 1}`, question: q.question, consumer: q.consumer, blocks: !!q.blocksCurrentStage })) : [])].sort(byId);
+  const questions = [...unknowns.map(u => ({ id: `discovery:${u.id}`, question: u.question, consumer: u.consumer, kind: u.kind ?? null, blocks: !!u.blocksCurrentStage })),
+    ...feats.flatMap((f, i) => prepOf(f).length === 1 ? (prepOf(f)[0].remainingQuestions ?? []).map((q, k) => ({ id: `feature:${i}:${k + 1}`, question: q.question, consumer: q.consumer, kind: q.kind ?? null, blocks: !!q.blocksCurrentStage })) : [])].sort(byId);
   for (const q of questions) if (typeof q.consumer !== "string" || !q.consumer.trim()) refuse("question_consumer_missing", q.id, "У вопроса нет потребителя");
   if (!inventory) gap("inventory_missing", "repo-inventory", { mechanism: "M8 реализуемость горизонта" }, "Инвентарь репозитория кодом не собран (решение 12.09 не реализовано)");
 
