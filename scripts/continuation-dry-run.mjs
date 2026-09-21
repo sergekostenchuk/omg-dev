@@ -18,15 +18,38 @@ const store=new Store(join(out,'copy.sqlite')),engine=new ProductEngine(store),p
 try{
  const question=store.list('question').find(q=>q.value.projectId===project&&q.value.level==='R2'&&q.value.spec.field==='contractsAndConsumers'&&q.value.status==='open');
  if(!question)throw Error('The copy has no paused contractsAndConsumers question');
- const saved=engine.execute({type:'configure-saved-synthesis',project,question:question.id,expected:store.get(`saved-synthesis:${question.id}`)?.revision??0});
- const citations=[...new Map(saved.value.checkpoints.flatMap(ref=>store.get(ref.id,ref.revision).value.observations.map(o=>({source:o.source,selector:o.selector}))).map(c=>[JSON.stringify(c),c])).values()];
+ const saved=store.get(`saved-synthesis:${question.id}`);
+ if(!saved)throw Error('Recovery must use the already selected saved checkpoints');
  const sourcesBefore=store.list('source').length,log=join(out,'envelopes.ndjson'),adapter=join(out,'fixture.mjs');
  writeFileSync(adapter,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync(${JSON.stringify(log)},JSON.stringify(r)+'\\n');
-const citations=${JSON.stringify(citations)};let research;
-if(c.role==='reader'||c.dispatchMode==='planning')throw Error('Recovery cannot buy another reader or plan');
-if(c.role==='assess-answer')research=c.evidencePage.end<c.evidencePage.total?{action:'assessment_checkpoint',notes:['Fixture checked this saved evidence page']}:{verdict:'supported',reasons:[]};
-else if(!c.synthesisPage.complete)research={action:'checkpoint',question:c.question.id,value:{fixtureOnly:true,savedFindingsProcessedThrough:c.synthesisPage.end},unresolved:['Compose remaining saved findings'],citations};
-else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Recorded fixture only, not a real research conclusion',facts:[],designs:[{id:'fixture-result',decision:'Fixture output from saved findings',benefit:'Validate recovery transport',consumer:'n-state'}],gaps:[]},citations};
+const fail=m=>{throw Error(m)},read=(record,pointer)=>({action:'read_context',record,pointer});let research;
+if(c.role==='reader'||c.dispatchMode==='planning')fail('Recovery cannot buy another reader or plan');
+if(!c.question.schema?.properties?.designs)fail('Response contract absent from this stateless packet');
+const originals=(c.contextWorkspace??[]).filter(x=>x.record.id.startsWith('research-checkpoint:'));
+if(c.role==='assess-answer'){
+ const text=c.observations.length?JSON.stringify(c.observations):c.evidencePage.text;
+ if(!text||!c.candidatePage)fail('The assessor needs actual evidence and the candidate');
+ if(!c.candidatePage.complete||!c.evidencePage.complete)research={action:'assessment_checkpoint',notes:[JSON.stringify({evidenceChars:text.length,candidateChars:c.candidatePage.end})]};
+ else {if(!c.value?.designs?.length||c.value.designs.some(d=>!d.decision||!d.consumer))fail('The assessor cannot validate an absent candidate');research={verdict:'supported',reasons:[]};}
+}else {
+ const pieces=c.selectedContext??[];
+ const savedEvidence=pieces.flatMap(p=>p.evidence??[]);
+ if(originals.length<2){
+  const next=savedEvidence.find(e=>!originals.some(x=>x.record.id===e.original.record.id&&x.pointer===e.original.pointer));
+  if(!next)fail('Direct addresses to saved observations are absent');research=read(next.original.record,next.original.pointer);
+ }else{
+  if(originals.some(x=>!x.value?.source||!x.value?.selector||!x.value?.value))fail('Two source operands must coexist, not only their addresses');
+  if(c.materialPage)fail('Fixture requires full proposal operands; it cannot pretend to interpret an incomplete JSON fragment');
+  const prior=(c.conclusions??[]).flatMap(n=>n.proposal?.value?.designs??[]);
+  const additions=pieces.flatMap(p=>p.proposal?.value?.designs?.slice(0,1)??[]);
+  const designs=[...new Map([...prior,...additions].map(d=>[d.id,d])).values()];
+  if(!designs.length)fail('No supplied saved findings to combine');
+  const citations=originals.map(x=>({source:x.value.source,selector:x.value.selector}));
+  research={action:c.synthesisPage.complete?'answer':'checkpoint',question:c.question.id,
+   value:{applicability:'applicable',reason:'Transport fixture combining supplied saved design proposals; no claim of completed real research',facts:[],designs,gaps:[]},citations,
+   ...(!c.synthesisPage.complete?{unresolved:['Combine the remaining saved proposals']}:{})};
+ }
+}
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:100,outputTokens:25,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const old=store.get(`reader-pilot:${project}`),{projectId:_id,...settings}=old.value;
  const cmd={executable:process.execPath,args:[adapter]};

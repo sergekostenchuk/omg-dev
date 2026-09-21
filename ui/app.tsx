@@ -7,6 +7,7 @@ import type { Graph } from "../src/graph/model.js";
 import type { Environment } from "../src/runtime/environment.js";
 import "./app.css";
 import { PlanPanel } from "./plan.js";
+import { ExecutionPanel } from "./execution.js";
 
 type View = ReturnType<ProductEngine['projection']>;
 type Provider = { id: string; label: string; available: boolean; command: { executable: string; args: string[] }; models: { id: string; label: string }[] };
@@ -101,7 +102,7 @@ function StagePanel({ view, stage, cmd, run, busy }: { view: View; stage: Stage;
     </>}
     {stage === "om-g2" && <RefinementPanel view={view} cmd={cmd} run={run} busy={busy}/>}
     {stage === "compilation" && <PlanPanel view={view} busy={busy} compile={() => { void run(() => cmd({ type: "compile", project }), "Машинный план скомпилирован и проверен"); }}/>} 
-    {stage === "execution" && <p className="empty-inline">Работа этой стадии доступна после принятия предыдущего результата.</p>}
+    {stage === "execution" && <ExecutionPanel view={view} command={cmd} refresh={() => run(async () => {}, "Состояние исполнения обновлено")}/>}
     {current.artifact && <><div className="artifact-bar"><div><strong>Версия {current.artifact.revision}</strong><small>Привязана к исходным данным и доказательствам</small></div><button disabled={busy || current.state !== "draft"} onClick={() => run(() => cmd({ type: "accept-stage", project, stage, expected: current.artifact!.revision }), "Результат принят")}>Принять результат</button></div><details><summary>Содержание и привязки</summary><pre>{JSON.stringify(current.artifact.value.content, null, 2)}</pre></details></>}
   </section>;
 }
