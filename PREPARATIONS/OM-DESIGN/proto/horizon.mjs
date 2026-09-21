@@ -33,14 +33,15 @@ export function closeHorizon(upper, { choiceVersion, features, excluded = [], re
       queue.push({ block: p.block, path: [...path, `${p.via}→${p.block}`] }); } }
   // адреса внешних входов — по ОКОНЧАТЕЛЬНОМУ горизонту и всем его привязкам, независимо от порядка обхода и от того, каким путём вошёл источник
   const externalInputs = [...horizon.keys()].flatMap(id => needs(id).filter(p => p.external).map(p => ({ consumer: id, connector: p.via, source: p.block })));
+  const covers = (block, artifact) => { const b = available.get(block); return Boolean(b) && Object.hasOwn(b, artifact) && isRef(b[artifact]); };      // только собственное поле основания, не унаследованное
   // покрытие: у блока «результат уже есть» (на границе или внутри горизонта) основание обязано называть каждый артефакт, который берёт у него горизонт
-  for (const id of horizon.keys()) for (const p of needs(id)) if (!p.external && p.block !== id && available.has(p.block) && (boundary.has(p.block) || horizon.has(p.block)) && !available.get(p.block)?.[p.artifact])
+  for (const id of horizon.keys()) for (const p of needs(id)) if (!p.external && p.block !== id && available.has(p.block) && (boundary.has(p.block) || horizon.has(p.block)) && !covers(p.block, p.artifact))
     if (!refusals.some(r => r.code === "horizon_available_uncovered" && r.target === `${p.block}:${p.artifact}`)) refusals.push({ code: "horizon_available_uncovered", target: `${p.block}:${p.artifact}`, via: p.via });
   // исход ВЫБРАННОЙ фичи — тоже требуемый результат: без его основания блок-производитель готовым не объявляется (вердикт №2 по M7, п.3)
-  for (const r of roots) { const art = blocks.get(r).outcome; if (available.has(r) && horizon.has(r) && !available.get(r)?.[art] && !refusals.some(x => x.code === "horizon_available_uncovered" && x.target === `${r}:${art}`)) refusals.push({ code: "horizon_available_uncovered", target: `${r}:${art}`, via: "feature" }); }
+  for (const r of roots) { const art = blocks.get(r).outcome; if (available.has(r) && horizon.has(r) && !covers(r, art) && !refusals.some(x => x.code === "horizon_available_uncovered" && x.target === `${r}:${art}`)) refusals.push({ code: "horizon_available_uncovered", target: `${r}:${art}`, via: "feature" }); }
   const nodes = [...horizon.keys()].sort(); const value = { choiceVersion, features: features.map(f => f.outcome).sort(), nodes, refinement: Object.fromEntries(nodes.map(n => [n, refined.has(n) ? "accepted" : "needed"])), // готовность результата — вместе с ТОЧНЫМ основанием: оно входит в хэш горизонта, смена квитанции — другой горизонт (вердикт №3)
-    execution: Object.fromEntries(nodes.map(n => [n, available.has(n) ? { state: "available", basis: available.get(n) } : { state: "needed" }])),
-    boundary: [...boundary].map(([block, basis]) => ({ block, basis })).sort((a, b) => a.block < b.block ? -1 : 1), externalInputs: externalInputs.sort((a, b) => (a.consumer + a.connector < b.consumer + b.connector ? -1 : 1)),
+    execution: Object.fromEntries(nodes.map(n => [n, available.has(n) ? { state: "available", basis: structuredClone(available.get(n)) } : { state: "needed" }])),
+    boundary: [...boundary].map(([block, basis]) => ({ block, basis: structuredClone(basis) })).sort((a, b) => a.block < b.block ? -1 : 1), externalInputs: externalInputs.sort((a, b) => (a.consumer + a.connector < b.consumer + b.connector ? -1 : 1)),
     excluded: [...excluded].map(e => ({ block: e.block, reason: e.reason, returnCondition: e.returnCondition })).sort((a, b) => a.block < b.block ? -1 : 1) };
   return { horizon: { ...value, hash: hashJson(value) }, conflicts, refusals };
 }

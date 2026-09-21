@@ -203,3 +203,10 @@ test("основание готовности ищется по блоку-ПР�
       g.edges.push({ id: "e-realizes-far", relation: "realizes", source: "garden-produce-work", target: "garden-produce-operation", condition: "работа лежит в операции другого блока" }); return g; });
     const rec = put(store, g, "garden-produce-work", "garden-data"); const ok = W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(rec) } }); assert.deepEqual(ok.findings, []);
     const n = W.neighborsOf(g, "garden-consume-work", { ...ctx, receipts: ok.receipts }).find(n => n.direction === "reads"); assert.deepEqual([n.delivery, n.neighbor.operation.id, n.neighbor.block.id], ["available", "garden-produce-operation", "garden-produce-block"]); } finally { done(); } });
+
+test("выданный пакет — копия: правка пакета не меняет граф, из которого ворота выводят его заново; основание ищется только в собственных полях", () => {
+  const { store, done } = fresh(); try { const r = run(store, ZONE, OPS); const g = r.cand.graph; const ctx = { identity: r.identity }; const before = hashJson(g); const packets = W.buildPackets(g, ctx);
+    const p = packets.find(x => x.work === "garden-consume-work"); const n = p.neighbors.find(x => x.direction === "reads"); n.codeRef.path = "чужой-файл.txt"; n.neighbor.codeRef.path = "чужой-файл.txt"; p.hash = hashJson(p.neighbors);
+    assert.equal(hashJson(g), before, "граф не изменился"); assert.deepEqual(W.gatePackets(g, packets, ctx).codes, ["packet_neighbors_forged"]); } finally { done(); }
+  const second = fresh(); try { const store = second.store; const only = consumerOnly(store); put(store, only.g, "garden-produce-work", "garden-data"); const proto = Object.create({ "garden-data": { id: "x", revision: 1, hash: "a".repeat(64) } });
+    assert.deepEqual(W.checkDeliveries(store, P, only.g, { "garden-produce-block": proto }).findings.map(f => f.code), ["available_basis_missing"], "унаследованное поле основанием не считается"); } finally { second.done(); } });

@@ -59,7 +59,8 @@ export function neighborsOf(graph, workId, { identity = new Set(), receipts = ne
     const key = `${p.id}:${p.producer}`; const delivery = exec.has(p.producer) ? "in-plan" : receipts.has(key) ? "available" : "undelivered";
     out.push({ control: p.id, direction: t ? "receives" : "requires", ...(t ? { path: t.path, condition: t.condition } : { artifact: N.get(p.producer)?.outcome }), neighbor: chainOf(N, p.producer, identity), delivery, ...(delivery === "available" ? { basis: receipts.get(key) } : {}) }); }
   for (const t of transfers.filter(x => x.from === workId)) out.push({ control: t.id, direction: "sends", path: t.path, condition: t.condition, neighbor: chainOf(N, t.to, identity), delivery: exec.has(t.to) ? "in-plan" : "sleeping" });
-  return out.sort((a, b) => (hashJson(a) < hashJson(b) ? -1 : 1));
+  // записи пакета — КОПИИ: правка выданного пакета не меняет граф, из которого ворота выводят его заново (тот же класс, что вердикт №2 по M5, п.1)
+  return structuredClone(out.sort((a, b) => (hashJson(a) < hashJson(b) ? -1 : 1)));
 }
 
 /** F7.4. Вход работы плана от производителя вне плана. Одно правило для ВСЕХ видов входа (вердикт №1 по M7, пп. 2 и 3):
@@ -75,7 +76,7 @@ export function checkDeliveries(store, project, graph, bases = {}, { owner = () 
   const blockOf = id => N.get(N.get(N.get(id)?.parent)?.parent)?.id; const schemaOf = artifact => graph.contracts.find(x => x.id === graph.artifacts.find(a => a.id === artifact)?.contract)?.schema;
   const fits = (rec, artifact, producer) => rec.kind === "artifact" && rec.value.projectId === project && rec.value.artifact === artifact && rec.value.node === producer.id
     && rec.value.signature === nodeSignature(graph, producer) && rec.value.contractHash === hashJson(schemaOf(artifact));
-  const deliver = (key, artifact, producerId, target, flowBlock = null) => { const producer = N.get(producerId); const block = flowBlock ?? blockOf(producerId); /* блок — производитель связи на уровне блоков, а не «где лежит работа» */ const named = bases[block]?.[artifact]; const at = { target, producer: producerId, block, artifact }; checked.add(`${block}:${artifact}`);
+  const deliver = (key, artifact, producerId, target, flowBlock = null) => { const producer = N.get(producerId); const block = flowBlock ?? blockOf(producerId); /* блок — производитель связи на уровне блоков, а не «где лежит работа» */ const named = Object.hasOwn(bases, String(block)) && bases[block] && Object.hasOwn(bases[block], artifact) ? bases[block][artifact] : undefined; const at = { target, producer: producerId, block, artifact }; checked.add(`${block}:${artifact}`);
     if (!named) return findings.push({ code: "available_basis_missing", ...at }); const rec = store.get(named.id, named.revision);
     if (!rec || rec.hash !== named.hash) return findings.push({ code: "available_basis_unresolved", ...at }); const head = store.get(receiptId(project, artifact));
     if (rec.id !== receiptId(project, artifact) || head?.revision !== rec.revision || head?.hash !== rec.hash) return findings.push({ code: "available_basis_stale", ...at });

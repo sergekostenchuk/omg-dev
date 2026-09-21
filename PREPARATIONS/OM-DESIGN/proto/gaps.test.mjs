@@ -73,3 +73,32 @@ test("вердикт №1 п.1: G4b — у каждого блокирующег
   assert.deepEqual(G.gateAnswers(SRC, swap(r => ({ ...r, inputHash: "другая версия входа" }))).codes, ["answer_version_stale"]); assert.deepEqual(G.gateAnswers(SRC, [...all, all[0]]).codes, ["answer_duplicate"]);
   assert.deepEqual(G.gateAnswers(SRC, [...all, { ...all[0], gap: "f".repeat(64) }]).codes, ["answer_gap_unknown"]);
   const calm = { ...SRC, frameGaps: [], inputResult: { ...INPUT, gaps: INPUT.gaps.filter(g => g.code === "inventory_missing"), input: { ...INPUT.input, questions: [] } } }; assert.equal(G.gateAnswers(calm, []).passed, true, "инвентарь остаётся обязательством M8, но готовности сборки не держит"); });
+
+test("вердикт №2 п.1: проверяемая запись не может изменить доверенную таблицу — правка массива маршрутов НА МЕСТЕ политику не трогает, таблицы заморожены", () => {
+  const r = live(); const g = r.gaps.find(x => x.blocking && x.kind === "design-decision"); g.routes.splice(0, 1, "code"); assert.deepEqual(G.ROUTES["design-decision"], ["design"], "сценарий ревью: таблица не изменилась");
+  assert.deepEqual(live().gaps.find(x => x.id === g.id).routes, ["design"]); assert.deepEqual(G.gateGaps(r, SRC).codes, ["gap_record_forged"]);
+  const blocking = live().gaps.filter(x => x.blocking); assert.ok(G.gateAnswers(SRC, blocking.map((x, i) => ({ gap: x.id, route: "code", inputHash: INPUT.hash, answerRef: ref(i) }))).codes.includes("answer_route_foreign"), "маршрут code для проектных пробелов по-прежнему чужой");
+  assert.throws(() => G.ROUTES["design-decision"].push("code"), TypeError); assert.throws(() => { G.GAP_CLASSES.obligation_open.kind = "repository-fact"; }, TypeError); assert.throws(() => { G.ROUTES["design-decision"] = ["code"]; }, TypeError); assert.throws(() => G.MOMENTS.push("never"), TypeError);
+  const d = live().gaps.find(x => x.deferral); d.deferral.blocks.push("n-ui"); assert.notDeepEqual(d.deferral.blocks, d.consumers, "части записи не делят один массив");
+  assert.deepEqual(G.collectGaps({ ...SRC, frameGaps: [], inputResult: { ...INPUT, gaps: [{ code: "constructor", target: "x", kind: "design-decision", consumer: HOR.nodes[0] }] } }).refusals.map(x => x.code), ["gap_class_unknown"], "унаследованное поле объекта классом пробела не считается"); });
+
+test("вердикт №2 п.2: адресация заполняет только НЕДОСТАЮЩИЙ адрес — сведения производителя и принятую адресацию не переписывает; повтор того же решения ничего не меняет", () => {
+  const stages = load(); const u = stages.discovery.fields.preparation.unknowns[0]; u.consumer = HOR.nodes[0]; u.kind = "repository-fact"; const joined = buildOmInput(stages); const qid = `discovery:${u.id}`; const src = sourcesFor(HOR, joined);
+  const gap = G.collectGaps(src).gaps.find(g => g.target === qid); assert.equal(gap.blocking, true); assert.ok(G.gateAnswers(src, []).codes.includes("answer_missing_for_blocking_gap"));
+  const bypass = G.applyAddressing(joined, [{ question: qid, consumer: HOR.nodes[0], kind: "post-implementation-proof", basis: ref(1) }], UPPER);
+  assert.deepEqual(bypass.refusals.map(x => x.code), ["addressing_overrides_producer"], "сценарий ревью: переклассификация уже адресованного вопроса — отказ"); assert.equal(bypass.result.hash, joined.hash, "вход не изменён");
+  assert.equal(G.collectGaps(sourcesFor(HOR, bypass.result)).gaps.find(g => g.target === qid).blocking, true, "вопрос остался блокирующим: запрет отсрочки не обойдён");
+  const target = INPUT.input.questions[1]; const outside = UPPER.nodes.find(n => n.kind === "block" && !H.has(n.id) && n.id !== "n-ui").id; const d = { question: target.id, consumer: outside, kind: "environment-confirmation", basis: ref(7) };
+  const once = G.applyAddressing(INPUT, [d], UPPER), twice = G.applyAddressing(once.result, [d], UPPER); assert.deepEqual([once.refusals, twice.refusals], [[], []]); assert.equal(twice.result.hash, once.result.hash, "сценарий ревью: повтор того же решения не меняет версию входа");
+  assert.equal(twice.result.input.questions.find(q => q.id === target.id).prose, target.consumer, "исходная проза потребителя сохранена");
+  for (const other of [{ ...d, kind: "post-implementation-proof" }, { ...d, consumer: HOR.nodes[0] }, { ...d, basis: ref(8) }]) { const again = G.applyAddressing(once.result, [other], UPPER);
+    assert.deepEqual(again.refusals.map(x => x.code), ["addressing_conflict"], JSON.stringify(other)); assert.equal(again.result.hash, once.result.hash); }
+  assert.deepEqual(G.applyAddressing(INPUT, "не список", UPPER).refusals.map(x => x.code), ["addressing_invalid"]); });
+
+test("вердикт №2 п.3 и ОТСУТСТВИЕ: нет присланного набора, списка отказов, ответов или обязательного источника — типизированный отказ, а не успех; проход старше зафиксированного линий не меняет", () => {
+  assert.ok(live().gaps.some(g => g.blocking)); for (const bad of [{}, undefined, null, { gaps: live().gaps }, { refusals: [] }, { gaps: "набор", refusals: [] }, { gaps: [null], refusals: [] }])
+    assert.deepEqual(G.gateGaps(bad, SRC).codes, ["gap_set_missing"], `сценарий ревью: ${JSON.stringify(bad)?.slice(0, 40)}`);
+  assert.deepEqual(G.gateGaps({ gaps: [], refusals: [] }, SRC).codes, ["gap_missing"], "пустой присланный набор сверяется честно"); assert.deepEqual(G.gateAnswers(SRC, undefined).codes, ["answers_missing"]); assert.deepEqual(G.gateAnswers(SRC, [null]).codes, ["answers_missing"]);
+  for (const [name, broken] of [["horizon", { ...SRC, horizon: undefined }], ["graph", { ...SRC, graph: {} }], ["frameGaps", { ...SRC, frameGaps: null }]]) { assert.deepEqual(G.collectGaps(broken).refusals, [{ code: "gap_source_missing", target: name }]);
+    assert.deepEqual(G.gateGaps({ gaps: [], refusals: [] }, broken).codes, ["gap_source_missing"]); assert.deepEqual(G.gateAnswers(broken, []).codes, ["gap_source_missing"], "нет источника — не значит «пробелов нет»"); }
+  const p2 = G.mergeLines(G.mergeLines([], live().gaps, 1).lines, live().gaps, 2); for (const pass of [1, 0, 1.5, "3", undefined]) { const late = G.mergeLines(p2.lines, [], pass); assert.deepEqual(late.refusals.map(x => x.code), ["pass_out_of_order"], String(pass)); assert.deepEqual(late.lines, p2.lines); } });
