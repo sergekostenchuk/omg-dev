@@ -53,17 +53,28 @@ function acceptedEnds(connector, flows, o, level, under) {
 /** Узел-представитель: тождественное уточнение блока 1:1. Признак identity хранится в каркасе, а не в узле (схема узла закрыта). */
 export const identityNode = (block, level = 2) => ({ ...structuredClone(block), id: repId(block.id, level), kind: KIND[level], parent: block.id, title: `${block.title} (представитель ${level === 2 ? "блока" : "операции"})` });
 
+/** СВОЯ часть слоя: то, что есть в проекции уровня, но отсутствует в проекции уровня выше, — узлы уровня, привязки уровня, зависимые определения. */
+export function lowerPart(graph, level) { const P = projectGraph(graph, level), U = projectGraph(graph, level - 1); const seen = key => new Set((U[key] ?? []).map(x => hashJson(x)));
+  const own = key => { const u = seen(key); return (P[key] ?? []).filter(x => !u.has(hashJson(x))); };
+  return { nodes: P.nodes.filter(n => n.kind === KIND[level]), bindings: P.connectors.map(c => ({ id: c.id, wakeTest: c.wakeTest ?? null, bindings: c.bindings.filter(b => b.level === level) })).filter(c => c.bindings.length),
+    ...Object.fromEntries(["anchors", "joins", "tests", "edges", "transfers", "packets"].map(k => [k, own(k)])), horizon: P.horizon ?? [] }; }
+
 /** Принятое состояние: граф и принятый каркас (с источниками заполнений). Исторический слой без каркаса — целиком настоящий. */
 export function loadAccepted(store, project, level = 2) {
   const graph = store.get(`graph:${project}`); const frame = store.get(`om-frame:${project}:${level}`);
-  // записанное соответствие «обязательство → конец» относится к слою, принятому вместе с ним: сверка по хэшу проекции слоя (как LayerProof движка)
-  const drift = Boolean(frame && graph && frame.value.layerHash !== hashJson(projectGraph(graph.value, level)));
-  return { graph, frame, drift, recorded: frame && !drift ? frame.value.fills : null, identity: new Set((frame?.value.fills ?? []).filter(f => f.source === "identity").map(f => f.node)) };
+  // записанное соответствие «обязательство → конец» относится к слою, принятому вместе с ним: сверка по хэшу проекции слоя (как LayerProof движка).
+  // Слой изменился: если СВОЯ часть слоя та же, а верхний слой — ровно тот, что принят каркасом уровня выше, это законная смена базы (нужен явный
+  // переход rebaseFrame); всё остальное — правка в обход каркаса (вердикт №3 по M7, п.3). Проверка посторонних изменений не ослабляется.
+  let drift = false, rebase = false;
+  if (frame && graph && frame.value.layerHash !== hashJson(projectGraph(graph.value, level))) { const upperFrame = level > 2 ? store.get(`om-frame:${project}:${level - 1}`) : null;
+    rebase = Boolean(upperFrame) && upperFrame.value.layerHash === hashJson(projectGraph(graph.value, level - 1)) && frame.value.lowerHash === hashJson(lowerPart(graph.value, level)); drift = !rebase; }
+  return { graph, frame, drift, rebase, recorded: frame && !drift && !rebase ? frame.value.fills : null, identity: new Set((frame?.value.fills ?? []).filter(f => f.source === "identity").map(f => f.node)) };
 }
 
 /** F4.2 + F4.3. Заполнения: принятое настоящее → предложения → представитель (только вне горизонта). Возвращает fills и незаполненное. */
 export function fillObligations(upper, obligations, accepted, proposals, horizon, baseRefs, level = 2) {
   const g = accepted?.graph?.value ?? null; const identity = accepted?.identity ?? new Set(); const fills = []; const open = [];
+  if (accepted?.rebase) refuse("frame_rebase_required", accepted.frame.id, "Верхний слой законно изменён и принят: сначала явный переход каркаса на новую базу (rebaseFrame), потом новые обязательства");
   if (accepted?.drift) refuse("frame_layer_drift", accepted.frame.id, "Принятый слой изменён в обход каркаса: записанное соответствие обязательств к нему не относится");
   // принадлежность узла верхнему — действующая семантика уточнения движка: вложенность И явное realizes (вердикт №2 по M7, п.2), а не один parent
   const rel = new RefinementRelations({ version: 2, nodes: [...(g?.nodes ?? upper.nodes), ...proposals.flatMap(p => p.value.nodes)], edges: [...(g?.edges ?? upper.edges ?? []), ...proposals.flatMap(p => p.value.edges ?? [])] });
@@ -125,12 +136,16 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
   const need = new Set(filled.fills.filter(f => f.source === "identity").map(f => f.node));
   for (const b of upper.nodes.filter(n => n.kind === KIND[level - 1])) if (need.has(repId(b.id, level)) && !cand.nodes.some(n => n.id === repId(b.id, level))) {
     cand.nodes.push(identityNode(b, level)); if (level === 2) for (const j of upper.joins.filter(j => j.consumer === b.id)) cand.joins.push({ ...structuredClone(j), id: `${j.id}-i`, consumer: repId(b.id) }); }
+  // представитель несёт только те порты, концы которых закрывает САМ: если часть концов верхнего узла закрыта настоящим узлом (например, работой,
+  // реализующей две операции), лишний порт представителя остался бы непривязанным
+  for (const b of upper.nodes.filter(n => n.kind === KIND[level - 1])) { const rep = cand.nodes.find(n => n.id === repId(b.id, level)); if (!rep || !need.has(rep.id)) continue;
+    const used = new Set(filled.fills.filter(f => f.source === "identity" && f.node === rep.id && f.port !== undefined).map(f => f.port)); rep.ports = structuredClone(b.ports.filter(p => used.has(p.id))); }
   // уровень 3: план исполнения — настоящие работы операций горизонта; представитель не исполняется никогда
   const relC = new RefinementRelations(cand); const exec = new Set(level === 3 ? cand.nodes.filter(n => n.kind === "work" && !need.has(n.id) && [...horizon].some(op => relC.refines(n.id, op))).map(n => n.id) : []); if (level === 3) cand.horizon = [...exec].sort();
   const obById = new Map(obligations.map(o => [o.id, o]));
   for (const c of cand.connectors) { const ups = c.bindings.filter(b => b.level === level - 1); if (!ups.length) continue; const lower = [];
     const of = (role, node, port, flow) => filled.fills.filter(f => { const o = obById.get(f.obligation); return o.connector === c.id && o.role === role && o.upper === node && o.port === port && o.flow === flow; }).map(f => plain({ node: f.node, port: f.port, codeRef: f.codeRef }));
-    for (const U of ups) { const fk = flowKey(U); const producer = of("producer", U.producer.node, U.producer.port, fk)[0]; const consumers = U.consumers.flatMap(e => of("consumer", e.node, e.port, fk));
+    for (const U of ups) { const fk = flowKey(U); const producer = of("producer", U.producer.node, U.producer.port, fk)[0]; const consumers = U.consumers.flatMap(e => of("consumer", e.node, e.port, fk)).filter((e, i, all) => all.findIndex(x => x.node === e.node && x.port === e.port) === i);      // один конец может законно закрывать два обязательства потока (работа уточняет две операции): в привязке он один
       // уровень 3, действующий механизм «спящей связи»: производитель в плане исполнения, потребитель — нет → отдельная привязка с якорем и тестом пробуждения
       if (level === 3 && U.anchor == null && producer && exec.has(producer.node) && consumers.some(e => !exec.has(e.node))) {
         const test = cand.tests.find(t => t.node === producer.node && t.covers.includes(c.id)); if (!test) refuse("sleeping_wake_test_missing", c.id, `У производителя ${producer.node} нет теста, покрывающего связь: спящий потребитель останется без проверки пробуждения`);
@@ -157,7 +172,7 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
 export function saveCandidate(store, project, candidate, filled, base, proposals, level = 2) {
   // имя кандидата — от графа, базы и предложений: одинаковый граф на другой базе — другой кандидат
   return store.write({ id: `om-candidate:${hashJson([candidate.hash, base, proposals.map(p => reference(p))])}`, kind: "frame-candidate", expected: 0,
-    value: plain({ project, level, graphHash: candidate.hash, layerHash: hashJson(projectGraph(candidate.graph, level)), graph: candidate.graph, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
+    value: plain({ project, level, graphHash: candidate.hash, layerHash: hashJson(projectGraph(candidate.graph, level)), upperHash: hashJson(projectGraph(candidate.graph, level - 1)), lowerHash: hashJson(lowerPart(candidate.graph, level)), graph: candidate.graph, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
 }
 
 /** F4.6. Исход проверки G3 для ТОЧНОЙ записи кандидата. Цепочка: граф из записи → его хэш → запись кандидата → исход G3.
@@ -179,6 +194,20 @@ export function settleCandidate(store, project, candidateRef, passed, codes = []
   if (stale(graph, rec.value.base.graph) || stale(frame, rec.value.base.frame)) refuse("input_stale", rec.id, "База кандидата уже сменилась: принят другой кандидат");
   const guards = [reference(rec), ...(graph ? [reference(graph)] : []), ...(frame ? [reference(frame)] : []), ...saved];
   return store.writeMany([{ id: `graph:${project}`, kind: "graph", expected: graph?.revision ?? 0, value: rec.value.graph },
-    { id: `om-frame:${project}:${level}`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level, candidateHash: rec.value.graphHash, layerHash: rec.value.layerHash,
+    { id: `om-frame:${project}:${level}`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level, candidateHash: rec.value.graphHash, layerHash: rec.value.layerHash, upperHash: rec.value.upperHash, lowerHash: rec.value.lowerHash,
       fills: rec.value.fills.map(f => ({ ...f, source: f.source === "proposed" ? "accepted" : f.source })) }) }, ...mark("accepted")], guards);
+}
+
+/** Явный переход каркаса на новую принятую базу (вердикт №3 по M7, п.3). Условия — те же, что в loadAccepted: своя часть слоя не менялась, верхний слой
+ *  принят каркасом уровня выше. Заполнения, чьё обязательство сохранилось в новом верхнем слое (тот же id = тот же конец того же потока), ПЕРЕНОСЯТСЯ;
+ *  остальные уходят в retired и остаются в записи. История — ревизии записи каркаса и ссылка rebasedFrom. Новые обязательства заполнений не имеют:
+ *  после перехода они обрабатываются обычным порядком (предложение, представитель, пробел). Одна транзакция с охраной графа и каркаса. */
+export function rebaseFrame(store, project, level = 3) {
+  const acc = loadAccepted(store, project, level); if (!acc.frame || !acc.graph) refuse("frame_missing", `om-frame:${project}:${level}`, "Переносить нечего: каркас уровня не принят");
+  if (acc.drift) refuse("frame_layer_drift", acc.frame.id, "Принятый слой изменён в обход каркаса: переход на новую базу не выполняется"); if (!acc.rebase) return { skipped: "каркас уже на действующей базе" };
+  const g = acc.graph.value; const ids = new Set(frameObligations(upperOf(g, level), new Set(), level).map(o => o.id)); const fills = acc.frame.value.fills;
+  const carried = fills.filter(f => ids.has(f.obligation)), retired = fills.filter(f => !ids.has(f.obligation));
+  store.writeMany([{ id: acc.frame.id, kind: "connection-frame", expected: acc.frame.revision, value: plain({ ...acc.frame.value, layerHash: hashJson(projectGraph(g, level)), upperHash: hashJson(projectGraph(g, level - 1)),
+    fills: carried, retired: [...(acc.frame.value.retired ?? []), ...retired], rebasedFrom: reference(acc.frame) }) }], [reference(acc.graph), reference(acc.frame)]);
+  return { carried: carried.length, retired: retired.length };
 }
