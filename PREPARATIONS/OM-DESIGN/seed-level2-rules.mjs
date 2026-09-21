@@ -4,11 +4,11 @@ import { W, heightOf } from "./vocab.mjs";
 import { RULES, OWNER_DECISIONS } from "./level2-rules.mjs";
 const s = JSON.parse(readFileSync("om-design.json", "utf8")); const by = id => s.nodes.find(n => n.id === id); s.notes ??= [];
 const NW = 820, GAP = 60, X0 = 10080, Y0 = -80; const wrapped = t => t.split("\n").reduce((a, l) => a + Math.max(1, Math.ceil(l.length / 96)), 0); const heightFor = t => Math.max(420, 110 + 22 * wrapped(t));
-const COLS = [["rules-general", "rules-m1m2", "rules-m4"], ["rules-handoff-horizon", "rules-m7", "rules-g8"], ["rules-handoff-gaps", "rules-m5", "rules-appendix"]]; let maxH = 0;
+const COLS = [["rules-general", "rules-m1m2", "rules-m4"], ["rules-handoff-horizon", "rules-m7", "rules-g8"], ["rules-handoff-gaps", "rules-m5", "rules-appendix"], ["rules-m6", "rules-mc"]]; let maxH = 0;
 COLS.forEach((col, ci) => { let y = Y0; for (const id of col) { const r = RULES.find(x => x.id === id); if (!r) throw new Error(`нет текста ${id}`); const h = heightFor(r.text);
   let n = s.notes.find(x => x.properties?.omd_note === id || x.title === r.title); if (!n) { n = { id: Math.max(0, ...s.notes.map(x => Number(x.id) || 0)) + 1, type: "Note", flags: {}, order: 0, mode: 0, inputs: [], outputs: [], color: "#2f4a3a", bgcolor: "#26332b" }; s.notes.push(n); }
   Object.assign(n, { title: r.title, pos: [X0 + ci * (NW + GAP), y], size: [NW, h], properties: { ...(n.properties ?? {}), omd_note: id }, widgets_values: [r.text] }); y += h + 90; } maxH = Math.max(maxH, y); });
-const GT = "Уровень 2 · ПРАВИЛА И ПЕРЕДАЧИ · предмет ревью"; let g = s.groups.find(x => x.title === GT); if (!g) { g = { id: GT, title: GT }; s.groups.push(g); } g.bounding = [X0 - 40, Y0 - 80, 3 * NW + 2 * GAP + 80, maxH - Y0 + 60];
+const GT = "Уровень 2 · ПРАВИЛА И ПЕРЕДАЧИ · предмет ревью"; let g = s.groups.find(x => x.title === GT); if (!g) { g = { id: GT, title: GT }; s.groups.push(g); } g.bounding = [X0 - 40, Y0 - 80, COLS.length * NW + (COLS.length - 1) * GAP + 80, maxH - Y0 + 60];
 const G8 = s.nodes.find(n => /^G8/.test(n.fields?.["название"] ?? ""))?.id;
 for (const d of OWNER_DECISIONS) { const consumer = by(d.consumer) ? d.consumer : d.id === "d-model-cap" ? G8 : null; if (!consumer) throw new Error(`нет потребителя для ${d.id}`);
   let n = by(d.id); if (!n) { n = { id: d.id, type: "owner", fields: {}, pos: [1680, 900000 + s.nodes.length], size: [W, 0], group: "Решения владельца" }; s.nodes.push(n); }
@@ -24,6 +24,10 @@ for (const id of ["gate-repeat", "store-repairs"]) { const n = by(id); if (!n) t
 const NOBUDGET = " РЕШЕНИЕ ВЛАДЕЛЬЦА 21.09.2026 (вечер): упомянутые в этой карточке бюджет, предохранители, потолки и лимиты попыток больше НЕ являются условием допуска или остановки. Действуют Т0 и правила «Вызовы модели · вопрос по делу, учёт, продвижение и остановка»; расход только учитывается.";
 for (const id of ["mech-weight", "model-research", "model-design"]) { const n = by(id); if (!n) throw new Error(`нет карточки ${id}`); const key = Object.keys(n.fields).find(k => /бюджет/i.test(k)) ?? Object.keys(n.fields).find(k => k !== "название") ?? Object.keys(n.fields)[0];
   if (!n.fields[key].includes("больше НЕ являются условием допуска или остановки")) { n.fields[key] += NOBUDGET; n.size = [W, heightOf(n.type, n.fields)]; } }
+const L2MC = " Уровень 2 карты (21.09.2026): раскрыт карточками правил «M6 · маршрут пробела и ответ кодом» и «MC1 и MC2 · обращение к модели: пакет вопроса, форма ответа, проверка».";
+for (const id of ["mech-derive", "model-research", "model-design"]) { const n = by(id); const key = Object.keys(n.fields).find(k => k === "что делает" || k === "вопрос") ?? Object.keys(n.fields)[1]; if (!n.fields[key].includes("раскрыт карточками правил «M6")) { n.fields[key] += L2MC; n.size = [W, heightOf(n.type, n.fields)]; } }
+const ROLES = " РЕШЕНИЕ ВЛАДЕЛЬЦА 21.09.2026 (вечер): «чтобы было одно обращение к модели, и она спокойно на это ответила по делу». Цикл «планировщик чтения → читатель → аналитик → оценщик» ЗАМЕНЁН: одно обращение исследователя по узкому пакету вопроса, чтение — по конкретным адресам, независимый оценщик — отдельной ролью и только после проверок кодом. Роли планировщика и читателя не вводятся.";
+{ const n = by("model-research"); const key = Object.keys(n.fields).find(k => /бюджет/i.test(k)); if (!n.fields[key].includes("Цикл «планировщик чтения → читатель → аналитик → оценщик» ЗАМЕНЁН")) { n.fields[key] += ROLES; n.size = [W, heightOf(n.type, n.fields)]; } }
 for (const gid of new Set(s.nodes.map(n => n.group).filter(Boolean))) { const ns = s.nodes.filter(n => n.group === gid).sort((a, b) => a.pos[1] - b.pos[1]); let yy = ns[0].pos[1]; for (const n of ns) { n.pos[1] = yy; yy += n.size[1] + 110; }
   const gg = s.groups.find(x => x.id === gid || String(x.title).startsWith(gid)); if (gg) gg.bounding = [ns[0].pos[0] - 40, ns[0].pos[1] - 80, W + 80, yy - 110 - ns[0].pos[1] + 140]; }
 writeFileSync("om-design.json", JSON.stringify(s, null, 1));
