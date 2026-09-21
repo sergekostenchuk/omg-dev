@@ -25,7 +25,9 @@ export function buildOmInput(stages, { inventory = null } = {}) {
   const usedBy = id => preps.map((p, i) => ({ p, i })).filter(({ p }) => (p.behaviorContracts ?? []).includes(id)).map(({ p, i }) => ({ feature: i, title: String(p.featureTitle).slice(0, 80) }));
   const contracts = bcs.map(c => { for (const r of c.requirements ?? []) if (!reqIds.has(r)) refuse("requirement_ref_unresolved", `${c.id}.requirements`, `Требование ${r} не найдено в концепции`);
     if (!artIds.has(c.outcome)) refuse("outcome_artifact_unknown", `${c.id}.outcome`, `Исход ${c.outcome} не является артефактом карты`);
-    let nodes = null; if (Array.isArray(c.nodes) && c.nodes.length) { for (const n of c.nodes) if (!nodeIds.has(n)) refuse("contract_node_unknown", `${c.id}.nodes`, `Узел ${n} не найден на карте`); nodes = [...c.nodes].sort(); }
+    // правило эры: запись прежней эры поля nodes не имеет вовсе — это пробел; запись новой эры поле объявила и обязана его заполнить
+    let nodes = null; if (Array.isArray(c.nodes) && c.nodes.length) { for (const n of c.nodes) if (!nodeIds.has(n)) refuse("contract_node_unknown", `${c.id}.nodes`, `Узел ${n} не найден на карте`); nodes = [...new Set(c.nodes)].sort(); }
+    else if ("nodes" in c) refuse("contract_node_unbound", `${c.id}.nodes`, "Поле привязки объявлено, но пусто или не список id");
     else gap("contract_node_unbound", c.id, { features: usedBy(c.id) }, "Контракт не привязан к блокам карты по id; упоминание блока в прозе привязкой не считается");
     const proseFields = ["writer", "authority", "rollback"].filter(k => { const v = c.state?.[k]; return !(typeof v === "string" && (nodeIds.has(v) || actorIds.has(v))); });
     if (proseFields.length) gap("contract_boundary_prose", c.id, { features: usedBy(c.id) }, `Граница записана прозой, а не id узла или участника: ${proseFields.join(", ")}`);

@@ -24,6 +24,8 @@ test("битые ссылки — отказ ворот входа с типиз
   bad(s => { s.features.fields.featurePreparation.find(p => p.remainingQuestions.length).remainingQuestions[0].consumer = " "; }, "question_consumer_missing");
   bad(s => { s.features.fields.features[0].outcome = "a-нет-такого"; }, "outcome_artifact_unknown");
   bad(s => { s.specification.fields.behaviorContracts[0].nodes = ["n-нет-такого"]; }, "contract_node_unknown");
+  bad(s => { s.specification.fields.behaviorContracts[0].nodes = []; }, "contract_node_unbound");          // новая эра: поле объявлено и пусто — отказ
+  bad(s => { s.specification.fields.behaviorContracts[0].nodes = "n-intake"; }, "contract_node_unbound");   // не список id
   bad(s => { delete s.specification.fields.behaviorContracts; }, "input_field_missing"); bad(s => { delete s.concept; }, "input_field_missing"); });
 
 test("привязка контракта к блокам — по id и «один ко многим»; упоминание блока в прозе привязкой не считается", () => {
