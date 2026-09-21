@@ -39,7 +39,7 @@ export function loadAccepted(store, project) {
 export function fillObligations(upper, obligations, accepted, proposals, horizon, baseRefs) {
   const g = accepted?.graph?.value ?? null; const identity = accepted?.identity ?? new Set(); const fills = []; const open = [];
   const parentOf = new Map([...(g?.nodes ?? []), ...proposals.flatMap(p => p.value.nodes)].map(n => [n.id, n.parent]));
-  for (const p of proposals) { if (p.value.status !== "proposed") continue;
+  for (const p of proposals) { if (p.value.status !== "proposed") refuse("proposal_not_proposed", p.id, `Предложение со статусом ${p.value.status} повторно не подаётся: нужно новое предложение`);
     if (hashJson(p.value.base) !== hashJson(baseRefs)) refuse("proposal_base_stale", p.id, "Предложение сделано для другой базы"); }
   const removed = new Set(proposals.flatMap(p => p.value.removes ?? []));
   for (const o of obligations) {
@@ -89,7 +89,8 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
     // зависимое определение принятой части меняется только ЯВНО: его id назван в redefines предложения
     for (const key of PARTS) for (const x of p.value[key] ?? []) { const at = cand[key].findIndex(y => y.id === x.id);
       if (at < 0) cand[key].push(structuredClone(x)); else if ((p.value.redefines ?? []).includes(x.id)) cand[key][at] = structuredClone(x); }
-    for (const c of p.value.localConnectors ?? []) if (!cand.connectors.some(y => y.id === c.id)) cand.connectors.push(structuredClone(c)); }
+    for (const c of p.value.localConnectors ?? []) { const at = cand.connectors.findIndex(y => y.id === c.id);
+      if (at < 0) cand.connectors.push(structuredClone(c)); else if ((p.value.redefines ?? []).includes(c.id)) cand.connectors[at] = structuredClone(c); } }
   const need = new Set(filled.fills.filter(f => f.source === "identity").map(f => f.node));
   for (const b of upper.nodes.filter(n => n.kind === "block")) if (need.has(repId(b.id)) && !cand.nodes.some(n => n.id === repId(b.id))) {
     cand.nodes.push(identityNode(b)); for (const j of upper.joins.filter(j => j.consumer === b.id)) cand.joins.push({ ...structuredClone(j), id: `${j.id}-i`, consumer: repId(b.id) }); }
@@ -113,19 +114,28 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
 export function saveCandidate(store, project, candidate, filled, base, proposals) {
   // имя кандидата — от графа, базы и предложений: одинаковый граф на другой базе — другой кандидат
   return store.write({ id: `om-candidate:${hashJson([candidate.hash, base, proposals.map(p => reference(p))])}`, kind: "frame-candidate", expected: 0,
-    value: plain({ project, level: 2, graphHash: candidate.hash, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
+    value: plain({ project, level: 2, graphHash: candidate.hash, graph: candidate.graph, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
 }
 
-/** F4.6. Исход проверки. Проход — один writeMany с охраной на актуальные граф, каркас и предложения; отказ принятого не меняет. */
-export function settleCandidate(store, project, candidate, candidateRev, passed, codes = []) {
-  const proposals = candidateRev.value.proposals.map(r => store.get(r.id)); const verdict = { candidateHash: candidate.hash, candidate: reference(candidateRev), codes };
-  const mark = status => proposals.map(p => ({ id: p.id, kind: "layer-proposal", expected: p.revision, value: plain({ ...p.value, status, verdict }) }));
-  if (!passed) return store.writeMany(mark("rejected"), [reference(candidateRev)]);
+/** F4.6. Исход проверки G3 для ТОЧНОЙ записи кандидата. Цепочка: граф из записи → его хэш → запись кандидата → исход G3.
+ *  Предложения сверяются и охраняются по ссылкам, сохранённым в кандидате, а не по текущим головам. */
+export function settleCandidate(store, project, candidateRef, passed, codes = []) {
+  const rec = store.get(candidateRef.id, candidateRef.revision);
+  if (!rec || rec.hash !== candidateRef.hash || rec.kind !== "frame-candidate") refuse("candidate_missing", candidateRef.id, "Исход G3 выдан не на эту запись кандидата");
+  if (hashJson(rec.value.graph) !== rec.value.graphHash) refuse("candidate_graph_mismatch", rec.id, "Граф в записи не соответствует проверенному хэшу");
+  const saved = rec.value.proposals; const heads = saved.map(r => store.get(r.id));
+  const exact = heads.every((h, i) => h && h.revision === saved[i].revision && h.hash === saved[i].hash && h.value.status === "proposed");
+  const verdict = { candidateHash: rec.value.graphHash, candidate: reference(rec), codes };
+  const mark = status => heads.map((p, i) => ({ id: p.id, kind: "layer-proposal", expected: saved[i].revision, value: plain({ ...p.value, status, verdict }) }));
+  if (!passed) { if (!exact) return { skipped: "предложения уже в другой ревизии или статусе — запоздавший отказ ничего не меняет" };
+    return store.writeMany(mark("rejected"), [reference(rec), ...saved]); }
+  // проход: отдельной сверки предложений нет намеренно — их защищают охранные ссылки и expected по ревизиям, СОХРАНЁННЫМ в кандидате:
+  // изменённое после сборки предложение даёт input_stale от самого хранилища, и ни одна запись транзакции не применяется
   const graph = store.get(`graph:${project}`); const frame = store.get(`om-frame:${project}:2`);
-  const guards = [reference(candidateRev), ...(graph ? [reference(graph)] : []), ...(frame ? [reference(frame)] : []), ...proposals.map(p => reference(p))];
   const stale = (now, was) => (now ? hashJson(reference(now)) : null) !== (was ? hashJson(was) : null);
-  if (stale(graph, candidateRev.value.base.graph) || stale(frame, candidateRev.value.base.frame)) refuse("input_stale", candidate.hash, "База кандидата уже сменилась: принят другой кандидат");
-  return store.writeMany([{ id: `graph:${project}`, kind: "graph", expected: graph?.revision ?? 0, value: candidate.graph },
-    { id: `om-frame:${project}:2`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level: 2, candidateHash: candidate.hash,
-      fills: candidateRev.value.fills.map(f => ({ ...f, source: f.source === "proposed" ? "accepted" : f.source })) }) }, ...mark("accepted")], guards);
+  if (stale(graph, rec.value.base.graph) || stale(frame, rec.value.base.frame)) refuse("input_stale", rec.id, "База кандидата уже сменилась: принят другой кандидат");
+  const guards = [reference(rec), ...(graph ? [reference(graph)] : []), ...(frame ? [reference(frame)] : []), ...saved];
+  return store.writeMany([{ id: `graph:${project}`, kind: "graph", expected: graph?.revision ?? 0, value: rec.value.graph },
+    { id: `om-frame:${project}:2`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level: 2, candidateHash: rec.value.graphHash,
+      fills: rec.value.fills.map(f => ({ ...f, source: f.source === "proposed" ? "accepted" : f.source })) }) }, ...mark("accepted")], guards);
 }

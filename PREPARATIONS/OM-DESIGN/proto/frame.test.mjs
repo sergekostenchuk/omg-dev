@@ -39,7 +39,7 @@ function pass(store, horizonIds, makeProposals = () => [], UPPER_ = UPPER) {
   const proposals = makeProposals(obligations, base, acc); const filled = F.fillObligations(UPPER, obligations, acc, proposals, horizon, base);
   if (filled.open.length) return { obligations, filled, acc };
   const candidate = F.assembleCandidate(UPPER, obligations, filled, acc, proposals, horizon); const rev = F.saveCandidate(store, P, candidate, filled, base, proposals);
-  return { obligations, filled, candidate, rev, acc, settle: (ok = true) => F.settleCandidate(store, P, candidate, rev, ok) };
+  return { obligations, filled, candidate, rev, acc, settle: (ok = true) => F.settleCandidate(store, P, reference(rev), ok) };
 }
 const refusal = (fn, code) => assert.throws(fn, e => { assert.ok(String(e.code ?? e.message).includes(code) || String(e.message).includes(code), `ожидался ${code}, получено: ${e.code} ${e.message}`); return true; });
 
@@ -105,3 +105,37 @@ test("кратность: все потребители связи доезжа�
     const multi = UPPER.connectors.filter(c => c.bindings[0].consumers.length > 1); assert.ok(multi.length > 0);
     for (const c of multi) { const low = r.candidate.graph.connectors.find(x => x.id === c.id).bindings.find(b => b.level === 2); const want = FULL.connectors.find(x => x.id === c.id).bindings.find(b => b.level === 2).consumers.length;
       assert.equal(low.consumers.length, want, `${c.id}: потребителей внизу ${low.consumers.length}, в принятом слое ${want}`); } } finally { done(); } });
+
+// ---- контрпримеры третьего вердикта Codex (~/REPORTS/review/omg-l2-m4_verdict-3.md) ----
+test("принимается только граф из записи кандидата: подмена объекта после проверки ничего не даёт, несоответствие хэша — отказ (вердикт 3, п.1)", () => {
+  const { store, done } = fresh(); try { const r = pass(store, []); r.candidate.graph.nodes.find(n => n.kind === "operation").title = "ПОДМЕНА после проверки"; r.settle();
+    const acc = F.loadAccepted(store, P); assert.equal(acc.graph.hash ? acc.frame.value.candidateHash : null, r.rev.value.graphHash);
+    assert.ok(!JSON.stringify(acc.graph.value).includes("ПОДМЕНА"), "в принятый граф попало только проверенное содержание");
+    const forged = store.write({ id: "om-candidate:forged", kind: "frame-candidate", expected: 0, value: { ...r.rev.value, graphHash: "0".repeat(64) } });
+    refusal(() => F.settleCandidate(store, P, reference(forged), true), "candidate_graph_mismatch");
+    refusal(() => F.settleCandidate(store, P, { ...reference(r.rev), hash: "f".repeat(64) }, true), "candidate_missing"); } finally { done(); } });
+
+test("принятие идёт по ревизиям предложений, сохранённым в кандидате; изменённое после сборки предложение не принимается (вердикт 3, п.2)", () => {
+  const { store, done } = fresh(); try { pass(store, []).settle(); const H = ["n-intake", "n-state"];
+    const r = pass(store, H, (ob, base) => [put(store, "p", proposalFor(H, ob, base))]); const p1 = store.get("om-proposal:p");
+    store.write({ id: p1.id, kind: "layer-proposal", expected: p1.revision, value: { ...p1.value, nodes: p1.value.nodes.map(n => ({ ...n, title: n.title + " (изменено после сборки)" })) } });
+    const head = F.loadAccepted(store, P).graph.hash; refusal(() => r.settle(), "input_stale");
+    assert.equal(F.loadAccepted(store, P).graph.hash, head); assert.equal(store.get("om-proposal:p").value.status, "proposed", "новое содержание не помечено принятым"); } finally { done(); } });
+
+test("отклонённое предложение повторно не подаётся; запоздавший отказ не отменяет принятого (вердикт 3, п.2)", () => {
+  const { store, done } = fresh(); try { pass(store, []).settle(); const H = ["n-intake", "n-state"];
+    const r = pass(store, H, (ob, base) => [put(store, "x", proposalFor(H, ob, base))]); r.settle(false); assert.equal(store.get("om-proposal:x").value.status, "rejected");
+    refusal(() => pass(store, H, () => [store.get("om-proposal:x")]), "proposal_not_proposed");
+    const ok = pass(store, H, (ob, base) => [put(store, "y", proposalFor(H, ob, base))]); ok.settle(); const late = ok.settle(false);
+    assert.ok(late.skipped); assert.equal(store.get("om-proposal:y").value.status, "accepted", "запоздавший отказ не меняет принятое"); } finally { done(); } });
+
+test("законная замена раскрытия с переопределением ЛОКАЛЬНОЙ связи принимается (вердикт 3, п.3)", () => {
+  const { store, done } = fresh(); try { const H = ["n-intake", "n-state"]; pass(store, []).settle(); pass(store, H, (ob, base) => [put(store, "h", proposalFor(H, ob, base))]).settle();
+    const OLD = "o-state-project", NEW = "o-state-project-v2"; const r = pass(store, H, (ob, base, acc) => { const v = proposalFor(["n-state"], ob, base, { [OLD]: NEW });
+      const sw = x => JSON.parse(JSON.stringify(x).replaceAll(`"${OLD}"`, `"${NEW}"`)); v.nodes = v.nodes.filter(n => n.id === NEW); v.redefines = [];
+      for (const key of ["joins", "tests", "edges", "journeys", "packets", "transfers"]) { v[key] = []; for (const x of acc.graph.value[key] ?? []) if (JSON.stringify(x).includes(`"${OLD}"`)) { v[key].push(sw(x)); v.redefines.push(x.id); } }
+      v.localConnectors = acc.graph.value.connectors.filter(c => !c.bindings.some(b => b.level === 1) && JSON.stringify(c).includes(`"${OLD}"`)).map(sw); v.redefines.push(...v.localConnectors.map(c => c.id));
+      assert.ok(v.localConnectors.length > 0, "у заменяемой операции есть локальная связь"); v.removes = [OLD];
+      v.fills = v.fills.filter(f => f.node === NEW); v.replaces = v.fills.map(f => ({ obligation: f.obligation, base: { node: OLD, graph: reference(acc.graph) }, with: { node: f.node, port: f.port ?? null }, basis: "исправление раскрытия n-state" }));
+      v.artifacts = []; v.contracts = []; return [put(store, "swap", v)]; });
+    const ids = r.candidate.graph.nodes.map(n => n.id); assert.ok(ids.includes(NEW) && !ids.includes(OLD)); r.settle(); } finally { done(); } });
