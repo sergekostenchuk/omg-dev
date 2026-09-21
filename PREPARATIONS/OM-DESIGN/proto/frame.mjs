@@ -8,6 +8,7 @@ import { composeLayer, layerDesignOf } from "../../../dist/src/graph/layer-desig
 import { projectGraph } from "../../../dist/src/graph/project.js";
 import { hashJson } from "../../../dist/src/canonical.js";
 import { reference } from "../../../dist/src/pipeline/contracts.js";
+import { RefinementRelations } from "../../../dist/src/graph/relations.js";
 
 export class FrameRefusal extends Error { constructor(code, target, message) { super(`${code}: ${message}`); this.code = code; this.target = target; } }
 const refuse = (code, target, message) => { throw new FrameRefusal(code, target, message); };
@@ -33,17 +34,19 @@ export function frameObligations(upper, horizon, level = 2) {
   return [...out.values()].sort((a, b) => a.id < b.id ? -1 : 1);
 }
 
-/** Принятые концы нижних привязок, относящиеся к обязательству. Нижняя привязка относится к верхнему потоку по узлам (правило уточнения
+/** ЭВРИСТИКА для слоя БЕЗ записи каркаса (исторический слой). Там, где соответствие «обязательство → конец» принято и записано, оно читается из
+ *  записи (fillObligations) и не угадывается заново (вердикт №2 по M7, п.1).
+ *  Принятые концы нижних привязок, относящиеся к обязательству. Нижняя привязка относится к верхнему потоку по узлам (правило уточнения
  *  валидатора); подходят несколько РАЗНЫХ потоков — по совпадению id портов; не различить — отказ: первый порт не выбирается. */
-function acceptedEnds(connector, flows, o, level, parentOf) {
+function acceptedEnds(connector, flows, o, level, under) {
   const out = []; const ambiguous = () => refuse("accepted_binding_ambiguous", o.connector, `Принятую привязку связи ${o.connector} нельзя однозначно отнести к верхнему потоку: нужны разные id портов или запись каркаса`);
   for (const L of connector?.bindings.filter(b => b.level === level) ?? []) {
-    let mine = flows.filter(U => parentOf(L.producer.node) === U.producer.node && L.consumers.every(e => U.consumers.some(u => u.node === parentOf(e.node))));
-    if (new Set(mine.map(flowKey)).size > 1) { mine = mine.filter(U => U.producer.port === L.producer.port && L.consumers.every(e => U.consumers.some(u => u.node === parentOf(e.node) && u.port === e.port))); if (new Set(mine.map(flowKey)).size !== 1) ambiguous(); }
+    let mine = flows.filter(U => under(L.producer.node, U.producer.node) && L.consumers.every(e => U.consumers.some(u => under(e.node, u.node))));
+    if (new Set(mine.map(flowKey)).size > 1) { mine = mine.filter(U => U.producer.port === L.producer.port && L.consumers.every(e => U.consumers.some(u => under(e.node, u.node) && u.port === e.port))); if (new Set(mine.map(flowKey)).size !== 1) ambiguous(); }
     mine = mine.filter(U => flowKey(U) === o.flow); if (!mine.length) continue;
     if (o.role === "producer") { out.push(L.producer); continue; }
     const ends = mine.flatMap(U => U.consumers).filter(u => u.node === o.upper); const ports = new Set(ends.map(u => u.port));
-    for (const e of L.consumers.filter(e => parentOf(e.node) === o.upper)) { if (ports.size > 1 && !ports.has(e.port)) ambiguous(); if (ports.size <= 1 || e.port === o.port) out.push(e); } }
+    for (const e of L.consumers.filter(e => under(e.node, o.upper))) { if (ports.size > 1 && !ports.has(e.port)) ambiguous(); if (ports.size <= 1 || e.port === o.port) out.push(e); } }
   return out.filter(e => e.port !== undefined).filter((e, i, all) => all.findIndex(x => x.node === e.node && x.port === e.port) === i);
 }
 
@@ -53,13 +56,18 @@ export const identityNode = (block, level = 2) => ({ ...structuredClone(block), 
 /** Принятое состояние: граф и принятый каркас (с источниками заполнений). Исторический слой без каркаса — целиком настоящий. */
 export function loadAccepted(store, project, level = 2) {
   const graph = store.get(`graph:${project}`); const frame = store.get(`om-frame:${project}:${level}`);
-  return { graph, frame, identity: new Set((frame?.value.fills ?? []).filter(f => f.source === "identity").map(f => f.node)) };
+  // записанное соответствие «обязательство → конец» относится к слою, принятому вместе с ним: сверка по хэшу проекции слоя (как LayerProof движка)
+  const drift = Boolean(frame && graph && frame.value.layerHash !== hashJson(projectGraph(graph.value, level)));
+  return { graph, frame, drift, recorded: frame && !drift ? frame.value.fills : null, identity: new Set((frame?.value.fills ?? []).filter(f => f.source === "identity").map(f => f.node)) };
 }
 
 /** F4.2 + F4.3. Заполнения: принятое настоящее → предложения → представитель (только вне горизонта). Возвращает fills и незаполненное. */
 export function fillObligations(upper, obligations, accepted, proposals, horizon, baseRefs, level = 2) {
   const g = accepted?.graph?.value ?? null; const identity = accepted?.identity ?? new Set(); const fills = []; const open = [];
-  const parentOf = new Map([...(g?.nodes ?? []), ...proposals.flatMap(p => p.value.nodes)].map(n => [n.id, n.parent]));
+  if (accepted?.drift) refuse("frame_layer_drift", accepted.frame.id, "Принятый слой изменён в обход каркаса: записанное соответствие обязательств к нему не относится");
+  // принадлежность узла верхнему — действующая семантика уточнения движка: вложенность И явное realizes (вердикт №2 по M7, п.2), а не один parent
+  const rel = new RefinementRelations({ version: 2, nodes: [...(g?.nodes ?? upper.nodes), ...proposals.flatMap(p => p.value.nodes)], edges: [...(g?.edges ?? upper.edges ?? []), ...proposals.flatMap(p => p.value.edges ?? [])] });
+  const under = (id, up) => id !== up && rel.refines(id, up);
   for (const p of proposals) { if (p.value.status !== "proposed") refuse("proposal_not_proposed", p.id, `Предложение со статусом ${p.value.status} повторно не подаётся: нужно новое предложение`);
     if (hashJson(p.value.base) !== hashJson(baseRefs)) refuse("proposal_base_stale", p.id, "Предложение сделано для другой базы"); }
   // МАСКАРАД: имена представителей зарезервированы — узел предложения не может выдать себя за представителя (и наоборот)
@@ -67,14 +75,14 @@ export function fillObligations(upper, obligations, accepted, proposals, horizon
   const removed = new Set(proposals.flatMap(p => p.value.removes ?? []));
   for (const o of obligations) {
     const proposed = proposals.flatMap(p => p.value.fills.filter(f => f.obligation === o.id).map(f => ({ ...f, proposal: p.id })));
-    for (const f of proposed) if (parentOf.get(f.node) !== o.upper) refuse("slot_fill_foreign", o.id, `Узел ${f.node} не принадлежит ${o.upper}`);
+    for (const f of proposed) if (!under(f.node, o.upper)) refuse("slot_fill_foreign", o.id, `Узел ${f.node} не уточняет ${o.upper}`);
     const distinct = new Set(proposed.map(f => `${f.node}:${f.port ?? ""}`));
     if (o.role !== "consumer" && distinct.size > 1) refuse("slot_fill_conflict", o.id, "Несколько разных предложений на единичное обязательство");
     // принятое: концы нижних привязок (или узел с исходом блока), чей узел — потомок upper.node, не представитель и не удалён заменой
-    let acceptedFill = [];
-    if (g) { const mine = n => g.nodes.find(x => x.id === n)?.parent === o.upper;
-      if (o.kind.endsWith("-outcome")) acceptedFill = g.nodes.filter(n => n.kind === KIND[level] && n.parent === o.upper && n.outcome === o.artifact).map(n => ({ node: n.id }));
-      else acceptedFill = acceptedEnds(g.connectors.find(c => c.id === o.connector), upper.connectors.find(c => c.id === o.connector)?.bindings.filter(b => b.level === level - 1) ?? [], o, level, id => g.nodes.find(x => x.id === id)?.parent); }
+    const recorded = accepted?.recorded?.filter(f => f.obligation === o.id) ?? []; let acceptedFill = [];
+    if (recorded.length) acceptedFill = recorded.map(f => plain({ node: f.node, port: f.port, codeRef: f.codeRef }));              // принятое соответствие — из записи каркаса, без угадывания
+    else if (g) { if (o.kind.endsWith("-outcome")) acceptedFill = g.nodes.filter(n => n.kind === KIND[level] && under(n.id, o.upper) && n.outcome === o.artifact).map(n => ({ node: n.id }));
+      else acceptedFill = acceptedEnds(g.connectors.find(c => c.id === o.connector), upper.connectors.find(c => c.id === o.connector)?.bindings.filter(b => b.level === level - 1) ?? [], o, level, under); }
     const before = acceptedFill.filter(f => !identity.has(f.node));                       // принятое ДО замен — по нему сверяется база замены
     const real = before.filter(f => !removed.has(f.node)); const reps = acceptedFill.filter(f => identity.has(f.node));
     const replaces = proposals.flatMap(p => (p.value.replaces ?? []).filter(r => r.obligation === o.id).map(r => ({ ...r, proposal: p.id })));
@@ -118,7 +126,7 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
   for (const b of upper.nodes.filter(n => n.kind === KIND[level - 1])) if (need.has(repId(b.id, level)) && !cand.nodes.some(n => n.id === repId(b.id, level))) {
     cand.nodes.push(identityNode(b, level)); if (level === 2) for (const j of upper.joins.filter(j => j.consumer === b.id)) cand.joins.push({ ...structuredClone(j), id: `${j.id}-i`, consumer: repId(b.id) }); }
   // уровень 3: план исполнения — настоящие работы операций горизонта; представитель не исполняется никогда
-  const exec = new Set(level === 3 ? cand.nodes.filter(n => n.kind === "work" && !need.has(n.id) && horizon.has(n.parent)).map(n => n.id) : []); if (level === 3) cand.horizon = [...exec].sort();
+  const relC = new RefinementRelations(cand); const exec = new Set(level === 3 ? cand.nodes.filter(n => n.kind === "work" && !need.has(n.id) && [...horizon].some(op => relC.refines(n.id, op))).map(n => n.id) : []); if (level === 3) cand.horizon = [...exec].sort();
   const obById = new Map(obligations.map(o => [o.id, o]));
   for (const c of cand.connectors) { const ups = c.bindings.filter(b => b.level === level - 1); if (!ups.length) continue; const lower = [];
     const of = (role, node, port, flow) => filled.fills.filter(f => { const o = obById.get(f.obligation); return o.connector === c.id && o.role === role && o.upper === node && o.port === port && o.flow === flow; }).map(f => plain({ node: f.node, port: f.port, codeRef: f.codeRef }));
@@ -149,7 +157,7 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
 export function saveCandidate(store, project, candidate, filled, base, proposals, level = 2) {
   // имя кандидата — от графа, базы и предложений: одинаковый граф на другой базе — другой кандидат
   return store.write({ id: `om-candidate:${hashJson([candidate.hash, base, proposals.map(p => reference(p))])}`, kind: "frame-candidate", expected: 0,
-    value: plain({ project, level, graphHash: candidate.hash, graph: candidate.graph, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
+    value: plain({ project, level, graphHash: candidate.hash, layerHash: hashJson(projectGraph(candidate.graph, level)), graph: candidate.graph, fills: filled.fills, base, proposals: proposals.map(p => reference(p)) }) });
 }
 
 /** F4.6. Исход проверки G3 для ТОЧНОЙ записи кандидата. Цепочка: граф из записи → его хэш → запись кандидата → исход G3.
@@ -171,6 +179,6 @@ export function settleCandidate(store, project, candidateRef, passed, codes = []
   if (stale(graph, rec.value.base.graph) || stale(frame, rec.value.base.frame)) refuse("input_stale", rec.id, "База кандидата уже сменилась: принят другой кандидат");
   const guards = [reference(rec), ...(graph ? [reference(graph)] : []), ...(frame ? [reference(frame)] : []), ...saved];
   return store.writeMany([{ id: `graph:${project}`, kind: "graph", expected: graph?.revision ?? 0, value: rec.value.graph },
-    { id: `om-frame:${project}:${level}`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level, candidateHash: rec.value.graphHash,
+    { id: `om-frame:${project}:${level}`, kind: "connection-frame", expected: frame?.revision ?? 0, value: plain({ project, level, candidateHash: rec.value.graphHash, layerHash: rec.value.layerHash,
       fills: rec.value.fills.map(f => ({ ...f, source: f.source === "proposed" ? "accepted" : f.source })) }) }, ...mark("accepted")], guards);
 }

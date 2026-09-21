@@ -83,3 +83,9 @@ test("вердикт №1 по M7, п.3: основание готовности
   const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), refined: REFINED, available: partial }); assert.deepEqual(gateHorizon(r).codes, ["horizon_available_uncovered"]);
   assert.deepEqual(r.refusals.map(x => x.target), [`${edge.block}:${used.artifact}`], "отказ адресный: блок и непокрытый результат");
   assert.ok(gateHorizon(closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", { id: "artifact-receipt:n-check", revision: 1, hash: "e".repeat(64) }]]) })).codes.includes("horizon_available_unproven"), "одна ссылка «на блок» основанием не считается"); });
+
+test("вердикт №2 по M7, п.3: исход ВЫБРАННОЙ фичи — требуемый результат; без его основания блок-производитель готовым не объявляется", () => {
+  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const other = produced(root).find(a => a !== "verified-change") ?? "посторонний-артефакт"; const one = { id: "artifact-receipt:x", revision: 1, hash: "e".repeat(64) };
+  const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([[root, { [other]: one }]]) }); assert.deepEqual(gateHorizon(r).codes, ["horizon_available_uncovered"], "сценарий ревью: квитанция только на внутренний результат");
+  assert.deepEqual(r.refusals.map(x => [x.target, x.via]), [[`${root}:verified-change`, "feature"]]); const ok = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([[root, basis(root)]]) });
+  assert.equal(gateHorizon(ok).passed, true); assert.equal(ok.horizon.execution[root].state, "available"); });

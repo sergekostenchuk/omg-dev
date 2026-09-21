@@ -3,7 +3,7 @@
 // Запуск: node --test PREPARATIONS/OM-DESIGN/proto/works.test.mjs
 import test from "node:test"; import assert from "node:assert/strict"; import { mkdtempSync, rmSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
 import { Store } from "../../../dist/src/storage/store.js"; import { reference } from "../../../dist/src/pipeline/contracts.js"; import { projectGraph } from "../../../dist/src/graph/project.js";
-import { validateGraph } from "../../../dist/src/graph/validate.js"; import { deriveTasks } from "../../../dist/src/compiler/derive.js"; import { nodeSignature, receiptId } from "../../../dist/src/compiler/model.js"; import { hashJson } from "../../../dist/src/canonical.js";
+import { validateGraph } from "../../../dist/src/graph/validate.js"; import { RefinementRelations } from "../../../dist/src/graph/relations.js"; import { deriveTasks } from "../../../dist/src/compiler/derive.js"; import { nodeSignature, receiptId } from "../../../dist/src/compiler/model.js"; import { hashJson } from "../../../dist/src/canonical.js";
 import * as F from "./frame.mjs"; import * as W from "./works.mjs"; import { gardenPlus } from "./garden-plus.mjs";
 
 const P = "proto"; const G3 = gardenPlus(); const ACC2 = (({ level, ...g }) => g)(projectGraph(G3, 2));      // принятый слой операций, работ ещё нет
@@ -13,22 +13,23 @@ const fresh = (value = ACC2) => { const dir = mkdtempSync(join(tmpdir(), "om-wor
 const baseOf = acc => ({ graph: acc.graph ? reference(acc.graph) : null, frame: acc.frame ? reference(acc.frame) : null }); const KIND = { 2: "operation", 3: "work" };
 
 /** Предложение слоя из узлов фикстуры G: узлы, заполнения (конец берётся из нижней привязки ТОГО ЖЕ потока, с привязкой к коду), тесты, локальные связи. */
-function proposalAt(G, level, uppers, obligations, base, upper, tweak = v => v) {
-  const par = id => G.nodes.find(n => n.id === id)?.parent; const nodes = G.nodes.filter(n => n.kind === KIND[level] && uppers.includes(n.parent)); const ids = new Set(nodes.map(n => n.id)); const fills = [];
+function proposalAt(G, level, uppers, obligations, base, upper, tweak = v => v, portMap = {}) {
+  const rel = new RefinementRelations(G); const under = (id, up) => id !== up && rel.refines(id, up); const low = port => portMap[port] ?? port;      // уточнение — вложенность или realizes; нижние порты могут называться иначе
+  const nodes = G.nodes.filter(n => n.kind === KIND[level] && uppers.some(u => under(n.id, u))); const ids = new Set(nodes.map(n => n.id)); const fills = [];
   for (const o of obligations.filter(o => uppers.includes(o.upper))) {
-    if (o.kind.endsWith("-outcome")) { const n = nodes.find(n => n.parent === o.upper && n.outcome === o.artifact); if (n) fills.push({ obligation: o.id, node: n.id }); continue; }
+    if (o.kind.endsWith("-outcome")) { const n = nodes.find(n => under(n.id, o.upper) && n.outcome === o.artifact); if (n) fills.push({ obligation: o.id, node: n.id }); continue; }
     const U = upper.connectors.find(c => c.id === o.connector).bindings.find(b => b.level === level - 1 && F.flowKey(b) === o.flow);
-    for (const b of G.connectors.find(c => c.id === o.connector).bindings.filter(b => b.level === level && b.producer.port === U.producer.port)) for (const e of (o.role === "producer" ? [b.producer] : b.consumers))
-      if (ids.has(e.node) && par(e.node) === o.upper && (o.role === "producer" || e.port === o.port) && !fills.some(f => f.obligation === o.id && f.node === e.node && f.port === e.port)) fills.push({ obligation: o.id, node: e.node, port: e.port, ...(e.codeRef ? { codeRef: e.codeRef } : {}) }); }
+    for (const b of G.connectors.find(c => c.id === o.connector).bindings.filter(b => b.level === level && b.producer.port === low(U.producer.port))) for (const e of (o.role === "producer" ? [b.producer] : b.consumers))
+      if (ids.has(e.node) && under(e.node, o.upper) && (o.role === "producer" || e.port === low(o.port)) && !fills.some(f => f.obligation === o.id && f.node === e.node && f.port === e.port)) fills.push({ obligation: o.id, node: e.node, port: e.port, ...(e.codeRef ? { codeRef: e.codeRef } : {}) }); }
   const local = G.connectors.filter(c => !c.bindings.some(b => b.level < level) && c.bindings.some(b => b.level === level) && c.bindings.filter(b => b.level === level).every(b => [b.producer, ...b.consumers].every(e => ids.has(e.node))))
     .map(c => ({ ...structuredClone(c), bindings: structuredClone(c.bindings.filter(b => b.level <= level)) }));
   const artifacts = G.artifacts.filter(a => (nodes.some(n => n.outcome === a.id) || local.some(c => c.artifact === a.id)) && !upper.artifacts.some(u => u.id === a.id));
-  return tweak({ base, level, source: "decision", status: "proposed", nodes: structuredClone(nodes), fills, tests: structuredClone(G.tests.filter(t => ids.has(t.node))), localConnectors: local, artifacts: structuredClone(artifacts) });
+  return tweak({ base, level, source: "decision", status: "proposed", nodes: structuredClone(nodes), fills, tests: structuredClone(G.tests.filter(t => ids.has(t.node))), localConnectors: local, artifacts: structuredClone(artifacts), edges: structuredClone((G.edges ?? []).filter(e => e.relation === "realizes" && ids.has(e.source))) });
 }
 /** Полный проход каркаса: обязательства → предложение → заполнение → кандидат → (по желанию) принятие. */
-function runAt(store, G, level, zone, uppers, { accept = false, tweak, tag = "" } = {}) {
+function runAt(store, G, level, zone, uppers, { accept = false, tweak, tag = "", portMap } = {}) {
   const acc = F.loadAccepted(store, P, level); const upper = F.upperOf(acc.graph.value, level); const ob = F.frameObligations(upper, zone, level); const base = baseOf(acc);
-  const props = uppers.length ? [store.write({ id: `om-proposal:w-${hashJson([level, uppers, base, tag]).slice(0, 8)}`, kind: "layer-proposal", expected: 0, value: proposalAt(G, level, uppers, ob, base, upper, tweak) })] : [];
+  const props = uppers.length ? [store.write({ id: `om-proposal:w-${hashJson([level, uppers, base, tag]).slice(0, 8)}`, kind: "layer-proposal", expected: 0, value: proposalAt(G, level, uppers, ob, base, upper, tweak, portMap) })] : [];
   const filled = F.fillObligations(upper, ob, acc, props, zone, base, level); const cand = F.assembleCandidate(upper, ob, filled, acc, props, zone, level);
   if (accept) F.settleCandidate(store, P, reference(F.saveCandidate(store, P, cand, filled, base, props, level)), true);
   return { ob, filled, cand, identity: new Set(filled.fills.filter(f => f.source === "identity").map(f => f.node)) };
@@ -167,3 +168,38 @@ test("перекрёстные потоки: один порт потребит�
     [3, strip(projectGraph(G, 2)), OPS, ["out → consume-work/in,consume-work/in-alt", "out → w-later-operation/in (спит)", "out-alt → consume-work/in"]]]) {
     const { store, done } = fresh(accepted); try { assert.deepEqual(pairs(runAt(store, G, level, new Set(zone), zone, { accept: true }).cand.graph, level), want, `уровень ${level}: предложение`);
       const again = runAt(store, G, level, new Set(zone), []); assert.deepEqual(pairs(again.cand.graph, level), want, `уровень ${level}: повторный проход по принятому`); assert.equal(validateGraph(again.cand.graph).findings.length, 0); } finally { done(); } } });
+
+test("вердикт №2 п.1: принятое соответствие «обязательство → конец» читается из записи каркаса — нижние порты названы иначе, повторный проход не угадывает и не отказывает; слой, изменённый в обход каркаса, — отказ", () => {
+  const MAP = { out: "emit", "out-alt": "emit-alt", in: "receive", "in-alt": "receive-alt" }; const strip = ({ level, ...g }) => g;
+  const renamed = level => { const G = gardenPlus({ alt: true }); for (const n of G.nodes.filter(n => n.kind === KIND[level])) for (const p of n.ports) p.id = MAP[p.id] ?? p.id;
+    for (const c of G.connectors) for (const b of c.bindings.filter(b => b.level === level)) for (const e of [b.producer, ...b.consumers]) if (G.nodes.find(n => n.id === e.node).kind === KIND[level]) e.port = MAP[e.port] ?? e.port; return G; };
+  const pairs = (graph, level) => graph.connectors.find(c => c.id === "garden-flow").bindings.filter(b => b.level === level).map(b => `${b.producer.port} → ${b.consumers.map(e => e.port).join(",")}${b.anchor ? " (спит)" : ""}`).sort();
+  for (const [level, zone, want] of [[2, ["garden-produce-block", "garden-consume-block"], ["emit → receive,in", "emit-alt → receive-alt"]], [3, OPS, ["emit → in (спит)", "emit → receive", "emit-alt → receive-alt"]]]) {
+    const G = renamed(level); assert.equal(validateGraph(G).findings.length, 0); const { store, done } = fresh(strip(projectGraph(G, level - 1)));
+    try { assert.deepEqual(pairs(runAt(store, G, level, new Set(zone), zone, { accept: true, portMap: MAP }).cand.graph, level), want, `уровень ${level}: предложение со своими именами портов`);
+      const again = runAt(store, G, level, new Set(zone), []); assert.deepEqual(pairs(again.cand.graph, level), want, `уровень ${level}: сценарий ревью — повторный проход без изменений проходит`); assert.equal(again.filled.open.length, 0);
+      assert.ok(again.filled.fills.filter(f => f.source === "accepted").length > 0); const head = store.get(`graph:${P}`); const touched = structuredClone(head.value); touched.nodes.find(n => n.kind === KIND[level]).title += " (правка в обход каркаса)";
+      store.write({ id: head.id, kind: "graph", expected: head.revision, value: touched }); assert.throws(() => runAt(store, G, level, new Set(zone), []), e => e.code === "frame_layer_drift"); } finally { done(); } } });
+
+test("вердикт №2 п.2: работа лежит в одной операции и явно реализует роль другой (realizes) — каркас не открывает заполненное, а пакет называет соседом операцию УТОЧНЯЕМОГО конца связи", () => {
+  const G = gardenPlus(); G.nodes.find(n => n.id === "garden-produce-work").parent = "garden-prep-operation"; G.edges.push({ id: "e-realizes", relation: "realizes", source: "garden-produce-work", target: "garden-produce-operation", condition: "одна атомарная работа реализует роль производства" });
+  assert.equal(validateGraph(G).findings.length, 0, "граф сценария ревью допустим"); const strip = ({ level, ...g }) => g; const { store, done } = fresh(strip(projectGraph(G, 2)));
+  try { const r = runAt(store, G, 3, ZONE, OPS, { accept: true }); assert.equal(r.filled.open.length, 0); assert.deepEqual(r.cand.graph.horizon, ["garden-consume-work", "garden-prep-work", "garden-produce-work"]);
+    const again = runAt(store, G, 3, ZONE, []); assert.equal(again.filled.open.length, 0, "по записи каркаса: заполненные обязательства не открываются");
+    assert.deepEqual(runAt(store, G, 3, new Set(["garden-produce-operation", "garden-consume-operation"]), []).cand.graph.horizon, ["garden-consume-work", "garden-produce-work"], "в план исполнения работа входит по уточняемой операции зоны, даже если лежит в операции вне зоны"); const upper = F.upperOf(G, 3); const ob = F.frameObligations(upper, ZONE, 3);
+    const hist = F.fillObligations(upper, ob, { graph: { value: G, id: "h", hash: "h" }, identity: new Set() }, [], ZONE, { graph: null, frame: null }, 3); assert.equal(hist.open.length, 0, "исторический слой без записи каркаса: уточнение через realizes распознано действующим RefinementRelations");
+    assert.ok(hist.fills.some(f => f.node === "garden-produce-work" && f.source === "accepted" && ob.find(o => o.id === f.obligation).upper === "garden-produce-operation"));
+    const g = r.cand.graph; const ctx = { identity: r.identity, correspondence: W.correspondenceOf(r.ob, r.filled.fills) }; const reads = W.neighborsOf(g, "garden-consume-work", ctx).find(n => n.direction === "reads");
+    assert.deepEqual([reads.neighbor.work.id, reads.neighbor.operation.id, reads.neighbor.block.id], ["garden-produce-work", "garden-produce-operation", "garden-produce-block"], "сценарий ревью: сосед — операция производства, а не операция, где лежит работа");
+    assert.equal(W.neighborsOf(g, "garden-produce-work", ctx).find(n => n.direction === "reads").neighbor.operation.id, "garden-prep-operation"); const packets = W.buildPackets(g, ctx); assert.equal(W.gatePackets(g, packets, ctx).passed, true);
+    const wrong = structuredClone(packets); const p = wrong.find(x => x.work === "garden-consume-work"); p.neighbors.find(n => n.direction === "reads").neighbor.operation.id = "garden-prep-operation"; p.hash = hashJson(p.neighbors);
+    assert.deepEqual(W.gatePackets(g, wrong, ctx).codes, ["packet_neighbors_forged"], "пакет с адресом «где лежит работа» ворота больше не пропускают");
+    const twin = structuredClone(g); twin.edges.push({ id: "e-twin", relation: "realizes", source: "garden-consume-work", target: "garden-later-operation", condition: "та же работа реализует и отложенного потребителя" });
+    assert.throws(() => W.neighborsOf(twin, "garden-produce-work", { identity: r.identity }), e => e.code === "neighbor_chain_ambiguous", "работа уточняет два конца одной связи: без записи каркаса адрес не выбирается");
+    assert.equal(W.neighborsOf(twin, "garden-produce-work", ctx).find(n => n.direction === "writes" && n.delivery === "in-plan").neighbor.operation.id, "garden-consume-operation", "с записью каркаса — принятое соответствие"); } finally { done(); } });
+
+test("основание готовности ищется по блоку-ПРОИЗВОДИТЕЛЮ связи (как его видит горизонт M2), а не по блоку, где лежит работа", () => {
+  const { store, done } = fresh(); try { const { g, ctx } = consumerOnly(store, g => { g.nodes.find(n => n.id === "garden-produce-work").parent = "garden-later-operation";
+      g.edges.push({ id: "e-realizes-far", relation: "realizes", source: "garden-produce-work", target: "garden-produce-operation", condition: "работа лежит в операции другого блока" }); return g; });
+    const rec = put(store, g, "garden-produce-work", "garden-data"); const ok = W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(rec) } }); assert.deepEqual(ok.findings, []);
+    const n = W.neighborsOf(g, "garden-consume-work", { ...ctx, receipts: ok.receipts }).find(n => n.direction === "reads"); assert.deepEqual([n.delivery, n.neighbor.operation.id, n.neighbor.block.id], ["available", "garden-produce-operation", "garden-produce-block"]); } finally { done(); } });
