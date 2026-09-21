@@ -1,6 +1,9 @@
 // om-design.json -> воркфлоу ComfyUI. Позиции берутся из схемы; у узлов без позиции считается сетка по группам.
 import { readFileSync, writeFileSync } from "node:fs";
 import { TYPES, EDGE_KINDS, W, heightOf } from "./vocab.mjs";
+import { isDiscussion, withFeed } from "./comfy/om_design/web/feed_render.js";
+import { readFeedItems } from "./feed-source.mjs";
+
 const [specPath, outPath, flag] = process.argv.slice(2);
 const spec = JSON.parse(readFileSync(specPath, "utf8"));
 const RELAYOUT = flag === "--relayout";
@@ -27,6 +30,10 @@ const nodes = spec.nodes.map((n, i) => { const id = i + 1; const T = TYPES[n.typ
   const ins = inputsOf.get(id) ?? []; for (let k = ins.length; k < T.nIn; k++) ins.push({ name: `in_${k + 1}`, type: "*", link: null });
   return { id, type: T.cls, pos: n.pos ?? [0, 0], size: n.size ?? T.size, flags: {}, order: i, mode: 0, inputs: ins, outputs, properties: { "Node name for S&R": T.cls, omd_id: n.id, omd_group: n.group ?? "" }, widgets_values: T.fields.map(f => n.fields?.[f] ?? ""), color: T.color, bgcolor: T.color }; });
 const groups = (spec.groups ?? []).map(g => ({ title: g.title, bounding: g.bounding, color: "#3f4a5a", font_size: 26, flags: {} }));
-let nextId = nodes.length; for (const note of spec.notes ?? []) nodes.push({ ...note, id: ++nextId, order: nodes.length, inputs: [], outputs: [] });
+// карточка обсуждения = история + лента из журнала ревью (проекция); остальные заметки — как есть
+const feed = readFeedItems();
+let nextId = nodes.length; for (const note of spec.notes ?? []) { const n = { ...note, id: ++nextId, order: nodes.length, inputs: [], outputs: [] };
+  if (isDiscussion(n.title)) { const text = withFeed(n.widgets_values?.[0], feed.items, feed.status); n.widgets_values = [text, ...(n.widgets_values ?? []).slice(1)]; if (n.widgets_values_named) n.widgets_values_named = { ...n.widgets_values_named, text }; }
+  nodes.push(n); }
 writeFileSync(outPath, JSON.stringify({ id: "om-design", revision: 0, last_node_id: nodes.length, last_link_id: lid, nodes, links, groups, config: {}, extra: { ds: { scale: 0.3, offset: [0, 0] }, omd: { version: spec.version, exported: new Date().toISOString() } }, version: 0.4 }, null, 1));
 console.log(`экспорт: узлов ${nodes.length}, связей ${links.length}, групп ${groups.length} -> ${outPath}`);

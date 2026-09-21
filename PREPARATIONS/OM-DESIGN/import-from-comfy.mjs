@@ -1,11 +1,15 @@
 // Воркфлоу ComfyUI -> om-design.json с проверкой «хлеба». Источник истины после правок в ComfyUI.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { TYPES, CLS_TO_TYPE } from "./vocab.mjs";
+import { isDiscussion, splitHistory } from "./comfy/om_design/web/feed_render.js";
+
 const [wfPath, specPath] = process.argv.slice(2);
 const wf = JSON.parse(readFileSync(wfPath, "utf8"));
 const prev = existsSync(specPath) ? JSON.parse(readFileSync(specPath, "utf8")) : { version: 1, nodes: [], edges: [], groups: [] };
 const byComfyId = new Map(); const nodes = []; const problems = [];
-const notes = wf.nodes.filter(n => n.type === "Note" || n.type === "MarkdownNote");
+// лента в карточке обсуждения — проекция журнала: в источник истины возвращается только история (до черты)
+const notes = wf.nodes.filter(n => n.type === "Note" || n.type === "MarkdownNote").map(n => { if (!isDiscussion(n.title)) return n;
+  const text = splitHistory(n.widgets_values?.[0]); return { ...n, widgets_values: [text, ...(n.widgets_values ?? []).slice(1)], ...(n.widgets_values_named ? { widgets_values_named: { ...n.widgets_values_named, text } } : {}) }; });
 for (const n of wf.nodes) { const type = CLS_TO_TYPE[n.type]; if (!type) { if (n.type !== "Note" && n.type !== "MarkdownNote") problems.push(`чужой узел ${n.type} #${n.id}, пропущен`); continue; }
   const T = TYPES[type]; const fields = Object.fromEntries(T.fields.map((f, i) => [f, String(n.widgets_values?.[i] ?? "")]));
   const id = n.properties?.omd_id || `${type}-${n.id}`; byComfyId.set(n.id, id);
