@@ -691,8 +691,8 @@
    "type": "gate",
    "fields": {
     "название": "G5 · Ворота атомарности",
-    "что проверяет": "Действующие проверки графа, слоя и семантики плюс новые проверки атомарности и полного пакета контекста, с явным отображением кодов. «Не больше одного» и «ровно один» различаются; единственность проверяемой обязанности проверяется отдельно от наличия проверки. Результат записывается с хэшем кандидата и базовыми ссылками; принятие меняет статус предложений MC2 уровня работ. Ворота пакетов (gatePackets): у каждой работы плана исполнения есть пакет соседей; пакет равен выведенному заново из принятого графа (подделка соседа, пересчитанный подделкой хэш и пропущенный сосед видны); пакет для узла вне плана — отказ; ни один нужный вход не остаётся без источника. Квитанции производителей вне плана сверены (F7.4). Уровень 2 карты (21.09.2026): раскрыт карточками правил «G5 · атомарность работы и пакет задачи», «M8 и G6 · реализуемость горизонта», «M9 · передача компилятору».",
-    "коды отказа": "Действующие: boundary_mismatch; realization_boundary_conflict; endpoint_code_missing; endpoint_code_foreign; layer_port_unbound; test_obligation_missing; connector_test_missing; test_entrypoint_unbound; counterfactual_missing; write_ownership_overlap; ownership_transfer_missing; work_packet_boundary; future_dependency_unanchored; multiple_producers (артефакт на уровне). Новые: work_writer_not_single; work_artifact_not_single; work_write_scope_unbounded; work_responsibility_not_single; work_packet_over_budget; work_blocking_gap_open. Соседи и доставка (уровень 2 карты): packet_missing; packet_foreign; packet_neighbors_forged; neighbor_undelivered; neighbor_chain_broken; neighbor_contract_missing; available_basis_missing; available_basis_mismatch; available_basis_unresolved; available_basis_foreign; horizon_execution_missing; horizon_producer_unrefined; proposal_node_reserved; sleeping_wake_test_missing; sleeping_anchor_underivable; work_port_unbound. Редакция 2: packet_duplicate; available_basis_stale; ownership_predecessor_missing; accepted_binding_ambiguous; upper_binding_ambiguous. Редакция 3: frame_layer_drift; neighbor_chain_ambiguous. Редакция 4: frame_rebase_required; available_basis_ambiguous."
+    "что проверяет": "Действующие проверки графа, слоя и семантики плюс новые проверки атомарности и полного пакета контекста, с явным отображением кодов. «Не больше одного» и «ровно один» различаются; отдельной механической проверки «единственности проверяемой обязанности» НЕТ (ревью 21.09.2026, записи №132–134): видимую коду часть закрывают правило «один артефакт» и проверки границы состояния; смысловую неделимость текста обязанности код не доказывает — это правило проектирования работы. Результат записывается с хэшем кандидата и базовыми ссылками; принятие меняет статус предложений MC2 уровня работ. Ворота пакетов (gatePackets): у каждой работы плана исполнения есть пакет соседей; пакет равен выведенному заново из принятого графа (подделка соседа, пересчитанный подделкой хэш и пропущенный сосед видны); пакет для узла вне плана — отказ; ни один нужный вход не остаётся без источника. Квитанции производителей вне плана сверены (F7.4). Уровень 2 карты (21.09.2026): раскрыт карточками правил «G5 · атомарность работы и пакет задачи», «M8 и G6 · реализуемость горизонта», «M9 · передача компилятору».",
+    "коды отказа": "Действующие: boundary_mismatch; realization_boundary_conflict; endpoint_code_missing; endpoint_code_foreign; layer_port_unbound; test_obligation_missing; connector_test_missing; test_entrypoint_unbound; counterfactual_missing; write_ownership_overlap; ownership_transfer_missing; work_packet_boundary; future_dependency_unanchored; multiple_producers (артефакт на уровне). Новые: work_writer_not_single; work_artifact_not_single; work_write_scope_unbounded; work_packet_over_budget; work_blocking_gap_open. Соседи и доставка (уровень 2 карты): packet_missing; packet_foreign; packet_neighbors_forged; neighbor_undelivered; neighbor_chain_broken; neighbor_contract_missing; available_basis_missing; available_basis_mismatch; available_basis_unresolved; available_basis_foreign; horizon_execution_missing; horizon_producer_unrefined; proposal_node_reserved; sleeping_wake_test_missing; sleeping_anchor_underivable; work_port_unbound. Редакция 2: packet_duplicate; available_basis_stale; ownership_predecessor_missing; accepted_binding_ambiguous; upper_binding_ambiguous. Редакция 3: frame_layer_drift; neighbor_chain_ambiguous. Редакция 4: frame_rebase_required; available_basis_ambiguous. НЕ ВВЕДЁН: work_responsibility_not_single — нет признака без ложных срабатываний; его введение потребует отдельного изменения правила схемы."
    },
    "pos": [
     5040,
@@ -700,7 +700,7 @@
    ],
    "size": [
     620,
-    724
+    792
    ],
    "group": "Уровень 1 · Работы и выход"
   },
@@ -717,7 +717,7 @@
    },
    "pos": [
     5040,
-    1772
+    1840
    ],
    "size": [
     620,
@@ -735,7 +735,7 @@
    },
    "pos": [
     5040,
-    2552
+    2620
    ],
    "size": [
     620,
@@ -756,7 +756,7 @@
    },
    "pos": [
     5040,
-    2978
+    3046
    ],
    "size": [
     620,
@@ -773,7 +773,7 @@
    },
    "pos": [
     5040,
-    3571
+    3639
    ],
    "size": [
     620,
@@ -790,7 +790,7 @@
    },
    "pos": [
     5040,
-    4016
+    4084
    ],
    "size": [
     620,
@@ -2509,7 +2509,7 @@
     5000,
     -160,
     700,
-    4554
+    4622
    ]
   },
   {
