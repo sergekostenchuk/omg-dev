@@ -1,9 +1,9 @@
-import { hashJson } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
-import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
-import { readRecord, writeGuarded } from "./refs.js";
+import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type RefusalRoute, type Sealed } from "./refusal.js";
+import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
 
 /**
@@ -16,20 +16,52 @@ import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-jo
  * there is progress when a key is new to the history of THIS goal — so alternation A → B → A, the re-taking of a
  * result that was lost, a changed candidate and a delivered answer are no progress, and a fix that cancelled an
  * earlier result is a conflict of results rather than a success.
- * The count of consecutive attempts without progress, the verdict of every attempt and the saved stop are DERIVED
- * from the attempts and re-derived whenever the record is read: a stored count or verdict that does not follow from
- * the attempts is refused instead of believed. There is no limit on the NUMBER of attempts. The third consecutive
- * attempt without progress saves a stop with its cause and the point to continue from; a restart does not lift it,
- * and only a recorded ground — a change of approach or of inputs, or the owner's decision — continues the work.
+ * The count of consecutive attempts without progress, the verdict of every attempt, the saved stop and the LADDER the
+ * series stands on after one are DERIVED from the attempts, the continuations and the escalations, and re-derived
+ * whenever the record is read: a stored count, verdict or rung that does not follow from them is refused instead of
+ * believed. There is no limit on the NUMBER of attempts. The third consecutive attempt without progress IN THE WINDOW
+ * NOW OPEN saves a stop with its cause and the point to continue from; a restart does not lift it, and only a ground
+ * of the rung the ladder has reached continues the work: while the first rung stands, the recorded review of THIS stop
+ * with an independent reviewer or a confirmed fix of the input; once that rung has been spent — by a continuation that
+ * gave no new accepted result of the goal, or by a review that ended without a decision and escalated the stop — the
+ * owner's decision alone. A continuation opens a NEW WINDOW — up to three attempts without progress again — and is
+ * not itself progress; an escalation opens none and leaves the stop standing. Only a new accepted result of the goal
+ * the ladder stands for returns it to the start, and the ladder outlives a successor of the series, a change of slice
+ * and a return to an earlier subject.
  * EVERY change of state names the state it comes from: the attempt a request opens, the outcome it closes, the stop
- * it continues and the predecessor it succeeds. A delivery that arrives late finds its own state already there and
- * changes nothing (T5), instead of landing on whatever state the series has reached since.
+ * it continues or escalates and the predecessor it succeeds. A delivery that arrives late finds its own state already
+ * there and changes nothing (T5), instead of landing on whatever state the series has reached since.
  */
 const UNIT = "store-repairs";
 const MAX_ENTITY_ID = 200; // the store's own limit on an entity id (src/storage/store.ts)
-const STOP_AFTER = 3; // the third consecutive attempt without progress saves a stop (rules of model calls, G7)
+const STOP_AFTER = 3; // the third consecutive attempt without progress in the open window stops (model calls, G7)
 
 export const REPAIR_SERIES_KIND = "repair-series";
+
+/**
+ * The records the three grounds are made of. All are written by later units — the review of a stop by A6, the
+ * confirmation of a repeated addressed check by B1 and A4, the owner's decision by the command API of H2 — and this
+ * unit only READS them, at the exact reference a request names and inside this project's namespace. What it weighs is
+ * what it can weigh from its own history, and the three are tied to that history differently. The review and the
+ * owner's decision name the stop itself — its attempt and the goals it was raised for — and are compared with the stop
+ * derived from the attempts. The fixed input names no stop: it is tied through the refusal the attempts of THIS stop
+ * ran into, the input that refusal stood on, and the confirmation of a later revision of that same input.
+ * Whether the reviewer was independent, whether the re-check really passed and whether the decision really came from
+ * the owner are established by the unit whose duty that is; a field of a record declaring any of them would be a
+ * verdict handed to a consumer to trust. What a ground may NOT do is stand on a sentence alone: T1 — what was decided
+ * is read from a record, not taken on the word of whoever is asking.
+ *
+ * A review says how it ENDED, and says it in its own content rather than in a status beside it: a cause (or a named
+ * hypothesis) and a change are each either said, or explicitly null — null cause, "the reviewer could not name one";
+ * null change, "the review found no usable change". Said and said is a review that decided something, and it is a
+ * ground to continue. Either one null is a review that ENDED WITHOUT A DECISION, and the rules send that stop to the
+ * owner: it is a ground to escalate, never to continue. Anything else — a key left out, an empty text, an empty
+ * structure — is not an outcome at all but a broken record, and it moves nothing. A failed call or an off-form answer
+ * leaves no record of a review, and the series does nothing about it: recovering the same call is A6's.
+ */
+export const STOP_REVIEW_KIND = "om-stop-review";
+export const INPUT_FIX_KIND = "om-input-fix";
+export const OWNER_DECISION_KIND = "om-owner-decision";
 
 /**
  * Why a cycle ended. The table is closed because the rules attach a defined effect to its entries and an unnamed
@@ -46,10 +78,26 @@ const WITHOUT_RESULT: readonly CompletionReason[] = Object.freeze(["off-form", "
 export const ATTEMPT_VERDICTS = Object.freeze(["progress", "conflict", "none", "neutral"] as const);
 export type AttemptVerdict = typeof ATTEMPT_VERDICTS[number];
 
-// The grounds on which stopped work continues. "Inputs changed" is also what a successor of a series stands on when
-// the slice moves — a recorded ground to continue, which is not itself progress.
-export const CONTINUATION_GROUNDS = Object.freeze(["approach-changed", "inputs-changed", "owner-decision"] as const);
+/**
+ * The grounds on which stopped work continues, and the only ones (owner's decision of 21.09.2026).
+ * "The approach has changed", written by the executor's own hand, is not among them any more: it lifted a stop without
+ * anyone outside the circling cycle having looked at it. Each of the three that are left stands on a record somebody
+ * else wrote — the review of this stop, the confirmation of a fixed input, the decision of the owner — because a
+ * ground that stood on a sentence would be that same hand under another name.
+ */
+export const CONTINUATION_GROUNDS = Object.freeze(["inputs-fixed", "owner-decision", "review-record"] as const);
 export type ContinuationGround = typeof CONTINUATION_GROUNDS[number];
+
+// The ladder admits the owner at every rung, and the two grounds of the first rung only while that rung stands.
+const OWNER_ONLY = Object.freeze(["owner-decision"] as const);
+const FIRST_RUNG = 1;
+const OWNER_RUNG = 2;
+const groundsOf = (rung: number): readonly ContinuationGround[] => (rung === FIRST_RUNG ? CONTINUATION_GROUNDS : OWNER_ONLY);
+
+// Why a SUCCESSOR of a series was opened. A slice that moved is a ground to open one and carry the history over; it
+// is not a ground to continue a stopped series, and one change of horizon moves no rung of the ladder.
+export const SUCCESSION_GROUNDS = Object.freeze(["inputs-changed"] as const);
+export type SuccessionGround = typeof SUCCESSION_GROUNDS[number];
 
 // Every refusal this unit can produce. The list is the checklist its test walks, so a new code cannot arrive untested.
 export const SERIES_CODES = Object.freeze([
@@ -57,6 +105,7 @@ export const SERIES_CODES = Object.freeze([
   "attempt_running", "attempt_unknown", "attempt_conflict", "outcome_conflict", "outcome_invalid",
   "basis_unresolved", "cancelled_unknown", "refusal_unlinked",
   "series_stopped", "stop_absent", "continuation_conflict",
+  "owner_required", "review_unusable", "input_unfixed", "decision_unusable", "escalation_conflict",
 ] as const);
 export type SeriesCode = typeof SERIES_CODES[number];
 
@@ -115,13 +164,46 @@ export interface Attempt {
   readonly verdict: AttemptVerdict | null;
 }
 
+/** The recorded ground a SUCCESSOR of a series stands on: the slice of the horizon it was opened for moved. */
 export interface SeriesBasis {
-  readonly ground: ContinuationGround;
+  readonly ground: SuccessionGround;
   readonly text: string;
 }
 
-export interface Continuation extends SeriesBasis {
+/**
+ * A ground to continue a stopped series, with the records it is made of.
+ * The text is what the owner reads; the references are what the series weighs. A ground carries exactly the records
+ * ITS rule names — a review names one record, a fixed input names the refusal that stood, the input the attempts ran
+ * with and the confirmation of the repeated check, a decision of the owner names the record that decision was taken
+ * in — so a ground can neither be given without them nor pad itself out with references nothing looks at.
+ */
+export interface ReviewContinuation {
+  readonly ground: "review-record";
+  readonly text: string;
+  readonly review: Ref;
+}
+export interface InputsContinuation {
+  readonly ground: "inputs-fixed";
+  readonly text: string;
+  readonly refusal: string;
+  readonly input: Ref;
+  readonly confirmation: Ref;
+}
+export interface OwnerContinuation {
+  readonly ground: "owner-decision";
+  readonly text: string;
+  readonly decision: Ref;
+}
+export type ContinuationBasis = ReviewContinuation | InputsContinuation | OwnerContinuation;
+export type Continuation = ContinuationBasis & { readonly after: number };
+
+/**
+ * A stop sent to the owner because its review ENDED WITHOUT A DECISION: the stop it answers and the exact review that
+ * says so. It lifts nothing and opens no window — the stop stays saved, and only the owner's decision continues it.
+ */
+export interface Escalation {
   readonly after: number;
+  readonly review: Ref;
 }
 
 export interface SeriesStop {
@@ -130,6 +212,20 @@ export interface SeriesStop {
   readonly goals: readonly string[];
   readonly reason: string;
   readonly resume: string;
+}
+
+/**
+ * Where the series stands on the ladder after a stop, derived from its history like the count and the stop itself.
+ * `rung` is the rung the NEXT continuation has to satisfy, `goals` the goals of the stop the ladder began at — the
+ * original goal a new accepted result of which returns it to the start — `windows` the stops already continued, each
+ * of which opened a window of its own, and `grounds` what a continuation may stand on now, so that a consumer reads
+ * the requirement instead of deriving the ladder again for itself.
+ */
+export interface SeriesLadder {
+  readonly rung: number;
+  readonly goals: readonly string[];
+  readonly windows: readonly number[];
+  readonly grounds: readonly ContinuationGround[];
 }
 
 export interface RepairSeries {
@@ -142,7 +238,9 @@ export interface RepairSeries {
   readonly inherited: readonly Attempt[];
   readonly attempts: readonly Attempt[];
   readonly continuations: readonly Continuation[];
+  readonly escalations: readonly Escalation[];
   readonly withoutProgress: number;
+  readonly ladder: SeriesLadder;
   readonly stop: SeriesStop | null;
 }
 
@@ -165,26 +263,68 @@ export interface CompleteAttemptRequest extends SeriesRequest {
   readonly attempt: number;
   readonly outcome: ClaimedOutcome;
 }
+/**
+ * The record a ground stands on, in one of the two ways a neighbour can hand it over — never both, never neither.
+ * `ref` names a record ALREADY STORED, at its exact reference. `pending` is the record the neighbour writes IN THIS
+ * SAME TRANSACTION (A6 writing a review and escalating on it, H2 writing the owner's decision and continuing on it):
+ * the store offers no outer transaction, so a ground written on its own first would stand in the store while the
+ * series still allowed what that ground forbids. The content of the record is weighed by the same function either
+ * way; only where the value comes from differs, and the series keeps the exact reference in both cases.
+ */
+export interface PendingRecord {
+  readonly id: string;
+  readonly kind: string;
+  readonly value: Json;
+}
+export type GroundRecord =
+  | { readonly ref: Ref; readonly pending?: never }
+  | { readonly pending: PendingRecord; readonly ref?: never };
+
+/** The ground a continuation is ASKED for with: the records it stands on, each already stored or written with it. */
+export interface ReviewGround {
+  readonly ground: "review-record";
+  readonly text: string;
+  readonly review: GroundRecord;
+}
+export interface InputsGround {
+  readonly ground: "inputs-fixed";
+  readonly text: string;
+  readonly refusal: string;
+  readonly input: Ref;
+  readonly confirmation: GroundRecord;
+}
+export interface OwnerGround {
+  readonly ground: "owner-decision";
+  readonly text: string;
+  readonly decision: GroundRecord;
+}
+export type ContinuationRequest = ReviewGround | InputsGround | OwnerGround;
+
 /** The stop is part of the request: a late continuation finds the stop it was given for, and never lifts a later one. */
-export interface ResumeSeriesRequest extends SeriesRequest, SeriesBasis {
+export type ResumeSeriesRequest = SeriesRequest & ContinuationRequest & { readonly stop: number };
+/** Names the stop it escalates and the review that ended without a decision, so a late repeat finds its own. */
+export interface EscalateSeriesRequest extends SeriesRequest {
   readonly stop: number;
+  readonly review: GroundRecord;
 }
 
 /**
- * One prepared change: the record to write, the exact references it must be guarded by, and what the series would
- * hold afterwards. `write` is null when the series already holds this change — a repeat needs no revision.
+ * One prepared change: the records to write, the exact references they must be guarded by, and what the series would
+ * hold afterwards. The series itself is always the FIRST write; a ground handed over as `pending` is the second, so
+ * the ground and the change it grounds commit together or not at all. `writes` is empty when the series already holds
+ * this change — a repeat needs no revision, and adds nothing to anyone's transaction.
  * A caller that has to write SEVERAL records at once (B3 applying the transition of many series together with its own
- * record of the transition) puts these writes and guards into one writeGuarded of its own, so that either all of the
- * successors and the transition are applied, or none is.
+ * record of the transition, A6 writing a review and escalating on it) puts these writes and guards into one
+ * writeGuarded of its own, so that either all of them are applied, or none is.
  */
 export interface PreparedWrite {
   readonly id: string;
   readonly kind: string;
   readonly expected: number;
-  readonly value: RepairSeries;
+  readonly value: unknown;
 }
 export interface SeriesTransition {
-  readonly write: PreparedWrite | null;
+  readonly writes: readonly PreparedWrite[];
   readonly guards: readonly Ref[];
   readonly value: RepairSeries;
 }
@@ -196,11 +336,19 @@ const CLAIMED_REFUSAL_KEYS = Object.freeze(["name", "goal", "row"] as const);
 const OUTCOME_KEYS = Object.freeze(["reason", "achieved", "cancelled", "refusals"] as const);
 const ATTEMPT_KEYS = Object.freeze(["ordinal", "goal", "outcome", "verdict"] as const);
 const BASIS_KEYS = Object.freeze(["ground", "text"] as const);
-const CONTINUATION_KEYS = Object.freeze([...BASIS_KEYS, "after"] as const);
+const REVIEW_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "review"] as const);
+const INPUTS_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "refusal", "input", "confirmation"] as const);
+const OWNER_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "decision"] as const);
+const groundKeys = (ground: ContinuationGround): readonly string[] =>
+  ground === "review-record" ? REVIEW_GROUND_KEYS : ground === "inputs-fixed" ? INPUTS_GROUND_KEYS : OWNER_GROUND_KEYS;
 const SERIES_KEYS = Object.freeze([
   "projectId", "block", "line", "slice", "predecessor", "basis",
-  "inherited", "attempts", "continuations", "withoutProgress", "stop",
+  "inherited", "attempts", "continuations", "escalations", "withoutProgress", "ladder", "stop",
 ] as const);
+const ESCALATION_KEYS = Object.freeze(["after", "review"] as const);
+const REF_SOURCE_KEYS = Object.freeze(["ref"] as const);
+const PENDING_SOURCE_KEYS = Object.freeze(["pending"] as const);
+const PENDING_KEYS = Object.freeze(["id", "kind", "value"] as const);
 
 interface Address { readonly project: string; readonly block: string; readonly line: number; readonly id: string }
 interface Context { readonly target: string; readonly ref: Ref | undefined }
@@ -215,10 +363,27 @@ export function seriesId(project: string, block: string, line: number): string {
 }
 
 /**
+ * The namespaces the records of the three grounds are read from.
+ * A record of another project cannot be a ground here even if it reads perfectly, so the address is checked before
+ * the store is touched; the tail of the id belongs to the unit that writes the record.
+ */
+export function stopReviewNamespace(project: string): string {
+  return `${STOP_REVIEW_KIND}:${requireProject(project)}:`;
+}
+export function inputFixNamespace(project: string): string {
+  return `${INPUT_FIX_KIND}:${requireProject(project)}:`;
+}
+export function ownerDecisionNamespace(project: string): string {
+  return `${OWNER_DECISION_KIND}:${requireProject(project)}:`;
+}
+
+/**
  * Opens the series of one block and one slice of the horizon, or its successor when the slice has moved.
- * A successor names its predecessor by an exact reference, carries its whole history of attempts and stands on a
- * recorded ground — the change of inputs continues the work, but is not itself progress, so the count of attempts
- * without progress is carried over with the history rather than cleared. A successor at the same slice is refused:
+ * A successor names its predecessor by an exact reference, carries its whole history — attempts AND the continuations
+ * recorded so far — and stands on a recorded ground of its own. The change of the slice is a ground to OPEN it, not a
+ * ground to continue: a stop the predecessor saved comes across still standing, the count of attempts without progress
+ * comes with it, and the rung of the ladder comes with it too, because one change of horizon moves no rung.
+ * A successor at the same slice is refused:
  * an unchanged slice is the same series, and re-issuing one would be a way round a saved stop.
  * Opening the same series again changes nothing and writes no revision, however much has happened since (T5).
  */
@@ -247,14 +412,26 @@ export function completeAttempt(store: Store, request: CompleteAttemptRequest): 
 }
 
 /**
- * Continues the series from the stop the request names, on a recorded ground.
+ * Continues the series from the stop the request names, on a ground the rung it has reached admits.
  * A restart does not lift a stop and neither does a continuation given for an earlier one: the ground is recorded
  * against the attempt whose stop it answers, so a late repeat finds its own ground already there and leaves a stop
- * saved since then standing. The count of attempts without progress is untouched — a change of approach or of inputs
- * is not itself progress.
+ * saved since then standing. A continuation opens a new window of up to three attempts without progress; it is not
+ * itself progress, so it spends the rung it stood on instead of returning the ladder to the start.
  */
 export function resumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
   return applied(store, prepareResume(store, request));
+}
+
+/**
+ * Sends the stop the request names to the owner, on the exact record of a review that ended without a decision.
+ * The rules put such a stop on the second rung: the stop stays saved, no window opens, and from then on only the
+ * owner's decision continues it — a second review of the same stop, however good, and a fixed input no longer do.
+ * A6 writes the review and changes no series, so this is the transition that keeps its outcome in the series itself.
+ * It applies to its own stop and once: the same request again changes nothing, another review for a stop already
+ * escalated is refused, and a stop that no longer stands cannot be escalated at all (T5).
+ */
+export function escalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
+  return applied(store, prepareEscalate(store, request));
 }
 
 /**
@@ -281,6 +458,8 @@ export const prepareCompleteAttempt = (store: Store, request: CompleteAttemptReq
   handed(prepareComplete(store, request));
 export const prepareResumeSeries = (store: Store, request: ResumeSeriesRequest): OmResult<Sealed<SeriesTransition>> =>
   handed(prepareResume(store, request));
+export const prepareEscalateSeries = (store: Store, request: EscalateSeriesRequest): OmResult<Sealed<SeriesTransition>> =>
+  handed(prepareEscalate(store, request));
 
 const handed = (prepared: OmResult<Prepared>): OmResult<Sealed<SeriesTransition>> =>
   prepared.ok ? delivered(prepared.value.transition) : prepared;
@@ -289,25 +468,24 @@ function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Re
   if (!prepared.ok) return prepared;
   const { transition, current } = prepared.value;
   // Nothing to write is a fact, not a failure: the series already holds what was asked for.
-  if (transition.write === null) return delivered(current!);
+  if (transition.writes.length === 0) return delivered(current!);
+  // One transaction for the series and the ground it stands on: both commit, or neither does (T7).
   const result = writeGuarded<RepairSeries>(store, {
-    unit: UNIT, target: transition.write.id, guards: transition.guards, writes: [transition.write],
+    unit: UNIT, target: transition.writes[0]!.id, guards: transition.guards, writes: [...transition.writes],
   });
   if (!result.ok) return result;
   return delivered(result.value[0]!);
 }
 
 const unchanged = (current: Revision<RepairSeries>): OmResult<Prepared> =>
-  ({ ok: true, value: { transition: { write: null, guards: [], value: current.value }, current } });
+  ({ ok: true, value: { transition: { writes: [], guards: [], value: current.value }, current } });
 
-function change(address: Address, value: RepairSeries, expected: number, guards: readonly Ref[], current: Revision<RepairSeries> | null): OmResult<Prepared> {
-  return {
-    ok: true,
-    value: {
-      transition: { write: { id: address.id, kind: REPAIR_SERIES_KIND, expected, value }, guards: [...guards], value },
-      current,
-    },
-  };
+function change(
+  address: Address, value: RepairSeries, expected: number, guards: readonly Ref[], current: Revision<RepairSeries> | null,
+  grounds: readonly PreparedWrite[] = [],
+): OmResult<Prepared> {
+  const series: PreparedWrite = { id: address.id, kind: REPAIR_SERIES_KIND, expected, value };
+  return { ok: true, value: { transition: { writes: [series, ...grounds], guards: [...guards], value }, current } };
 }
 
 function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepared> {
@@ -328,6 +506,8 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
   // The predecessor is resolved first, at the exact revision the request names, so that opening the same successor
   // again is recognised as a repeat however far the predecessor has moved on since.
   let inherited: readonly Attempt[] = [];
+  let carried: readonly Continuation[] = [];
+  let escalated: readonly Escalation[] = [];
   let predecessor: Ref | null = null;
   let earlier: Revision<RepairSeries> | null = null;
   if (request.predecessor !== null) {
@@ -341,6 +521,11 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
     if (broken) return broken;
     earlier = read.value as Revision<RepairSeries>;
     inherited = [...earlier.value.inherited, ...earlier.value.attempts].map(copyAttempt);
+    // The continuations come across with the attempts: a stop already answered must not come back to life in the
+    // successor, and the windows already opened are what the rung of the ladder is derived from.
+    carried = earlier.value.continuations.map(plainContinuation);
+    // Escalations too: a stop the owner alone may continue stays the owner's across a change of horizon.
+    escalated = earlier.value.escalations.map(plainEscalation);
     predecessor = reference(earlier);
   }
 
@@ -370,7 +555,7 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
 
   const value = settled({
     projectId: address.project, block: address.block, line: address.line, slice: request.slice,
-    predecessor, basis, inherited, attempts: [], continuations: [],
+    predecessor, basis, inherited, attempts: [], continuations: carried, escalations: escalated,
   });
   return change(address, value, 0, predecessor === null ? [] : [predecessor], null);
 }
@@ -406,7 +591,7 @@ function prepareBegin(store: Store, request: BeginAttemptRequest): OmResult<Prep
     return problem("attempt_running", "Another goal is already being attempted in this series, and a second cycle does not run beside it", context, "attempt");
   }
   if (held.stop !== null) {
-    return problem("series_stopped", `A saved stop stands after attempt ${held.stop.attempt}; only a recorded ground continues the work`, context, "stop");
+    return problem("series_stopped", `A saved stop stands after attempt ${held.stop.attempt}: ${held.stop.resume}`, context, "stop");
   }
   const attempt: Attempt = { ordinal: request.attempt, goal, outcome: null, verdict: null };
   const value = settled({ ...plainSeries(held), attempts: [...held.attempts.map(copyAttempt), attempt] });
@@ -475,9 +660,8 @@ function prepareResume(store: Store, request: ResumeSeriesRequest): OmResult<Pre
   const address = requireAddress(request);
   requireCondition(Number.isSafeInteger(request.stop) && request.stop >= 1,
     "series_request_invalid", "A continuation names the attempt whose stop it answers");
-  requireCondition(basisProblem(request) === null,
-    "series_request_invalid", "A continuation names one of the recorded grounds and says what changed");
-  const basis = basisOf(request);
+  requireCondition(groundProblem(request, isGroundRecord) === null,
+    "series_request_invalid", "A continuation names one of the recorded grounds, says what changed, and carries the records that ground is made of — each stored and named by its exact reference, or written with it, never both and never neither");
 
   const current = currentSeries(store, address);
   if (!current) return missing(address);
@@ -486,21 +670,308 @@ function prepareResume(store: Store, request: ResumeSeriesRequest): OmResult<Pre
   const context: Context = { target: address.id, ref: reference(head) };
   const held = head.value;
 
+  // Where the record of the ground comes from is settled first, so that its exact reference is known before anything
+  // is compared: a late repeat of a continuation whose ground was written with it finds that record stored by now.
+  const grounded = groundOf(store, address, request);
+  if ("ok" in grounded) return grounded;
+  const basis = basisFrom(request, grounded.ref);
+
   const already = held.continuations.find(item => item.after === request.stop);
   if (already) {
     // T5: the stop this ground was given for is continued already. The same ground again changes nothing, and a
     // different one does not replace it — neither lifts a stop saved since then, because neither is about it.
-    if (hashJson(plainBasis(already)) === hashJson(basis)) return unchanged(head);
+    if (hashJson(continuationOf(already)) === hashJson(basis)) return unchanged(head);
     return problem("continuation_conflict", `The stop after attempt ${request.stop} is continued already, and a later ground does not replace the earlier one`, context, "ground");
   }
-  if (held.stop === null || held.stop.attempt !== request.stop) {
+  const stop = held.stop;
+  if (stop === null || stop.attempt !== request.stop) {
     return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
   }
+  // The rung decides what this stop admits, and the ladder was derived from the history when the record was read.
+  // A refusal here goes to the OWNER: what is missing is the owner's decision, and nobody else can supply it.
+  if (!held.ladder.grounds.includes(basis.ground)) {
+    return problem("owner_required",
+      `The first rung of the ladder is spent for ${held.ladder.goals.join(", ")}, so only the owner's decision continues the stop after attempt ${request.stop}`,
+      context, "ground", "owner");
+  }
+  const unusable = groundStanding(store, address, basis, grounded.value, held, stop, context);
+  if (unusable) return unusable;
+
   const value = settled({
     ...plainSeries(held),
     continuations: [...held.continuations.map(plainContinuation), { ...basis, after: request.stop }],
   });
-  return change(address, value, head.revision, [reference(head)], head);
+  return change(address, value, head.revision, [reference(head)], head, grounded.write === null ? [] : [grounded.write]);
+}
+
+function prepareEscalate(store: Store, request: EscalateSeriesRequest): OmResult<Prepared> {
+  requireStore(store);
+  requireCondition(isPlainObject(request), "series_request_invalid", "A stop is escalated through a request object");
+  const address = requireAddress(request);
+  requireCondition(Number.isSafeInteger(request.stop) && request.stop >= 1,
+    "series_request_invalid", "An escalation names the attempt whose stop it sends to the owner");
+  requireCondition(isGroundRecord(request.review),
+    "series_request_invalid", "An escalation names the review that ended without a decision — stored and named by its exact reference, or written with it, never both and never neither");
+
+  const current = currentSeries(store, address);
+  if (!current) return missing(address);
+  if (!current.ok) return current;
+  const head = current.value;
+  const context: Context = { target: address.id, ref: reference(head) };
+  const held = head.value;
+
+  const grounded = locate(store, address, request.review, STOP_REVIEW_KIND, stopReviewNamespace(address.project), "review");
+  if ("ok" in grounded) return grounded;
+  const escalation: Escalation = { after: request.stop, review: exactRef(grounded.ref) };
+
+  const already = held.escalations.find(item => item.after === request.stop);
+  if (already) {
+    // T5: this stop was sent to the owner already. The same review again is the same request delivered twice; another
+    // review does not replace the one it was escalated on — neither is applied a second time.
+    if (sameRef(already.review, escalation.review)) return unchanged(head);
+    return problem("escalation_conflict", `The stop after attempt ${request.stop} was sent to the owner on another review already, and a later review does not replace it`, context, "review");
+  }
+  const stop = held.stop;
+  if (stop === null || stop.attempt !== request.stop) {
+    return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
+  }
+  // At the second rung no review is called and there is nothing left to escalate: the stop is the owner's already.
+  if (held.ladder.rung !== FIRST_RUNG) {
+    return problem("owner_required", `The stop after attempt ${request.stop} already waits for the owner's decision, and a review has nothing to send on`, context, "stop", "owner");
+  }
+  const unusable = weighReview(grounded.value, address, stop, context, "undecided");
+  if (unusable) return unusable;
+
+  const value = settled({ ...plainSeries(held), escalations: [...held.escalations.map(plainEscalation), escalation] });
+  return change(address, value, head.revision, [reference(head)], head, grounded.write === null ? [] : [grounded.write]);
+}
+
+/** Where a record of a ground comes from, what it holds, and — when it is written with this change — its write. */
+interface Located {
+  readonly ref: Ref;
+  readonly value: unknown;
+  readonly write: PreparedWrite | null;
+}
+
+/** The record the request's own ground stands on: the review, the confirmation of the fix, or the owner's decision. */
+function groundOf(store: Store, address: Address, request: ContinuationRequest): OmResult<never> | Located {
+  if (request.ground === "review-record") {
+    return locate(store, address, request.review, STOP_REVIEW_KIND, stopReviewNamespace(address.project), "review");
+  }
+  if (request.ground === "inputs-fixed") {
+    return locate(store, address, request.confirmation, INPUT_FIX_KIND, inputFixNamespace(address.project), "confirmation");
+  }
+  return locate(store, address, request.decision, OWNER_DECISION_KIND, ownerDecisionNamespace(address.project), "decision");
+}
+
+/**
+ * Settles where the record of a ground comes from, and nothing else — its CONTENT is weighed afterwards by one function
+ * whichever way it came.
+ * A stored record is read at its exact reference inside this project's namespace, as A1 reads any record. A record
+ * written with this change is held to the same address rules BEFORE the store is touched — this namespace, this kind —
+ * and its exact reference is computed as the store will make it: the first revision of its id, with the hash of its
+ * content. One copy of that content is taken here, and it is the copy that is weighed, referenced and written, so no
+ * caller can change between the check and the write what the series stands on.
+ * An id already standing is not overwritten. Holding this very record, it IS this record — stored by the transaction
+ * this request repeats, or by its writer on its own — and is taken like any stored one; holding anything else, it is a
+ * revision conflict, the same refusal the store gives when another record takes the id between this preparation and
+ * the write (T5, T7).
+ */
+function locate(
+  store: Store, address: Address, source: GroundRecord, kind: string, namespace: string, field: string,
+): OmResult<never> | Located {
+  if (source.ref !== undefined) {
+    const read = readRecord<Json>(store, source.ref, { unit: UNIT, target: address.id, kind, idPrefix: namespace });
+    if (!read.ok) return read;
+    return { ref: reference(read.value), value: read.value.value, write: null };
+  }
+  const pending = source.pending;
+  if (!pending.id.startsWith(namespace)) {
+    return asRecord("record_foreign", `A record at ${pending.id} lies outside ${namespace}`, address, `${field}.pending.id`);
+  }
+  if (pending.kind !== kind) {
+    return asRecord("record_foreign", `A ${pending.kind} record cannot stand for a ${kind} record`, address, `${field}.pending.kind`);
+  }
+  const value = sealed(pending.value);
+  const hash = hashJson(value);
+  const standing = store.get(pending.id);
+  if (standing === null) {
+    return { ref: { id: pending.id, revision: 1, hash }, value, write: { id: pending.id, kind, expected: 0, value } };
+  }
+  if (standing.kind === kind && standing.hash === hash) return { ref: reference(standing), value: standing.value, write: null };
+  return asRecord("revision_conflict", `Another record already stands at ${pending.id}, and a record written with this change is the first revision of its id`,
+    address, `${field}.pending.id`, reference(standing));
+}
+
+// A record handed over to be written is refused with the codes A1 gives a stored record for the same defect, so that
+// one fact reads alike whichever way the record came.
+function asRecord(code: RefsRefusalCode, message: string, address: Address, field: string, ref?: Ref): OmResult<never> {
+  return refused(code, message, { unit: UNIT, target: address.id, field, ref }, "producer");
+}
+
+function basisFrom(request: ContinuationRequest, ref: Ref): ContinuationBasis {
+  if (request.ground === "review-record") return { ground: request.ground, text: request.text, review: exactRef(ref) };
+  if (request.ground === "inputs-fixed") {
+    return {
+      ground: request.ground, text: request.text, refusal: request.refusal,
+      input: exactRef(request.input), confirmation: exactRef(ref),
+    };
+  }
+  return { ground: request.ground, text: request.text, decision: exactRef(ref) };
+}
+
+/** Weighs the content of a ground's record against the history this series holds, whichever way the record came. */
+function groundStanding(
+  store: Store, address: Address, basis: ContinuationBasis, value: unknown, held: RepairSeries, stop: SeriesStop, context: Context,
+): OmResult<never> | null {
+  if (basis.ground === "review-record") return weighReview(value, address, stop, context, "decided");
+  if (basis.ground === "inputs-fixed") return weighFix(store, address, basis, value, held, stop, context);
+  return weighDecision(value, address, stop, context);
+}
+
+/**
+ * The one question the records of a review and of an owner's decision share: is this about THIS lineage and THIS
+ * stop, with THE GOALS the stop was raised for? (A fixed input names no stop and is tied to it otherwise — see
+ * weighFix.) The stop and the goals are derived here from the attempts, never read out of the record, so a record about
+ * another stop, one that arrived late for a stop continued long since and one delivered twice all fail on the
+ * comparison (T3, T5) — and no field a record carries about itself, "accepted", "independent" or "lifts any stop", is
+ * consulted.
+ */
+function aboutStop(value: unknown, address: Address, stop: SeriesStop): { readonly value: Record<string, unknown> } | { readonly field: string } {
+  if (!isPlainObject(value)) return { field: "" };
+  const record = value as Record<string, unknown>;
+  if (record['projectId'] !== address.project || record['block'] !== address.block) return { field: ".block" };
+  if (record['stop'] !== stop.attempt) return { field: ".stop" };
+  const goals = record['goals'];
+  if (!Array.isArray(goals) || goals.length === 0 || !goals.every(isText)) return { field: ".goals" };
+  // T6: the goals are an unordered set on both sides, so both are put in one order before they are compared.
+  if (hashJson(ordered(goals as string[], key => key)) !== hashJson(ordered([...stop.goals], key => key))) {
+    return { field: ".goals" };
+  }
+  return { value: record };
+}
+
+const notAbout = (field: string): string =>
+  field === ".block" ? "is about another block"
+    : field === ".stop" ? "is about another stop"
+      : field === ".goals" ? "is about another goal" : "is not a record of a stop at all";
+
+type ReviewEnd = "decided" | "undecided";
+
+/**
+ * How a review ended, read from what it says rather than from a status beside it (see STOP_REVIEW_KIND).
+ * A cause and a change are each said or explicitly null; a key left out, an empty text or an empty structure is a
+ * broken record, which is no outcome at all. A status field would be a second truth free to contradict the content.
+ */
+function reviewEnd(review: Record<string, unknown>): { readonly end: ReviewEnd } | { readonly field: string } {
+  const cause = review['cause'];
+  const change = review['change'];
+  if (cause !== null && !said(cause)) return { field: "review.cause" };
+  if (change !== null && !said(change)) return { field: "review.change" };
+  return { end: cause === null || change === null ? "undecided" : "decided" };
+}
+
+/**
+ * The review of a stop, weighed for what the request wants of it.
+ * A review that decided — a cause and a change — continues the stop; a review that ended without a decision sends it
+ * to the owner and continues nothing. Each is refused on the other's path, so that no review is read as the outcome
+ * it did not have. The independence of the reviewer and the worth of the cause are A6's to establish.
+ */
+function weighReview(value: unknown, address: Address, stop: SeriesStop, context: Context, wanted: ReviewEnd): OmResult<never> | null {
+  const found = aboutStop(value, address, stop);
+  if ("field" in found) {
+    return problem("review_unusable", `A review that ${notAbout(found.field)} is no ground for this stop`, context, `review${found.field}`);
+  }
+  const ended = reviewEnd(found.value);
+  if ("field" in ended) {
+    return problem("review_unusable", "A review says its cause and its change, each explicitly null when there is none; a part left out or left empty is a broken record, not an outcome", context, ended.field);
+  }
+  if (ended.end === wanted) return null;
+  if (wanted === "decided") {
+    return problem("review_unusable",
+      `This review ended without a decision, so it continues nothing: escalateSeries sends the stop after attempt ${stop.attempt} to the owner on it`,
+      context, found.value['change'] === null ? "review.change" : "review.cause");
+  }
+  return problem("review_unusable",
+    `This review found a cause and a change, so it escalates nothing: it continues the stop after attempt ${stop.attempt} through resumeSeries`,
+    context, "review.change");
+}
+
+/**
+ * The decision of the owner.
+ * The owner decides through the command API (H2), which writes the decision down — before this change, or with it; this
+ * unit weighs that record like the others. A ground standing on a sentence alone would let any code that can call this
+ * function walk the series past the rung where only the owner may decide — the executor's own hand under another name —
+ * and T1 says what was decided is read from a record. WHO decided and how their action was authenticated is the command
+ * API's to answer: this unit reads no field claiming it, and refuses towards the owner when the record does not hold.
+ */
+function weighDecision(value: unknown, address: Address, stop: SeriesStop, context: Context): OmResult<never> | null {
+  const found = aboutStop(value, address, stop);
+  if ("field" in found) {
+    return problem("decision_unusable", `A decision that ${notAbout(found.field)} does not continue this stop`, context, `decision${found.field}`, "owner");
+  }
+  if (!isText(found.value['decided'])) {
+    return problem("decision_unusable", "A record that says nothing the owner decided is no ground to continue", context, "decision.decided", "owner");
+  }
+  return null;
+}
+
+/**
+ * A fixed input, weighed against the refusal it is supposed to have fixed. It names no stop: it is tied to this one
+ * through the refusal the attempts of THIS stop ran into.
+ * The refusal is a row of THIS project's journal (A2), and one the attempts this stop was raised for really ran into;
+ * the input is one of the exact records that refusal was weighed against, which its origin holds; and the confirmation
+ * of the repeated addressed check names that same refusal and a LATER revision of that same record, whose content
+ * really differs. A new id, a new revision holding the same content, or a confirmation about something else is no fix.
+ * The confirmation may be written with this change; the revision it confirms may not — a check is run on a revision
+ * that stands, so that revision is read from the store. Whether the change was the one the refusal called for is what
+ * the repeated ADDRESSED check establishes, and its record is read here, not re-run.
+ */
+function weighFix(
+  store: Store, address: Address, basis: InputsContinuation, value: unknown, held: RepairSeries, stop: SeriesStop, context: Context,
+): OmResult<never> | null {
+  const journal = readJournal(store, { project: address.project });
+  if (!journal.ok) {
+    return problem("refusal_unlinked", `This project holds no journal a refusal could stand in: ${journal.refusal.code}`, context, "refusal");
+  }
+  const row = journal.value.value.rows.find(item => item.id === basis.refusal);
+  if (!row) {
+    return problem("refusal_unlinked", "No refusal stands in the journal of this project under that row", context, "refusal");
+  }
+  const attempts = new Map([...held.inherited, ...held.attempts].map(item => [item.ordinal, item]));
+  const met = stop.attempts.some(ordinal =>
+    (attempts.get(ordinal)?.outcome?.refusals ?? []).some(item => item.row === basis.refusal));
+  if (!met) {
+    return problem("input_unfixed", "The attempts this stop was raised for did not run into that refusal", context, "refusal");
+  }
+  if (!row.origin.sources.some(item => sameRef(item.ref, basis.input))) {
+    return problem("input_unfixed", "That refusal did not stand on the input the continuation names", context, "input");
+  }
+  if (!isPlainObject(value)) {
+    return problem("input_unfixed", "A confirmation carries the refusal it re-checked and the revision of the input it re-checked", context, "confirmation");
+  }
+  const confirmation = value as Record<string, unknown>;
+  if (confirmation['refusal'] !== basis.refusal) {
+    return problem("input_unfixed", "The confirmation re-checked another refusal", context, "confirmation.refusal");
+  }
+  const fixed = confirmation['input'];
+  if (!isRef(fixed)) {
+    return problem("input_unfixed", "A confirmation names the exact revision of the input it re-checked", context, "confirmation.input");
+  }
+  if (fixed.id !== basis.input.id) {
+    return problem("input_unfixed", "A record of another id is no fix of the input the attempts ran with", context, "confirmation.input");
+  }
+  if (fixed.revision <= basis.input.revision) {
+    return problem("input_unfixed", "A confirmation of a revision no later than the one the attempts ran with fixes nothing", context, "confirmation.input");
+  }
+  const found = store.get(fixed.id, fixed.revision);
+  if (!found || found.hash !== fixed.hash) {
+    return problem("input_unfixed", "The confirmation names a revision of the input that does not stand at that exact reference", context, "confirmation.input");
+  }
+  if (found.hash === basis.input.hash) {
+    return problem("input_unfixed", "A new revision holding the very data the refusal stood on is no fix of it", context, "confirmation.input");
+  }
+  return null;
 }
 
 /**
@@ -549,17 +1020,31 @@ const missing = (address: Address): OmResult<never> =>
 const running = (value: RepairSeries): Attempt | null => value.attempts.find(item => item.outcome === null) ?? null;
 
 // ---------------------------------------------------------------------------
-// What the series derives for itself: the verdict of every attempt, the count and the saved stop.
+// What the series derives for itself: the verdict of every attempt, the count, the saved stop and the ladder.
 
 interface Walk {
   readonly verdicts: ReadonlyMap<number, AttemptVerdict>;
   readonly achieved: ReadonlyMap<string, ReadonlySet<string>>;
   readonly withoutProgress: number;
+  readonly ladder: SeriesLadder;
   readonly stop: SeriesStop | null;
-  readonly stray: boolean;
+  readonly flaw: { readonly field: string; readonly message: string } | null;
 }
 
-type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "stop">;
+type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "ladder" | "stop">;
+
+// A ladder is built here rather than shared: what is written holds no object of a policy table (T11).
+const ladderAt = (rung: number, goals: readonly string[], windows: readonly number[]): SeriesLadder =>
+  ({ rung, goals: [...goals], windows: [...windows], grounds: [...groundsOf(rung)] });
+const ladderStart = (): SeriesLadder => ladderAt(FIRST_RUNG, [], []);
+// A continuation spends the rung it stood on: the next stop of the same goal is the owner's, and the ladder never
+// climbs back down to the reviewer. The goals it stands for are those of the stop that began it — the original goal.
+const climbed = (ladder: SeriesLadder, stop: SeriesStop): SeriesLadder =>
+  ladderAt(OWNER_RUNG, ladder.goals.length > 0 ? ladder.goals : stop.goals, [...ladder.windows, stop.attempt]);
+// A review that ended without a decision spends the first rung too, but it opens nothing: the ladder stands at the
+// owner's rung for the goals of the stop, and the list of windows stays what it was.
+const sentToOwner = (ladder: SeriesLadder, stop: SeriesStop): SeriesLadder =>
+  ladderAt(OWNER_RUNG, ladder.goals.length > 0 ? ladder.goals : stop.goals, ladder.windows);
 
 /**
  * Walks the attempts of a goal's whole lineage and derives what follows from them.
@@ -573,10 +1058,16 @@ function walk(value: SeriesDraft): Walk {
   const achieved = new Map<string, Set<string>>();
   const lifts = new Map(value.continuations.map(item => [item.after, item]));
   const used = new Set<number>();
+  const raises = new Map(value.escalations.map(item => [item.after, item]));
+  const raised = new Set<number>();
   let withoutProgress = 0;
   let stop: SeriesStop | null = null;
-  let stray = false;
+  let ladder = ladderStart();
+  let flaw: { readonly field: string; readonly message: string } | null = null;
   let run: { ordinals: number[]; goals: string[] } = { ordinals: [], goals: [] };
+  // A window is the run of attempts a stop is counted in. One opens at the start, at every new accepted result, and
+  // at every recorded continuation — that is what "again up to three attempts" is made of.
+  const opened = (): void => { withoutProgress = 0; run = { ordinals: [], goals: [] }; };
 
   const step = (attempt: Attempt): void => {
     if (attempt.outcome === null) return;
@@ -589,42 +1080,66 @@ function walk(value: SeriesDraft): Walk {
     achieved.set(attempt.goal.key, history);
 
     if (verdict === "progress") {
-      withoutProgress = 0;
-      run = { ordinals: [], goals: [] };
+      opened();
+      // Only a new accepted result of the goal the ladder stands for returns it to the start; a result of another
+      // goal opens a window, as any progress does, but leaves the rung where it was.
+      if (ladder.goals.includes(attempt.goal.key)) ladder = ladderStart();
     } else if (verdict !== "neutral") {
       withoutProgress += 1;
       run.ordinals.push(attempt.ordinal);
       if (!run.goals.includes(attempt.goal.key)) run.goals.push(attempt.goal.key);
-      if (withoutProgress >= STOP_AFTER && stop === null) stop = stopOf(attempt, run.ordinals, run.goals);
+      if (withoutProgress >= STOP_AFTER && stop === null) stop = stopOf(attempt, run.ordinals, run.goals, ladder);
+    }
+    // An escalation answers the stop of this attempt BEFORE any continuation of it: the owner decides on a stop
+    // that was escalated to them, never the other way round.
+    if (raises.has(attempt.ordinal)) {
+      raised.add(attempt.ordinal);
+      if (stop === null || ladder.rung !== FIRST_RUNG) flaw ??= { field: "escalations", message: "An escalation stands where no stop of the first rung was saved" };
+      else {
+        // The stop STAYS, the count stays and no window opens: only the rung, and what the stop now asks for, move.
+        ladder = sentToOwner(ladder, stop);
+        stop = { ...stop, attempts: [...stop.attempts], goals: [...stop.goals], resume: resumeOf(stop.attempt, ladder) };
+      }
     }
     const lift = lifts.get(attempt.ordinal);
     if (lift) {
       used.add(attempt.ordinal);
-      // A continuation standing where no stop was raised is a ground for nothing; the record is refused, not read.
-      if (stop === null) stray = true;
-      else stop = null;
+      // A continuation standing where no stop was raised, or on a ground the rung it answers does not admit, is a
+      // ground for nothing; the record is refused, not read.
+      if (stop === null) flaw ??= { field: "continuations", message: "A continuation stands where no stop was saved" };
+      else if (!ladder.grounds.includes(lift.ground)) {
+        flaw ??= { field: "continuations", message: `A stop at rung ${ladder.rung} of the ladder is not continued on the ground "${lift.ground}"` };
+      } else {
+        ladder = climbed(ladder, stop);
+        stop = null;
+        opened();
+      }
     }
   };
 
   for (const attempt of value.inherited) step(attempt);
-  // The recorded ground a successor stands on continues the work the predecessor stopped at; the count stays.
-  if (value.basis !== null) stop = null;
   for (const attempt of value.attempts) step(attempt);
-  return { verdicts, achieved, withoutProgress, stop, stray: stray || used.size !== lifts.size };
+  if (used.size !== lifts.size) flaw ??= { field: "continuations", message: "A continuation follows an attempt this series does not hold" };
+  if (raised.size !== raises.size) flaw ??= { field: "escalations", message: "An escalation follows an attempt this series does not hold" };
+  return { verdicts, achieved, withoutProgress, ladder, stop, flaw };
 }
 
-function stopOf(attempt: Attempt, ordinals: readonly number[], goals: readonly string[]): SeriesStop {
+function stopOf(attempt: Attempt, ordinals: readonly number[], goals: readonly string[], ladder: SeriesLadder): SeriesStop {
   // Assembled by code from the records of the attempts, so two readings of the same history give the same stop.
   return {
     attempt: attempt.ordinal,
     attempts: [...ordinals],
     goals: [...goals],
     reason: `${ordinals.length} consecutive attempts closed without a new accepted result for ${goals.join(", ")}`,
-    resume: `attempt ${attempt.ordinal + 1} needs a recorded ground: a changed approach, changed inputs or the owner's decision`,
+    resume: resumeOf(attempt.ordinal, ladder),
   };
 }
 
-/** The value as it is written: the attempts carry the verdicts the walk derived, and the count and stop follow them. */
+const resumeOf = (ordinal: number, ladder: SeriesLadder): string => (ladder.rung === FIRST_RUNG
+  ? `attempt ${ordinal + 1} needs a ground of the first rung: the recorded review of this stop with an independent reviewer, a confirmed fix of the input, or the owner's decision`
+  : `attempt ${ordinal + 1} needs the owner's decision: the first rung of the ladder is spent for ${ladder.goals.join(", ")}`);
+
+/** The value as it is written: the attempts carry the verdicts the walk derived, and the count, ladder and stop follow. */
 function settled(draft: SeriesDraft): RepairSeries {
   const derived = walk(draft);
   const verdict = (attempt: Attempt): Attempt =>
@@ -636,7 +1151,9 @@ function settled(draft: SeriesDraft): RepairSeries {
     inherited: draft.inherited.map(verdict),
     attempts: draft.attempts.map(verdict),
     continuations: draft.continuations.map(plainContinuation),
+    escalations: draft.escalations.map(plainEscalation),
     withoutProgress: derived.withoutProgress,
+    ladder: derived.ladder,
     stop: derived.stop,
   };
 }
@@ -654,8 +1171,23 @@ const ordered = <T>(items: readonly T[], key: (item: T) => string): T[] =>
   [...items].sort((left, right) => compare(key(left), key(right)));
 
 const exactRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
+const sameRef = (left: Ref, right: Ref): boolean =>
+  left.id === right.id && left.revision === right.revision && left.hash === right.hash;
 const plainBasis = (basis: SeriesBasis): SeriesBasis => ({ ground: basis.ground, text: basis.text });
-const plainContinuation = (item: Continuation): Continuation => ({ ...plainBasis(item), after: item.after });
+
+/** The ground as the series keeps it: the records its own rule names, copied one by one, and nothing else. */
+function continuationOf(basis: ContinuationBasis): ContinuationBasis {
+  if (basis.ground === "review-record") return { ground: basis.ground, text: basis.text, review: exactRef(basis.review) };
+  if (basis.ground === "inputs-fixed") {
+    return {
+      ground: basis.ground, text: basis.text, refusal: basis.refusal,
+      input: exactRef(basis.input), confirmation: exactRef(basis.confirmation),
+    };
+  }
+  return { ground: basis.ground, text: basis.text, decision: exactRef(basis.decision) };
+}
+const plainContinuation = (item: Continuation): Continuation => ({ ...continuationOf(item), after: item.after });
+const plainEscalation = (item: Escalation): Escalation => ({ after: item.after, review: exactRef(item.review) });
 
 const goalOf = (goal: AttemptGoal): AttemptGoal =>
   ({ key: goal.key, questions: ordered(goal.questions, question => question), result: goal.result });
@@ -683,6 +1215,7 @@ const plainSeries = (value: RepairSeries): SeriesDraft => ({
   inherited: value.inherited.map(copyAttempt),
   attempts: value.attempts.map(copyAttempt),
   continuations: value.continuations.map(plainContinuation),
+  escalations: value.escalations.map(plainEscalation),
 });
 
 // ---------------------------------------------------------------------------
@@ -751,11 +1284,68 @@ function outcomeContradiction(outcome: AttemptOutcome): string | null {
 function basisProblem(value: unknown): string | null {
   if (!isPlainObject(value)) return "basis";
   const basis = value as Record<string, unknown>;
-  if (!CONTINUATION_GROUNDS.includes(basis['ground'] as ContinuationGround)) return "ground";
+  if (!SUCCESSION_GROUNDS.includes(basis['ground'] as SuccessionGround)) return "ground";
   return isText(basis['text']) ? null : "text";
 }
 
 const basisOf = (basis: SeriesBasis): SeriesBasis => plainBasis({ ground: basis.ground, text: basis.text });
+
+/**
+ * The shape of a ground to continue, on both paths it arrives by — a request and a stored continuation.
+ * The key set is NOT fixed here: a request carries the address of its series as well, and what a ground may not do is
+ * come without the records it is made of. The stored form is held to its exact keys where it is read.
+ */
+function groundProblem(value: unknown, holds: (record: unknown) => boolean): string | null {
+  if (!isPlainObject(value)) return "ground";
+  const basis = value as Record<string, unknown>;
+  const ground = basis['ground'];
+  if (!CONTINUATION_GROUNDS.includes(ground as ContinuationGround)) return "ground";
+  if (!isText(basis['text'])) return "text";
+  if (ground === "review-record") return holds(basis['review']) ? null : "review";
+  if (ground === "inputs-fixed") {
+    if (!isText(basis['refusal'])) return "refusal";
+    // The input the attempts ran with is a revision that STANDS: it is what they ran with, not something to be
+    // written now. Only the confirmation of the re-check may still be on its way.
+    if (!isRef(basis['input'])) return "input";
+    if (!holds(basis['confirmation'])) return "confirmation";
+    return null;
+  }
+  return holds(basis['decision']) ? null : "decision";
+}
+
+/**
+ * The two ways a neighbour hands over the record of a ground, and the rule that it is exactly one of them.
+ * A record on its way carries the id it will stand at, its kind and its content; the series checks here only that all
+ * three are there and that the content is JSON a store can hold, so that what it hashes and writes is a value and not
+ * a promise. Where that id may lie and what the content must say are weighed later, like a stored record's.
+ */
+function isGroundRecord(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  const source = value as Record<string, unknown>;
+  if (exactKeys(source, REF_SOURCE_KEYS)) return isRef(source['ref']);
+  if (!exactKeys(source, PENDING_SOURCE_KEYS)) return false;
+  const pending = source['pending'];
+  if (!isPlainObject(pending) || !exactKeys(pending, PENDING_KEYS)) return false;
+  const record = pending as Record<string, unknown>;
+  return isText(record['id']) && String(record['id']).length <= MAX_ENTITY_ID
+    && isText(record['kind']) && isJson(record['value']);
+}
+
+// A value a store can hold at all: canonical() is the one judge of that, and its refusal is a defect of the caller.
+function isJson(value: unknown): boolean {
+  try {
+    canonical(value);
+    return true;
+  } catch (error) {
+    if (error instanceof EngineError) return false;
+    throw error;
+  }
+}
+
+// Said at all, in whatever form the unit that writes the record holds it. What it is WORTH is that unit's to answer;
+// that it was said is this unit's, because an absent part of an agreed record is an absence, not an empty one (T4).
+const said = (value: unknown): boolean =>
+  isText(value) || (Array.isArray(value) ? value.length > 0 : isPlainObject(value) && Object.keys(value as object).length > 0);
 
 // ---------------------------------------------------------------------------
 // The stored record.
@@ -818,18 +1408,39 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   if (!Array.isArray(continuations)) {
     return problem("series_invalid", "A series carries its recorded continuations, explicitly empty until a stop was continued", context, "continuations");
   }
-  let last = inherited.length;
+  // A continuation may answer an INHERITED stop: a slice that moved does not lift one, so the successor is where the
+  // stop its predecessor saved is continued. Stops are still answered in the order they were saved, and once each.
+  let last = 0;
   for (let index = 0; index < continuations.length; index += 1) {
     const item = continuations[index];
-    if (!isPlainObject(item) || !exactKeys(item, CONTINUATION_KEYS) || basisProblem(item) !== null) {
-      return problem("series_invalid", "A continuation names the recorded ground it stands on and the attempt it follows", context, `continuations.${index}`);
+    const flawed = groundProblem(item, isRef);
+    if (flawed !== null) {
+      return problem("series_invalid", "A continuation names the recorded ground it stands on with the records that ground is made of", context, `continuations.${index}.${flawed}`);
     }
-    // A continuation of THIS series follows one of its own attempts; stops are answered in the order they were saved.
+    if (!exactKeys(item, [...groundKeys((item as Continuation).ground), "after"])) {
+      return problem("series_invalid", "A continuation carries the records of its own ground and the attempt it follows, and nothing else", context, `continuations.${index}`);
+    }
     const after = (item as Record<string, unknown>)['after'];
     if (!Number.isSafeInteger(after) || Number(after) <= last || Number(after) > all.length) {
       return problem("series_invalid", "A continuation follows one attempt of this series, and one attempt is continued once", context, `continuations.${index}.after`);
     }
     last = Number(after);
+  }
+  const escalations = series['escalations'];
+  if (!Array.isArray(escalations)) {
+    return problem("series_invalid", "A series carries its escalations, explicitly empty until a stop was sent to the owner", context, "escalations");
+  }
+  let raised = 0;
+  for (let index = 0; index < escalations.length; index += 1) {
+    const item = escalations[index];
+    if (!isPlainObject(item) || !exactKeys(item, ESCALATION_KEYS) || !isRef((item as Record<string, unknown>)['review'])) {
+      return problem("series_invalid", "An escalation names the stop it sent to the owner and the exact review it was sent on, and nothing else", context, `escalations.${index}`);
+    }
+    const after = (item as Record<string, unknown>)['after'];
+    if (!Number.isSafeInteger(after) || Number(after) <= raised || Number(after) > all.length) {
+      return problem("series_invalid", "An escalation follows one attempt of this series, and one stop is escalated once", context, `escalations.${index}.after`);
+    }
+    raised = Number(after);
   }
 
   const draft = plainSeries(series as unknown as RepairSeries);
@@ -847,14 +1458,26 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
     if (hashJson(handedDown) !== hashJson(draft.inherited)) {
       return problem("series_invalid", "The inherited history is not the history its predecessor holds", context, "inherited");
     }
+    // The continuations already recorded come across whole and unchanged: dropping one would raise a stop that was
+    // answered long ago, and adding one would give the successor a window nobody opened.
+    const answered = read.value.value.continuations.map(plainContinuation);
+    if (hashJson(draft.continuations.slice(0, answered.length)) !== hashJson(answered)) {
+      return problem("series_invalid", "The continuations a successor inherits are not the ones its predecessor holds", context, "continuations");
+    }
+    // The same for escalations: a successor that dropped one would hand a stop the owner alone may continue back to
+    // the reviewer, and one change of horizon does not do that.
+    const sent = read.value.value.escalations.map(plainEscalation);
+    if (hashJson(draft.escalations.slice(0, sent.length)) !== hashJson(sent)) {
+      return problem("series_invalid", "The escalations a successor inherits are not the ones its predecessor holds", context, "escalations");
+    }
     if (read.value.value.slice === draft.slice) {
       return problem("series_invalid", "A successor stands on a slice its predecessor did not hold", context, "slice");
     }
   }
 
   const derived = walk(draft);
-  if (derived.stray) {
-    return problem("series_invalid", "A continuation stands where no stop was saved", context, "continuations");
+  if (derived.flaw !== null) {
+    return problem("series_invalid", derived.flaw.message, context, derived.flaw.field);
   }
   for (const attempt of [...draft.inherited, ...draft.attempts]) {
     if ((derived.verdicts.get(attempt.ordinal) ?? null) !== attempt.verdict) {
@@ -863,6 +1486,9 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   }
   if (series['withoutProgress'] !== derived.withoutProgress) {
     return problem("series_invalid", "The count of attempts without progress is not the count its attempts give", context, "withoutProgress");
+  }
+  if (hashJson(series['ladder'] ?? null) !== hashJson(derived.ladder)) {
+    return problem("series_invalid", "The ladder is not the ladder its attempts and continuations give", context, "ladder");
   }
   if (hashJson(series['stop'] ?? null) !== hashJson(derived.stop)) {
     return problem("series_invalid", "The saved stop is not the stop its attempts give", context, "stop");
@@ -909,10 +1535,11 @@ function exactKeys(value: unknown, keys: readonly string[]): boolean {
   return own.length === keys.length && keys.every(key => Object.hasOwn(value as object, key));
 }
 
-// A refusal of this unit goes back to whoever produced what it read: the series rules on the history it keeps and on
-// nothing else, and switches nothing by refusing (T8).
-function problem(code: SeriesCode, message: string, context: Context, field: string): OmResult<never> {
-  return refused(code, message, { unit: UNIT, target: context.target, field, ref: context.ref }, "producer");
+// A refusal of this unit goes back to whoever produced what it read — or, when what is missing is a decision only the
+// owner can take, to the owner. The series rules on the history it keeps and on nothing else, and switches nothing by
+// refusing (T8): a stop stays a stop, and no window opens because a ground was turned away.
+function problem(code: SeriesCode, message: string, context: Context, field: string, route: RefusalRoute = "producer"): OmResult<never> {
+  return refused(code, message, { unit: UNIT, target: context.target, field, ref: context.ref }, route);
 }
 
 function requireStore(store: unknown): asserts store is Store {

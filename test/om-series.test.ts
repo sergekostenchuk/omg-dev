@@ -13,12 +13,14 @@ import {
   classifyRefusal, readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
 } from "../src/om/refusal-journal.js";
 import {
-  beginAttempt, completeAttempt, openSeries, readSeries, resumeSeries, seriesId,
-  prepareBeginAttempt, prepareCompleteAttempt, prepareOpenSeries, prepareResumeSeries,
-  ATTEMPT_VERDICTS, COMPLETION_REASONS, CONTINUATION_GROUNDS, REPAIR_SERIES_KIND, SERIES_CODES,
+  beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, resumeSeries, seriesId,
+  prepareBeginAttempt, prepareCompleteAttempt, prepareEscalateSeries, prepareOpenSeries, prepareResumeSeries,
+  inputFixNamespace, ownerDecisionNamespace, stopReviewNamespace,
+  ATTEMPT_VERDICTS, COMPLETION_REASONS, CONTINUATION_GROUNDS, INPUT_FIX_KIND, OWNER_DECISION_KIND,
+  REPAIR_SERIES_KIND, SERIES_CODES, STOP_REVIEW_KIND, SUCCESSION_GROUNDS,
   type Attempt, type AttemptGoal, type BeginAttemptRequest, type ClaimedOutcome, type ClaimedRefusal,
-  type CompleteAttemptRequest, type OpenSeriesRequest, type RepairSeries, type ResumeSeriesRequest,
-  type SeriesRequest, type SeriesTransition,
+  type CompleteAttemptRequest, type Continuation, type EscalateSeriesRequest, type OpenSeriesRequest, type RepairSeries,
+  type GroundRecord, type ResumeSeriesRequest, type SeriesRequest, type SeriesTransition,
 } from "../src/om/series.js";
 
 const UNIT = "store-repairs";
@@ -95,13 +97,121 @@ function journalled(store: Store, project: string, over: Record<string, unknown>
           name: String(over['origin'] ?? "artifact_missing"),
           stage: String(over['stage'] ?? "candidate-assembly"),
           subject: String(over['subject'] ?? "artifact:cart"),
-          sources: [{ role: "proposal", ref: { id: "layer-proposal:7", revision: 2, hash: hex("b") } }],
+          sources: (over['sources'] as Json | undefined)
+            ?? [{ role: "proposal", ref: { id: "layer-proposal:7", revision: 2, hash: hex("b") } }],
         },
       }],
     },
   });
   const journal = deliveredOf(recordRefusal(store, { project, source: reference(source) }));
   return { name, goal, row: journal.value.rows[journal.value.rows.length - 1]!.id };
+}
+
+/**
+ * The record of a review of a stop with an independent reviewer — what A6 will write, and all this unit reads of it.
+ * "independent" is in it on purpose: the series must not lift a stop because a record says so about itself.
+ */
+const review = (project: string, stop: number, goals: readonly string[] = ["gap:cart:price"], over: Record<string, unknown> = {}) => ({
+  projectId: project, block: BLOCK, stop, goals: [...goals],
+  reviewer: { name: "a reviewer who is not the executor", independent: true },
+  context: { attempts: [stop - 2, stop - 1, stop], refusals: ["graph_invalid"] },
+  cause: "the same question goes to the same producer every cycle, and its answer is refused for the same reason",
+  change: { text: "ask M5 to address the gap before a layer is proposed", addresses: ["M5", "MC2"] },
+  ...over,
+});
+
+const reviewed = (store: Store, project: string, value: Record<string, unknown>, kind = STOP_REVIEW_KIND, prefix?: string): Ref =>
+  reference(store.write({ id: `${prefix ?? stopReviewNamespace(project)}${next()}`, kind, expected: 0, value: value as Json }));
+
+/** The record of the repeated addressed check that confirms a fixed input — what B1 and A4 will write. */
+const confirmed = (store: Store, project: string, value: Record<string, unknown>, kind = INPUT_FIX_KIND, prefix?: string): Ref =>
+  reference(store.write({ id: `${prefix ?? inputFixNamespace(project)}${next()}`, kind, expected: 0, value: value as Json }));
+
+/**
+ * A review that ENDED WITHOUT A DECISION: it says so in its own content — here a cause, and explicitly no usable change.
+ * It is what A6 writes when the reviewer found nothing to change, and the ground of an escalation, never of a
+ * continuation.
+ */
+const undecided = (store: Store, project: string, stop: number, goals?: readonly string[], over: Record<string, unknown> = {}): Ref =>
+  reviewed(store, project, review(project, stop, goals, { change: null, ...over }));
+
+const byReview = (store: Store, project: string, stop: number, goals?: readonly string[], over: Record<string, unknown> = {}) =>
+  ({ ground: "review-record", text: "the review named a cause and a change", review: { ref: reviewed(store, project, review(project, stop, goals, over)) } } as const);
+
+/**
+ * The record the owner's decision is taken in — what the command API of H2 will write, and all this unit reads of it.
+ * "taken" is in it on purpose: the series must not continue because a record says of itself that the owner approved.
+ */
+const decision = (project: string, stop: number, goals: readonly string[] = ["gap:cart:price"], over: Record<string, unknown> = {}) => ({
+  projectId: project, block: BLOCK, stop, goals: [...goals],
+  decided: "go on: I have read what was tried and I want one more window",
+  taken: { by: "the owner", through: "the command API", approved: true },
+  ...over,
+});
+
+const decided = (store: Store, project: string, value: Record<string, unknown>, kind = OWNER_DECISION_KIND, prefix?: string): Ref =>
+  reference(store.write({ id: `${prefix ?? ownerDecisionNamespace(project)}${next()}`, kind, expected: 0, value: value as Json }));
+
+const byOwner = (store: Store, project: string, stop: number, goals?: readonly string[], over: Record<string, unknown> = {}) =>
+  ({ ground: "owner-decision", text: "the owner decided to go on", decision: { ref: decided(store, project, decision(project, stop, goals, over)) } } as const);
+
+/**
+ * A record its writer hands over to be written WITH the change it grounds — what A6 does with a review it has just
+ * had back, H2 with the owner's decision, B1 and A4 with the confirmation of a re-check. Nothing of it is in the
+ * store until the transition is applied.
+ */
+const onItsWay = (id: string, kind: string, value: Record<string, unknown>): GroundRecord =>
+  ({ pending: { id, kind, value: value as Json } });
+
+const unwritten = (project: string, kind: string): string => {
+  const namespace = kind === STOP_REVIEW_KIND ? stopReviewNamespace(project)
+    : kind === INPUT_FIX_KIND ? inputFixNamespace(project) : ownerDecisionNamespace(project);
+  return `${namespace}${next()}`;
+};
+
+/**
+ * The stored form of a ground a request was made with: the series keeps the exact reference of each record, whichever
+ * of the two ways it came by.
+ */
+function storedGround(ground: Record<string, unknown>, after: number): Record<string, unknown> {
+  const taken = (source: unknown): Ref => (source as { ref: Ref }).ref;
+  if (ground['ground'] === "review-record") return { ground: "review-record", text: ground['text'], review: taken(ground['review']), after };
+  if (ground['ground'] === "inputs-fixed") {
+    return { ground: "inputs-fixed", text: ground['text'], refusal: ground['refusal'], input: ground['input'], confirmation: taken(ground['confirmation']), after };
+  }
+  return { ground: "owner-decision", text: ground['text'], decision: taken(ground['decision']), after };
+}
+
+/** A refusal a gate wrote against a named input of this project, and the exact revision the attempts ran with. */
+function fixable(store: Store, project: string, earlier = 0): { input: Ref; refusal: ClaimedRefusal } {
+  const id = `om-stage:${project}:${next()}`;
+  let input = store.write({ id, kind: "om-stage", expected: 0, value: { rows: ["the price of a cart line names no producer"] } });
+  // Revisions the attempts never ran with, so that "a later revision" can be told from "another revision".
+  for (let round = 0; round < earlier; round += 1) {
+    input = store.write({ id, kind: "om-stage", expected: input.revision, value: { rows: ["and the tax of a cart line names none either", round] } });
+  }
+  return { input: reference(input), refusal: journalled(store, project, { sources: [{ role: "input", ref: reference(input) }] }) };
+}
+
+/** The input fixed at a later revision, and the confirmation of the repeated addressed check that says so. */
+function byFix(store: Store, project: string, base: { input: Ref; refusal: ClaimedRefusal }, over: Record<string, unknown> = {}) {
+  const head = store.get(base.input.id)!;
+  const better = store.write({
+    id: base.input.id, kind: "om-stage", expected: head.revision,
+    value: { rows: ["the price of a cart line is produced by the pricing operation", head.revision] },
+  });
+  return {
+    ground: "inputs-fixed", text: "the stage was corrected and the addressed check was run again",
+    refusal: base.refusal.row, input: base.input,
+    confirmation: { ref: confirmed(store, project, { refusal: base.refusal.row, input: reference(better), check: "addressed", ...over }) },
+  } as const;
+}
+
+/** Three cycles that move nothing, all refused by the same journalled refusal, so a stop names it. */
+function circled(store: Store, project: string, refusal: ClaimedRefusal, line = 1): void {
+  for (let round = 0; round < 3; round += 1) {
+    cycle(store, project, goal(), outcome({ reason: "refused", refusals: [refusal] }), line);
+  }
 }
 
 const goal = (over: Partial<AttemptGoal> = {}): AttemptGoal => ({
@@ -268,17 +378,53 @@ test("every refusal code of this unit is produced, addressed and routed", t => {
   opened(store, "p12");
   for (let round = 0; round < 3; round += 1) cycle(store, "p12", goal(), fruitless());
   record(refusalOf(beginAttempt(store, { ...address("p12"), attempt: 4, goal: goal() })), "series_stopped", "p12");
-  deliveredOf(resumeSeries(store, { ...address("p12"), stop: 3, ground: "owner-decision", text: "carry on" }));
-  record(refusalOf(resumeSeries(store, { ...address("p12"), stop: 3, ground: "approach-changed", text: "or rather this" })), "continuation_conflict", "p12");
+  deliveredOf(resumeSeries(store, { ...address("p12"), stop: 3, ...byOwner(store, "p12", 3) }));
+  record(refusalOf(resumeSeries(store, { ...address("p12"), stop: 3, ...byOwner(store, "p12", 3) })), "continuation_conflict", "p12");
 
   opened(store, "p13");
-  record(refusalOf(resumeSeries(store, { ...address("p13"), stop: 1, ground: "owner-decision", text: "carry on" })), "stop_absent", "p13");
+  record(refusalOf(resumeSeries(store, { ...address("p13"), stop: 1, ...byOwner(store, "p13", 1) })), "stop_absent", "p13");
 
   opened(store, "p14");
   deliveredOf(beginAttempt(store, { ...address("p14"), attempt: 1, goal: goal() }));
   record(refusalOf(completeAttempt(store, {
     ...address("p14"), attempt: 1, outcome: outcome({ reason: "refused", refusals: [{ name: "graph_invalid", goal: "a goal", row: "om-refusal:invented" }] }),
   })), "refusal_unlinked", "p14");
+
+  // The second rung: the first was spent without a new accepted result, so nothing but the owner's decision continues.
+  opened(store, "p15");
+  for (let round = 0; round < 3; round += 1) cycle(store, "p15", goal(), fruitless());
+  deliveredOf(resumeSeries(store, { ...address("p15"), stop: 3, ...byReview(store, "p15", 3) }));
+  for (let round = 0; round < 3; round += 1) cycle(store, "p15", goal(), fruitless());
+  const owed = addressed(refusalOf(resumeSeries(store, { ...address("p15"), stop: 6, ...byReview(store, "p15", 6) })), "owner_required", "p15");
+  assert.equal(owed.route, "owner");
+  seen.push(owed.code);
+
+  // A review of another stop is no ground to lift this one.
+  opened(store, "p16");
+  for (let round = 0; round < 3; round += 1) cycle(store, "p16", goal(), fruitless());
+  record(refusalOf(resumeSeries(store, { ...address("p16"), stop: 3, ...byReview(store, "p16", 9) })), "review_unusable", "p16");
+
+  // A decision taken about another stop is no ground to lift this one either, and it goes back to the owner.
+  opened(store, "p16b");
+  for (let round = 0; round < 3; round += 1) cycle(store, "p16b", goal(), fruitless());
+  const misdirected = addressed(refusalOf(resumeSeries(store, { ...address("p16b"), stop: 3, ...byOwner(store, "p16b", 9) })), "decision_unusable", "p16b");
+  // A stop escalated on one review is not escalated again on another.
+  opened(store, "p16c");
+  for (let round = 0; round < 3; round += 1) cycle(store, "p16c", goal(), fruitless());
+  deliveredOf(escalateSeries(store, { ...address("p16c"), stop: 3, review: { ref: undecided(store, "p16c", 3) } }));
+  record(refusalOf(escalateSeries(store, { ...address("p16c"), stop: 3, review: { ref: undecided(store, "p16c", 3) } })), "escalation_conflict", "p16c");
+  assert.equal(misdirected.route, "owner");
+  seen.push(misdirected.code);
+
+  // A fixed input that fixes a refusal these attempts never ran into.
+  opened(store, "p17");
+  for (let round = 0; round < 3; round += 1) cycle(store, "p17", goal(), fruitless());
+  const stranger = journalled(store, "p17");
+  record(refusalOf(resumeSeries(store, {
+    ...address("p17"), stop: 3, ground: "inputs-fixed", text: "the stage was corrected",
+    refusal: stranger.row, input: { id: "layer-proposal:7", revision: 2, hash: hex("b") },
+    confirmation: { ref: confirmed(store, "p17", { refusal: stranger.row, input: { id: "layer-proposal:7", revision: 3, hash: hex("c") } }) },
+  })), "input_unfixed", "p17");
 
   assert.deepEqual([...new Set(seen)].sort(), [...SERIES_CODES].sort());
 });
@@ -290,7 +436,7 @@ test("an absent argument, field or set is a typed refusal that names the address
     () => readSeries(store, address("empty")),
     () => beginAttempt(store, { ...address("empty"), attempt: 1, goal: goal() }),
     () => completeAttempt(store, { ...address("empty"), attempt: 1, outcome: outcome() }),
-    () => resumeSeries(store, { ...address("empty"), stop: 1, ground: "owner-decision", text: "carry on" }),
+    () => resumeSeries(store, { ...address("empty"), stop: 1, ...byOwner(store, "empty", 1) }),
   ]) addressed(refusalOf(call()), "series_missing", "empty");
 
   // An absent set inside a stored series is not an empty one, and the refusal names which one is missing.
@@ -322,6 +468,25 @@ test("an absent argument, field or set is a typed refusal that names the address
   assert.equal(stored(value => ({
     ...value, attempts: [{ ...value.attempts[0]!, outcome: { ...value.attempts[0]!.outcome!, reason: "refused", refusals: [{ name: "n", goal: "g" }] } }],
   }), "series_invalid", "a11"), "attempts.0.refusals.0");
+  // The ladder is as obligatory as the count: a series that carries no rung at all carries no series.
+  assert.equal(stored(value => without({ ...value }, "ladder"), "series_invalid", "a12"), "value");
+  assert.equal(stored(value => ({ ...value, ladder: null }), "series_invalid", "a13"), "ladder");
+  assert.equal(stored(value => ({ ...value, ladder: without({ ...value.ladder }, "grounds") }), "series_invalid", "a14"), "ladder");
+
+  // A ground held without the record it is made of: the continuation names a review nobody can read.
+  const continued = (build: (item: Continuation) => Record<string, unknown>, project: string): string | undefined => {
+    opened(store, project);
+    for (let round = 0; round < 3; round += 1) cycle(store, project, goal(), fruitless());
+    deliveredOf(resumeSeries(store, { ...address(project), stop: 3, ...byReview(store, project, 3) }));
+    forge(store, project, value => ({ ...value, continuations: [build(value.continuations[0]!)] }));
+    return addressed(refusalOf(readSeries(store, address(project))), "series_invalid", project).at.field;
+  };
+  assert.equal(continued(item => without({ ...item }, "review"), "a15"), "continuations.0.review");
+  assert.equal(continued(item => ({ ...item, review: null }), "a16"), "continuations.0.review");
+  assert.equal(continued(item => without({ ...item }, "text"), "a17"), "continuations.0.text");
+  assert.equal(continued(item => without({ ...item }, "after"), "a18"), "continuations.0");
+  // And a ground padded out with a record its own rule never names is not that ground either.
+  assert.equal(continued(item => ({ ...item, confirmation: { id: "x", revision: 1, hash: hex("a") } }), "a19"), "continuations.0");
 
   // Explicit emptiness is a fact and is kept: a cycle that accepted nothing is a cycle, not a missing one.
   const empty = opened(store, "bare");
@@ -375,6 +540,12 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
     ["a continuation standing where no stop was saved", value => ({
       ...value, continuations: [{ ground: "owner-decision", text: "carry on", after: 1 }],
     })],
+    ["a ladder standing at a rung its continuations never climbed",
+      value => ({ ...value, ladder: { ...value.ladder, rung: 2, grounds: ["owner-decision"] } })],
+    ["a ladder admitting a ground its rung does not",
+      value => ({ ...value, ladder: { ...value.ladder, grounds: [...value.ladder.grounds, "approach-changed"] } })],
+    ["a ladder claiming windows that were never opened",
+      value => ({ ...value, ladder: { ...value.ladder, windows: [4] } })],
     ["an attempt carrying a field the series does not keep",
       value => swapped(value, 0, attempt => ({ ...attempt, progress: true }))],
     ["an outcome that claims an achievement it says it could not have",
@@ -401,7 +572,7 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
     // A series that cannot be read cannot be attempted, closed, continued or re-opened either: every path refuses.
     addressed(refusalOf(beginAttempt(store, { ...address(project), attempt: 5, goal: goal() })), "series_invalid", project);
     addressed(refusalOf(completeAttempt(store, { ...address(project), attempt: 1, outcome: outcome() })), "series_invalid", project);
-    addressed(refusalOf(resumeSeries(store, { ...address(project), stop: 4, ground: "owner-decision", text: "carry on" })), "series_invalid", project);
+    addressed(refusalOf(resumeSeries(store, { ...address(project), stop: 4, ...byOwner(store, project, 4) })), "series_invalid", project);
     addressed(refusalOf(openSeries(store, { ...address(project), slice: SLICE, predecessor: null, basis: null })), "series_invalid", project);
     // And it is no ground for a successor: a lineage does not start from a history nobody wrote.
     assert.equal(refusalOf(openSeries(store, {
@@ -488,11 +659,15 @@ test("a series written to by someone else between the read and the write is refu
   for (let round = 0; round < 2; round += 1) cycle(store, PROJECT, goal(), fruitless());
   assert.equal(standingStop(store), 4);
 
-  // The competitor continues the stopped series while this call is continuing it on another ground.
+  // The competitor continues the stopped series while this call is continuing it on another ground. The review this
+  // call stands on is perfectly good: the window it would have opened is lost with the transaction, not half-opened.
+  const contested = byReview(store, PROJECT, 4);
+  const rival = byOwner(store, PROJECT, 4);
   store.armed = true;
-  store.run = other => { deliveredOf(resumeSeries(other, { ...address(PROJECT), stop: 4, ground: "owner-decision", text: "the owner said to go on" })); };
-  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 4, ground: "approach-changed", text: "ask M5 first" })), "input_stale");
+  store.run = other => { deliveredOf(resumeSeries(other, { ...address(PROJECT), stop: 4, ...rival })); };
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 4, ...contested })), "input_stale");
   assert.deepEqual(held(store)!.value.continuations.map(item => item.ground), ["owner-decision"]);
+  assert.equal(held(store)!.value.ladder.rung, 2);
 
   // And a predecessor that moves between the read and the write leaves the successor unwritten, not half-built.
   store.armed = false;
@@ -508,34 +683,35 @@ test("a series written to by someone else between the read and the write is refu
 
 test("every change names the state it comes from, so a late delivery finds its own and changes nothing (T5)", t => {
   const { path, store } = fixture(t);
-  // THE STOP. Three attempts without progress, a ground recorded for that stop, then a fourth attempt stops again.
+  // THE STOP. Three attempts without progress, a review recorded for that stop, and three more before it stops again.
   opened(store);
   for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
-  const ground = { ground: "approach-changed", text: "ask M5 to address the gap first" } as const;
+  const ground = byReview(store, PROJECT, 3);
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
-  const fourth = cycle(store, PROJECT, goal(), fruitless());
-  assert.equal(fourth.value.stop!.attempt, 4);
+  for (let round = 0; round < 2; round += 1) assert.equal(cycle(store, PROJECT, goal(), fruitless()).value.stop, null);
+  const sixth = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(sixth.value.stop!.attempt, 6);
 
   // The SAME continuation delivered again is about the stop after attempt three, which is continued already. It
-  // changes nothing and it does not lift the stop saved after attempt four.
+  // changes nothing and it does not lift the stop saved after attempt six.
   const late = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
-  assert.equal(late.revision, fourth.revision);
-  assert.deepEqual(late.value, fourth.value);
-  assert.equal(late.value.stop!.attempt, 4);
+  assert.equal(late.revision, sixth.revision);
+  assert.deepEqual(late.value, sixth.value);
+  assert.equal(late.value.stop!.attempt, 6);
   assert.deepEqual(late.value.continuations.map(item => item.after), [3]);
-  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 5, goal: goal() })), "series_stopped");
+  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 7, goal: goal() })), "series_stopped");
   // A ground given for a stop that never stood is refused, and so is a second ground for one already continued.
-  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 2, ground: "owner-decision", text: "carry on" })), "stop_absent");
-  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ground: "owner-decision", text: "another ground" })), "continuation_conflict");
-  assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, fourth.revision);
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 2, ...byOwner(store, PROJECT, 2) })), "stop_absent");
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byOwner(store, PROJECT, 3) })), "continuation_conflict");
+  assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, sixth.revision);
 
   // THE ATTEMPT. A "begin" that arrives late finds the attempt it was about, closed long since, and opens nothing.
-  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 4, ground: "owner-decision", text: "the owner said to go on" }));
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
   const moved = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:A")] }));
-  assert.equal(moved.value.attempts.length, 5);
+  assert.equal(moved.value.attempts.length, 7);
   const echo = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
   assert.equal(echo.revision, moved.revision);
-  assert.equal(echo.value.attempts.length, 5);
+  assert.equal(echo.value.attempts.length, 7);
   // The same ordinal under another goal is a conflict, not a second attempt and not a rewriting of the first.
   addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal({ key: "gap:cart:tax" }) })), "attempt_conflict");
   // An ordinal that is neither held nor next opens nothing either.
@@ -701,8 +877,9 @@ test("prepared changes of several series are applied by one transaction, or by n
   // A prepared change is a write and its guards, and nothing has been written yet.
   const one = prepare(BLOCK, first);
   const two = prepare(other, second);
-  assert.equal(one.write!.kind, REPAIR_SERIES_KIND);
-  assert.equal(one.write!.expected, 0);
+  assert.equal(one.writes.length, 1);
+  assert.equal(one.writes[0]!.kind, REPAIR_SERIES_KIND);
+  assert.equal(one.writes[0]!.expected, 0);
   assert.deepEqual(one.guards, [reference(first)]);
   assert.deepEqual(one.value.inherited, []);
   assert.equal(store.get(seriesId(PROJECT, BLOCK, 2)), null);
@@ -714,7 +891,7 @@ test("prepared changes of several series are applied by one transaction, or by n
     ({ id: "om-series-transition:alpha:7", kind: "series-transition", expected: 0, value: { state: "applied" }, ...over });
   const apply = (parts: readonly SeriesTransition[], guards: readonly Ref[]) => writeGuarded(store, {
     unit: "b3", target: "om-series-transition:alpha:7",
-    writes: [...parts.map(part => part.write!), transition()],
+    writes: [...parts.flatMap(part => [...part.writes]), transition()],
     guards: [...parts.flatMap(part => [...part.guards]), ...guards],
   });
 
@@ -747,12 +924,12 @@ test("prepared changes of several series are applied by one transaction, or by n
 
   // A prepared change that is a repeat carries no write at all, so a caller adds nothing to its transaction.
   const repeat = prepare(BLOCK, first);
-  assert.equal(repeat.write, null);
+  assert.deepEqual(repeat.writes, []);
   assert.deepEqual(repeat.guards, []);
   assert.deepEqual(repeat.value, deliveredOf(readSeries(store, at(BLOCK, 2))).value);
   // And a prepared change that cannot be made is refused at preparation, before anything is written.
   assert.equal(refusalOf(prepareBeginAttempt(store, { ...at(BLOCK, 2), attempt: 9, goal: goal() })).code, "attempt_unknown");
-  assert.equal(refusalOf(prepareResumeSeries(store, { ...at(BLOCK, 2), stop: 1, ground: "owner-decision", text: "on" })).code, "stop_absent");
+  assert.equal(refusalOf(prepareResumeSeries(store, { ...at(BLOCK, 2), stop: 1, ...byOwner(store, PROJECT, 1) })).code, "stop_absent");
   assert.equal(refusalOf(prepareCompleteAttempt(store, { ...at(BLOCK, 2), attempt: 1, outcome: outcome() })).code, "attempt_unknown");
 });
 
@@ -971,24 +1148,33 @@ test("the third attempt without progress saves a stop a restart does not lift, a
   assert.equal(read.value.withoutProgress, 3);
   addressed(refusalOf(beginAttempt(back, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
 
-  // Only a recorded ground continues the work, and the ground is kept where the owner can read it.
-  const text = "ask M5 to address the gap before proposing a layer";
-  const resumed = deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 3, ground: "approach-changed", text }));
+  // Only a ground of the rung the ladder stands at continues the work, and it is kept where the owner can read it.
+  const ground = byReview(back, PROJECT, 3, stop.goals);
+  const resumed = deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 3, ...ground }));
   assert.equal(resumed.value.stop, null);
-  assert.deepEqual(resumed.value.continuations, [{ ground: "approach-changed", text, after: 3 }]);
-  // Continuing is not progress: the count is untouched, so one more attempt that moves nothing stops the series again.
-  assert.equal(resumed.value.withoutProgress, 3);
+  assert.deepEqual(resumed.value.continuations, [storedGround(ground, 3)]);
+  // The continuation opens a NEW window: the count starts again, and it is not progress — the rung is spent, and the
+  // ladder now stands for the goals that stop was raised for.
+  assert.equal(resumed.value.withoutProgress, 0);
+  assert.equal(resumed.value.ladder.rung, 2);
+  assert.deepEqual(resumed.value.ladder.goals, stop.goals);
+  assert.deepEqual(resumed.value.ladder.windows, [3]);
+  assert.deepEqual(resumed.value.ladder.grounds, ["owner-decision"]);
 
-  const fourth = cycle(back, PROJECT, goal(), fruitless(), 1);
-  assert.equal(fourth.value.withoutProgress, 4);
-  assert.equal(fourth.value.stop!.attempt, 4);
-  assert.deepEqual(fourth.value.stop!.attempts, [1, 2, 3, 4]);
-  // And progress clears both the count and the road to the next stop.
-  deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 4, ground: "owner-decision", text: "try the other producer" }));
+  // Two more attempts that move nothing do not stop it; the third of the new window does.
+  for (let round = 0; round < 2; round += 1) assert.equal(cycle(back, PROJECT, goal(), fruitless(), 1).value.stop, null);
+  const sixth = cycle(back, PROJECT, goal(), fruitless(), 1);
+  assert.equal(sixth.value.withoutProgress, 3);
+  assert.equal(sixth.value.stop!.attempt, 6);
+  assert.deepEqual(sixth.value.stop!.attempts, [4, 5, 6]);
+  assert.ok(sixth.value.stop!.resume.includes("owner"));
+  // And progress clears the count, the road to the next stop and the ladder.
+  deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 6, ...byOwner(back, PROJECT, 6) }));
   const won = cycle(back, PROJECT, goal(), outcome({ achieved: [win(back, "line:A")] }), 1);
   assert.equal(won.value.withoutProgress, 0);
   assert.equal(won.value.stop, null);
-  assert.deepEqual(won.value.continuations.map(item => item.after), [3, 4]);
+  assert.deepEqual(won.value.ladder, { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] });
+  assert.deepEqual(won.value.continuations.map(item => item.after), [3, 6]);
 });
 
 test("the identity of a goal survives a change of revisions, of ids and of the series around it", t => {
@@ -1022,7 +1208,8 @@ test("the identity of a goal survives a change of revisions, of ids and of the s
   assert.equal(fresh.value.attempts[1]!.verdict, "progress");
   assert.equal(fresh.value.withoutProgress, 0);
 
-  // A stop the predecessor saved comes across with the history, and the recorded ground of the move continues it.
+  // A stop the predecessor saved comes across with the history, and the move does NOT continue it: one change of
+  // horizon is a ground to open a successor, never a ground to go on.
   opened(store, "halted");
   for (let round = 0; round < 3; round += 1) cycle(store, "halted", goal(), fruitless());
   const halted = deliveredOf(readSeries(store, address("halted")));
@@ -1031,13 +1218,17 @@ test("the identity of a goal survives a change of revisions, of ids and of the s
     ...address("halted", 2), slice: "slice:cart@2", predecessor: reference(halted),
     basis: { ground: "inputs-changed", text: "the basis of the block was replaced" },
   }));
-  assert.equal(carried.value.stop, null);
+  assert.deepEqual(carried.value.stop, halted.value.stop);
   assert.equal(carried.value.withoutProgress, 3);
   assert.deepEqual(carried.value.basis, { ground: "inputs-changed", text: "the basis of the block was replaced" });
-  // The ground is recorded, so the next attempt runs; it is still the fourth without progress and stops again.
+  addressed(refusalOf(beginAttempt(store, { ...address("halted", 2), attempt: 4, goal: goal() })), "series_stopped", "halted", 2);
+
+  // The stop is continued in the successor, where it now stands, and that opens the window the attempts run in.
+  deliveredOf(resumeSeries(store, { ...address("halted", 2), stop: 3, ...byReview(store, "halted", 3) }));
   const after = cycle(store, "halted", goal(), fruitless(), 2);
-  assert.equal(after.value.withoutProgress, 4);
-  assert.equal(after.value.stop!.attempt, 4);
+  assert.equal(after.value.withoutProgress, 1);
+  assert.equal(after.value.stop, null);
+  assert.deepEqual(after.value.continuations.map(item => item.after), [3]);
 });
 
 test("every exported function refuses a missing, null or mistyped argument as a typed defect, never a TypeError", t => {
@@ -1054,11 +1245,15 @@ test("every exported function refuses a missing, null or mistyped argument as a 
     (request, series) => { prepareBeginAttempt(series as Store, request as BeginAttemptRequest); },
     (request, series) => { prepareCompleteAttempt(series as Store, request as CompleteAttemptRequest); },
     (request, series) => { prepareResumeSeries(series as Store, request as ResumeSeriesRequest); },
+    (request, series) => { escalateSeries(series as Store, request as EscalateSeriesRequest); },
+    (request, series) => { prepareEscalateSeries(series as Store, request as EscalateSeriesRequest); },
   ];
   const [open, begin, complete, resume] = calls as [typeof calls[number], typeof calls[number], typeof calls[number], typeof calls[number]];
   const good: Record<string, unknown> = {
     ...address(PROJECT), slice: SLICE, predecessor: null, basis: null, goal: goal(),
     attempt: 1, outcome: outcome(), stop: 1, ground: "owner-decision", text: "carry on",
+    review: { id: `${stopReviewNamespace(PROJECT)}1`, revision: 1, hash: hex("a") },
+    decision: { id: `${ownerDecisionNamespace(PROJECT)}1`, revision: 1, hash: hex("a") },
   };
 
   // No default argument stands in for a broken one: a helper quietly substituting the real store would test itself.
@@ -1087,12 +1282,35 @@ test("every exported function refuses a missing, null or mistyped argument as a 
   }
   assert.throws(() => open({ ...good, line: 2 }, store), code("series_request_invalid"));
   assert.throws(() => open({ ...good, predecessor: { id: seriesId(PROJECT, BLOCK, 1), revision: 1, hash: hex("a") } }, store), code("series_request_invalid"));
-  for (const basis of [undefined, "basis", 7, {}, { ground: "invented", text: "why" }, { ground: "owner-decision", text: "" }]) {
+  // A ground to CONTINUE is not a ground to open a successor: the vocabularies are different, and neither defaults.
+  for (const basis of [undefined, "basis", 7, {}, { ground: "invented", text: "why" }, { ground: "inputs-changed", text: "" },
+    { ground: "owner-decision", text: "why" }, { ground: "review-record", text: "why" }, { ground: "inputs-fixed", text: "why" }]) {
     assert.throws(() => open({ ...good, line: 2, predecessor: { id: seriesId(PROJECT, BLOCK, 1), revision: 1, hash: hex("a") }, basis }, store), code("series_request_invalid"));
   }
-  for (const over of [{ ground: undefined }, { ground: "invented" }, { text: undefined }, { text: "" }, { text: 7 }, { stop: undefined }, { stop: 0 }, { stop: 1.5 }, { stop: "1" }]) {
+  const ref = { id: "om-input:alpha", revision: 1, hash: hex("a") };
+  for (const over of [{ ground: undefined }, { ground: "invented" }, { text: undefined }, { text: "" }, { text: 7 }, { stop: undefined }, { stop: 0 }, { stop: 1.5 }, { stop: "1" },
+    // The ground the executor used to write by its own hand is gone, and so is the ground a successor stands on.
+    { ground: "approach-changed" }, { ground: "inputs-changed" },
+    // A ground without the records it is made of is no ground: nothing stands in for an absent reference.
+    { ground: "review-record", review: undefined }, { ground: "review-record", review: null }, { ground: "review-record", review: "om-stop-review:alpha:1" },
+    { ground: "review-record", review: { id: "om-stop-review:alpha:1", revision: 1 } },
+    { ground: "inputs-fixed" }, { ground: "inputs-fixed", refusal: "row", input: ref },
+    { ground: "inputs-fixed", refusal: "", input: ref, confirmation: ref },
+    { ground: "inputs-fixed", refusal: "row", input: null, confirmation: ref },
+    { ground: "inputs-fixed", refusal: "row", input: ref, confirmation: { id: "x", revision: 0, hash: hex("a") } },
+    // The owner's decision is a record as well: without the reference to it there is no ground, only a sentence.
+    { decision: null }, { decision: "om-owner-decision:alpha:1" }, { decision: { id: "x", revision: 1 } },
+    { decision: { id: "", revision: 1, hash: hex("a") } }]) {
     assert.throws(() => resume({ ...good, ...over }, store), code("series_request_invalid"));
   }
+  assert.throws(() => resume(without(good, "decision"), store), code("series_request_invalid"));
+  // An escalation names its stop and the exact review; neither is defaulted, and a review is never named by a word.
+  const escalate = calls[9]!;
+  for (const over of [{ stop: undefined }, { stop: 0 }, { stop: 1.5 }, { stop: "1" }, { review: null }, { review: "om-stop-review:alpha:1" },
+    { review: { id: "om-stop-review:alpha:1", revision: 1 } }, { review: { id: "", revision: 1, hash: hex("a") } }]) {
+    assert.throws(() => escalate({ ...good, ...over }, store), code("series_request_invalid"));
+  }
+  assert.throws(() => escalate(without(good, "review"), store), code("series_request_invalid"));
   for (const goalValue of [undefined, null, "goal", 7, {}, without(goal() as unknown as Record<string, unknown>, "key"),
     { ...goal(), extra: 1 }, { ...goal(), questions: [] }, { ...goal(), questions: "one" }, { ...goal(), questions: [7] }, { ...goal(), result: "" }]) {
     assert.throws(() => begin({ ...good, goal: goalValue }, store), code("series_request_invalid"));
@@ -1134,7 +1352,7 @@ test("what a consumer is handed is a deep frozen copy, independent of the store 
   assert.ok(deeplyFrozen(prepared));
   assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, 3);
 
-  for (const table of [SERIES_CODES, COMPLETION_REASONS, ATTEMPT_VERDICTS, CONTINUATION_GROUNDS]) {
+  for (const table of [SERIES_CODES, COMPLETION_REASONS, ATTEMPT_VERDICTS, CONTINUATION_GROUNDS, SUCCESSION_GROUNDS]) {
     assert.ok(Object.isFrozen(table));
     assert.throws(() => { (table as unknown as string[]).push("invented"); }, TypeError);
   }
@@ -1155,10 +1373,13 @@ test("a series switches nothing else: the journal, the graph, gaps, readiness an
     store.get(`om-refusal-journal:${PROJECT}`)!,
   ];
   opened(store);
+  // The record the ground stands on is written by whoever writes it — the command API, not the series; it is in
+  // place before the count is taken, so that what the series itself adds to the store can be seen to be nothing.
+  const ownerGround = byOwner(store, PROJECT, 3);
   const before = store.list().length;
   cycle(store, PROJECT, goal(), refusal);
   for (let round = 0; round < 2; round += 1) cycle(store, PROJECT, goal(), fruitless());
-  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ground: "inputs-changed", text: "the stage was accepted anew" }));
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ownerGround }));
 
   for (const record of untouched) {
     const now = store.get(record.id)!;
@@ -1171,6 +1392,1110 @@ test("a series switches nothing else: the journal, the graph, gaps, readiness an
   assert.deepEqual(store.list(REPAIR_SERIES_KIND).map(record => record.id), [seriesId(PROJECT, BLOCK, 1)]);
   const series = deliveredOf(readSeries(store, address(PROJECT)));
   assert.equal(series.value.stop, null);
-  assert.equal(series.value.withoutProgress, 3);
+  assert.equal(series.value.withoutProgress, 0);
+  assert.equal(series.value.ladder.rung, 2);
   assert.deepEqual((series.value.attempts as readonly Attempt[]).map(item => item.verdict), ["none", "none", "none"]);
+});
+
+// ---------------------------------------------------------------------------
+// The ladder after a stop (owner's decision of 21.09.2026, journal entry 170).
+
+test("a continuation on the record of a review opens a new window: three attempts again before the next stop", t => {
+  const { path, store } = fixture(t);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  const stopped = deliveredOf(readSeries(store, address(PROJECT)));
+  assert.equal(stopped.value.stop!.attempt, 3);
+  // At the start the ladder stands at its first rung, and the stop says what that rung asks for.
+  assert.deepEqual(stopped.value.ladder, { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] });
+  assert.ok(stopped.value.stop!.resume.includes("first rung"));
+  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
+
+  const ground = byReview(store, PROJECT, 3);
+  const resumed = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(resumed.value.stop, null);
+  assert.deepEqual(resumed.value.continuations, [storedGround(ground, 3)]);
+  // The continuation is no progress: no verdict changed, nothing was accepted, and the rung it stood on is spent.
+  assert.deepEqual(verdicts(resumed.value), ["none", "none", "none"]);
+  assert.deepEqual(resumed.value.ladder, { rung: 2, goals: ["gap:cart:price"], windows: [3], grounds: ["owner-decision"] });
+  // But the window starts again: the count of attempts without progress begins from nothing.
+  assert.equal(resumed.value.withoutProgress, 0);
+
+  const fourth = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(fourth.value.withoutProgress, 1);
+  assert.equal(fourth.value.stop, null);
+  const fifth = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(fifth.value.withoutProgress, 2);
+  assert.equal(fifth.value.stop, null);
+  // The third of the NEW window stops the series, and the stop names that window, not the whole history.
+  const sixth = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(sixth.value.withoutProgress, 3);
+  assert.equal(sixth.value.stop!.attempt, 6);
+  assert.deepEqual(sixth.value.stop!.attempts, [4, 5, 6]);
+  assert.ok(sixth.value.stop!.resume.includes("owner"));
+  assert.equal(sixth.value.attempts.length, 6);
+
+  // A restart derives the same ladder from the same history: it is in the record, not in a process.
+  store.close();
+  const back = new Store(path);
+  t.after(() => back.close());
+  assert.deepEqual(deliveredOf(readSeries(back, address(PROJECT))).value, sixth.value);
+});
+
+test("a second stop with no new accepted result of the goal is continued by the owner and by nobody else", t => {
+  const { store } = fixture(t);
+  const base = fixable(store, PROJECT);
+  opened(store);
+  circled(store, PROJECT, base.refusal);
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byReview(store, PROJECT, 3) }));
+  circled(store, PROJECT, base.refusal);
+  const standing = held(store)!;
+  assert.equal(standing.value.stop!.attempt, 6);
+  assert.equal(standing.value.ladder.rung, 2);
+
+  // The record of a review of THIS stop, and a fix of the very input these attempts ran into, both perfectly formed:
+  // at the second rung neither is a ground, and the refusal goes to the owner.
+  for (const ground of [byReview(store, PROJECT, 6), byFix(store, PROJECT, base)]) {
+    const refusal = addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...ground })), "owner_required");
+    assert.equal(refusal.route, "owner");
+    assert.equal(refusal.at.field, "ground");
+    assert.ok(refusal.message.includes("gap:cart:price"));
+  }
+  // Both ways in are the same way: what is prepared for another unit's transaction is refused at preparation too.
+  assert.equal(refusalOf(prepareResumeSeries(store, { ...address(PROJECT), stop: 6, ...byReview(store, PROJECT, 6) })).code, "owner_required");
+  assert.equal(refusalOf(prepareResumeSeries(store, { ...address(PROJECT), stop: 6, ...byFix(store, PROJECT, base) })).code, "owner_required");
+  assert.equal(deliveredOf(prepareResumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) })).writes[0]!.expected, standing.revision);
+
+  // The refusal switched nothing (T8): the stop stands, no window opened, no revision was written.
+  const after = held(store)!;
+  assert.equal(after.revision, standing.revision);
+  assert.deepEqual(after.value.stop, standing.value.stop);
+  assert.deepEqual(after.value.continuations.map(item => item.after), [3]);
+  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 7, goal: goal() })), "series_stopped");
+
+  const owned = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
+  assert.equal(owned.value.stop, null);
+  assert.equal(owned.value.withoutProgress, 0);
+  assert.deepEqual(owned.value.ladder.windows, [3, 6]);
+  assert.deepEqual(owned.value.ladder.goals, ["gap:cart:price"]);
+});
+
+test("the owner's decision opens a window of its own, and the next stop is the owner's again", t => {
+  const { store } = fixture(t);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  // The owner may decide at any rung, including the first, and that spends the rung like any continuation.
+  const first = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byOwner(store, PROJECT, 3) }));
+  assert.equal(first.value.ladder.rung, 2);
+  for (let round = 0; round < 2; round += 1) assert.equal(cycle(store, PROJECT, goal(), fruitless()).value.stop, null);
+  const second = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(second.value.stop!.attempt, 6);
+
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
+  for (let round = 0; round < 2; round += 1) assert.equal(cycle(store, PROJECT, goal(), fruitless()).value.stop, null);
+  const third = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(third.value.stop!.attempt, 9);
+  // The ladder does not climb back down to the reviewer, however many windows the owner opens.
+  assert.equal(third.value.ladder.rung, 2);
+  assert.deepEqual(third.value.ladder.windows, [3, 6]);
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 9, ...byReview(store, PROJECT, 9) })), "owner_required");
+  const again = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 9, ...byOwner(store, PROJECT, 9) }));
+  assert.deepEqual(again.value.ladder.windows, [3, 6, 9]);
+  assert.equal(again.value.stop, null);
+});
+
+test("only a new accepted result of the goal the ladder stands for returns it to the start", t => {
+  const { store } = fixture(t);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byReview(store, PROJECT, 3) }));
+
+  // A result accepted for ANOTHER goal opens a window, as any progress does, but the rung stays where it was.
+  const other = cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), outcome({ achieved: [win(store, "line:tax")] }));
+  assert.equal(other.value.attempts[3]!.verdict, "progress");
+  assert.equal(other.value.withoutProgress, 0);
+  assert.equal(other.value.ladder.rung, 2);
+  assert.deepEqual(other.value.ladder.goals, ["gap:cart:price"]);
+  for (let round = 0; round < 2; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  const stopped = cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(stopped.value.stop!.attempt, 7);
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 7, ...byReview(store, PROJECT, 7) })), "owner_required");
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 7, ...byOwner(store, PROJECT, 7) }));
+
+  // A new accepted result of the goal itself does return it: the ladder is at the start, and the reviewer is a ground.
+  const won = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:price")] }));
+  assert.deepEqual(won.value.ladder, { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] });
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(held(store)!.value.stop!.attempt, 11);
+  const resumed = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 11, ...byReview(store, PROJECT, 11) }));
+  assert.equal(resumed.value.stop, null);
+  assert.deepEqual(resumed.value.ladder.windows, [11]);
+
+  // Re-taking a result this goal already had is no new result, so it returns nothing.
+  for (let round = 0; round < 2; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  const retaken = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:price")] }));
+  assert.equal(retaken.value.attempts[13]!.verdict, "none");
+  assert.equal(retaken.value.ladder.rung, 2);
+  assert.equal(retaken.value.stop!.attempt, 14);
+});
+
+test("the state of the ladder outlives a successor, a change of slice and a return to the earlier subject", t => {
+  const { store } = fixture(t);
+  const at = (line: number): SeriesRequest => address("long", line);
+  const moved = (line: number, slice: string, from: Revision<RepairSeries>) => deliveredOf(openSeries(store, {
+    ...at(line), slice, predecessor: reference(from), basis: { ground: "inputs-changed", text: "the closure of the block moved" },
+  }));
+  opened(store, "long");
+  for (let round = 0; round < 3; round += 1) cycle(store, "long", goal(), fruitless());
+  deliveredOf(resumeSeries(store, { ...at(1), stop: 3, ...byReview(store, "long", 3) }));
+  for (let round = 0; round < 3; round += 1) cycle(store, "long", goal(), fruitless());
+  const first = deliveredOf(readSeries(store, at(1)));
+  assert.equal(first.value.stop!.attempt, 6);
+  assert.equal(first.value.ladder.rung, 2);
+
+  // The slice moves. The stop comes across still standing — one change of horizon lifts nothing — and so do the
+  // count, the window already opened and the rung.
+  const second = moved(2, "slice:cart@2", first);
+  assert.deepEqual(second.value.stop, first.value.stop);
+  assert.deepEqual(second.value.ladder, first.value.ladder);
+  assert.deepEqual(second.value.continuations.map(item => item.after), [3]);
+  assert.equal(second.value.withoutProgress, 3);
+  addressed(refusalOf(beginAttempt(store, { ...at(2), attempt: 7, goal: goal() })), "series_stopped", "long", 2);
+  addressed(refusalOf(resumeSeries(store, { ...at(2), stop: 6, ...byReview(store, "long", 6) })), "owner_required", "long", 2);
+
+  // And back to the subject it started on: another line, the same history, and the same rung of the same ladder.
+  const third = moved(3, SLICE, second);
+  assert.deepEqual(third.value.ladder, first.value.ladder);
+  assert.deepEqual(third.value.stop, first.value.stop);
+  addressed(refusalOf(resumeSeries(store, { ...at(3), stop: 6, ...byReview(store, "long", 6) })), "owner_required", "long", 3);
+
+  // Only the owner continues it, and the window opens on the line the series now stands on.
+  const carried = deliveredOf(resumeSeries(store, { ...at(3), stop: 6, ...byOwner(store, "long", 6) }));
+  assert.equal(carried.value.stop, null);
+  assert.deepEqual(carried.value.continuations.map(item => item.after), [3, 6]);
+  assert.deepEqual(carried.value.ladder.windows, [3, 6]);
+  const seventh = cycle(store, "long", goal(), fruitless(), 3);
+  assert.equal(seventh.value.withoutProgress, 1);
+  assert.equal(seventh.value.stop, null);
+
+  // A successor that dropped a continuation of its predecessor would raise a stop answered long ago: it is refused.
+  forge(store, "long", value => ({ ...value, continuations: [value.continuations[1]!] }), 3);
+  assert.equal(addressed(refusalOf(readSeries(store, at(3))), "series_invalid", "long", 3).at.field, "continuations");
+});
+
+test("the executor's own word that the approach has changed lifts no stop any more", t => {
+  const { store } = fixture(t);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  const before = held(store)!;
+  assert.ok(!(CONTINUATION_GROUNDS as readonly string[]).includes("approach-changed"));
+
+  // It is not a ground of the table any more, so it is a defect of the calling code, not a refusal of the series.
+  for (const ground of ["approach-changed", "inputs-changed"]) {
+    assert.throws(() => resumeSeries(store, { ...address(PROJECT), stop: 3, ground, text: "I will try something else" } as unknown as ResumeSeriesRequest),
+      code("series_request_invalid"));
+  }
+  const after = held(store)!;
+  assert.equal(after.revision, before.revision);
+  assert.equal(after.value.stop!.attempt, 3);
+  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
+
+  // And a series holding such a continuation is not a series this unit ever wrote.
+  forge(store, PROJECT, value => ({ ...value, continuations: [{ ground: "approach-changed", text: "I tried something else", after: 3 }] }));
+  assert.equal(addressed(refusalOf(readSeries(store, address(PROJECT))), "series_invalid").at.field, "continuations.0.ground");
+});
+
+test("a review is the review of THIS stop and THIS goal, it says a cause and a change, and it answers once (T5)", t => {
+  const { store } = fixture(t);
+  opened(store);
+  cycle(store, PROJECT, goal(), fruitless());
+  cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), fruitless());
+  cycle(store, PROJECT, goal(), fruitless());
+  const stop = held(store)!.value.stop!;
+  assert.deepEqual(stop.goals, ["gap:cart:price", "gap:cart:tax"]);
+  const standing = () => held(store)!;
+  const refuse = (review: unknown, expected: string): Refusal => addressed(refusalOf(resumeSeries(store, {
+    ...address(PROJECT), stop: 3, ground: "review-record", text: "the reviewer looked at it", review: { ref: review as Ref },
+  })), expected);
+
+  // A review kept in another project's namespace, one whose content was rewritten under a reference to it, and a
+  // record of another kind wearing the address of a review: none of them is read as a review of this stop.
+  const genuine = reviewed(store, PROJECT, review(PROJECT, 3, stop.goals));
+  assert.equal(refuse(reviewed(store, "elsewhere", review(PROJECT, 3, stop.goals)), "record_foreign").at.field, "id");
+  assert.equal(refuse({ ...genuine, hash: hex("d") }, "record_forged").at.field, "hash");
+  assert.equal(refuse(reviewed(store, PROJECT, review(PROJECT, 3, stop.goals), UNIT_REFUSAL_KIND), "record_foreign").at.field, "kind");
+  assert.equal(refuse({ id: genuine.id, revision: 9, hash: genuine.hash }, "record_missing").at.ref!.revision, 9);
+
+  // The stop and the goals are derived here from the attempts, so no field of the review decides what it belongs to.
+  // The last of these declares itself accepted, independent and applicable to any stop; it is about another one.
+  const unusable: [unknown, string][] = [
+    [review(PROJECT, 9, stop.goals), "review.stop"],
+    [review(PROJECT, 3, ["gap:cart:price"]), "review.goals"],
+    [review(PROJECT, 3, [...stop.goals, "gap:cart:weight"]), "review.goals"],
+    [review(PROJECT, 3, stop.goals, { goals: [] }), "review.goals"],
+    [review(PROJECT, 3, stop.goals, { block: "block:checkout" }), "review.block"],
+    [review(PROJECT, 3, stop.goals, { projectId: "beta" }), "review.block"],
+    [review(PROJECT, 3, stop.goals, { cause: "" }), "review.cause"],
+    [review(PROJECT, 3, stop.goals, { change: {} }), "review.change"],
+    [without(review(PROJECT, 3, stop.goals), "change"), "review.change"],
+    [review(PROJECT, 9, stop.goals, { lifts: "any stop", accepted: true, independent: true }), "review.stop"],
+  ];
+  for (const [value, field] of unusable) {
+    assert.equal(refuse(reviewed(store, PROJECT, value as Record<string, unknown>), "review_unusable").at.field, field);
+  }
+  // Nothing of that moved anything: the stop stands where it stood and no window opened.
+  assert.equal(standing().value.stop!.attempt, 3);
+  assert.deepEqual(standing().value.continuations, []);
+
+  // The review of this stop lifts it, once. The same one delivered again changes nothing, and when the next stop is
+  // saved it is the ladder that answers first: this rung is spent.
+  const ground = { ground: "review-record", text: "the reviewer looked at it", review: { ref: genuine } } as const;
+  const resumed = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  const echo = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(echo.revision, resumed.revision);
+  assert.deepEqual(echo.value, resumed.value);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(held(store)!.value.stop!.attempt, 6);
+  const late = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(late.value.stop!.attempt, 6);
+  assert.deepEqual(late.value.continuations.map(item => item.after), [3]);
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...ground })), "owner_required");
+});
+
+test("a fixed input names the refusal that stood, the input it stood on and the confirmation of the repeated check", t => {
+  const { store } = fixture(t);
+  const base = fixable(store, PROJECT);
+  opened(store);
+  circled(store, PROJECT, base.refusal);
+  assert.equal(held(store)!.value.stop!.attempt, 3);
+  const refuse = (ground: Record<string, unknown>, expected: string): Refusal => addressed(refusalOf(resumeSeries(store, {
+    ...address(PROJECT), stop: 3, ground: "inputs-fixed", text: "the stage was corrected",
+    refusal: base.refusal.row, input: base.input, ...ground,
+  } as unknown as ResumeSeriesRequest)), expected);
+
+  const elsewhere = fixable(store, "beta");
+  const another = fixable(store, PROJECT, 1);
+  const stranger = journalled(store, PROJECT, { code: "work_not_atomic", goal: "each work owns one artifact" });
+  const fix = byFix(store, PROJECT, base);
+  const fixedRef = (over: Record<string, unknown> = {}, drop?: string): Ref => {
+    const value: Record<string, unknown> = {
+      refusal: base.refusal.row, input: { id: base.input.id, revision: 2, hash: store.get(base.input.id, 2)!.hash }, ...over,
+    };
+    return confirmed(store, PROJECT, drop === undefined ? value : without(value, drop));
+  };
+  // Everything the refusals below stand on is in place; from here the series itself writes nothing (T8). The input
+  // goes on being written by whoever fixes it — that is the point of the ground — so only what the series could
+  // touch is watched: its own record and the journal it reads a refusal from.
+  const untouched = [store.get(`om-refusal-journal:${PROJECT}`)!, held(store)!];
+
+  // A row that stands nowhere, and a row of another project's journal: neither is a refusal of this project.
+  assert.equal(refuse({ refusal: "om-refusal:invented", confirmation: fix.confirmation }, "refusal_unlinked").at.field, "refusal");
+  assert.equal(refuse({ refusal: elsewhere.refusal.row, confirmation: fix.confirmation }, "refusal_unlinked").at.field, "refusal");
+  // A refusal of this project that these attempts never ran into fixes nothing they were stopped for.
+  assert.equal(refuse({ refusal: stranger.row, confirmation: fix.confirmation }, "input_unfixed").at.field, "refusal");
+  // An input that refusal never stood on: its origin holds the records it was weighed against, and this is not one.
+  assert.equal(refuse({ input: elsewhere.input, confirmation: fix.confirmation }, "input_unfixed").at.field, "input");
+  assert.equal(refuse({ input: { ...base.input, revision: 9 }, confirmation: fix.confirmation }, "input_unfixed").at.field, "input");
+
+  // The confirmation is read at its exact reference, inside this project's namespace, as a record of its own kind.
+  assert.equal(refuse({ confirmation: { ref: confirmed(store, "beta", { refusal: base.refusal.row, input: base.input }) } }, "record_foreign").at.field, "id");
+  assert.equal(refuse({ confirmation: { ref: { ...fix.confirmation.ref, hash: hex("d") } } }, "record_forged").at.field, "hash");
+  assert.equal(refuse({ confirmation: { ref: confirmed(store, PROJECT, { refusal: base.refusal.row, input: base.input }, UNIT_REFUSAL_KIND) } }, "record_foreign").at.field, "kind");
+
+  // And what it says is weighed against the refusal and the input the continuation names: another refusal, another
+  // record, the very revision the attempts ran with, a revision that stands nowhere, and a revision that changed
+  // nothing are none of them a fix. A new id is not one either — that is the rule in so many words.
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ refusal: stranger.row }) } }, "input_unfixed").at.field, "confirmation.refusal");
+  assert.equal(refuse({ confirmation: { ref: fixedRef({}, "input") } }, "input_unfixed").at.field, "confirmation.input");
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ input: elsewhere.input }) } }, "input_unfixed").at.field, "confirmation.input");
+  // Another record entirely, at a later revision and holding something else: a new id is no fix of this input.
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ input: another.input }) } }, "input_unfixed").at.field, "confirmation.input");
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ input: base.input }) } }, "input_unfixed").at.field, "confirmation.input");
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ input: { ...base.input, revision: 9 } }) } }, "input_unfixed").at.field, "confirmation.input");
+  // A revision that holds again exactly what the refusal stood on is a new revision and no fix.
+  const copied = store.write({ id: base.input.id, kind: "om-stage", expected: 2, value: store.get(base.input.id, 1)!.value });
+  assert.equal(refuse({ confirmation: { ref: fixedRef({ input: reference(copied) }) } }, "input_unfixed").at.field, "confirmation.input");
+
+  // Nothing of that was written anywhere: the stop stands, and the journal and the input are as they were (T8).
+  assert.equal(held(store)!.value.stop!.attempt, 3);
+  for (const record of untouched) {
+    const now = store.get(record.id)!;
+    assert.equal(now.revision, record.revision, record.id);
+    assert.equal(now.hash, record.hash, record.id);
+  }
+
+  // The fix of the very input these attempts ran into continues the series, and opens a window like any ground.
+  const resumed = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...fix }));
+  assert.equal(resumed.value.stop, null);
+  assert.equal(resumed.value.withoutProgress, 0);
+  assert.deepEqual(resumed.value.continuations, [storedGround(fix, 3)]);
+  assert.deepEqual(resumed.value.ladder, { rung: 2, goals: ["gap:cart:price"], windows: [3], grounds: ["owner-decision"] });
+  // A confirmation of an EARLIER revision is no fix either, even when its content differs from the one the attempts
+  // ran with: a fix comes after the refusal it answers, not before it.
+  opened(store, "back");
+  const older = fixable(store, "back", 1);
+  assert.equal(older.input.revision, 2);
+  circled(store, "back", older.refusal);
+  addressed(refusalOf(resumeSeries(store, {
+    ...address("back"), stop: 3, ground: "inputs-fixed", text: "a revision the attempts had left behind",
+    refusal: older.refusal.row, input: older.input,
+    confirmation: { ref: confirmed(store, "back", {
+      refusal: older.refusal.row, input: { id: older.input.id, revision: 1, hash: store.get(older.input.id, 1)!.hash },
+    }) },
+  })), "input_unfixed", "back");
+
+  // And at the second rung it is no ground at all, however well it is made: a fix of the input the NEW window ran
+  // into does not stand in for the owner's decision.
+  const second = fixable(store, PROJECT);
+  circled(store, PROJECT, second.refusal);
+  assert.equal(held(store)!.value.stop!.attempt, 6);
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byFix(store, PROJECT, second) })), "owner_required");
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
+});
+
+test("the ladder is derived from the history at every reading, and a stored one that does not follow is refused (T3)", t => {
+  const { store } = fixture(t);
+  const build = (project: string): RepairSeries => {
+    opened(store, project);
+    for (let round = 0; round < 3; round += 1) cycle(store, project, goal(), fruitless());
+    deliveredOf(resumeSeries(store, { ...address(project), stop: 3, ...byReview(store, project, 3) }));
+    for (let round = 0; round < 3; round += 1) cycle(store, project, goal(), fruitless());
+    return held(store, project)!.value;
+  };
+  const genuine = build("ladder");
+  assert.deepEqual(genuine.ladder, { rung: 2, goals: ["gap:cart:price"], windows: [3], grounds: ["owner-decision"] });
+  assert.equal(genuine.stop!.attempt, 6);
+
+  const forgeries: [string, (value: RepairSeries) => Record<string, unknown>][] = [
+    ["a rung climbed back down to the reviewer",
+      value => ({ ...value, ladder: { ...value.ladder, rung: 1, grounds: [...CONTINUATION_GROUNDS] } })],
+    ["a ladder that forgot the goal it stands for", value => ({ ...value, ladder: { ...value.ladder, goals: [] } })],
+    ["a ladder that forgot the window it opened", value => ({ ...value, ladder: { ...value.ladder, windows: [] } })],
+    ["grounds that do not follow from the rung",
+      value => ({ ...value, ladder: { ...value.ladder, grounds: [...CONTINUATION_GROUNDS] } })],
+    ["a ladder wearing a field of its own", value => ({ ...value, ladder: { ...value.ladder, lifted: true } })],
+  ];
+  forgeries.forEach(([name, forgery], index) => {
+    const project = `rung${index}`;
+    build(project);
+    forge(store, project, forgery);
+    const refusal = addressed(refusalOf(readSeries(store, address(project))), "series_invalid", project);
+    assert.equal(refusal.at.field, "ladder", name);
+    // A series whose ladder cannot be read cannot be continued on any ground either.
+    addressed(refusalOf(resumeSeries(store, { ...address(project), stop: 6, ...byOwner(store, project, 6) })), "series_invalid", project);
+  });
+
+  // A continuation standing on a ground the rung it answers does not admit is not read either, however the count,
+  // the stop and the ladder around it were written to agree with it.
+  forge(store, "ladder", value => ({
+    ...value, stop: null, withoutProgress: 0,
+    continuations: [...value.continuations, { ground: "review-record", text: "a second look", review: byReview(store, "ladder", 6).review.ref, after: 6 }],
+  }));
+  const refusal = addressed(refusalOf(readSeries(store, address("ladder"))), "series_invalid", "ladder");
+  assert.equal(refusal.at.field, "continuations");
+  assert.ok(refusal.message.includes("rung 2"));
+
+  // The module has not been released, so no store holds a series of the former shape: one is refused, not migrated.
+  forge(store, "ladder", value => ({
+    ...without({ ...value }, "ladder"),
+    continuations: [{ ground: "approach-changed", text: "I tried something else", after: 3 }],
+  }));
+  assert.equal(addressed(refusalOf(readSeries(store, address("ladder"))), "series_invalid", "ladder").at.field, "value");
+});
+
+test("a decision of the owner is a record too: about THIS stop and THIS goal, and never a sentence alone (T1, T5)", t => {
+  const { store } = fixture(t);
+  opened(store);
+  cycle(store, PROJECT, goal(), fruitless());
+  cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), fruitless());
+  cycle(store, PROJECT, goal(), fruitless());
+  const stop = held(store)!.value.stop!;
+  assert.deepEqual(stop.goals, ["gap:cart:price", "gap:cart:tax"]);
+  const refuse = (decision: unknown, expected: string): Refusal => addressed(refusalOf(resumeSeries(store, {
+    ...address(PROJECT), stop: 3, ground: "owner-decision", text: "the owner decided", decision: { ref: decision as Ref },
+  })), expected);
+
+  // Read like the other two grounds: this project's namespace, this kind, this exact content.
+  const genuine = decided(store, PROJECT, decision(PROJECT, 3, stop.goals));
+  assert.equal(refuse(decided(store, "elsewhere", decision(PROJECT, 3, stop.goals)), "record_foreign").at.field, "id");
+  assert.equal(refuse({ ...genuine, hash: hex("d") }, "record_forged").at.field, "hash");
+  assert.equal(refuse(decided(store, PROJECT, decision(PROJECT, 3, stop.goals), STOP_REVIEW_KIND), "record_foreign").at.field, "kind");
+  assert.equal(refuse({ id: genuine.id, revision: 9, hash: genuine.hash }, "record_missing").at.ref!.revision, 9);
+
+  // The stop and the goals are derived here from the attempts, so nothing the record says of itself decides what it
+  // belongs to. The last of these declares itself taken by the owner, approved and good for any stop; it is about
+  // another one, and that is the end of it.
+  const unusable: [unknown, string][] = [
+    [decision(PROJECT, 9, stop.goals), "decision.stop"],
+    [decision(PROJECT, 3, ["gap:cart:price"]), "decision.goals"],
+    [decision(PROJECT, 3, [...stop.goals, "gap:cart:weight"]), "decision.goals"],
+    [decision(PROJECT, 3, stop.goals, { goals: [] }), "decision.goals"],
+    [decision(PROJECT, 3, stop.goals, { block: "block:checkout" }), "decision.block"],
+    [decision(PROJECT, 3, stop.goals, { projectId: "beta" }), "decision.block"],
+    [decision(PROJECT, 3, stop.goals, { decided: "" }), "decision.decided"],
+    [decision(PROJECT, 3, stop.goals, { decided: { approved: true } }), "decision.decided"],
+    [without(decision(PROJECT, 3, stop.goals), "decided"), "decision.decided"],
+    [decision(PROJECT, 9, stop.goals, { lifts: "any stop", approved: true, by: "the owner" }), "decision.stop"],
+  ];
+  for (const [value, field] of unusable) {
+    const refusal = refuse(decided(store, PROJECT, value as Record<string, unknown>), "decision_unusable");
+    assert.equal(refusal.at.field, field);
+    assert.equal(refusal.route, "owner");
+  }
+  // A record that is no record of a stop at all is refused with the ground it was given for, not read around.
+  assert.equal(refuse(reference(store.write({
+    id: `${ownerDecisionNamespace(PROJECT)}plain`, kind: OWNER_DECISION_KIND, expected: 0, value: "the owner said yes",
+  })), "decision_unusable").at.field, "decision");
+  // Nothing of that moved anything: the stop stands where it stood and no window opened.
+  assert.equal(held(store)!.value.stop!.attempt, 3);
+  assert.deepEqual(held(store)!.value.continuations, []);
+
+  // The decision taken about THIS stop lifts it, once, and opens a window like any ground.
+  const ground = { ground: "owner-decision", text: "the owner decided", decision: { ref: genuine } } as const;
+  const resumed = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(resumed.value.stop, null);
+  assert.equal(resumed.value.withoutProgress, 0);
+  assert.deepEqual(resumed.value.continuations, [storedGround(ground, 3)]);
+  const echo = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(echo.revision, resumed.revision);
+  assert.deepEqual(echo.value, resumed.value);
+  // Another decision for a stop already continued does not replace the one it was continued on.
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byOwner(store, PROJECT, 3, stop.goals) })), "continuation_conflict");
+
+  // And when the next stop is saved, the decision that answered the earlier one does not answer this one: the
+  // continuation names the stop it belongs to, so a repeat delivered late is a repeat and lifts nothing.
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  assert.equal(held(store)!.value.stop!.attempt, 6);
+  const late = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  assert.equal(late.value.stop!.attempt, 6);
+  assert.deepEqual(late.value.continuations.map(item => item.after), [3]);
+  // At the second rung the decision is the only ground there is, and it is read exactly as before.
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byReview(store, PROJECT, 6) })), "owner_required");
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 9) })), "decision_unusable");
+  const second = deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
+  assert.equal(second.value.stop, null);
+  assert.deepEqual(second.value.ladder.windows, [3, 6]);
+
+  // A stored ground of the owner without the record it stands on is not a ground this unit ever wrote.
+  forge(store, PROJECT, value => ({
+    ...value, continuations: [without({ ...value.continuations[0]! }, "decision"), value.continuations[1]!],
+  }));
+  assert.equal(addressed(refusalOf(readSeries(store, address(PROJECT))), "series_invalid").at.field, "continuations.0.decision");
+});
+
+test("a successor derives an inherited decision from its predecessor, and a race for one leaves nothing half-open (T3, T7)", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-series-owner-"));
+  const path = join(root, "live.sqlite");
+  const store = new RacingStore(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  store.target = seriesId(PROJECT, BLOCK, 1);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+
+  // Two decisions about the same stop, both good. The competitor's lands; ours finds the head it read gone, and the
+  // window it would have opened is lost with the transaction rather than opened half-way.
+  const rival = byOwner(store, PROJECT, 3);
+  const ours = byOwner(store, PROJECT, 3);
+  store.armed = true;
+  store.run = other => { deliveredOf(resumeSeries(other, { ...address(PROJECT), stop: 3, ...rival })); };
+  addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ours })), "input_stale");
+  const landed = deliveredOf(readSeries(store, address(PROJECT)));
+  assert.deepEqual(landed.value.continuations, [storedGround(rival, 3)]);
+  assert.equal(landed.value.ladder.rung, 2);
+
+  // The slice moves. The successor carries that continuation, and it is derived again from the predecessor at the
+  // exact reference it names: a decision swapped for another good one in the successor is not the one handed down.
+  store.armed = false;
+  const successor = deliveredOf(openSeries(store, {
+    ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(landed),
+    basis: { ground: "inputs-changed", text: "the closure of the block moved" },
+  }));
+  assert.deepEqual(successor.value.continuations, landed.value.continuations);
+  assert.equal(successor.value.ladder.rung, 2);
+  forge(store, PROJECT, value => ({ ...value, continuations: [{ ...value.continuations[0]!, decision: ours.decision.ref }] }), 2);
+  assert.equal(addressed(refusalOf(readSeries(store, address(PROJECT, 2))), "series_invalid", PROJECT, 2).at.field, "continuations");
+});
+
+// ---------------------------------------------------------------------------
+// A review that ended without a decision (review returned, journal entry 172): the stop goes to the owner.
+
+test("a review that ended without a decision sends the stop to the owner, and a second review no longer lifts it", t => {
+  const { path, store } = fixture(t);
+  const base = fixable(store, PROJECT);
+  opened(store);
+  circled(store, PROJECT, base.refusal);
+  const standing = held(store)!;
+  assert.equal(standing.value.stop!.attempt, 3);
+  assert.equal(standing.value.ladder.rung, 1);
+
+  // The reviewer's scenario, step 2: a review of this stop that names a cause and, explicitly, no usable change.
+  // It continues nothing, and says which transition such a review is for.
+  const nothing = undecided(store, PROJECT, 3);
+  const refusal = addressed(refusalOf(resumeSeries(store, {
+    ...address(PROJECT), stop: 3, ground: "review-record", text: "the reviewer looked at it", review: { ref: nothing },
+  })), "review_unusable");
+  assert.equal(refusal.at.field, "review.change");
+  assert.ok(refusal.message.includes("escalateSeries"));
+  assert.equal(held(store)!.revision, standing.revision);
+
+  // The transition keeps that outcome in the series: the rung is spent, the stop STAYS, and no window opens.
+  const sent = deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: nothing } }));
+  assert.deepEqual(sent.value.escalations, [{ after: 3, review: nothing }]);
+  assert.deepEqual(sent.value.ladder, { rung: 2, goals: ["gap:cart:price"], windows: [], grounds: ["owner-decision"] });
+  assert.equal(sent.value.stop!.attempt, 3);
+  assert.deepEqual(sent.value.stop!.attempts, standing.value.stop!.attempts);
+  assert.equal(sent.value.stop!.reason, standing.value.stop!.reason);
+  assert.ok(sent.value.stop!.resume.includes("owner's decision"));
+  assert.equal(sent.value.withoutProgress, standing.value.withoutProgress);
+  assert.deepEqual(sent.value.continuations, []);
+  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
+
+  // Step 3: another review of the same stop, with a cause AND a change, is refused towards the owner; so is a fix of
+  // the very input these attempts ran into.
+  const stillOwners = (at: Store): void => {
+    for (const ground of [byReview(at, PROJECT, 3), byFix(at, PROJECT, base)]) {
+      const owed = addressed(refusalOf(resumeSeries(at, { ...address(PROJECT), stop: 3, ...ground })), "owner_required");
+      assert.equal(owed.route, "owner");
+    }
+    assert.equal(at.get<RepairSeries>(seriesId(PROJECT, BLOCK, 1))!.value.stop!.attempt, 3);
+  };
+  stillOwners(store);
+
+  // The same after a restart: the escalation is in the record, and the rung is derived from it again.
+  store.close();
+  const back = new Store(path);
+  t.after(() => back.close());
+  const cold = deliveredOf(readSeries(back, address(PROJECT)));
+  assert.deepEqual(cold.value, sent.value);
+  stillOwners(back);
+  // And the same escalation delivered again is a repeat: no revision.
+  const echo = deliveredOf(escalateSeries(back, { ...address(PROJECT), stop: 3, review: { ref: nothing } }));
+  assert.equal(echo.revision, sent.revision);
+
+  // The owner's decision opens a window of up to three attempts, and the next stop is the owner's again.
+  const owned = deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 3, ...byOwner(back, PROJECT, 3) }));
+  assert.equal(owned.value.stop, null);
+  assert.equal(owned.value.withoutProgress, 0);
+  assert.deepEqual(owned.value.ladder.windows, [3]);
+  for (let round = 0; round < 2; round += 1) assert.equal(cycle(back, PROJECT, goal(), fruitless()).value.stop, null);
+  const sixth = cycle(back, PROJECT, goal(), fruitless());
+  assert.equal(sixth.value.stop!.attempt, 6);
+  assert.equal(sixth.value.ladder.rung, 2);
+  addressed(refusalOf(resumeSeries(back, { ...address(PROJECT), stop: 6, ...byReview(back, PROJECT, 6) })), "owner_required");
+  // An escalation delivered late for the stop the owner has since answered changes nothing and lifts nothing.
+  const late = deliveredOf(escalateSeries(back, { ...address(PROJECT), stop: 3, review: { ref: nothing } }));
+  assert.equal(late.revision, sixth.revision);
+  assert.equal(late.value.stop!.attempt, 6);
+});
+
+test("an escalation stands on the exact record of a review that ended without a decision, of its own stop, once (T5)", t => {
+  const { store } = fixture(t);
+  opened(store);
+  cycle(store, PROJECT, goal(), fruitless());
+  cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), fruitless());
+  cycle(store, PROJECT, goal(), fruitless());
+  const stop = held(store)!.value.stop!;
+  const before = held(store)!;
+  const refuse = (review: unknown, expected: string): Refusal =>
+    addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: review as Ref } })), expected);
+
+  // Read like every record of a ground: this project's namespace, this kind, this exact content.
+  const genuine = undecided(store, PROJECT, 3, stop.goals);
+  assert.equal(refuse(reviewed(store, "elsewhere", review(PROJECT, 3, stop.goals, { change: null })), "record_foreign").at.field, "id");
+  assert.equal(refuse({ ...genuine, hash: hex("d") }, "record_forged").at.field, "hash");
+  assert.equal(refuse(reviewed(store, PROJECT, review(PROJECT, 3, stop.goals, { change: null }), OWNER_DECISION_KIND), "record_foreign").at.field, "kind");
+  assert.equal(refuse({ id: genuine.id, revision: 9, hash: genuine.hash }, "record_missing").at.ref!.revision, 9);
+
+  // A review of another stop, goal or block is not the review of this stop, however it ended.
+  const unusable: [Record<string, unknown>, string][] = [
+    [review(PROJECT, 9, stop.goals, { change: null }), "review.stop"],
+    [review(PROJECT, 3, ["gap:cart:price"], { change: null }), "review.goals"],
+    [review(PROJECT, 3, stop.goals, { change: null, block: "block:checkout" }), "review.block"],
+    [review(PROJECT, 3, stop.goals, { change: null, projectId: "beta" }), "review.block"],
+    // A broken record is no outcome: a part left out, left empty or left as an empty structure moves nothing.
+    [without(review(PROJECT, 3, stop.goals), "change"), "review.change"],
+    [review(PROJECT, 3, stop.goals, { change: {} }), "review.change"],
+    [review(PROJECT, 3, stop.goals, { change: [] }), "review.change"],
+    [review(PROJECT, 3, stop.goals, { change: "" }), "review.change"],
+    [without(review(PROJECT, 3, stop.goals, { change: null }), "cause"), "review.cause"],
+    [review(PROJECT, 3, stop.goals, { change: null, cause: "" }), "review.cause"],
+    [review(PROJECT, 3, stop.goals, { change: null, cause: 7 }), "review.cause"],
+    // And a review that DID decide escalates nothing: it is a ground to continue, through the other transition.
+    [review(PROJECT, 3, stop.goals), "review.change"],
+    // A status beside the content decides nothing either: this one declares "no decision" and says a change.
+    [review(PROJECT, 3, stop.goals, { outcome: "no-decision", decided: false }), "review.change"],
+  ];
+  for (const [value, field] of unusable) assert.equal(refuse(reviewed(store, PROJECT, value), "review_unusable").at.field, field);
+  const decided = refuse(reviewed(store, PROJECT, review(PROJECT, 3, stop.goals)), "review_unusable");
+  assert.ok(decided.message.includes("resumeSeries"));
+  // Nothing of that moved anything.
+  assert.equal(held(store)!.revision, before.revision);
+  assert.deepEqual(held(store)!.value.escalations, []);
+
+  // Applied once: the same request again is a repeat without a revision; another review for the escalated stop is a
+  // conflict, not a second application.
+  const sent = deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: genuine } }));
+  const echo = deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: genuine } }));
+  assert.equal(echo.revision, sent.revision);
+  assert.deepEqual(echo.value, sent.value);
+  assert.equal(addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: undecided(store, PROJECT, 3, stop.goals) } })), "escalation_conflict").at.field, "review");
+  assert.equal(held(store)!.revision, sent.revision);
+
+  // A reviewer who could not name a cause at all ended without a decision too, whatever change is written beside it.
+  opened(store, "blind");
+  for (let round = 0; round < 3; round += 1) cycle(store, "blind", goal(), fruitless());
+  const blind = deliveredOf(escalateSeries(store, { ...address("blind"), stop: 3, review: { ref: reviewed(store, "blind", review("blind", 3, undefined, { cause: null })) } }));
+  assert.equal(blind.value.ladder.rung, 2);
+
+  // A stop that no longer stands cannot be escalated: continued on a review that decided, it is gone.
+  opened(store, "gone");
+  for (let round = 0; round < 3; round += 1) cycle(store, "gone", goal(), fruitless());
+  deliveredOf(resumeSeries(store, { ...address("gone"), stop: 3, ...byReview(store, "gone", 3) }));
+  addressed(refusalOf(escalateSeries(store, { ...address("gone"), stop: 3, review: { ref: undecided(store, "gone", 3) } })), "stop_absent", "gone");
+  // And a stop at the owner's rung has nothing left to escalate.
+  for (let round = 0; round < 3; round += 1) cycle(store, "gone", goal(), fruitless());
+  const owners = addressed(refusalOf(escalateSeries(store, { ...address("gone"), stop: 6, review: { ref: undecided(store, "gone", 6) } })), "owner_required", "gone");
+  assert.equal(owners.route, "owner");
+  assert.deepEqual(held(store, "gone")!.value.escalations, []);
+});
+
+test("an escalation outlives a successor and a change of slice, and a successor derives it again from its predecessor", t => {
+  const { store } = fixture(t);
+  const base = fixable(store, "long");
+  const at = (line: number): SeriesRequest => address("long", line);
+  const moved = (line: number, slice: string, from: Revision<RepairSeries>) => deliveredOf(openSeries(store, {
+    ...at(line), slice, predecessor: reference(from), basis: { ground: "inputs-changed", text: "the closure of the block moved" },
+  }));
+  opened(store, "long");
+  circled(store, "long", base.refusal);
+  const first = deliveredOf(escalateSeries(store, { ...at(1), stop: 3, review: { ref: undecided(store, "long", 3) } }));
+
+  // The slice moves, then comes back to the subject it started on. Each line carries the stop, the escalation and the
+  // rung — one change of horizon does not hand the stop back to the reviewer.
+  const second = moved(2, "slice:cart@2", first);
+  const third = moved(3, SLICE, second);
+  for (const [line, series] of [[2, second], [3, third]] as const) {
+    assert.deepEqual(series.value.escalations, first.value.escalations);
+    assert.deepEqual(series.value.stop, first.value.stop);
+    assert.deepEqual(series.value.ladder, first.value.ladder);
+    for (const ground of [byReview(store, "long", 3), byFix(store, "long", base)]) {
+      addressed(refusalOf(resumeSeries(store, { ...at(line), stop: 3, ...ground })), "owner_required", "long", line);
+    }
+    // The escalation it inherited is its own: the same request again is a repeat, another review a conflict.
+    assert.equal(deliveredOf(escalateSeries(store, { ...at(line), stop: 3, review: { ref: first.value.escalations[0]!.review } })).revision, series.revision);
+    addressed(refusalOf(escalateSeries(store, { ...at(line), stop: 3, review: { ref: undecided(store, "long", 3) } })), "escalation_conflict", "long", line);
+  }
+
+  // Only the owner continues it, on the line the series now stands on.
+  const owned = deliveredOf(resumeSeries(store, { ...at(3), stop: 3, ...byOwner(store, "long", 3) }));
+  assert.equal(owned.value.stop, null);
+  assert.deepEqual(owned.value.ladder.windows, [3]);
+
+  // A successor that dropped the escalation, or swapped it for another good one, is not the one handed down (T3).
+  const dropped = held(store, "long", 2)!;
+  forge(store, "long", value => ({ ...value, escalations: [] }), 2);
+  assert.equal(addressed(refusalOf(readSeries(store, at(2))), "series_invalid", "long", 2).at.field, "escalations");
+  store.write({ id: dropped.id, kind: REPAIR_SERIES_KIND, expected: dropped.revision + 1, value: dropped.value as unknown as Json });
+  forge(store, "long", value => ({ ...value, escalations: [{ after: 3, review: undecided(store, "long", 3) }] }), 2);
+  assert.equal(addressed(refusalOf(readSeries(store, at(2))), "series_invalid", "long", 2).at.field, "escalations");
+});
+
+test("an escalation stored where no stop of the first rung stood, or held out of shape, is refused (T3, T4)", t => {
+  const { store } = fixture(t);
+  const build = (project: string): RepairSeries => {
+    opened(store, project);
+    for (let round = 0; round < 3; round += 1) cycle(store, project, goal(), fruitless());
+    return deliveredOf(escalateSeries(store, { ...address(project), stop: 3, review: { ref: undecided(store, project, 3) } })).value;
+  };
+  const genuine = build("esc");
+  const review_ = genuine.escalations[0]!.review;
+  const forgeries: [string, (value: RepairSeries) => Record<string, unknown>, string][] = [
+    ["a series with no set of escalations at all", value => without({ ...value }, "escalations"), "value"],
+    ["an absent set is not an empty one", value => ({ ...value, escalations: null }), "escalations"],
+    ["an escalation without its review", value => ({ ...value, escalations: [{ after: 3 }] }), "escalations.0"],
+    ["an escalation wearing a field of its own", value => ({ ...value, escalations: [{ after: 3, review: review_, lifts: true }] }), "escalations.0"],
+    ["an escalation of an attempt the series does not hold", value => ({ ...value, escalations: [{ after: 9, review: review_ }] }), "escalations.0.after"],
+    ["one stop escalated twice", value => ({ ...value, escalations: [{ after: 3, review: review_ }, { after: 3, review: review_ }] }), "escalations.1.after"],
+    ["an escalation where no stop was saved", value => ({ ...value, escalations: [{ after: 2, review: review_ }] }), "escalations"],
+    ["an escalation wished away, the rung it gave kept", value => ({ ...value, escalations: [] }), "ladder"],
+    ["an escalation kept, the rung it gave taken back",
+      value => ({ ...value, ladder: { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] } }), "ladder"],
+    ["an escalation that lifted its stop", value => ({ ...value, stop: null }), "stop"],
+  ];
+  forgeries.forEach(([name, forgery, field], index) => {
+    const project = `esc${index}`;
+    build(project);
+    forge(store, project, forgery);
+    assert.equal(addressed(refusalOf(readSeries(store, address(project))), "series_invalid", project).at.field, field, name);
+  });
+  // An escalation standing at a stop of the owner's rung is no escalation either.
+  opened(store, "late");
+  for (let round = 0; round < 3; round += 1) cycle(store, "late", goal(), fruitless());
+  deliveredOf(resumeSeries(store, { ...address("late"), stop: 3, ...byReview(store, "late", 3) }));
+  for (let round = 0; round < 3; round += 1) cycle(store, "late", goal(), fruitless());
+  forge(store, "late", value => ({ ...value, escalations: [{ after: 6, review: review_ }] }));
+  const refusal = addressed(refusalOf(readSeries(store, address("late"))), "series_invalid", "late");
+  assert.equal(refusal.at.field, "escalations");
+  assert.ok(refusal.message.includes("first rung"));
+});
+
+test("an escalation racing another change is refused rather than written over it (T7)", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-series-escalate-"));
+  const path = join(root, "live.sqlite");
+  const store = new RacingStore(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  store.target = seriesId(PROJECT, BLOCK, 1);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+
+  // Two reviews of the same stop, both ended without a decision. The competitor's lands between our read and our write.
+  const theirs = undecided(store, PROJECT, 3);
+  const ours = undecided(store, PROJECT, 3);
+  store.armed = true;
+  store.run = other => { deliveredOf(escalateSeries(other, { ...address(PROJECT), stop: 3, review: { ref: theirs } })); };
+  addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: ours } })), "input_stale");
+  assert.deepEqual(held(store)!.value.escalations, [{ after: 3, review: theirs }]);
+  // Read again, ours is what it is: another review for a stop already escalated.
+  addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: ours } })), "escalation_conflict");
+
+  // The owner answers the stop between our read and our escalation of it on yet another review: nothing is escalated
+  // over a stop that no longer stands, and read again it is simply gone.
+  opened(store, "other");
+  store.target = seriesId("other", BLOCK, 1);
+  for (let round = 0; round < 3; round += 1) cycle(store, "other", goal(), fruitless());
+  const owner = byOwner(store, "other", 3);
+  const late = undecided(store, "other", 3);
+  store.armed = true;
+  store.run = other => { deliveredOf(resumeSeries(other, { ...address("other"), stop: 3, ...owner })); };
+  addressed(refusalOf(escalateSeries(store, { ...address("other"), stop: 3, review: { ref: late } })), "input_stale", "other");
+  assert.deepEqual(held(store, "other")!.value.escalations, []);
+  addressed(refusalOf(escalateSeries(store, { ...address("other"), stop: 3, review: { ref: late } })), "stop_absent", "other");
+});
+
+test("escalations of several series are prepared without writing and applied by one transaction, or by none", t => {
+  const { store } = fixture(t);
+  const blocks = ["block:cart", "block:checkout", "block:invoice"] as const;
+  const at = (block: string): SeriesRequest => ({ project: PROJECT, block, line: 1 });
+  const stopped = (block: string): void => {
+    deliveredOf(openSeries(store, { ...at(block), slice: SLICE, predecessor: null, basis: null }));
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      deliveredOf(beginAttempt(store, { ...at(block), attempt, goal: goal() }));
+      deliveredOf(completeAttempt(store, { ...at(block), attempt, outcome: fruitless() }));
+    }
+  };
+  for (const block of blocks) stopped(block);
+  const prepare = (block: string) => deliveredOf(prepareEscalateSeries(store, {
+    ...at(block), stop: 3, review: { ref: undecided(store, PROJECT, 3, undefined, { block }) },
+  }));
+  const heads = () => blocks.map(block => store.get(seriesId(PROJECT, block, 1))!.revision);
+  const apply = (parts: readonly SeriesTransition[]) => writeGuarded(store, {
+    unit: "b3", target: "om-escalations:alpha", writes: parts.flatMap(part => [...part.writes]), guards: parts.flatMap(part => [...part.guards]),
+  });
+
+  // A prepared escalation is a write and its guard, and nothing has been written yet.
+  const before = heads();
+  const cart = prepare("block:cart");
+  const checkout = prepare("block:checkout");
+  assert.equal(cart.writes.length, 1);
+  assert.equal(cart.writes[0]!.kind, REPAIR_SERIES_KIND);
+  assert.equal(cart.writes[0]!.expected, before[0]);
+  assert.deepEqual(cart.guards, [reference(store.get(seriesId(PROJECT, "block:cart", 1))!)]);
+  assert.equal(cart.value.ladder.rung, 2);
+  assert.deepEqual(heads(), before);
+
+  // One participant moves before the write — the owner answers the checkout stop — and the transaction commits
+  // nothing: the cart is not left escalated on its own.
+  deliveredOf(resumeSeries(store, { ...at("block:checkout"), stop: 3, ...byOwner(store, PROJECT, 3, undefined, { block: "block:checkout" }) }));
+  assert.equal(refusalOf(apply([cart, checkout])).code, "input_stale");
+  assert.deepEqual(deliveredOf(readSeries(store, at("block:cart"))).value.escalations, []);
+  assert.equal(deliveredOf(readSeries(store, at("block:cart"))).value.ladder.rung, 1);
+  assert.deepEqual(deliveredOf(readSeries(store, at("block:checkout"))).value.escalations, []);
+  // What cannot be escalated any more is refused at preparation, before anything is written.
+  assert.equal(refusalOf(prepareEscalateSeries(store, {
+    ...at("block:checkout"), stop: 3, review: { ref: undecided(store, PROJECT, 3, undefined, { block: "block:checkout" }) },
+  })).code, "stop_absent");
+
+  // Nothing prevented: both escalations are written by one transaction, and read back as this unit's own.
+  const done = deliveredOf(apply([prepare("block:cart"), prepare("block:invoice")]));
+  assert.equal(done.length, 2);
+  for (const block of ["block:cart", "block:invoice"]) {
+    const series = deliveredOf(readSeries(store, at(block)));
+    assert.equal(series.value.escalations.length, 1);
+    assert.equal(series.value.ladder.rung, 2);
+    assert.equal(series.value.stop!.attempt, 3);
+  }
+  // A prepared escalation that is a repeat carries no write, so a caller adds nothing to its transaction.
+  const cartReview = deliveredOf(readSeries(store, at("block:cart"))).value.escalations[0]!.review;
+  const repeat = deliveredOf(prepareEscalateSeries(store, { ...at("block:cart"), stop: 3, review: { ref: cartReview } }));
+  assert.deepEqual(repeat.writes, []);
+  assert.deepEqual(repeat.guards, []);
+});
+
+// ---------------------------------------------------------------------------
+// A ground written in the same transaction as the change it grounds (review returned, journal entry 174).
+
+test("a review written WITH the escalation: nothing of it stands before, both stand after, and a moved guard leaves neither", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-series-pending-"));
+  const path = join(root, "live.sqlite");
+  const store = new RacingStore(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  store.target = seriesId(PROJECT, BLOCK, 1);
+  opened(store);
+  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  const stopped = held(store)!;
+
+  // Two writers, each with a review of this stop that has just come back and is not in the store at all. The
+  // competitor's transaction lands between our read and our write.
+  const theirs = unwritten(PROJECT, STOP_REVIEW_KIND);
+  const ours = unwritten(PROJECT, STOP_REVIEW_KIND);
+  const value = review(PROJECT, 3, undefined, { change: null });
+  assert.equal(store.get(theirs), null);
+  assert.equal(store.get(ours), null);
+  store.armed = true;
+  store.run = other => {
+    deliveredOf(escalateSeries(other, { ...address(PROJECT), stop: 3, review: onItsWay(theirs, STOP_REVIEW_KIND, value) }));
+  };
+  addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: onItsWay(ours, STOP_REVIEW_KIND, value) })), "input_stale");
+  // Neither of OUR two records was written: not the review, not the second rung.
+  assert.equal(store.get(ours), null);
+  const landed = deliveredOf(readSeries(store, address(PROJECT)));
+  assert.equal(landed.value.escalations.length, 1);
+  assert.equal(landed.value.escalations[0]!.review.id, theirs);
+  // The competitor's review was written by the same transaction as its escalation, at its first revision.
+  const written = store.get(theirs)!;
+  assert.equal(written.revision, 1);
+  assert.equal(written.kind, STOP_REVIEW_KIND);
+  assert.equal(written.hash, hashJson(value));
+  assert.deepEqual(landed.value.escalations[0]!.review, reference(written));
+  assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, stopped.revision + 1);
+  assert.equal(landed.value.ladder.rung, 2);
+  assert.equal(landed.value.stop!.attempt, 3);
+
+  // T5 for a record on its way: the same request again finds its own record standing and is a repeat — no second
+  // revision of either. Другое содержимое под тем же id is a revision conflict, and nothing is overwritten.
+  store.armed = false;
+  const repeat = deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: onItsWay(theirs, STOP_REVIEW_KIND, value) }));
+  assert.equal(repeat.revision, landed.revision);
+  assert.equal(store.history(theirs).length, 1);
+  assert.deepEqual(deliveredOf(prepareEscalateSeries(store, { ...address(PROJECT), stop: 3, review: onItsWay(theirs, STOP_REVIEW_KIND, value) })).writes, []);
+  const clash = addressed(refusalOf(escalateSeries(store, {
+    ...address(PROJECT), stop: 3, review: onItsWay(theirs, STOP_REVIEW_KIND, review(PROJECT, 3, undefined, { change: null, cause: "another cause" })),
+  })), "revision_conflict");
+  assert.equal(clash.at.field, "review.pending.id");
+  assert.equal(store.history(theirs).length, 1);
+  assert.equal(store.get(theirs)!.hash, written.hash);
+
+  // And the same window on the id of the record itself: it is free when the preparation looks, and taken by someone
+  // else before the write. The transaction commits nothing, so the series is not escalated on a record it never wrote.
+  opened(store, "taken");
+  for (let round = 0; round < 3; round += 1) cycle(store, "taken", goal(), fruitless());
+  const contested = unwritten("taken", STOP_REVIEW_KIND);
+  const mine = review("taken", 3, undefined, { change: null });
+  store.target = contested;
+  store.armed = true;
+  store.run = other => { other.write({ id: contested, kind: STOP_REVIEW_KIND, expected: 0, value: review("taken", 3, undefined, { change: null, cause: "theirs" }) as unknown as Json }); };
+  const lost = refusalOf(escalateSeries(store, { ...address("taken"), stop: 3, review: onItsWay(contested, STOP_REVIEW_KIND, mine) }));
+  assert.equal(lost.code, "revision_conflict");
+  // The refusal names the id that was taken, which is the record that could not be written.
+  assert.equal(lost.at.target, contested);
+  assert.equal(lost.at.unit, UNIT);
+  assert.equal(store.history(contested).length, 1);
+  assert.notEqual(store.get(contested)!.hash, hashJson(mine));
+  assert.deepEqual(held(store, "taken")!.value.escalations, []);
+  assert.equal(held(store, "taken")!.value.ladder.rung, 1);
+});
+
+test("a review, a confirmation of a fix and a decision of the owner, each written with the continuation it grounds", t => {
+  const { store } = fixture(t);
+  const window = (project: string): { readonly base: { input: Ref; refusal: ClaimedRefusal } } => {
+    const base = fixable(store, project);
+    opened(store, project);
+    circled(store, project, base.refusal);
+    return { base };
+  };
+
+  // A review that decided, written with the continuation it grounds.
+  window("rev");
+  const reviewId = unwritten("rev", STOP_REVIEW_KIND);
+  assert.equal(store.get(reviewId), null);
+  const resumed = deliveredOf(resumeSeries(store, {
+    ...address("rev"), stop: 3, ground: "review-record", text: "the reviewer answered",
+    review: onItsWay(reviewId, STOP_REVIEW_KIND, review("rev", 3)),
+  }));
+  assert.equal(store.get(reviewId)!.revision, 1);
+  assert.deepEqual(resumed.value.continuations[0]!, {
+    ground: "review-record", text: "the reviewer answered", review: reference(store.get(reviewId)!), after: 3,
+  });
+  assert.equal(resumed.value.stop, null);
+  assert.equal(resumed.value.ladder.rung, 2);
+
+  // A confirmation of a fixed input, written with the continuation. The input it confirms is a revision that STANDS:
+  // a re-check is run on a record, not on one that is still to be written.
+  const fixWindow = window("fix");
+  const better = store.write({
+    id: fixWindow.base.input.id, kind: "om-stage", expected: fixWindow.base.input.revision,
+    value: { rows: ["the price is produced by the pricing operation"] },
+  });
+  const fixId = unwritten("fix", INPUT_FIX_KIND);
+  const fixed = deliveredOf(resumeSeries(store, {
+    ...address("fix"), stop: 3, ground: "inputs-fixed", text: "the stage was corrected and re-checked",
+    refusal: fixWindow.base.refusal.row, input: fixWindow.base.input,
+    confirmation: onItsWay(fixId, INPUT_FIX_KIND, { refusal: fixWindow.base.refusal.row, input: reference(better), check: "addressed" }),
+  }));
+  assert.equal(store.get(fixId)!.revision, 1);
+  assert.equal(fixed.value.continuations[0]!.ground, "inputs-fixed");
+  assert.equal(fixed.value.stop, null);
+
+  // The owner's decision, written with the continuation: H2 writes the decision and continues the series at once.
+  const ownerWindow = window("own");
+  deliveredOf(escalateSeries(store, { ...address("own"), stop: 3, review: { ref: undecided(store, "own", 3) } }));
+  const decisionId = unwritten("own", OWNER_DECISION_KIND);
+  assert.equal(store.get(decisionId), null);
+  const owned = deliveredOf(resumeSeries(store, {
+    ...address("own"), stop: 3, ground: "owner-decision", text: "the owner decided",
+    decision: onItsWay(decisionId, OWNER_DECISION_KIND, decision("own", 3)),
+  }));
+  assert.equal(store.get(decisionId)!.revision, 1);
+  assert.equal(owned.value.stop, null);
+  assert.deepEqual(owned.value.ladder.windows, [3]);
+  assert.equal(ownerWindow.base.refusal.row.length > 0, true);
+
+  // Prepared, not written: the set carries the series and the record its ground is made of, and when the series
+  // moves before the write, neither is written.
+  const raceWindow = window("race");
+  const lateId = unwritten("race", OWNER_DECISION_KIND);
+  deliveredOf(escalateSeries(store, { ...address("race"), stop: 3, review: { ref: undecided(store, "race", 3) } }));
+  const transition = deliveredOf(prepareResumeSeries(store, {
+    ...address("race"), stop: 3, ground: "owner-decision", text: "the owner decided",
+    decision: onItsWay(lateId, OWNER_DECISION_KIND, decision("race", 3)),
+  }));
+  assert.deepEqual(transition.writes.map(write => write.id), [seriesId("race", BLOCK, 1), lateId]);
+  assert.equal(transition.writes[1]!.expected, 0);
+  assert.equal(store.get(lateId), null);
+  // Another decision answers that stop first; the prepared set is stale, and nothing of it is applied.
+  deliveredOf(resumeSeries(store, { ...address("race"), stop: 3, ...byOwner(store, "race", 3) }));
+  const before = held(store, "race")!;
+  assert.equal(refusalOf(writeGuarded(store, {
+    unit: "a6", target: seriesId("race", BLOCK, 1), writes: [...transition.writes], guards: [...transition.guards],
+  })).code, "input_stale");
+  assert.equal(store.get(lateId), null);
+  assert.equal(held(store, "race")!.revision, before.revision);
+  assert.equal(raceWindow.base.refusal.row.length > 0, true);
+});
+
+test("a record handed over to be written is held to the address and the content of a stored one, and writes nothing when refused", t => {
+  const { store } = fixture(t);
+  const base = fixable(store, PROJECT);
+  opened(store);
+  circled(store, PROJECT, base.refusal);
+  const stop = held(store)!.value.stop!;
+  const standing = held(store)!;
+  const escalate = (id: string, kind: string, value: Record<string, unknown>, expected: string): Refusal =>
+    addressed(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: onItsWay(id, kind, value) })), expected);
+  const undecidedValue = review(PROJECT, 3, stop.goals, { change: null });
+
+  // The address rules of a stored record hold before the store is touched: this project's namespace, this kind.
+  const foreign = `${stopReviewNamespace("beta")}${next()}`;
+  assert.equal(escalate(foreign, STOP_REVIEW_KIND, undecidedValue, "record_foreign").at.field, "review.pending.id");
+  assert.equal(escalate(`om-stage:${PROJECT}:1`, STOP_REVIEW_KIND, undecidedValue, "record_foreign").at.field, "review.pending.id");
+  const wrongKind = unwritten(PROJECT, STOP_REVIEW_KIND);
+  assert.equal(escalate(wrongKind, OWNER_DECISION_KIND, undecidedValue, "record_foreign").at.field, "review.pending.kind");
+
+  // The content is weighed by the same rules as a stored record's, and a record refused is a record not written.
+  const cases: [Record<string, unknown>, string][] = [
+    [review(PROJECT, 9, stop.goals, { change: null }), "review.stop"],
+    [review(PROJECT, 3, ["gap:cart:tax"], { change: null }), "review.goals"],
+    [review(PROJECT, 3, [...stop.goals, "gap:cart:tax"], { change: null }), "review.goals"],
+    [review(PROJECT, 3, stop.goals, { change: null, block: "block:checkout" }), "review.block"],
+    [review(PROJECT, 3, stop.goals, { change: null, projectId: "beta" }), "review.block"],
+    [review(PROJECT, 3, stop.goals, {}), "review.change"],
+    [review(PROJECT, 3, stop.goals, { change: {} }), "review.change"],
+  ];
+  for (const [value, field] of cases) {
+    const id = unwritten(PROJECT, STOP_REVIEW_KIND);
+    assert.equal(escalate(id, STOP_REVIEW_KIND, value, "review_unusable").at.field, field);
+    assert.equal(store.get(id), null, field);
+  }
+  assert.equal(store.get(foreign), null);
+  assert.equal(store.get(wrongKind), null);
+  assert.equal(held(store)!.revision, standing.revision);
+  assert.deepEqual(held(store)!.value.escalations, []);
+
+  // An id another record already stands at is not written over, whatever that record is.
+  const taken = unwritten(PROJECT, STOP_REVIEW_KIND);
+  const other = store.write({ id: taken, kind: STOP_REVIEW_KIND, expected: 0, value: review(PROJECT, 9, stop.goals) as unknown as Json });
+  assert.equal(escalate(taken, STOP_REVIEW_KIND, undecidedValue, "revision_conflict").at.field, "review.pending.id");
+  assert.equal(store.get(taken)!.hash, other.hash);
+  assert.equal(store.history(taken).length, 1);
+
+  // Neither of the two ways is a default for the other: a ground names exactly one of them.
+  const broken: unknown[] = [
+    {}, { ref: reference(other), pending: { id: taken, kind: STOP_REVIEW_KIND, value: undecidedValue } },
+    { pending: null }, { pending: { id: taken, kind: STOP_REVIEW_KIND } },
+    { pending: { id: taken, value: undecidedValue } }, { pending: { kind: STOP_REVIEW_KIND, value: undecidedValue } },
+    { pending: { id: "", kind: STOP_REVIEW_KIND, value: undecidedValue } },
+    { pending: { id: `${stopReviewNamespace(PROJECT)}${"x".repeat(200)}`, kind: STOP_REVIEW_KIND, value: undecidedValue } },
+    { pending: { id: taken, kind: STOP_REVIEW_KIND, value: undefined } },
+    { pending: { id: taken, kind: STOP_REVIEW_KIND, value: () => undecidedValue } },
+    { pending: { id: taken, kind: STOP_REVIEW_KIND, value: undecidedValue, extra: 1 } },
+  ];
+  for (const review_ of broken) {
+    assert.throws(() => escalateSeries(store, { ...address(PROJECT), stop: 3, review: review_ as GroundRecord }), code("series_request_invalid"));
+    assert.throws(() => resumeSeries(store, {
+      ...address(PROJECT), stop: 3, ground: "review-record", text: "on", review: review_ as GroundRecord,
+    }), code("series_request_invalid"));
+  }
+  assert.equal(held(store)!.revision, standing.revision);
+});
+
+test("two series and one new record of a ground go into one transaction, or none of them does", t => {
+  const { store } = fixture(t);
+  const other = "block:checkout";
+  const at = (block: string): SeriesRequest => ({ project: PROJECT, block, line: 1 });
+  const stopped = (block: string): void => {
+    deliveredOf(openSeries(store, { ...at(block), slice: SLICE, predecessor: null, basis: null }));
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      deliveredOf(beginAttempt(store, { ...at(block), attempt, goal: goal() }));
+      deliveredOf(completeAttempt(store, { ...at(block), attempt, outcome: fruitless() }));
+    }
+  };
+  stopped(BLOCK);
+  stopped(other);
+
+  // One block's stop is escalated on a review that is written with it; the other's on a review already stored.
+  const newReview = unwritten(PROJECT, STOP_REVIEW_KIND);
+  const prepare = () => [
+    deliveredOf(prepareEscalateSeries(store, {
+      ...at(BLOCK), stop: 3, review: onItsWay(newReview, STOP_REVIEW_KIND, review(PROJECT, 3, undefined, { change: null })),
+    })),
+    deliveredOf(prepareEscalateSeries(store, {
+      ...at(other), stop: 3, review: { ref: undecided(store, PROJECT, 3, undefined, { block: other }) },
+    })),
+  ];
+  const apply = (parts: readonly SeriesTransition[]) => writeGuarded(store, {
+    unit: "a6", target: "om-escalations:alpha",
+    writes: parts.flatMap(part => [...part.writes]), guards: parts.flatMap(part => [...part.guards]),
+  });
+  const first = prepare();
+  assert.deepEqual(first[0]!.writes.map(write => write.id), [seriesId(PROJECT, BLOCK, 1), newReview]);
+  assert.equal(first[1]!.writes.length, 1);
+  assert.equal(store.get(newReview), null);
+
+  // One participant moves before the write: nothing at all is applied — not the other series, and not the new record.
+  deliveredOf(escalateSeries(store, { ...at(other), stop: 3, review: { ref: undecided(store, PROJECT, 3, undefined, { block: other }) } }));
+  assert.equal(refusalOf(apply(first)).code, "input_stale");
+  assert.equal(store.get(newReview), null);
+  assert.deepEqual(deliveredOf(readSeries(store, at(BLOCK))).value.escalations, []);
+
+  // Nothing prevented: the review and both series move together.
+  const second = deliveredOf(prepareEscalateSeries(store, {
+    ...at(BLOCK), stop: 3, review: onItsWay(newReview, STOP_REVIEW_KIND, review(PROJECT, 3, undefined, { change: null })),
+  }));
+  const done = deliveredOf(apply([second]));
+  assert.equal(done.length, 2);
+  assert.equal(store.get(newReview)!.revision, 1);
+  const series = deliveredOf(readSeries(store, at(BLOCK)));
+  assert.deepEqual(series.value.escalations, [{ after: 3, review: reference(store.get(newReview)!) }]);
+  assert.equal(series.value.ladder.rung, 2);
+  assert.equal(deliveredOf(readSeries(store, at(other))).value.ladder.rung, 2);
 });
