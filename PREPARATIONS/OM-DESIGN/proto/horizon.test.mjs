@@ -62,7 +62,14 @@ test("вердикт №2 п.1: адреса внешних входов не з
 test("вердикт №2 п.2: доступный результат без принятого раскрытия границей не становится — блок добирается в горизонт ради раскрытия, и каркас не отказывает", () => {
   const root = BLOCKS.find(b => b.outcome === "verified-change").id; const basisOf = id => ({ id: `artifact-receipt:${id}`, revision: 1, hash: "e".repeat(64) });
   const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", basisOf("n-check")]]) });            // refined пуст, принятого слоя нет
-  assert.ok(r.horizon.nodes.includes("n-check")); assert.deepEqual([r.horizon.refinement["n-check"], r.horizon.execution["n-check"]], ["needed", "available"]); assert.deepEqual(r.horizon.boundary, []);
+  assert.ok(r.horizon.nodes.includes("n-check")); assert.deepEqual([r.horizon.refinement["n-check"], r.horizon.execution["n-check"].state], ["needed", "available"]); assert.deepEqual(r.horizon.boundary, []);
   const H = new Set(r.horizon.nodes); assert.doesNotThrow(() => fillObligations(UPPER, frameObligations(UPPER, H), null, [], H, { graph: null, frame: null }), "F4.2 не встречает нераскрытого производителя вне горизонта");
   const both = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), refined: REFINED, available: new Map(BLOCKS.filter(b => b.id !== root).map(b => [b.id, basisOf(b.id)])) });
   assert.deepEqual(both.horizon.nodes, [root]); assert.ok(both.horizon.boundary.length > 0, "граница — только при результате И принятом раскрытии"); });
+
+test("вердикт №3: основание готовности доезжает до результата у блока ВНУТРИ горизонта; смена квитанции — другой хэш горизонта", () => {
+  const ref = (revision, hash) => ({ id: "artifact-receipt:n-check", revision, hash }); const run = b => closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", b]]) });
+  const a = run(ref(1, "a".repeat(64))), b = run(ref(2, "b".repeat(64))); assert.equal(gateHorizon(a).passed, true); assert.deepEqual(a.horizon.nodes, b.horizon.nodes);
+  assert.deepEqual(a.horizon.execution["n-check"], { state: "available", basis: ref(1, "a".repeat(64)) }, "ссылка на квитанцию сохранена точно"); assert.deepEqual(b.horizon.execution["n-check"].basis, ref(2, "b".repeat(64)));
+  assert.notEqual(a.horizon.hash, b.horizon.hash, "другое основание — другой горизонт"); assert.equal(a.horizon.hash, run(ref(1, "a".repeat(64))).horizon.hash, "то же основание — тот же хэш");
+  const other = a.horizon.nodes.find(n => n !== "n-check"); assert.deepEqual(a.horizon.execution[other], { state: "needed" }, "у неисполненного блока основания нет"); });

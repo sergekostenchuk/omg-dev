@@ -30,7 +30,8 @@ export function closeHorizon(upper, { choiceVersion, features, excluded = [], re
       queue.push({ block: p.block, path: [...path, `${p.via}→${p.block}`] }); } }
   // адреса внешних входов — по ОКОНЧАТЕЛЬНОМУ горизонту и всем его привязкам, независимо от порядка обхода и от того, каким путём вошёл источник
   const externalInputs = [...horizon.keys()].flatMap(id => needs(id).filter(p => p.external).map(p => ({ consumer: id, connector: p.via, source: p.block })));
-  const nodes = [...horizon.keys()].sort(); const value = { choiceVersion, features: features.map(f => f.outcome).sort(), nodes, refinement: Object.fromEntries(nodes.map(n => [n, refined.has(n) ? "accepted" : "needed"])), execution: Object.fromEntries(nodes.map(n => [n, available.has(n) ? "available" : "needed"])),
+  const nodes = [...horizon.keys()].sort(); const value = { choiceVersion, features: features.map(f => f.outcome).sort(), nodes, refinement: Object.fromEntries(nodes.map(n => [n, refined.has(n) ? "accepted" : "needed"])), // готовность результата — вместе с ТОЧНЫМ основанием: оно входит в хэш горизонта, смена квитанции — другой горизонт (вердикт №3)
+    execution: Object.fromEntries(nodes.map(n => [n, available.has(n) ? { state: "available", basis: available.get(n) } : { state: "needed" }])),
     boundary: [...boundary].map(([block, basis]) => ({ block, basis })).sort((a, b) => a.block < b.block ? -1 : 1), externalInputs: externalInputs.sort((a, b) => (a.consumer + a.connector < b.consumer + b.connector ? -1 : 1)),
     excluded: [...excluded].map(e => ({ block: e.block, reason: e.reason, returnCondition: e.returnCondition })).sort((a, b) => a.block < b.block ? -1 : 1) };
   return { horizon: { ...value, hash: hashJson(value) }, conflicts, refusals };
