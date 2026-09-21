@@ -1,0 +1,334 @@
+{
+ "source": "PREPARATIONS/OMG-MAP-SCHEME/omg-map-scheme.html (атрибуты data-anchor)",
+ "rule": "идти по order сверху вниз; обзор стадии пишется после всех её блоков",
+ "order": [
+  {
+   "block": "1.1",
+   "kind": "блок",
+   "name": "Черновик стадии: три вопроса из контракта",
+   "anchor": "ШАГ 1.1 · Черновик стадии: три вопроса из контракта",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.1-Черновик-стадии-три-вопроса-из-контракта.md"
+  },
+  {
+   "block": "1.2",
+   "kind": "блок",
+   "name": "Исследование стадии: цикл «пакет → действие модели → запись хода»",
+   "anchor": "ШАГ 1.2 · Исследование стадии: цикл «пакет → действие модели → запись хода»",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.2-Исследование-стадии-цикл-пакет-действие-модели-з.md"
+  },
+  {
+   "block": "1.3",
+   "kind": "блок",
+   "name": "Оценка ответа независимым ревьюером",
+   "anchor": "ШАГ 1.3 · Оценка ответа независимым ревьюером",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.3-Оценка-ответа-независимым-ревьюером.md"
+  },
+  {
+   "block": "1.4",
+   "kind": "блок",
+   "name": "Сборка графа L1 и проверка структуры",
+   "anchor": "ШАГ 1.4 · Сборка графа L1 и проверка структуры",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.4-Сборка-графа-L1-и-проверка-структуры.md"
+  },
+  {
+   "block": "1.5",
+   "kind": "блок",
+   "name": "Приёмка стадии оператором",
+   "anchor": "ШАГ 1.5 · Приёмка стадии оператором",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.5-При-мка-стадии-оператором.md"
+  },
+  {
+   "block": "1.6",
+   "kind": "блок",
+   "name": "Вход в обогащение карты: R0 и печать слоя L1",
+   "anchor": "ШАГ 1.6 · Вход в обогащение карты: R0 и печать слоя L1",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1.6-Вход-в-обогащение-карты-R0-и-печать-слоя-L1.md"
+  },
+  {
+   "block": "1",
+   "kind": "обзор стадии",
+   "name": "Вход в операционную карту",
+   "anchor": "Блок 1",
+   "stage": "Вход в карту (стадия operation-map, R0/L1)",
+   "file": "1-Вход-в-операционную-карту.md"
+  },
+  {
+   "block": "2.0",
+   "kind": "блок",
+   "name": "общий механизм",
+   "anchor": "Блок 2 · 2.0 общий механизм",
+   "stage": "Исследование R1",
+   "file": "2.0-общий-механизм.md"
+  },
+  {
+   "block": "2.1",
+   "kind": "блок",
+   "name": "R1 · productDomain",
+   "anchor": "Блок 2.1 · R1 · productDomain",
+   "stage": "Исследование R1",
+   "file": "2.1-R1-productDomain.md"
+  },
+  {
+   "block": "2.2",
+   "kind": "блок",
+   "name": "R1 · actorsAndChannels",
+   "anchor": "Блок 2.2 · R1 · actorsAndChannels",
+   "stage": "Исследование R1",
+   "file": "2.2-R1-actorsAndChannels.md"
+  },
+  {
+   "block": "2.3",
+   "kind": "блок",
+   "name": "R1 · runtime",
+   "anchor": "Блок 2.3 · R1 · runtime",
+   "stage": "Исследование R1",
+   "file": "2.3-R1-runtime.md"
+  },
+  {
+   "block": "2.4",
+   "kind": "блок",
+   "name": "R1 · persistence",
+   "anchor": "Блок 2.4 · R1 · persistence",
+   "stage": "Исследование R1",
+   "file": "2.4-R1-persistence.md"
+  },
+  {
+   "block": "2.5",
+   "kind": "блок",
+   "name": "R1 · authority",
+   "anchor": "Блок 2.5 · R1 · authority",
+   "stage": "Исследование R1",
+   "file": "2.5-R1-authority.md"
+  },
+  {
+   "block": "2.6",
+   "kind": "блок",
+   "name": "R1 · integrations",
+   "anchor": "Блок 2.6 · R1 · integrations",
+   "stage": "Исследование R1",
+   "file": "2.6-R1-integrations.md"
+  },
+  {
+   "block": "2.7",
+   "kind": "блок",
+   "name": "R1 · recovery",
+   "anchor": "Блок 2.7 · R1 · recovery",
+   "stage": "Исследование R1",
+   "file": "2.7-R1-recovery.md"
+  },
+  {
+   "block": "2.8",
+   "kind": "блок",
+   "name": "R1 · delivery",
+   "anchor": "Блок 2.8 · R1 · delivery",
+   "stage": "Исследование R1",
+   "file": "2.8-R1-delivery.md"
+  },
+  {
+   "block": "2.9",
+   "kind": "блок",
+   "name": "R1 · evidenceAndTests",
+   "anchor": "Блок 2.9 · R1 · evidenceAndTests",
+   "stage": "Исследование R1",
+   "file": "2.9-R1-evidenceAndTests.md"
+  },
+  {
+   "block": "2",
+   "kind": "обзор стадии",
+   "name": "Исследование R1: общий механизм",
+   "anchor": "Блок 2",
+   "stage": "Исследование R1",
+   "file": "2-Исследование-R1-общий-механизм.md"
+  },
+  {
+   "block": "3.1",
+   "kind": "блок",
+   "name": "Проектный вызов и печать слоя",
+   "anchor": "ШАГ 3.1 · Проектный вызов и печать слоя",
+   "stage": "Слой L2",
+   "file": "3.1-Проектный-вызов-и-печать-слоя.md"
+  },
+  {
+   "block": "3",
+   "kind": "обзор стадии",
+   "name": "слой L2",
+   "anchor": "Блок 3 · слой L2",
+   "stage": "Слой L2",
+   "file": "3-слой-L2.md"
+  },
+  {
+   "block": "4.0",
+   "kind": "блок",
+   "name": "отличия R2",
+   "anchor": "Блок 4 · 4.0 отличия R2",
+   "stage": "Исследование R2",
+   "file": "4.0-отличия-R2.md"
+  },
+  {
+   "block": "4.1",
+   "kind": "блок",
+   "name": "R2 · contractsAndConsumers",
+   "anchor": "Блок 4.1 · R2 · contractsAndConsumers",
+   "stage": "Исследование R2",
+   "file": "4.1-R2-contractsAndConsumers.md"
+  },
+  {
+   "block": "4.2",
+   "kind": "блок",
+   "name": "R2 · authorityPaths",
+   "anchor": "Блок 4.2 · R2 · authorityPaths",
+   "stage": "Исследование R2",
+   "file": "4.2-R2-authorityPaths.md"
+  },
+  {
+   "block": "4.3",
+   "kind": "блок",
+   "name": "R2 · stateAndRecovery",
+   "anchor": "Блок 4.3 · R2 · stateAndRecovery",
+   "stage": "Исследование R2",
+   "file": "4.3-R2-stateAndRecovery.md"
+  },
+  {
+   "block": "4.4",
+   "kind": "блок",
+   "name": "R2 · connectivityAndProof",
+   "anchor": "Блок 4.4 · R2 · connectivityAndProof",
+   "stage": "Исследование R2",
+   "file": "4.4-R2-connectivityAndProof.md"
+  },
+  {
+   "block": "4.5",
+   "kind": "блок",
+   "name": "R2 · gap_e1adf1b878b3cde4d6140b33",
+   "anchor": "Блок 4.5 · R2 · gap_e1adf1b878b3cde4d6140b33",
+   "stage": "Исследование R2",
+   "file": "4.5-R2-gap_e1adf1b878b3cde4d6140b33.md"
+  },
+  {
+   "block": "4.6",
+   "kind": "блок",
+   "name": "R2 · gap_0b349c0a90f168c6bdf4be76",
+   "anchor": "Блок 4.6 · R2 · gap_0b349c0a90f168c6bdf4be76",
+   "stage": "Исследование R2",
+   "file": "4.6-R2-gap_0b349c0a90f168c6bdf4be76.md"
+  },
+  {
+   "block": "4.7",
+   "kind": "блок",
+   "name": "R2 · gap_6c6887e7d1bb86c1daf6aabf",
+   "anchor": "Блок 4.7 · R2 · gap_6c6887e7d1bb86c1daf6aabf",
+   "stage": "Исследование R2",
+   "file": "4.7-R2-gap_6c6887e7d1bb86c1daf6aabf.md"
+  },
+  {
+   "block": "4.8",
+   "kind": "блок",
+   "name": "R2 · gap_8a6a7c304fc66d63fbae557b",
+   "anchor": "Блок 4.8 · R2 · gap_8a6a7c304fc66d63fbae557b",
+   "stage": "Исследование R2",
+   "file": "4.8-R2-gap_8a6a7c304fc66d63fbae557b.md"
+  },
+  {
+   "block": "4.9",
+   "kind": "блок",
+   "name": "R2 · gap_61d88b5a8e29806257cef44a",
+   "anchor": "Блок 4.9 · R2 · gap_61d88b5a8e29806257cef44a",
+   "stage": "Исследование R2",
+   "file": "4.9-R2-gap_61d88b5a8e29806257cef44a.md"
+  },
+  {
+   "block": "4.10",
+   "kind": "блок",
+   "name": "R2 · gap_3b7075c17c79bea02f7cd2df",
+   "anchor": "Блок 4.10 · R2 · gap_3b7075c17c79bea02f7cd2df",
+   "stage": "Исследование R2",
+   "file": "4.10-R2-gap_3b7075c17c79bea02f7cd2df.md"
+  },
+  {
+   "block": "4.11",
+   "kind": "блок",
+   "name": "R2 · gap_c2483d91f640e5e0b8071f6a",
+   "anchor": "Блок 4.11 · R2 · gap_c2483d91f640e5e0b8071f6a",
+   "stage": "Исследование R2",
+   "file": "4.11-R2-gap_c2483d91f640e5e0b8071f6a.md"
+  },
+  {
+   "block": "4.12",
+   "kind": "блок",
+   "name": "R2 · gap_5ab27dd62003d8d60429e077",
+   "anchor": "Блок 4.12 · R2 · gap_5ab27dd62003d8d60429e077",
+   "stage": "Исследование R2",
+   "file": "4.12-R2-gap_5ab27dd62003d8d60429e077.md"
+  },
+  {
+   "block": "4.13",
+   "kind": "блок",
+   "name": "R2 · gap_e25b108b1d63eaf9812ec85e",
+   "anchor": "Блок 4.13 · R2 · gap_e25b108b1d63eaf9812ec85e",
+   "stage": "Исследование R2",
+   "file": "4.13-R2-gap_e25b108b1d63eaf9812ec85e.md"
+  },
+  {
+   "block": "4",
+   "kind": "обзор стадии",
+   "name": "Исследование R2: отличия",
+   "anchor": "Блок 4",
+   "stage": "Исследование R2",
+   "file": "4-Исследование-R2-отличия.md"
+  },
+  {
+   "block": "5",
+   "kind": "блок",
+   "name": "слой L3",
+   "anchor": "Блок 5 · слой L3",
+   "stage": "Слой L3",
+   "file": "5-слой-L3.md"
+  },
+  {
+   "block": "6.1",
+   "kind": "блок",
+   "name": "проверка R3",
+   "anchor": "Блок 6 · 6.1 проверка R3",
+   "stage": "R3 и компилятор",
+   "file": "6.1-проверка-R3.md"
+  },
+  {
+   "block": "6.2",
+   "kind": "блок",
+   "name": "публикация om-g2",
+   "anchor": "Блок 6 · 6.2 публикация om-g2",
+   "stage": "R3 и компилятор",
+   "file": "6.2-публикация-om-g2.md"
+  },
+  {
+   "block": "6.3",
+   "kind": "блок",
+   "name": "компилятор",
+   "anchor": "Блок 6 · 6.3 компилятор",
+   "stage": "R3 и компилятор",
+   "file": "6.3-компилятор.md"
+  },
+  {
+   "block": "6.4",
+   "kind": "блок",
+   "name": "принятие плана",
+   "anchor": "Блок 6 · 6.4 принятие плана",
+   "stage": "R3 и компилятор",
+   "file": "6.4-принятие-плана.md"
+  },
+  {
+   "block": "6",
+   "kind": "обзор стадии",
+   "name": "R3 и компилятор",
+   "anchor": "Блок 6 · R3 и компилятор",
+   "stage": "R3 и компилятор",
+   "file": "6-R3-и-компилятор.md"
+  }
+ ]
+}

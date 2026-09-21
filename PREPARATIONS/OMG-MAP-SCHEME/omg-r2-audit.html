@@ -1,0 +1,221 @@
+<title>Аудит фазы R2 OMG</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F5F7F8; --surface:#FFFFFF; --ink:#16232B; --muted:#5B6B75; --rule:#D6DEE2;
+  --accent:#0F6E6A; --accent-soft:#E3F0EF; --crit:#B23A2A; --crit-soft:#F7E8E5; --warn:#B8770F; --warn-soft:#F8EFDD; --ok:#2E7D4F; --ok-soft:#E4F1E9;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0F1618; --surface:#172023; --ink:#E6ECEE; --muted:#9AAAB2; --rule:#2A363B;
+    --accent:#4FB3AD; --accent-soft:#183131; --crit:#E0705F; --crit-soft:#3A2220; --warn:#E0A54A; --warn-soft:#3A2E17; --ok:#62B98A; --ok-soft:#1B3325;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0F1618; --surface:#172023; --ink:#E6ECEE; --muted:#9AAAB2; --rule:#2A363B;
+  --accent:#4FB3AD; --accent-soft:#183131; --crit:#E0705F; --crit-soft:#3A2220; --warn:#E0A54A; --warn-soft:#3A2E17; --ok:#62B98A; --ok-soft:#1B3325;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.page{max-width:980px;margin:0 auto;padding:40px 24px 80px}
+header{display:grid;gap:10px;padding-bottom:22px;border-bottom:2px solid var(--ink);margin-bottom:26px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--serif);font-weight:600;font-size:34px;line-height:1.15;margin:0;text-wrap:balance}
+.lede{color:var(--muted);max-width:68ch;margin:0}
+.verdict{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 34px}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;display:grid;gap:6px;align-content:start}
+.card .k{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.card .v{font-family:var(--serif);font-size:19px;line-height:1.25;font-weight:600}
+.card .s{font-size:13.5px;color:var(--muted)}
+.card.crit{border-color:var(--crit);border-top-width:4px}
+.card.warn{border-color:var(--warn);border-top-width:4px}
+.card.accent{border-color:var(--accent);border-top-width:4px}
+section{margin:0 0 40px}
+h2{font-family:var(--serif);font-weight:600;font-size:24px;line-height:1.2;margin:0 0 6px;text-wrap:balance}
+h3{font-family:var(--sans);font-weight:600;font-size:16.5px;margin:22px 0 6px}
+.sub{color:var(--muted);margin:0 0 14px;max-width:70ch}
+p{max-width:70ch;margin:0 0 12px}
+ul,ol{max-width:70ch;padding-left:22px;margin:0 0 12px}
+li{margin:0 0 6px}
+code,.mono{font-family:var(--mono);font-size:13px}
+code{background:var(--accent-soft);padding:1px 5px;border-radius:3px;color:var(--ink)}
+.ev{border-left:3px solid var(--accent);background:var(--surface);padding:10px 14px;margin:10px 0 16px;max-width:76ch;font-size:14px}
+.ev .t{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:6px}
+.ev ul{margin:0;padding-left:18px}
+.ev li{margin:0 0 4px}
+.finding{border:1px solid var(--rule);border-radius:6px;background:var(--surface);padding:18px 20px;margin:0 0 18px}
+.finding .rank{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-family:var(--mono);font-size:11.5px;letter-spacing:.04em}
+.pill.crit{background:var(--crit-soft);color:var(--crit)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.accent{background:var(--accent-soft);color:var(--accent)}
+.finding h3{margin-top:0;font-family:var(--serif);font-size:19px}
+.tablewrap{overflow-x:auto;margin:10px 0 18px;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:8px 12px;border-bottom:1px solid var(--rule);text-align:left;vertical-align:top}
+th{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;background:var(--bg)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:13px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+.gauge{display:grid;gap:6px;margin:8px 0 16px;max-width:70ch}
+.gauge .bar{height:12px;border-radius:3px;background:var(--rule);position:relative;overflow:hidden}
+.gauge .bar i{position:absolute;left:0;top:0;bottom:0;background:var(--accent)}
+.gauge .bar i.crit{background:var(--crit)}
+.gauge .lbl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0 16px}
+.flow .st{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:10px 12px;font-size:13.5px}
+.flow .st b{display:block;font-family:var(--mono);font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
+.flow .st .c{color:var(--muted);font-size:12.5px}
+.cmp td:first-child{font-weight:500}
+footer{border-top:1px solid var(--rule);padding-top:14px;color:var(--muted);font-size:13px;max-width:76ch}
+@media (max-width:720px){.verdict{grid-template-columns:1fr}h1{font-size:28px}}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="page">
+<header>
+  <div class="eyebrow">OMG · om-g2 · независимый аудит · 07.09.2026 01:10</div>
+  <h1>Аудит фазы R2: что должно получиться и получается ли это текущим кодом</h1>
+  <p class="lede">Проверка от задачи, а не от кода. Все факты взяты из живой базы <span class="mono">.omg/state.sqlite</span> (копия только для чтения), журнала вызовов модели и кода на коммите <span class="mono">d88b89c</span>. Строки кода указаны там, где утверждение можно проверить самому.</p>
+</header>
+
+<div class="verdict">
+  <div class="card accent"><div class="k">Задача прогона</div><div class="v">Принятый машинный план и остановка</div><div class="s">Ближайший результат: файловые проекции стадий и исследований рядом с SQLite, восстановление из канона без модели.</div></div>
+  <div class="card crit"><div class="k">Достигается ли текущим кодом</div><div class="v">Нет</div><div class="s">Контракт приёмки ответа R2 в этом прогоне невыполним для неизвестного, которое нельзя прочитать из репозитория. Токены после хода 16 ушли на невыполнимый контракт.</div></div>
+  <div class="card warn"><div class="k">Бюджет</div><div class="v">10,70 млн из 15 млн</div><div class="s">R2: принято 0 из 13 вопросов, первый вопрос 1,54 млн и на паузе. На 12 вопросов, L3 и R3 остаётся 4,30 млн.</div></div>
+</div>
+
+<section>
+  <h2>1. Что должно быть получено</h2>
+  <p class="sub">Формула владельца и ближайший результат, как они записаны в источниках прогона.</p>
+  <p>Формула из поручения владельца (источник <span class="mono">owner-request</span>): идея → discovery → концепция → операционная карта → ТЗ → подготовка фич → уточнение той же карты на R0–R3/L1–L3 → машинный план атомарных задач → выполнение с проверкой, ревью и коммитами. Решение владельца от 06.09: этот прогон доказательный, доходит до принятого машинного плана и останавливается без исполнения задач.</p>
+  <p>Ближайший результат, под который выбрана область исследования (<span class="mono">research-scope.outcome</span>, источник <span class="mono">owner-automatic-file-projections</span>): «Оператор автоматически получает читаемые файлы сохранённых стадий и исследований рядом с SQLite; после сбоя они восстанавливаются из канона без модели». Одна небольшая доработка, по словам владельца.</p>
+  <p>Машинный план строит компилятор из графа уровня L3: узлы горизонта, ссылки на код, тесты, границы, артефакты и контракты (<span class="mono">src/compiler/derive.ts:15–66</span>). Ему нужны непустой горизонт (<span class="mono">derive.ts:16</span>) и свежая проверка выполнимости R3 (<span class="mono">compiler.ts:29</span>).</p>
+</section>
+
+<section>
+  <h2>2. Как код идёт к этому</h2>
+  <p class="sub">Путь от открытого вопроса R2 до машинного плана, с местами, где платятся вызовы модели.</p>
+  <div class="flow">
+    <div class="st"><b>R2</b>4 базовых вопроса + gap-группы из активных обязательств области: 13 вопросов, 33 обязательства.<div class="c">research-scope.ts:67–70</div></div>
+    <div class="st"><b>вопрос</b>планирование → чтения (до 16) → сборка страницами → ответ → проверка → оценщик → принят.<div class="c">research-runner.ts:72–237</div></div>
+    <div class="st"><b>R2 завершён</b>все вопросы черновика приняты, набор побайтно равен пересчитанному сейчас.<div class="c">refinement.ts:96–106</div></div>
+    <div class="st"><b>L3</b>одним черновиком модель пишет граф до L3 и выбирает горизонт.<div class="c">refinement.ts:123, 132–143</div></div>
+    <div class="st"><b>R3 → план</b>проверка репозитория, компилятор читает граф.<div class="c">compiler.ts:29, derive.ts</div></div>
+  </div>
+  <p><strong>Что из R2 идёт дальше.</strong> Компилятор результат R2 не читает: в <span class="mono">src/compiler</span> нет ни одного обращения к отчётам исследования, только к графу. Факты и решения R2 попадают в контекст модели на L3 как текст (<span class="mono">research-context.ts:50–56</span>), пробелы переносятся как открытые (<span class="mono">research-context.ts:46–47</span>). То есть продукт R2 в этом прогоне: текст, который прочитает один вызов модели на L3, и список пробелов.</p>
+  <p><strong>Откуда 33 обязательства.</strong> Принятые ответы R1 содержат 42 пробела; из них построена область с 34 обязательствами, из которых 33 активны и разложены по 9 gap-вопросам (по 1–7 на вопрос). Базовые 4 вопроса обязательств не несут, но обязаны не оставить ни одного неотложенного пробела.</p>
+</section>
+
+<section>
+  <h2>3. Соответствует ли код задаче</h2>
+  <p class="sub">Четыре расхождения, по весу. Первое делает фазу недостижимой независимо от бюджета и от исправлений упаковщика.</p>
+
+  <div class="finding">
+    <div class="rank"><span class="pill crit">расхождение 1</span> контракт приёмки невыполним в этом прогоне</div>
+    <h3>Модели велено записывать неизвестное как пробел, а валидатор на R2 отвергает любой пробел</h3>
+    <p>Правило: на уровне R2 пробел проходит, только если он отложен областью или структурой графа (<span class="mono">research-evidence.ts:62</span>). Область откладывает только точную копию уже отложенного обязательства, а отложено одно, про интерфейс (<span class="mono">research-scope.ts:72–75</span>; в базе <span class="mono">actors-g5</span>). Структурное отложение требует непустого горизонта, якорей и тестов пробуждения (<span class="mono">research-contracts.ts:19–29</span>); в живом графе горизонт пуст, якорей 0, тестов пробуждения 0, поэтому оно всегда ложно. Итог: в этом прогоне любой пробел, кроме копии одного про интерфейс, отвергается.</p>
+    <p>При этом промпт каждого вопроса R2 заканчивается словами «Неизвестное сохрани адресным gap; неприменимость обоснуй» (<span class="mono">research-contracts.ts:36</span>), а для gap-вопросов ответ «неприменимо» запрещён отдельно (<span class="mono">evidence.ts:31</span>). Текст отказа, который получает модель, это её собственный текст пробела (<span class="mono">evidence.ts:62</span>): правило не названо, допустимая форма не подсказана.</p>
+    <div class="ev"><div class="t">Журнал первого вопроса, contractsAndConsumers</div><ul>
+      <li>Ходы 2–14: план, шесть адресных чтений, три пакета файлов репозитория (<span class="mono">cli.ts, server.ts, engine.ts, commands.ts, store.ts, schema.ts, snapshots.ts, contracts.ts, pipeline.ts, discovery.ts, research-runner.ts</span>). Модель читала то, что нужно.</li>
+      <li>Ход 15: ответ с 14 фактами, 9 решениями, 11 пробелами, 20 цитатами. Отвергнуты все 14 фактов: путь записан как «src/cli.ts: main», промпт просит «точные пути/символы», валидатор требует путь файла (<span class="mono">evidence.ts:47–51</span>).</li>
+      <li>Ход 16: 17 фактов приняты. Отвергнуты все 13 пробелов, все с requiredFor=next.</li>
+      <li>Ход 17: те же пробелы, 12 отвергнуты. Ход 18: модель просит новое исследование. Дальше чтения, пауза по бюджету на 1 088 098; после возобновления петля адресных запросов и пауза на 1 542 356.</li>
+    </ul></div>
+    <p><strong>Почему это тупик, а не ошибка модели.</strong> Источники прогона: 72 файла копии репозитория и 8 документов владельца. Результатов запусков, версии Codex, сведений об ОС и содержимого живой базы среди них нет. Из 33 обязательств 9 требуют именно этого (<span class="mono">delivery-g2, delivery-g6, g-live-results, g-recovery-live-evidence, g-recovery-concurrent-execution, g-general-resume-test, actors-g3, actors-g4, runtime-g2</span>), одно требует живой базы (<span class="mono">delivery-g3</span>). У модели три выхода: выдумать; записать пробел и получить отказ; оформить неизвестное как проектное допущение, что валидатор пропустит, но промпт запрещает и отказ не подсказывает. Модель выбирала честный второй.</p>
+  </div>
+
+  <div class="finding">
+    <div class="rank"><span class="pill crit">расхождение 2</span> порядок: горизонт выбирается после исследования, которое он должен ограничивать</div>
+    <h3>R2 обязан закрыть всю область, не зная, что именно будет строиться</h3>
+    <p>Горизонт появляется только на L3 (<span class="mono">refinement.ts:123</span>: пустой горизонт запрещён лишь для уровня 3). R2 идёт раньше и должен закрыть все активные обязательства области из 6 узлов и 5 границ. Для результата «проекции файлов рядом с базой» область породила 33 обязательства про потерю питания, миграции схем, два конкурентных исполнителя, изоляцию Codex, матрицу платформ. Код знает о связи горизонта и обязательств, но применяет её после: принятый R2 аннулируется, если новый горизонт потребовал незакрытый пробел (<span class="mono">refinement.ts:175–178</span>). Фильтра «нужно ли это для ближайшего результата» до R2 нет.</p>
+  </div>
+
+  <div class="finding">
+    <div class="rank"><span class="pill warn">расхождение 3</span> бюджет не сходится при любом коде</div>
+    <h3>На 12 вопросов, L3 и R3 остаётся 4,30 млн при цене вопроса от 0,32 до 1,93 млн</h3>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Вопрос</th><th class="num">Вызовов</th><th class="num">Токенов</th><th>Статус</th></tr></thead>
+      <tbody>
+        <tr><td>R1 recovery</td><td class="num">36</td><td class="num">1 927 758</td><td>принят</td></tr>
+        <tr><td>R1 integrations</td><td class="num">31</td><td class="num">1 732 599</td><td>принят</td></tr>
+        <tr><td>R1 evidenceAndTests</td><td class="num">24</td><td class="num">1 119 011</td><td>принят</td></tr>
+        <tr><td>R1 actorsAndChannels</td><td class="num">20</td><td class="num">1 007 096</td><td>принят</td></tr>
+        <tr><td>R1 authority</td><td class="num">18</td><td class="num">906 153</td><td>принят</td></tr>
+        <tr><td>R1 persistence</td><td class="num">12</td><td class="num">646 015</td><td>принят</td></tr>
+        <tr><td>R1 productDomain</td><td class="num">10</td><td class="num">522 920</td><td>принят</td></tr>
+        <tr><td>R1 runtime</td><td class="num">7</td><td class="num">493 482</td><td>принят</td></tr>
+        <tr><td>L2 layerDesign</td><td class="num">8</td><td class="num">487 449</td><td>принят</td></tr>
+        <tr><td>R1 delivery</td><td class="num">8</td><td class="num">319 802</td><td>принят</td></tr>
+        <tr><td><strong>R2 contractsAndConsumers</strong></td><td class="num">28</td><td class="num">1 542 356</td><td><span class="pill crit">не принят, пауза</span></td></tr>
+      </tbody>
+    </table></div>
+    <div class="gauge">
+      <div class="lbl"><span>Израсходовано всего</span><span>10 704 641 из 15 000 000</span></div>
+      <div class="bar"><i style="width:71.4%"></i></div>
+      <div class="lbl"><span>Остаток на 12 вопросов R2 + L3 + R3</span><span>4 295 359</span></div>
+      <div class="lbl"><span>12 вопросов по медиане R1 (776 тыс.)</span><span>≈ 9,3 млн</span></div>
+      <div class="bar"><i class="crit" style="width:100%"></i></div>
+    </div>
+    <p>Даже если каждый оставшийся вопрос стоил бы 350 тысяч, что вдвое дешевле самого дешёвого вопроса R1, на 12 вопросов ушло бы 4,2 млн и на L3 с R3 не осталось бы ничего. Прогноз «четыре конверта до ответа» из сухого прогона был свойством фикстуры, отвечавшей по признаку дочитанной страницы, а не прогнозом.</p>
+  </div>
+
+  <div class="finding">
+    <div class="rank"><span class="pill warn">расхождение 4</span> управление вызовами внутри одного хода</div>
+    <h3>Внутренние циклы сборки и оценки не ограничены ничем, кроме бюджета</h3>
+    <ul>
+      <li>Лимит ходов прогона считает ходы, а не вызовы: сборка и оценка крутятся внутри одного хода бесконечным циклом (<span class="mono">synthesis-session.ts:57, assessment-session.ts:26</span>).</li>
+      <li>В сборке адресный запрос контекста не проверяется вовсе (<span class="mono">synthesis-session.ts:97–99</span>); у оценщика проверка только с предыдущим запросом (<span class="mono">assessment-session.ts:42</span>), чередование двух адресов проходит. Сегодня: 12 вызовов, 417 тысяч токенов за 3 минуты.</li>
+      <li>В пакете продолжения схема ответа и обязательства не повторяются, есть только адрес схемы (<span class="mono">working-context.ts:79–80</span>); модель без памяти между вызовами вынуждена дозапрашивать, и каждый дозапрос это полный вызов.</li>
+      <li>Восстановление из сохранённых точек: если данных не хватает, запрос нового исследования запрещён и останавливает весь прогон (<span class="mono">synthesis-session.ts:101</span>, вне блока повтора). Повторный запуск воссоздаёт ту же сессию. Выхода изнутри нет.</li>
+      <li>Сухие проверки отвечали по признаку «страница дочитана», поэтому 200 зелёных тестов ничего не сказали о достаточности пакета.</li>
+    </ul>
+    <p>Эти дефекты удваивают и утраивают цену вопроса, но не они делают фазу недостижимой. Их исправление без первых двух расхождений приведёт следующий вопрос к той же стене примерно на миллионе токенов.</p>
+  </div>
+</section>
+
+<section>
+  <h2>4. Что работает</h2>
+  <ul>
+    <li>Ограничители без автоподъёма: вопрос остановлен на 1 542 356 при пределе 1 600 000, следующий резерв не влез, общий участок не тронут.</li>
+    <li>Модель читала нужные файлы и на ходе 16 дала 17 принятых фактов с верными путями.</li>
+    <li>Пакеты продолжения держатся в 75–78 тысяч знаков при потолке 100 тысяч, постоянная часть не повторяется.</li>
+    <li>Исправление засчёта доставки после сбоя проверено независимо и закоммичено.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>5. Что нужно, чтобы код соответствовал задаче</h2>
+  <p class="sub">По убыванию веса. Это моё мнение для владельца, не указание исполнителю.</p>
+  <ol>
+    <li><strong>Горизонт до R2, область равна горизонту.</strong> Обязательства фильтровать по вопросу «блокирует ли это ближайший результат». Для проекций файлов из 33 останутся единицы: точка вызова после записи, границы каталога, восстановление из канона.</li>
+    <li><strong>Честная форма для неизвестного.</strong> На R2 неизвестное, которое нельзя прочитать, записывается либо как явное проектное допущение с потребителем, либо как отложенный пробел с условием пробуждения. Отказ валидатора называет правило и допустимую форму. Формат пути без символа зафиксировать в промпте.</li>
+    <li><strong>Источники для фактов исполнения.</strong> Результаты тестов и проба среды регистрируются как источники, либо обязательства, требующие их, снимаются с R2 и уходят в задачи плана.</li>
+    <li><strong>Контроль продвижения перед каждым платным вызовом.</strong> Множество выданных адресов на сессию, идентичность по содержимому, потолок запросов без сдвига курсора, схема ответа в каждом продолжении, выход из режима восстановления при нехватке данных.</li>
+    <li><strong>Бюджетное решение владельца.</strong> С остатком 4,3 млн R2 в нынешнем составе не закончить. Либо узкий R2 по горизонту, либо новый лимит с прогнозом по фактическим ценам, а не по фикстурам.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>6. Сравнение с аудитом Codex</h2>
+  <p class="sub">По его записям 43–44 в канале и сообщениям в чате на 00:53. Его аудит ещё идёт, сравнение уточнится, когда он закончит.</p>
+  <div class="tablewrap"><table class="cmp">
+    <thead><tr><th>Находка</th><th>Мой аудит</th><th>Аудит Codex</th></tr></thead>
+    <tbody>
+      <tr><td>Контракт приёмки невыполним для непрочитываемого неизвестного</td><td><span class="pill crit">главное</span></td><td>не названо</td></tr>
+      <tr><td>Горизонт после R2, обязательства без фильтра по результату</td><td><span class="pill crit">главное</span></td><td>не названо</td></tr>
+      <tr><td>Бюджет не сходится при любом коде</td><td><span class="pill warn">есть</span></td><td>не названо</td></tr>
+      <tr><td>Результат R2 компилятор не читает, это текст для L3</td><td><span class="pill accent">есть</span></td><td>не названо</td></tr>
+      <tr><td>Петля адресных запросов, один слот контекста, счётчик внутренних вызовов</td><td><span class="pill warn">есть</span></td><td><span class="pill ok">есть</span>, глубже: идентичность по содержимому</td></tr>
+      <tr><td>Восстановление уводит в журнал старых чтений</td><td><span class="pill warn">есть</span></td><td><span class="pill ok">есть</span></td></tr>
+      <tr><td>Фикстуры не доказывали достаточность пакета</td><td><span class="pill warn">есть</span></td><td><span class="pill ok">есть</span>, признал сам</td></tr>
+    </tbody>
+  </table></div>
+  <p>Его разбор точен по механике упаковки и петель и идёт глубже моего в идентичности чтений. Но он смотрит на R2 как на задачу управления вызовами. Если починить только это, следующий вопрос упрётся в тот же контракт приёмки и тот же бюджет.</p>
+</section>
+
+<footer>Основания: копии живой базы 00:41 и 00:55, журнал 202 вызовов модели, коммит d88b89c, два независимых чтения кода по определению задачи и по пути исполнения. Копия отчёта: ~/REPORTS/OMG-R2-AUDIT_070926-0110.md.</footer>
+</div>

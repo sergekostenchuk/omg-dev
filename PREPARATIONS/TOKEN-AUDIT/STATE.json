@@ -1,0 +1,339 @@
+{
+ "blocks": {
+  "1.1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.1.verdict.md",
+   "record": "1.1-Черновик-стадии-три-вопроса-из-контракта.md",
+   "updated": "2026-09-07T03:47:54+03:00"
+  },
+  "1.2": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.2.verdict.md",
+   "record": "1.2-Исследование-стадии-цикл-пакет-действие-модели-з.md",
+   "updated": "2026-09-07T03:57:58+03:00"
+  },
+  "1.3": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.3.verdict.md",
+   "record": "1.3-Оценка-ответа-независимым-ревьюером.md",
+   "updated": "2026-09-07T04:15:30+03:00"
+  },
+  "1.4": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.4.verdict.md",
+   "record": "1.4-Сборка-графа-L1-и-проверка-структуры.md",
+   "updated": "2026-09-07T04:22:50+03:00"
+  },
+  "1.5": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.5.verdict.md",
+   "record": "1.5-При-мка-стадии-оператором.md",
+   "updated": "2026-09-07T04:30:32+03:00"
+  },
+  "1.6": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.6.verdict.md",
+   "record": "1.6-Вход-в-обогащение-карты-R0-и-печать-слоя-L1.md",
+   "updated": "2026-09-07T04:38:35+03:00"
+  },
+  "1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "1.verdict.md",
+   "record": "1-Вход-в-операционную-карту.md",
+   "updated": "2026-09-07T04:53:42+03:00",
+   "kind": "обзор стадии"
+  },
+  "2.0": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.0.verdict.md",
+   "record": "2.0-общий-механизм.md",
+   "updated": "2026-09-07T05:22:27+03:00"
+  },
+  "2.1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.1.verdict.md",
+   "record": "2.1-R1-productDomain.md",
+   "updated": "2026-09-07T05:37:30+03:00"
+  },
+  "2.2": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.2.verdict.md",
+   "record": "2.2-R1-actorsAndChannels.md",
+   "updated": "2026-09-07T05:55:16+03:00"
+  },
+  "2.3": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.3.verdict.md",
+   "record": "2.3-R1-runtime.md",
+   "updated": "2026-09-07T06:09:33+03:00"
+  },
+  "2.4": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.4.verdict.md",
+   "record": "2.4-R1-persistence.md",
+   "updated": "2026-09-07T06:24:33+03:00"
+  },
+  "2.5": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.5.verdict.md",
+   "record": "2.5-R1-authority.md",
+   "updated": "2026-09-07T06:39:09+03:00"
+  },
+  "2.6": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.6.verdict.md",
+   "record": "2.6-R1-integrations.md",
+   "updated": "2026-09-07T07:17:38+03:00"
+  },
+  "2.7": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.7.verdict.md",
+   "record": "2.7-R1-recovery.md",
+   "updated": "2026-09-07T07:33:32+03:00"
+  },
+  "2.8": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.8.verdict.md",
+   "record": "2.8-R1-delivery.md",
+   "updated": "2026-09-07T07:43:51+03:00"
+  },
+  "2.9": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.9.verdict.md",
+   "record": "2.9-R1-evidenceAndTests.md",
+   "updated": "2026-09-07T07:58:53+03:00"
+  },
+  "2": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "2.verdict.md",
+   "record": "2-Исследование-R1-общий-механизм.md",
+   "updated": "2026-09-07T08:10:12+03:00"
+  },
+  "3.1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "3.1.verdict.md",
+   "record": "3.1-Проектный-вызов-и-печать-слоя.md",
+   "updated": "2026-09-07T08:26:45+03:00"
+  },
+  "3": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "3.verdict.md",
+   "record": "3-слой-L2.md",
+   "updated": "2026-09-07T08:30:27+03:00"
+  },
+  "4.0": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.0.verdict.md",
+   "record": "4.0-отличия-R2.md",
+   "updated": "2026-09-07T08:55:04+03:00"
+  },
+  "4.1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.1.verdict.md",
+   "record": "4.1-R2-contractsAndConsumers.md",
+   "updated": "2026-09-07T09:07:51+03:00"
+  },
+  "4.2": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.2.verdict.md",
+   "record": "4.2-R2-authorityPaths.md",
+   "updated": "2026-09-07T09:14:56+03:00"
+  },
+  "4.3": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.3.verdict.md",
+   "record": "4.3-R2-stateAndRecovery.md",
+   "updated": "2026-09-07T09:21:32+03:00"
+  },
+  "4.4": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.4.verdict.md",
+   "record": "4.4-R2-connectivityAndProof.md",
+   "updated": "2026-09-07T09:26:30+03:00"
+  },
+  "4.5": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.5.verdict.md",
+   "record": "4.5-R2-gap_e1adf1b878b3cde4d6140b33.md",
+   "updated": "2026-09-07T09:33:39+03:00"
+  },
+  "4.6": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.6.verdict.md",
+   "record": "4.6-R2-gap_0b349c0a90f168c6bdf4be76.md",
+   "updated": "2026-09-07T09:40:39+03:00"
+  },
+  "4.7": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.7.verdict.md",
+   "record": "4.7-R2-gap_6c6887e7d1bb86c1daf6aabf.md",
+   "updated": "2026-09-07T09:48:38+03:00"
+  },
+  "4.8": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.8.verdict.md",
+   "record": "4.8-R2-gap_8a6a7c304fc66d63fbae557b.md",
+   "updated": "2026-09-07T09:54:40+03:00"
+  },
+  "4.9": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.9.verdict.md",
+   "record": "4.9-R2-gap_61d88b5a8e29806257cef44a.md",
+   "updated": "2026-09-07T10:01:40+03:00"
+  },
+  "4.10": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.10.verdict.md",
+   "record": "4.10-R2-gap_3b7075c17c79bea02f7cd2df.md",
+   "updated": "2026-09-07T10:06:39+03:00"
+  },
+  "4.11": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.11.verdict.md",
+   "record": "4.11-R2-gap_c2483d91f640e5e0b8071f6a.md",
+   "updated": "2026-09-07T10:15:00+03:00"
+  },
+  "4.12": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.12.verdict.md",
+   "record": "4.12-R2-gap_5ab27dd62003d8d60429e077.md",
+   "updated": "2026-09-07T10:21:39+03:00"
+  },
+  "4.13": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.13.verdict.md",
+   "record": "4.13-R2-gap_e25b108b1d63eaf9812ec85e.md",
+   "updated": "2026-09-07T10:30:02+03:00"
+  },
+  "4": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "4.verdict.md",
+   "record": "4-Исследование-R2-отличия.md",
+   "updated": "2026-09-07T10:40:56+03:00"
+  },
+  "5": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "5.verdict.md",
+   "record": "5-слой-L3.md",
+   "updated": "2026-09-07T10:49:56+03:00"
+  },
+  "6.1": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "6.1.verdict.md",
+   "record": "6.1-проверка-R3.md",
+   "updated": "2026-09-07T10:59:52+03:00"
+  },
+  "6.2": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "6.2.verdict.md",
+   "record": "6.2-публикация-om-g2.md",
+   "updated": "2026-09-07T11:06:44+03:00"
+  },
+  "6.3": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "6.3.verdict.md",
+   "record": "6.3-компилятор.md",
+   "updated": "2026-09-07T11:15:50+03:00"
+  },
+  "6.4": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "6.4.verdict.md",
+   "record": "6.4-принятие-плана.md",
+   "updated": "2026-09-07T11:23:46+03:00"
+  },
+  "6": {
+   "grade": 9,
+   "round": 1,
+   "status": "принят",
+   "verdict": "6.verdict.md",
+   "record": "6-R3-и-компилятор.md",
+   "updated": "2026-09-07T11:36:01+03:00"
+  }
+ },
+ "unresolvedInARow": 0,
+ "stopped": false,
+ "protocol": "TOKEN-BUDGET-AUDIT-BRIEF-2026-09-07.md §5.1–5.2",
+ "current": "6",
+ "next": null,
+ "completed": "2026-09-07T11:36:01+03:00"
+}
