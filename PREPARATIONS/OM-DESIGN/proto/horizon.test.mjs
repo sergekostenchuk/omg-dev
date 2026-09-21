@@ -1,6 +1,6 @@
 // Тесты замыкания горизонта на принятом верхнем слое omg-live (только чтение).
 import test from "node:test"; import assert from "node:assert/strict"; import { DatabaseSync } from "node:sqlite"; import { homedir } from "node:os"; import { join } from "node:path";
-import { closeHorizon, gateHorizon } from "./horizon.mjs"; import { frameObligations } from "./frame.mjs";
+import { closeHorizon, gateHorizon } from "./horizon.mjs"; import { frameObligations, fillObligations } from "./frame.mjs";
 const db = new DatabaseSync(join(homedir(), "OMG/.omg/state.sqlite"), { readOnly: true });
 const UPPER = (({ level, ...g }) => g)(JSON.parse(db.prepare(`SELECT r.body FROM revisions r JOIN heads h ON h.entity_id=r.entity_id AND h.revision=r.revision WHERE r.entity_id='graph-layer:omg-live:1'`).get().body).projection);
 const BLOCKS = UPPER.nodes.filter(n => n.kind === "block"); const F = outcome => [{ outcome }]; const UI = { block: "n-ui", reason: "сначала бэкенд (решение владельца 21.09.2026)", returnCondition: "понятно, как работает бэкенд" };
@@ -11,9 +11,30 @@ test("новый продукт: горизонт замкнут — у кажд
   const ob = frameObligations(UPPER, H); for (const o of ob.filter(o => o.kind === "connection-end" && o.role === "consumer" && o.zone === "horizon")) {
     const producer = ob.find(p => p.connector === o.connector && p.role === "producer"); assert.equal(producer.zone, "horizon", `производитель ${producer.upper} связи ${o.connector} обязан быть в горизонте`); } });
 
-test("готовые зависимости в горизонт не добираются: при уже раскрытых соседях горизонт — только блок фичи", () => {
-  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const r = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), refined: new Set(BLOCKS.map(b => b.id).filter(id => id !== root)) });
-  assert.deepEqual(r.horizon.nodes, [root]); assert.ok(r.horizon.boundary.length > 0, "готовые зависимости названы границей"); });
+const FULL = JSON.parse(db.prepare(`SELECT r.body FROM revisions r JOIN heads h ON h.entity_id=r.entity_id AND h.revision=r.revision WHERE r.entity_id='graph:omg-live'`).get().body);
+const REFINED = new Set(FULL.nodes.filter(n => n.kind === "operation").map(n => n.parent)); const basis = id => ({ id: `artifact-receipt:${id}`, revision: 1, hash: "e".repeat(64) });
+
+test("вердикт №1 п.4: принятое раскрытие — не готовый результат: неисполненные производители входят в горизонт, раскрытие помечено как переиспользуемое", () => {
+  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const r = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), refined: REFINED });
+  for (const b of ["n-check", "n-implement", "n-review"]) assert.ok(r.horizon.nodes.includes(b), `${b} не исполнен — обязан быть в плане работ`);
+  assert.ok(r.horizon.nodes.length > 1); assert.deepEqual(r.horizon.boundary, []); assert.ok(Object.values(r.horizon.refinement).every(x => x === "accepted"), "раскрытие переиспользуется, проектировать заново не нужно");
+  const ready = new Map(r.horizon.nodes.filter(n => n !== root).map(n => [n, basis(n)])); const cut = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), refined: REFINED, available: ready });
+  assert.deepEqual(cut.horizon.nodes, [root]); assert.ok(cut.horizon.boundary.length > 0 && cut.horizon.boundary.every(x => x.basis.hash), "граница — только с подтверждённым основанием");
+  assert.ok(gateHorizon(closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), available: new Map([["n-check", {}]]) })).codes.includes("horizon_available_unproven")); });
+
+test("вердикт №1 п.3: обязательная управляющая зависимость (requires) входит в замыкание; исключённая — конфликт с путём", () => {
+  const G = structuredClone(UPPER); G.edges.push({ id: "e-test-requires", relation: "requires", source: "n-publish", target: "n-backup", condition: "проверка ревью" });
+  const base = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change") }); const withReq = closeHorizon(G, { choiceVersion: "c", features: F("verified-change") });
+  assert.ok(withReq.horizon.nodes.includes("n-backup")); if (!base.horizon.nodes.includes("n-backup")) assert.equal(withReq.horizon.nodes.length, base.horizon.nodes.length + (withReq.horizon.nodes.length - base.horizon.nodes.length));
+  const ex = closeHorizon(G, { choiceVersion: "c", features: F("verified-change"), excluded: [{ block: "n-backup", reason: "проверка", returnCondition: "после проверки" }] });
+  assert.deepEqual(gateHorizon(ex).codes, ["horizon_requires_excluded"]); assert.ok(ex.conflicts.some(c => c.block === "n-backup" && c.path.some(step => String(step).includes("e-test-requires")))); });
+
+test("вердикт №1 п.5: внешний источник согласован между M2 и каркасом — G2 проходит, и F4.2 НЕ даёт horizon_producer_unrefined; адрес связи потребителя сохранён", () => {
+  const EXT = structuredClone(UPPER); EXT.artifacts.find(a => a.id === "a-runtime").external = true; const r = closeHorizon(EXT, { choiceVersion: "c", features: F("autonomous-knowledge") });
+  assert.equal(gateHorizon(r).passed, true); assert.ok(!r.horizon.nodes.includes("n-runtime")); assert.ok(r.horizon.externalInputs.some(x => x.connector === "cn-runtime"), "связь с внешним источником названа");
+  const H = new Set(r.horizon.nodes); const ob = frameObligations(EXT, H); const filled = fillObligations(EXT, ob, null, [], H, { graph: null, frame: null });      // не бросает отказ
+  const end = ob.find(o => o.connector === "cn-runtime" && o.role === "producer"); assert.ok(filled.fills.some(f => f.obligation === end.id && f.source === "identity"), "конец внешней связи закрыт представителем");
+  assert.throws(() => fillObligations(UPPER, frameObligations(UPPER, H), null, [], H, { graph: null, frame: null }), e => e.code === "horizon_producer_unrefined", "тот же горизонт без пометки external — отказ остаётся"); });
 
 test("исключённый блок, без которого фича не производится, молча не отбрасывается: конфликт с путём зависимости → вопрос владельцу", () => {
   const free = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change") }); const needed = free.horizon.nodes.find(n => n !== BLOCKS.find(b => b.outcome === "verified-change").id);

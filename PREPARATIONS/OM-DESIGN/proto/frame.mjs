@@ -65,7 +65,8 @@ export function fillObligations(upper, obligations, accepted, proposals, horizon
     fills.push({ obligation: o.id, node: repId(o.upper), port: o.port, source: "identity", basis: o.upper, kept: reps.length > 0 });
   }
   // производитель вне горизонта без настоящего раскрытия, нужный узлу горизонта, не откладывается
-  for (const o of obligations.filter(x => x.kind === "connection-end" && x.role === "producer" && x.zone === "outside")) {
+  const externalArtifacts = new Set(upper.artifacts.filter(a => a.external).map(a => a.id));      // внешний источник: адрес связи сохраняется представителем, реализация производителя не требуется
+  for (const o of obligations.filter(x => x.kind === "connection-end" && x.role === "producer" && x.zone === "outside" && !externalArtifacts.has(x.artifact))) {
     const mine = fills.filter(f => f.obligation === o.id); const needed = obligations.some(x => x.connector === o.connector && x.role === "consumer" && x.zone === "horizon");
     if (needed && mine.every(f => f.source === "identity")) refuse("horizon_producer_unrefined", o.id, `Производитель ${o.upper} связи ${o.connector} вне горизонта и не раскрыт`); }
   for (const f of fills) if (f.source === "identity" && obligations.find(o => o.id === f.obligation).zone === "horizon") refuse("identity_in_horizon", f.obligation, "Представитель не закрывает обязательство горизонта");
