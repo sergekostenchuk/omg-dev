@@ -8,28 +8,32 @@ import * as F from "./frame.mjs"; import * as W from "./works.mjs"; import { gar
 
 const P = "proto"; const G3 = gardenPlus(); const ACC2 = (({ level, ...g }) => g)(projectGraph(G3, 2));      // принятый слой операций, работ ещё нет
 const OPS = ["garden-prep-operation", "garden-produce-operation", "garden-consume-operation"]; const ZONE = new Set(OPS);
-const fresh = () => { const dir = mkdtempSync(join(tmpdir(), "om-works-")); const store = new Store(join(dir, "s.sqlite")); store.write({ id: `graph:${P}`, kind: "graph", expected: 0, value: ACC2 });
+const fresh = (value = ACC2) => { const dir = mkdtempSync(join(tmpdir(), "om-works-")); const store = new Store(join(dir, "s.sqlite")); store.write({ id: `graph:${P}`, kind: "graph", expected: 0, value });
   return { store, done: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } }; };
-const baseOf = acc => ({ graph: acc.graph ? reference(acc.graph) : null, frame: acc.frame ? reference(acc.frame) : null });
-const parent = id => G3.nodes.find(n => n.id === id)?.parent;
+const baseOf = acc => ({ graph: acc.graph ? reference(acc.graph) : null, frame: acc.frame ? reference(acc.frame) : null }); const KIND = { 2: "operation", 3: "work" };
 
-/** Предложение слоя работ из работ фикстуры: узлы, заполнения с привязкой к коду (codeRef), тесты. */
-function proposal3(ops, obligations, base, tweak = v => v) {
-  const works = G3.nodes.filter(n => n.kind === "work" && ops.includes(n.parent)); const ids = new Set(works.map(w => w.id)); const fills = [];
-  for (const o of obligations.filter(o => ops.includes(o.upper))) {
-    if (o.kind.endsWith("-outcome")) { const w = works.find(w => w.parent === o.upper && w.outcome === o.artifact); if (w) fills.push({ obligation: o.id, node: w.id }); continue; }
-    for (const b of G3.connectors.find(c => c.id === o.connector).bindings.filter(b => b.level === 3)) for (const e of (o.role === "producer" ? [b.producer] : b.consumers))
-      if (ids.has(e.node) && parent(e.node) === o.upper) fills.push({ obligation: o.id, node: e.node, port: e.port, codeRef: e.codeRef }); }
-  return tweak({ base, level: 3, source: "decision", status: "proposed", nodes: structuredClone(works), fills, tests: structuredClone(G3.tests.filter(t => ids.has(t.node))), localConnectors: [] });
+/** Предложение слоя из узлов фикстуры G: узлы, заполнения (конец берётся из нижней привязки ТОГО ЖЕ потока, с привязкой к коду), тесты, локальные связи. */
+function proposalAt(G, level, uppers, obligations, base, upper, tweak = v => v) {
+  const par = id => G.nodes.find(n => n.id === id)?.parent; const nodes = G.nodes.filter(n => n.kind === KIND[level] && uppers.includes(n.parent)); const ids = new Set(nodes.map(n => n.id)); const fills = [];
+  for (const o of obligations.filter(o => uppers.includes(o.upper))) {
+    if (o.kind.endsWith("-outcome")) { const n = nodes.find(n => n.parent === o.upper && n.outcome === o.artifact); if (n) fills.push({ obligation: o.id, node: n.id }); continue; }
+    const U = upper.connectors.find(c => c.id === o.connector).bindings.find(b => b.level === level - 1 && F.flowKey(b) === o.flow);
+    for (const b of G.connectors.find(c => c.id === o.connector).bindings.filter(b => b.level === level && b.producer.port === U.producer.port)) for (const e of (o.role === "producer" ? [b.producer] : b.consumers))
+      if (ids.has(e.node) && par(e.node) === o.upper && (o.role === "producer" || e.port === o.port) && !fills.some(f => f.obligation === o.id && f.node === e.node && f.port === e.port)) fills.push({ obligation: o.id, node: e.node, port: e.port, ...(e.codeRef ? { codeRef: e.codeRef } : {}) }); }
+  const local = G.connectors.filter(c => !c.bindings.some(b => b.level < level) && c.bindings.some(b => b.level === level) && c.bindings.filter(b => b.level === level).every(b => [b.producer, ...b.consumers].every(e => ids.has(e.node))))
+    .map(c => ({ ...structuredClone(c), bindings: structuredClone(c.bindings.filter(b => b.level <= level)) }));
+  const artifacts = G.artifacts.filter(a => (nodes.some(n => n.outcome === a.id) || local.some(c => c.artifact === a.id)) && !upper.artifacts.some(u => u.id === a.id));
+  return tweak({ base, level, source: "decision", status: "proposed", nodes: structuredClone(nodes), fills, tests: structuredClone(G.tests.filter(t => ids.has(t.node))), localConnectors: local, artifacts: structuredClone(artifacts) });
 }
-/** Полный проход каркаса работ: обязательства → предложение → заполнение → кандидат → (по желанию) принятие. */
-function run(store, zone, ops, { accept = false, tweak, tag = "" } = {}) {
-  const acc = F.loadAccepted(store, P, 3); const upper = F.upperOf(acc.graph.value, 3); const ob = F.frameObligations(upper, zone, 3); const base = baseOf(acc);
-  const props = ops.length ? [store.write({ id: `om-proposal:w-${hashJson([ops, base, tag]).slice(0, 8)}`, kind: "layer-proposal", expected: 0, value: proposal3(ops, ob, base, tweak) })] : [];
-  const filled = F.fillObligations(upper, ob, acc, props, zone, base, 3); const cand = F.assembleCandidate(upper, ob, filled, acc, props, zone, 3);
-  if (accept) F.settleCandidate(store, P, reference(F.saveCandidate(store, P, cand, filled, base, props, 3)), true);
+/** Полный проход каркаса: обязательства → предложение → заполнение → кандидат → (по желанию) принятие. */
+function runAt(store, G, level, zone, uppers, { accept = false, tweak, tag = "" } = {}) {
+  const acc = F.loadAccepted(store, P, level); const upper = F.upperOf(acc.graph.value, level); const ob = F.frameObligations(upper, zone, level); const base = baseOf(acc);
+  const props = uppers.length ? [store.write({ id: `om-proposal:w-${hashJson([level, uppers, base, tag]).slice(0, 8)}`, kind: "layer-proposal", expected: 0, value: proposalAt(G, level, uppers, ob, base, upper, tweak) })] : [];
+  const filled = F.fillObligations(upper, ob, acc, props, zone, base, level); const cand = F.assembleCandidate(upper, ob, filled, acc, props, zone, level);
+  if (accept) F.settleCandidate(store, P, reference(F.saveCandidate(store, P, cand, filled, base, props, level)), true);
   return { ob, filled, cand, identity: new Set(filled.fills.filter(f => f.source === "identity").map(f => f.node)) };
 }
+const run = (store, zone, ops, opts) => runAt(store, G3, 3, zone, ops, opts);
 const receipt = (graph, node, artifact = "garden-data") => ({ projectId: P, artifact, node, signature: nodeSignature(graph, graph.nodes.find(n => n.id === node)),
   contractHash: hashJson(graph.contracts.find(c => c.id === graph.artifacts.find(a => a.id === artifact).contract).schema), commit: "c".repeat(40), tree: "t".repeat(40), value: { files: [] } });
 
@@ -79,21 +83,56 @@ test("сверка с настоящим компилятором задач: у
     assert.deepEqual(W.gatePackets(r.cand.graph, packets.slice(1), ctx).codes, ["packet_missing"]);
     assert.deepEqual(W.gatePackets(r.cand.graph, [...packets, { work: "w-garden-later-operation", neighbors: [], hash: hashJson([]) }], ctx).codes, ["packet_foreign"]); } finally { done(); } });
 
-test("производитель вне плана исполнения: без настоящей принятой работы — отказ (пересмотр готовности); с ней — только по годной квитанции на ЭТОГО производителя", () => {
+/** Принятый слой работ, в плане исполнения — только потребитель: производители (prep, produce) приняты, но исполнять их не нужно. */
+function consumerOnly(store, change = g => g) { run(store, ZONE, OPS, { accept: true }); const r = run(store, new Set(["garden-consume-operation"]), []); return { g: change(structuredClone(r.cand.graph)), ctx: { identity: r.identity } }; }
+const put = (store, graph, node, artifact) => { const id = receiptId(P, artifact); const head = store.get(id); return store.write({ id, kind: "artifact", expected: head?.revision ?? 0, value: receipt(graph, node, artifact) }); };
+
+test("производитель вне плана исполнения: без настоящей принятой работы — отказ (пересмотр готовности); с ней — только по квитанции, которую M2 назвал основанием ЭТОГО результата", () => {
   const { store, done } = fresh(); try { const only = new Set(["garden-consume-operation"]);
     assert.throws(() => run(store, only, ["garden-consume-operation"]), e => e.code === "horizon_producer_unrefined", "результат «уже есть», а раскрытого производителя нет — готовность пересматривается");
-    run(store, ZONE, OPS, { accept: true }); const r = run(store, only, []); assert.deepEqual(r.cand.graph.horizon, ["garden-consume-work"]); const g = r.cand.graph; const ctx = { identity: r.identity };
-    assert.deepEqual(W.checkDeliveries(store, P, g).findings.map(f => [f.code, f.target, f.block]), [["available_basis_missing", "garden-flow", "garden-produce-block"]]);
+    const { g, ctx } = consumerOnly(store); assert.deepEqual(g.horizon, ["garden-consume-work"]);
+    assert.deepEqual(W.checkDeliveries(store, P, g).findings.map(f => [f.code, f.target, f.block, f.artifact]), [["available_basis_missing", "garden-flow", "garden-produce-block", "garden-data"]]);
     assert.deepEqual(W.gatePackets(g, W.buildPackets(g, ctx), ctx).codes, ["neighbor_undelivered"], "вход без источника задачу исполнителю не пускает");
-    let rec = store.write({ id: receiptId(P, "garden-data"), kind: "artifact", expected: 0, value: receipt(g, "garden-prep-work") });
-    assert.deepEqual(W.checkDeliveries(store, P, g).findings.map(f => f.code), ["available_basis_mismatch"], "квитанция на другого производителя не годится");
-    rec = store.write({ id: rec.id, kind: "artifact", expected: rec.revision, value: receipt(g, "garden-produce-work") }); const ok = W.checkDeliveries(store, P, g, { "garden-produce-block": reference(rec) });
-    assert.deepEqual(ok.findings, []); const full = { ...ctx, receipts: ok.receipts }; const n = W.neighborsOf(g, "garden-consume-work", full).find(n => n.direction === "reads");
+    let rec = put(store, g, "garden-prep-work", "garden-data"); const named = r => ({ "garden-produce-block": { "garden-data": reference(r) } });
+    assert.deepEqual(W.checkDeliveries(store, P, g, named(rec)).findings.map(f => f.code), ["available_basis_mismatch"], "квитанция на другого производителя не годится");
+    rec = put(store, g, "garden-produce-work", "garden-data"); const ok = W.checkDeliveries(store, P, g, named(rec)); assert.deepEqual(ok.findings, []);
+    const full = { ...ctx, receipts: ok.receipts }; const n = W.neighborsOf(g, "garden-consume-work", full).find(n => n.direction === "reads");
     assert.deepEqual([n.delivery, n.basis, n.neighbor.operation.id], ["available", reference(rec), "garden-produce-operation"], "сосед известен до подблока, данные — по квитанции"); assert.equal(W.gatePackets(g, W.buildPackets(g, full), full).passed, true);
     const ext = structuredClone(g); ext.artifacts.find(a => a.id === "garden-data").external = true; assert.equal(W.neighborsOf(ext, "garden-consume-work", ctx).find(n => n.direction === "reads").delivery, "external", "внешний источник — не недоставленный вход");
     assert.equal(W.gatePackets(ext, W.buildPackets(ext, ctx), ctx).passed, true);
-    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-produce-block": { ...reference(rec), hash: "0".repeat(64) } }).findings.map(f => f.code), ["available_basis_unresolved"]);
-    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-consume-block": reference(rec) }).findings.map(f => f.code), ["available_basis_foreign"], "основание названо на работу чужого блока"); } finally { done(); } });
+    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": { ...reference(rec), hash: "0".repeat(64) } } }).findings.map(f => f.code), ["available_basis_unresolved"]); } finally { done(); } });
+
+test("вердикт №1 п.3: негодное основание того же блока не заменяется другой квитанцией; сменившаяся квитанция — отказ, пока M2 не назовёт её основанием", () => {
+  const { store, done } = fresh(); try { const { g } = consumerOnly(store); const data = put(store, g, "garden-produce-work", "garden-data");
+    const bad = store.write({ id: receiptId(P, "garden-prep"), kind: "artifact", expected: 0, value: { ...receipt(g, "garden-prep-work", "garden-prep"), signature: "f".repeat(64), contractHash: "f".repeat(64) } });
+    const f = W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-prep": reference(bad) } }).findings.map(x => [x.code, x.artifact]).sort();
+    assert.deepEqual(f, [["available_basis_mismatch", "garden-prep"], ["available_basis_missing", "garden-data"]], "контрпример ревью: годная квитанция garden-data существует, но основанием не названа — и не подставляется; негодное основание отклонено");
+    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(data) }, "garden-consume-block": { "garden-data": reference(data) } }).findings.map(x => [x.code, x.block]), [["available_basis_foreign", "garden-consume-block"]], "основание названо на работу чужого блока");
+    const newer = put(store, g, "garden-produce-work", "garden-data"); assert.ok(newer.revision > data.revision);
+    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(data) } }).findings.map(x => x.code), ["available_basis_stale"], "компилятор прочтёт новую квитанцию — M2 обязан назвать основанием именно её");
+    assert.deepEqual(W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(newer) } }).findings, []); } finally { done(); } });
+
+test("вердикт №1 п.2: доставка покрывает ВСЕ виды входа — обязательный предшественник (requires) по квитанции его исхода, передача владения по основанию прежнего писателя; сверено с настоящим deriveTasks версии 2", () => {
+  const { store, done } = fresh(); try { const { g, ctx } = consumerOnly(store, g => { g.edges.push({ id: "e-needs-prep", relation: "requires", source: "garden-consume-work", target: "garden-prep-work", condition: "подготовка завершена" });
+      g.transfers.push({ id: "t-own", path: "consume.txt", from: "garden-prep-work", to: "garden-consume-work", condition: "producer_committed" }); return g; });
+    const data = put(store, g, "garden-produce-work", "garden-data"), prep = put(store, g, "garden-prep-work", "garden-prep"); const bases = { "garden-produce-block": { "garden-data": reference(data), "garden-prep": reference(prep) } };
+    const proof = { node: "garden-prep-work", boundary: g.nodes.find(n => n.id === "garden-prep-work").boundary, ref: { id: "owner:consume.txt", revision: 1, hash: "a".repeat(64) } }; const owner = path => (path === "consume.txt" ? proof : null);
+    const none = W.checkDeliveries(store, P, g, { "garden-produce-block": { "garden-data": reference(data) } }); assert.deepEqual(none.findings.map(f => [f.code, f.target]).sort(), [["available_basis_missing", "e-needs-prep"], ["ownership_predecessor_missing", "t-own"]]);
+    assert.deepEqual(W.checkDeliveries(store, P, g, bases, { owner: () => ({ ...proof, node: "garden-produce-work" }) }).findings.map(f => f.code), ["ownership_predecessor_missing"], "основание владения — точный прежний писатель пути, а не произвольная квитанция");
+    assert.deepEqual(W.checkDeliveries(store, P, g, bases, { owner: () => ({ ...proof, boundary: { ...proof.boundary, rollback: "другая" } }) }).findings.map(f => f.code), ["ownership_predecessor_missing"], "сменившаяся граница прежнего писателя основанием не считается");
+    const ok = W.checkDeliveries(store, P, g, bases, { owner }); assert.deepEqual(ok.findings, []); const full = { ...ctx, receipts: ok.receipts }; const ns = W.neighborsOf(g, "garden-consume-work", full);
+    const req = ns.find(n => n.control === "e-needs-prep"), got = ns.find(n => n.control === "t-own");
+    assert.deepEqual([req.direction, req.delivery, req.basis, req.artifact, req.neighbor.operation.id], ["requires", "available", reference(prep), "garden-prep", "garden-prep-operation"], "управляющий элемент пакета несёт основание");
+    assert.deepEqual([got.direction, got.delivery, got.basis, got.path], ["receives", "available", proof.ref, "consume.txt"]); assert.equal(W.gatePackets(g, W.buildPackets(g, full), full).passed, true);
+    const refs = { "garden-data": reference(data), "garden-prep": reference(prep) }; const { tasks } = deriveTasks(P, hashJson(g), g, (producer, artifact) => ({ receipt: refs[artifact], source: null }), { version: 2, owner });
+    const task = tasks.find(t => t.node === "garden-consume-work"); for (const input of task.inputs) { const n = ns.find(n => (n.connector ?? n.control) === input.connector); assert.ok(n && n.delivery === "available", `вход ${input.connector} доставлен`); assert.deepEqual(n.basis, input.receipt, "пакет и компилятор называют одно и то же основание"); }
+    const grant = task.ownership.find(o => o.transfer === "t-own"); assert.deepEqual([grant.from, grant.receipt], ["garden-prep-work", got.basis], "основание передачи владения — то же, что выдаёт writeGrants"); } finally { done(); } });
+
+test("вердикт №1 п.4: ровно один пакет на работу — дубликат отклоняется, даже если второй пакет правильный", () => {
+  const { store, done } = fresh(); try { const r = run(store, ZONE, OPS); const ctx = { identity: r.identity }; const packets = W.buildPackets(r.cand.graph, ctx); const forged = structuredClone(packets[2]);
+    forged.neighbors[0].neighbor.operation.id = "garden-forged-operation"; forged.hash = hashJson(forged.neighbors);
+    assert.deepEqual(W.gatePackets(r.cand.graph, [packets[0], packets[1], forged, packets[2]], ctx).codes, ["packet_duplicate"], "контрпример ревью: поддельный первым, правильный вторым");
+    assert.deepEqual(W.gatePackets(r.cand.graph, [...packets, packets[0]], ctx).codes, ["packet_duplicate"]); } finally { done(); } });
 
 test("маскарад и отсутствие: сломанная цепочка соседа, артефакт без контракта, пакет не для работы — типизированные отказы", () => {
   const { store, done } = fresh(); try { const g = run(store, ZONE, OPS).cand.graph; const broken = structuredClone(g); broken.nodes.find(n => n.id === "garden-consume-work").parent = "garden-consume-block";
@@ -105,3 +144,26 @@ test("передача владения путём — обязательный 
   const { store, done } = fresh(); try { const g = structuredClone(run(store, ZONE, OPS).cand.graph); g.transfers = [{ id: "t-shared", path: "shared.txt", from: "garden-prep-work", to: "garden-produce-work", condition: "producer_committed" }];
     const got = W.neighborsOf(g, "garden-produce-work").find(n => n.control === "t-shared"); assert.deepEqual([got.direction, got.path, got.neighbor.work.id, got.neighbor.operation.id, got.delivery], ["receives", "shared.txt", "garden-prep-work", "garden-prep-operation", "in-plan"]);
     const sent = W.neighborsOf(g, "garden-prep-work").find(n => n.control === "t-shared"); assert.deepEqual([sent.direction, sent.neighbor.work.id, sent.neighbor.block.id], ["sends", "garden-produce-work", "garden-produce-block"]); } finally { done(); } });
+
+test("вердикт №1 п.1: у одной связи два потока с разными портами — различие сохраняется на ОБОИХ уровнях, и при предложении, и при повторном проходе по принятому слою; неразличимое соответствие — отказ", () => {
+  const G = gardenPlus({ alt: true }); assert.equal(validateGraph(G).findings.length, 0); const strip = ({ level, ...g }) => g; const pairs = (graph, level) => graph.connectors.find(c => c.id === "garden-flow").bindings.filter(b => b.level === level)
+    .map(b => `${b.producer.node}/${b.producer.port} → ${b.consumers.map(e => `${e.node}/${e.port}`).join(",")}${b.anchor ? " (спит)" : ""}`).sort();
+  for (const [level, accepted, zone, want] of [
+    [2, strip(projectGraph(G, 1)), ["garden-produce-block", "garden-consume-block"], ["garden-produce-operation/out → garden-consume-operation/in,i-garden-later-block/in", "garden-produce-operation/out-alt → garden-consume-operation/in-alt"]],
+    [3, strip(projectGraph(G, 2)), OPS, ["garden-produce-work/out → garden-consume-work/in", "garden-produce-work/out → w-garden-later-operation/in (спит)", "garden-produce-work/out-alt → garden-consume-work/in-alt"]]]) {
+    const { store, done } = fresh(accepted); try { const first = runAt(store, G, level, new Set(zone), zone, { accept: true }); assert.deepEqual(pairs(first.cand.graph, level), want, `уровень ${level}: предложение`);
+      const again = runAt(store, G, level, new Set(zone), []); assert.deepEqual(pairs(again.cand.graph, level), want, `уровень ${level}: повторный проход по принятому — без потери порта и без дублей`);
+      const hist = structuredClone(store.get(`graph:${P}`).value); for (const b of hist.connectors.find(c => c.id === "garden-flow").bindings.filter(b => b.level === level)) b.producer.port = "renamed";
+      for (const n of hist.nodes.filter(n => n.id === (level === 2 ? "garden-produce-operation" : "garden-produce-work"))) n.ports.push({ id: "renamed", direction: "out", contract: "garden-contract" });
+      const upper = F.upperOf(hist, level); const ob = F.frameObligations(upper, new Set(zone), level);
+      assert.throws(() => F.fillObligations(upper, ob, { graph: { value: hist, id: "h", hash: "h" }, identity: new Set() }, [], new Set(zone), { graph: null, frame: null }, level), e => e.code === "accepted_binding_ambiguous", "первый порт не выбирается"); } finally { done(); } }
+  const twice = strip(projectGraph(G, 1)); twice.connectors.find(c => c.id === "garden-flow").bindings[0].consumers.push({ node: "garden-consume-block", port: "in" });
+  assert.throws(() => F.frameObligations(twice, new Set(), 2), e => e.code === "upper_binding_ambiguous"); });
+
+test("перекрёстные потоки: один порт потребителя питают два потока, а один поток — два порта одного узла; концы различаются потоком И портом, на обоих уровнях, при предложении и повторном проходе", () => {
+  const G = gardenPlus({ alt: "cross" }); assert.equal(validateGraph(G).findings.length, 0); const strip = ({ level, ...g }) => g; const pairs = (graph, level) => graph.connectors.find(c => c.id === "garden-flow").bindings.filter(b => b.level === level)
+    .map(b => `${b.producer.port} → ${b.consumers.map(e => `${e.node.replace("garden-", "")}/${e.port}`).sort().join(",")}${b.anchor ? " (спит)" : ""}`).sort();
+  for (const [level, accepted, zone, want] of [[2, strip(projectGraph(G, 1)), ["garden-produce-block", "garden-consume-block"], ["out → consume-operation/in,consume-operation/in-alt,i-later-block/in", "out-alt → consume-operation/in"]],
+    [3, strip(projectGraph(G, 2)), OPS, ["out → consume-work/in,consume-work/in-alt", "out → w-later-operation/in (спит)", "out-alt → consume-work/in"]]]) {
+    const { store, done } = fresh(accepted); try { assert.deepEqual(pairs(runAt(store, G, level, new Set(zone), zone, { accept: true }).cand.graph, level), want, `уровень ${level}: предложение`);
+      const again = runAt(store, G, level, new Set(zone), []); assert.deepEqual(pairs(again.cand.graph, level), want, `уровень ${level}: повторный проход по принятому`); assert.equal(validateGraph(again.cand.graph).findings.length, 0); } finally { done(); } } });

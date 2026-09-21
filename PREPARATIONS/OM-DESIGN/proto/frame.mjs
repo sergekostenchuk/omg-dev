@@ -18,14 +18,33 @@ export const repId = (id, level = 2) => level === 2 ? `i-${id.replace(/^n-/, "")
 export const upperOf = (graph, level = 2) => (({ level: _l, ...g }) => g)(projectGraph(graph, level - 1));
 
 /** F4.1. Обязательства по ВСЕМУ верхнему слою: исход каждого блока и каждый конец каждой связи, включая связи внешних артефактов. */
+/** Поток связи — верхняя привязка, различимая концом-производителем (узел И порт) и якорем. У одной связи потоков может быть несколько
+ *  (out → in и out-alt → in-alt): каждый конец принадлежит СВОЕМУ потоку, нижние привязки зеркалят верхние по одной (вердикт №1 по M7, п.1). */
+export const flowKey = b => hashJson([b.producer.node, b.producer.port, b.anchor ?? null]);
 export function frameObligations(upper, horizon, level = 2) {
-  const out = []; const zone = id => horizon.has(id) ? "horizon" : "outside";
-  const id = o => hashJson([o.kind, o.connector ?? null, level, o.role ?? null, o.upper, o.port ?? null]);
-  for (const b of upper.nodes.filter(n => n.kind === KIND[level - 1])) out.push({ kind: `${KIND[level - 1]}-outcome`, upper: b.id, artifact: b.outcome, zone: zone(b.id) });
+  const out = new Map(); const zone = id => horizon.has(id) ? "horizon" : "outside";
+  const id = o => hashJson([o.kind, o.connector ?? null, level, o.role ?? null, o.upper, o.port ?? null, o.flow ?? null]);
+  const put = o => { const k = id(o); if (!out.has(k)) { out.set(k, { id: k, ...o }); return; }        // производитель общий для привязок одного потока; потребитель дважды в одном потоке неразличим
+    if (o.role === "consumer") refuse("upper_binding_ambiguous", o.connector, `Конец ${o.upper}/${o.port} дважды входит в один поток связи ${o.connector}`); };
+  for (const b of upper.nodes.filter(n => n.kind === KIND[level - 1])) put({ kind: `${KIND[level - 1]}-outcome`, upper: b.id, artifact: b.outcome, zone: zone(b.id) });
   for (const c of upper.connectors) for (const bind of c.bindings.filter(x => x.level === level - 1))
     for (const [role, ep] of [["producer", bind.producer], ...bind.consumers.map(e => ["consumer", e])])
-      out.push({ kind: "connection-end", connector: c.id, artifact: c.artifact, role, upper: ep.node, port: ep.port, zone: zone(ep.node) });
-  return out.map(o => ({ id: id(o), ...o })).sort((a, b) => a.id < b.id ? -1 : 1);
+      put({ kind: "connection-end", connector: c.id, artifact: c.artifact, role, upper: ep.node, port: ep.port, flow: flowKey(bind), zone: zone(ep.node) });
+  return [...out.values()].sort((a, b) => a.id < b.id ? -1 : 1);
+}
+
+/** Принятые концы нижних привязок, относящиеся к обязательству. Нижняя привязка относится к верхнему потоку по узлам (правило уточнения
+ *  валидатора); подходят несколько РАЗНЫХ потоков — по совпадению id портов; не различить — отказ: первый порт не выбирается. */
+function acceptedEnds(connector, flows, o, level, parentOf) {
+  const out = []; const ambiguous = () => refuse("accepted_binding_ambiguous", o.connector, `Принятую привязку связи ${o.connector} нельзя однозначно отнести к верхнему потоку: нужны разные id портов или запись каркаса`);
+  for (const L of connector?.bindings.filter(b => b.level === level) ?? []) {
+    let mine = flows.filter(U => parentOf(L.producer.node) === U.producer.node && L.consumers.every(e => U.consumers.some(u => u.node === parentOf(e.node))));
+    if (new Set(mine.map(flowKey)).size > 1) { mine = mine.filter(U => U.producer.port === L.producer.port && L.consumers.every(e => U.consumers.some(u => u.node === parentOf(e.node) && u.port === e.port))); if (new Set(mine.map(flowKey)).size !== 1) ambiguous(); }
+    mine = mine.filter(U => flowKey(U) === o.flow); if (!mine.length) continue;
+    if (o.role === "producer") { out.push(L.producer); continue; }
+    const ends = mine.flatMap(U => U.consumers).filter(u => u.node === o.upper); const ports = new Set(ends.map(u => u.port));
+    for (const e of L.consumers.filter(e => parentOf(e.node) === o.upper)) { if (ports.size > 1 && !ports.has(e.port)) ambiguous(); if (ports.size <= 1 || e.port === o.port) out.push(e); } }
+  return out.filter(e => e.port !== undefined).filter((e, i, all) => all.findIndex(x => x.node === e.node && x.port === e.port) === i);
 }
 
 /** Узел-представитель: тождественное уточнение блока 1:1. Признак identity хранится в каркасе, а не в узле (схема узла закрыта). */
@@ -55,9 +74,7 @@ export function fillObligations(upper, obligations, accepted, proposals, horizon
     let acceptedFill = [];
     if (g) { const mine = n => g.nodes.find(x => x.id === n)?.parent === o.upper;
       if (o.kind.endsWith("-outcome")) acceptedFill = g.nodes.filter(n => n.kind === KIND[level] && n.parent === o.upper && n.outcome === o.artifact).map(n => ({ node: n.id }));
-      else acceptedFill = (g.connectors.find(c => c.id === o.connector)?.bindings.filter(b => b.level === level) ?? [])
-        .flatMap(b => o.role === "producer" ? [b.producer] : b.consumers).filter(e => mine(e.node) && e.port !== undefined)
-        .filter((e, i, all) => all.findIndex(x => x.node === e.node && x.port === e.port) === i); }     // на уровне 3 у связи бывает две привязки (действующая и спящая) с одним производителем
+      else acceptedFill = acceptedEnds(g.connectors.find(c => c.id === o.connector), upper.connectors.find(c => c.id === o.connector)?.bindings.filter(b => b.level === level - 1) ?? [], o, level, id => g.nodes.find(x => x.id === id)?.parent); }
     const before = acceptedFill.filter(f => !identity.has(f.node));                       // принятое ДО замен — по нему сверяется база замены
     const real = before.filter(f => !removed.has(f.node)); const reps = acceptedFill.filter(f => identity.has(f.node));
     const replaces = proposals.flatMap(p => (p.value.replaces ?? []).filter(r => r.obligation === o.id).map(r => ({ ...r, proposal: p.id })));
@@ -102,18 +119,19 @@ export function assembleCandidate(upper, obligations, filled, accepted, proposal
     cand.nodes.push(identityNode(b, level)); if (level === 2) for (const j of upper.joins.filter(j => j.consumer === b.id)) cand.joins.push({ ...structuredClone(j), id: `${j.id}-i`, consumer: repId(b.id) }); }
   // уровень 3: план исполнения — настоящие работы операций горизонта; представитель не исполняется никогда
   const exec = new Set(level === 3 ? cand.nodes.filter(n => n.kind === "work" && !need.has(n.id) && horizon.has(n.parent)).map(n => n.id) : []); if (level === 3) cand.horizon = [...exec].sort();
-  for (const c of cand.connectors) { const ups = c.bindings.filter(b => b.level === level - 1); if (!ups.length) continue; const up = { producer: ups[0].producer, consumers: ups.flatMap(b => b.consumers), anchor: ups[0].anchor };
-    const of = (role, node, port) => filled.fills.filter(f => { const o = obligations.find(x => x.id === f.obligation); return o.connector === c.id && o.role === role && o.upper === node && o.port === port; }).map(f => plain({ node: f.node, port: f.port, codeRef: f.codeRef }));
-    const producer = of("producer", up.producer.node, up.producer.port)[0]; const consumers = up.consumers.flatMap(e => of("consumer", e.node, e.port));
-    let lower = [{ level, producer, consumers, anchor: up.anchor ?? null }];
-    // уровень 3, действующий механизм «спящей связи»: производитель в плане исполнения, потребитель — нет → отдельная привязка с якорем и тестом пробуждения
-    if (level === 3 && producer && exec.has(producer.node) && consumers.some(e => !exec.has(e.node))) {
-      const test = cand.tests.find(t => t.node === producer.node && t.covers.includes(c.id)); if (!test) refuse("sleeping_wake_test_missing", c.id, `У производителя ${producer.node} нет теста, покрывающего связь: спящий потребитель останется без проверки пробуждения`);
-      let anchor = cand.anchors.find(a => a.outcome === c.artifact);
-      if (!anchor) { const owner = cand.nodes.find(n => n.id === producer.node && n.outcome === c.artifact) ?? cand.nodes.find(n => n.outcome === c.artifact && n.kind === "work"); if (!owner) refuse("sleeping_anchor_underivable", c.id, `Нет работы с исходом ${c.artifact}: якорь спящей связи механически не выводится`);
-        anchor = { id: `anchor-${c.id}`, owner: owner.id, outcome: c.artifact, test: test.id }; cand.anchors.push(anchor); }
-      c.wakeTest = c.wakeTest ?? test.id; const awake = consumers.filter(e => exec.has(e.node));
-      lower = [...(awake.length ? [{ level, producer, consumers: awake, anchor: null }] : []), { level, producer, consumers: consumers.filter(e => !exec.has(e.node)), anchor: anchor.id }]; }
+  const obById = new Map(obligations.map(o => [o.id, o]));
+  for (const c of cand.connectors) { const ups = c.bindings.filter(b => b.level === level - 1); if (!ups.length) continue; const lower = [];
+    const of = (role, node, port, flow) => filled.fills.filter(f => { const o = obById.get(f.obligation); return o.connector === c.id && o.role === role && o.upper === node && o.port === port && o.flow === flow; }).map(f => plain({ node: f.node, port: f.port, codeRef: f.codeRef }));
+    for (const U of ups) { const fk = flowKey(U); const producer = of("producer", U.producer.node, U.producer.port, fk)[0]; const consumers = U.consumers.flatMap(e => of("consumer", e.node, e.port, fk));
+      // уровень 3, действующий механизм «спящей связи»: производитель в плане исполнения, потребитель — нет → отдельная привязка с якорем и тестом пробуждения
+      if (level === 3 && U.anchor == null && producer && exec.has(producer.node) && consumers.some(e => !exec.has(e.node))) {
+        const test = cand.tests.find(t => t.node === producer.node && t.covers.includes(c.id)); if (!test) refuse("sleeping_wake_test_missing", c.id, `У производителя ${producer.node} нет теста, покрывающего связь: спящий потребитель останется без проверки пробуждения`);
+        let anchor = cand.anchors.find(a => a.outcome === c.artifact);
+        if (!anchor) { const owner = cand.nodes.find(n => n.id === producer.node && n.outcome === c.artifact) ?? cand.nodes.find(n => n.outcome === c.artifact && n.kind === "work"); if (!owner) refuse("sleeping_anchor_underivable", c.id, `Нет работы с исходом ${c.artifact}: якорь спящей связи механически не выводится`);
+          anchor = { id: `anchor-${c.id}`, owner: owner.id, outcome: c.artifact, test: test.id }; cand.anchors.push(anchor); }
+        c.wakeTest = c.wakeTest ?? test.id; const awake = consumers.filter(e => exec.has(e.node));
+        lower.push(...(awake.length ? [{ level, producer, consumers: awake, anchor: null }] : []), { level, producer, consumers: consumers.filter(e => !exec.has(e.node)), anchor: anchor.id }); }
+      else lower.push({ level, producer, consumers, anchor: U.anchor ?? null }); }
     c.bindings = [...c.bindings.filter(b => b.level !== level), ...lower]; }
   // замена не оставляет висящих ссылок: всё принятое, что ссылалось на убранный узел, обязано быть переопределено предложением
   const dangling = []; for (const key of [...PARTS, "connectors"]) for (const x of cand[key]) { const t = JSON.stringify(x).split('"'); for (const id of drop) if (t.includes(id)) dangling.push(`${key}:${x.id}→${id}`); }

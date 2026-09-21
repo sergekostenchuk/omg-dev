@@ -12,14 +12,16 @@ test("новый продукт: горизонт замкнут — у кажд
     const producer = ob.find(p => p.connector === o.connector && p.role === "producer"); assert.equal(producer.zone, "horizon", `производитель ${producer.upper} связи ${o.connector} обязан быть в горизонте`); } });
 
 const FULL = JSON.parse(db.prepare(`SELECT r.body FROM revisions r JOIN heads h ON h.entity_id=r.entity_id AND h.revision=r.revision WHERE r.entity_id='graph:omg-live'`).get().body);
-const REFINED = new Set(FULL.nodes.filter(n => n.kind === "operation").map(n => n.parent)); const basis = id => ({ id: `artifact-receipt:${id}`, revision: 1, hash: "e".repeat(64) });
+const REFINED = new Set(FULL.nodes.filter(n => n.kind === "operation").map(n => n.parent)); // основание готовности блока: квитанция на КАЖДЫЙ его результат — исход и артефакты связей, где он производитель
+const produced = id => [...new Set([BLOCKS.find(b => b.id === id).outcome, ...UPPER.connectors.filter(c => c.bindings.some(b => b.level === 1 && b.producer.node === id)).map(c => c.artifact)])];
+const basis = (id, revision = 1, hash = "e".repeat(64)) => Object.fromEntries(produced(id).map(a => [a, { id: `artifact-receipt:${a}`, revision, hash }]));
 
 test("вердикт №1 п.4: принятое раскрытие — не готовый результат: неисполненные производители входят в горизонт, раскрытие помечено как переиспользуемое", () => {
   const root = BLOCKS.find(b => b.outcome === "verified-change").id; const r = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), refined: REFINED });
   for (const b of ["n-check", "n-implement", "n-review"]) assert.ok(r.horizon.nodes.includes(b), `${b} не исполнен — обязан быть в плане работ`);
   assert.ok(r.horizon.nodes.length > 1); assert.deepEqual(r.horizon.boundary, []); assert.ok(Object.values(r.horizon.refinement).every(x => x === "accepted"), "раскрытие переиспользуется, проектировать заново не нужно");
   const ready = new Map(r.horizon.nodes.filter(n => n !== root).map(n => [n, basis(n)])); const cut = closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), refined: REFINED, available: ready });
-  assert.deepEqual(cut.horizon.nodes, [root]); assert.ok(cut.horizon.boundary.length > 0 && cut.horizon.boundary.every(x => x.basis.hash), "граница — только с подтверждённым основанием");
+  assert.deepEqual(cut.horizon.nodes, [root]); assert.ok(cut.horizon.boundary.length > 0 && cut.horizon.boundary.every(x => Object.values(x.basis).length && Object.values(x.basis).every(r => r.hash)), "граница — только с подтверждённым основанием: квитанция на каждый результат");
   assert.ok(gateHorizon(closeHorizon(UPPER, { choiceVersion: "c1", features: F("verified-change"), available: new Map([["n-check", {}]]) })).codes.includes("horizon_available_unproven")); });
 
 test("вердикт №1 п.3: обязательная управляющая зависимость (requires) входит в замыкание; исключённая — конфликт с путём", () => {
@@ -60,7 +62,7 @@ test("вердикт №2 п.1: адреса внешних входов не з
   assert.deepEqual(a.horizon.externalInputs.filter(x => x.connector === "cn-runtime").map(x => x.consumer).sort(), want, "у КАЖДОГО потребителя горизонта адрес внешнего входа записан"); assert.ok(H.has("n-runtime"), "источник вошёл в горизонт по управляющей зависимости — входы не потеряны"); });
 
 test("вердикт №2 п.2: доступный результат без принятого раскрытия границей не становится — блок добирается в горизонт ради раскрытия, и каркас не отказывает", () => {
-  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const basisOf = id => ({ id: `artifact-receipt:${id}`, revision: 1, hash: "e".repeat(64) });
+  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const basisOf = basis;
   const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", basisOf("n-check")]]) });            // refined пуст, принятого слоя нет
   assert.ok(r.horizon.nodes.includes("n-check")); assert.deepEqual([r.horizon.refinement["n-check"], r.horizon.execution["n-check"].state], ["needed", "available"]); assert.deepEqual(r.horizon.boundary, []);
   const H = new Set(r.horizon.nodes); assert.doesNotThrow(() => fillObligations(UPPER, frameObligations(UPPER, H), null, [], H, { graph: null, frame: null }), "F4.2 не встречает нераскрытого производителя вне горизонта");
@@ -68,8 +70,16 @@ test("вердикт №2 п.2: доступный результат без п�
   assert.deepEqual(both.horizon.nodes, [root]); assert.ok(both.horizon.boundary.length > 0, "граница — только при результате И принятом раскрытии"); });
 
 test("вердикт №3: основание готовности доезжает до результата у блока ВНУТРИ горизонта; смена квитанции — другой хэш горизонта", () => {
-  const ref = (revision, hash) => ({ id: "artifact-receipt:n-check", revision, hash }); const run = b => closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", b]]) });
+  const ref = (revision, hash) => basis("n-check", revision, hash); const run = b => closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", b]]) });
   const a = run(ref(1, "a".repeat(64))), b = run(ref(2, "b".repeat(64))); assert.equal(gateHorizon(a).passed, true); assert.deepEqual(a.horizon.nodes, b.horizon.nodes);
   assert.deepEqual(a.horizon.execution["n-check"], { state: "available", basis: ref(1, "a".repeat(64)) }, "ссылка на квитанцию сохранена точно"); assert.deepEqual(b.horizon.execution["n-check"].basis, ref(2, "b".repeat(64)));
   assert.notEqual(a.horizon.hash, b.horizon.hash, "другое основание — другой горизонт"); assert.equal(a.horizon.hash, run(ref(1, "a".repeat(64))).horizon.hash, "то же основание — тот же хэш");
   const other = a.horizon.nodes.find(n => n !== "n-check"); assert.deepEqual(a.horizon.execution[other], { state: "needed" }, "у неисполненного блока основания нет"); });
+
+test("вердикт №1 по M7, п.3: основание готовности называет каждый результат блока, нужный горизонту; «любая квитанция блока» и непокрытый результат — отказ", () => {
+  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const full = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), refined: REFINED, available: new Map(BLOCKS.filter(b => b.id !== root).map(b => [b.id, basis(b.id)])) });
+  assert.equal(gateHorizon(full).passed, true); const edge = full.horizon.boundary[0]; const used = UPPER.connectors.find(c => c.bindings.some(b => b.level === 1 && b.producer.node === edge.block && b.consumers.some(e => e.node === root)));
+  assert.ok(used, "у корня есть вход от блока границы"); const partial = new Map(BLOCKS.filter(b => b.id !== root).map(b => [b.id, basis(b.id)])); const cut = { ...basis(edge.block) }; delete cut[used.artifact]; cut["посторонний-артефакт"] = { id: "artifact-receipt:x", revision: 1, hash: "e".repeat(64) }; partial.set(edge.block, cut);
+  const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), refined: REFINED, available: partial }); assert.deepEqual(gateHorizon(r).codes, ["horizon_available_uncovered"]);
+  assert.deepEqual(r.refusals.map(x => x.target), [`${edge.block}:${used.artifact}`], "отказ адресный: блок и непокрытый результат");
+  assert.ok(gateHorizon(closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", { id: "artifact-receipt:n-check", revision: 1, hash: "e".repeat(64) }]]) })).codes.includes("horizon_available_unproven"), "одна ссылка «на блок» основанием не считается"); });
