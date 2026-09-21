@@ -35,7 +35,7 @@ test("горизонт меняет статус, а не состав проб�
 
 test("каркас работ: потребитель пробела — операция, горизонт — блоки; пробел привязан к блоку операции, сосед сохранён", () => {
   const g3 = gardenPlus(); const acc2 = (({ level, ...g }) => g)(projectGraph(g3, 2)); const upper = F.upperOf(acc2, 3); const zone = new Set(["garden-prep-operation", "garden-produce-operation", "garden-consume-operation"]);
-  const ob = F.frameObligations(upper, zone, 3); const open = F.fillObligations(upper, ob, null, [], zone, { graph: null, frame: null }, 3).open; const src = { frameGaps: F.openObligationsToGaps(ob, open), horizon: { nodes: ["garden-consume-block", "garden-produce-block"] }, graph: acc2 };
+  const ob = F.frameObligations(upper, zone, 3); const open = F.fillObligations(upper, ob, null, [], zone, { graph: null, frame: null }, 3).open; const src = { inputResult: { input: { features: [], contracts: [], questions: [] }, gaps: [], hash: null }, frameGaps: F.openObligationsToGaps(ob, open), horizon: { nodes: ["garden-consume-block", "garden-produce-block"] }, graph: acc2 };      // источники — явно, в том числе пустой вход
   const r = G.collectGaps(src); assert.deepEqual(r.refusals, []); assert.equal(G.gateGaps(r, src).passed, true); assert.equal(r.gaps.length, open.length);
   const end = r.gaps.find(g => g.node === "garden-produce-operation" && g.neighbors?.length); assert.deepEqual(end.consumers, ["garden-produce-block"]); assert.ok(end.neighbors.some(n => n.node === "garden-prep-operation" || n.node === "garden-consume-operation"), "в пробеле назван сосед по связи"); });
 
@@ -102,3 +102,32 @@ test("вердикт №2 п.3 и ОТСУТСТВИЕ: нет присланн�
   for (const [name, broken] of [["horizon", { ...SRC, horizon: undefined }], ["graph", { ...SRC, graph: {} }], ["frameGaps", { ...SRC, frameGaps: null }]]) { assert.deepEqual(G.collectGaps(broken).refusals, [{ code: "gap_source_missing", target: name }]);
     assert.deepEqual(G.gateGaps({ gaps: [], refusals: [] }, broken).codes, ["gap_source_missing"]); assert.deepEqual(G.gateAnswers(broken, []).codes, ["gap_source_missing"], "нет источника — не значит «пробелов нет»"); }
   const p2 = G.mergeLines(G.mergeLines([], live().gaps, 1).lines, live().gaps, 2); for (const pass of [1, 0, 1.5, "3", undefined]) { const late = G.mergeLines(p2.lines, [], pass); assert.deepEqual(late.refusals.map(x => x.code), ["pass_out_of_order"], String(pass)); assert.deepEqual(late.lines, p2.lines); } });
+
+test("вердикт №3 п.1: обязательный источник приходит ЯВНО — удалённое поле frameGaps или вход без списков дают отказ, а не «пробелов нет»; явный пустой список — полученный пустой результат", () => {
+  assert.ok(G.gateAnswers(SRC, []).codes.includes("answer_missing_for_blocking_gap")); const { frameGaps, ...noFrame } = SRC; assert.ok(frameGaps.length > 0);
+  assert.deepEqual(G.collectGaps(noFrame), { gaps: [], refusals: [{ code: "gap_source_missing", target: "frameGaps" }] }, "сценарий ревью: поле удалено"); assert.deepEqual(G.gateGaps({ gaps: [], refusals: [] }, noFrame).codes, ["gap_source_missing"]); assert.deepEqual(G.gateAnswers(noFrame, []).codes, ["gap_source_missing"]);
+  for (const [target, broken] of [["frameGaps", { ...SRC, frameGaps: undefined }], ["inputResult", { ...SRC, inputResult: undefined }], ["inputResult", { ...SRC, inputResult: null }], ["inputResult", { ...SRC, inputResult: { input: INPUT.input } }],
+    ["inputResult.input", { ...SRC, inputResult: { ...INPUT, input: { ...INPUT.input, questions: undefined } } }], ["horizon", undefined]]) assert.deepEqual(G.collectGaps(broken).refusals, [{ code: "gap_source_missing", target }], target);
+  const empty = { ...SRC, frameGaps: [] }; const r = G.collectGaps(empty); assert.deepEqual(r.refusals, []); assert.ok(r.gaps.length > 0 && !r.gaps.some(g => g.origins.includes("frame"))); assert.equal(G.gateGaps(r, empty).passed, true); });
+
+test("вердикт №3 п.2: каждое известное поле производителя защищено отдельно — при потребителе прозой вид знания не меняется, при известном потребителе не меняется узел; недостающее заполняется", () => {
+  const stages = load(); const [a, b] = stages.discovery.fields.preparation.unknowns; a.kind = "repository-fact"; b.consumer = HOR.nodes[0]; delete b.kind; const joined = buildOmInput(stages); assert.deepEqual(joined.refusals, []);
+  const qa = `discovery:${a.id}`, qb = `discovery:${b.id}`; const before = G.collectGaps(sourcesFor(HOR, joined)).gaps; assert.ok([qa, qb].every(id => before.find(g => g.target === id).code === "question_unaddressed"), "оба вопроса адресованы не полностью");
+  const bypass = G.applyAddressing(joined, [{ question: qa, consumer: HOR.nodes[0], kind: "post-implementation-proof", basis: ref(1) }], UPPER); assert.deepEqual(bypass.refusals.map(x => x.code), ["addressing_overrides_producer"], "сценарий ревью: известный вид знания не теряется");
+  assert.equal(bypass.result.hash, joined.hash); assert.deepEqual(G.applyAddressing(joined, [{ question: qb, consumer: HOR.nodes[1], kind: "repository-fact", basis: ref(1) }], UPPER).refusals.map(x => x.code), ["addressing_overrides_producer"], "известный потребитель не переписывается");
+  const ok = G.applyAddressing(joined, [{ question: qa, consumer: HOR.nodes[0], kind: "repository-fact", basis: ref(1) }, { question: qb, consumer: HOR.nodes[0], kind: "owner-decision", basis: ref(2) }], UPPER); assert.deepEqual(ok.refusals, []);
+  const src = sourcesFor(HOR, ok.result); const after = G.collectGaps(src).gaps; assert.deepEqual([qa, qb].map(id => { const g = after.find(x => x.target === id); return [g.code, g.kind, g.blocking]; }), [["predecessor_question", "repository-fact", true], ["predecessor_question", "owner-decision", true]]);
+  assert.ok(G.gateAnswers(src, []).codes.includes("answer_missing_for_blocking_gap"), "вопрос остался блокирующим: запрет отсрочки не обойдён"); });
+
+test("вердикт №3 п.3: запоздавший проход не отменяет более позднее закрытие или отсрочку — порядок сверяется по последнему ОБРАБОТАННОМУ состоянию линии", () => {
+  const gaps = live().gaps; const one = gaps.find(g => !g.deferral); const rest = gaps.filter(g => g.id !== one.id); const p1 = G.mergeLines([], gaps, 1).lines; const closed = G.mergeLines(p1, rest, 5, [{ id: one.id, reason: "filled", basis: ref(1) }]); assert.deepEqual(closed.refusals, []);
+  const line = closed.lines.find(l => l.id === one.id); assert.deepEqual([line.status, line.closedPass, line.lastPass, line.statePass], ["closed", 5, 1, 5], "появлялся на проходе 1, состояние обработано на проходе 5");
+  const late = G.mergeLines(closed.lines, gaps, 2); assert.deepEqual(late.refusals.map(x => x.code), ["pass_out_of_order"], "сценарий ревью: проход 2 после закрытия на проходе 5"); assert.deepEqual(late.lines, closed.lines, "закрытие и его основание сохранены");
+  const away = G.mergeLines(p1, rest, 5); assert.deepEqual((({ status, scope, statePass }) => [status, scope, statePass])(away.lines.find(l => l.id === one.id)), ["deferred", "absent", 5]);
+  const late2 = G.mergeLines(away.lines, gaps, 2); assert.deepEqual(late2.refusals.map(x => x.code), ["pass_out_of_order"]); assert.deepEqual(late2.lines, away.lines, "отсрочка сохранена");
+  const next = G.mergeLines(closed.lines, gaps, 6).lines.find(l => l.id === one.id); assert.deepEqual([next.status, next.reopened, next.statePass, next.passes], ["open", 1, 6, 2], "законный следующий проход открывает линию заново");
+  assert.deepEqual(G.mergeLines(closed.lines, rest, 5, [{ id: one.id, reason: "filled", basis: ref(1) }]).lines, closed.lines, "повтор прохода 5 ничего не меняет");
+  // сценарий ревью в чистом виде — ЕДИНСТВЕННАЯ линия: соседние линии с поздним появлением отказ не подменяют
+  const solo = G.mergeLines(G.mergeLines([], [one], 1).lines, [], 5, [{ id: one.id, reason: "filled", basis: ref(1) }]).lines; assert.deepEqual([solo[0].lastPass, solo[0].statePass, solo[0].status], [1, 5, "closed"]);
+  const soloLate = G.mergeLines(solo, [one], 2); assert.deepEqual(soloLate.refusals.map(x => x.code), ["pass_out_of_order"]); assert.deepEqual(soloLate.lines, solo);
+  const soloAway = G.mergeLines(G.mergeLines([], [one], 1).lines, [], 5).lines; const soloAwayLate = G.mergeLines(soloAway, [one], 2); assert.deepEqual([soloAwayLate.refusals.map(x => x.code), soloAwayLate.lines], [["pass_out_of_order"], soloAway]); });

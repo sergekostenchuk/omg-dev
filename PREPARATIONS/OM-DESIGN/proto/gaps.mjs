@@ -29,12 +29,15 @@ export const gapId = (target, field) => hashJson([target, field]);
  *  узел любого уровня → его блок; механизм OM (например, M8) — потребитель-механизм. Нет ни одного потребителя — отказ, в горизонте нет — отсрочка.
  *  Несколько источников на одно поле одной цели: одинаковая классификация — одна запись с объединёнными потребителями и происхождением;
  *  противоречащая — отказ gap_class_conflict (первый источник молча не выигрывает). */
-export function collectGaps({ inputResult = null, frameGaps = [], horizon, graph } = {}) {
-  // ОТСУТСТВИЕ: без горизонта или графа набор не выводится — это отказ, а не «пробелов нет»
-  if (!Array.isArray(horizon?.nodes) || !Array.isArray(graph?.nodes) || !Array.isArray(frameGaps)) return { gaps: [], refusals: [{ code: "gap_source_missing", target: !Array.isArray(horizon?.nodes) ? "horizon" : !Array.isArray(graph?.nodes) ? "graph" : "frameGaps" }] };
+export function collectGaps({ inputResult, frameGaps, horizon, graph } = {}) {
+  // ОТСУТСТВИЕ: каждый источник приходит ЯВНО — значений по умолчанию нет (вердикт №3 по M5, п.1). Нет поля — отказ gap_source_missing, а не «пробелов нет»;
+  // явный пустой список — полученный пустой результат источника
+  const missing = !Array.isArray(horizon?.nodes) ? "horizon" : !Array.isArray(graph?.nodes) ? "graph" : !Array.isArray(frameGaps) ? "frameGaps"
+    : !inputResult || !Array.isArray(inputResult.gaps) || !inputResult.input ? "inputResult" : !Array.isArray(inputResult.input.questions) || !Array.isArray(inputResult.input.features) ? "inputResult.input" : null;
+  if (missing) return { gaps: [], refusals: [{ code: "gap_source_missing", target: missing }] };
   const refusals = [], found = new Map(); const H = new Set(horizon.nodes); const N = new Map(graph.nodes.map(n => [n.id, n]));
   const blockOf = id => { let n = N.get(id); while (n && n.kind !== "block") n = N.get(n.parent); return n?.id ?? null; };
-  const input = inputResult?.input ?? { features: [], contracts: [] }; const byOutcome = o => graph.nodes.filter(n => n.kind === "block" && n.outcome === o).map(n => n.id);
+  const input = inputResult.input; const byOutcome = o => graph.nodes.filter(n => n.kind === "block" && n.outcome === o).map(n => n.id);
   const featureBlocks = i => byOutcome(input.features.find(f => f.index === i)?.outcome); const reqBlocks = r => input.features.filter(f => (f.requirementIds ?? []).includes(r)).flatMap(f => byOutcome(f.outcome));
   const resolve = c => typeof c === "string" ? [blockOf(c)].filter(Boolean) : Array.isArray(c?.features) ? c.features.flatMap(f => featureBlocks(f.feature)) : c?.requirement !== undefined ? reqBlocks(c.requirement) : [];
   const push = (src, origin) => { const cls = Object.hasOwn(GAP_CLASSES, String(src.code)) ? GAP_CLASSES[src.code] : null; if (!cls) { refusals.push({ code: "gap_class_unknown", target: src.code }); return; }
@@ -46,9 +49,9 @@ export function collectGaps({ inputResult = null, frameGaps = [], horizon, graph
       prior.consumers = [...new Set([...prior.consumers, ...consumers])].sort(); prior.origins = [...new Set([...prior.origins, origin])].sort(); return; }
     found.set(id, { id, target: src.target, field: cls.field, code: src.code, kind, routes: [...ROUTES[kind]], moment: cls.moment ?? MOMENT[kind], consumers, ...(mechanism ? { mechanism } : {}), origins: [origin],
       ...(src.node ? { node: src.node } : {}), ...(src.neighbors ? { neighbors: structuredClone(src.neighbors) } : {}), ...(src.addressedBy ? { addressedBy: structuredClone(src.addressedBy) } : {}) }); };
-  for (const g of inputResult?.gaps ?? []) push(g, "input");
+  for (const g of inputResult.gaps) push(g, "input");
   // ПУТИ: четвёртый источник — вопросы предыдущих стадий. Потребитель прозой узлом не считается: такой вопрос сначала адресуется (проектное решение, проверяемое кодом)
-  for (const q of input.questions ?? []) N.has(q.consumer) && KNOWLEDGE_KINDS.includes(q.kind) ? push({ code: "predecessor_question", target: q.id, kind: q.kind, consumer: q.consumer, addressedBy: q.addressedBy }, "question")
+  for (const q of input.questions) N.has(q.consumer) && KNOWLEDGE_KINDS.includes(q.kind) ? push({ code: "predecessor_question", target: q.id, kind: q.kind, consumer: q.consumer, addressedBy: q.addressedBy }, "question")
     : push({ code: "question_unaddressed", target: q.id, consumer: { mechanism: "M5: адресация вопроса предшественника" } }, "question");
   for (const g of frameGaps) push({ code: "obligation_open", target: g.target, consumer: g.consumer, node: g.consumer, neighbors: g.neighbors }, "frame");
   const gaps = [...found.values()].map(g => { const active = Boolean(g.mechanism) || g.consumers.some(b => H.has(b));
@@ -65,6 +68,8 @@ export function applyAddressing(inputResult, decisions, graph) {
   for (const d of decisions) { const q = state.get(d?.question);
     if (!q || !known.has(d.question) || by.has(d.question) || !N.has(d.consumer) || !KNOWLEDGE_KINDS.includes(d.kind) || !isRef(d.basis)) { refusals.push({ code: "addressing_invalid", target: String(d?.question) }); continue; }
     // переход только из состояния «не адресован»: адресация заполняет НЕДОСТАЮЩИЙ адрес и не переписывает ни сведения производителя, ни принятую адресацию
+    // каждое УЖЕ ИЗВЕСТНОЕ поле сохраняется независимо от полноты остальных (вердикт №3 по M5, п.2): нет потребителя — не повод менять вид знания, и наоборот
+    if (!q.addressedBy && ((KNOWLEDGE_KINDS.includes(q.kind) && d.kind !== q.kind) || (N.has(q.consumer) && d.consumer !== q.consumer))) { refusals.push({ code: "addressing_overrides_producer", target: q.id }); continue; }
     if (addressed(q)) { if (!q.addressedBy) refusals.push({ code: "addressing_overrides_producer", target: q.id });
       else if (q.consumer !== d.consumer || q.kind !== d.kind || hashJson(q.addressedBy) !== hashJson(d.basis)) refusals.push({ code: "addressing_conflict", target: q.id }); continue; }      // то же решение повторно — без изменений
     by.set(d.question, d); }
@@ -78,13 +83,15 @@ export function applyAddressing(inputResult, decisions, graph) {
  *  горизонта, каркас отдаёт только свою зону), — отложен с пометкой «вне области проверки», а не закрыт. Фиксация прохода идемпотентна: повтор
  *  того же номера прохода счётчик не меняет. Счётчик проходов — не счётчик попыток серии G7: тот ведётся отдельно (admission.mjs). */
 export function mergeLines(previous, gaps, pass, closures = []) {
-  if (!Number.isSafeInteger(pass) || pass < 1 || previous.some(l => l.lastPass > pass)) return { lines: previous, refusals: [{ code: "pass_out_of_order", target: String(pass) }] };      // проход старше уже зафиксированного линий не меняет
+  // statePass — последний проход, обработавший СОСТОЯНИЕ линии (появление, отсрочка, закрытие); lastPass — последнее появление пробела. Запоздавший проход
+  // сверяется со statePass: более позднее закрытие или отсрочка им не отменяются (вердикт №3 по M5, п.3)
+  if (!Number.isSafeInteger(pass) || pass < 1 || previous.some(l => (l.statePass ?? l.lastPass) > pass)) return { lines: previous, refusals: [{ code: "pass_out_of_order", target: String(pass) }] };
   const lines = new Map(previous.map(l => [l.id, { ...l }])); const now = new Set(gaps.map(g => g.id)); const refusals = []; const close = new Map();
   for (const c of closures) { if (!lines.has(c.id) || now.has(c.id) || !["filled", "cancelled"].includes(c.reason) || !isRef(c.basis) || close.has(c.id)) { refusals.push({ code: "closure_invalid", target: String(c.id) }); continue; } close.set(c.id, c); }
   for (const g of gaps) { const l = lines.get(g.id); const status = g.deferral ? "deferred" : "open"; const { scope, closedPass, closedBy, basis, ...rest } = l ?? {};
-    lines.set(g.id, l ? { ...rest, passes: l.passes + (l.lastPass === pass ? 0 : 1), status, lastPass: pass, reopened: l.reopened + (l.status === "closed" ? 1 : 0) } : { id: g.id, target: g.target, field: g.field, firstPass: pass, lastPass: pass, passes: 1, status, reopened: 0 }); }
-  for (const l of [...lines.values()]) { if (now.has(l.id) || l.status === "closed") continue; const c = close.get(l.id);
-    lines.set(l.id, c ? { ...l, status: "closed", closedPass: pass, closedBy: c.reason, basis: c.basis } : { ...l, status: "deferred", scope: "absent" }); }
+    lines.set(g.id, l ? { ...rest, passes: l.passes + (l.lastPass === pass ? 0 : 1), status, lastPass: pass, statePass: pass, reopened: l.reopened + (l.status === "closed" ? 1 : 0) } : { id: g.id, target: g.target, field: g.field, firstPass: pass, lastPass: pass, statePass: pass, passes: 1, status, reopened: 0 }); }
+  for (const l of [...lines.values()]) { if (now.has(l.id)) continue; if (l.status === "closed") { lines.set(l.id, { ...l, statePass: pass }); continue; } const c = close.get(l.id);
+    lines.set(l.id, c ? { ...l, status: "closed", closedPass: pass, closedBy: c.reason, basis: structuredClone(c.basis), statePass: pass } : { ...l, status: "deferred", scope: "absent", statePass: pass }); }
   return { lines: [...lines.values()].sort((a, b) => (a.id < b.id ? -1 : 1)), refusals };
 }
 
