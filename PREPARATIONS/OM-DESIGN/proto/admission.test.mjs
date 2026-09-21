@@ -10,66 +10,89 @@ const fresh = () => { const dir = mkdtempSync(join(tmpdir(), "om-adm-")); const 
 const basis = store => [reference(store.get("policy") ?? store.write({ id: "policy", kind: "om-policy", expected: 0, value: { version: 1 } }))];
 const cap = (store, tokens, kind = "guaranteed") => ({ kind, tokens, basis: basis(store), explanation: "жёсткий предел вызова, заданный средой" });
 const U = (i, o) => ({ inputTokens: i, outputTokens: o, cachedInputTokens: null, reasoningOutputTokens: null });
-const call = (store, id, block, tokens, extra = {}) => A.admitCall(store, P, { call: id, block, series: "s1", horizon: "H1", estimate: cap(store, tokens), ...extra });
+const DISPATCH = { adapter: { id: "adapter:codex", revision: 1, hash: "a".repeat(64) }, config: { id: "adapter-config:codex", revision: 3, hash: "c".repeat(64) } };
+const open = (store, { budget, blockCap, callCap }) => { A.openFuses(store, P, { blockCap, callCap: callCap ?? blockCap }); return A.openAllocation(store, P, { limit: budget }, "решение владельца: бюджет горизонта"); };
+const call = (store, id, block, tokens, extra = {}) => A.admitCall(store, P, { call: id, block, series: "s1", horizon: "H1", estimate: cap(store, tokens), dispatch: DISPATCH, ...extra });
 const refusal = (fn, code) => assert.throws(fn, e => { assert.equal(e.code, code, `ожидался ${code}, получено ${e.code}: ${e.message}`); return true; });
 const left = store => A.usageOf(store, P);
+const blockRow = (store, block) => left(store).groups[A.groupsOf(A.activeAllocation(store, P), block).block] ?? { measured: 0, reserved: 0 };
 
 test("контрпример ревью: лимит 100, два резерва по 60 — второй не допускается, пока первый не закрыт", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); call(store, "call-1", "n-state", 60);
+  const { store, done } = fresh(); try { open(store, { budget: 100, blockCap: 100 }); call(store, "call-1", "n-state", 60);
     refusal(() => call(store, "call-2", "n-recovery", 60), "call_not_admitted_horizon_budget"); assert.equal(left(store).reserved, 60); assert.equal(store.get("call-2"), null, "недопущенный вызов не создан"); } finally { done(); } });
 
 test("одновременность: два допуска по одному снимку не проходят оба — второй пересчитывается и получает отказ", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); let raced = false;
-    refusal(() => A.admitCall(store, P, { call: "slow", block: "n-state", series: "s1", horizon: "H1", estimate: cap(store, 60) },
+  const { store, done } = fresh(); try { open(store, { budget: 100, blockCap: 100 }); let raced = false;
+    refusal(() => A.admitCall(store, P, { call: "slow", block: "n-state", series: "s1", horizon: "H1", estimate: cap(store, 60), dispatch: DISPATCH },
       { beforeWrite: () => { if (!raced) { raced = true; call(store, "fast", "n-state", 60); } } }), "call_not_admitted_block_cap");
     assert.ok(store.get("om-admission:fast")); assert.equal(store.get("om-admission:slow"), null); assert.equal(left(store).reserved, 60); } finally { done(); } });
 
-test("потолок блока действует отдельно от бюджета линии; предел одного вызова — отдельный предохранитель", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 1000, blockCap: 100, callCap: 80 }); call(store, "b1", "n-state", 70);
+test("потолок блока действует отдельно от выделения; предел одного вызова — отдельный предохранитель", () => {
+  const { store, done } = fresh(); try { open(store, { budget: 1000, blockCap: 100, callCap: 80 }); call(store, "b1", "n-state", 70);
     refusal(() => call(store, "b2", "n-state", 40), "call_not_admitted_block_cap"); call(store, "other", "n-recovery", 40); refusal(() => call(store, "big", "n-check", 90), "call_not_admitted_call_cap"); } finally { done(); } });
 
-test("вердикт №1 п.1: новая версия горизонта НЕ обнуляет учёт блока — расход и резервы прежней версии считаются", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 1000, blockCap: 100 });
-    call(store, "h1-a", "n-state", 40); A.settleCall(store, "h1-a", U(30, 10)); call(store, "h1-b", "n-state", 20);                 // H1: потрачено 40, зарезервировано 20
-    refusal(() => call(store, "h2-a", "n-state", 60, { horizon: "H2" }), "call_not_admitted_block_cap");                            // H2: тот же блок — 40 + 20 + 60 > 100
-    call(store, "h2-b", "n-state", 40, { horizon: "H2" }); const row = left(store).groups["n-state"]; assert.deepEqual([row.measured, row.reserved], [40, 60]); } finally { done(); } });
+test("смена версии выбора НЕ обнуляет учёт блока и НЕ создаёт нового выделения", () => {
+  const { store, done } = fresh(); try { const alloc = open(store, { budget: 1000, blockCap: 100 });
+    call(store, "h1-a", "n-state", 40); A.settleCall(store, "h1-a", U(30, 10)); call(store, "h1-b", "n-state", 20);
+    refusal(() => call(store, "h2-a", "n-state", 60, { horizon: "H2" }), "call_not_admitted_block_cap"); call(store, "h2-b", "n-state", 40, { horizon: "H2" });
+    assert.deepEqual([blockRow(store, "n-state").measured, blockRow(store, "n-state").reserved], [40, 60]); assert.equal(A.activeAllocation(store, P).id, alloc.id, "выделение то же"); } finally { done(); } });
+
+test("вердикт №2 п.3: бюджет горизонта — это ВЫДЕЛЕНИЕ: новое создаётся только решением владельца с основанием и даёт свой лимит; общий проектный потолок не вводится", () => {
+  const { store, done } = fresh(); try { const a1 = open(store, { budget: 100, blockCap: 100 }); call(store, "a1-x", "n-state", 60); call(store, "a1-y", "n-recovery", 40);
+    refusal(() => call(store, "a1-z", "n-check", 10), "call_not_admitted_horizon_budget");
+    refusal(() => A.openAllocation(store, P, { limit: 100 }, " "), "allocation_invalid"); refusal(() => A.openAllocation(store, P, { limit: "100" }, "основание"), "allocation_invalid");
+    const a2 = A.openAllocation(store, P, { limit: 100 }, "решение владельца: бюджет следующего горизонта"); assert.equal(store.get(a1.id).value.state, "closed"); assert.notEqual(a2.id, a1.id);
+    const adm = call(store, "a2-x", "n-check", 80); assert.equal(adm.admission.value.allocation.id, a2.id); assert.equal(left(store).reserved, 180, "резервы прежнего выделения остались в общей ведомости");
+    A.settleCall(store, "a1-x", U(50, 5)); assert.equal(left(store).groups[A.groupsOf(a1, "n-state").alloc].measured, 55, "вызов прежнего выделения закрывается обычным порядком в СВОЙ учёт");
+    refusal(() => call(store, "a2-y", "n-state", 30), "call_not_admitted_horizon_budget"); } finally { done(); } });
 
 test("неизвестный расход резерв НЕ освобождает; известный — закрывает; перерасход виден", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); call(store, "c1", "n-state", 60);
+  const { store, done } = fresh(); try { open(store, { budget: 100, blockCap: 100 }); call(store, "c1", "n-state", 60);
     A.settleCall(store, "c1", null, "failed"); assert.equal(left(store).reserved, 60, "сбой без данных о расходе не обнуляет резерв"); refusal(() => call(store, "c2", "n-state", 60), "call_not_admitted_block_cap");
     A.settleCall(store, "c1", U(30, 10)); const u = left(store); assert.deepEqual([u.measured, u.reserved], [40, 0]);
     call(store, "c3", "n-state", 50); assert.equal(A.settleCall(store, "c3", U(50, 9)).code, "spend_over_reserve"); assert.deepEqual(A.auditAdmissions(store, P, ["c1", "c3"]).map(f => f.code), ["spend_over_reserve"]); } finally { done(); } });
 
-test("вердикт №1 п.2: закрытие однократно — расход нельзя уменьшить повторной доставкой и нельзя записать отрицательным", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); call(store, "k", "n-state", 100); A.settleCall(store, "k", U(60, 20));
+test("закрытие однократно — расход нельзя уменьшить повторной доставкой и нельзя записать отрицательным", () => {
+  const { store, done } = fresh(); try { open(store, { budget: 100, blockCap: 100 }); call(store, "k", "n-state", 100); A.settleCall(store, "k", U(60, 20));
     refusal(() => A.settleCall(store, "k", U(0, 0)), "settlement_conflict"); assert.equal(left(store).measured, 80); refusal(() => call(store, "k2", "n-state", 100), "call_not_admitted_block_cap");
-    assert.equal(A.settleCall(store, "k", U(60, 20)).repeated, true, "тот же результат возвращает прежний исход"); assert.equal(left(store).measured, 80);
-    const { store: s2, done: d2 } = fresh(); try { A.openFuses(s2, P, { horizonBudget: 100, blockCap: 100 }); call(s2, "neg", "n-state", 50);
+    assert.equal(A.settleCall(store, "k", U(60, 20)).repeated, true); assert.equal(left(store).measured, 80);
+    const { store: s2, done: d2 } = fresh(); try { open(s2, { budget: 100, blockCap: 100 }); call(s2, "neg", "n-state", 50);
       refusal(() => A.settleCall(s2, "neg", U(-10, 0)), "usage_invalid"); refusal(() => A.settleCall(s2, "neg", { inputTokens: 5, outputTokens: 5 }), "usage_invalid"); assert.equal(A.usageOf(s2, P).reserved, 50); } finally { d2(); } } finally { done(); } });
 
-test("вердикт №1 п.3: аудит вычисляет перерасход из канонического расхода и резерва, а не доверяет статусному полю", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); call(store, "w", "n-state", 60); const rec = store.get("w");
-    store.write({ id: "w", kind: "model-call", expected: rec.revision, value: { ...rec.value, status: "succeeded", usage: U(60, 10) } });     // расход записан в обход закрытия, отметки о перерасходе нет нигде
+test("аудит вычисляет перерасход из канонического расхода и резерва, а не доверяет статусному полю", () => {
+  const { store, done } = fresh(); try { open(store, { budget: 100, blockCap: 100 }); call(store, "w", "n-state", 60); const rec = store.get("w");
+    store.write({ id: "w", kind: "model-call", expected: rec.revision, value: { ...rec.value, status: "succeeded", usage: U(60, 10) } });
     assert.deepEqual(A.auditAdmissions(store, P, ["w"]), [{ code: "spend_over_reserve", call: "w", used: 70, reserve: 60 }]); } finally { done(); } });
 
-test("вердикт №1 п.4: повтор — это тот же вызов в том же контексте; то же имя в другом контексте — отказ без нового резерва", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 1000, blockCap: 1000 }); const a = call(store, "d1", "n-state", 10); const b = call(store, "d1", "n-state", 10);
+test("вердикт №2 п.1: неверные значения предохранителей не становятся действующими и ограничений не отключают", () => {
+  const { store, done } = fresh(); try { refusal(() => A.openFuses(store, P, { blockCap: "not-a-number", callCap: "not-a-number" }), "fuses_invalid"); refusal(() => A.openFuses(store, P, { blockCap: 0 }), "fuses_invalid"); refusal(() => A.openFuses(store, P, { blockCap: 10, callCap: 20 }), "fuses_invalid");
+    open(store, { budget: 100, blockCap: 100 }); for (const patch of [{ blockCap: "not-a-number" }, { callCap: -5 }, { blockCap: 1.5 }, { horizonBudget: "not-a-number" }, { blockCap: null }]) refusal(() => A.raiseFuses(store, P, patch, "основание"), "fuses_invalid");
+    assert.equal(store.get("om-fuses:proto").revision, 1, "неверная версия не записана"); call(store, "v1", "n-state", 60); refusal(() => call(store, "v2", "n-recovery", 60), "call_not_admitted_horizon_budget"); } finally { done(); } });
+
+test("вердикт №2 п.2: повтор — тот же вызов с тем же контрактом отправки; другой адаптер, конфигурация или основание оценки — конфликт идентичности", () => {
+  const { store, done } = fresh(); try { open(store, { budget: 1000, blockCap: 1000 }); const a = call(store, "d1", "n-state", 10); const b = call(store, "d1", "n-state", 10);
     assert.equal(b.repeated, true); assert.equal(b.admission.hash, a.admission.hash); assert.equal(left(store).reserved, 10);
-    refusal(() => call(store, "d1", "n-recovery", 10), "call_identity_conflict"); refusal(() => call(store, "d1", "n-state", 900), "call_identity_conflict");
-    refusal(() => A.admitCall(store, P, { call: "d1", block: "n-state", series: "другая", horizon: "H1", estimate: cap(store, 10) }), "call_identity_conflict"); assert.equal(left(store).reserved, 10);
+    const other = { ...DISPATCH, adapter: { ...DISPATCH.adapter, id: "adapter:other" } }; refusal(() => call(store, "d1", "n-state", 10, { dispatch: other }), "call_identity_conflict");
+    refusal(() => call(store, "d1", "n-state", 10, { dispatch: { ...DISPATCH, config: { ...DISPATCH.config, revision: 4 } } }), "call_identity_conflict");
+    const otherBasis = { ...cap(store, 10), basis: [{ id: "policy-b", revision: 1, hash: "b".repeat(64) }] }; refusal(() => call(store, "d1", "n-state", 10, { estimate: otherBasis }), "call_identity_conflict");
+    refusal(() => call(store, "d1", "n-recovery", 10), "call_identity_conflict"); refusal(() => call(store, "d1", "n-state", 900), "call_identity_conflict"); assert.equal(left(store).reserved, 10);
+    assert.equal(store.get("d1").value.dispatch.adapter.id, "adapter:codex"); refusal(() => call(store, "nodispatch", "n-state", 10, { dispatch: null }), "dispatch_contract_missing");
     assert.deepEqual(A.auditAdmissions(store, P, ["d1", "ghost"]).map(f => f.code), ["call_without_admission"]); } finally { done(); } });
 
-test("адаптер без гарантированного предела не допускается; отказ сохраняется остановкой с точной версией предохранителей", async () => {
-  const { store, done } = fresh(); try { const f = A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 });
-    refusal(() => A.admitCall(store, P, { call: "e1", block: "n-state", series: "s", horizon: "H1", estimate: cap(store, 10, "estimated") }), "call_cap_unenforceable");
-    call(store, "full", "n-state", 100); refusal(() => call(store, "over", "n-state", 1), "call_not_admitted_block_cap");
-    const stops = store.get(`om-refusal:${(await import("../../../dist/src/canonical.js")).hashJson(["over", "call_not_admitted_block_cap", reference(f)])}`); assert.ok(stops && stops.value.resume && stops.value.fuses.revision === 1); } finally { done(); } });
+test("КАЖДЫЙ отказ допуска сохраняется остановкой с причиной, точными версиями лимитов и точкой продолжения", async () => {
+  const { hashJson } = await import("../../../dist/src/canonical.js"); const { store, done } = fresh(); try { const f = A.openFuses(store, P, { blockCap: 100 });
+    refusal(() => call(store, "early", "n-state", 10), "allocation_missing"); const alloc = A.openAllocation(store, P, { limit: 100 }, "решение владельца");
+    refusal(() => A.admitCall(store, P, { call: "e1", block: "n-state", series: "s", horizon: "H1", estimate: cap(store, 10, "estimated"), dispatch: DISPATCH }), "call_cap_unenforceable");
+    call(store, "full", "n-state", 100); refusal(() => call(store, "over", "n-state", 1), "call_not_admitted_block_cap"); refusal(() => call(store, "full", "n-check", 100), "call_identity_conflict");
+    const saved = code => store.get(`om-refusal:${hashJson([code === "call_identity_conflict" ? "full" : code === "allocation_missing" ? "early" : code === "call_cap_unenforceable" ? "e1" : "over", code,
+      ["call_cap_unenforceable"].includes(code) ? null : reference(f), ["call_cap_unenforceable", "allocation_missing"].includes(code) ? null : reference(alloc)])}`);
+    for (const code of ["allocation_missing", "call_cap_unenforceable", "call_not_admitted_block_cap", "call_identity_conflict"]) { const r = saved(code); assert.ok(r, `остановка ${code} сохранена`); assert.ok(r.value.resume && r.value.message); } } finally { done(); } });
 
-test("повышение лимита — новая версия предохранителей по основанию: действует на последующие допуски, учёт не обнуляет", () => {
-  const { store, done } = fresh(); try { A.openFuses(store, P, { horizonBudget: 100, blockCap: 100 }); call(store, "p1", "n-state", 90); refusal(() => call(store, "p2", "n-state", 50), "call_not_admitted_block_cap");
-    refusal(() => A.openFuses(store, P, { horizonBudget: 1000, blockCap: 1000 }), "fuses_exist"); refusal(() => A.raiseFuses(store, P, { blockCap: 200, horizonBudget: 200 }, ""), "fuses_basis_missing");
-    A.raiseFuses(store, P, { blockCap: 200, horizonBudget: 200 }, "решение владельца: поднять потолок блока"); const adm = call(store, "p2", "n-state", 50);
-    assert.equal(adm.admission.value.fuses.revision, 2); assert.equal(store.get("om-admission:p1").value.fuses.revision, 1); assert.equal(left(store).reserved, 140); } finally { done(); } });
+test("повышение потолка — новая версия предохранителей по основанию: действует на последующие допуски, учёт не обнуляет", () => {
+  const { store, done } = fresh(); try { open(store, { budget: 1000, blockCap: 100 }); call(store, "p1", "n-state", 90); refusal(() => call(store, "p2", "n-state", 50), "call_not_admitted_block_cap");
+    refusal(() => A.openFuses(store, P, { blockCap: 1000 }), "fuses_exist"); refusal(() => A.raiseFuses(store, P, { blockCap: 200, callCap: 200 }, ""), "fuses_invalid");
+    A.raiseFuses(store, P, { blockCap: 200, callCap: 200 }, "решение владельца: поднять потолок блока"); const adm = call(store, "p2", "n-state", 50);
+    assert.equal(adm.admission.value.fuses.revision, 2); assert.equal(store.get("om-admission:p1").value.fuses.revision, 1); assert.equal(blockRow(store, "n-state").reserved, 140); } finally { done(); } });
 
 // ---- переход серий ----
 const slices = map => block => map[block];

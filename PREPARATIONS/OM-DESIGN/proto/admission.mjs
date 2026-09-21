@@ -12,50 +12,74 @@ const refuse = (code, message) => { throw new Refusal(code, message); };
 const plain = v => JSON.parse(JSON.stringify(v));
 const CODES = { budget_segment_exhausted: "call_not_admitted_horizon_budget", budget_owner_group_limit: "call_not_admitted_block_cap", budget_question_limit: "call_not_admitted_block_cap" };
 
-const LINE = "om-budget-line";                 // ОДНА ведомость на проект: учёт блока переживает смену версии горизонта и предохранителей
-const TECH = 9_000_000_000_000;                // технический предел готового сегмента; действующие лимиты — в записи предохранителей
-const fusesId = project => `om-fuses:${project}`;
-
-/** Предохранители — версии одной записи. Новая версия (решение владельца) действует на последующие допуски; учёт при этом НЕ обнуляется. */
-export function openFuses(store, project, { horizonBudget, blockCap, callCap = blockCap }, basis = "начальная политика") {
-  if (!budgetSegmentOrNull(store, project)) configureBudgetSegment(store, project, LINE, TECH, TECH);
-  const had = store.get(fusesId(project)); if (had) refuse("fuses_exist", "Предохранители уже открыты: менять их можно только новой версией (raiseFuses)");
-  return store.write({ id: fusesId(project), kind: "om-fuses", expected: 0, value: { project, horizonBudget, blockCap, callCap, basis } });
-}
-export function raiseFuses(store, project, patch, basis) { const f = store.get(fusesId(project)); if (!basis?.trim()) refuse("fuses_basis_missing", "Новая версия предохранителей требует основания (решение владельца)");
-  return store.write({ id: f.id, kind: "om-fuses", expected: f.revision, value: { ...f.value, ...patch, basis } }); }
+const LINE = "om-budget-line";                 // ОДНА ведомость на проект: учёт переживает смену версии выбора и версии предохранителей
+const TECH = 9_000_000_000_000;                // технический предел готового сегмента; действующие лимиты — в om-fuses и в выделении бюджета
+const fusesId = project => `om-fuses:${project}`, headId = project => `om-allocation-head:${project}`;
+const limit = v => Number.isSafeInteger(v) && v > 0;
 const budgetSegmentOrNull = (store, project) => { try { return budgetSegment(store, project, LINE); } catch { return null; } };
 export const usageOf = (store, project) => budgetUsage(store, budgetSegment(store, project, LINE));
-const contextOf = ({ project, block, series, horizon, estimate }) => hashJson([project, block, series, horizon, estimate.kind, estimate.tokens]);
+export const groupsOf = (allocation, block) => ({ alloc: `alloc:${allocation.id}`, block: `block:${block}@${allocation.id}` });
 
-/** Сохранённая остановка: отказ допуска пишется в журнал с причиной, точной версией предохранителей и точкой продолжения. */
-function stop(store, code, message, ctx, fuses) { const id = `om-refusal:${hashJson([ctx.call, code, fuses ? reference(fuses) : null])}`;
-  if (!store.get(id)) store.write({ id, kind: "om-refusal", expected: 0, value: plain({ code, message, call: ctx.call, block: ctx.block, series: ctx.series, horizon: ctx.horizon,
-    fuses: fuses ? reference(fuses) : null, resume: "новая версия предохранителей либо закрытие действующих резервов" }) });
+/** Предохранители политики — версии одной записи. Проверяется ВЕСЬ итоговый объект до записи: неверная версия действующей не становится. */
+function checkedFuses(value) { const extra = Object.keys(value).filter(k => !["project", "blockCap", "callCap", "basis"].includes(k));
+  if (extra.length || !limit(value.blockCap) || !limit(value.callCap) || value.callCap > value.blockCap || typeof value.basis !== "string" || !value.basis.trim())
+    refuse("fuses_invalid", "Предохранители — положительные целые blockCap ≥ callCap и непустое основание; посторонние поля не допускаются"); return value; }
+export function openFuses(store, project, { blockCap, callCap = blockCap }, basis = "начальная политика") {
+  if (!budgetSegmentOrNull(store, project)) configureBudgetSegment(store, project, LINE, TECH, TECH);
+  if (store.get(fusesId(project))) refuse("fuses_exist", "Предохранители уже открыты: менять их можно только новой версией (raiseFuses)");
+  return store.write({ id: fusesId(project), kind: "om-fuses", expected: 0, value: checkedFuses({ project, blockCap, callCap, basis }) }); }
+export function raiseFuses(store, project, patch, basis) { const f = store.get(fusesId(project)); if (!f) refuse("fuses_missing", "Предохранители проекта не открыты");
+  return store.write({ id: f.id, kind: "om-fuses", expected: f.revision, value: checkedFuses({ ...f.value, ...patch, basis }) }); }
+
+/** ВЫДЕЛЕНИЕ БЮДЖЕТА — устойчивая идентичность «бюджета горизонта». Создаётся только явным решением владельца с основанием, живёт сквозь
+ *  любые смены версии выбора; обычная смена choiceVersion нового выделения не создаёт. Прежнее закрывается для НОВЫХ допусков, его
+ *  незакрытые резервы остаются в общей ведомости и закрываются обычным порядком — двух независимых каналов расходования нет. */
+export function openAllocation(store, project, { limit: amount }, basis) {
+  if (!limit(amount) || typeof basis !== "string" || !basis.trim()) refuse("allocation_invalid", "Выделение — положительное целое и непустое основание (решение владельца)");
+  const head = store.get(headId(project)); const n = (head?.value.sequence ?? 0) + 1; const id = `om-allocation:${hashJson([project, n])}`; const writes = [];
+  if (head) { const prev = store.get(head.value.active.id); writes.push({ id: prev.id, kind: "om-allocation", expected: prev.revision, value: { ...prev.value, state: "closed" } }); }
+  writes.push({ id, kind: "om-allocation", expected: 0, value: { project, sequence: n, limit: amount, basis, state: "active" } });
+  const out = store.writeMany(writes, head ? [reference(head)] : []); const created = out[out.length - 1];
+  store.write({ id: headId(project), kind: "om-allocation-head", expected: head?.revision ?? 0, value: { project, sequence: n, active: reference(created) } }); return created; }
+export const activeAllocation = (store, project) => { const head = store.get(headId(project)); return head ? store.get(head.value.active.id) : null; };
+
+/** Неизменяемый контракт отправки: к чему именно выдан допуск. Другой адаптер, конфигурация или основание оценки — другой вызов. */
+const contextOf = ({ project, block, series, horizon, estimate, dispatch }) => hashJson([project, block, series, horizon, estimate.kind, estimate.tokens, estimate.basis, dispatch]);
+
+/** Сохранённая остановка: КАЖДЫЙ отказ допуска пишется в журнал с причиной, точными версиями предохранителей и выделения и точкой продолжения. */
+function stop(store, code, message, ctx, refs = {}) { const id = `om-refusal:${hashJson([ctx.call, code, refs.fuses ?? null, refs.allocation ?? null])}`;
+  if (!store.get(id)) store.write({ id, kind: "om-refusal", expected: 0, value: plain({ code, message, call: ctx.call, block: ctx.block, series: ctx.series, horizon: ctx.horizon, dispatch: ctx.dispatch ?? null,
+    fuses: refs.fuses ?? null, allocation: refs.allocation ?? null, resume: "новая версия предохранителей, новое выделение бюджета либо закрытие действующих резервов" }) });
   refuse(code, message); }
 
-/** G8. До отправки: действующая версия предохранителей, расход + ВСЕ действующие резервы + новый резерв — по блоку и по линии, одной транзакцией. */
-export function admitCall(store, project, { call, block, series, horizon, estimate }, hooks = {}) {
-  const ctx = { project, call, block, series, horizon, estimate };
-  if (estimate?.kind !== "guaranteed") stop(store, "call_cap_unenforceable", "Адаптер не гарантирует верхнюю границу вызова: оценка — не предел", ctx, store.get(fusesId(project)));
+/** G8. До отправки: расход + ВСЕ действующие резервы + новый резерв — по блоку и по выделению, одной транзакцией, по точным версиям лимитов. */
+export function admitCall(store, project, { call, block, series, horizon, estimate, dispatch }, hooks = {}) {
+  const ctx = { project, call, block, series, horizon, estimate, dispatch };
+  if (!dispatch?.adapter || !dispatch?.config) stop(store, "dispatch_contract_missing", "Допуск выдаётся на точный контракт отправки: адаптер и его конфигурация", ctx);
+  if (estimate?.kind !== "guaranteed") stop(store, "call_cap_unenforceable", "Адаптер не гарантирует верхнюю границу вызова: оценка — не предел", ctx);
   for (let attempt = 0; attempt < 3; attempt++) {
     const done = store.get(`om-admission:${call}`);
-    if (done) { if (done.value.context !== contextOf(ctx)) refuse("call_identity_conflict", `Вызов ${call} уже допущен в другом контексте: совпадение имени не доказывает повтор`); return { admission: done, repeated: true }; }
-    const fuses = store.get(fusesId(project)); if (!fuses) refuse("fuses_missing", "Предохранители проекта не открыты");
-    if (estimate.tokens > fuses.value.callCap) stop(store, "call_not_admitted_call_cap", `Предел вызова ${estimate.tokens} выше допустимого ${fuses.value.callCap}`, ctx, fuses);
-    const segment = budgetSegment(store, project, LINE); const before = budgetUsage(store, segment); const row = before.groups[block] ?? { measured: 0, reserved: 0 };
-    if (row.measured + row.reserved + estimate.tokens > fuses.value.blockCap) stop(store, "call_not_admitted_block_cap", `Блок ${block}: расход ${row.measured} + резервы ${row.reserved} + новый ${estimate.tokens} > ${fuses.value.blockCap}`, ctx, fuses);
-    if (before.measured + before.reserved + estimate.tokens > fuses.value.horizonBudget) stop(store, "call_not_admitted_horizon_budget", `Линия: расход ${before.measured} + резервы ${before.reserved} + новый ${estimate.tokens} > ${fuses.value.horizonBudget}`, ctx, fuses);
-    const reserve = reserveResearchCall(store, segment, call, [block], estimate);                                   // готовая ведомость: одна запись с проверкой ревизии
+    if (done) { if (done.value.context !== contextOf(ctx)) stop(store, "call_identity_conflict", `Вызов ${call} уже допущен с другим контекстом или контрактом отправки: совпадение имени не доказывает повтор`, ctx, { fuses: done.value.fuses, allocation: done.value.allocation }); return { admission: done, repeated: true }; }
+    const fuses = store.get(fusesId(project)), allocation = activeAllocation(store, project); const refs = { fuses: fuses ? reference(fuses) : null, allocation: allocation ? reference(allocation) : null };
+    if (!fuses) stop(store, "fuses_missing", "Предохранители проекта не открыты", ctx, refs); if (!allocation) stop(store, "allocation_missing", "Бюджет не выделен: нужно решение владельца", ctx, refs);
+    checkedFuses(fuses.value); if (!limit(allocation.value.limit)) refuse("allocation_invalid", "Действующее выделение повреждено");
+    if (!limit(estimate.tokens)) stop(store, "estimate_invalid", "Предел вызова — положительное целое", ctx, refs);
+    if (estimate.tokens > fuses.value.callCap) stop(store, "call_not_admitted_call_cap", `Предел вызова ${estimate.tokens} выше допустимого ${fuses.value.callCap}`, ctx, refs);
+    const g = groupsOf(allocation, block); const segment = budgetSegment(store, project, LINE); const before = budgetUsage(store, segment);
+    const row = k => before.groups[k] ?? { measured: 0, reserved: 0 }; const sum = r => r.measured + r.reserved + estimate.tokens;
+    if (sum(row(g.block)) > fuses.value.blockCap) stop(store, "call_not_admitted_block_cap", `Блок ${block}: расход ${row(g.block).measured} + резервы ${row(g.block).reserved} + новый ${estimate.tokens} > ${fuses.value.blockCap}`, ctx, refs);
+    if (sum(row(g.alloc)) > allocation.value.limit) stop(store, "call_not_admitted_horizon_budget", `Выделение: расход ${row(g.alloc).measured} + резервы ${row(g.alloc).reserved} + новый ${estimate.tokens} > ${allocation.value.limit}`, ctx, refs);
+    let reserve; try { reserve = reserveResearchCall(store, segment, call, [g.alloc, g.block], estimate); } catch (e) { stop(store, `budget_technical_refusal:${e.code ?? "unknown"}`, String(e.message), ctx, refs); }
+    const head = store.get(headId(project));
     const writes = [...reserve.writes,
-      { id: call, kind: "model-call", expected: 0, value: { projectId: project, purpose: "om-call", status: "running", usage: null, budget: { segment: reference(segment), groups: [block], estimate } } },
-      { id: `om-admission:${call}`, kind: "call-admission", expected: 0, value: plain({ call, project, block, series, horizon, context: contextOf(ctx), fuses: reference(fuses), reserve: estimate.tokens,
-        before: { line: { measured: before.measured, reserved: before.reserved }, block: row } }) }];
+      { id: call, kind: "model-call", expected: 0, value: plain({ projectId: project, purpose: "om-call", status: "running", usage: null, dispatch, budget: { segment: reference(segment), groups: [g.alloc, g.block], estimate } }) },
+      { id: `om-admission:${call}`, kind: "call-admission", expected: 0, value: plain({ call, project, block, series, horizon, dispatch, context: contextOf(ctx), fuses: refs.fuses, allocation: refs.allocation, reserve: estimate.tokens,
+        before: { allocation: row(g.alloc), block: row(g.block) } }) }];
     hooks.beforeWrite?.();
-    try { const out = store.writeMany(writes, [...reserve.guards, reference(fuses)]); return { admission: out[out.length - 1], repeated: false }; }
-    catch (e) { if (!["revision_conflict", "input_stale"].includes(e.code)) throw e; }                           // ведомость или предохранители сменились — пересчитать заново
+    try { const out = store.writeMany(writes, [...reserve.guards, reference(fuses), reference(allocation), reference(head)]); return { admission: out[out.length - 1], repeated: false }; }
+    catch (e) { if (!["revision_conflict", "input_stale"].includes(e.code)) throw e; }                           // ведомость, предохранители или выделение сменились — пересчитать
   }
-  refuse("admission_contention", "Допуск не удалось зафиксировать за три попытки");
+  stop(store, "admission_contention", "Допуск не удалось зафиксировать за три попытки", ctx);
 }
 
 /** Закрытие вызова — ОДНОКРАТНОЕ и одной транзакцией. Счётчики проверяет готовый tokenUsage. Неизвестный расход резерв не освобождает;
