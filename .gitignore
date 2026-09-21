@@ -8,3 +8,6 @@ public/app.css
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# план команд тест-оператора Codex: машинный файл с путями этого компьютера
+.omg-final-check.json
