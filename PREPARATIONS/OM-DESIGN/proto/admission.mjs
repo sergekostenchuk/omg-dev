@@ -18,7 +18,7 @@ const fusesId = project => `om-fuses:${project}`, headId = project => `om-alloca
 const limit = v => Number.isSafeInteger(v) && v > 0;
 const budgetSegmentOrNull = (store, project) => { try { return budgetSegment(store, project, LINE); } catch { return null; } };
 export const usageOf = (store, project) => budgetUsage(store, budgetSegment(store, project, LINE));
-export const groupsOf = (allocation, block) => ({ alloc: `alloc:${allocation.id}`, block: `block:${block}@${allocation.id}` });
+export const groupsOf = (allocation, block) => ({ alloc: `alloc:${allocation.id}`, block: `block:${block}`, blockInAlloc: `block:${block}@${allocation.id}` });
 
 /** Предохранители политики — версии одной записи. Проверяется ВЕСЬ итоговый объект до записи: неверная версия действующей не становится. */
 function checkedFuses(value) { const extra = Object.keys(value).filter(k => !["project", "blockCap", "callCap", "basis"].includes(k));
@@ -36,14 +36,20 @@ export function raiseFuses(store, project, patch, basis) { const f = store.get(f
  *  незакрытые резервы остаются в общей ведомости и закрываются обычным порядком — двух независимых каналов расходования нет. */
 export function openAllocation(store, project, { limit: amount }, basis) {
   if (!limit(amount) || typeof basis !== "string" || !basis.trim()) refuse("allocation_invalid", "Выделение — положительное целое и непустое основание (решение владельца)");
-  const head = store.get(headId(project)); const n = (head?.value.sequence ?? 0) + 1; const id = `om-allocation:${hashJson([project, n])}`; const writes = [];
-  if (head) { const prev = store.get(head.value.active.id); writes.push({ id: prev.id, kind: "om-allocation", expected: prev.revision, value: { ...prev.value, state: "closed" } }); }
-  writes.push({ id, kind: "om-allocation", expected: 0, value: { project, sequence: n, limit: amount, basis, state: "active" } });
-  const out = store.writeMany(writes, head ? [reference(head)] : []); const created = out[out.length - 1];
-  store.write({ id: headId(project), kind: "om-allocation-head", expected: head?.revision ?? 0, value: { project, sequence: n, active: reference(created) } }); return created; }
-export const activeAllocation = (store, project) => { const head = store.get(headId(project)); return head ? store.get(head.value.active.id) : null; };
+  const head = store.get(headId(project)); const n = (head?.value.sequence ?? 0) + 1; const id = `om-allocation:${hashJson([project, n])}`; const writes = [], guards = [];
+  if (head) { const prev = store.get(head.value.activeId); guards.push(reference(head), reference(prev)); writes.push({ id: prev.id, kind: "om-allocation", expected: prev.revision, value: { ...prev.value, state: "closed" } }); }
+  writes.push({ id, kind: "om-allocation", expected: 0, value: { project, sequence: n, limit: amount, basis, state: "active" } },
+    { id: headId(project), kind: "om-allocation-head", expected: head?.revision ?? 0, value: { project, sequence: n, activeId: id } });
+  return store.writeMany(writes, guards)[writes.length - 2];                                   // закрытие прежнего, новое выделение и указатель — ОДНОЙ транзакцией
+}
+/** Действующее выделение — пара «указатель + запись»: запись обязана быть active и той же последовательности, что указатель. */
+export function activeAllocation(store, project) { const head = store.get(headId(project)); if (!head) return null; const allocation = store.get(head.value.activeId);
+  return allocation && allocation.value.state === "active" && allocation.value.sequence === head.value.sequence ? { head, allocation } : { head, allocation, broken: true }; }
 
 /** Неизменяемый контракт отправки: к чему именно выдан допуск. Другой адаптер, конфигурация или основание оценки — другой вызов. */
+const isRef = r => r && typeof r.id === "string" && r.id.length > 0 && Number.isSafeInteger(r.revision) && r.revision > 0 && /^[0-9a-f]{64}$/.test(String(r.hash)) && Object.keys(r).length === 3;
+function checkedDispatch(store, d) { if (!d || Object.keys(d).sort().join() !== "adapter,config" || !isRef(d.adapter) || !isRef(d.config)) return "dispatch_contract_invalid";
+  for (const r of [d.adapter, d.config]) { const rec = store.get(r.id, r.revision); if (!rec || rec.hash !== r.hash) return "dispatch_contract_unresolved"; } return null; }
 const contextOf = ({ project, block, series, horizon, estimate, dispatch }) => hashJson([project, block, series, horizon, estimate.kind, estimate.tokens, estimate.basis, dispatch]);
 
 /** Сохранённая остановка: КАЖДЫЙ отказ допуска пишется в журнал с причиной, точными версиями предохранителей и выделения и точкой продолжения. */
@@ -55,13 +61,14 @@ function stop(store, code, message, ctx, refs = {}) { const id = `om-refusal:${h
 /** G8. До отправки: расход + ВСЕ действующие резервы + новый резерв — по блоку и по выделению, одной транзакцией, по точным версиям лимитов. */
 export function admitCall(store, project, { call, block, series, horizon, estimate, dispatch }, hooks = {}) {
   const ctx = { project, call, block, series, horizon, estimate, dispatch };
-  if (!dispatch?.adapter || !dispatch?.config) stop(store, "dispatch_contract_missing", "Допуск выдаётся на точный контракт отправки: адаптер и его конфигурация", ctx);
+  const bad = checkedDispatch(store, dispatch); if (bad) stop(store, bad, "Допуск выдаётся на точный контракт отправки: ссылки {id, revision, hash} на существующие записи адаптера и его конфигурации", { ...ctx, dispatch: null });
   if (estimate?.kind !== "guaranteed") stop(store, "call_cap_unenforceable", "Адаптер не гарантирует верхнюю границу вызова: оценка — не предел", ctx);
   for (let attempt = 0; attempt < 3; attempt++) {
     const done = store.get(`om-admission:${call}`);
     if (done) { if (done.value.context !== contextOf(ctx)) stop(store, "call_identity_conflict", `Вызов ${call} уже допущен с другим контекстом или контрактом отправки: совпадение имени не доказывает повтор`, ctx, { fuses: done.value.fuses, allocation: done.value.allocation }); return { admission: done, repeated: true }; }
-    const fuses = store.get(fusesId(project)), allocation = activeAllocation(store, project); const refs = { fuses: fuses ? reference(fuses) : null, allocation: allocation ? reference(allocation) : null };
-    if (!fuses) stop(store, "fuses_missing", "Предохранители проекта не открыты", ctx, refs); if (!allocation) stop(store, "allocation_missing", "Бюджет не выделен: нужно решение владельца", ctx, refs);
+    const fuses = store.get(fusesId(project)), active = activeAllocation(store, project); const allocation = active?.allocation ?? null; const refs = { fuses: fuses ? reference(fuses) : null, allocation: allocation ? reference(allocation) : null };
+    if (!fuses) stop(store, "fuses_missing", "Предохранители проекта не открыты", ctx, refs); if (!active) stop(store, "allocation_missing", "Бюджет не выделен: нужно решение владельца", ctx, refs);
+    if (active.broken) stop(store, "allocation_inactive", "Указатель выделения не согласован с записью: закрытое выделение новых допусков не выдаёт", ctx, refs);
     checkedFuses(fuses.value); if (!limit(allocation.value.limit)) refuse("allocation_invalid", "Действующее выделение повреждено");
     if (!limit(estimate.tokens)) stop(store, "estimate_invalid", "Предел вызова — положительное целое", ctx, refs);
     if (estimate.tokens > fuses.value.callCap) stop(store, "call_not_admitted_call_cap", `Предел вызова ${estimate.tokens} выше допустимого ${fuses.value.callCap}`, ctx, refs);
@@ -69,10 +76,10 @@ export function admitCall(store, project, { call, block, series, horizon, estima
     const row = k => before.groups[k] ?? { measured: 0, reserved: 0 }; const sum = r => r.measured + r.reserved + estimate.tokens;
     if (sum(row(g.block)) > fuses.value.blockCap) stop(store, "call_not_admitted_block_cap", `Блок ${block}: расход ${row(g.block).measured} + резервы ${row(g.block).reserved} + новый ${estimate.tokens} > ${fuses.value.blockCap}`, ctx, refs);
     if (sum(row(g.alloc)) > allocation.value.limit) stop(store, "call_not_admitted_horizon_budget", `Выделение: расход ${row(g.alloc).measured} + резервы ${row(g.alloc).reserved} + новый ${estimate.tokens} > ${allocation.value.limit}`, ctx, refs);
-    let reserve; try { reserve = reserveResearchCall(store, segment, call, [g.alloc, g.block], estimate); } catch (e) { stop(store, `budget_technical_refusal:${e.code ?? "unknown"}`, String(e.message), ctx, refs); }
-    const head = store.get(headId(project));
+    let reserve; try { reserve = reserveResearchCall(store, segment, call, [g.alloc, g.block, g.blockInAlloc], estimate); } catch (e) { stop(store, `budget_technical_refusal:${e.code ?? "unknown"}`, String(e.message), ctx, refs); }
+    const head = active.head;
     const writes = [...reserve.writes,
-      { id: call, kind: "model-call", expected: 0, value: plain({ projectId: project, purpose: "om-call", status: "running", usage: null, dispatch, budget: { segment: reference(segment), groups: [g.alloc, g.block], estimate } }) },
+      { id: call, kind: "model-call", expected: 0, value: plain({ projectId: project, purpose: "om-call", status: "running", usage: null, dispatch, budget: { segment: reference(segment), groups: [g.alloc, g.block, g.blockInAlloc], estimate } }) },
       { id: `om-admission:${call}`, kind: "call-admission", expected: 0, value: plain({ call, project, block, series, horizon, dispatch, context: contextOf(ctx), fuses: refs.fuses, allocation: refs.allocation, reserve: estimate.tokens,
         before: { allocation: row(g.alloc), block: row(g.block) } }) }];
     hooks.beforeWrite?.();
