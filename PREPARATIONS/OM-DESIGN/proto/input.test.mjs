@@ -56,3 +56,7 @@ test("вердикт №1 п.2: эру определяет версия кон�
   const older = buildOmInput(load(), { nodesRequiredSince: v + 1 }); assert.equal(gateInput(older).passed, true, "запись прежней версии: отсутствие поля — пробел"); assert.equal(older.gaps.filter(g => g.code === "contract_node_unbound").length, 20);
   const s2 = load(); s2.specification.contractVersion = v; const now = buildOmInput(s2, { nodesRequiredSince: v }); assert.equal(gateInput(now).passed, false, "запись новой версии: отсутствие обязательного поля — отказ, удаление поля пробелом не становится");
   assert.equal(now.refusals.filter(r => r.code === "contract_node_unbound").length, 20); assert.equal(now.gaps.filter(g => g.code === "contract_node_unbound").length, 0); });
+
+test("вердикт №2, риск 1: при введённом пороге эры версия контракта обязана определяться — невозможность её прочитать прежней эрой не считается", () => {
+  const s = load(); s.specification.contractVersion = undefined; const r = buildOmInput(s, { nodesRequiredSince: 3 });
+  assert.ok(r.refusals.some(x => x.code === "stage_contract_version_unknown")); assert.equal(gateInput(r).passed, false); assert.equal(gateInput(buildOmInput(s)).passed, true, "без порога эры различать нечего"); });

@@ -51,3 +51,18 @@ test("исключения входят в хэш горизонта; повто
   const b = closeHorizon(UPPER, { choiceVersion: "c1", features: [{ outcome: "recoverable-state" }, { outcome: "verified-change" }], excluded: [UI] }); assert.equal(a.horizon.hash, b.horizon.hash);
   assert.notEqual(a.horizon.hash, closeHorizon(UPPER, { choiceVersion: "c1", features: [{ outcome: "verified-change" }, { outcome: "recoverable-state" }] }).horizon.hash, "снятие исключения меняет хэш");
   assert.notEqual(a.horizon.hash, closeHorizon(UPPER, { choiceVersion: "c2", features: [{ outcome: "verified-change" }, { outcome: "recoverable-state" }], excluded: [UI] }).horizon.hash, "другая версия выбора — другой горизонт, даже при тех же узлах"); });
+
+test("вердикт №2 п.1: адреса внешних входов не зависят от порядка обхода и перестановки фич; источник, вошедший другим путём, входа не теряет", () => {
+  const G = structuredClone(UPPER); G.artifacts.find(a => a.id === "a-runtime").external = true; G.edges.push({ id: "e-test-requires-runtime", relation: "requires", source: "n-publish", target: "n-runtime", condition: "проверка ревью" });
+  const two = [{ outcome: "verified-change" }, { outcome: "autonomous-knowledge" }]; const a = closeHorizon(G, { choiceVersion: "c", features: two }), b = closeHorizon(G, { choiceVersion: "c", features: [...two].reverse() });
+  assert.equal(gateHorizon(a).passed, true); assert.deepEqual(a.horizon.nodes, b.horizon.nodes); assert.equal(a.horizon.hash, b.horizon.hash, "перестановка фич хэш горизонта не меняет");
+  const H = new Set(a.horizon.nodes); const want = G.connectors.find(c => c.id === "cn-runtime").bindings[0].consumers.map(e => e.node).filter(n => H.has(n) && n !== "n-runtime").sort();
+  assert.deepEqual(a.horizon.externalInputs.filter(x => x.connector === "cn-runtime").map(x => x.consumer).sort(), want, "у КАЖДОГО потребителя горизонта адрес внешнего входа записан"); assert.ok(H.has("n-runtime"), "источник вошёл в горизонт по управляющей зависимости — входы не потеряны"); });
+
+test("вердикт №2 п.2: доступный результат без принятого раскрытия границей не становится — блок добирается в горизонт ради раскрытия, и каркас не отказывает", () => {
+  const root = BLOCKS.find(b => b.outcome === "verified-change").id; const basisOf = id => ({ id: `artifact-receipt:${id}`, revision: 1, hash: "e".repeat(64) });
+  const r = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), available: new Map([["n-check", basisOf("n-check")]]) });            // refined пуст, принятого слоя нет
+  assert.ok(r.horizon.nodes.includes("n-check")); assert.deepEqual([r.horizon.refinement["n-check"], r.horizon.execution["n-check"]], ["needed", "available"]); assert.deepEqual(r.horizon.boundary, []);
+  const H = new Set(r.horizon.nodes); assert.doesNotThrow(() => fillObligations(UPPER, frameObligations(UPPER, H), null, [], H, { graph: null, frame: null }), "F4.2 не встречает нераскрытого производителя вне горизонта");
+  const both = closeHorizon(UPPER, { choiceVersion: "c", features: F("verified-change"), refined: REFINED, available: new Map(BLOCKS.filter(b => b.id !== root).map(b => [b.id, basisOf(b.id)])) });
+  assert.deepEqual(both.horizon.nodes, [root]); assert.ok(both.horizon.boundary.length > 0, "граница — только при результате И принятом раскрытии"); });

@@ -29,6 +29,8 @@ export function buildOmInput(stages, { inventory = null, nodesRequiredSince = NO
   // подготовка сопоставляется с фичей по её ИДЕНТИЧНОСТИ (название + исход), как в действующем preparation-validation.ts:66, а не по месту в массиве
   const prepOf = f => preps.filter(p => p.featureTitle === f.title && p.outcome === f.outcome);
   const usedBy = id => feats.map((f, i) => ({ f, i })).filter(({ f }) => prepOf(f).length === 1 && (prepOf(f)[0].behaviorContracts ?? []).includes(id)).map(({ f, i }) => ({ feature: i, title: String(f.title).slice(0, 80) }));
+  // если порог новой эры введён, версия контракта точной записи ОБЯЗАНА определяться: невозможность её прочитать не означает прежнюю эру
+  if (nodesRequiredSince !== null && !Number.isInteger(stages.specification.contractVersion)) refuse("stage_contract_version_unknown", "stage:specification", "Версия контракта записи стадии не определена — эру установить нельзя");
   const newEra = nodesRequiredSince !== null && Number.isInteger(stages.specification.contractVersion) && stages.specification.contractVersion >= nodesRequiredSince;
   const contracts = bcs.map(c => { for (const r of c.requirements ?? []) if (!reqIds.has(r)) refuse("requirement_ref_unresolved", `${c.id}.requirements`, `Требование ${r} не найдено в концепции`);
     if (!artIds.has(c.outcome)) refuse("outcome_artifact_unknown", `${c.id}.outcome`, `Исход ${c.outcome} не является артефактом карты`);

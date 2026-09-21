@@ -17,18 +17,20 @@ export function closeHorizon(upper, { choiceVersion, features, excluded = [], re
   for (const f of features) { const producers = [...blocks.values()].filter(b => b.outcome === f.outcome); if (!producers.length) refusals.push({ code: "horizon_feature_unknown", target: f.outcome }); roots.push(...producers.map(b => b.id)); }
   // необходимые предшественники: производители по связям данных (внешний источник реализации производителя не требует) И обязательные
   // управляющие зависимости — действующая семантика controlPredecessors (requires, transfers)
-  const externalInputs = [];
   const needs = id => [...upper.connectors.flatMap(c => c.bindings.filter(b => b.level === 1 && b.anchor == null && b.consumers.some(e => e.node === id) && b.producer.node !== id).map(b => ({ block: b.producer.node, via: c.id, external: external.has(c.artifact) }))),
     ...controlPredecessors(upper, id).filter(x => blocks.has(x.producer)).map(x => ({ block: x.producer, via: x.id, external: false }))];
   const horizon = new Map(), boundary = new Map(), conflicts = []; const queue = roots.map(r => ({ block: r, path: [r] }));
   while (queue.length) { const { block, path } = queue.shift();
     if (out.has(block)) { conflicts.push({ code: "horizon_requires_excluded", block, path }); continue; }
     if (horizon.has(block)) continue; horizon.set(block, path);
-    for (const p of needs(block)) { if (horizon.has(p.block)) continue;
-      if (p.external) { externalInputs.push({ consumer: block, connector: p.via, source: p.block }); continue; }     // адрес связи потребителя сохраняется, внутренний производитель не требуется
-      if (available.has(p.block) && !out.has(p.block)) { boundary.set(p.block, available.get(p.block)); continue; }  // результат уже есть — подтверждённая граница
+    for (const p of needs(block)) { if (p.external || horizon.has(p.block)) continue;                               // внешний источник реализации производителя не требует
+      // граница пригодна для каркаса, только если у производителя есть И доступный результат, И принятое настоящее раскрытие: иначе M4 не найдёт
+      // конкретного подблока-производителя. Доступный, но не раскрытый — добирается в горизонт ради раскрытия (исполнять его не нужно).
+      if (available.has(p.block) && refined.has(p.block) && !out.has(p.block)) { boundary.set(p.block, available.get(p.block)); continue; }
       queue.push({ block: p.block, path: [...path, `${p.via}→${p.block}`] }); } }
-  const nodes = [...horizon.keys()].sort(); const value = { choiceVersion, features: features.map(f => f.outcome).sort(), nodes, refinement: Object.fromEntries(nodes.map(n => [n, refined.has(n) ? "accepted" : "needed"])),
+  // адреса внешних входов — по ОКОНЧАТЕЛЬНОМУ горизонту и всем его привязкам, независимо от порядка обхода и от того, каким путём вошёл источник
+  const externalInputs = [...horizon.keys()].flatMap(id => needs(id).filter(p => p.external).map(p => ({ consumer: id, connector: p.via, source: p.block })));
+  const nodes = [...horizon.keys()].sort(); const value = { choiceVersion, features: features.map(f => f.outcome).sort(), nodes, refinement: Object.fromEntries(nodes.map(n => [n, refined.has(n) ? "accepted" : "needed"])), execution: Object.fromEntries(nodes.map(n => [n, available.has(n) ? "available" : "needed"])),
     boundary: [...boundary].map(([block, basis]) => ({ block, basis })).sort((a, b) => a.block < b.block ? -1 : 1), externalInputs: externalInputs.sort((a, b) => (a.consumer + a.connector < b.consumer + b.connector ? -1 : 1)),
     excluded: [...excluded].map(e => ({ block: e.block, reason: e.reason, returnCondition: e.returnCondition })).sort((a, b) => a.block < b.block ? -1 : 1) };
   return { horizon: { ...value, hash: hashJson(value) }, conflicts, refusals };
