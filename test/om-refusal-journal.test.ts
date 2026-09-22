@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type Revision } from "../src/storage/store.js";
@@ -8,10 +8,12 @@ import { EngineError } from "../src/errors.js";
 import { hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
+import { writeGuarded } from "../src/om/refs.js";
 import {
-  classifyRefusal, journalId, readJournal, recordRefusal, unitRefusalNamespace,
+  classifyRefusal, journalId, prepareClassifyRefusal, prepareRecordRefusal, readJournal, recordRefusal, unitRefusalNamespace,
   REFUSAL_JOURNAL_CODES, REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND,
-  type ClassifyRefusalRequest, type JournalRequest, type JournalRow, type RecordRefusalRequest, type RefusalClassification, type RefusalJournal,
+  type ClassifyRefusalRequest, type ClassifyRefusalsRequest, type JournalRequest, type JournalRow,
+  type RecordRefusalRequest, type RefusalClassification, type RefusalJournal,
 } from "../src/om/refusal-journal.js";
 
 const UNIT = "store-refusals";
@@ -672,4 +674,184 @@ test("a journal written to by someone else between the read and the classificati
   const journal = deliveredOf(classifyRefusal(store, { project: PROJECT, ...verdict({ row }) }));
   assert.deepEqual(journal.value.classifications.map(item => item.class), ["derivation", "input"]);
   assert.deepEqual(journal.value.rows.map(item => item.gate), ["G3", "G5"]);
+});
+
+test("a change of the journal is prepared without being written, and a caller applies it inside its own transaction", t => {
+  const { store } = fixture(t);
+  const first = gateRecord(store, "g3:1", gateFailure());
+
+  // The rows, the write and the guards are ready, and the store holds nothing of them yet.
+  const prepared = deliveredOf(prepareRecordRefusal(store, { project: PROJECT, source: reference(first) }));
+  assert.deepEqual(prepared.writes.map(write => write.id), [journalId(PROJECT)]);
+  assert.equal(prepared.writes[0]!.kind, REFUSAL_JOURNAL_KIND);
+  assert.equal(prepared.writes[0]!.expected, 0);
+  // The record the rows came from is guarded, so a gate that rewrites it first leaves no row standing for it.
+  assert.deepEqual(prepared.guards, [reference(first)]);
+  assert.equal(prepared.value.rows.length, 1);
+  assert.deepEqual(prepared.value.classifications, []);
+  assert.equal(journalOf(store), null);
+
+  // The caller writes it together with a record of its own: both stand, or neither does.
+  const own = { id: "om-gate-run:alpha", kind: "om-gate-run", expected: 0, value: { gate: "G3" } };
+  const applied = deliveredOf(writeGuarded(store, {
+    unit: "g3", target: own.id, writes: [...prepared.writes, own], guards: [...prepared.guards],
+  }));
+  assert.deepEqual(applied.map(record => record.id), [journalId(PROJECT), own.id]);
+  assert.equal(journalOf(store)!.revision, 1);
+  assert.equal(hashJson(prepared.value), journalOf(store)!.hash);
+
+  // A prepared change that is a repeat carries no write at all, so a caller adds nothing to its transaction.
+  const repeat = deliveredOf(prepareRecordRefusal(store, { project: PROJECT, source: reference(first) }));
+  assert.deepEqual(repeat.writes, []);
+  assert.deepEqual(repeat.guards, []);
+  assert.deepEqual(repeat.value, journalOf(store)!.value);
+
+  // A second record appends to the head it was prepared against, and guards both.
+  const second = gateRecord(store, "g5:1", gateFailure({ gate: "G5" }));
+  const grown = deliveredOf(prepareRecordRefusal(store, { project: PROJECT, source: reference(second) }));
+  assert.equal(grown.writes[0]!.expected, 1);
+  assert.deepEqual(grown.guards, [reference(second), reference(journalOf(store)!)]);
+  assert.equal(grown.value.rows.length, 2);
+
+  // A change that cannot be made is refused at the preparation, before anything is written.
+  const broken = gateRecord(store, "g3:2", gateFailure({ refusals: [] }));
+  addressed(refusalOf(prepareRecordRefusal(store, { project: PROJECT, source: reference(broken) })), "refusals_missing");
+  addressed(refusalOf(prepareRecordRefusal(store, { project: PROJECT, source: { ...reference(first), hash: hex("d") } })), "record_forged");
+  assert.equal(journalOf(store)!.revision, 1);
+});
+
+test("a whole set of decisions about one journal is prepared as ONE write, not as several competing ones", t => {
+  const { store } = fixture(t);
+  const record = gateRecord(store, "g3:1", gateFailure({
+    refusals: [entry(), entry({ code: "layer_port_unbound" }), entry({ code: "work_not_atomic" })],
+  }));
+  const rows = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(record) })).value.rows.map(row => row.id);
+  const head = journalOf(store)!;
+  const decisions = rows.map((row, index) => verdict({ row, class: ["proposal", "input", "derivation"][index]! }));
+
+  const prepared = deliveredOf(prepareClassifyRefusal(store, { project: PROJECT, classifications: decisions }));
+  // A journal is one record, and a transaction writes each record once: three decisions are one write of one id.
+  assert.equal(prepared.writes.length, 1);
+  assert.equal(prepared.writes[0]!.id, journalId(PROJECT));
+  assert.equal(prepared.writes[0]!.expected, head.revision);
+  assert.deepEqual(prepared.guards, [reference(head)]);
+  assert.deepEqual(prepared.value.classifications.map(item => item.class), ["proposal", "input", "derivation"]);
+  assert.deepEqual(journalOf(store)!.value.classifications, []);
+
+  const applied = deliveredOf(writeGuarded(store, {
+    unit: "gate-repeat", target: journalId(PROJECT), writes: [...prepared.writes], guards: [...prepared.guards],
+  }));
+  assert.equal(applied.length, 1);
+  assert.equal(journalOf(store)!.revision, head.revision + 1);
+  assert.deepEqual(journalOf(store)!.value.classifications.map(item => item.row), rows);
+
+  // The same set again decides nothing new, whatever order it comes in, and carries no write.
+  const again = deliveredOf(prepareClassifyRefusal(store, { project: PROJECT, classifications: [...decisions].reverse() }));
+  assert.deepEqual(again.writes, []);
+  assert.deepEqual(again.guards, []);
+  assert.deepEqual(again.value, journalOf(store)!.value);
+
+  // A set that decides one refusal twice in the same breath: the same decision twice is one, a different one is a
+  // second answer where the journal holds one.
+  const fourth = gateRecord(store, "g3:2", gateFailure({ gate: "G4" }));
+  const extra = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(fourth) })).value.rows[3]!.id;
+  const twice = deliveredOf(prepareClassifyRefusal(store, {
+    project: PROJECT, classifications: [verdict({ row: extra }), verdict({ row: extra })],
+  }));
+  assert.equal(twice.writes.length, 1);
+  assert.equal((twice.writes[0]!.value as RefusalJournal).classifications.length, 4);
+  addressed(refusalOf(prepareClassifyRefusal(store, {
+    project: PROJECT, classifications: [verdict({ row: extra }), verdict({ row: extra, class: "unknown" })],
+  })), "classification_conflict");
+  // And one unknown row refuses the whole set: no decision of it is prepared at all.
+  addressed(refusalOf(prepareClassifyRefusal(store, {
+    project: PROJECT, classifications: [verdict({ row: extra }), verdict({ row: "om-refusal:invented" })],
+  })), "row_unknown");
+  assert.equal(journalOf(store)!.value.classifications.length, 3);
+
+  // An absent set is not an empty one, and neither decides anything: both are the calling code's defect.
+  const prepare = (request: unknown): void => { prepareClassifyRefusal(store, request as ClassifyRefusalsRequest); };
+  for (const classifications of [undefined, null, [], "one", 7, {}]) {
+    assert.throws(() => prepare({ project: PROJECT, classifications }), code("journal_request_invalid"));
+  }
+  for (const item of [null, undefined, "row", 7, {}, without({ ...verdict({ row: extra }) }, "addressee"),
+    { ...verdict({ row: extra }), basis: [{ role: "proposal" }] }]) {
+    assert.throws(() => prepare({ project: PROJECT, classifications: [item] }), code("journal_request_invalid"));
+  }
+  for (const project of [undefined, null, "", 7, "alpha:beta"]) {
+    assert.throws(() => prepare({ project, classifications: [verdict({ row: extra })] }), code("journal_request_invalid"));
+  }
+  for (const broken of [null, undefined, "store", 7, {}]) {
+    assert.throws(() => prepareClassifyRefusal(broken as Store, { project: PROJECT, classifications: [verdict({ row: extra })] }),
+      code("journal_request_invalid"));
+  }
+  assert.equal(journalOf(store)!.value.classifications.length, 3);
+
+  // The accepted single operation and the set decide alike: one is the other said for one row.
+  const single = deliveredOf(classifyRefusal(store, { project: PROJECT, ...verdict({ row: extra }) }));
+  assert.deepEqual(single.value.classifications, twice.value.classifications);
+  addressed(refusalOf(prepareClassifyRefusal(store, { project: "nowhere", classifications: [verdict({ row: extra })] })),
+    "journal_missing", "nowhere");
+});
+
+test("the sources of an origin are separated by a byte none of them can contain, so no two keys collide (T6)", t => {
+  const { store } = fixture(t);
+  // Two sources whose role and id run into one another: "ab" + "c" and "a" + "bc" are the same text unseparated, so
+  // a key built without a separator would make them EQUAL and leave their canonical order to the order they arrived
+  // in — and a row id is the hash of that order.
+  const shared = { revision: 1, hash: hex("f") };
+  const left = { role: "ab", ref: { ...shared, id: "c" } };
+  const right = { role: "a", ref: { ...shared, id: "bc" } };
+  const rowOf = (sources: readonly unknown[], name: string): JournalRow => {
+    const record = gateRecord(store, name, gateFailure({ refusals: [entry({ origin: origin({ sources }) })] }), name);
+    return deliveredOf(recordRefusal(store, { project: name, source: reference(record) })).value.rows[0]!;
+  };
+  const one = rowOf([left, right], "sep1");
+  const other = rowOf([right, left], "sep2");
+  // One order, and therefore one identity, whichever way the two arrived.
+  assert.deepEqual(one.origin.sources.map(item => item.role), ["a", "ab"]);
+  assert.deepEqual(other.origin.sources, one.origin.sources);
+  // The two rows differ only in the record they came from, so everything else about them hashes alike.
+  const content = (row: JournalRow): string => hashJson(without(without({ ...row }, "source"), "id"));
+  assert.equal(content(one), content(other));
+});
+
+test("the identity of a journal row is the same it has always been for the same refusal and the same sources", t => {
+  const { store } = fixture(t);
+  const record = gateRecord(store, "g3:1", gateFailure());
+  const row = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(record) })).value.rows[0]!;
+
+  // Derived again here, by this test's own reading of the rule: the row is the hash of its content with the sources
+  // in the canonical order. Nothing of the unit's is reused, so a change of how a row is built shows up as a break.
+  const key = (item: { role: string; ref: Ref }): string => `${item.role}\0${item.ref.id}\0${item.ref.revision}\0${item.ref.hash}`;
+  const body = {
+    gate: "G3", code: "graph_invalid",
+    goal: "every artifact an operation consumes is produced somewhere in the layer",
+    remedy: "add the producer of artifact:cart to the proposal, or drop the operation consuming it",
+    origin: {
+      name: "artifact_missing", stage: "candidate-assembly", subject: "artifact:cart",
+      sources: [{ role: "proposal", ref: PROPOSAL }, { role: "base", ref: BASE }]
+        .sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)),
+    },
+    source: reference(record),
+  };
+  assert.equal(row.id, hashJson(body));
+  // And pinned, so that a row journalled before this change still answers to the id it was journalled under.
+  assert.equal(row.id, "d54eab905f8de3fff64764859d56d1ee403195084d77e20fa0923f36c3ae4383");
+});
+
+test("no source of this block carries a literal control byte", () => {
+  // A literal NUL or other control byte makes a file binary to grep, to file and to review tools, and an editor may
+  // drop it or show it as a space. Where such a byte is meant — the separator of a sort key — it is written as an
+  // escape. This walks the sources so the class cannot come back unnoticed.
+  const directory = new URL("../../src/om/", import.meta.url);
+  const sources = readdirSync(directory).filter(name => name.endsWith(".ts"));
+  assert.ok(sources.length >= 4, `expected the sources of the block, found ${sources.join(", ")}`);
+  const control = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
+  for (const name of sources) {
+    const text = readFileSync(new URL(name, directory), "latin1");
+    const index = text.search(control);
+    assert.equal(index, -1,
+      `${name} carries a literal control byte at ${index}: ${JSON.stringify(text.slice(Math.max(0, index - 40), index + 40))}`);
+  }
 });

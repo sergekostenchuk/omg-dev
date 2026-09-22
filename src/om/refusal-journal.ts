@@ -83,6 +83,37 @@ export interface JournalRequest { readonly project: string }
 export interface RecordRefusalRequest extends JournalRequest { readonly source: Ref }
 export interface ClassifyRefusalRequest extends JournalRequest, RefusalClassification {}
 
+/**
+ * Several decisions of G7 about one journal, asked for at once.
+ * A journal is ONE record, and a transaction writes each record once, so a neighbour that classifies a whole set of
+ * refusals in the transaction of its own change cannot call the single-row preparation once per row: that would offer
+ * the store several competing writes of one id. The set is weighed row by row — the same rules, in the order given —
+ * and comes out as ONE write.
+ */
+export interface ClassifyRefusalsRequest extends JournalRequest {
+  readonly classifications: readonly RefusalClassification[];
+}
+
+/**
+ * One prepared change of the journal: the record to write, the exact references it must be guarded by, and what the
+ * journal would hold afterwards. `writes` is empty when the journal already holds this change — a repeat needs no
+ * revision, and adds nothing to anyone's transaction.
+ * A caller that has to write SEVERAL records at once (G7 recording the outcome of a cycle in the series AND the class
+ * of every refusal of that cycle here) puts these writes and guards into one writeGuarded of its own, so that either
+ * all of them are applied or none is. Calling the operations one after another would leave a partial result.
+ */
+export interface JournalWrite {
+  readonly id: string;
+  readonly kind: string;
+  readonly expected: number;
+  readonly value: unknown;
+}
+export interface JournalTransition {
+  readonly writes: readonly JournalWrite[];
+  readonly guards: readonly Ref[];
+  readonly value: RefusalJournal;
+}
+
 const ENTRY_TEXTS = Object.freeze(["code", "goal", "remedy"] as const);
 const ORIGIN_TEXTS = Object.freeze(["name", "stage", "subject"] as const);
 const RECORD_KEYS = Object.freeze(["gate", "refusals"] as const);
@@ -96,6 +127,7 @@ const JOURNAL_KEYS = Object.freeze(["projectId", "rows", "classifications"] as c
 
 interface Context { readonly target: string; readonly ref: Ref }
 interface Codes { readonly entry: RefusalJournalCode; readonly origin: RefusalJournalCode; readonly source: RefusalJournalCode }
+interface Prepared { readonly transition: JournalTransition; readonly current: Revision<RefusalJournal> | null }
 
 // The same shape is read on two paths: as it arrives from a gate, and as it already stands in the journal. What is
 // wrong is the same; who is at fault is not, so each path carries its own codes.
@@ -117,6 +149,48 @@ export function unitRefusalNamespace(project: string): string {
  * adds no row and no revision (T5), and this unit writes nothing but the journal (T8).
  */
 export function recordRefusal(store: Store, request: RecordRefusalRequest): OmResult<Sealed<Revision<RefusalJournal>>> {
+  return applied(store, prepareRecord(store, request));
+}
+
+/**
+ * Writes what G7 derived for one journalled refusal: its class, its addressee and the grounds it was derived from.
+ * The row itself is not touched, so its id still stands for its content. A classification already written is not
+ * replaced: the same one again changes nothing, and a different one is refused — a later reading does not undo an
+ * earlier decision (T5). Like a row, a classification switches nothing else (T8).
+ */
+export function classifyRefusal(store: Store, request: ClassifyRefusalRequest): OmResult<Sealed<Revision<RefusalJournal>>> {
+  requireStore(store);
+  requireCondition(isPlainObject(request), "journal_request_invalid", "A classification is asked for by a request object");
+  // One decision is a set of one: the accepted operation and the set share every rule, so neither can drift.
+  return applied(store, prepareClassify(store, { project: request.project, classifications: [request] }));
+}
+
+// Each change is prepared once and applied in one of two ways: written on its own here, or handed to a caller that
+// writes it together with other records in a single guarded transaction. One implementation, two entrances.
+export const prepareRecordRefusal = (store: Store, request: RecordRefusalRequest): OmResult<Sealed<JournalTransition>> =>
+  handed(prepareRecord(store, request));
+export const prepareClassifyRefusal = (store: Store, request: ClassifyRefusalsRequest): OmResult<Sealed<JournalTransition>> =>
+  handed(prepareClassify(store, request));
+
+const handed = (prepared: OmResult<Prepared>): OmResult<Sealed<JournalTransition>> =>
+  prepared.ok ? delivered(prepared.value.transition) : prepared;
+
+const unchanged = (current: Revision<RefusalJournal>): OmResult<Prepared> =>
+  ({ ok: true, value: { transition: { writes: [], guards: [], value: current.value }, current } });
+
+function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Revision<RefusalJournal>>> {
+  if (!prepared.ok) return prepared;
+  const { transition, current } = prepared.value;
+  // Nothing to write is a fact, not a failure: the journal already holds what was asked for.
+  if (transition.writes.length === 0) return delivered(current!);
+  const written = writeGuarded<RefusalJournal>(store, {
+    unit: UNIT, target: transition.writes[0]!.id, guards: transition.guards, writes: [...transition.writes],
+  });
+  if (!written.ok) return written;
+  return delivered(written.value[0]!);
+}
+
+function prepareRecord(store: Store, request: RecordRefusalRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "journal_request_invalid", "A refusal is journalled through a request object");
   const project = requireProject(request.project);
@@ -133,7 +207,7 @@ export function recordRefusal(store: Store, request: RecordRefusalRequest): OmRe
 
   const current = currentJournal(store, project, target);
   if (current && !current.ok) return current;
-  const head = current && current.ok ? current.value : null;
+  const head = current && current.ok ? (current.value as Revision<RefusalJournal>) : null;
   const rows: readonly JournalRow[] = head ? head.value.rows : [];
 
   const known = new Set(rows.map(row => row.id));
@@ -147,7 +221,7 @@ export function recordRefusal(store: Store, request: RecordRefusalRequest): OmRe
     known.add(row.id);
     additions.push(row);
   }
-  if (current && current.ok && additions.length === 0) return current;
+  if (head && additions.length === 0) return unchanged(head);
 
   // A journal that has classified nothing yet says so explicitly: an absent set is never read as an empty one (T4).
   const value: RefusalJournal = {
@@ -155,64 +229,88 @@ export function recordRefusal(store: Store, request: RecordRefusalRequest): OmRe
     rows: [...rows, ...additions],
     classifications: head ? head.value.classifications : [],
   };
-  const written = writeGuarded<RefusalJournal>(store, {
-    unit: UNIT, target,
-    guards: head ? [source, reference(head)] : [source],
-    writes: [{ id: target, kind: REFUSAL_JOURNAL_KIND, expected: head ? head.revision : 0, value }],
-  });
-  if (!written.ok) return written;
-  return delivered(written.value[0]!);
+  return {
+    ok: true,
+    value: {
+      transition: {
+        // The record the rows came from is guarded beside the journal's own head: a gate that rewrites its record
+        // between this reading and the write leaves no row standing for content it no longer holds (T7).
+        guards: head ? [source, reference(head)] : [source],
+        writes: [{ id: target, kind: REFUSAL_JOURNAL_KIND, expected: head ? head.revision : 0, value }],
+        value,
+      },
+      current: head,
+    },
+  };
 }
 
-/**
- * Writes what G7 derived for one journalled refusal: its class, its addressee and the grounds it was derived from.
- * The row itself is not touched, so its id still stands for its content. A classification already written is not
- * replaced: the same one again changes nothing, and a different one is refused — a later reading does not undo an
- * earlier decision (T5). Like a row, a classification switches nothing else (T8).
- */
-export function classifyRefusal(store: Store, request: ClassifyRefusalRequest): OmResult<Sealed<Revision<RefusalJournal>>> {
+function prepareClassify(store: Store, request: ClassifyRefusalsRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "journal_request_invalid", "A classification is asked for by a request object");
   const project = requireProject(request.project);
   const target = journalId(project);
-  requireCondition(isText(request.row), "journal_request_invalid", "A classification names the journal row it stands for");
-  // The class and the addressee are G7's words, checked for being said at all, never for being one of a list this
-  // unit keeps: the vocabulary belongs to the gate that derives them.
-  requireCondition(isText(request.class), "journal_request_invalid", "A classification names the class G7 derived from the origin");
-  requireCondition(isText(request.addressee), "journal_request_invalid", "A classification names who the refusal goes back to");
-  requireCondition(Array.isArray(request.basis),
-    "journal_request_invalid", "A classification carries the grounds it was derived from, explicitly empty when the origin was not established");
-  for (const ground of request.basis) {
-    requireCondition(isPlainObject(ground) && exactKeys(ground, SOURCE_KEYS) && isText(ground.role) && isRef(ground.ref),
-      "journal_request_invalid", "Each ground of a classification names its role and an exact reference");
-  }
+  // An absent set is not an empty one, and an explicitly empty one decides nothing: a caller with nothing to
+  // classify adds nothing to its transaction instead of asking for a change that would be none.
+  requireCondition(Array.isArray(request.classifications) && request.classifications.length > 0,
+    "journal_request_invalid", "A classification names at least one refusal G7 decided about");
+  for (const item of request.classifications) requireClassification(item);
 
   const current = currentJournal(store, project, target);
   if (!current) return refused("journal_missing", "This project holds no journal of refusals to classify", { unit: UNIT, target }, "producer");
   if (!current.ok) return current;
-  const head = current.value;
+  const head = current.value as Revision<RefusalJournal>;
   const context: Context = { target, ref: reference(head) };
-  if (!head.value.rows.some(row => row.id === request.row)) {
-    return problem("row_unknown", "No refusal stands in this journal under that id", context, "row");
+  const rows = new Set(head.value.rows.map(row => row.id));
+  // The decisions already standing and those taken earlier in THIS set are weighed alike: a set that says one thing
+  // twice says it once, and a set that says two different things about one refusal decides it twice, which is what
+  // the journal holds each refusal once against.
+  const decided = new Map(head.value.classifications.map(item => [item.row, item as RefusalClassification]));
+  const additions: RefusalClassification[] = [];
+  for (const item of request.classifications) {
+    if (!rows.has(item.row)) return problem("row_unknown", "No refusal stands in this journal under that id", context, "row");
+    const classification = classificationOf(item);
+    const already = decided.get(item.row);
+    if (already) {
+      if (hashJson(already) === hashJson(classification)) continue;
+      return problem("classification_conflict", "This refusal is classified already, and a later classification does not replace the earlier one", context, "row");
+    }
+    decided.set(item.row, classification);
+    additions.push(classification);
   }
-  const classification = classificationOf(request);
-  const already = head.value.classifications.find(item => item.row === request.row);
-  if (already) {
-    if (hashJson(already) === hashJson(classification)) return current;
-    return problem("classification_conflict", "This refusal is classified already, and a later classification does not replace the earlier one", context, "row");
-  }
+  if (additions.length === 0) return unchanged(head);
 
   const value: RefusalJournal = {
     projectId: project,
     rows: head.value.rows,
-    classifications: [...head.value.classifications, classification],
+    classifications: [...head.value.classifications, ...additions],
   };
-  const written = writeGuarded<RefusalJournal>(store, {
-    unit: UNIT, target, guards: [reference(head)],
-    writes: [{ id: target, kind: REFUSAL_JOURNAL_KIND, expected: head.revision, value }],
-  });
-  if (!written.ok) return written;
-  return delivered(written.value[0]!);
+  return {
+    ok: true,
+    value: {
+      transition: {
+        guards: [reference(head)],
+        writes: [{ id: target, kind: REFUSAL_JOURNAL_KIND, expected: head.revision, value }],
+        value,
+      },
+      current: head,
+    },
+  };
+}
+
+function requireClassification(value: unknown): void {
+  requireCondition(isPlainObject(value), "journal_request_invalid", "A classification is asked for by an object");
+  const item = value as unknown as RefusalClassification;
+  requireCondition(isText(item.row), "journal_request_invalid", "A classification names the journal row it stands for");
+  // The class and the addressee are G7's words, checked for being said at all, never for being one of a list this
+  // unit keeps: the vocabulary belongs to the gate that derives them.
+  requireCondition(isText(item.class), "journal_request_invalid", "A classification names the class G7 derived from the origin");
+  requireCondition(isText(item.addressee), "journal_request_invalid", "A classification names who the refusal goes back to");
+  requireCondition(Array.isArray(item.basis),
+    "journal_request_invalid", "A classification carries the grounds it was derived from, explicitly empty when the origin was not established");
+  for (const ground of item.basis) {
+    requireCondition(isPlainObject(ground) && exactKeys(ground, SOURCE_KEYS) && isText(ground.role) && isRef(ground.ref),
+      "journal_request_invalid", "Each ground of a classification names its role and an exact reference");
+  }
 }
 
 /**
@@ -269,7 +367,10 @@ function classificationOf(source: RefusalClassification): RefusalClassification 
   };
 }
 
-const sortKey = (source: OriginSource): string => `${source.role} ${source.ref.id} ${source.ref.revision} ${source.ref.hash}`;
+// The separator is a NUL because no role, id or hash can contain one, so two different sources cannot produce one key.
+// It is written as an ESCAPE and never as a literal byte: a literal one makes the file binary to grep and to review
+// tools, and an editor may drop it or show it as a space — the key would then change, and with it every row id.
+const sortKey = (source: OriginSource): string => `${source.role}\0${source.ref.id}\0${source.ref.revision}\0${source.ref.hash}`;
 // Not localeCompare: a row id is the hash of its own content, so the order must not depend on the machine's locale.
 const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
