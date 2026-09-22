@@ -228,6 +228,46 @@ export interface SeriesLadder {
   readonly grounds: readonly ContinuationGround[];
 }
 
+/**
+ * How the window opened after a stop was answered ENDED. A window opens at the start of a series, at every new accepted
+ * result and at every recorded continuation, so the window a continuation opened ends at the first of: the next saved
+ * stop, a cycle that reached a new accepted result, or nothing yet.
+ */
+export const WINDOW_ENDINGS = Object.freeze(["stop", "progress", "open"] as const);
+export type WindowEnding = typeof WINDOW_ENDINGS[number];
+
+export type StopWindow =
+  | { readonly ended: "stop"; readonly at: number }
+  | { readonly ended: "progress"; readonly at: number; readonly goal: string; readonly accepted: readonly string[] }
+  | { readonly ended: "open" };
+
+/**
+ * One SAVED STOP of a line, as the walk over its attempts derives it: the attempt it was saved after, the exact goals
+ * it was counted over, what answered it, and what became of the window its continuation opened.
+ * This is HISTORY, not state: the ladder of a series keeps only what the NEXT continuation has to satisfy, and a new
+ * accepted result returns it to the start, which drops the windows already spent. A consumer that needs the goals of a
+ * stop already answered, or the boundary of a window already closed, reads them here — from the one walk that derives
+ * and checks the ladder itself — instead of approximating them from what the current ladder still says.
+ */
+export interface StopHistoryEntry {
+  readonly attempt: number;
+  readonly attempts: readonly number[];
+  readonly goals: readonly string[];
+  /** The escalation that sent this stop to the owner, or null. */
+  readonly escalation: Escalation | null;
+  /** The continuation this stop was continued on, or null while it stands. */
+  readonly continuation: Continuation | null;
+  /** What became of the window the continuation opened — null when no continuation opened one. */
+  readonly window: StopWindow | null;
+}
+
+export interface StopHistory {
+  /** Every stop this line saved, inherited ones first, in the order they were saved. */
+  readonly stops: readonly StopHistoryEntry[];
+  /** The attempt the stop standing NOW was saved after, or null: the same stop the record holds. */
+  readonly standing: number | null;
+}
+
 export interface RepairSeries {
   readonly projectId: string;
   readonly block: string;
@@ -446,6 +486,26 @@ export function readSeries(store: Store, request: SeriesRequest): OmResult<Seale
   const current = currentSeries(store, address);
   if (!current) return missing(address);
   return current.ok ? delivered(current.value) : current;
+}
+
+/**
+ * THE HISTORY OF THE STOPS of one line, inherited ones included — for a consumer that has to speak about a stop the
+ * series has already answered: which goals it was counted over, what answered it, and what ended the window its
+ * continuation opened.
+ *
+ * It is the SAME derivation, not a second one: the walk that builds the count, the ladder and the saved stop, and that
+ * every reading of the record checks the stored ones against, fills this history in as it goes. The LADDER is state —
+ * it says what the next continuation has to satisfy, and a new accepted result returns it to the start, which drops the
+ * windows already spent and the goals of the stop the ladder began at. The history is not dropped: the attempts, the
+ * continuations and the escalations it is derived from stay in the record and travel to a successor, so an inherited
+ * stop keeps its goals and its window exactly. Nothing here is stored beside them and nothing is believed: a record
+ * whose stored ladder, count or stop does not follow from the same walk is refused by readSeries before this returns.
+ */
+export function readStopHistory(store: Store, request: SeriesRequest): OmResult<Sealed<StopHistory>> {
+  const read = readSeries(store, request);
+  if (!read.ok) return read;
+  const derived = walk(plainSeries(read.value.value as unknown as RepairSeries));
+  return delivered({ stops: derived.stops, standing: derived.stop === null ? null : derived.stop.attempt });
 }
 
 // Each change is prepared once and applied in one of two ways: written on its own here, or handed to a caller that
@@ -1028,7 +1088,19 @@ interface Walk {
   readonly withoutProgress: number;
   readonly ladder: SeriesLadder;
   readonly stop: SeriesStop | null;
+  readonly stops: readonly StopHistoryEntry[];
   readonly flaw: { readonly field: string; readonly message: string } | null;
+}
+
+// The history as the walk fills it in: one draft per saved stop, completed as the walk reaches what answered it and
+// what closed the window it opened.
+interface StopDraft {
+  attempt: number;
+  attempts: readonly number[];
+  goals: readonly string[];
+  escalation: Escalation | null;
+  continuation: Continuation | null;
+  window: StopWindow | null;
 }
 
 type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "ladder" | "stop">;
@@ -1065,6 +1137,11 @@ function walk(value: SeriesDraft): Walk {
   let ladder = ladderStart();
   let flaw: { readonly field: string; readonly message: string } | null = null;
   let run: { ordinals: number[]; goals: string[] } = { ordinals: [], goals: [] };
+  // The history of the stops, and the two drafts the walk is in the middle of: the stop standing at this point, and
+  // the one whose continuation opened the window the walk is inside.
+  const stops: StopDraft[] = [];
+  let saved: StopDraft | null = null;
+  let inside: StopDraft | null = null;
   // A window is the run of attempts a stop is counted in. One opens at the start, at every new accepted result, and
   // at every recorded continuation — that is what "again up to three attempts" is made of.
   const opened = (): void => { withoutProgress = 0; run = { ordinals: [], goals: [] }; };
@@ -1072,15 +1149,22 @@ function walk(value: SeriesDraft): Walk {
   const step = (attempt: Attempt): void => {
     if (attempt.outcome === null) return;
     const history = achieved.get(attempt.goal.key) ?? new Set<string>();
+    const fresh = attempt.outcome.achieved.filter(item => !history.has(item.key)).map(item => item.key);
     const verdict: AttemptVerdict = attempt.outcome.reason === "awaiting-owner" ? "neutral"
       : attempt.outcome.cancelled.length > 0 ? "conflict"
-        : attempt.outcome.achieved.some(item => !history.has(item.key)) ? "progress" : "none";
+        : fresh.length > 0 ? "progress" : "none";
     verdicts.set(attempt.ordinal, verdict);
     for (const item of attempt.outcome.achieved) history.add(item.key);
     achieved.set(attempt.goal.key, history);
 
     if (verdict === "progress") {
       opened();
+      // A new accepted result closes the window it was reached in, whichever goal it belongs to: what stops the series
+      // afterwards is counted in the window this result opened, not in the one before it.
+      if (inside !== null) {
+        inside.window = { ended: "progress", at: attempt.ordinal, goal: attempt.goal.key, accepted: fresh };
+        inside = null;
+      }
       // Only a new accepted result of the goal the ladder stands for returns it to the start; a result of another
       // goal opens a window, as any progress does, but leaves the rung where it was.
       if (ladder.goals.includes(attempt.goal.key)) ladder = ladderStart();
@@ -1088,7 +1172,16 @@ function walk(value: SeriesDraft): Walk {
       withoutProgress += 1;
       run.ordinals.push(attempt.ordinal);
       if (!run.goals.includes(attempt.goal.key)) run.goals.push(attempt.goal.key);
-      if (withoutProgress >= STOP_AFTER && stop === null) stop = stopOf(attempt, run.ordinals, run.goals, ladder);
+      if (withoutProgress >= STOP_AFTER && stop === null) {
+        stop = stopOf(attempt, run.ordinals, run.goals, ladder);
+        // This stop closes the window that was open, and becomes the one the history is collecting next.
+        if (inside !== null) { inside.window = { ended: "stop", at: attempt.ordinal }; inside = null; }
+        saved = {
+          attempt: stop.attempt, attempts: [...stop.attempts], goals: [...stop.goals],
+          escalation: null, continuation: null, window: null,
+        };
+        stops.push(saved);
+      }
     }
     // An escalation answers the stop of this attempt BEFORE any continuation of it: the owner decides on a stop
     // that was escalated to them, never the other way round.
@@ -1096,6 +1189,8 @@ function walk(value: SeriesDraft): Walk {
       raised.add(attempt.ordinal);
       if (stop === null || ladder.rung !== FIRST_RUNG) flaw ??= { field: "escalations", message: "An escalation stands where no stop of the first rung was saved" };
       else {
+        // It answers the stop that stands, which is the one the history is collecting.
+        if (saved !== null) saved.escalation = plainEscalation(raises.get(attempt.ordinal)!);
         // The stop STAYS, the count stays and no window opens: only the rung, and what the stop now asks for, move.
         ladder = sentToOwner(ladder, stop);
         stop = { ...stop, attempts: [...stop.attempts], goals: [...stop.goals], resume: resumeOf(stop.attempt, ladder) };
@@ -1110,6 +1205,12 @@ function walk(value: SeriesDraft): Walk {
       else if (!ladder.grounds.includes(lift.ground)) {
         flaw ??= { field: "continuations", message: `A stop at rung ${ladder.rung} of the ladder is not continued on the ground "${lift.ground}"` };
       } else {
+        if (saved !== null) {
+          saved.continuation = plainContinuation(lift);
+          // The window this continuation opens is the one the history follows until a result or the next stop ends it.
+          inside = saved;
+          saved = null;
+        }
         ladder = climbed(ladder, stop);
         stop = null;
         opened();
@@ -1121,7 +1222,10 @@ function walk(value: SeriesDraft): Walk {
   for (const attempt of value.attempts) step(attempt);
   if (used.size !== lifts.size) flaw ??= { field: "continuations", message: "A continuation follows an attempt this series does not hold" };
   if (raised.size !== raises.size) flaw ??= { field: "escalations", message: "An escalation follows an attempt this series does not hold" };
-  return { verdicts, achieved, withoutProgress, ladder, stop, flaw };
+  // A window still open is said to be open: what will end it is not yet in the history. Only the window of the LAST
+  // continuation can be in that state, because every later continuation follows a stop, and a stop closes it.
+  for (const draft of stops) if (draft.continuation !== null && draft.window === null) draft.window = { ended: "open" };
+  return { verdicts, achieved, withoutProgress, ladder, stop, stops, flaw };
 }
 
 function stopOf(attempt: Attempt, ordinals: readonly number[], goals: readonly string[], ladder: SeriesLadder): SeriesStop {

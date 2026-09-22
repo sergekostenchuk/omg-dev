@@ -13,7 +13,7 @@ import {
   classifyRefusal, readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
 } from "../src/om/refusal-journal.js";
 import {
-  beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, resumeSeries, seriesId,
+  beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, readStopHistory, resumeSeries, seriesId,
   prepareBeginAttempt, prepareCompleteAttempt, prepareEscalateSeries, prepareOpenSeries, prepareResumeSeries,
   inputFixNamespace, ownerDecisionNamespace, stopReviewNamespace,
   ATTEMPT_VERDICTS, COMPLETION_REASONS, CONTINUATION_GROUNDS, INPUT_FIX_KIND, OWNER_DECISION_KIND,
@@ -2498,4 +2498,86 @@ test("two series and one new record of a ground go into one transaction, or none
   assert.deepEqual(series.value.escalations, [{ after: 3, review: reference(store.get(newReview)!) }]);
   assert.equal(series.value.ladder.rung, 2);
   assert.equal(deliveredOf(readSeries(store, at(other))).value.ladder.rung, 2);
+});
+
+// ---------------------------------------------------------------------------
+// The history of the stops, derived by the same walk that builds and checks the ladder (journal record №186).
+
+test("the history of the stops comes from the same walk: exact goals, window boundaries, and what answered each", t => {
+  const { store } = fixture(t);
+  opened(store);
+  // Two cycles of one goal and a third of another: the stop is counted over both of them.
+  const refusal = journalled(store, PROJECT);
+  const failed = () => outcome({ reason: "refused", refusals: [refusal] });
+  cycle(store, PROJECT, goal(), failed());
+  cycle(store, PROJECT, goal(), failed());
+  cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), failed());
+  assert.deepEqual(held(store)!.value.stop!.goals, ["gap:cart:price", "gap:cart:tax"]);
+
+  // A stop that stands: nothing answered it, so no window was opened.
+  assert.deepEqual(deliveredOf(readStopHistory(store, address(PROJECT))), {
+    standing: 3,
+    stops: [{
+      attempt: 3, attempts: [1, 2, 3], goals: ["gap:cart:price", "gap:cart:tax"],
+      escalation: null, continuation: null, window: null,
+    }],
+  });
+
+  // Continued on a review: the window it opened stays open until something ends it.
+  const ground = byReview(store, PROJECT, 3, ["gap:cart:price", "gap:cart:tax"]);
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground } as ResumeSeriesRequest));
+  const continued = deliveredOf(readStopHistory(store, address(PROJECT)));
+  assert.equal(continued.standing, null);
+  assert.deepEqual(continued.stops[0]!.continuation, storedGround(ground, 3));
+  assert.deepEqual(continued.stops[0]!.window, { ended: "open" });
+
+  // Three more cycles without progress: that window closed in the NEXT stop, which the history holds too.
+  circled(store, PROJECT, refusal);
+  const twice = deliveredOf(readStopHistory(store, address(PROJECT)));
+  assert.deepEqual(twice.stops.map(item => item.attempt), [3, 6]);
+  assert.deepEqual(twice.stops[0]!.window, { ended: "stop", at: 6 });
+  assert.deepEqual(twice.stops[1]!.goals, ["gap:cart:price"]);
+  assert.equal(twice.stops[1]!.window, null);
+
+  // The owner lets it go on, and the next cycle reaches a new accepted result: THAT ends the second window, and it
+  // returns the ladder to its start — which drops the windows the ladder had spent. The history keeps every stop.
+  const owner = byOwner(store, PROJECT, 6, ["gap:cart:price"]);
+  deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...owner } as ResumeSeriesRequest));
+  cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:cart:price")] }));
+  assert.deepEqual(held(store)!.value.ladder.windows, []);
+  circled(store, PROJECT, refusal);
+
+  const whole = deliveredOf(readStopHistory(store, address(PROJECT)));
+  assert.deepEqual(whole.stops.map(item => item.attempt), [3, 6, 10]);
+  assert.equal(whole.standing, 10);
+  assert.deepEqual(whole.stops[0]!.window, { ended: "stop", at: 6 });
+  assert.deepEqual(whole.stops[1]!.window, { ended: "progress", at: 7, goal: "gap:cart:price", accepted: ["line:cart:price"] });
+  assert.deepEqual(whole.stops[1]!.continuation, storedGround(owner, 6));
+  assert.equal(whole.stops[2]!.window, null);
+  // The goals of a stop already answered are still exact here, and the ladder no longer says them at all.
+  assert.deepEqual(whole.stops[0]!.goals, ["gap:cart:price", "gap:cart:tax"]);
+  assert.deepEqual(held(store)!.value.ladder.goals, []);
+  assert.ok(deeplyFrozen(whole));
+
+  // A successor of the series carries the whole history: an inherited stop keeps its attempt, its goals and its window.
+  const predecessor = reference(held(store)!);
+  opened(store, PROJECT, { line: 2, slice: "slice:cart@2", predecessor, basis: { ground: "inputs-changed", text: "the slice of the horizon moved" } });
+  const inheritedHistory = deliveredOf(readStopHistory(store, address(PROJECT, 2)));
+  assert.deepEqual(inheritedHistory, whole);
+
+  // An escalation answers a stop and opens NO window: the stop stays, and it stays the owner's.
+  opened(store, "beta");
+  circled(store, "beta", journalled(store, "beta"));
+  const raised = undecided(store, "beta", 3);
+  deliveredOf(escalateSeries(store, { ...address("beta"), stop: 3, review: { ref: raised } }));
+  const escalated = deliveredOf(readStopHistory(store, address("beta")));
+  assert.equal(escalated.standing, 3);
+  assert.deepEqual(escalated.stops[0]!.escalation, { after: 3, review: raised });
+  assert.equal(escalated.stops[0]!.continuation, null);
+  assert.equal(escalated.stops[0]!.window, null);
+
+  // It is read like any series: the shape of the request is weighed first, and a series that does not stand is refused.
+  assert.throws(() => readStopHistory(store, undefined as unknown as SeriesRequest), code("series_request_invalid"));
+  assert.throws(() => readStopHistory({} as Store, address(PROJECT)), code("series_request_invalid"));
+  assert.equal(refusalOf(readStopHistory(store, address("gamma"))).code, "series_missing");
 });

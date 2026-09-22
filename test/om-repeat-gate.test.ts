@@ -19,7 +19,7 @@ import {
   type AttemptGoal, type BeginAttemptRequest, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
 import {
-  closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, stopContext,
+  closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, readStopContext, stopContext,
   originAnalysisNamespace, originDecisionNamespace, originHoldId, originHoldNamespace,
   ADDRESSEE_KINDS, GATE_REFUSAL_CODES, LIFT_GROUNDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND,
   ORIGIN_ROLES, REFUSAL_CLASSES, REFUSAL_STAGES, REPEAT_GATE_CODES, SUBJECT_DECISIONS,
@@ -1863,4 +1863,49 @@ test("a saved lift whose grounds no longer establish its class is refused at the
   back.write({ id: other.hold.id, kind: ORIGIN_HOLD_KIND, expected: 2, value: other.standing as unknown as Json });
   deliveredOf(liftOriginHold(back, liftBy("trimmed", reference(back.get(other.hold.id)!), "origin-analysis", { ref: record })));
   deliveredOf(openAttempt(back, { ...address("trimmed"), attempt: 2, goal: goal() }));
+});
+
+// ---------------------------------------------------------------------------
+// The heads a context was read from, handed over for whoever writes on it (journal record №184, interface of A5).
+
+test("the gate hands over the mutable heads a context was read from, the LIFTED holds among them", t => {
+  const { store } = fixture(t);
+  opened(store);
+  const held = heldBy(store, PROJECT);
+  const standing = holdAt(store, held.hold);
+  // The owner decided about that origin; the hold is lifted and the series goes on to its stop.
+  const decision = storedAs(store, ORIGIN_DECISION_KIND, originDecisionNamespace(PROJECT), decisionOf(standing));
+  deliveredOf(liftOriginHold(store, liftBy(PROJECT, held.hold, "owner-decision", { ref: decision })));
+  for (let index = 0; index < 2; index += 1) closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
+
+  const reading = deliveredOf(readStopContext(store, address(PROJECT)));
+  // The context is the one context, assembled by the one function; the reading only says what it was read from.
+  assert.deepEqual(reading.context, deliveredOf(stopContext(store, address(PROJECT))));
+  assert.equal(reading.context.stop!.attempt, 3);
+  assert.deepEqual(reading.context.holds, []);
+
+  // Every head, each at the revision it stands at: the series, the journal, and the hold — lifted, and still read.
+  assert.deepEqual([...reading.reads].map(ref => ref.id).sort(),
+    [at(PROJECT), journalId(PROJECT), held.hold.id].sort());
+  for (const ref of reading.reads) {
+    const current = store.get(ref.id)!;
+    assert.equal(ref.revision, current.revision);
+    assert.equal(ref.hash, current.hash);
+  }
+  // The HISTORICAL records a context names are not heads: the record the hold was lifted on is read at its exact
+  // reference, and a newer revision of it makes the lift no less true.
+  assert.equal(reading.reads.some(ref => ref.id === decision.id), false);
+
+  // A series no gate has refused anything in keeps no journal, and the reading says so instead of naming an absent one.
+  opened(store, "beta");
+  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), outcome({ reason: "interrupted" }), 1);
+  const quiet = deliveredOf(readStopContext(store, address("beta")));
+  assert.deepEqual([...quiet.reads].map(ref => ref.id), [at("beta")]);
+
+  // Both entrances refuse a series nothing stops, with the same code and the same address.
+  opened(store, "gamma");
+  assert.equal(refusalOf(readStopContext(store, address("gamma"))).code, "stop_absent");
+  assert.equal(refusalOf(stopContext(store, address("gamma"))).code, "stop_absent");
+  assert.throws(() => readStopContext(store, undefined as unknown as SeriesRequest), typedDefect);
+  assert.ok(deeplyFrozen(reading));
 });

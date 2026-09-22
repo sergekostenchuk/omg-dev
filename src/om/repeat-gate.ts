@@ -279,6 +279,21 @@ export interface StopContext {
 }
 
 /**
+ * A context together with the MUTABLE HEADS it was read from: the records whose CURRENT revision this reading depends
+ * on — the series, the journal of refusals, and every hold of the lineage, the ones that still stand and the ones
+ * already lifted alike. Whoever acts on a context guards its transaction with them, so that nothing the reading stood
+ * on moves between it and the write (T7); a consumer that guarded only the standing holds would let the head of a
+ * lifted one change underneath it.
+ * The HISTORICAL records a context names — the revision of the series a hold was raised at, the record a hold was
+ * lifted on — are deliberately NOT among them: they are read at their exact references, and a newer revision of any of
+ * them makes none of them false (T3).
+ */
+export interface ContextReading {
+  readonly context: StopContext;
+  readonly reads: readonly Ref[];
+}
+
+/**
  * What the gate hands back once a cycle has been closed through it.
  * The verdict, the count, the stop and the rung are the SERIES' findings, reported here rather than derived again.
  */
@@ -469,25 +484,44 @@ export function prepareLiftOriginHold(store: Store, request: LiftOriginHoldReque
  * has no context to give, and says so.
  */
 export function stopContext(store: Store, request: SeriesRequest): OmResult<Sealed<StopContext>> {
+  const read = contextReading(store, request);
+  return read.ok ? delivered(read.value.context) : read;
+}
+
+/**
+ * The same context, with the mutable heads it was read from beside it (ContextReading), for a consumer that goes on to
+ * write on it: it guards its transaction with them instead of guessing which records this gate touched.
+ */
+export function readStopContext(store: Store, request: SeriesRequest): OmResult<Sealed<ContextReading>> {
+  const read = contextReading(store, request);
+  return read.ok ? delivered(read.value) : read;
+}
+
+function contextReading(store: Store, request: SeriesRequest): OmResult<ContextReading> {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "The context of a stop is asked for through a request object");
   const address = requireAddress(request);
   const series = readSeries(store, request);
   if (!series.ok) return series;
-  const held = series.value.value as RepairSeries;
+  const current = series.value as Revision<RepairSeries>;
+  const held = current.value;
   const holds = holdsOf(store, address, held);
   if ("ok" in holds) return holds;
   if (held.stop === null && holds.standing.length === 0) {
     return refused("stop_absent", "Neither a saved stop nor a hold stands in this series, so there is no context of one to assemble",
       { unit: UNIT, target: address.id, field: "stop" }, "producer");
   }
+  // holdsOf hands back the heads it read — the journal and every hold of the lineage, lifted or standing — and the
+  // series' own head is the other one: a context is only as current as these.
+  const reads: Ref[] = [reference(current), ...holds.guards];
   let decided: ReadonlyMap<string, RefusalClassification> = new Map();
   if (rowsOf(held).size > 0) {
     const journal = readJournal(store, { project: address.project });
     if (!journal.ok) return unlinked(address, journal.refusal.code, "stop.refusals");
+    reads.push(reference(journal.value));
     decided = new Map(journal.value.value.classifications.map(item => [item.row, item as RefusalClassification]));
   }
-  return delivered(contextOf(address, held, holds.standing, decided));
+  return { ok: true, value: { context: contextOf(address, held, holds.standing, decided), reads: uniqueGuards(reads) } };
 }
 
 // ---------------------------------------------------------------------------
