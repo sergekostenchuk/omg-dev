@@ -1121,16 +1121,20 @@ const sentToOwner = (ladder: SeriesLadder, stop: SeriesStop): SeriesLadder =>
 /**
  * Walks the attempts of a goal's whole lineage and derives what follows from them.
  * Nothing stored is believed here: the verdict of an attempt comes from its achievements weighed against the history
- * of ITS goal, the count from the verdicts, and the stop from the count. A key already in that history is no progress
- * however it was reached, and a key stays in the history once accepted — so the re-taking of a lost result is not a
- * new achievement either. A cancelled result makes the cycle a conflict of results rather than a success.
+ * of ITS goal, the count from the verdicts, and the stop from the count. A history that could not have happened is
+ * named as a flaw rather than walked on: an attempt standing after a stop nothing had continued, and an escalation or
+ * a continuation recorded after a LATER attempt than the stop it would answer, are both refused at every reading.
+ * A key already in that history is no progress however it was reached, and a key stays in the history once accepted —
+ * so the re-taking of a lost result is not a new achievement either. A cancelled result makes the cycle a conflict of
+ * results rather than a success.
  */
 function walk(value: SeriesDraft): Walk {
   const verdicts = new Map<number, AttemptVerdict>();
   const achieved = new Map<string, Set<string>>();
-  const lifts = new Map(value.continuations.map(item => [item.after, item]));
+  // Each transition is kept with the position it is stored at, so that a refusal names the field it was read from.
+  const lifts = new Map(value.continuations.map((item, index) => [item.after, { item, index }]));
   const used = new Set<number>();
-  const raises = new Map(value.escalations.map(item => [item.after, item]));
+  const raises = new Map(value.escalations.map((item, index) => [item.after, { item, index }]));
   const raised = new Set<number>();
   let withoutProgress = 0;
   let stop: SeriesStop | null = null;
@@ -1147,6 +1151,34 @@ function walk(value: SeriesDraft): Walk {
   const opened = (): void => { withoutProgress = 0; run = { ordinals: [], goals: [] }; };
 
   const step = (attempt: Attempt): void => {
+    // A SAVED STOP CLOSES THE WINDOW. While it stands no attempt of this series follows it — a restart does not lift
+    // it and only a ground of its rung opens a new window — and a transition recorded after a LATER attempt answers no
+    // stop this history holds. The two are one forged history seen from two sides: an escalation "after: 4" beside the
+    // stop saved after attempt 3 was read as that stop's own and handed to it, so the checks stand together and each
+    // names the field it was read from. The public operations already refuse both live (series_stopped when an attempt
+    // is begun past a standing stop, stop_absent when a continuation or an escalation names another ordinal); this is
+    // the same rule applied to a record that arrives already written.
+    if (stop !== null && attempt.ordinal !== stop.attempt) {
+      const standing = stop.attempt;
+      const raise = raises.get(attempt.ordinal);
+      const lift = lifts.get(attempt.ordinal);
+      if (raise !== undefined) {
+        flaw ??= {
+          field: `escalations.${raise.index}.after`,
+          message: `An escalation of attempt ${attempt.ordinal} is not the escalation of the stop saved after attempt ${standing}, the only stop that stands there`,
+        };
+      } else if (lift !== undefined) {
+        flaw ??= {
+          field: `continuations.${lift.index}.after`,
+          message: `A continuation of attempt ${attempt.ordinal} is not the continuation of the stop saved after attempt ${standing}, the only stop that stands there`,
+        };
+      } else {
+        flaw ??= {
+          field: `attempts.${attempt.ordinal}`,
+          message: `Attempt ${attempt.ordinal} was begun while the stop saved after attempt ${standing} still stood, and no ground had continued it`,
+        };
+      }
+    }
     if (attempt.outcome === null) return;
     const history = achieved.get(attempt.goal.key) ?? new Set<string>();
     const fresh = attempt.outcome.achieved.filter(item => !history.has(item.key)).map(item => item.key);
@@ -1190,13 +1222,13 @@ function walk(value: SeriesDraft): Walk {
       if (stop === null || ladder.rung !== FIRST_RUNG) flaw ??= { field: "escalations", message: "An escalation stands where no stop of the first rung was saved" };
       else {
         // It answers the stop that stands, which is the one the history is collecting.
-        if (saved !== null) saved.escalation = plainEscalation(raises.get(attempt.ordinal)!);
+        if (saved !== null) saved.escalation = plainEscalation(raises.get(attempt.ordinal)!.item);
         // The stop STAYS, the count stays and no window opens: only the rung, and what the stop now asks for, move.
         ladder = sentToOwner(ladder, stop);
         stop = { ...stop, attempts: [...stop.attempts], goals: [...stop.goals], resume: resumeOf(stop.attempt, ladder) };
       }
     }
-    const lift = lifts.get(attempt.ordinal);
+    const lift = lifts.get(attempt.ordinal)?.item;
     if (lift) {
       used.add(attempt.ordinal);
       // A continuation standing where no stop was raised, or on a ground the rung it answers does not admit, is a

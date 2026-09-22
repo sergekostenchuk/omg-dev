@@ -2581,3 +2581,98 @@ test("the history of the stops comes from the same walk: exact goals, window bou
   assert.throws(() => readStopHistory({} as Store, address(PROJECT)), code("series_request_invalid"));
   assert.equal(refusalOf(readStopHistory(store, address("gamma"))).code, "series_missing");
 });
+
+// ---------------------------------------------------------------------------
+// A record that arrives ALREADY WRITTEN (repair A3.2, verdict 188). A saved stop closes the window, so a stored
+// history holds no attempt past a stop nothing had continued, and every escalation and continuation in it answers the
+// stop of its OWN attempt. The live operations refuse both (series_stopped, stop_absent) — and never saw this record
+// written, which is why the same rule is applied at every reading.
+
+/** One more completed attempt, shaped exactly as this unit writes one: the last attempt of a line at a later ordinal. */
+const oneMore = (attempts: readonly Attempt[], ordinal: number): Record<string, unknown> =>
+  ({ ...(attempts[attempts.length - 1] as unknown as Record<string, unknown>), ordinal });
+
+test("a stored history holds no attempt past a standing stop, and no transition of another attempt's stop (T3, T4)", t => {
+  const { store } = fixture(t);
+  const stopped = (project: string): RepairSeries => {
+    opened(store, project);
+    for (let round = 0; round < 3; round += 1) cycle(store, project, goal(), fruitless());
+    return held(store, project)!.value;
+  };
+
+  // An attempt standing past a stop nothing continued. Everything derived from the history is written to agree with it
+  // — a count of four, the same stop, the same rung — and the attempt still could not have been begun.
+  const plain = stopped("past");
+  assert.equal(plain.stop!.attempt, 3);
+  forge(store, "past", value => ({ ...value, attempts: [...value.attempts, oneMore(value.attempts, 4)], withoutProgress: 4 }));
+  const past = addressed(refusalOf(readSeries(store, address("past"))), "series_invalid", "past");
+  assert.equal(past.at.field, "attempts.4");
+  assert.ok(past.message.includes("attempt 3"));
+
+  // And an attempt merely BEGUN past it moves no count at all, so nothing derived disagrees with the record either.
+  stopped("open");
+  forge(store, "open", value => ({
+    ...value, attempts: [...value.attempts, { ordinal: 4, goal: value.attempts[0]!.goal, outcome: null, verdict: null }],
+  }));
+  assert.equal(addressed(refusalOf(readSeries(store, address("open"))), "series_invalid", "open").at.field, "attempts.4");
+
+  // The ESCALATION of a stop is the escalation of its own attempt. This is the history verdict 188 reproduced: the
+  // stop stands after attempt 3, the escalation says "after: 4", and the history handed it to the stop of attempt 3.
+  stopped("raise");
+  const undecided_ = deliveredOf(escalateSeries(store, {
+    ...address("raise"), stop: 3, review: { ref: undecided(store, "raise", 3) },
+  })).value.escalations[0]!.review;
+  forge(store, "raise", value => ({
+    ...value, attempts: [...value.attempts, oneMore(value.attempts, 4)], withoutProgress: 4,
+    escalations: [{ after: 4, review: undecided_ }],
+  }));
+  const raise = addressed(refusalOf(readSeries(store, address("raise"))), "series_invalid", "raise");
+  assert.equal(raise.at.field, "escalations.0.after");
+  assert.ok(raise.message.includes("attempt 3"));
+  // The history of the stops comes from the same reading, so it hands out no escalation of a stop that is not its own:
+  // the refusal comes first, instead of the stop of attempt 3 carrying an escalation nobody made for it.
+  assert.equal(addressed(refusalOf(readStopHistory(store, address("raise"))), "series_invalid", "raise").at.field, "escalations.0.after");
+
+  // The same for a CONTINUATION: the window it opens is the window of its own stop, and no later attempt lends it one.
+  stopped("lift");
+  const ground = byReview(store, "lift", 3);
+  const continued = deliveredOf(resumeSeries(store, { ...address("lift"), stop: 3, ...ground })).value;
+  assert.deepEqual(continued.ladder.windows, [3]);
+  assert.equal(continued.stop, null);
+  forge(store, "lift", value => ({
+    ...value, attempts: [...value.attempts, oneMore(value.attempts, 4)],
+    continuations: [{ ...value.continuations[0]!, after: 4 }],
+  }));
+  const lift = addressed(refusalOf(readSeries(store, address("lift"))), "series_invalid", "lift");
+  assert.equal(lift.at.field, "continuations.0.after");
+  assert.equal(addressed(refusalOf(readStopHistory(store, address("lift"))), "series_invalid", "lift").at.field, "continuations.0.after");
+
+  // What the live operations do is untouched: an ordinal that is not the standing stop is stop_absent for either kind
+  // of transition, an attempt past the stop is series_stopped, and no refusal writes anything (T8).
+  const genuine = stopped("live");
+  const before = held(store, "live")!.revision;
+  addressed(refusalOf(escalateSeries(store, { ...address("live"), stop: 4, review: { ref: undecided(store, "live", 4) } })), "stop_absent", "live");
+  addressed(refusalOf(resumeSeries(store, { ...address("live"), stop: 4, ...byReview(store, "live", 4) })), "stop_absent", "live");
+  addressed(refusalOf(beginAttempt(store, { ...address("live"), attempt: 4, goal: goal() })), "series_stopped", "live");
+  assert.equal(held(store, "live")!.revision, before);
+  assert.deepEqual(held(store, "live")!.value, genuine);
+
+  // A successor whose predecessor holds such a history is refused by the same check: the inherited line is derived
+  // again from the predecessor at the exact reference it names, and a history that could not have happened is not one.
+  stopped("heir");
+  const successor = deliveredOf(openSeries(store, {
+    ...address("heir", 2), slice: "slice:cart@2", predecessor: reference(held(store, "heir", 1)!),
+    basis: { ground: "inputs-changed", text: "the closure of the block moved" },
+  }));
+  assert.equal(successor.value.stop!.attempt, 3);
+  assert.equal(successor.value.inherited.length, 3);
+  forge(store, "heir", value => ({ ...value, attempts: [...value.attempts, oneMore(value.attempts, 4)], withoutProgress: 4 }));
+  const moved = reference(held(store, "heir", 1)!);
+  forge(store, "heir", value => ({
+    ...value, predecessor: moved, inherited: [...value.inherited, oneMore(value.inherited, 4)], withoutProgress: 4,
+  }), 2);
+  assert.equal(addressed(refusalOf(readSeries(store, address("heir", 1))), "series_invalid", "heir").at.field, "attempts.4");
+  const heir = addressed(refusalOf(readSeries(store, address("heir", 2))), "series_invalid", "heir", 2);
+  assert.equal(heir.at.field, "attempts.4");
+  assert.equal(addressed(refusalOf(readStopHistory(store, address("heir", 2))), "series_invalid", "heir", 2).at.field, "attempts.4");
+});
