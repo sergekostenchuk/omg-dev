@@ -463,7 +463,7 @@
 - Отдаёт: connection-frame (каркас обязательств уровня N); layer-proposal (предложение слоя); Записи OM в SQLite
 - Читает записи: frame-candidate; исход G3 с хэшем кандидата
 - Пишет записи: graph; graph-layer; connection-frame; layer-proposal (статусы)
-- Разрешённые пути: `src/om/frame-accept.ts`, `test/om-frame-accept.test.ts`, `src/om/layer-basis.ts`, `test/om-layer-basis.test.ts`, `src/om/frame-obligations.ts`, `test/om-frame-obligations.test.ts`, `src/om/horizon.ts`, `test/om-horizon.test.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`
+- Разрешённые пути: `src/om/frame-accept.ts`, `test/om-frame-accept.test.ts`, `src/om/layer-basis.ts`, `test/om-layer-basis.test.ts`, `src/om/frame-obligations.ts`, `test/om-frame-obligations.test.ts`, `src/om/horizon.ts`, `test/om-horizon.test.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`, `src/om/frame-proposals.ts`, `test/om-frame-proposals.test.ts`
 - Из движка как есть: GraphRepository.saveDerived — src/graph/repository.ts (проверить пригодность; иначе запись через A1); A1
 - Пробный код (сценарии, не код к переносу): proto/frame.mjs — rebaseFrame
 - После: C4, A4, A5, D1
@@ -481,6 +481,7 @@
   - контрольный сценарий: первый OM-кандидат из L1 принят, затем его слой законно читается и используется следующим prepareFrame, горизонтом (B2) и D1; upper-not-accepted уже не скрывает принятый верх; старые исследовательские основания читаются своим договором (№313-1)
   - действующий путь — N=2/G3; договор готов для обоих уровней, N=3 до настоящих F2/F5 — типизированный отказ без записей; объект с passed=true основанием не является (№313-2)
   - отрицательный путь rejectProposals по договору №319: отказ выводится заново штатной assembleCandidate с G3 над точным FrameRequest и полным набором Ref; набор отклоняется ЦЕЛИКОМ одной writeGuarded с охранами и expected всех предложений; verdict хранит нормализованный запрос источников и выведенные коды/адреса/findings, историческое подтверждение по исходным proposed-ревизиям; регрессии: два предложения с общей ошибкой → оба rejected; успех и gaps → без отклонения; ошибка источника (чужая/поддельная ссылка, сменившаяся голова, не-proposed, N3, сбой движка) → без записи; гонка одного участника → никаких частичных статусов; точный повтор без ревизий; запоздавший отказ после последующего принятия ничего не меняет (вердикт №319)
+  - перенос каркаса на новую базу: сохранённые заполнения переносятся, исчезнувшие — в историю, новые обязательства остаются открытыми; C3 на сохраняемых путях опирается на общий доказанный результат C2 (узкий перевод verifiedBase, без второго алгоритма принятия и без ослабления проверки полноты по переданному маркеру); регрессия: принятый L3 → законное изменение L2 → явный перенос → новые открытые обязательства проходят C3 и попадают в D1; подделанный перенос отвергается (вопрос воркера №322)
 
 ### C5.1 · Поставщик принятия: принятый каркас как достижение цели попытки
 
