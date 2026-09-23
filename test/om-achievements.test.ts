@@ -54,9 +54,9 @@ const request = (over: Partial<ConfirmRequest> = {}): ConfirmRequest =>
 const written = (store: Store, kind: string, value: Record<string, unknown> = { accepted: true, keys: ["line:cart:price"] }): Ref =>
   reference(store.write({ id: `${kind}:${PROJECT}:${next()}`, kind, expected: 0, value: value as Json }));
 
-test("the D2 acceptance provider and empty cancellation table are frozen and closed to callers", () => {
+test("the D2 and D5 acceptance providers and empty cancellation table are frozen and closed to callers", () => {
   for (const table of [ACCEPTANCE_PROVIDERS, CANCELLATION_PROVIDERS]) {
-    const expected = table === ACCEPTANCE_PROVIDERS ? ["gap-line"] : [];
+    const expected = table === ACCEPTANCE_PROVIDERS ? ["gap-line", "accepted-answer"] : [];
     assert.deepEqual(Object.keys(table), expected);
     assert.ok(Object.isFrozen(table));
     for (const provider of Object.values(table)) assert.ok(Object.isFrozen(provider));
@@ -206,4 +206,14 @@ test("every argument is checked before the store is touched, as a typed defect a
       assert.throws(() => confirm({ ...request(), [field]: broken }), code("acceptance_request_invalid"));
     }
   }
+});
+
+
+test("the accepted-answer provider rejects status imitations and unconfirmed cancellation", t => {
+  const { store } = fixture(t);
+  const row = store.write({ id: `om-answer:${PROJECT}:fake`, kind: "accepted-answer", expected: 0,
+    value: { project: PROJECT, accepted: true, status: "supported", key: "caller-result" } });
+  assert.equal(refusalOf(confirmResults(store, request({ accepting: [reference(row)] }))).code, "achievement_unconfirmed");
+  assert.equal(refusalOf(confirmResults(store, request({ cancelling: [reference(row)] }))).code, "cancellation_unconfirmed");
+  assert.equal(ACCEPTANCE_PROVIDERS["accepted-answer"]!.namespace(PROJECT), `om-answer:${PROJECT}:`);
 });

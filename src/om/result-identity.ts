@@ -1,10 +1,11 @@
 import { Ajv } from "ajv";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import type { Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store } from "../storage/store.js";
+import { normalizeAnswerContract, type AnswerQuestionContract } from "./accepted-answer.js";
 import { readAcceptedFrame, type AcceptedFrameRequest } from "./frame-accept.js";
 import { readCandidate } from "./frame-candidate.js";
 import { readFrame, type FrameFill, type FrameObligation, type FrameRead } from "./frame-obligations.js";
@@ -18,6 +19,45 @@ export const RESULT_SLICE_REFUSAL_CODES = Object.freeze([
 export const RESULT_IDENTITY_REFUSAL_CODES = Object.freeze([
   "result_identity_invalid", "result_identity_unfilled", "result_identity_ambiguous",
 ] as const);
+
+export interface FactResultIdentity {
+  project: string;
+  target: string;
+  field: string;
+  contract: AnswerQuestionContract;
+  value: Json;
+}
+
+/** Content identity only; a caller must establish acceptance and applicability separately. */
+export function factResultKey(input: FactResultIdentity): string {
+  function invalid(field: string): never {
+    throw new EngineError("result_identity_invalid", "A fact result needs its address, complete question contract and JSON value",
+      { unit: "D5", target: "fact-result", field });
+  }
+  if (!object(input) || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) invalid("input");
+  const fields = ["project", "target", "field", "contract", "value"];
+  for (const field of fields) if (!Object.hasOwn(input, field)) invalid(field);
+  if (!keys(input as unknown as Record<string, unknown>, fields)) invalid("input");
+  for (const field of ["project", "target", "field"] as const) if (!text(input[field])) invalid(field);
+  // Seal before hashing to reject unsupported values with a D5 address, retain own
+  // __proto__ properties and never freeze or rewrite the caller's input.
+  let value: Sealed<Json>;
+  try { value = sealed(input.value); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "unsealable_value") invalid("value");
+    throw error;
+  }
+  let contract: Sealed<AnswerQuestionContract>;
+  try { contract = normalizeAnswerContract(input.contract); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "answer_contract_invalid") {
+      const field = object(error.details) && text(error.details["field"]) ? error.details["field"] : "contract";
+      invalid(`contract.${field}`);
+    }
+    throw error;
+  }
+  return `om-result:${hashJson({ kind: "fact", project: input.project, target: input.target, field: input.field, contract, value })}`;
+}
 
 const parts = ["nodes", "contracts", "artifacts", "connectors", "anchors", "joins", "tests",
   "actors", "requirements", "edges", "journeys", "transfers", "packets"] as const;

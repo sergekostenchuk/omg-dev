@@ -11,6 +11,7 @@ import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
 import { readResultIdentity } from './result-identity.js';
+import { confirmAnswerGapClosure, type AnswerBasis } from './accepted-answer.js';
 
 export const GAP_LINE_KIND = 'gap-line';
 export const GAP_LINE_CODES = Object.freeze([
@@ -29,6 +30,7 @@ export interface GapLineAttempt { series: Ref; attempt: number }
 export interface GapClosureRequest extends GapLineClosure {
   acceptance: AcceptedFrameRequest | null;
   attempt: GapLineAttempt | null;
+  answer?: AnswerBasis;
 }
 /** A project snapshot includes every line, even when the current D1 set is empty. */
 export interface GapLinesRequest {
@@ -39,11 +41,14 @@ export interface GapLinesReadRequest { project: string; record: Ref }
 export interface PreparedGapLines {
   record: GapLinesRecord; existing: Revision<GapLinesRecord> | null; writes: Write[]; guards: Ref[]; references: Ref[];
 }
-interface ConfirmedGapClosure {
-  obligation: FrameObligation; acceptance: AcceptedFrameRequest;
+interface ConfirmedClosureBase {
   attempt: { series: Ref; ordinal: number; block: string; goal: AttemptGoal } | null;
-  references: Ref[]; guards: Ref[];
+  references: Ref[]; guards: Ref[]; writes: Write[];
 }
+type ConfirmedGapClosure = ConfirmedClosureBase & (
+  { kind: 'frame'; obligation: FrameObligation; acceptance: AcceptedFrameRequest }
+  | { kind: 'answer'; key: string }
+);
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const positive = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
@@ -186,6 +191,15 @@ function requireRequest(store: Store, value: unknown): asserts value is GapLines
       || !(acceptance === null || (object(acceptance) && text(acceptance['project'])
         && [2, 3].includes(acceptance['level'] as number)
         && ['graph', 'layer', 'frame'].every(key => isRef(acceptance[key]))))) invalid('closures');
+    if ('answer' in closure) {
+      const answer = closure['answer'];
+      if (!object(answer) || !(
+        isRef(answer['record']) && !('pending' in answer)
+        || !('record' in answer) && object(answer['pending']) && text(answer['pending']['id'])
+          && text(answer['pending']['kind']) && answer['pending']['expected'] === 0
+          && 'value' in answer['pending'] && answer['pending']['value'] !== undefined
+      )) invalid('closures.answer');
+    }
   }
 }
 function normalize(request: GapLinesRequest): GapLinesRequest {
@@ -196,7 +210,15 @@ function normalize(request: GapLinesRequest): GapLinesRequest {
   try {
     return sealed({ ...request, gaps: { sources: { ...sources,
       operations: proposals(sources.operations), works: proposals(sources.works),
-    }, records: sorted(request.gaps.records) }, closures: sorted(request.closures) }) as GapLinesRequest;
+    }, records: sorted(request.gaps.records) }, closures: sorted(request.closures.map(closure => {
+      if (closure.answer && 'pending' in closure.answer) {
+        const pending = closure.answer.pending;
+        // Validate JSON before hashing so malformed pending content keeps this boundary's addressed error.
+        const value = sealed(pending.value);
+        return { ...closure, answer: { record: { id: pending.id, revision: pending.expected + 1, hash: hashJson(value) } } };
+      }
+      return closure;
+    })) }) as GapLinesRequest;
   } catch (error) {
     if (error instanceof EngineError && error.code === 'unsealable_value') invalid('request.json');
     throw error;
@@ -257,8 +279,22 @@ function substantive(obligation: FrameObligation): Omit<FrameObligation, 'zone'>
 }
 /** One content verifier serves preparation, historical re-derivation, and the acceptance provider. */
 function confirmClosure(store: Store, project: string, line: GapLine, closure: GapClosureRequest,
-  previous: History | null, context: FrameRequest, current: boolean): ConfirmedGapClosure {
+  previous: History | null, gaps: GapReadRequest, current: boolean): ConfirmedGapClosure {
   if (closure.reason === 'cancelled') fail('closure_unsupported', line.id, 'reason', 'Cancellation requires the H2 owner-decision producer');
+  if (closure.answer) {
+    const source = oldGap(previous, line.id);
+    if (!source || closure.acceptance !== null)
+      fail('closure_unconfirmed', line.id, 'answer', 'An answer closure names its preceding gap and one accepting producer');
+    const basis = 'record' in closure.answer ? closure.answer.record : {
+      id: closure.answer.pending.id, revision: closure.answer.pending.expected + 1, hash: hashJson(closure.answer.pending.value),
+    };
+    if (!same(closure.basis, basis)) fail('closure_unconfirmed', line.id, 'basis', 'An answer closure must name the exact confirmed answer');
+    const answer = take(confirmAnswerGapClosure(store, { project, basis: closure.answer, target: line.target, field: line.field,
+      prior: source.history.row.value.request.gaps, current: gaps, attempt: closure.attempt, currentOnly: current }));
+    return { kind: 'answer', key: answer.key, attempt: answer.attempt,
+      references: [...answer.references], guards: [...answer.guards], writes: [...answer.writes] };
+  }
+  const context = gaps.sources.operations.frame;
   if (closure.acceptance === null || closure.acceptance.project !== project || !same(closure.basis, closure.acceptance.frame))
     fail('closure_unconfirmed', line.id, 'acceptance', 'A filled line names its exact accepted connection frame and its source context');
   // Historical delivery still belongs to its saved D1 context; only head freshness is conditional.
@@ -291,7 +327,7 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
   const attempt = seriesGoal(store, project, line, closure.attempt, current);
   if (attempt && attempt.block !== obligation.upper.node)
     fail('closure_unconfirmed', line.id, 'attempt.block', 'The recorded goal belongs to the block whose gap was filled');
-  return { obligation: obligation as FrameObligation, acceptance: closure.acceptance, attempt, references: unique([...frame.references, ...previousFrame.references, closure.basis,
+  return { kind: 'frame', obligation: obligation as FrameObligation, acceptance: closure.acceptance, attempt, writes: [], references: unique([...frame.references, ...previousFrame.references, closure.basis,
       closure.acceptance.graph, closure.acceptance.layer, ...(attempt ? [attempt.series] : [])]),
     guards: fresh ? guardsOf([...fresh.guards,
       ...(attempt ? [attempt.series] : [])]) : [] };
@@ -321,7 +357,7 @@ function loadHistory(store: Store, project: string, ref: Ref, cache: Map<string,
   if (merged.refusals.length) throw new LineFailure(merged.refusals[0]!);
   if (!same(merged.lines, value.lines)) fail('gap_line_forged', row.id, 'lines', 'The full set and every state must follow from saved sources and prior lines');
   const closures = value.request.closures.map(closure => confirmClosure(store, project,
-    value.lines.find(line => line.id === closure.id)!, closure, previous, value.request.gaps.sources.operations.frame, false));
+    value.lines.find(line => line.id === closure.id)!, closure, previous, value.request.gaps, false));
   const result: History = { row, gaps, closures, previous, references: unique([ref,
     ...value.request.gaps.records, ...closures.flatMap(item => item.references)]) };
   cache.set(key, result); return result;
@@ -331,7 +367,10 @@ export function readGapLines(store: Store, request: GapLinesReadRequest): OmResu
   return run(() => loadHistory(store, request.project, request.record, new Map()).row);
 }
 export function prepareGapLines(store: Store, request: GapLinesRequest): OmResult<Sealed<PreparedGapLines>> {
-  requireRequest(store, request); request = normalize(request);
+  requireRequest(store, request);
+  // Pending answers are verified by D5 before inclusion in the transaction. Saved history only names exact records.
+  const suppliedClosures = request.closures;
+  request = normalize(request);
   return run(() => {
     const latest = store.get<GapLinesRecord>(gapLinesId(request.project));
     const previous = latest ? loadHistory(store, request.project, reference(latest), new Map()) : null;
@@ -348,13 +387,19 @@ export function prepareGapLines(store: Store, request: GapLinesRequest): OmResul
       fail('input_stale', gapLinesId(request.project), 'gaps.records', 'D1 must have saved this complete current set before lines are advanced');
     const merged = mergeLines(previous?.row.value.lines ?? [], gaps.collection.gaps as Gap[], request.pass, request.closures);
     if (merged.refusals.length) throw new LineFailure(merged.refusals[0]!);
-    const closures = request.closures.map(closure => confirmClosure(store, request.project,
-      merged.lines.find(line => line.id === closure.id)! as GapLine, closure, previous, request.gaps.sources.operations.frame, true));
+    const closures = suppliedClosures.map(closure => confirmClosure(store, request.project,
+      merged.lines.find(line => line.id === closure.id)! as GapLine, closure, previous, request.gaps, true));
     const record: GapLinesRecord = { project: request.project, request, lines: merged.lines as GapLine[] };
     const guards = guardsOf([...(latest ? [reference(latest)] : []), ...fresh.guards, ...request.gaps.records,
       ...closures.flatMap(item => item.guards)]);
     for (const ref of guards) head(store, ref);
-    return { record, existing: null, writes: [{ id: gapLinesId(request.project), kind: GAP_LINE_KIND, expected: latest?.revision ?? 0, value: record }],
+    const pending = new Map<string, Write>();
+    for (const write of closures.flatMap(item => item.writes)) {
+      const other = pending.get(write.id);
+      if (other && !same(other, write)) fail('closure_invalid', write.id, 'answer', 'A shared transaction cannot contain conflicting answer records');
+      pending.set(write.id, write);
+    }
+    return { record, existing: null, writes: [{ id: gapLinesId(request.project), kind: GAP_LINE_KIND, expected: latest?.revision ?? 0, value: record }, ...pending.values()],
       guards, references: unique([...historyReferences(previous), ...fresh.references, ...request.gaps.records,
         ...closures.flatMap(item => item.references)]) };
   });
@@ -380,7 +425,8 @@ export function confirmGapLineResult(record: Sealed<Revision<Json>>, context: Ac
       && same({ ...closure.attempt.goal, questions: sorted(closure.attempt.goal.questions) },
         { ...context.goal, questions: sorted(context.goal.questions) }));
     if (!closures.length) fail('closure_unconfirmed', record.id, 'attempt', 'No filled closure in this event belongs to the previously recorded full goal');
-    return closures.map(closure => take(readResultIdentity(store, { acceptance: closure.acceptance, obligation: closure.obligation.id })).key);
+    return closures.map(closure => closure.kind === 'answer' ? closure.key
+      : take(readResultIdentity(store, { acceptance: closure.acceptance, obligation: closure.obligation.id })).key);
   });
   return result.ok ? { keys: result.value } : { unconfirmed: `${result.refusal.code}: ${result.refusal.message}` };
 }

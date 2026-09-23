@@ -5,6 +5,7 @@ import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
 import type { Achievement, AttemptGoal } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
+import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
 
 /**
  * The contract of the PROVIDERS OF ACCEPTANCE: who may say that a result was accepted, and what its lasting key is.
@@ -69,7 +70,8 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
  * Kind of an ACCEPTING record → the provider written by its producing unit.
  * Historical grounds and semantic result identity are interpreted by that provider, never by this table.
  */
-export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult } });
+export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult },
+  "accepted-answer": { namespace: acceptedAnswerNamespace, confirm: confirmAcceptedAnswerResult } });
 
 /**
  * Kind of a TRANSITION that cancelled an earlier result → its provider, which derives the keys of the results it

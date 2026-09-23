@@ -487,6 +487,45 @@ test("D2 saved paths require explicit source sets and closure contexts and keep 
   assert.deepEqual(historySnapshot(f.store), before);
 });
 
+test("D5 answer bases cannot close a gap still present in the complete D1 source, including pending answers", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const line = first.value.lines[0]!;
+  const pending = { id: "accepted-answer:garden:pending-line", kind: "accepted-answer", expected: 0, value: { claim: "not authority" } };
+  const basis = { id: pending.id, revision: 1, hash: hashJson(pending.value) };
+  const before = historySnapshot(f.store);
+  for (const answer of [{ record: basis }, { pending }]) {
+    const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2,
+      closures: [{ id: line.id, reason: "filled", basis, acceptance: null, attempt: null, answer }] };
+    for (const operation of [prepareGapLines, writeGapLines]) denied(operation(f.store, request), "closure_invalid");
+    assert.equal(f.store.get(pending.id), null);
+    assert.deepEqual(historySnapshot(f.store), before);
+  }
+});
+
+test("D5 answer closure envelopes retain exact identity and reject mixed producers or incomplete pending records", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
+  const record = fakeRef("accepted-answer:garden:line");
+  const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
+    closures: [{ ...next.closure, acceptance: null, answer: { record }, basis: record }] };
+  const before = historySnapshot(f.store);
+  for (const operation of [prepareGapLines, writeGapLines]) {
+    denied(operation(f.store, { ...request, closures: [{ ...request.closures[0]!, basis: fakeRef("accepted-answer:garden:another") }] }), "closure_unconfirmed");
+    denied(operation(f.store, { ...request, closures: [{ ...request.closures[0]!, acceptance: next.acceptance }] }), "closure_unconfirmed");
+    for (const answer of [null, {}, { record: null }, { record, pending: {} }, { pending: { id: record.id, kind: "accepted-answer", expected: 0 } },
+      { pending: { id: record.id, kind: "accepted-answer", expected: 1, value: {} } }]) {
+      const closure = { ...request.closures[0]!, answer } as unknown as GapClosureRequest;
+      assert.throws(() => operation(f.store, { ...request, closures: [closure] }), malformed);
+    }
+    const cyclic: Record<string, unknown> = {}; cyclic['self'] = cyclic;
+    for (const value of [() => "claim", { unsupported: undefined }, cyclic]) {
+      const closure: GapClosureRequest = { ...request.closures[0]!,
+        answer: { pending: { id: record.id, kind: "accepted-answer", expected: 0, value } } };
+      assert.throws(() => operation(f.store, { ...request, closures: [closure] }), malformed);
+    }
+    assert.deepEqual(historySnapshot(f.store), before);
+  }
+});
+
 test("D2 saved replay normalizes the complete source proposal sets and gap reference order", t => {
   const f = firstPassFixture(t);
   const proposal: LayerProposal = { base: { graph: f.frame.graph, frame: null }, level: 2, source: "decision", status: "proposed",

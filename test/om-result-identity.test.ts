@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonical, hashJson } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { EngineError } from "../src/errors.js";
 import type { Graph, Node } from "../src/graph/model.js";
 import { fillObligations, prepareFrame, type FrameFill, type FrameObligation, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { OmResult } from "../src/om/refusal.js";
-import { extractResultSlice, normalizeResultContent, readResultIdentity, type ResultIdentityRequest, type ResultDependencySlice, RESULT_SLICE_REFUSAL_CODES } from "../src/om/result-identity.js";
+import { extractResultSlice, factResultKey, normalizeResultContent, readResultIdentity, type FactResultIdentity, type ResultIdentityRequest, type ResultDependencySlice, RESULT_SLICE_REFUSAL_CODES } from "../src/om/result-identity.js";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -23,6 +24,96 @@ import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { git } from "../src/runtime/environment.js";
 
 const clone = structuredClone;
+const fact = (): FactResultIdentity => ({
+  project: "garden", target: "garden-operation", field: "input",
+  contract: { establishes: "The repository's supported input format", consumer: { mechanism: "M6", uses: ["code-answer"] },
+    requirements: [{ format: "JSON" }, { environment: "production" }], resultForm: { type: "object", required: ["format"] } },
+  value: { format: "JSON", title: "Current format", purpose: "Feed the operation", benefit: "Structured input", beneficiary: "operator" },
+});
+
+test("fact keys use all four contract parts and value, without frame description exclusions", () => {
+  const input = fact(), key = factResultKey(input);
+  assert.match(key, /^om-result:[a-f0-9]{64}$/);
+  assert.equal(factResultKey(clone(input)), key);
+  const changes: ((value: FactResultIdentity) => void)[] = [
+    value => { value.project = "other"; }, value => { value.target = "other"; }, value => { value.field = "other"; },
+    value => { value.contract.establishes = "The supported streaming input format"; },
+    value => { value.contract.consumer = { mechanism: "M8" }; },
+    value => { value.contract.requirements = [{ format: "streaming JSON" }, { environment: "production" }]; },
+    value => { value.contract.resultForm = { type: "string" }; },
+    value => { (value.value as Record<string, Json>)["format"] = "streaming JSON"; },
+    ...["title", "purpose", "benefit", "beneficiary"].map(field => (value: FactResultIdentity) => {
+      (value.value as Record<string, Json>)[field] = "changed fact text";
+    }),
+  ];
+  for (const change of changes) { const changed = clone(input); change(changed); assert.notEqual(factResultKey(changed), key); }
+  const b = clone(input); (b.value as Record<string, Json>)["format"] = "streaming JSON";
+  const bKey = factResultKey(b);
+  assert.equal(factResultKey(clone(input)), key);
+  assert.equal(factResultKey(clone(b)), bKey);
+});
+
+test("fact normalization sorts only top-level requirements, retaining every multiplicity and nested array order", () => {
+  const input = fact(); input.value = ["first", "second", "first"];
+  const key = factResultKey(input), reordered = clone(input);
+  reordered.contract.requirements.reverse(); assert.equal(factResultKey(reordered), key);
+  const repeated = clone(input); repeated.contract.requirements.push(clone(input.contract.requirements[0]!));
+  assert.notEqual(factResultKey(repeated), key);
+  const permutation = clone(input); permutation.value = ["second", "first", "first"];
+  assert.notEqual(factResultKey(permutation), key);
+  const multiplicity = clone(input); multiplicity.value = ["first", "second"];
+  assert.notEqual(factResultKey(multiplicity), key);
+  for (const part of ["consumer", "requirements", "resultForm"] as const) {
+    const a = fact(), b = fact();
+    if (part === "requirements") { a.contract.requirements = [["first", "second"]]; b.contract.requirements = [["second", "first"]]; }
+    else { a.contract[part] = { sequence: ["first", "second"] }; b.contract[part] = { sequence: ["second", "first"] }; }
+    assert.notEqual(factResultKey(a), factResultKey(b), part);
+  }
+});
+
+test("fact keys retain missing versus explicit null and own __proto__ content without mutating input", () => {
+  const input = fact(); input.value = {};
+  const absent = factResultKey(input); input.value = { optional: null };
+  assert.notEqual(factResultKey(input), absent);
+  input.value = null; assert.notEqual(factResultKey(input), absent);
+  input.value = JSON.parse('{"__proto__":{"format":"JSON"},"sequence":["b","a"]}') as Json;
+  const before = canonical(input), key = factResultKey(input);
+  assert.equal(canonical(input), before);
+  assert.ok(!Object.isFrozen(input) && !Object.isFrozen(input.contract.requirements));
+  assert.ok(Object.hasOwn(input.value as object, "__proto__"));
+  assert.equal(Object.getPrototypeOf(input.value), Object.prototype);
+  const withoutPrototypeField = clone(input); withoutPrototypeField.value = { sequence: ["b", "a"] };
+  assert.notEqual(factResultKey(withoutPrototypeField), key);
+  const differentPrototypeField = clone(input);
+  Object.defineProperty(differentPrototypeField.value, "__proto__", { value: { format: "XML" }, enumerable: true });
+  assert.notEqual(factResultKey(differentPrototypeField), key);
+});
+
+test("fact identity refuses absent, inherited, foreign metadata and invalid JSON with an address", () => {
+  function rejects(input: unknown, field: string): void {
+    assert.throws(() => factResultKey(input as FactResultIdentity), error => error instanceof EngineError
+      && error.code === "result_identity_invalid"
+      && (error.details as { unit: string; target: string; field: string }).unit === "D5"
+      && (error.details as { target: string }).target === "fact-result"
+      && (error.details as { field: string }).field === field);
+  }
+  for (const value of [undefined, null, [], 42, new Date()]) rejects(value, "input");
+  for (const field of ["project", "target", "field", "contract", "value"]) {
+    const missing = fact() as unknown as Record<string, unknown>; delete missing[field]; rejects(missing, field);
+  }
+  for (const field of ["project", "target", "field"]) rejects({ ...fact(), [field]: " " }, field);
+  for (const field of ["id", "revision", "inputRevision", "pass", "assessor", "kind"])
+    rejects({ ...fact(), [field]: "not content" }, "input");
+  rejects(Object.create(fact()), "input");
+  for (const field of ["establishes", "consumer", "requirements", "resultForm"]) {
+    const missing = fact(); delete (missing.contract as unknown as Record<string, unknown>)[field];
+    rejects(missing, `contract.${field}`);
+  }
+  const cyclic: Record<string, unknown> = {}; cyclic["self"] = cyclic;
+  for (const value of [undefined, Number.NaN, Infinity, () => null, new Date(), cyclic, ["first", undefined], Array(2)])
+    rejects({ ...fact(), value }, "value");
+});
+
 function delivered<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
