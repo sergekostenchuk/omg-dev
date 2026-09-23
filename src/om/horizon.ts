@@ -12,7 +12,7 @@ import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { ProductEngine } from "../product/engine.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
-import { prepareOmInput, readOmInput, type InputRequest, type OmInputRecord } from "./input.js";
+import { prepareExistingOmInput, readOmInput } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { readLayerAcceptance, readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
 
@@ -194,11 +194,6 @@ function requireRequest(store: Store, request: HorizonRequest): void {
 function normalizedRequest(request: HorizonRequest): HorizonRequest {
   return jsonCopy({ ...request, choice: { ...request.choice,
     features: sorted(request.choice.features), excluded: sorted(request.choice.excluded) } });
-}
-function sourceInput(body: OmInputRecord, expected: number): InputRequest {
-  return { project: body.projectId, stages: Object.fromEntries(body.input.sources.map(source => [source.stage,
-    { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'],
-  inventory: body.input.inventory, expected };
 }
 function receiptShape(value: unknown, project: string, artifact: string): value is ArtifactReceipt {
   if (!object(value) || value['projectId'] !== project || value['artifact'] !== artifact
@@ -391,8 +386,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
       if (!head || canonical(reference(head)) !== canonical(ref))
         return refused("input_stale", "The horizon prerequisite is no longer current", address(ref.id, "head", ref), "producer");
     }
-    const input = traced.get<OmInputRecord>(request.input.id, request.input.revision)!;
-    const prepared = prepareOmInput(traced, sourceInput(input.value, input.revision));
+    const prepared = prepareExistingOmInput(traced, request.project, request.input);
     if (!prepared.ok) return prepared;
     if (!prepared.value.existing || canonical(reference(prepared.value.existing)) !== canonical(request.input))
       return refused("input_stale", "Horizon needs the currently admitted input", address(request.input.id, "input", request.input), "producer");

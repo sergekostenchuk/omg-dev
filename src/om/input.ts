@@ -11,6 +11,7 @@ import { ProductEngine } from "../product/engine.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
+import { deriveInputDecisions } from "./addressing.js";
 
 // The producer still emits contract v3 without structured nodes or check kinds.
 export const NODES_REQUIRED_SINCE: number | null = null;
@@ -34,13 +35,19 @@ export interface OmInput {
   contracts: { id: string; nodes: string[] | null; requirements: string[]; outcome: string; actor: string;
     success: string[]; failures: string[]; forbiddenEffects: string[]; state: Record<string, Json>; proof: string }[];
   features: { index: number; title: string; outcome: string; behaviorIndexes: number[]; requirementIds: string[]; contracts: string[] }[];
-  questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref }[];
+  questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
+    addressedBy?: Ref; originalConsumer?: string }[];
   map: { nodes: string[]; artifacts: string[]; connectors: string[] };
 }
 export interface InputBuildResult { input: OmInput | null; hash: string | null; refusals: Refusal[]; gaps: InputGap[] }
 export interface InputRequest { project: string; stages: Record<UpstreamStage, Ref>; inventory?: Ref | null; expected: number }
-export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[] }
+export interface DecisionInputDerivation { previous: Ref; graph: Ref; decisions: Ref[] }
+export interface RefreshInputDerivation { kind: "refresh"; previous: Ref; stages: Record<UpstreamStage, Ref>; inventory: Ref | null }
+export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation;
+export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[]; derivation?: InputDerivation }
+export interface DerivedInputRequest extends DecisionInputDerivation { project: string }
 export interface PreparedOmInput { record: OmInputRecord; writes: Write[]; guards: Ref[]; existing: Revision<OmInputRecord> | null }
+export const INPUT_REFRESH_CONFLICT = "input_refresh_conflict";
 
 type Row = Record<string, any>;
 const object = (value: unknown): value is Row => isPlainObject(value);
@@ -464,10 +471,27 @@ export function prepareOmInput(store: Store, request: InputRequest): OmResult<Se
   request = copy(request);
   const derived = deriveInputRecord(store, request);
   if (!derived.ok) return derived;
+  const id = `om-input:${request.project}`, current = store.get<OmInputRecord>(id);
+  const checked = current && current.revision === request.expected
+    ? readOmInput(store, request.project, reference(current)) : null;
+  if (checked && !checked.ok) return checked;
+  // A refreshed independent source must not erase accepted decisions. Both the previous version and
+  // the requested root are rebuilt before carrying their checked content into a refresh derivation.
+  if (current && checked?.ok && Object.hasOwn(checked.value.value, "derivation")) {
+    if (canonical(checked.value.value.input.sources) === canonical(derived.value.input.sources)
+      && canonical(checked.value.value.input.inventory) === canonical(derived.value.input.inventory))
+      return prepareExistingOmInput(store, request.project, reference(current));
+    const refreshed = refreshInputRecord(checked.value as Revision<OmInputRecord>, derived.value as OmInputRecord);
+    if (!refreshed.ok) return refreshed;
+    const acceptance = currentAcceptance(store, request);
+    if (!acceptance.ok) return acceptance;
+    return delivered({ record: refreshed.value, existing: null,
+      writes: [{ id, kind: "om-input", expected: request.expected, value: refreshed.value }],
+      guards: [...acceptance.value, reference(current)] });
+  }
   const acceptance = currentAcceptance(store, request);
   if (!acceptance.ok) return acceptance;
   const record = derived.value;
-  const id = `om-input:${request.project}`, current = store.get<OmInputRecord>(id);
   const guards = [...acceptance.value];
   const existing = current?.kind === "om-input" && current.revision === request.expected && canonical(current.value) === canonical(record) ? current : null;
   return delivered({ record, existing, writes: existing ? [] : [{ id, kind: "om-input", expected: request.expected, value: record }],
@@ -492,6 +516,30 @@ export function readOmInput(store: Store, project: string, ref: Ref): OmResult<S
   if (!object(body) || body.projectId !== project || !object(body.input) || !Array.isArray(body.input.sources)
     || body.input.sources.length !== INPUT_STAGES.length || !Array.isArray(body.gaps))
     return refused("record_forged", "OM input has an incomplete saved source set", at(ref.id, "sources", ref), "producer");
+  if (Object.hasOwn(body, "derivation")) {
+    const lineage: unknown = body.derivation;
+    if (!object(lineage) || !isRef(lineage.previous) || lineage.previous.id !== ref.id || lineage.previous.revision !== ref.revision - 1)
+      return refused("record_forged", "Derived input needs its immediately preceding exact input", at(ref.id, "derivation", ref), "producer");
+    let rebuilt: OmResult<Sealed<OmInputRecord>>;
+    if (Object.hasOwn(lineage, "kind")) {
+      if (lineage.kind !== "refresh" || !object(lineage.stages) || INPUT_STAGES.some(stage => !isRef(lineage.stages[stage]))
+        || (lineage.inventory !== null && !isRef(lineage.inventory)))
+        return refused("record_forged", "A refresh needs explicit exact stages and inventory", at(ref.id, "derivation", ref), "producer");
+      const previous = readOmInput(store, project, lineage.previous);
+      if (!previous.ok) return previous;
+      const root = deriveInputRecord(store, { project, stages: lineage.stages as InputRequest['stages'], inventory: lineage.inventory, expected: 0 });
+      if (!root.ok) return root;
+      rebuilt = refreshInputRecord(previous.value as Revision<OmInputRecord>, root.value as OmInputRecord);
+    } else {
+      if (!isRef(lineage.graph) || !Array.isArray(lineage.decisions) || !lineage.decisions.every(isRef))
+        return refused("record_forged", "Addressed input needs its exact graph and decisions", at(ref.id, "derivation", ref), "producer");
+      rebuilt = deriveOmInput(store, { project, previous: lineage.previous, graph: lineage.graph, decisions: lineage.decisions });
+    }
+    if (!rebuilt.ok) return rebuilt;
+    if (canonical(rebuilt.value) !== canonical(body))
+      return refused("record_forged", "Addressed input must derive from its exact previous input and checked decisions", at(ref.id, "derivation", ref), "producer");
+    return delivered(read.value);
+  }
   const refs = new Map<UpstreamStage, Ref>();
   for (const source of body.input.sources) {
     const stage = object(source) ? source.stage as UpstreamStage : null;
@@ -504,5 +552,65 @@ export function readOmInput(store: Store, project: string, ref: Ref): OmResult<S
   if (!rebuilt.ok) return rebuilt;
   if (canonical(rebuilt.value) !== canonical(body))
     return refused("record_forged", "OM input must be derived again from its exact saved sources", at(ref.id, "input", ref), "producer");
+  // Genuine stage-only history stays valid, but a later root cannot erase an already checked decision
+  // chain merely by omitting derivation. Walking exact predecessors also catches repeated stripped roots.
+  if (ref.revision > 1) {
+    const prior = store.get<OmInputRecord>(ref.id, ref.revision - 1);
+    if (!prior || prior.kind !== "om-input")
+      return refused("record_forged", "An input revision needs its exact preceding input", at(ref.id, "previous", ref), "producer");
+    const previous = readOmInput(store, project, reference(prior));
+    if (!previous.ok) return previous;
+    if (previous.value.value.derivation)
+      return refused("record_forged", "A stage-only root cannot erase accepted input decisions", at(ref.id, "derivation", ref), "producer");
+  }
   return delivered(read.value);
+}
+
+// Both arguments have passed their source-derived historical readers. Inventory is the only independent
+// root source here: a stage change needs a separate resolution, never an implicit reset of D3 fields.
+function refreshInputRecord(previous: Revision<OmInputRecord>, root: OmInputRecord): OmResult<Sealed<OmInputRecord>> {
+  if (canonical(previous.value.input.sources) !== canonical(root.input.sources))
+    return refused(INPUT_REFRESH_CONFLICT, "Changed stage sources require an explicit resolution of the accepted input decisions",
+      at(previous.id, "sources", reference(previous)), "producer");
+  const input = { ...previous.value.input, inventory: root.input.inventory };
+  const gaps = sorted([...previous.value.gaps.filter(gap => gap.code !== "inventory_missing"),
+    ...root.gaps.filter(gap => gap.code === "inventory_missing")]);
+  const stages = Object.fromEntries(root.input.sources.map(source => [source.stage,
+    { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'];
+  return delivered({ projectId: root.projectId, input, hash: hashJson(input), gaps,
+    derivation: { kind: "refresh", previous: reference(previous), stages, inventory: root.input.inventory } });
+}
+
+/** Historical derivation shared by the addressing writer, restored reads and current admission. */
+export function deriveOmInput(store: Store, request: DerivedInputRequest): OmResult<Sealed<OmInputRecord>> {
+  if (!object(request)) invalid("request");
+  requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
+  if (!isRef(request.previous)) invalid("previous");
+  if (!isRef(request.graph)) invalid("graph");
+  if (!Array.isArray(request.decisions) || !request.decisions.every(isRef)) invalid("decisions");
+  request = copy(request);
+  const previous = readOmInput(store, request.project, request.previous);
+  if (!previous.ok) return previous;
+  const decisions = sorted(request.decisions);
+  const derived = deriveInputDecisions(store, { project: request.project, previous: previous.value as Revision<OmInputRecord>,
+    graph: request.graph, decisions });
+  if (!derived.ok) return derived;
+  return delivered({ projectId: request.project, input: derived.value.input, hash: hashJson(derived.value.input),
+    gaps: derived.value.gaps, derivation: { previous: request.previous, graph: request.graph, decisions } });
+}
+
+/** Admit an exact saved version without reconstructing it as a stage-only root or requiring historical heads. */
+export function prepareExistingOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<PreparedOmInput>> {
+  const read = readOmInput(store, project, ref);
+  if (!read.ok) return read;
+  const current = store.get<OmInputRecord>(ref.id);
+  if (!current || canonical(reference(current)) !== canonical(ref))
+    return refused("input_stale", "The requested OM input version is no longer current", at(ref.id, "head", ref), "producer");
+  const body = read.value.value;
+  const acceptance = currentAcceptance(store, { project,
+    stages: Object.fromEntries(body.input.sources.map(source => [source.stage,
+      { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'],
+    inventory: body.input.inventory, expected: ref.revision });
+  if (!acceptance.ok) return acceptance;
+  return delivered({ record: body, existing: read.value, writes: [], guards: [...acceptance.value, ref] });
 }

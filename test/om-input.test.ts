@@ -1,7 +1,8 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { Ajv } from "ajv";
-import { copyFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, digest, hashJson, type Json } from "../src/canonical.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
@@ -10,15 +11,21 @@ import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import {
-  buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, INPUT_REFUSAL_CODES, NODES_REQUIRED_SINCE,
-  type InputBuildResult, type InputOptions, type InputRequest, type InputStages, type OmInput,
+  buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput,
+  INPUT_REFUSAL_CODES, NODES_REQUIRED_SINCE, INPUT_REFRESH_CONFLICT,
+  type InputBuildResult, type InputOptions, type InputRequest, type InputStages, type OmInput, type OmInputRecord, type DerivedInputRequest,
 } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal, Sealed } from "../src/om/refusal.js";
-import { createOmFixture, type OmFixture } from "./om-fixture.js";
+import { createOmFixture, gardenGraph, type OmFixture } from "./om-fixture.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { ResearchAssessment } from "../src/discovery/research-model.js";
 import type { Source } from "../src/evidence/evidence.js";
+import { inputDecisionWrite, writeAddressing, type AddressingRequest, type InputDecisionProposal } from "../src/om/addressing.js";
+import { projectGraph } from "../src/graph/project.js";
+import type { Graph } from "../src/graph/model.js";
+import { preparedFeatures } from "./product-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
 
 type Row = Record<string, any>;
 const clone = <T>(value: T): T => structuredClone(value);
@@ -490,6 +497,10 @@ test("every exported boundary validates absent or malformed arguments before acc
   assert.throws(() => gateInput({ ...buildOmInput(valid), refusals: undefined } as unknown as InputBuildResult), addressedError);
   const forged = clone(buildOmInput(valid));
   assert.equal(gateInput({ ...forged, hash: fakeHash } as InputBuildResult).passed, false);
+  const foreign = f.store.write({ id: "om-input:garden", kind: "foreign-input", expected: 0, value: {} });
+  for (const action of [prepareOmInput, writeOmInput])
+    refusal<unknown>(action(f.store, { ...request(f), expected: foreign.revision }), "record_foreign");
+  assert.deepEqual(reference(f.store.get(foreign.id)!), reference(foreign));
 });
 
 test("input policy keeps all five sources when the upstream module array is mutated after import", async t => {
@@ -768,4 +779,251 @@ test("current acceptance preserves engine exceptions on new and existing input w
     f.store.get = originalGet;
   }
   assert.deepEqual(revisions(), before);
+});
+
+test("B1 existing-version admission guards current dependencies while historical input remains readable", async t => {
+  const f = await createOmFixture(t);
+  const saved = delivered(writeOmInput(f.store, request(f)));
+  const ref = reference(saved);
+  const prepared = delivered(prepareExistingOmInput(f.store, f.project, ref));
+  assert.deepEqual(prepared.existing, saved);
+  assert.deepEqual(prepared.writes, []);
+  const graph = reference(f.store.get(`graph:${f.project}`)!);
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(graph)));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)));
+  bumpProof(f.store, graph);
+  refusal(writeGuarded(f.store, { unit: "input-neighbor", target: "neighbor:garden:existing", guards: prepared.guards,
+    writes: [{ id: "neighbor:garden:existing", kind: "neighbor", expected: 0, value: { input: ref } }] }), "input_stale");
+  assert.equal(f.store.get("neighbor:garden:existing"), null);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), saved);
+  const refreshed = delivered(prepareExistingOmInput(f.store, f.project, ref));
+  assert.ok(refreshed.guards.some(guard => canonical(guard) === canonical(reference(f.store.get(graph.id)!))));
+  const changed = f.store.write({ id: saved.id, kind: saved.kind, expected: saved.revision, value: saved.value });
+  refusal(prepareExistingOmInput(f.store, f.project, ref), "input_stale");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), saved);
+  assert.deepEqual(delivered(prepareExistingOmInput(f.store, f.project, reference(changed))).existing, changed);
+});
+
+test("B1 refuses malformed or cyclic derived input lineage before treating its body as stage output", async t => {
+  const f = await createOmFixture(t);
+  const saved = delivered(writeOmInput(f.store, request(f)));
+  const prior = reference(saved), graph = reference(f.graphRevision);
+  const before = f.store.history(saved.id).length;
+  const badLineages = [null, {}, { previous: prior, graph },
+    { previous: prior, graph, decisions: null },
+    { previous: { ...prior, id: "om-input:foreign" }, graph, decisions: [] },
+    { previous: { ...prior, revision: 1000 }, graph, decisions: [] }];
+  for (const derivation of badLineages) {
+    const record = f.store.write({ id: saved.id, kind: saved.kind, expected: f.store.get(saved.id)!.revision,
+      value: { ...clone(saved.value), derivation } });
+    refusal(readOmInput(f.store, f.project, reference(record)), "record_forged");
+    refusal(prepareExistingOmInput(f.store, f.project, reference(record)), "record_forged");
+  }
+  assert.equal(f.store.history(saved.id).length, before + badLineages.length);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, prior)), saved);
+  f.reopen();
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, prior)), saved);
+  refusal(readOmInput(f.store, f.project, reference(f.store.get(saved.id)!)), "record_forged");
+});
+
+test("B1 derived-input request shape is checked before storage reads", async t => {
+  const f = await createOmFixture(t);
+  const ref = reference(f.graphRevision);
+  const valid: DerivedInputRequest = { project: f.project, previous: ref, graph: ref, decisions: [] };
+  const cases: unknown[] = [undefined, null, {}, { ...valid, previous: null }, { ...valid, graph: null },
+    { ...valid, decisions: undefined }, { ...valid, decisions: null }, { ...valid, decisions: [null] }];
+  const originalGet = f.store.get;
+  f.store.get = () => { throw new Error("Malformed requests must not reach storage"); };
+  try {
+    for (const candidate of cases) assert.throws(() => deriveOmInput(f.store, candidate as DerivedInputRequest), addressedError);
+  } finally {
+    f.store.get = originalGet;
+  }
+});
+
+test("B1 rederives addressed versions and preserves them through reuse, source history and restart", async t => {
+  const f = await createOmFixture(t);
+  const base = delivered(writeOmInput(f.store, request(f)));
+  const criterion = base.value.input.criteria[0]!;
+  assert.equal(criterion.checkKind, null);
+  const proposal = f.store.write(inputDecisionWrite({ project: f.project, input: reference(base), graph: reference(f.graphRevision),
+    layers: [], decision: { target: criterion.id, field: "checkKind", value: "test" } }));
+  const derivation = { project: f.project, previous: reference(base), graph: reference(f.graphRevision), decisions: [reference(proposal)] };
+  const body = delivered(deriveOmInput(f.store, derivation));
+  assert.equal(body.input.criteria[0]!.checkKind, "test");
+  const addressed = f.store.write({ id: base.id, kind: base.kind, expected: base.revision, value: body });
+  const ref = reference(addressed);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), addressed);
+  for (const prepared of [delivered(prepareExistingOmInput(f.store, f.project, ref)),
+    delivered(prepareOmInput(f.store, { ...request(f), expected: addressed.revision }))]) {
+    assert.deepEqual(prepared.existing, addressed);
+    assert.deepEqual(prepared.writes, []);
+    assert.deepEqual(prepared.record, body);
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)));
+  }
+  assert.deepEqual(delivered(writeOmInput(f.store, { ...request(f), expected: addressed.revision })), addressed);
+  assert.equal(f.store.history(base.id).length, 2);
+
+  // Historical decisions and their graph must not become permanent head requirements.
+  bumpProof(f.store, reference(proposal));
+  bumpProof(f.store, reference(f.graphRevision));
+  assert.deepEqual(delivered(prepareExistingOmInput(f.store, f.project, ref)).existing, addressed);
+  f.reopen();
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), addressed);
+  assert.deepEqual(delivered(prepareOmInput(f.store, { ...request(f), expected: addressed.revision })).existing, addressed);
+  bumpProof(f.store, reference(f.store.get(`source:${f.project}:brief`)!));
+  refusal(prepareExistingOmInput(f.store, f.project, ref), "stage_not_accepted");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), addressed);
+
+  const nextProposal = f.store.write(inputDecisionWrite({ project: f.project, input: ref, graph: reference(f.graphRevision),
+    layers: [], decision: { target: body.input.contracts[0]!.id, field: "nodes", value: ["garden-produce-block"] } }));
+  const nextBody = delivered(deriveOmInput(f.store, { project: f.project, previous: ref, graph: reference(f.graphRevision),
+    decisions: [reference(nextProposal)] }));
+  const forged = clone(nextBody) as OmInputRecord;
+  forged.input.criteria[0]!.checkKind = "environment-observation";
+  forged.hash = hashJson(forged.input);
+  const fake = f.store.write({ id: base.id, kind: base.kind, expected: addressed.revision, value: forged });
+  refusal(readOmInput(f.store, f.project, reference(fake)), "record_forged");
+  refusal(prepareExistingOmInput(f.store, f.project, reference(fake)), "record_forged");
+  refusal(prepareOmInput(f.store, { ...request(f), expected: fake.revision }), "record_forged");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), addressed);
+  f.reopen();
+  refusal(readOmInput(f.store, f.project, reference(fake)), "record_forged");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), addressed);
+});
+
+function refreshFixture(t: TestContext) {
+  const directory = mkdtempSync(join(tmpdir(), "om-input-refresh-")), path = join(directory, "state.sqlite");
+  let store = new Store(path);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const project = "garden", block = "garden-produce-block", { level: _level, ...graph } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(new ProductEngine(store), project, graph as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Row).unknowns = [{ id: "output-format", question: "Which repository output format is supported?",
+      consumer: "The producing team", blocksCurrentStage: false, resolution: "Read the repository during OM" }];
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as InputRequest['stages'];
+  const base = delivered(writeOmInput(store, { project, stages, expected: 0 }));
+  const decisions: InputDecisionProposal['decision'][] = [
+    { target: base.value.input.questions[0]!.id, field: "address", value: { consumer: block, kind: "repository-fact" } },
+    { target: base.value.input.contracts[0]!.id, field: "nodes", value: [block, "garden-consume-block"] },
+    { target: base.value.input.contracts[0]!.id, field: "state", value: { writer: block, authority: block, rollback: block } },
+    { target: base.value.input.criteria[0]!.id, field: "checkKind", value: "test" },
+  ];
+  const graphRef = reference(store.get(`graph:${project}`)!);
+  const addressedRequest: AddressingRequest = { project, input: reference(base), graph: graphRef,
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(base), graph: graphRef, layers: [], decision }) })) };
+  const addressed = delivered(writeAddressing(store, addressedRequest));
+  return { get store() { return store; }, project, stages, base, addressed, addressedRequest,
+    restart() { store.close(); store = new Store(path); } };
+}
+
+test("B1 inventory refresh preserves all four accepted D3 decisions through repeated refresh, history and restart", t => {
+  const f = refreshFixture(t), original = f.addressed.value;
+  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0, value: { projectId: f.project, paths: [] } });
+  const firstRequest = { project: f.project, stages: f.stages, expected: f.addressed.revision, inventory: reference(inventory) };
+  const prepared = delivered(prepareOmInput(f.store, firstRequest));
+  assert.deepEqual(prepared.record.input, { ...original.input, inventory: reference(inventory) });
+  assert.deepEqual(prepared.record.gaps, original.gaps.filter(gap => gap.code !== "inventory_missing"));
+  assert.deepEqual(prepared.record.derivation, { kind: "refresh", previous: reference(f.addressed), stages: f.stages, inventory: reference(inventory) });
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(f.addressed))));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(inventory))));
+  const first = delivered(writeOmInput(f.store, firstRequest));
+  assert.deepEqual(first.value, prepared.record);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(first))), first);
+  assert.deepEqual(delivered(writeOmInput(f.store, { ...firstRequest, expected: first.revision })), first);
+
+  const nextInventory = f.store.write({ id: inventory.id, kind: inventory.kind, expected: inventory.revision,
+    value: { projectId: f.project, paths: ["src/main.ts"] } });
+  const secondRequest = { ...firstRequest, expected: first.revision, inventory: reference(nextInventory) };
+  const nextPrepared = delivered(prepareOmInput(f.store, secondRequest));
+  assert.ok(nextPrepared.guards.some(guard => canonical(guard) === canonical(reference(nextInventory))));
+  assert.ok(!nextPrepared.guards.some(guard => canonical(guard) === canonical(reference(inventory))), "The previous inventory is history, not a current guard");
+  const second = delivered(writeOmInput(f.store, secondRequest));
+  assert.deepEqual(second.value.input, { ...original.input, inventory: reference(nextInventory) });
+  assert.deepEqual(second.value.input.questions, original.input.questions);
+  assert.deepEqual(second.value.input.contracts, original.input.contracts);
+  assert.deepEqual(second.value.input.criteria, original.input.criteria);
+  assert.deepEqual(delivered(prepareExistingOmInput(f.store, f.project, reference(second))).existing, second);
+  f.restart();
+  for (const revision of [f.base, f.addressed, first, second]) assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(revision))), revision);
+  assert.deepEqual(delivered(writeOmInput(f.store, { ...secondRequest, expected: second.revision })), second);
+  assert.deepEqual(delivered(writeAddressing(f.store, f.addressedRequest)), f.addressed);
+  assert.equal(f.store.history(second.id).length, second.revision);
+
+  const withoutInventory = delivered(writeOmInput(f.store, { project: f.project, stages: f.stages, expected: second.revision, inventory: null }));
+  assert.deepEqual(withoutInventory.value.input, original.input);
+  assert.deepEqual(withoutInventory.value.gaps, original.gaps);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(withoutInventory))), withoutInventory);
+  f.restart();
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(first))), first);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(withoutInventory))), withoutInventory);
+});
+
+test("B1 refresh refuses a changed stage basis and counterfeits cannot erase accepted decisions", t => {
+  const f = refreshFixture(t);
+  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0, value: { projectId: f.project, paths: [] } });
+  const request = { project: f.project, stages: f.stages, expected: f.addressed.revision, inventory: reference(inventory) };
+  const refreshed = delivered(writeOmInput(f.store, request));
+  const features = f.store.get(f.stages.features.id)!;
+  const nextFeatures = f.store.write({ id: features.id, kind: features.kind, expected: features.revision, value: features.value });
+  const changed = { ...request, stages: { ...f.stages, features: reference(nextFeatures) }, expected: refreshed.revision };
+  const before = f.store.list().map(reference);
+  refusal(prepareOmInput(f.store, changed), INPUT_REFRESH_CONFLICT);
+  refusal(writeOmInput(f.store, changed), INPUT_REFRESH_CONFLICT);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(refreshed))), refreshed);
+
+  const fake = clone(refreshed.value) as OmInputRecord;
+  fake.input.questions[0]!.kind = null;
+  delete fake.input.questions[0]!.addressedBy;
+  fake.hash = hashJson(fake.input);
+  const forged = f.store.write({ id: refreshed.id, kind: refreshed.kind, expected: refreshed.revision, value: fake });
+  refusal(readOmInput(f.store, f.project, reference(forged)), "record_forged");
+  refusal(prepareExistingOmInput(f.store, f.project, reference(forged)), "record_forged");
+  f.restart();
+  refusal(readOmInput(f.store, f.project, reference(forged)), "record_forged");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(refreshed))), refreshed);
+});
+
+test("B1 rejects stripped refresh lineage even when the replacement is a self-consistent stage-only root", t => {
+  const f = refreshFixture(t);
+  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0, value: { projectId: f.project, paths: [] } });
+  const request = { project: f.project, stages: f.stages, expected: f.addressed.revision, inventory: reference(inventory) };
+  const refreshed = delivered(writeOmInput(f.store, request));
+  const root = clone(f.base.value) as OmInputRecord;
+  root.input.inventory = reference(inventory);
+  root.hash = hashJson(root.input);
+  root.gaps = root.gaps.filter(gap => gap.code !== "inventory_missing");
+  assert.equal(Object.hasOwn(root, "derivation"), false);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const previous = f.store.get(refreshed.id)!;
+    const counterfeit = f.store.write({ id: refreshed.id, kind: refreshed.kind, expected: previous.revision, value: root });
+    assert.equal(refusal(readOmInput(f.store, f.project, reference(counterfeit)), "record_forged").at.field, "derivation");
+    refusal(prepareExistingOmInput(f.store, f.project, reference(counterfeit)), "record_forged");
+    refusal(prepareOmInput(f.store, { ...request, expected: counterfeit.revision }), "record_forged");
+    refusal(writeOmInput(f.store, { ...request, expected: counterfeit.revision }), "record_forged");
+    assert.equal(f.store.get(refreshed.id)!.revision, counterfeit.revision);
+    f.restart();
+    refusal(readOmInput(f.store, f.project, reference(counterfeit)), "record_forged");
+    assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(refreshed))), refreshed);
+  }
+});
+
+test("B1 refresh history cannot skip an accepted decision by naming an earlier root", t => {
+  const f = refreshFixture(t);
+  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0, value: { projectId: f.project, paths: [] } });
+  const skipped = clone(f.base.value) as OmInputRecord;
+  skipped.input.inventory = reference(inventory);
+  skipped.hash = hashJson(skipped.input);
+  skipped.gaps = skipped.gaps.filter(gap => gap.code !== "inventory_missing");
+  skipped.derivation = { kind: "refresh", previous: reference(f.base), stages: f.stages, inventory: reference(inventory) };
+  const forged = f.store.write({ id: f.addressed.id, kind: f.addressed.kind, expected: f.addressed.revision, value: skipped });
+  refusal(readOmInput(f.store, f.project, reference(forged)), "record_forged");
+  refusal(prepareExistingOmInput(f.store, f.project, reference(forged)), "record_forged");
+  refusal(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: forged.revision, inventory: reference(inventory) }), "record_forged");
+  f.restart();
+  refusal(readOmInput(f.store, f.project, reference(forged)), "record_forged");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(f.addressed))), f.addressed);
 });
