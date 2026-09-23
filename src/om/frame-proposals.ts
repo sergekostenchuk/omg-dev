@@ -5,7 +5,7 @@ import { LEVEL, type Graph, type Node } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { Store } from "../storage/store.js";
+import { Store, type Revision } from "../storage/store.js";
 import { readRecord } from "./refs.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import {
@@ -49,6 +49,8 @@ export interface FrameProposals {
   frame: FrameRead; proposals: ProposalObservation[]; result: ProposalResult; gaps: FrameGap[]; references: Ref[];
 }
 export interface PreparedFrameProposals extends FrameProposals { guards: Ref[]; expected: PreparedFrame['expected'] }
+export interface ObserveProposalRequest { project: string; proposal: Ref; request: ProposalRequest }
+export interface ObservedProposal { record: Revision<LayerProposal>; definitions: string[]; references: Ref[]; sources: ProposalRequest }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -59,6 +61,8 @@ const parts = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 't
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
 const partShapes = new Map(parts.map(part => [part, schemas.compile(sealed(graphV2Schema.properties[part === 'localConnectors' ? 'connectors' : part].items))]));
+const graphParts = ['nodes', 'connectors', 'artifacts', 'contracts', 'anchors', 'joins', 'tests'] as const;
+const graphV2Parts = ['actors', 'requirements', 'edges', 'journeys', 'transfers', 'packets'] as const;
 function invalid(field: string, target = 'proposals'): never {
   throw new EngineError('proposal_request_invalid', 'Proposal application needs explicit, well-formed inputs', { unit: 'F4.3', target, field });
 }
@@ -290,6 +294,65 @@ function requireStored(store: Store, request: unknown): asserts request is Propo
   if (!(store instanceof Store) || !object(request)) invalid('request');
   requireRequest(request['frame']);
   if (!Array.isArray(request['proposals']) || !request['proposals'].every(isRef)) invalid('proposals');
+}
+/** Read only definition addresses. Semantic validity belongs to application and the graph gates. */
+export function definitionIds(value: unknown, kind: 'proposal' | 'graph', target: string): OmResult<Sealed<string[]>> {
+  if (!['proposal', 'graph'].includes(kind) || !text(target)) invalid('definitions');
+  return outcome(() => {
+    if (!object(value)) reject('proposal_invalid', target, 'value', 'Definition-bearing content must be an explicit object');
+    if (kind === 'graph' && value['version'] !== 1 && value['version'] !== 2)
+      reject('proposal_invalid', target, 'version', 'Definition-bearing graphs name their schema version');
+    const required: readonly string[] = kind === 'proposal' ? [...parts] : [...graphParts, ...(value['version'] === 2 ? graphV2Parts : [])];
+    const optional = kind === 'graph' ? graphV2Parts.filter(part => !required.includes(part)) : [];
+    // Task bindings refer to definitions owned by their external research scope, like fills refer to nodes.
+    if (kind === 'graph' && Object.hasOwn(value, 'researchObligations') && !Array.isArray(value['researchObligations']))
+      reject('proposal_invalid', target, 'researchObligations', 'Task bindings must be an explicit set when present');
+    const definitions: string[] = [];
+    for (const part of [...required, ...optional.filter(part => Object.hasOwn(value, part))]) {
+      const entries = value[part];
+      if (!Array.isArray(entries)) reject('proposal_invalid', target, part, 'A definition section must be an explicit readable set');
+      for (let index = 0; index < entries.length; index++) {
+        const entry: unknown = entries[index];
+        if (!object(entry) || !text(entry['id']))
+          reject('proposal_invalid', target, `${part}.${index}.id`, 'Each definition must have its readable address');
+        definitions.push(entry['id']);
+      }
+    }
+    return [...new Set(definitions)].sort(order);
+  });
+}
+/** Observation reads a refusal's historical composition; it never applies or accepts that proposal. */
+export function observeProposal(store: Store, request: ObserveProposalRequest): OmResult<Sealed<ObservedProposal>> {
+  if (!object(request) || !text(request.project) || !isRef(request.proposal)) invalid('observation');
+  requireStored(store, request.request); request = copy(request);
+  return outcome(() => {
+    const context = request.request;
+    if (context.frame.project !== request.project || !context.proposals.some(ref => same(ref, request.proposal)))
+      reject('proposal_invalid', request.proposal.id, 'request', 'The observed proposal must occur in its own project context');
+    if (new Set(context.proposals.map(ref => ref.id)).size !== context.proposals.length)
+      reject('proposal_invalid', request.proposal.id, 'request.proposals', 'A proposal context names each exact participant once');
+    const frame = take(readFrame(store, context.frame)), references = [...frame.references];
+    let observed: ObservedProposal | null = null;
+    for (const ref of context.proposals) {
+      const record = take(readRecord<LayerProposal>(store, ref, { unit: 'F4.3', target: ref.id,
+        idPrefix: `om-proposal:${request.project}:`, kind: 'layer-proposal' })) as Revision<LayerProposal>;
+      const proposal = record.value;
+      if (!object(proposal) || !object(proposal.base) || !isRef(proposal.base.graph)
+        || proposal.base.frame !== null && !isRef(proposal.base.frame) || ![2, 3].includes(proposal.level)
+        || !['input', 'decision'].includes(proposal.source) || !['proposed', 'accepted', 'rejected'].includes(proposal.status))
+        reject('proposal_invalid', ref.id, 'base', 'A proposal observation needs its recorded base, level, source and status');
+      if (proposal.level !== context.frame.level || !same(proposal.base.graph, context.frame.graph)
+        || !same(proposal.base.frame, context.frame.frame))
+        reject('proposal_base_stale', ref.id, 'base', 'The observed proposal must belong to this exact frame basis');
+      for (const part of ['fills', 'removes', 'redefines', 'replaces'] as const)
+        if (!Array.isArray(proposal[part])) reject('proposal_invalid', ref.id, part, 'A proposal must retain every mandatory section');
+      const definitions = take(definitionIds(proposal, 'proposal', ref.id));
+      references.push(reference(record));
+      if (same(ref, request.proposal)) observed = { record, definitions: [...definitions], references,
+        sources: { frame: context.frame, proposals: sorted(context.proposals) } };
+    }
+    return { ...observed!, references: sorted([...new Map(references.map(ref => [canonical(ref), ref])).values()]) };
+  });
 }
 function loadProposals(store: Store, request: ProposalRequest): ProposalObservation[] {
   return request.proposals.map(ref => {

@@ -6,8 +6,8 @@ import { projectGraph } from '../graph/project.js';
 import { requireGraph, validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { fillObligations, flowKey, type ConnectionFrame, type FrameRead, type PreparedFrame } from './frame-obligations.js';
-import { applyProposals, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
+import { fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameRead, type PreparedFrame } from './frame-obligations.js';
+import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
   type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -33,6 +33,7 @@ export type CandidateWriteResult = { state: 'gaps'; gaps: FrameGap[] }
 export interface CandidateReadRequest { project: string; candidate: Ref }
 export interface CandidateGateRequest extends CandidateReadRequest { graph?: unknown }
 export interface CandidateGate { passed: true; candidate: Ref; graphHash: string; findings: Finding[] }
+export interface ObservedCandidate { record: Revision<FrameCandidateRecord>; definitions: string[]; references: Ref[]; sources: ProposalRequest }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -380,6 +381,42 @@ export function readCandidate(store: Store, request: CandidateReadRequest): Cand
     const row = loaded.value as Revision<FrameCandidateRecord>;
     verifyRecord(store, row, request.project);
     return row;
+  });
+}
+/** Observe the saved refusal object and its sources without declaring its assembly or G3 successful. */
+export function observeCandidate(store: Store, request: CandidateReadRequest): CandidateResult<ObservedCandidate> {
+  requireStore(store); requireRead(request); request = copy(request);
+  return outcome(() => {
+    const record = take(readRecord<FrameCandidateRecord>(store, request.candidate, { unit: 'G3', target: request.candidate.id,
+      idPrefix: `om-candidate:${request.project}:`, kind: 'frame-candidate' })) as Revision<FrameCandidateRecord>;
+    const value = record.value;
+    if (!object(value) || value.project !== request.project || value.level !== 2 || record.revision !== 1
+      || !object(value.graph) || !object(value.base) || !isRef(value.base.graph)
+      || value.base.frame !== null && !isRef(value.base.frame) || !Array.isArray(value.proposals) || !value.proposals.every(isRef)
+      || !Array.isArray(value.fills) || ![value.graphHash, value.layerHash, value.upperHash].every(item => typeof item === 'string' && /^[a-f0-9]{64}$/.test(item)))
+      reject('candidate_graph_mismatch', record.id, 'record', 'A candidate observation needs its readable immutable envelope and exact source addresses');
+    try { requireRequest(value.request); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'candidate_request_invalid')
+        reject('candidate_graph_mismatch', record.id, 'request', 'The observed candidate must retain its complete source request');
+      throw error;
+    }
+    if (value.request.frame.project !== request.project || value.request.frame.level !== value.level
+      || !same(value.base, { graph: value.request.frame.graph, frame: value.request.frame.frame })
+      || !same(sorted(value.proposals), sorted(value.request.proposals)))
+      reject('candidate_graph_mismatch', record.id, 'request', 'The candidate must name precisely the same base, level and proposal set as its source request');
+    if (value.graphHash !== hashJson(value.graph) || record.id !== idOf(value))
+      reject('candidate_graph_mismatch', record.id, 'graphHash', 'The observed candidate must retain its own graph hash and content address');
+    const frame = take(readFrame(store, value.request.frame));
+    if (value.graph.id !== frame.upper.id)
+      reject('candidate_graph_mismatch', record.id, 'graph.id', 'The observed graph belongs to another product');
+    const references: Ref[] = [reference(record), ...frame.references];
+    // C3 observes the whole named set in one historical base read, including every participant's linkage.
+    if (value.request.proposals.length) references.push(...take(observeProposal(store, {
+      project: request.project, proposal: value.request.proposals[0]!, request: value.request,
+    })).references);
+    return { record, definitions: [...take(definitionIds(value.graph, 'graph', record.id))], references: unique(references),
+      sources: normalizeRequest(value.request) };
   });
 }
 /** Current preparation inherits C3's complete admission guards, including when an immutable candidate already exists. */

@@ -4,7 +4,7 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
 import { readRecord } from "./refs.js";
-import { readJournal, type JournalRow, type RefusalOrigin } from "./refusal-journal.js";
+import { readJournal, normalizeOriginSource, type JournalRow, type RefusalOrigin } from "./refusal-journal.js";
 import {
   readStopHistory, seriesId, stopReviewNamespace, COMPLETION_REASONS, STOP_REVIEW_KIND,
   type CompletionReason, type Continuation, type SeriesRequest, type StopHistory, type StopHistoryEntry,
@@ -382,7 +382,7 @@ function obstaclesOf(store: Store, at: Address, context: StopContext, guards: Re
       row: row.id, source: exactRef(row.source), gate: row.gate, code: row.code, goal: row.goal, remedy: row.remedy,
       origin: {
         name: row.origin.name, stage: row.origin.stage, subject: row.origin.subject,
-        sources: row.origin.sources.map(item => ({ role: item.role, ref: exactRef(item.ref) })),
+        sources: row.origin.sources.map(normalizeOriginSource),
       },
       class: obstacle.class, addressee: obstacle.addressee, times: obstacle.times,
     });

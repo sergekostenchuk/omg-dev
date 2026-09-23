@@ -1,9 +1,11 @@
-import { hashJson } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { canonical, hashJson } from "../canonical.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
-import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
+import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
+import type { FrameRequest } from "./frame-obligations.js";
+import type { ProposalRequest } from "./frame-proposals.js";
 
 /**
  * The project's journal of gate refusals. A gate that refuses writes a record of its own; this unit reads that record
@@ -34,7 +36,10 @@ export type RefusalJournalCode = typeof REFUSAL_JOURNAL_CODES[number];
 export interface OriginSource {
   readonly role: string;
   readonly ref: Ref;
+  readonly context?: OriginSourceContext;
 }
+export type OriginSourceContext = { readonly kind: "proposal"; readonly request: Sealed<ProposalRequest> }
+  | { readonly kind: "frame"; readonly request: Sealed<FrameRequest> };
 
 export interface RefusalOrigin {
   readonly name: string;
@@ -133,6 +138,58 @@ interface Prepared { readonly transition: JournalTransition; readonly current: R
 // wrong is the same; who is at fault is not, so each path carries its own codes.
 const INCOMING: Codes = { entry: "refusal_entry_invalid", origin: "origin_invalid", source: "origin_source_invalid" };
 const STORED: Codes = { entry: "journal_invalid", origin: "journal_invalid", source: "journal_invalid" };
+
+function frameContextShape(value: unknown): value is FrameRequest {
+  if (!isPlainObject(value) || !exactKeys(value, ["project", "level", "horizon", "graph", "layer", "frame", "upper"])) return false;
+  const frame = value as FrameRequest;
+  if (!isText(frame.project) || ![2, 3].includes(frame.level) || !isRef(frame.horizon) || !isRef(frame.graph)
+    || frame.layer !== null && !isRef(frame.layer) || frame.frame !== null && !isRef(frame.frame)) return false;
+  return frame.level === 2 ? frame.upper === null : isPlainObject(frame.upper) && exactKeys(frame.upper, ["horizon", "frame"])
+    && isRef(frame.upper!.horizon) && (frame.upper!.frame === null || isRef(frame.upper!.frame));
+}
+function sourceIssue(value: unknown): string | null {
+  if (!isPlainObject(value) || !exactKeys(value, Object.hasOwn(value as object, "context") ? [...SOURCE_KEYS, "context"] : SOURCE_KEYS)) return "";
+  const source = value as OriginSource;
+  if (!isText(source.role)) return "role";
+  if (!isRef(source.ref)) return "ref";
+  if (!Object.hasOwn(source, "context")) return null;
+  const context = source.context;
+  if (!isPlainObject(context) || !exactKeys(context, ["kind", "request"])) return "context";
+  if (context!.kind === "frame") return frameContextShape(context!.request) ? null : "context.request";
+  if (context!.kind !== "proposal" || !isPlainObject(context!.request) || !exactKeys(context!.request, ["frame", "proposals"])) return "context";
+  const request = context!.request;
+  return frameContextShape(request.frame) && Array.isArray(request.proposals) && Array.from(request.proposals).every(isRef) ? null : "context.request";
+}
+const sourceRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
+function normalizedFrameContext(frame: FrameRequest): FrameRequest {
+  return { project: frame.project, level: frame.level, horizon: sourceRef(frame.horizon), graph: sourceRef(frame.graph),
+    layer: frame.layer === null ? null : sourceRef(frame.layer), frame: frame.frame === null ? null : sourceRef(frame.frame),
+    upper: frame.upper === null ? null : { horizon: sourceRef(frame.upper.horizon), frame: frame.upper.frame === null ? null : sourceRef(frame.upper.frame) } };
+}
+/** Syntax and identity only: each producer still proves the source and its exact assembly context. */
+export function normalizeOriginSource(value: unknown): Sealed<OriginSource> {
+  const issue = sourceIssue(value);
+  if (issue !== null) throw new EngineError("journal_request_invalid", "An origin source needs its role, exact reference and complete context",
+    { unit: UNIT, target: "source", field: issue || "source" });
+  const source = value as OriginSource;
+  let context: OriginSourceContext | undefined;
+  if (source.context?.kind === "frame") context = { kind: "frame", request: normalizedFrameContext(source.context.request) };
+  else if (source.context?.kind === "proposal") context = { kind: "proposal", request: {
+    frame: normalizedFrameContext(source.context.request.frame), proposals: source.context.request.proposals.map(sourceRef)
+      .sort((a, b) => compare(canonical(a), canonical(b))),
+  } };
+  try { return sealed({ role: source.role, ref: sourceRef(source.ref), ...(context === undefined ? {} : { context }) }); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "unsealable_value")
+      throw new EngineError("journal_request_invalid", "An origin source must be finite JSON", { unit: UNIT, target: "source", field: "context" });
+    throw error;
+  }
+}
+/** Context participates in identity; contextless sources retain their established ordering. */
+export function originSourceKey(value: OriginSource): string {
+  const source = normalizeOriginSource(value);
+  return `${source.role}\0${source.ref.id}\0${source.ref.revision}\0${source.ref.hash}${source.context === undefined ? "" : `\0${canonical(source.context)}`}`;
+}
 
 export function journalId(project: string): string {
   return `${REFUSAL_JOURNAL_KIND}:${requireProject(project)}`;
@@ -308,7 +365,7 @@ function requireClassification(value: unknown): void {
   requireCondition(Array.isArray(item.basis),
     "journal_request_invalid", "A classification carries the grounds it was derived from, explicitly empty when the origin was not established");
   for (const ground of item.basis) {
-    requireCondition(isPlainObject(ground) && exactKeys(ground, SOURCE_KEYS) && isText(ground.role) && isRef(ground.ref),
+    requireCondition(sourceIssue(ground) === null,
       "journal_request_invalid", "Each ground of a classification names its role and an exact reference");
   }
 }
@@ -349,8 +406,8 @@ function rowOf(gate: string, entry: UnitRefusal, source: Ref): JournalRow {
       // T6: the order sources arrive in decides nothing, so a row is stored canonically and the same refusal
       // delivered twice hashes alike.
       sources: entry.origin.sources
-        .map(item => ({ role: item.role, ref: { id: item.ref.id, revision: item.ref.revision, hash: item.ref.hash } }))
-        .sort((left, right) => compare(sortKey(left), sortKey(right))),
+        .map(normalizeOriginSource)
+        .sort((left, right) => compare(originSourceKey(left as OriginSource), originSourceKey(right as OriginSource))),
     },
     source: { id: source.id, revision: source.revision, hash: source.hash },
   };
@@ -362,15 +419,11 @@ function classificationOf(source: RefusalClassification): RefusalClassification 
     row: source.row, class: source.class, addressee: source.addressee,
     // Canonical for the same reason a row is: two readings of the same decision must compare equal (T5, T6).
     basis: source.basis
-      .map(ground => ({ role: ground.role, ref: { id: ground.ref.id, revision: ground.ref.revision, hash: ground.ref.hash } }))
-      .sort((left, right) => compare(sortKey(left), sortKey(right))),
+      .map(normalizeOriginSource)
+      .sort((left, right) => compare(originSourceKey(left as OriginSource), originSourceKey(right as OriginSource))),
   };
 }
 
-// The separator is a NUL because no role, id or hash can contain one, so two different sources cannot produce one key.
-// It is written as an ESCAPE and never as a literal byte: a literal one makes the file binary to grep and to review
-// tools, and an editor may drop it or show it as a space — the key would then change, and with it every row id.
-const sortKey = (source: OriginSource): string => `${source.role}\0${source.ref.id}\0${source.ref.revision}\0${source.ref.hash}`;
 // Not localeCompare: a row id is the hash of its own content, so the order must not depend on the machine's locale.
 const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
@@ -422,10 +475,8 @@ function checkOrigin(value: unknown, context: Context, path: string, codes: Code
   for (let index = 0; index < sources.length; index += 1) {
     const where = `${path}.sources.${index}`;
     const item = sources[index];
-    if (!isPlainObject(item) || !exactKeys(item, SOURCE_KEYS)) return problem(codes.source, "A source names the role it played and an exact reference", context, where);
-    const entry = item as Record<string, unknown>;
-    if (!isText(entry['role'])) return problem(codes.source, "A source names the role it played", context, `${where}.role`);
-    if (!isRef(entry['ref'])) return problem(codes.source, "A source is an exact {id, revision, hash} reference", context, `${where}.ref`);
+    const issue = sourceIssue(item);
+    if (issue !== null) return problem(codes.source, "A source needs its role, exact reference and complete context", context, issue ? `${where}.${issue}` : where);
   }
   return null;
 }
@@ -517,10 +568,8 @@ function checkClassifications(value: unknown, rows: ReadonlySet<string>, context
     if (!Array.isArray(basis)) return problem("journal_invalid", "A classification carries the grounds it was derived from", context, `${path}.basis`);
     for (let ground = 0; ground < basis.length; ground += 1) {
       const where = `${path}.basis.${ground}`;
-      const item = basis[ground] as Record<string, unknown>;
-      if (!isPlainObject(item) || !exactKeys(item, SOURCE_KEYS)) return problem("journal_invalid", "A ground names the role it played and an exact reference", context, where);
-      if (!isText(item['role'])) return problem("journal_invalid", "A ground names the role it played", context, `${where}.role`);
-      if (!isRef(item['ref'])) return problem("journal_invalid", "A ground is an exact {id, revision, hash} reference", context, `${where}.ref`);
+      const issue = sourceIssue(basis[ground]);
+      if (issue !== null) return problem("journal_invalid", "A ground needs its role, exact reference and complete context", context, issue ? `${where}.${issue}` : where);
     }
     if (hashJson(classificationOf(item as unknown as RefusalClassification)) !== hashJson(item)) {
       return problem("journal_invalid", "A classification is not held as this unit writes one", context, path);

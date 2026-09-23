@@ -9,14 +9,27 @@ import { hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { writeGuarded } from "../src/om/refs.js";
-import { journalId, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
+import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
+import type { Graph } from "../src/graph/model.js";
+import { projectGraph } from "../src/graph/project.js";
+import { ProductEngine } from "../src/product/engine.js";
+import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
+import { writeCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
+import { settleCandidate } from "../src/om/frame-accept.js";
+import { writeOmInput } from "../src/om/input.js";
+import { writeHorizon } from "../src/om/horizon.js";
+import { gardenGraph } from "./om-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
+
+import { journalId, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, normalizeOriginSource } from "../src/om/refusal-journal.js";
 import {
   beginAttempt, completeAttempt, escalateSeries, openSeries, ownerDecisionNamespace, resumeSeries, seriesId, stopReviewNamespace,
   COMPLETION_REASONS, REPAIR_SERIES_KIND, STOP_REVIEW_KIND, OWNER_DECISION_KIND,
   type AttemptGoal, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
 import {
-  closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, readStopContext, stopContext,
+  closeAttempt, liftOriginHold, openAttempt, originAnalysisNamespace, originDecisionNamespace, readStopContext, stopContext,
   ADDRESSEE_KINDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND, REFUSAL_CLASSES,
   type GateOutcome, type OriginHold, type RefusalClass, type RepeatOutcome,
 } from "../src/om/repeat-gate.js";
@@ -74,14 +87,80 @@ const next = (): number => (unique += 1);
 const address = (project: string, line = 1): SeriesRequest => ({ project, block: BLOCK, line });
 const at = (project: string, line = 1): string => seriesId(project, BLOCK, line);
 
-/** A record of the map that names the definitions it carries — the minimal form G7 reads of a proposal or a base. */
-function carries(store: Store, project: string, role: string, defines: readonly string[]): Ref {
-  return reference(store.write({
-    id: `om-${role}:${project}:${next()}`, kind: `om-${role}`, expected: 0, value: { defines: [...defines] } as Json,
-  }));
+/** Exact accepted sources: the initial L1 has no local operation artifact; accepted OM L2 does. */
+const definitionFixtures = new WeakMap<Store, Map<string, { first: FrameRequest; accepted: FrameRequest; upper: Graph; subject: string }>>();
+const sourceContexts = new Map<string, Record<string, unknown>>();
+function remember(ref: Ref, context: Record<string, unknown>): Ref {
+  sourceContexts.set(`${ref.id}@${ref.revision}@${ref.hash}`, context); return ref;
+}
+function definitionFixture(store: Store, project: string, subject = SUBJECT) {
+  const cache = definitionFixtures.get(store) ?? new Map(); definitionFixtures.set(store, cache);
+  const previous = cache.get(project); if (previous) return previous;
+  const graph = gardenGraph("standard", project);
+  const oldArtifact = `${project}-prep`;
+  graph.artifacts.find(item => item.id === oldArtifact)!.id = subject;
+  for (const node of graph.nodes) if (node.outcome === oldArtifact) node.outcome = subject;
+  for (const connector of graph.connectors) if (connector.artifact === oldArtifact) connector.artifact = subject;
+  const { level: _level, ...upper } = projectGraph(graph, 1);
+  preparedFeatures(new ProductEngine(store), project, upper as Graph);
+  const input = deliveredOf(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
+    refinement: null, choice: { choiceVersion: "origin-initial", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
+  const first: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!),
+    horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
+  const read = deliveredOf(prepareFrame(store, first)), projected = projectGraph(graph, 2);
+  const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
+    { graph, reference: { ...first.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const proposal: LayerProposal = { base: { graph: first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+    nodes: projected.nodes.filter(node => node.kind === "operation"), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
+      ...(fill.port === undefined ? {} : { port: fill.port }) })),
+    localConnectors: projected.connectors.map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))
+      .filter(connector => connector.bindings.length > 0),
+    artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins, anchors: projected.anchors, tests: projected.tests,
+    edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+    removes: [], replaces: [], redefines: [] };
+  const offered = reference(store.write({ id: `om-proposal:${project}:origin-accepted`, kind: "layer-proposal", expected: 0, value: proposal }));
+  const candidate = deliveredOf(writeCandidate(store, { frame: first, proposals: [offered] }));
+  assert.equal(candidate.state, "candidate"); if (candidate.state !== "candidate") throw new Error("No candidate");
+  const ref = reference(candidate.record);
+  const applied = deliveredOf(settleCandidate(store, { project, level: 2, candidate: ref,
+    outcome: { gate: "G3", candidate: ref, graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
+  const nextHorizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(applied.graph!),
+    refinement: reference(applied.layer!), choice: { choiceVersion: "origin-accepted", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
+  const accepted: FrameRequest = { ...first, graph: reference(applied.graph!), horizon: reference(nextHorizon.gate),
+    layer: reference(applied.layer!), frame: reference(applied.frame!) };
+  remember(first.graph, { kind: "frame", request: first }); remember(accepted.graph, { kind: "frame", request: accepted });
+  const built = { first, accepted, upper: upper as Graph, subject }; cache.set(project, built); return built;
 }
 
-const source = (role: string, ref: Ref): Record<string, unknown> => ({ role, ref });
+/** Every named source belongs to this one explicit saved assembly, including its complete proposal set. */
+function assembly(store: Store, project: string, base: "first" | "accepted",
+  proposalDefinitions: readonly (readonly string[])[], derivedDefinitions: readonly string[]) {
+  const f = definitionFixture(store, project), frame = f[base];
+  const artifacts = (definitions: readonly string[]) => definitions.map(id => ({ ...structuredClone(f.upper.artifacts[0]!), id }));
+  const proposals = proposalDefinitions.map(definitions => {
+    const value: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 2, source: "decision", status: "proposed",
+      nodes: [], fills: [], localConnectors: [], artifacts: artifacts(definitions), contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [],
+      transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+    return reference(store.write({ id: `om-proposal:${project}:${next()}`, kind: "layer-proposal", expected: 0, value }));
+  });
+  const request: ProposalRequest = { frame, proposals };
+  for (const ref of proposals) remember(ref, { kind: "proposal", request });
+  const graph = structuredClone(store.get<Graph>(frame.graph.id, frame.graph.revision)!.value);
+  graph.artifacts = [...graph.artifacts.filter(item => !derivedDefinitions.includes(item.id)), ...artifacts(derivedDefinitions)];
+  const value: FrameCandidateRecord = { project, level: 2, graph, graphHash: hashJson(graph), layerHash: hashJson(projectGraph(graph, 2)),
+    upperHash: hashJson(projectGraph(f.upper, 1)), base: { graph: frame.graph, frame: frame.frame }, proposals, fills: [], request };
+  const id = `om-candidate:${project}:${hashJson([value.graphHash, value.base, value.proposals])}`;
+  const candidate = reference(store.get(id) ?? store.write({ id, kind: "frame-candidate", expected: 0, value }));
+  const proposalSources = proposals.map(ref => source("proposal", ref));
+  return { proposalSources, sources: [...proposalSources, source("base", frame.graph), source("derived", candidate)] };
+}
+
+const source = (role: string, ref: Ref): Record<string, unknown> => {
+  const context = sourceContexts.get(`${ref.id}@${ref.revision}@${ref.hash}`);
+  return { role, ref, ...(context ? { context } : {}) };
+};
 
 /** A refusal a gate really wrote, journalled through the accepted API of A2, with the origin G7 weighs. */
 function journalled(store: Store, project: string, origin: Record<string, unknown> = {}, over: Record<string, string> = {}): ClaimedRefusal {
@@ -105,18 +184,11 @@ function journalled(store: Store, project: string, origin: Record<string, unknow
 function artifactMissing(store: Store, project: string, shape: "proposal" | "input"): ClaimedRefusal {
   if (shape === "proposal") {
     return journalled(store, project, {
-      sources: [
-        source("proposal", carries(store, project, "proposal", ["artifact:tax"])),
-        source("base", carries(store, project, "base", ["artifact:order"])),
-        source("derived", carries(store, project, "candidate", ["artifact:tax"])),
-      ],
+      sources: assembly(store, project, "first", [["artifact:tax"]], ["artifact:tax"]).sources,
     });
   }
   return journalled(store, project, {
-    sources: [
-      source("base", carries(store, project, "base", [SUBJECT])),
-      source("derived", carries(store, project, "candidate", [SUBJECT])),
-    ],
+    sources: assembly(store, project, "accepted", [], [SUBJECT]).sources,
   });
 }
 
@@ -1021,13 +1093,11 @@ test("an analysis of other goals is no explanation of this stop, however exact i
 
 test("the explanation carries the content of the journal rows of the window, and a recorded remedy is not a proven cause", t => {
   const { store } = fixture(t);
+  definitionFixture(store, PROJECT, "artifact:price");
   opened(store);
   const refusal = journalled(store, PROJECT, {
     name: "artifact_missing", subject: "artifact:price",
-    sources: [
-      source("base", carries(store, PROJECT, "base", ["artifact:price"])),
-      source("derived", carries(store, PROJECT, "candidate", ["artifact:price"])),
-    ],
+    sources: assembly(store, PROJECT, "accepted", [], ["artifact:price"]).sources,
   }, {
     code: "missing_price_producer", gate: "G3",
     goal: "every artifact an operation consumes is produced somewhere in the layer",
@@ -1142,4 +1212,39 @@ test("after a result resets the ladder no stop is lost, and every window is judg
   // The analysis of the INHERITED stop after attempt 3 is still the analysis of that stop in the successor.
   assert.equal(inherited.remedies[0]!.claims.length, 2);
   assert.deepEqual(inherited.remedies[0]!.records, report.remedies[0]!.records);
+});
+
+test("the complete modern source context survives A2, an origin hold and analysis, A5, moved historical heads and restart", t => {
+  const { store, path } = fixture(t);
+  opened(store);
+  const observed = assembly(store, PROJECT, "first", [["artifact:tax"]], ["artifact:tax"]);
+  const proposal = observed.proposalSources[0]!;
+  const refused = journalled(store, PROJECT, { sources: [proposal] });
+  const stopped = closed(store, PROJECT, goal(), refusedBy(refused));
+  assert.equal(stopped.holds.length, 1);
+  const hold = stopped.holds[0]!, raised = store.get<OriginHold>(hold.id)!.value;
+  const original = normalizeOriginSource(proposal);
+  assert.equal(original.context!.kind, "proposal");
+  assert.deepEqual(reportOf(store).obstacles[0]!.origin.sources, [original]);
+  const basis = observed.sources;
+  const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, `${originAnalysisNamespace(PROJECT)}${next()}`, {
+    projectId: PROJECT, block: BLOCK, attempt: raised.attempt, row: raised.row, class: "proposal", basis,
+  });
+  deliveredOf(liftOriginHold(store, { project: PROJECT, hold, ground: "origin-analysis", record: { ref: analysis } }));
+  const lifted = store.get<OriginHold>(hold.id)!;
+  assert.ok(lifted.value.lift!.basis.some(item => item.context?.kind === "proposal"));
+  assert.ok(lifted.value.lift!.basis.some(item => item.context?.kind === "frame"));
+  for (let index = 0; index < 2; index += 1) closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
+  const report = reportOf(store);
+  assert.deepEqual(report.obstacles[0]!.origin.sources, [original]);
+  assert.equal(report.guards.some(ref => ref.id === original.ref.id), false);
+  const frame = original.context!.request.frame;
+  for (const ref of [original.ref, frame.graph, frame.horizon, analysis]) {
+    const latest = store.get(ref.id)!;
+    store.write({ id: latest.id, kind: latest.kind, expected: latest.revision, value: latest.value });
+  }
+  assert.deepEqual(reportOf(store), report);
+  assert.deepEqual(deliveredOf(checkStanding(store, report)), report);
+  store.close(); const reopened = new Store(path); t.after(() => reopened.close());
+  assert.deepEqual(reportOf(reopened), report);
 });

@@ -1,17 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type Revision } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { writeGuarded } from "../src/om/refs.js";
+import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
+import type { Graph } from "../src/graph/model.js";
+import { projectGraph } from "../src/graph/project.js";
+import { ProductEngine } from "../src/product/engine.js";
+import { fillObligations, prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
+import { writeCandidate, readCandidate, gateCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
+import { settleCandidate } from "../src/om/frame-accept.js";
+import { writeOmInput } from "../src/om/input.js";
+import { writeHorizon } from "../src/om/horizon.js";
+import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
 import {
-  classifyRefusal, journalId, recordRefusal, unitRefusalNamespace,
-  REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal,
+  classifyRefusal, journalId, normalizeOriginSource, originSourceKey, recordRefusal, unitRefusalNamespace,
+  REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal, type OriginSource,
 } from "../src/om/refusal-journal.js";
 import {
   beginAttempt, completeAttempt, openSeries, resumeSeries, seriesId,
@@ -19,7 +31,7 @@ import {
   type AttemptGoal, type BeginAttemptRequest, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
 import {
-  closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, readStopContext, stopContext,
+  readDefinitions, closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, readStopContext, stopContext,
   originAnalysisNamespace, originDecisionNamespace, originHoldId, originHoldNamespace,
   ADDRESSEE_KINDS, GATE_REFUSAL_CODES, LIFT_GROUNDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND,
   ORIGIN_ROLES, REFUSAL_CLASSES, REFUSAL_STAGES, REPEAT_GATE_CODES, SUBJECT_DECISIONS,
@@ -76,18 +88,113 @@ const next = (): number => (unique += 1);
 const address = (project: string, line = 1): SeriesRequest => ({ project, block: BLOCK, line });
 const at = (project: string, line = 1): string => seriesId(project, BLOCK, line);
 
-/**
- * A record of the map that names the definitions it carries — the minimal form this gate reads of a proposal (C3), an
- * accepted base (C5) and an assembled candidate (C4), none of which is written yet.
- */
-function carries(store: Store, project: string, role: string, defines: readonly string[], over: Record<string, unknown> = {}): Ref {
-  return reference(store.write({
-    id: `om-${role}:${project}:${next()}`, kind: `om-${role}`, expected: 0,
-    value: { defines: [...defines], ...over } as Json,
-  }));
+/** Exact accepted sources: the initial L1 has no local operation artifact; accepted OM L2 does. */
+interface DefinitionFixture { first: FrameRequest; accepted: FrameRequest; upper: Graph; subject?: string; baseAbsent?: Ref }
+const definitionFixtures = new WeakMap<Store, Map<string, DefinitionFixture>>();
+const sourceContexts = new Map<string, Record<string, unknown>>();
+function remember(ref: Ref, context: Record<string, unknown>): Ref {
+  sourceContexts.set(`${ref.id}@${ref.revision}:${ref.hash}`, context); return ref;
+}
+function initialFrame(store: Store, project: string) {
+  const graph = gardenGraph("standard", project);
+  const oldArtifact = `${project}-prep`;
+  graph.artifacts.find(item => item.id === oldArtifact)!.id = SUBJECT;
+  for (const node of graph.nodes) if (node.outcome === oldArtifact) node.outcome = SUBJECT;
+  for (const connector of graph.connectors) if (connector.artifact === oldArtifact) connector.artifact = SUBJECT;
+  const { level: _level, ...upper } = projectGraph(graph, 1);
+  preparedFeatures(new ProductEngine(store), project, upper as Graph);
+  const input = deliveredOf(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
+    refinement: null, choice: { choiceVersion: "origin-initial", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
+  const first: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!),
+    horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
+  return { graph, upper: upper as Graph, input, first };
+}
+function definitionFixture(store: Store, project: string): DefinitionFixture {
+  const cache = definitionFixtures.get(store) ?? new Map<string, DefinitionFixture>(); definitionFixtures.set(store, cache);
+  const previous = cache.get(project); if (previous) return previous;
+  const { graph, upper, input, first } = initialFrame(store, project);
+  const read = deliveredOf(prepareFrame(store, first)), projected = projectGraph(graph, 2);
+  const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
+    { graph, reference: { ...first.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const proposal: LayerProposal = { base: { graph: first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+    nodes: projected.nodes.filter(node => node.kind === "operation"), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
+      ...(fill.port === undefined ? {} : { port: fill.port }) })),
+    localConnectors: projected.connectors.map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))
+      .filter(connector => connector.bindings.length > 0),
+    artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins, anchors: projected.anchors, tests: projected.tests,
+    edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+    removes: [], replaces: [], redefines: [] };
+  const offered = reference(store.write({ id: `om-proposal:${project}:origin-accepted`, kind: "layer-proposal", expected: 0, value: proposal }));
+  const candidate = deliveredOf(writeCandidate(store, { frame: first, proposals: [offered] }));
+  assert.equal(candidate.state, "candidate"); if (candidate.state !== "candidate") throw new Error("No candidate");
+  const ref = reference(candidate.record);
+  const applied = deliveredOf(settleCandidate(store, { project, level: 2, candidate: ref,
+    outcome: { gate: "G3", candidate: ref, graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
+  const nextHorizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(applied.graph!),
+    refinement: reference(applied.layer!), choice: { choiceVersion: "origin-accepted", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
+  const accepted: FrameRequest = { ...first, graph: reference(applied.graph!), horizon: reference(nextHorizon.gate),
+    layer: reference(applied.layer!), frame: reference(applied.frame!) };
+  remember(first.graph, { kind: "frame", request: first }); remember(accepted.graph, { kind: "frame", request: accepted });
+  const built = { first, accepted, upper: upper as Graph }; cache.set(project, built); return built;
 }
 
-const source = (role: string, ref: Ref): Record<string, unknown> => ({ role, ref });
+/** Actual stored sections are observed, even when the payload is semantically unfit for acceptance. */
+function carries(store: Store, project: string, role: string, definitions: readonly string[], over: Record<string, unknown> = {}): Ref {
+  if (role === "workspace") return reference(store.write({ id: `workspace:${project}:${next()}`, kind: "workspace", expected: 0, value: over as Json }));
+  const f = definitionFixture(store, project);
+  if (role === "base" || role === "basis") return definitions.includes(f.subject ?? SUBJECT) ? f.accepted.graph : f.baseAbsent ?? f.first.graph;
+  const artifacts = definitions.map(id => ({ ...structuredClone(f.upper.artifacts[0]!), id }));
+  const request: ProposalRequest = { frame: f.first, proposals: [] };
+  if (role === "proposal") {
+    const value: LayerProposal = { base: { graph: f.first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+      nodes: [], fills: [], localConnectors: [], artifacts, contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [],
+      transfers: [], anchors: [], removes: [], replaces: [], redefines: [], ...over };
+    const ref = reference(store.write({ id: `om-proposal:${project}:${next()}`, kind: "layer-proposal", expected: 0, value }));
+    return remember(ref, { kind: "proposal", request: { ...request, proposals: [ref] } });
+  }
+  const graph = structuredClone(f.upper);
+  graph.artifacts = [...graph.artifacts.filter(item => !definitions.includes(item.id)), ...artifacts];
+  const value: FrameCandidateRecord = { project, level: 2, graph, graphHash: hashJson(graph), layerHash: hashJson(projectGraph(graph, 2)),
+    upperHash: hashJson(projectGraph(f.upper, 1)), base: { graph: f.first.graph, frame: null }, proposals: [], fills: [], request, ...over };
+  const id = `om-candidate:${project}:${hashJson([value.graphHash, value.base, value.proposals])}`;
+  const current = store.get(id);
+  return reference(current ?? store.write({ id, kind: "frame-candidate", expected: 0, value }));
+}
+
+const source = (role: string, ref: Ref): Record<string, unknown> => {
+  const context = sourceContexts.get(`${ref.id}@${ref.revision}:${ref.hash}`);
+  return { role, ref, ...(context ? { context } : {}) };
+};
+
+/** Build one explicitly linked assembly; no journal or gate helper repairs its supplied sources. */
+function assembly(store: Store, project: string, shape: {
+  proposals?: readonly (readonly string[])[]; bases?: readonly boolean[]; derived?: readonly (readonly string[])[]; frame?: FrameRequest;
+}): OriginSource[] {
+  const f = definitionFixture(store, project), frame = shape.frame ?? (shape.bases?.some(Boolean) ? f.accepted : f.first);
+  const artifacts = (definitions: readonly string[]) => definitions.map(id => ({ ...structuredClone(f.upper.artifacts[0]!), id }));
+  const proposals = (shape.proposals ?? []).map(definitions => reference(store.write({ id: `om-proposal:${project}:assembly-${next()}`,
+    kind: "layer-proposal", expected: 0, value: { base: { graph: frame.graph, frame: frame.frame }, level: frame.level,
+      source: "decision", status: "proposed", nodes: [], fills: [], localConnectors: [], artifacts: artifacts(definitions), contracts: [],
+      joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] } })));
+  const request: ProposalRequest = { frame, proposals: [...proposals].sort((a, b) => canonical(a) < canonical(b) ? -1 : 1) };
+  const proposalSources: OriginSource[] = proposals.map(ref => ({ role: "proposal", ref, context: { kind: "proposal", request } }));
+  const absentBase = shape.bases?.some(holds => !holds)
+    ? f.baseAbsent ?? deliveredOf(readFrame(store, frame)).upperRef : null;
+  const baseSources: OriginSource[] = (shape.bases ?? []).map(holds => ({ role: "base",
+    ref: holds ? frame.graph : absentBase!, context: { kind: "frame", request: frame } }));
+  const derivedSources: OriginSource[] = (shape.derived ?? []).map(definitions => {
+    const graph = structuredClone(f.upper);
+    graph.artifacts = [...graph.artifacts.filter(item => !definitions.includes(item.id)), ...artifacts(definitions)];
+    const value: FrameCandidateRecord = { project, level: 2, graph, graphHash: hashJson(graph), layerHash: hashJson(projectGraph(graph, 2)),
+      upperHash: hashJson(projectGraph(f.upper, 1)), base: { graph: frame.graph, frame: frame.frame }, proposals: request.proposals,
+      fills: [], request };
+    const id = `om-candidate:${project}:${hashJson([value.graphHash, value.base, value.proposals])}`;
+    return { role: "derived", ref: reference(store.get(id) ?? store.write({ id, kind: "frame-candidate", expected: 0, value })) };
+  });
+  return [...proposalSources, ...baseSources, ...derivedSources];
+}
 
 /** A refusal a gate really wrote, journalled through the accepted API of A2, with the origin G7 weighs. */
 function journalled(store: Store, project: string, origin: Record<string, unknown> = {}, over: Record<string, unknown> = {}): ClaimedRefusal {
@@ -112,33 +219,10 @@ function journalled(store: Store, project: string, origin: Record<string, unknow
 
 /** The refusal of the rules' own example, in each of the three shapes the origin can take. */
 function artifactMissing(store: Store, project: string, shape: "proposal" | "derivation" | "input"): ClaimedRefusal {
-  if (shape === "proposal") {
-    // The definition is in neither the proposal nor the base: the proposal is what is corrected.
-    return journalled(store, project, {
-      sources: [
-        source("proposal", carries(store, project, "proposal", ["artifact:tax"])),
-        source("base", carries(store, project, "base", ["artifact:order"])),
-        source("derived", carries(store, project, "candidate", ["artifact:tax"])),
-      ],
-    });
-  }
-  if (shape === "derivation") {
-    // It was in the full proposal and is not in what the code assembled: the assembler is what is corrected.
-    return journalled(store, project, {
-      sources: [
-        source("proposal", carries(store, project, "proposal", [SUBJECT])),
-        source("base", carries(store, project, "base", ["artifact:order"])),
-        source("derived", carries(store, project, "candidate", ["artifact:order"])),
-      ],
-    });
-  }
-  // An accepted record of a producer holds it, and nothing lost it on the way: that record is what is corrected.
-  return journalled(store, project, {
-    sources: [
-      source("base", carries(store, project, "base", [SUBJECT])),
-      source("derived", carries(store, project, "candidate", [SUBJECT])),
-    ],
-  });
+  const sources = shape === "proposal" ? assembly(store, project, { proposals: [["artifact:tax"]], bases: [false], derived: [["artifact:tax"]] })
+    : shape === "derivation" ? assembly(store, project, { proposals: [[SUBJECT]], bases: [false], derived: [["artifact:order"]] })
+    : assembly(store, project, { bases: [true], derived: [[SUBJECT]] });
+  return journalled(store, project, { sources });
 }
 
 const goal = (over: Partial<AttemptGoal> = {}): AttemptGoal => ({
@@ -457,10 +541,7 @@ test("a mixed set gives every refusal its own class and route, and none of them 
 
 test("an origin that cannot be placed raises a hold AT ONCE, and no project question is raised for it", t => {
   const { store, path } = fixture(t);
-  const both = () => [
-    source("proposal", carries(store, PROJECT, "proposal", [SUBJECT])),
-    source("base", carries(store, PROJECT, "base", [SUBJECT])),
-  ];
+  const both = () => assembly(store, PROJECT, { proposals: [[SUBJECT]], bases: [true] });
   const cases: [string, Record<string, unknown>][] = [
     ["an origin that names no source at all", { sources: [] }],
     ["a stage this gate does not name", { stage: "somewhere-else", sources: both() }],
@@ -536,7 +617,7 @@ test("the classes decided by the stage keep their own addressees, and the refusa
   const { store } = fixture(t);
   const untouched = [
     store.write({ id: "om-readiness:alpha", kind: "om-readiness", expected: 0, value: { ready: true, basis: "b1" } }),
-    store.write({ id: "graph:alpha", kind: "graph", expected: 0, value: { horizon: [BLOCK] } }),
+    store.write({ id: "graph:untouched", kind: "graph", expected: 0, value: { horizon: [BLOCK] } }),
     store.write({ id: "om-gaps:alpha", kind: "om-gaps", expected: 0, value: { open: ["gap:1"] } }),
     store.write({ id: "om-queue:alpha", kind: "om-queue", expected: 0, value: { order: [BLOCK], weights: { [BLOCK]: 3 } } }),
   ];
@@ -785,16 +866,16 @@ test("an absent field, source or set is a typed refusal that names the address, 
 
   // A record of the map that does not name the definitions it carries answers nothing, and is not read as "none".
   assert.equal(fails({ sources: [source("base", reference(store.write({ id: `om-base:${PROJECT}:${next()}`, kind: "om-base", expected: 0, value: { rows: [SUBJECT] } })))] },
-    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.defines");
+    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.kind");
   assert.equal(fails({ sources: [source("base", reference(store.write({ id: `om-base:${PROJECT}:${next()}`, kind: "om-base", expected: 0, value: { defines: null } })))] },
-    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.defines");
+    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.kind");
   assert.equal(fails({ sources: [source("base", reference(store.write({ id: `om-base:${PROJECT}:${next()}`, kind: "om-base", expected: 0, value: { defines: [SUBJECT, 7] } })))] },
-    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.defines");
+    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.kind");
   assert.equal(fails({ sources: [source("base", reference(store.write({ id: `om-base:${PROJECT}:${next()}`, kind: "om-base", expected: 0, value: "a base" })))] },
-    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.defines");
+    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.kind");
   // A source that stands at no such revision, and one whose record was never written at all.
   assert.equal(fails({ sources: [source("base", { ...standing, revision: 9 })] },
-    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0");
+    "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0.ref");
   assert.equal(fails({ sources: [source("environment", { id: `om-workspace:${PROJECT}:absent`, revision: 1, hash: hex("e") })] },
     "origin_unreadable").at.field, "outcome.refusals.0.origin.sources.0");
   // The address of the refused source travels with the refusal, so the gate that wrote the origin knows which one.
@@ -809,10 +890,10 @@ test("an absent field, source or set is a typed refusal that names the address, 
   const found = addressed(refusalOf(closeAttempt(store, {
     ...address(PROJECT), attempt: 1, outcome: refusedBy(sound, lame),
   })), "origin_unreadable", at(PROJECT));
-  assert.equal(found.at.field, "outcome.refusals.1.origin.sources.0");
+  assert.equal(found.at.field, "outcome.refusals.1.origin.sources.0.ref");
   assert.equal(addressed(refusalOf(closeAttempt(store, {
     ...address(PROJECT), attempt: 1, outcome: refusedBy(lame, sound),
-  })), "origin_unreadable", at(PROJECT)).at.field, "outcome.refusals.0.origin.sources.0");
+  })), "origin_unreadable", at(PROJECT)).at.field, "outcome.refusals.0.origin.sources.0.ref");
 
   // An absent set of refusals, of accepting records or of cancelling ones is the calling code's defect; an explicitly
   // empty one is a cycle that ran into none and achieved none.
@@ -850,20 +931,15 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
 
   // Identical content hashes alike, so a hash is no identity: what is read is the record the id names.
   const mine = carries(store, PROJECT, "base", [SUBJECT]);
-  const twin = reference(store.write({ id: `om-base:beta:twin`, kind: "om-base", expected: 0, value: { defines: [SUBJECT] } }));
-  assert.equal(twin.hash, mine.hash);
+  const twin = carries(store, "beta", "base", [SUBJECT]);
   const borrowed = journalled(store, PROJECT, {
     sources: [source("base", twin), source("derived", carries(store, PROJECT, "candidate", [SUBJECT]))],
   });
-  const result = deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(borrowed) }));
-  // The addressee names the record that was actually read, never a record of this project holding the same content.
-  assert.equal(routeOf(result, borrowed.row).addressee, `${ADDRESSEE_KINDS.input}:${twin.id}`);
-
-  // A hash the named revision does not hold is a forged ground, whichever way it was substituted.
-  const other = store.write({ id: mine.id, kind: "om-base", expected: 1, value: { defines: [] } });
-  const swapped = journalled(store, PROJECT, { sources: [source("base", { ...mine, hash: other.hash })] });
+  addressed(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(borrowed) })), "origin_unreadable", at(PROJECT));
+  const swapped = journalled(store, PROJECT, { sources: [source("base", { ...mine, hash: hex("e") })] });
+  addressed(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(swapped) })), "origin_unreadable", at(PROJECT));
+  deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: outcome() }));
   deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() }));
-  addressed(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 2, outcome: refusedBy(swapped) })), "origin_unreadable", at(PROJECT));
 
   // A record that declares a verdict about itself gains nothing by it: only the definitions it carries are read.
   const plain = carries(store, PROJECT, "proposal", ["artifact:tax"]);
@@ -1011,6 +1087,14 @@ test("every exported function refuses a missing, null or mistyped argument as a 
   opened(store);
   deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
   const good: CloseAttemptRequest = { ...address(PROJECT), attempt: 1, outcome: outcome() };
+  const goodDefinitions = { project: PROJECT, source: { role: "environment", ref: { id: "workspace:alpha:x", revision: 1, hash: hex("a") } } };
+  for (const request of [undefined, null, "request", 7, {}, { project: PROJECT },
+    { ...goodDefinitions, project: null }, { ...goodDefinitions, source: null }, { ...goodDefinitions, source: { role: "base" } },
+    { ...goodDefinitions, source: { ...goodDefinitions.source, context: {} } },
+    { ...goodDefinitions, source: { ...goodDefinitions.source, context: { kind: "frame", request: {} } } }])
+    assert.throws(() => readDefinitions(store, request as unknown as Parameters<typeof readDefinitions>[1]), typedDefect);
+  for (const invalid of [null, undefined, "store", {}, 7])
+    assert.throws(() => readDefinitions(invalid as unknown as Store, goodDefinitions), typedDefect);
   const calls: ((request: unknown, gate: unknown) => void)[] = [
     (request, gate) => { closeAttempt(gate as Store, request as CloseAttemptRequest); },
     (request, gate) => { prepareCloseAttempt(gate as Store, request as CloseAttemptRequest); },
@@ -1133,14 +1217,14 @@ test("the gate writes the series and the journal and nothing else, whatever the 
     journalled(store, PROJECT, { stage: "readiness", subject: BLOCK, sources: [source("base", carries(store, PROJECT, "basis", [BLOCK]))] }),
     journalled(store, PROJECT, { sources: [] }),
   ];
-  const kinds = new Map(store.list().map(record => [record.id, record.hash]));
+  const kinds = new Map(store.list().map(record => [record.id, { head: reference(record), history: store.history(record.id).map(reference) }]));
   const result = closed(store, PROJECT, goal(), refusedBy(...refusals));
   assert.deepEqual(classes(result), [...every].sort());
 
-  for (const [id, hash] of kinds) {
+  for (const [id, before] of kinds) {
     if (id === at(PROJECT) || id === journalId(PROJECT)) continue;
-    assert.equal(store.get(id)!.hash, hash, id);
-    assert.equal(store.history(id).length, 1, id);
+    assert.deepEqual(reference(store.get(id)!), before.head, id);
+    assert.deepEqual(store.history(id).map(reference), before.history, id);
   }
   assert.deepEqual(store.list(REFUSAL_JOURNAL_KIND).map(record => record.id), [journalId(PROJECT)]);
   // The one record added is the gate's own hold of the refusal of unknown origin: no graph, input, readiness or gap.
@@ -1160,7 +1244,8 @@ test("the classes of the gate are re-derived at every reading, and a stored deci
   // The records the origin stood on move on. The origin names EXACT revisions, so the class derived earlier still
   // reads the records it was derived from, and the decision already taken is not revisited.
   const base = routeOf(first, refusal.row).basis.find(item => item.role === "base")!;
-  store.write({ id: base.ref.id, kind: "om-base", expected: base.ref.revision, value: { defines: [] } });
+  const oldBase = store.get<Graph>(base.ref.id)!;
+  store.write({ id: oldBase.id, kind: oldBase.kind, expected: oldBase.revision, value: { ...oldBase.value, title: "Later unaccepted graph" } });
   const second = closed(store, PROJECT, goal(), refusedBy(refusal));
   assert.equal(routeOf(second, refusal.row).class, "input");
   assert.equal(heldJournal(store)!.revision, journal.revision);
@@ -1170,8 +1255,9 @@ test("the classes of the gate are re-derived at every reading, and a stored deci
   const later = journalled(store, PROJECT, {
     sources: [source("base", reference(store.get(base.ref.id)!)), source("proposal", carries(store, PROJECT, "proposal", []))],
   });
-  const third = closed(store, PROJECT, goal(), refusedBy(later));
-  assert.equal(routeOf(third, later.row).class, "proposal");
+  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 3, goal: goal() }));
+  assert.equal(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 3, outcome: refusedBy(later) })).code, "origin_unreadable");
+  assert.equal(heldSeries(store)!.value.attempts[2]!.outcome, null);
 });
 
 test("a result is never taken on the caller's word: five invented keys on one real record move nothing (P1)", t => {
@@ -1245,12 +1331,12 @@ test("a hold is lifted on the analysis of ITS refusal, which routes it by the cl
   const one = heldBy(store, "stored");
   const culprit = carries(store, "stored", "base", [SUBJECT]);
   const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace("stored"),
-    analysisOf(holdAt(store, one.hold), { class: "input", basis: [{ role: "base", ref: culprit }] }));
+    analysisOf(holdAt(store, one.hold), { class: "input", basis: [source("base", culprit)] }));
   const lifted = deliveredOf(liftOriginHold(store, liftBy("stored", one.hold, "origin-analysis", { ref: analysis })));
   assert.equal(lifted.revision, 2);
   assert.deepEqual(lifted.value.lift, {
     ground: "origin-analysis", record: analysis, class: "input",
-    addressee: `${ADDRESSEE_KINDS.input}:${culprit.id}`, basis: [{ role: "base", ref: culprit }],
+    addressee: `${ADDRESSEE_KINDS.input}:${culprit.id}`, basis: [source("base", culprit)],
   });
   // The hold no longer holds: the next attempt opens, and nothing else changed — readiness included (T8).
   assert.equal(deliveredOf(openAttempt(store, { ...address("stored"), attempt: 2, goal: goal() })).value.attempts.length, 2);
@@ -1265,8 +1351,8 @@ test("a hold is lifted on the analysis of ITS refusal, which routes it by the cl
   const value = analysisOf(holdAt(store, two.hold), {
     class: "proposal",
     basis: [
-      { role: "proposal", ref: carries(store, "pending", "proposal", []) },
-      { role: "base", ref: carries(store, "pending", "base", []) },
+      source("proposal", carries(store, "pending", "proposal", [])),
+      source("base", carries(store, "pending", "base", [])),
     ],
   });
   const prepared = deliveredOf(prepareLiftOriginHold(store, liftBy("pending", two.hold, "origin-analysis", { pending: { id, kind: ORIGIN_ANALYSIS_KIND, value: value as Json } })));
@@ -1324,9 +1410,9 @@ test("a hold is lifted on the owner's decision about it — stored or written wi
     ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { class: "invented" }), "record.class"],
     ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { basis: [] }), "record.basis"],
     ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { basis: [{ role: "base", ref: { id: "om-base:none:gone", revision: 1, hash: hex("e") } }] }), "record.basis.0.ref"],
-    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { basis: [{ role: "hearsay", ref: carries(store, "none", "base", []) }] }), "record.basis.0"],
-    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { class: "input", basis: [{ role: "base", ref: carries(store, "none", "base", []) }, { role: "base", ref: carries(store, "none", "base", []) }] }), "record.basis"],
-    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { class: "derivation", basis: [{ role: "base", ref: carries(store, "none", "base", []) }] }), "record.basis"],
+    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { basis: [source("hearsay", carries(store, "none", "base", []))] }), "record.basis.0.role"],
+    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { class: "input", basis: [source("base", carries(store, "none", "base", [])), source("base", carries(store, "none", "base", []))] }), "record.basis"],
+    ["origin-analysis", ORIGIN_ANALYSIS_KIND, analysisOf(base, { class: "derivation", basis: [source("base", carries(store, "none", "base", []))] }), "record.basis"],
   ];
   for (const [ground, kind, value, field] of unusable) {
     const namespace = ground === "owner-decision" ? originDecisionNamespace("none") : originAnalysisNamespace("none");
@@ -1453,7 +1539,7 @@ test("a hold, its lift and the opening it guards leave no window between the che
   const { hold } = heldBy(store, PROJECT);
   const id = `${originAnalysisNamespace(PROJECT)}${next()}`;
   const value = analysisOf(holdAt(store, hold), {
-    class: "input", basis: [{ role: "base", ref: carries(store, PROJECT, "base", [SUBJECT]) }],
+    class: "input", basis: [source("base", carries(store, PROJECT, "base", [SUBJECT]))],
   });
   const prepared = deliveredOf(prepareLiftOriginHold(store, liftBy(PROJECT, hold, "origin-analysis", { pending: { id, kind: ORIGIN_ANALYSIS_KIND, value: value as Json } })));
   const decision = storedAs(store, ORIGIN_DECISION_KIND, originDecisionNamespace(PROJECT), decisionOf(holdAt(store, hold)));
@@ -1510,14 +1596,23 @@ test("a hold outlives a successor of the series: one change of the slice does no
   deliveredOf(openAttempt(store, { ...address(PROJECT, 2), attempt: 2, goal: goal() }));
 });
 
-test("the table of decision: every tally of roles and holders gets the class its sources suffice for, and no other", t => {
-  const { store } = fixture(t);
-  // A pool of records of each role, holding the subject or not; any origin may name any of them.
-  const pool = (role: string, holds: boolean): Ref[] => [0, 1].map(() => carries(store, "pool", role === "derived" ? "candidate" : role, holds ? [SUBJECT] : ["artifact:other"]));
-  const roles = ["proposal", "base", "derived"] as const;
-  const holding = Object.fromEntries(roles.map(role => [role, pool(role, true)])) as Record<string, Ref[]>;
-  const idle = Object.fromEntries(roles.map(role => [role, pool(role, false)])) as Record<string, Ref[]>;
-
+test("the table of decision: every tally of roles and holders gets the class its sources suffice for, and no other", async t => {
+  // This exhaustive table uses native acceptance once; dedicated integration tests also cover OM acceptance.
+  const native = await createOmFixture(t, "standard", "pool"), template = native.store, root = native.root, path = native.database;
+  const matrixSubject = "pool-prep";
+  const input = deliveredOf(writeOmInput(template, { project: "pool", expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(native.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const makeHorizon = (choiceVersion: string, refinement: Ref | null) => deliveredOf(writeHorizon(template,
+    { project: "pool", input: reference(input), graph: reference(native.graphRevision), refinement,
+      choice: { choiceVersion, features: [{ outcome: "pool-result" }], excluded: [] }, available: {} }));
+  const first: FrameRequest = { project: "pool", level: 2, graph: reference(native.graphRevision), horizon: reference(makeHorizon("table-upper", null).gate),
+    layer: null, frame: null, upper: null };
+  const accepted: FrameRequest = { ...first, horizon: reference(makeHorizon("table-lower", reference(template.get("phase:pool:L2")!)).gate),
+    layer: reference(native.layers[2]) };
+  const read = deliveredOf(readFrame(template, first)), upper = structuredClone(read.upper) as Graph;
+  const baseAbsent = remember(read.upperRef, { kind: "frame", request: first });
+  remember(accepted.graph, { kind: "frame", request: accepted });
+  definitionFixtures.set(template, new Map([["pool", { first, accepted, upper, subject: matrixSubject, baseAbsent }]]));
   // The rule in its own words: blamed on a holder — that holder named, exactly one; blamed on an absence — every place
   // looked in. Written here independently of the gate's table, so that a change of either shows up as a disagreement.
   const expected = (p: number, hp: number, b: number, hb: number, d: number, hd: number): RefusalClass => {
@@ -1543,36 +1638,45 @@ test("the table of decision: every tally of roles and holders gets the class its
     "1 1 1 1 1 1": "unknown", // proposed and accepted both: whose definition is unfit is not said
   };
 
+  // A closed, legitimately built snapshot preserves exact source histories for every table row.
+  // Each row gets an independent journal, so the truth table does not repeatedly replay unrelated refusals.
+  template.close();
   const seen = new Map<string, RefusalClass>();
   for (let p = 0; p <= 2; p += 1) for (let hp = 0; hp <= p; hp += 1)
   for (let b = 0; b <= 2; b += 1) for (let hb = 0; hb <= b; hb += 1)
   for (let d = 0; d <= 2; d += 1) for (let hd = 0; hd <= d; hd += 1) {
     const key = `${p} ${hp} ${b} ${hb} ${d} ${hd}`;
-    const counts: Record<string, [number, number]> = { proposal: [p, hp], base: [b, hb], derived: [d, hd] };
-    const sources = roles.flatMap(role => {
-      const [named, holders] = counts[role]!;
-      return [...holding[role]!.slice(0, holders), ...idle[role]!.slice(0, named - holders)].map(ref => source(role, ref));
-    });
-    const project = `tally${p}${hp}${b}${hb}${d}${hd}`;
-    opened(store, project);
-    const refusal = journalled(store, project, { sources: sources.length > 0 ? sources : [source("environment", holding["base"]![0]!)] });
-    const result = closed(store, project, goal(), refusedBy(refusal));
-    const routed = routeOf(result, refusal.row);
-    seen.set(key, routed.class);
-    assert.equal(routed.class, expected(p, hp, b, hb, d, hd), key);
-    // No positive class without the role it blames, and its responsible is the one record the rule singles out.
-    if (routed.class === "derivation") {
-      assert.ok(d === 1, key);
-      assert.equal(routed.addressee, `${ADDRESSEE_KINDS.derivation}:${idle["derived"]![0]!.id}`, key);
-    }
-    if (routed.class === "input") {
-      assert.ok(b >= 1 && hb === 1, key);
-      assert.equal(routed.addressee, `${ADDRESSEE_KINDS.input}:${holding["base"]![0]!.id}`, key);
-    }
-    if (routed.class === "proposal") assert.ok(p === 1, key);
-    // Whatever is not placed is held at once, and only a placed refusal of the proposal reaches the model.
-    assert.equal(result.holds.length, routed.class === "unknown" ? 1 : 0, key);
-    assert.equal(routed.toModel, routed.class === "proposal", key);
+    const database = join(root, `row-${p}${hp}${b}${hb}${d}${hd}.sqlite`);
+    copyFileSync(path, database);
+    const store = new Store(database);
+    try {
+      definitionFixtures.set(store, new Map([["pool", { first, accepted, upper, subject: matrixSubject, baseAbsent }]]));
+      const named = (total: number, holders: number) => Array.from({ length: total }, (_, index) => index < holders ? [matrixSubject] : ["artifact:other"]);
+      const sources = assembly(store, "pool", { frame: hb > 0 ? accepted : first, proposals: named(p, hp), bases: Array.from({ length: b }, (_, index) => index < hb),
+        derived: named(d, hd) });
+      const project = "pool", block = `tally:${p}${hp}${b}${hb}${d}${hd}`;
+      const request = { project, block, line: 1 };
+      deliveredOf(openSeries(store, { ...request, slice: SLICE, predecessor: null, basis: null }));
+      const refusal = journalled(store, project, { subject: matrixSubject, sources: sources.length > 0 ? sources : [source("environment", carries(store, project, "workspace", []))] });
+      deliveredOf(openAttempt(store, { ...request, attempt: 1, goal: goal() }));
+      const result = deliveredOf(closeAttempt(store, { ...request, attempt: 1, outcome: refusedBy(refusal) }));
+      const routed = routeOf(result, refusal.row);
+      seen.set(key, routed.class);
+      assert.equal(routed.class, expected(p, hp, b, hb, d, hd), key);
+      // No positive class without the role it blames, and its responsible is the one record the rule singles out.
+      if (routed.class === "derivation") {
+        assert.ok(d === 1, key);
+        assert.equal(routed.addressee, `${ADDRESSEE_KINDS.derivation}:${sources.find(item => item.role === "derived")!.ref.id}`, key);
+      }
+      if (routed.class === "input") {
+        assert.ok(b >= 1 && hb === 1, key);
+        assert.equal(routed.addressee, `${ADDRESSEE_KINDS.input}:${sources.find(item => item.role === "base")!.ref.id}`, key);
+      }
+      if (routed.class === "proposal") assert.ok(p === 1, key);
+      // Whatever is not placed is held at once, and only a placed refusal of the proposal reaches the model.
+      assert.equal(result.holds.length, routed.class === "unknown" ? 1 : 0, key);
+      assert.equal(routed.toModel, routed.class === "proposal", key);
+    } finally { store.close(); rmSync(database); }
   }
   assert.equal(seen.size, 216);
   for (const [key, want] of Object.entries(pinned)) assert.equal(seen.get(key), want, key);
@@ -1623,9 +1727,8 @@ test("the reviewer's reproduction: an analysis whose grounds establish ANOTHER c
   opened(store);
   // A proposal that DEFINES the subject, and the candidate the code assembled without it: the definition stood and the
   // one assembly lost it. The ordinary classification of a refusal weighed against these two says so.
-  const proposal = carries(store, PROJECT, "proposal", [SUBJECT]);
-  const candidate = carries(store, PROJECT, "candidate", ["artifact:order"]);
-  const grounds = [source("proposal", proposal), source("derived", candidate)];
+  const grounds = assembly(store, PROJECT, { proposals: [[SUBJECT]], derived: [["artifact:order"]] });
+  const candidate = grounds.find(item => item.role === "derived")!.ref;
   const ordinary = journalled(store, PROJECT, { sources: grounds });
   // The first cycle also ran into a refusal of unknown origin: its hold stands, and it is what an analysis would lift.
   const held = heldOn(store, PROJECT, { sources: [] }, [ordinary]);
@@ -1663,30 +1766,22 @@ test("the reviewer's reproduction: an analysis whose grounds establish ANOTHER c
 
 test("grounds the table of decision cannot place lift nothing: an absent role and several holders are both 'unknown'", t => {
   const { store } = fixture(t);
-  const cases: [string, string, Record<string, unknown>[]][] = [
-    // The reviewer's own two, now asked of the lift: what the assembly holds says nothing about the proposal, and two
-    // accepted records that could each be the culprit single nobody out.
+  const cases: [string, string, (project: string) => readonly unknown[]][] = [
     ["proposal", "only what the code assembled, holding the subject",
-      [source("derived", carries(store, "none1", "candidate", [SUBJECT]))]],
+      project => [source("derived", carries(store, project, "candidate", [SUBJECT]))]],
     ["input", "two accepted records both holding the subject",
-      [source("base", carries(store, "none1", "base", [SUBJECT])), source("base", carries(store, "none1", "base", [SUBJECT]))]],
-    // A mandatory definition absent everywhere it could have been named, with no place looked in.
+      project => [source("base", carries(store, project, "base", [SUBJECT])), source("base", carries(store, project, "base", [SUBJECT]))]],
     ["proposal", "a proposal that lacks it, and no accepted record looked in",
-      [source("proposal", carries(store, "none1", "proposal", []))]],
-    // One of two assemblies lost it: which one is not said, so the code to correct is not named.
+      project => [source("proposal", carries(store, project, "proposal", []))]],
     ["derivation", "two assemblies, one of which lost it",
-      [source("proposal", carries(store, "none1", "proposal", [SUBJECT])),
-        source("derived", carries(store, "none1", "candidate", [SUBJECT])),
-        source("derived", carries(store, "none1", "candidate", []))]],
+      project => assembly(store, project, { proposals: [[SUBJECT]], derived: [[SUBJECT], []] })],
   ];
-  cases.forEach(([claim, note, basis], index) => {
+  cases.forEach(([claim, note, build], index) => {
     const project = `unplaced${index}`;
     opened(store, project);
     const held = heldOn(store, project, { sources: [] });
-    liftRefused(store, project, held.hold, analysisOf(held.standing, { class: claim, basis }), "record.basis", note);
-    // The series stays held, and no analysis of this project stands: an insufficient ground wrote nothing.
+    liftRefused(store, project, held.hold, analysisOf(held.standing, { class: claim, basis: build(project) }), "record.basis", note);
     addressed(refusalOf(openAttempt(store, { ...address(project), attempt: 2, goal: goal() })), "origin_held", at(project));
-    // Only the one analysis that was stored BEFOREHAND stands: not one of the grounds offered with a lift was written.
     assert.equal(store.list(ORIGIN_ANALYSIS_KIND).filter(record => record.id.startsWith(originAnalysisNamespace(project))).length, 1, note);
   });
   // A source of the map among the grounds that does not name the definitions it carries answers nothing here either.
@@ -1694,20 +1789,20 @@ test("grounds the table of decision cannot place lift nothing: an absent role an
   const mute = heldOn(store, "mute", { sources: [] });
   const silent = reference(store.write({ id: `om-base:mute:${next()}`, kind: "om-base", expected: 0, value: { rows: [SUBJECT] } }));
   liftRefused(store, "mute", mute.hold, analysisOf(mute.standing, { class: "input", basis: [source("base", silent)] }),
-    "record.basis.0.defines", "a ground of the map that names no definitions");
+    "record.basis.0.kind", "an unsupported kind cannot witness map definitions");
 });
 
 test("an analysis whose grounds establish the class it claims lifts the hold, and says exactly what the table said", t => {
   const { store } = fixture(t);
   // In one project and one cycle: a refusal of unknown origin, and beside it a refusal weighed against the very
   // records the analysis will name. The lift and the ordinary classification must be the same finding, hash for hash.
-  const cases: [string, string, (project: string) => Record<string, unknown>[]][] = [
+  const cases: [string, string, (project: string) => readonly unknown[]][] = [
     ["input", "the one accepted record holds it, and nothing lost it",
-      project => [source("base", carries(store, project, "base", [SUBJECT])), source("derived", carries(store, project, "candidate", [SUBJECT]))]],
+      project => assembly(store, project, { bases: [true], derived: [[SUBJECT]] })],
     ["proposal", "looked for in the one proposal and the one accepted record, found in neither",
-      project => [source("proposal", carries(store, project, "proposal", [])), source("base", carries(store, project, "base", []))]],
+      project => assembly(store, project, { proposals: [[]], bases: [false] })],
     ["derivation", "proposed, and not in what the one assembly produced",
-      project => [source("proposal", carries(store, project, "proposal", [SUBJECT])), source("derived", carries(store, project, "candidate", []))]],
+      project => assembly(store, project, { proposals: [[SUBJECT]], derived: [[]] })],
   ];
   cases.forEach(([claim, note, build], index) => {
     // The same case twice: the analysis stored beforehand, and the analysis written WITH the lift.
@@ -1741,9 +1836,11 @@ test("an analysis whose grounds establish the class it claims lifts the hold, an
       assert.equal(deliveredOf(openAttempt(store, { ...address(project), attempt: 2, goal: goal() })).value.attempts.length, 2);
 
       // The grounds are an unordered set: the same analysis with them reversed is weighed to the same finding.
-      const mirror = `${project}r`;
-      opened(store, mirror);
-      const other = heldOn(store, mirror, { sources: [] });
+      const mirror = project;
+      const mirrorRefusal = journalled(store, mirror, { sources: [] });
+      const mirrorResult = deliveredOf(closeAttempt(store, { ...address(mirror), attempt: 2, outcome: refusedBy(mirrorRefusal) }));
+      assert.equal(mirrorResult.holds.length, 1);
+      const other = { hold: mirrorResult.holds[0]!, standing: holdAt(store, mirrorResult.holds[0]!) };
       const reversed = analysisOf(other.standing, { class: claim, basis: [...basis].reverse() });
       const twin = deliveredOf(liftOriginHold(store, liftBy(mirror, other.hold, "origin-analysis",
         { ref: storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace(mirror), reversed) })));
@@ -1813,10 +1910,7 @@ test("a saved lift whose grounds no longer establish its class is refused at the
   // with the addressee and the grounds recomputed to agree with itself. The store hashes it, so it is self-consistent.
   opened(store);
   const held = heldOn(store, PROJECT, { sources: [] });
-  const basis = [
-    source("proposal", carries(store, PROJECT, "proposal", [SUBJECT])),
-    source("derived", carries(store, PROJECT, "candidate", [])),
-  ];
+  const basis = assembly(store, PROJECT, { proposals: [[SUBJECT]], derived: [[]] });
   const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace(PROJECT),
     analysisOf(held.standing, { class: "proposal", basis }));
   const forged = { ...held.standing, lift: { ground: "origin-analysis", record: analysis, class: "proposal", addressee: `${ADDRESSEE_KINDS.proposal}:${SUBJECT}`, basis } };
@@ -1843,8 +1937,8 @@ test("a saved lift whose grounds no longer establish its class is refused at the
   // record establishes is the whole finding, and a lift that holds part of it does not hold the finding.
   opened(back, "trimmed");
   const other = heldOn(back, "trimmed", { sources: [] });
-  const culprit = carries(back, "trimmed", "base", [SUBJECT]);
-  const grounds = [source("base", culprit), source("derived", carries(back, "trimmed", "candidate", [SUBJECT]))];
+  const grounds = assembly(back, "trimmed", { bases: [true], derived: [[SUBJECT]] });
+  const culprit = grounds.find(item => item.role === "base")!.ref;
   const record = storedAs(back, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace("trimmed"),
     analysisOf(other.standing, { class: "input", basis: grounds }));
   back.write({
@@ -1853,7 +1947,7 @@ test("a saved lift whose grounds no longer establish its class is refused at the
       ...other.standing,
       lift: {
         ground: "origin-analysis", record, class: "input",
-        addressee: `${ADDRESSEE_KINDS.input}:${culprit.id}`, basis: [{ role: "base", ref: culprit }],
+        addressee: `${ADDRESSEE_KINDS.input}:${culprit.id}`, basis: grounds.filter(item => item.role === "base"),
       },
     } as unknown as Json,
   });
@@ -1908,4 +2002,243 @@ test("the gate hands over the mutable heads a context was read from, the LIFTED 
   assert.equal(refusalOf(stopContext(store, address("gamma"))).code, "stop_absent");
   assert.throws(() => readStopContext(store, undefined as unknown as SeriesRequest), typedDefect);
   assert.ok(deeplyFrozen(reading));
+});
+
+
+test("G7 observes real first-pass and accepted bases of both producers through their historical contracts", async t => {
+  const { store, path } = fixture(t);
+  const initial = initialFrame(store, "initial");
+  assert.equal(store.get("om-frame:initial:2"), null);
+  assert.ok(store.get<Graph>(initial.first.graph.id)!.value.nodes.every(node => node.kind !== "operation" && node.kind !== "work"));
+  assert.ok(deliveredOf(readDefinitions(store, { project: "initial", source: { role: "base", ref: initial.first.graph,
+    context: { kind: "frame", request: initial.first } } })).definitions.includes("initial-produce-block"));
+  const f = definitionFixture(store, PROJECT);
+  assert.equal(f.first.layer, null); assert.equal(f.first.frame, null);
+  const read = (record: Record<string, unknown>) => deliveredOf(readDefinitions(store, { project: PROJECT, source: record as unknown as OriginSource }));
+  assert.ok(!read(source("base", f.first.graph)).definitions.includes(SUBJECT));
+  assert.ok(read(source("base", f.accepted.graph)).definitions.includes(SUBJECT));
+  assert.ok(read({ role: "base", ref: f.accepted.frame!, context: { kind: "frame", request: f.accepted } }).definitions.includes(SUBJECT));
+  const graphHead = store.get(f.accepted.graph.id)!;
+  store.write({ id: graphHead.id, kind: graphHead.kind, expected: graphHead.revision, value: graphHead.value });
+  const sourceHead = store.get(`source:${PROJECT}:brief`)!;
+  store.write({ id: sourceHead.id, kind: sourceHead.kind, expected: sourceHead.revision, value: sourceHead.value });
+  assert.ok(read(source("base", f.accepted.graph)).definitions.includes(SUBJECT));
+  const saved = source("base", f.accepted.graph);
+  store.close();
+  const back = new Store(path); t.after(() => back.close());
+  assert.ok(deliveredOf(readDefinitions(back, { project: PROJECT, source: saved as unknown as OriginSource })).definitions.includes(SUBJECT));
+
+  const native = "native", nativeFixture = await createOmFixture(t, "standard", native);
+  const nativeStore = nativeFixture.store;
+  const input = deliveredOf(writeOmInput(nativeStore, { project: native, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(nativeStore.get(`stage:${native}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const horizon = deliveredOf(writeHorizon(nativeStore, { project: native, input: reference(input), graph: reference(nativeStore.get(`graph:${native}`)!),
+    refinement: reference(nativeStore.get(`phase:${native}:L2`)!), choice: { choiceVersion: "origin-native", features: [{ outcome: `${native}-result` }], excluded: [] }, available: {} }));
+  const request: FrameRequest = { project: native, level: 2, graph: reference(nativeStore.get(`graph:${native}`)!), horizon: reference(horizon.gate),
+    layer: reference(nativeStore.get(`graph-layer:${native}:2`)!), frame: null, upper: null };
+  const definitions = deliveredOf(readDefinitions(nativeStore, { project: native, source: { role: "base", ref: request.graph,
+    context: { kind: "frame", request } } })).definitions;
+  assert.ok(definitions.includes(`${native}-prep-operation`));
+  assert.ok(definitions.includes(`${native}-prep`));
+});
+
+test("G7 refuses missing or alien observation contexts and unreadable modern sections without falling back to defines", t => {
+  const { store } = fixture(t), f = definitionFixture(store, PROJECT);
+  const offered = carries(store, PROJECT, "proposal", [SUBJECT]), normal = source("proposal", offered);
+  const check = (origin: Record<string, unknown>) => {
+    const before = store.list().map(reference);
+    const found = refusalOf(readDefinitions(store, { project: PROJECT, source: origin as unknown as OriginSource }));
+    assert.ok(["origin_unreadable", "proposal_invalid", "proposal_base_stale", "proposal_foreign", "record_foreign", "record_forged", "candidate_graph_mismatch", "frame_basis_unproven", "candidate_missing"].includes(found.code), found.code);
+    assert.ok(found.at.field || found.at.ref); assert.deepEqual(store.list().map(reference), before);
+  };
+  check({ role: "proposal", ref: offered });
+  check({ ...normal, context: { kind: "proposal", request: { frame: f.first, proposals: [] } } });
+  check({ ...normal, context: { kind: "proposal", request: { frame: f.accepted, proposals: [offered] } } });
+  const foreign = definitionFixture(store, "foreign");
+  check({ ...normal, context: { kind: "proposal", request: { frame: foreign.first, proposals: [offered] } } });
+  check({ ...normal, ref: { ...offered, hash: hex("d") } });
+  check({ role: "base", ref: f.accepted.graph });
+  check({ role: "base", ref: f.accepted.graph, context: { kind: "frame", request: f.first } });
+  for (const field of ["nodes", "artifacts", "contracts", "localConnectors", "fills"]) {
+    const value = structuredClone(store.get(offered.id)!.value) as unknown as Record<string, Json>;
+    delete value[field]; value["defines"] = [SUBJECT];
+    const ref = reference(store.write({ id: `om-proposal:${PROJECT}:missing-${field}`, kind: "layer-proposal", expected: 0, value }));
+    check({ role: "proposal", ref, context: { kind: "proposal", request: { frame: f.first, proposals: [ref] } } });
+  }
+  const candidate = carries(store, PROJECT, "candidate", [SUBJECT]);
+  const savedRequest = store.get<FrameCandidateRecord>(candidate.id)!.value.request;
+  assert.ok(deliveredOf(readDefinitions(store, { project: PROJECT, source: { role: "derived", ref: candidate,
+    context: { kind: "proposal", request: savedRequest } } })).definitions.includes(SUBJECT));
+  check({ role: "derived", ref: candidate, context: { kind: "proposal", request: { ...savedRequest, proposals: [offered] } } });
+  check({ role: "derived", ref: candidate, context: { kind: "frame", request: savedRequest.frame } });
+  for (const field of ["nodes", "artifacts", "contracts", "connectors"]) {
+    const value = structuredClone(store.get(candidate.id)!.value) as unknown as Record<string, Json>;
+    const graph = value["graph"] as Record<string, Json>; delete graph[field]; value["defines"] = [SUBJECT];
+    const ref = reference(store.write({ id: `om-candidate:${PROJECT}:missing-${field}`, kind: "frame-candidate", expected: 0, value }));
+    check({ role: "derived", ref });
+  }
+  const legacy = reference(store.write({ id: `om-proposal:${PROJECT}:legacy`, kind: "om-proposal", expected: 0, value: { defines: [SUBJECT] } }));
+  check({ role: "proposal", ref: legacy });
+  const get = store.get.bind(store);
+  try {
+    for (const fault of [new TypeError("source read failed"), new EngineError("record_corrupt", "source corrupt")]) {
+      store.get = ((id: string, revision?: number) => { if (id === f.first.graph.id) throw fault; return get(id, revision); }) as Store["get"];
+      assert.throws(() => readDefinitions(store, { project: PROJECT, source: source("base", f.first.graph) as unknown as OriginSource }), error => error === fault);
+    }
+  } finally { store.get = get; }
+});
+
+test("G7 source context participates in identity and ordering, and different assemblies cannot share a classification", t => {
+  const { store } = fixture(t); opened(store);
+  const first = carries(store, PROJECT, "proposal", [SUBJECT]), second = carries(store, PROJECT, "proposal", []);
+  const frame = definitionFixture(store, PROJECT).first;
+  const a: OriginSource = { role: "proposal", ref: first, context: { kind: "proposal", request: { frame, proposals: [first] } } };
+  const b: OriginSource = { role: "proposal", ref: first, context: { kind: "proposal", request: { frame,
+    proposals: [first, second].sort((x, y) => canonical(x) < canonical(y) ? -1 : 1) } } };
+  const incompatible = journalled(store, PROJECT, { sources: [b, a, b] });
+  const stored = heldJournal(store)!.value.rows.find(item => item.id === incompatible.row)!.origin.sources;
+  assert.equal(stored.length, 3); assert.equal(stored.filter(item => canonical(item) === canonical(b)).length, 2);
+  assert.deepEqual(stored, [a, b, b].sort((x, y) => canonical(x) < canonical(y) ? -1 : 1));
+  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+  const before = store.list().map(reference);
+  for (const close of [prepareCloseAttempt, closeAttempt]) {
+    assert.equal(refusalOf(close(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(incompatible) }) as OmResult<unknown>).code, "origin_unreadable");
+    assert.deepEqual(store.list().map(reference), before);
+  }
+  const refusal = journalled(store, PROJECT, { sources: [a, a, a] });
+  const result = deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(refusal) }));
+  assert.deepEqual(routeOf(result, refusal.row).basis, [a, a, a]);
+  assert.equal(routeOf(result, refusal.row).class, "unknown");
+  const journal = heldJournal(store)!;
+  const again = deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(refusal) }));
+  assert.deepEqual(again.routed, result.routed); assert.equal(heldJournal(store)!.revision, journal.revision);
+  const analysis = analysisOf(holdAt(store, result.holds[0]!), { class: "proposal", basis: [a] });
+  const lifted = deliveredOf(liftOriginHold(store, liftBy(PROJECT, result.holds[0]!, "origin-analysis",
+    { pending: { id: `${originAnalysisNamespace(PROJECT)}context`, kind: ORIGIN_ANALYSIS_KIND, value: analysis as Json } })));
+  assert.deepEqual(lifted.value.lift!.basis, [a]);
+  const secondRow = journalled(store, PROJECT, { sources: [b] }, { code: "same-context-test", goal: "same-context-goal" });
+  const firstRow = journalled(store, PROJECT, { sources: [a] }, { code: "same-context-test", goal: "same-context-goal" });
+  assert.notEqual(firstRow.row, secondRow.row);
+});
+
+
+test("G7 routes a saved refusal candidate that lost a definition from its actual proposal without accepting it", t => {
+  const { store, path } = fixture(t), f = definitionFixture(store, PROJECT);
+  const accepted = store.get<{ acceptance: { candidate: Ref } }>(f.accepted.frame!.id, f.accepted.frame!.revision)!;
+  const original = store.get<FrameCandidateRecord>(accepted.value.acceptance.candidate.id)!;
+  const value = structuredClone(original.value);
+  value.graph.artifacts = value.graph.artifacts.filter(item => item.id !== SUBJECT);
+  value.graphHash = hashJson(value.graph); value.layerHash = hashJson(projectGraph(value.graph, 2));
+  const candidate = reference(store.write({ id: `om-candidate:${PROJECT}:${hashJson([value.graphHash, value.base, value.proposals])}`,
+    kind: "frame-candidate", expected: 0, value }));
+  const proposal = original.value.proposals[0]!;
+  const grounds: OriginSource[] = [
+    { role: "proposal", ref: proposal, context: { kind: "proposal", request: original.value.request } },
+    source("base", f.first.graph) as unknown as OriginSource,
+    { role: "derived", ref: candidate },
+  ];
+  assert.ok(deliveredOf(readDefinitions(store, { project: PROJECT, source: grounds[0]! })).definitions.includes(SUBJECT));
+  assert.ok(!deliveredOf(readDefinitions(store, { project: PROJECT, source: grounds[2]! })).definitions.includes(SUBJECT));
+  assert.equal(readCandidate(store, { project: PROJECT, candidate }).ok, false);
+  assert.equal(gateCandidate(store, { project: PROJECT, candidate }).ok, false);
+  opened(store);
+  const ordinary = journalled(store, PROJECT, { sources: grounds });
+  const held = heldOn(store, PROJECT, { sources: [] }, [ordinary]);
+  assert.equal(routeOf(held.result, ordinary.row).class, "derivation");
+  assert.equal(routeOf(held.result, ordinary.row).addressee, `${ADDRESSEE_KINDS.derivation}:${candidate.id}`);
+  const analysis = analysisOf(held.standing, { class: "derivation", basis: grounds });
+  const lifted = deliveredOf(liftOriginHold(store, liftBy(PROJECT, held.hold, "origin-analysis",
+    { pending: { id: `${originAnalysisNamespace(PROJECT)}lost-definition`, kind: ORIGIN_ANALYSIS_KIND, value: analysis as Json } })));
+  assert.deepEqual(lifted.value.lift!.basis, routeOf(held.result, ordinary.row).basis);
+  // The proposal is now accepted at its head; its original proposed revision is still the historical source.
+  assert.equal(store.get<LayerProposal>(proposal.id)!.value.status, "accepted");
+  assert.equal(store.get<LayerProposal>(proposal.id, proposal.revision)!.value.status, "proposed");
+  store.close(); const back = new Store(path); t.after(() => back.close());
+  assert.equal(refusalOf(stopContext(back, address(PROJECT))).code, "stop_absent");
+  deliveredOf(openAttempt(back, { ...address(PROJECT), attempt: 2, goal: goal() }));
+});
+
+
+test("G7 refuses individually valid sources from another assembly on close, lift and historical reread", t => {
+  const { store, path } = fixture(t), f = definitionFixture(store, PROJECT);
+  const actual = assembly(store, PROJECT, { proposals: [[]], bases: [false], derived: [[]] });
+  const foreignProposal = assembly(store, PROJECT, { proposals: [[SUBJECT]] }).find(item => item.role === "proposal")!;
+  const foreignBase = source("base", f.accepted.graph) as unknown as OriginSource;
+  const bad = [
+    { name: "proposal", sources: actual.map(item => item.role === "proposal" ? foreignProposal : item) },
+    { name: "base", sources: actual.map(item => item.role === "base" ? foreignBase : item) },
+  ];
+  const derived = actual.find(item => item.role === "derived")!;
+  assert.ok(deliveredOf(readDefinitions(store, { project: PROJECT, source: foreignProposal })).definitions.includes(SUBJECT));
+  assert.ok(deliveredOf(readDefinitions(store, { project: PROJECT, source: foreignBase })).definitions.includes(SUBJECT));
+  for (const item of actual) assert.ok(!deliveredOf(readDefinitions(store, { project: PROJECT, source: item })).definitions.includes(SUBJECT));
+  const snapshot = (db: Store) => db.list().map(row => ({ head: reference(row), history: db.history(row.id).map(reference) }));
+  opened(store); deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+  for (const entry of bad) {
+    const row = journalled(store, PROJECT, { sources: entry.sources });
+    const before = snapshot(store);
+    for (const close of [prepareCloseAttempt, closeAttempt]) {
+      const result = close(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(row) });
+      const found = refusalOf(result as OmResult<unknown>);
+      assert.equal(found.code, "origin_unreadable", entry.name); assert.ok(found.at.field?.includes("origin.sources"));
+      assert.ok(found.at.field?.includes("context")); assert.deepEqual(snapshot(store), before);
+    }
+  }
+  const valid = journalled(store, PROJECT, { sources: actual });
+  const placed = deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(valid) }));
+  assert.equal(routeOf(placed, valid.row).class, "proposal");
+  const held = heldBy(store, PROJECT), standing = holdAt(store, held.hold);
+  for (const entry of bad) {
+    const value = analysisOf(standing, { class: "derivation", basis: entry.sources });
+    const record = storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace(PROJECT), value);
+    for (const apply of [prepareLiftOriginHold, liftOriginHold]) for (const pending of [false, true]) {
+      const id = `${originAnalysisNamespace(PROJECT)}unlinked-${entry.name}-${next()}`;
+      const before = snapshot(store);
+      const result = apply(store, liftBy(PROJECT, reference(store.get(held.hold.id)!), "origin-analysis", pending
+        ? { pending: { id, kind: ORIGIN_ANALYSIS_KIND, value: value as Json } } : { ref: record }));
+      const found = refusalOf(result as OmResult<unknown>);
+      assert.equal(found.code, "lift_unusable", entry.name); assert.ok(found.at.field?.includes("record.basis"));
+      assert.ok(found.at.field?.includes("context")); assert.deepEqual(snapshot(store), before);
+      if (pending) assert.equal(store.get(id), null);
+    }
+    const current = store.get(held.hold.id)!;
+    const savedBasis = entry.sources.map(normalizeOriginSource)
+      .sort((left, right) => originSourceKey(left) < originSourceKey(right) ? -1 : originSourceKey(left) > originSourceKey(right) ? 1 : 0);
+    const forged = store.write({ id: current.id, kind: current.kind, expected: current.revision,
+      value: { ...standing, lift: { ground: "origin-analysis", record, class: "derivation",
+        addressee: `${ADDRESSEE_KINDS.derivation}:${derived.ref.id}`, basis: savedBasis } } as unknown as Json });
+    const before = snapshot(store);
+    for (const open of [prepareOpenAttempt, openAttempt]) {
+      const found = refusalOf(open(store, { ...address(PROJECT), attempt: 3, goal: goal() }) as OmResult<unknown>);
+      assert.equal(found.code, "hold_invalid"); assert.equal(found.at.field, "lift.record");
+    }
+    for (const read of [readStopContext, stopContext]) {
+      const found = refusalOf(read(store, address(PROJECT)) as OmResult<unknown>);
+      assert.equal(found.code, "hold_invalid"); assert.equal(found.at.field, "lift.record");
+    }
+    assert.deepEqual(snapshot(store), before);
+    // A new connection must reject the same saved lift from the exact historical grounds.
+    const reopened = new Store(path);
+    try {
+      assert.equal(refusalOf(openAttempt(reopened, { ...address(PROJECT), attempt: 3, goal: goal() })).code, "hold_invalid");
+      assert.equal(refusalOf(stopContext(reopened, address(PROJECT))).code, "hold_invalid");
+      assert.deepEqual(snapshot(reopened), before);
+    } finally { reopened.close(); }
+    store.write({ id: forged.id, kind: forged.kind, expected: forged.revision, value: standing as unknown as Json });
+  }
+  // Current heads do not rewrite which assembly the saved references witnessed.
+  for (const ref of new Map([...actual, foreignProposal, foreignBase].map(item => [item.ref.id, item.ref])).values()) {
+    const head = store.get(ref.id)!;
+    store.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+  }
+  const request = liftBy(PROJECT, reference(store.get(held.hold.id)!), "origin-analysis", { pending: {
+    id: `${originAnalysisNamespace(PROJECT)}linked`, kind: ORIGIN_ANALYSIS_KIND,
+    value: analysisOf(standing, { class: "proposal", basis: actual }) as Json } });
+  const lifted = deliveredOf(liftOriginHold(store, request));
+  assert.equal(lifted.value.lift!.class, "proposal");
+  store.close(); const back = new Store(path); t.after(() => back.close());
+  const before = snapshot(back);
+  assert.equal(deliveredOf(liftOriginHold(back, request)).hash, lifted.hash);
+  assert.deepEqual(snapshot(back), before);
+  deliveredOf(openAttempt(back, { ...address(PROJECT), attempt: 3, goal: goal() }));
 });

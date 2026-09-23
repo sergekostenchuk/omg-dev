@@ -1,4 +1,4 @@
-import { Ajv } from "ajv";
+import { Ajv, type AnySchema } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
@@ -319,7 +319,7 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
         check(canonical(extracted) === canonical(raw.value), "observation.value", "Observation must be derived from its saved source");
         return extracted;
       };
-      for (const question of questions as Revision<Row>[]) {
+      for (const [index, question] of (questions as Revision<Row>[]).entries()) {
         const q = question.value;
         check(question.id.startsWith(`question:${request.project}:`) && q.projectId === request.project && q.stage === stage
           && q.draftId === draftRecord.id && q.status === "answered" && isRef(q.answer), "questions", "Every research question must have its own saved answer");
@@ -344,7 +344,9 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
           check(text(answer.actor), "answer.actor", "A saved decision names its owner");
           answered = answer.value;
         }
-        check(canonical(answered) === canonical(draft.fields[q.spec.field]) && schemas.compile(q.spec.schema)(answered),
+        // The full ordered specs were checked against this era above. Reuse their stable schema objects:
+        // Ajv retains freshly decoded schemas by identity, so compiling each historical copy leaks validators.
+        check(canonical(answered) === canonical(draft.fields[q.spec.field]) && schemas.compile(specs[index]!.schema as AnySchema)(answered),
           `fields.${q.spec.field}`, "Fields must match the answered value and historical schema");
       }
       if (stage === "operation-map") {

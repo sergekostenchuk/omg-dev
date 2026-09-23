@@ -8,8 +8,8 @@ import {
 } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import {
-  prepareClassifyRefusal, readJournal,
-  type JournalRow, type OriginSource, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
+  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal,
+  type JournalRow, type OriginSource, type OriginSourceContext, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
 } from "./refusal-journal.js";
 import {
   prepareBeginAttempt, prepareCompleteAttempt, readSeries, seriesId, REPAIR_SERIES_KIND,
@@ -18,6 +18,11 @@ import {
   type SeriesLadder, type SeriesRequest, type SeriesStop, type SeriesTransition,
 } from "./series.js";
 import { confirmResults, type ConfirmedResults } from "./achievements.js";
+import { projectGraph } from "../graph/project.js";
+import type { Graph } from "../graph/model.js";
+import { readFrame, type FrameRequest } from "./frame-obligations.js";
+import { definitionIds, observeProposal, type ProposalRequest } from "./frame-proposals.js";
+import { observeCandidate } from "./frame-candidate.js";
 
 /**
  * The gate of repetition. It stands on EVERY return path — the refusal of the layer check (G3), of atomicity (G5), of
@@ -358,7 +363,10 @@ export interface HoldTransition {
 }
 
 interface Address { readonly project: string; readonly block: string; readonly line: number; readonly id: string }
-interface SourceReading { readonly role: OriginRole; readonly ref: Ref; readonly defines: boolean }
+interface SourceReading {
+  readonly role: OriginRole; readonly ref: Ref; readonly holdsSubject: boolean;
+  readonly context: Sealed<OriginSourceContext> | null;
+}
 /** An origin as it is weighed: the stage it arose at, the refused subject, and the exact records to weigh it against. */
 interface WeighedOrigin { readonly stage: string; readonly subject: string; readonly sources: readonly OriginSource[] }
 /**
@@ -368,6 +376,7 @@ interface WeighedOrigin { readonly stage: string; readonly subject: string; read
  * source is refused with here.
  */
 interface Placing {
+  readonly project: string;
   readonly target: string;
   readonly block: string;
   readonly series: string;
@@ -383,7 +392,6 @@ interface Holds { readonly standing: readonly HoldContext[]; readonly guards: re
 const GATE_OUTCOME_KEYS = Object.freeze(["reason", "accepting", "cancelling", "refusals"] as const);
 const HOLD_KEYS = Object.freeze(["projectId", "block", "series", "attempt", "row", "address", "lift"] as const);
 const LIFT_KEYS = Object.freeze(["ground", "record", "class", "addressee", "basis"] as const);
-const SOURCE_KEYS = Object.freeze(["role", "ref"] as const);
 const REF_SOURCE_KEYS = Object.freeze(["ref"] as const);
 const PENDING_SOURCE_KEYS = Object.freeze(["pending"] as const);
 const PENDING_KEYS = Object.freeze(["id", "kind", "value"] as const);
@@ -727,12 +735,12 @@ function raise(
  * The class of one refusal, from its origin: the stage it arose at, and where the refused subject is found among the
  * exact records the origin names — weighed by the table of decision, never by a first match.
  * Nothing here is read out of the refusal's own words about itself. The gate that wrote it may not declare a class (A2
- * refuses a record that does), and a source record may say of itself whatever it likes — only the set of definitions
- * it carries is consulted, and only at the exact revision the origin names.
+ * refuses a record that does). Sources must first agree on their saved assembly inputs; the definitions they carry
+ * at those exact revisions then determine the class, without trusting their own status or class claims.
  */
 const derive = (store: Store, row: JournalRow, address: Address, path: string): OmResult<never> | Derived =>
   placeOrigin(store, row.origin, {
-    target: address.id, block: address.block, series: address.id,
+    project: address.project, target: address.id, block: address.block, series: address.id,
     sources: `${path}.sources`, code: "origin_unreadable", route: "producer",
   });
 
@@ -756,11 +764,13 @@ function placeOrigin(store: Store, origin: WeighedOrigin, where: Placing): OmRes
     if ("ok" in reading) return reading;
     readings.push(reading);
   }
+  const incompatible = compatibleSources(readings, where);
+  if (incompatible) return incompatible;
   // T6: the grounds are an UNORDERED set, put in one order before anything is derived from it and before it is
   // compared — the same grounds in another order are the same finding, on either path.
   const basis = sources
-    .map(source => ({ role: source.role, ref: exactRef(source.ref) }))
-    .sort((left, right) => compare(sourceKey(left), sourceKey(right)));
+    .map(normalizeOriginSource)
+    .sort((left, right) => compare(originSourceKey(left), originSourceKey(right)));
   const map = readings.filter(reading => MAP_ROLES.includes(reading.role));
 
   // A stage this gate does not name has no defined effect; inventing one would be a choice about the product.
@@ -781,43 +791,146 @@ function placeOrigin(store: Store, origin: WeighedOrigin, where: Placing): OmRes
     return { class: "derivation", addressee: addressed("derivation", map.find(reading => reading.role === "derived")!.ref.id), basis };
   }
   if (decided.class === "input") {
-    return { class: "input", addressee: addressed("input", map.find(reading => reading.role === "base" && reading.defines)!.ref.id), basis };
+    return { class: "input", addressee: addressed("input", map.find(reading => reading.role === "base" && reading.holdsSubject)!.ref.id), basis };
   }
   return { class: "proposal", addressee: addressed("proposal", subject), basis };
 }
 
+/** Compare only the source links proved by the observing readers, never heads or matching definitions. */
+function compatibleSources(readings: readonly SourceReading[], where: Placing): OmResult<never> | null {
+  // Prefer the refused candidate's saved inputs. Without it the observed proposal contexts still constrain the
+  // named base and each other; the table below decides whether the sources suffice to establish a class.
+  const anchor = readings.find(reading => reading.role === "derived")?.context
+    ?? readings.find(reading => reading.context?.kind === "proposal")?.context
+    ?? readings.find(reading => reading.context !== null)?.context;
+  if (!anchor) return null;
+  const frameOf = (context: Sealed<OriginSourceContext>) =>
+    context.kind === "proposal" ? context.request.frame : context.request;
+  const frameKey = canonical(frameOf(anchor) as Json);
+  for (let index = 0; index < readings.length; index += 1) {
+    const reading = readings[index]!;
+    const context = reading.context;
+    if (context === null) continue;
+    let field: string | null = null;
+    if (canonical(frameOf(context) as Json) !== frameKey) field = "context.frame";
+    else if (anchor.kind === "proposal" && context.kind === "proposal") {
+      if (context.request.proposals.length !== anchor.request.proposals.length
+        || context.request.proposals.some((ref, position) => !sameRef(ref, anchor.request.proposals[position]!)))
+        field = "context.proposals";
+      else if (reading.role === "proposal" && !anchor.request.proposals.some(ref => sameRef(ref, reading.ref)))
+        field = "ref";
+    }
+    if (field !== null) return refused(where.code, "Origin sources must belong to the same observed assembly",
+      { unit: UNIT, target: where.target, field: `${where.sources}.${index}.${field}`, ref: reading.ref }, where.route);
+  }
+  return null;
+}
+
 function tallyOf(map: readonly SourceReading[]): OriginTally {
   const count = (role: MapRole, holding: boolean): number =>
-    map.filter(reading => reading.role === role && (!holding || reading.defines)).length;
+    map.filter(reading => reading.role === role && (!holding || reading.holdsSubject)).length;
   return {
     named: { proposal: count("proposal", false), base: count("base", false), derived: count("derived", false) },
     holding: { proposal: count("proposal", true), base: count("base", true), derived: count("derived", true) },
   };
 }
 
+export interface DefinitionRequest { project: string; source: OriginSource }
+export interface SourceDefinitions {
+  definitions: string[]; references: Ref[]; context: OriginSourceContext;
+}
+
 /**
- * One source of an origin, read at the EXACT reference it is named by.
- * The reference proves WHICH record was read: a twin holding identical content at another address hashes alike, so the
- * id is what tells them apart, and a hash that does not match the revision it names is a forged ground. A source of
- * the map names the definitions it carries; an absent set is an absence and a typed refusal, never a silent "it
- * carries none" that would quietly turn an error of the input into a question for the model (T4). This minimal form
- * stands in for the records of C3, C4 and C5 until they are written; it decides no class by itself — the table does.
+ * Observe historical definitions through the producer; a base additionally requires its proven acceptance.
+ * References returned here are historical witnesses, not requirements that their heads remain current.
  */
+export function readDefinitions(store: Store, request: DefinitionRequest): OmResult<Sealed<SourceDefinitions>> {
+  const invalid = (field: string): never => { throw new EngineError("repeat_request_invalid",
+    "A definition reading needs a store, named project and complete source", { unit: UNIT, target: "source", field }); };
+  if (!(store instanceof Store)) invalid("store");
+  if (!isPlainObject(request)) invalid("request");
+  let project: string;
+  try { project = requireProject(request.project); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "repeat_request_invalid") invalid("project");
+    throw error;
+  }
+  let source: Sealed<OriginSource>;
+  try { source = normalizeOriginSource(request.source); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "journal_request_invalid") invalid("source");
+    throw error;
+  }
+  const unreadable = (message: string, field: string): OmResult<never> => refused("origin_unreadable", message,
+    { unit: UNIT, target: source.ref.id, field, ref: source.ref }, "producer");
+  const found = store.get(source.ref.id, source.ref.revision);
+  if (!found || found.hash !== source.ref.hash) return unreadable("The source must stand at its exact reference", "ref");
+  if (source.role === "proposal" && found.kind === "layer-proposal") {
+    if (source.context?.kind !== "proposal") return unreadable("A proposal needs its complete source request", "context");
+    const observed = observeProposal(store, { project, proposal: source.ref, request: source.context.request as ProposalRequest });
+    return observed.ok ? delivered({ definitions: [...observed.value.definitions], references: [...observed.value.references],
+      context: { kind: "proposal", request: observed.value.sources } }) : observed;
+  }
+  if (source.role === "derived" && found.kind === "frame-candidate") {
+    // The candidate owns its request. A supplied context must agree, never replace that historical request.
+    const observed = observeCandidate(store, { project, candidate: source.ref });
+    if (!observed.ok) return observed;
+    if (source.context !== undefined) {
+      if (source.context.kind !== "proposal") return unreadable("A candidate context names its saved proposal request", "context");
+      let recorded: string;
+      try { recorded = originSourceKey({ role: source.role, ref: source.ref,
+        context: { kind: "proposal", request: observed.value.sources } }); }
+      catch (error) {
+        if (error instanceof EngineError && error.code === "journal_request_invalid")
+          return unreadable("The candidate has no comparable complete source request", "request");
+        throw error;
+      }
+      if (recorded !== originSourceKey(source)) return unreadable("A candidate context must equal its saved source request", "context");
+    }
+    return delivered({ definitions: [...observed.value.definitions], references: [...observed.value.references],
+      context: { kind: "proposal", request: observed.value.sources } });
+  }
+  if (source.role !== "base" || !["graph", "graph-layer", "connection-frame"].includes(found.kind))
+    return unreadable("This kind of record does not carry definitions in the named role", "kind");
+  if (source.context?.kind !== "frame" || source.context.request.project !== project)
+    return unreadable("An accepted base needs its own exact frame sources", "context");
+  const context = source.context.request as FrameRequest;
+  const basis = readFrame(store, context);
+  if (!basis.ok) return basis;
+  const frame = basis.value;
+  let graph = frame.upper;
+  if (found.kind === "graph") {
+    if (!sameRef(source.ref, context.graph)) return unreadable("The graph is not the graph named by its context", "context.graph");
+    if (frame.accepted !== null) graph = { ...projectGraph(frame.accepted.graph as Graph, context.level), version: frame.accepted.graph.version };
+  } else if (found.kind === "connection-frame") {
+    if (frame.accepted?.frame === null || frame.accepted === null || !sameRef(source.ref, frame.accepted.frame.reference))
+      return unreadable("The frame must be the proven accepted frame of this base", "context.frame");
+    graph = { ...projectGraph(frame.accepted.graph as Graph, context.level), version: frame.accepted.graph.version };
+  } else if (!sameRef(source.ref, frame.upperRef)) {
+    if (context.layer === null || frame.accepted === null || !sameRef(source.ref, context.layer))
+      return unreadable("The layer must be the proven upper or accepted lower layer", "context.layer");
+    graph = { ...projectGraph(frame.accepted.graph as Graph, context.level), version: frame.accepted.graph.version };
+  }
+  const definitions = definitionIds(graph, "graph", source.ref.id);
+  return definitions.ok ? delivered({ definitions: [...definitions.value], references: [...frame.references],
+    context: { kind: "frame", request: frame.request } }) : definitions;
+}
+
+/** The same observation serves ordinary classification and every reading of a lifted hold. */
 function readSource(store: Store, source: OriginSource, subject: string, where: Placing, path: string): OmResult<never> | SourceReading {
   const role = source.role as OriginRole;
-  const found = store.get(source.ref.id, source.ref.revision);
-  if (!found || found.hash !== source.ref.hash) {
-    return refused(where.code, "A source of an origin does not stand at the exact reference it is named by",
-      { unit: UNIT, target: where.target, field: path, ref: source.ref }, where.route);
+  if (role === "environment") {
+    const found = store.get(source.ref.id, source.ref.revision);
+    if (!found || found.hash !== source.ref.hash) return refused(where.code,
+      "An environment source must stand at its exact reference", { unit: UNIT, target: where.target, field: path, ref: source.ref }, where.route);
+    if (source.context !== undefined) return refused(where.code,
+      "Map assembly context cannot witness an environment source", { unit: UNIT, target: where.target, field: `${path}.context`, ref: source.ref }, where.route);
+    return { role, ref: source.ref, holdsSubject: false, context: null };
   }
-  if (!MAP_ROLES.includes(role)) return { role, ref: source.ref, defines: false };
-  const value = found.value;
-  const defines = isPlainObject(value) ? (value as Record<string, unknown>)['defines'] : undefined;
-  if (!Array.isArray(defines) || !defines.every(isText)) {
-    return refused(where.code, "A source of the map names the definitions it carries, explicitly empty when it carries none",
-      { unit: UNIT, target: where.target, field: `${path}.defines`, ref: source.ref }, where.route);
-  }
-  return { role, ref: source.ref, defines: defines.includes(subject) };
+  const read = readDefinitions(store, { project: where.project, source });
+  if (!read.ok) return refused(where.code, read.refusal.message,
+    { unit: UNIT, target: where.target, field: `${path}.${read.refusal.at.field ?? "record"}`, ref: source.ref }, where.route);
+  return { role, ref: source.ref, holdsSubject: read.value.definitions.includes(subject), context: read.value.context };
 }
 
 const unplaced = (where: Placing, basis: readonly OriginSource[]): Derived =>
@@ -1034,20 +1147,21 @@ function weighLift(store: Store, ground: LiftGround, value: unknown, hold: Origi
   if (!Array.isArray(grounds) || grounds.length === 0) return unusable("An analysis names the exact records it established the class on", "record.basis");
   const basis: OriginSource[] = [];
   for (let index = 0; index < grounds.length; index += 1) {
-    const item = grounds[index] as unknown;
-    if (!isPlainObject(item) || !exactKeys(item, SOURCE_KEYS) || !ORIGIN_ROLES.includes((item as OriginSource).role as OriginRole)
-      || !isRef((item as OriginSource).ref)) {
-      return unusable("A ground of an analysis names one of this gate's roles and an exact reference", `record.basis.${index}`);
+    let source: Sealed<OriginSource>;
+    try { source = normalizeOriginSource(grounds[index]); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === "journal_request_invalid")
+        return unusable("A ground needs its exact reference and complete source context", `record.basis.${index}`);
+      throw error;
     }
-    const source = item as OriginSource;
-    const found = store.get(source.ref.id, source.ref.revision);
-    if (!found || found.hash !== source.ref.hash) return unusable("A ground of an analysis does not stand at its exact reference", `record.basis.${index}.ref`);
-    basis.push({ role: source.role, ref: exactRef(source.ref) });
+    if (!ORIGIN_ROLES.includes(source.role as OriginRole))
+      return unusable("A ground of an analysis names one of this gate's roles", `record.basis.${index}.role`);
+    basis.push(source);
   }
   // ONE mechanism for one class: the grounds of the analysis are weighed by the function that weighs any origin, over
   // the stage and the subject of the refusal this hold is about. The claim is then compared with what was weighed.
   const placed = placeOrigin(store, { stage: row.origin.stage, subject: row.origin.subject, sources: basis }, {
-    target, block: hold.block, series: hold.series.id, sources: "record.basis", code: "lift_unusable", route: "producer",
+    project: hold.projectId, target, block: hold.block, series: hold.series.id, sources: "record.basis", code: "lift_unusable", route: "producer",
   });
   if ("ok" in placed) return placed;
   if (placed.class === "unknown") {
@@ -1244,8 +1358,6 @@ const copyGoal = (goal: AttemptGoal): AttemptGoal => ({ key: goal.key, questions
 const plainHold = (hold: OriginHold): Omit<OriginHold, "lift"> => ({
   projectId: hold.projectId, block: hold.block, series: exactRef(hold.series), attempt: hold.attempt, row: hold.row, address: hold.address,
 });
-// The separator of a sort key is a NUL, written as an escape: no role, id or hash contains one.
-const sourceKey = (source: OriginSource): string => `${source.role}\0${source.ref.id}\0${source.ref.revision}\0${source.ref.hash}`;
 // Not localeCompare: what a reviewer and the owner are handed must not depend on the machine's locale.
 const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 

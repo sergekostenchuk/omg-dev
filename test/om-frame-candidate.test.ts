@@ -14,7 +14,7 @@ import { ProductEngine } from "../src/product/engine.js";
 import { Store } from "../src/storage/store.js";
 import { fillObligations, prepareFrame, readFrame, type FrameRead, type FrameRequest, type FrameScope, type ConnectionFrame } from "../src/om/frame-obligations.js";
 import { type LayerProposal, type ProposalObservation, type ProposalRequest } from "../src/om/frame-proposals.js";
-import { assembleCandidate, prepareCandidate, writeCandidate, readCandidate, gateCandidate,
+import { assembleCandidate, observeCandidate, prepareCandidate, writeCandidate, readCandidate, gateCandidate,
   CANDIDATE_REFUSAL_CODES, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -115,6 +115,79 @@ function firstPass(t: TestContext, variant: "standard" | "cross" = "standard") {
   return { root, database, store, graph, frame, proposal, proposalRef,
     request: { frame: frameRequest, proposals: [proposalRef] } satisfies ProposalRequest };
 }
+
+test('candidate observation reads a self-consistent failed assembly without accepting its lost definition', t => {
+  const f = firstPass(t), peer = put(f.store, emptyProposal(f.frame, 'observation-peer'));
+  f.request.proposals.push(peer);
+  const written = delivered(writeCandidate(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const value = clone(written.record.value) as FrameCandidateRecord;
+  assert.ok(value.graph.artifacts.some(artifact => artifact.id === 'garden-data'));
+  value.graph.artifacts = value.graph.artifacts.filter(artifact => artifact.id !== 'garden-data');
+  value.graphHash = hashJson(value.graph); value.layerHash = hashJson(projectGraph(value.graph, 2));
+  Object.assign(value.graph, { defines: ['phantom-definition'] }); value.graphHash = hashJson(value.graph);
+  const id = `om-candidate:garden:${hashJson([value.graphHash, value.base, value.proposals])}`;
+  const record = f.store.write({ id, kind: 'frame-candidate', expected: 0, value });
+  const request = { project: 'garden', candidate: reference(record) }, before = revisions(f.store);
+  const observed = delivered(observeCandidate(f.store, request));
+  assert.deepEqual(observed.sources.frame, value.request.frame);
+  assert.deepEqual(observed.sources.proposals.map(canonical), value.request.proposals.map(canonical).sort());
+  assert.ok(Object.isFrozen(observed.sources)); assert.ok(Object.isFrozen(observed.sources.frame)); assert.ok(Object.isFrozen(observed.sources.proposals));
+  assert.deepEqual(observed.record, record); assert.ok(!observed.definitions.includes('garden-data'));
+  assert.ok(!observed.definitions.includes('phantom-definition'));
+  assert.ok(observed.definitions.includes('garden-produce-operation'));
+  for (const ref of [reference(record), f.proposalRef, peer, f.frame.request.graph, f.frame.request.horizon])
+    assert.ok(observed.references.some(item => canonical(item) === canonical(ref)));
+  for (const strict of [readCandidate, gateCandidate]) refusedAs(strict(f.store, request), 'candidate_graph_mismatch');
+  assert.deepEqual(revisions(f.store), before);
+  for (const id of [f.proposalRef.id, 'graph:garden', 'source:garden:brief']) {
+    const prior = f.store.get(id)!;
+    f.store.write({ id, kind: prior.kind, expected: prior.revision, value: prior.value });
+  }
+  const reopened = new Store(f.database);
+  try { assert.deepEqual(delivered(observeCandidate(reopened, request)), observed); }
+  finally { reopened.close(); }
+});
+
+test('candidate observation refuses unreadable sections, source-link masquerades and invalid boundaries', t => {
+  const f = firstPass(t), written = delivered(writeCandidate(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const original = written.record, request = { project: 'garden', candidate: reference(original) };
+  for (const bad of [undefined, null, [], {}, { project: 'garden' }, { ...request, candidate: null }])
+    assert.throws(() => observeCandidate(f.store, bad as unknown as typeof request), malformed);
+  let index = 0;
+  const corrupt = (mutate: (value: FrameCandidateRecord) => void, expected: string) => {
+    const value = clone(original.value) as FrameCandidateRecord;
+    mutate(value);
+    value.graphHash = hashJson(value.graph);
+    const id = `om-candidate:garden:${hashJson([value.graphHash, value.base, value.proposals])}`;
+    const row = f.store.write({ id: id === original.id || f.store.get(id) ? `${id}-${index++}` : id, kind: 'frame-candidate', expected: 0, value });
+    const result = observeCandidate(f.store, { project: 'garden', candidate: reference(row) });
+    return refusedAs(result, expected);
+  };
+  for (const part of ['nodes', 'connectors', 'artifacts', 'contracts', 'anchors', 'joins', 'tests', 'actors', 'requirements', 'edges', 'journeys', 'transfers', 'packets']) {
+    const refusal = corrupt(value => { delete (value.graph as unknown as Record<string, unknown>)[part]; }, 'proposal_invalid');
+    assert.equal(refusal.at.field, part);
+  }
+  corrupt(value => { delete (value as unknown as Record<string, unknown>).request; }, 'candidate_graph_mismatch');
+  corrupt(value => { value.request.frame = { ...value.request.frame, project: 'foreign' }; }, 'candidate_graph_mismatch');
+  corrupt(value => { value.base.graph = { ...value.base.graph, revision: value.base.graph.revision + 1 }; }, 'candidate_graph_mismatch');
+  corrupt(value => { value.proposals = []; }, 'candidate_graph_mismatch');
+  const wrongKind = f.store.write({ id: `${original.id}-wrong-kind`, kind: 'graph', expected: 0, value: original.value });
+  const foreign = f.store.write({ id: original.id.replace(':garden:', ':foreign:'), kind: original.kind, expected: 0, value: original.value });
+  for (const ref of [reference(wrongKind), reference(foreign), { ...request.candidate, hash: '0'.repeat(64) }, fakeRef('om-candidate:garden:missing')])
+    refusedAs(observeCandidate(f.store, { ...request, candidate: ref }), ref.hash === '0'.repeat(64) ? 'record_forged'
+      : ref.id.endsWith(':missing') ? 'record_missing' : 'record_foreign');
+  const before = revisions(f.store);
+  for (const fault of [new TypeError('candidate observation failure'), new EngineError('record_corrupt', 'corrupt source')]) {
+    const get = f.store.get.bind(f.store);
+    try {
+      f.store.get = ((id: string, revision?: number) => { if (id === f.proposalRef.id) throw fault; return get(id, revision); }) as Store['get'];
+      assert.throws(() => observeCandidate(f.store, request), error => error === fault);
+    } finally { f.store.get = get; }
+  }
+  assert.deepEqual(revisions(f.store), before);
+});
 
 // The expected lower bindings are taken from the graph supplied by the proposal, independently of candidate assembly.
 test("candidate assembly preserves separate cross-flows and every consumer, including legal consumer multiplicity", () => {

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Ajv } from "ajv";
 import { copyFileSync } from "node:fs";
 import { join } from "node:path";
 import { canonical, digest, hashJson, type Json } from "../src/canonical.js";
@@ -345,6 +346,64 @@ test("historical accepted sources keep their exact input and era after draft, st
   assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(saved))).value, original.record);
   refusal(prepareOmInput(f.store, { ...request(f), expected: 1 }), "input_stale");
   assert.equal(f.store.history(saved.id).length, 1);
+});
+
+test("historical input reads reuse the same era schema objects after source movement and Store reopen", async t => {
+  const f = await createOmFixture(t, "standard", "input-schema-identities");
+  const saved = delivered(writeOmInput(f.store, request(f)));
+  const expectedSchemas = UPSTREAM_STAGES.flatMap(stage => {
+    const accepted = f.stages[stage];
+    const draftRef = (accepted.value.content as Row).draft as Ref;
+    const draft = f.store.get<DiscoveryDraft>(draftRef.id, draftRef.revision)!;
+    return draft.value.questions.map(id => {
+      const proof = accepted.value.proofs.find(ref => ref.id === id)!;
+      return canonical(f.store.get<Question>(proof.id, proof.revision)!.value.spec.schema);
+    });
+  });
+  assert.ok(expectedSchemas.length > 0);
+  const expectedContents = [...new Set(expectedSchemas)].sort();
+  const compile = Ajv.prototype.compile;
+  const captured: { validator: Ajv; schema: Parameters<typeof compile>[0] }[] = [];
+  Ajv.prototype.compile = function (this: Ajv, ...args: Parameters<typeof compile>) {
+    captured.push({ validator: this, schema: args[0] });
+    return compile.apply(this, args);
+  } as typeof compile;
+  try {
+    const historical = () => delivered(readOmInput(f.store, f.project, reference(saved)));
+    assert.deepEqual(historical(), saved);
+    assert.ok(captured.length > 0, "The first historical read must validate saved question schemas");
+    // Graph validation also uses Ajv; select the instance that validates the whole historical question contract.
+    const validators = [...new Set(captured.map(call => call.validator))].filter(validator => {
+      const contents = new Set(captured.filter(call => call.validator === validator).map(call => canonical(call.schema)));
+      return contents.size === expectedContents.length && expectedContents.every(content => contents.has(content));
+    });
+    assert.equal(validators.length, 1, "One validator must check all historical question schemas");
+    const questionSchemas = () => captured.filter(call => call.validator === validators[0]).map(({ schema }) => {
+      assert.ok(schema !== null && typeof schema === "object");
+      return schema;
+    });
+    assert.deepEqual([...new Set(questionSchemas().map(canonical))].sort(), expectedContents);
+    const initialIdentities = new Set(questionSchemas());
+    const repeat = () => {
+      captured.length = 0;
+      assert.deepEqual(historical(), saved);
+      const schemas = questionSchemas();
+      assert.deepEqual([...new Set(schemas.map(canonical))].sort(), expectedContents);
+      assert.ok(schemas.every(schema => initialIdentities.has(schema)), "Historical reads must not create fresh schema identities");
+    };
+    repeat();
+    repeat();
+    const source = f.store.get<Source>(`source:${f.project}:brief`)!;
+    const content = `${source.value.content}\n`;
+    f.store.write({ id: source.id, kind: source.kind, expected: source.revision,
+      value: { ...clone(source.value), content, sha256: digest(content) } });
+    repeat();
+    f.reopen();
+    repeat();
+    assert.equal(f.store.history(saved.id).length, 1);
+  } finally {
+    Ajv.prototype.compile = compile;
+  }
 });
 
 test("all read source heads are guarded and a neighbor cannot persist a partial prepared input", async t => {

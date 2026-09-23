@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,11 +14,11 @@ import { Store } from "../src/storage/store.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGuarded } from "../src/om/refs.js";
-import type { OmResult } from "../src/om/refusal.js";
+import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { fillObligations, representativeId, readFrame, prepareFrame,
   type FrameLevel, type FrameRead, type FrameRequest, type FrameScope,
   type ConnectionFrame } from "../src/om/frame-obligations.js";
-import { applyProposals, openObligationsToGaps, readFrameProposals, prepareFrameProposals,
+import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, readFrameProposals, prepareFrameProposals,
   PROPOSAL_REFUSAL_CODES, type LayerProposal, type ProposalObservation,
   type ProposalRequest, type ProposalResult } from "../src/om/frame-proposals.js";
 import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
@@ -103,6 +103,118 @@ function acceptedRequest(f: OmFixture, horizon: Ref, level: FrameLevel): FrameRe
 function put(store: Store, proposal: ProposalObservation): Ref {
   return reference(store.write({ id: proposal.reference.id, kind: "layer-proposal", expected: 0, value: proposal.value }));
 }
+function observingFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-observed-proposal-')), database = join(root, 'state.sqlite'), store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = gardenGraph();
+  preparedFeatures(new ProductEngine(store), 'garden', upper(graph, 2));
+  const horizon = acceptedHorizon(store, null);
+  const request: FrameRequest = { project: 'garden', level: 2, graph: reference(store.get('graph:garden')!),
+    horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
+  const frame = delivered(readFrame(store, request)) as unknown as FrameRead;
+  return { store, database, frame, proposal: proposalFor(frame, graph) };
+}
+
+test('definition observation reads typed sections and never follows references, text or defines', () => {
+  const graph = gardenGraph(), frame = pureFrame(graph, 2), proposal = emptyProposal(frame).value;
+  for (const part of ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const)
+    (proposal as unknown as Record<string, unknown>)[part] = [{ id: `definition-${part}`, arbitrary: 'definition-from-text' }];
+  Object.assign(proposal, { defines: ['phantom'], removes: ['removed-reference'], redefines: ['redefined-reference'],
+    fills: [{ node: 'fill-reference', obligation: 'obligation-reference' }] });
+  const definitions = delivered(definitionIds(proposal, 'proposal', 'proposal'));
+  assert.equal(definitions.length, 11);
+  assert.ok(definitions.every(id => id.startsWith('definition-')));
+  assert.ok(Object.isFrozen(definitions));
+  for (const part of ['nodes', 'artifacts'] as const) {
+    for (const invalid of [undefined, null, 'array', [null], [{}], [{ id: 1 }]]) {
+      const bad: unknown = { ...proposal, [part]: invalid };
+      const refusal: Refusal = refusedAs(definitionIds(bad, 'proposal', 'observed-source'), 'proposal_invalid');
+      assert.equal(refusal.at.target, 'observed-source'); assert.ok(refusal.at.field!.startsWith(part));
+    }
+  }
+  const graphDefinitions = delivered(definitionIds({ ...graph, defines: ['phantom'], researchObligations: [{ id: 'binding-reference',
+    scope: fakeRef('research-scope:garden:R2'), obligation: 'external-obligation',
+    consumers: [{ node: 'consumer-reference', tests: ['test-reference'] }] }] }, 'graph', 'graph'));
+  assert.ok(graphDefinitions.includes('garden-data'));
+  assert.ok(graphDefinitions.includes('garden-prep-operation'));
+  assert.ok(!graphDefinitions.includes('phantom'));
+  for (const ref of ['binding-reference', 'external-obligation', 'consumer-reference', 'test-reference', 'out'])
+    assert.ok(!graphDefinitions.includes(ref));
+  refusedAs(definitionIds({ ...graph, researchObligations: null }, 'graph', 'graph'), 'proposal_invalid');
+  for (const part of ['actors', 'requirements', 'edges', 'journeys', 'transfers', 'packets']) {
+    const missing = clone(graph) as unknown as Record<string, unknown>; delete missing[part];
+    refusedAs(definitionIds(missing, 'graph', 'graph'), 'proposal_invalid');
+  }
+});
+
+test('proposal observation retains readable semantic defects and terminal statuses on the historical first-pass base', t => {
+  const f = observingFixture(t), value = clone(f.proposal.value);
+  const peer = put(f.store, emptyProposal(f.frame, 'observation-peer'));
+  value.nodes[0]!.outcome = 'absent-outcome';
+  Object.assign(value, { defines: ['phantom'], removes: ['remove-only-reference'] });
+  const histories = [];
+  for (const status of ['proposed', 'accepted', 'rejected'] as const) {
+    const record = f.store.write({ id: f.proposal.reference.id, kind: 'layer-proposal', expected: f.store.get(f.proposal.reference.id)?.revision ?? 0,
+      value: { ...value, status } });
+    const request = { project: 'garden', proposal: reference(record), request: { frame: f.frame.request, proposals: [reference(record), peer] } };
+    const before = revisions(f.store), result = delivered(observeProposal(f.store, request));
+    assert.deepEqual(result.record, record); assert.equal(hashJson(result.record.value), record.hash);
+    assert.deepEqual(result.sources.frame, f.frame.request);
+    assert.deepEqual(result.sources.proposals.map(canonical), request.request.proposals.map(canonical).sort());
+    assert.ok(Object.isFrozen(result.sources)); assert.ok(Object.isFrozen(result.sources.frame)); assert.ok(Object.isFrozen(result.sources.proposals));
+    assert.deepEqual(delivered(observeProposal(f.store, { ...request,
+      request: { ...request.request, proposals: [...request.request.proposals].reverse() } })).sources, result.sources);
+    assert.ok(result.definitions.includes(value.nodes[0]!.id)); assert.ok(!result.definitions.includes('absent-outcome'));
+    assert.ok(!result.definitions.includes('phantom')); assert.ok(!result.definitions.includes('remove-only-reference'));
+    for (const ref of [reference(record), peer, f.frame.request.graph, f.frame.request.horizon])
+      assert.ok(result.references.some(item => canonical(item) === canonical(ref)));
+    if (status !== 'proposed') refusedAs(readFrameProposals(f.store, request.request), 'proposal_not_proposed');
+    else assert.equal(readFrameProposals(f.store, request.request).ok, false);
+    assert.deepEqual(revisions(f.store), before); histories.push({ request, result });
+  }
+  for (const id of ['graph:garden', 'source:garden:brief']) {
+    const old = f.store.get(id)!;
+    f.store.write({ id, kind: old.kind, expected: old.revision, value: old.value });
+  }
+  const reopened = new Store(f.database);
+  try {
+    for (const { request, result } of histories) assert.deepEqual(delivered(observeProposal(reopened, request)), result);
+  } finally { reopened.close(); }
+});
+
+test('proposal observation rejects unreadable sets and foreign context without masking storage exceptions', t => {
+  const f = observingFixture(t), proposal = put(f.store, f.proposal);
+  const request = { project: 'garden', proposal, request: { frame: f.frame.request, proposals: [proposal] } };
+  for (const bad of [undefined, null, [], {}, { project: 'garden', proposal }, { ...request, proposal: null }])
+    assert.throws(() => observeProposal(f.store, bad as unknown as typeof request), malformed);
+  refusedAs(observeProposal(f.store, { ...request, request: { ...request.request, proposals: [] } }), 'proposal_invalid');
+  refusedAs(observeProposal(f.store, { ...request, project: 'foreign' }), 'proposal_invalid');
+  let index = 0;
+  for (const part of ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors', 'fills', 'removes', 'redefines', 'replaces']) {
+    const value = clone(f.proposal.value) as unknown as Record<string, unknown>; delete value[part];
+    const row = f.store.write({ id: `om-proposal:garden:absent-${index++}`, kind: 'layer-proposal', expected: 0, value });
+    const ref = reference(row), refusal = refusedAs(observeProposal(f.store, { ...request, proposal: ref,
+      request: { ...request.request, proposals: [ref] } }), 'proposal_invalid');
+    assert.equal(refusal.at.target, ref.id); assert.equal(refusal.at.field, part);
+  }
+  const different = f.store.write({ id: 'om-proposal:garden:other-base', kind: 'layer-proposal', expected: 0,
+    value: { ...f.proposal.value, base: { ...f.proposal.value.base, graph: { ...f.frame.request.graph, revision: 999 } } } });
+  const differentRef = reference(different);
+  refusedAs(observeProposal(f.store, { ...request, proposal: differentRef,
+    request: { ...request.request, proposals: [differentRef] } }), 'proposal_base_stale');
+  for (const ref of [fakeRef('om-proposal:foreign:one'), { ...proposal, hash: '0'.repeat(64) }, fakeRef('om-proposal:garden:absent')])
+    refusedAs(observeProposal(f.store, { ...request, proposal: ref, request: { ...request.request, proposals: [ref] } }),
+      ref.id.includes(':foreign:') ? 'record_foreign' : ref.id.endsWith(':absent') ? 'record_missing' : 'record_forged');
+  const before = revisions(f.store);
+  for (const fault of [new TypeError('observation read failure'), new EngineError('record_corrupt', 'source corrupt')]) {
+    const original = f.store.get.bind(f.store);
+    try {
+      f.store.get = ((id: string, revision?: number) => { if (id === proposal.id) throw fault; return original(id, revision); }) as Store['get'];
+      assert.throws(() => observeProposal(f.store, request), error => error === fault);
+    } finally { f.store.get = original; }
+  }
+  assert.deepEqual(revisions(f.store), before);
+});
 
 test("proposals fill both first layers and preserve every cross-flow consumer, port and complete definition", () => {
   for (const level of levels) {

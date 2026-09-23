@@ -11,10 +11,12 @@ import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.j
 import { writeGuarded } from "../src/om/refs.js";
 import {
   classifyRefusal, journalId, prepareClassifyRefusal, prepareRecordRefusal, readJournal, recordRefusal, unitRefusalNamespace,
+  normalizeOriginSource, originSourceKey,
   REFUSAL_JOURNAL_CODES, REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND,
   type ClassifyRefusalRequest, type ClassifyRefusalsRequest, type JournalRequest, type JournalRow,
-  type RecordRefusalRequest, type RefusalClassification, type RefusalJournal,
+  type RecordRefusalRequest, type RefusalClassification, type RefusalJournal, type OriginSource,
 } from "../src/om/refusal-journal.js";
+import type { FrameRequest } from "../src/om/frame-obligations.js";
 
 const UNIT = "store-refusals";
 const PROJECT = "alpha";
@@ -854,4 +856,61 @@ test("no source of this block carries a literal control byte", () => {
     assert.equal(index, -1,
       `${name} carries a literal control byte at ${index}: ${JSON.stringify(text.slice(Math.max(0, index - 40), index + 40))}`);
   }
+});
+
+test("origin context is normalized once and survives row identity, classification, historical reading and restart", t => {
+  const { store, path } = fixture(t);
+  const frame: FrameRequest = { project: PROJECT, level: 2, graph: BASE, horizon: refTo("om-horizon-gate:alpha:one"),
+    layer: null, frame: null, upper: null };
+  const left: OriginSource = { role: "proposal", ref: PROPOSAL, context: { kind: "proposal",
+    request: { frame, proposals: [refTo("om-proposal:alpha:z"), PROPOSAL, PROPOSAL] } } };
+  const right: OriginSource = { ...left, context: { kind: "proposal", request: {
+    frame: { ...frame, horizon: refTo("om-horizon-gate:alpha:two") }, proposals: [PROPOSAL] } } };
+  assert.notEqual(originSourceKey(left), originSourceKey(right));
+  // Sources and proposal references are multisets: order changes nothing, multiplicity remains visible.
+  const reversed: OriginSource = { ...left, context: { kind: "proposal", request: { frame,
+    proposals: [...(left.context as { kind: "proposal"; request: { proposals: readonly Ref[] } }).request.proposals].reverse() } } };
+  assert.deepEqual(normalizeOriginSource(reversed), normalizeOriginSource(left));
+  assert.ok(deeplyFrozen(normalizeOriginSource(left)));
+  const sources = [right, left, left];
+  const record = gateRecord(store, "context", gateFailure({ refusals: [entry({ origin: origin({ sources }) }),
+    entry({ origin: origin({ sources: [reversed, reversed, right] }) })] }));
+  const recorded = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(record) }));
+  assert.equal(recorded.value.rows.length, 1);
+  const row = recorded.value.rows[0]!;
+  assert.equal(row.origin.sources.length, 3);
+  assert.equal(row.origin.sources.filter(item => originSourceKey(item) === originSourceKey(left)).length, 2);
+  const normalized = normalizeOriginSource(left);
+  assert.equal(normalized.context!.kind, "proposal");
+  if (normalized.context!.kind === "proposal") assert.equal(normalized.context!.request.proposals.length, 3);
+  const classified = deliveredOf(classifyRefusal(store, { project: PROJECT, row: row.id, class: "unknown", addressee: "reviewer", basis: sources }));
+  assert.deepEqual(classified.value.classifications[0]!.basis, row.origin.sources);
+  const repeated = deliveredOf(classifyRefusal(store, { project: PROJECT, row: row.id, class: "unknown", addressee: "reviewer", basis: [reversed, right, reversed] }));
+  assert.equal(repeated.revision, classified.revision);
+  store.write({ id: record.id, kind: record.kind, expected: record.revision, value: gateFailure() });
+  assert.deepEqual(deliveredOf(readJournal(store, { project: PROJECT })).value, classified.value);
+  store.close(); const reopened = new Store(path); t.after(() => reopened.close());
+  assert.deepEqual(deliveredOf(readJournal(reopened, { project: PROJECT })).value, classified.value);
+});
+
+test("origin normalization rejects incomplete modern contexts and the journal reports their source address", t => {
+  const { store } = fixture(t);
+  const frame: FrameRequest = { project: PROJECT, level: 2, graph: BASE, horizon: refTo("om-horizon-gate:alpha:one"),
+    layer: null, frame: null, upper: null };
+  const valid = { role: "base", ref: BASE, context: { kind: "frame", request: frame } };
+  assert.deepEqual(normalizeOriginSource(valid), valid);
+  let number = 0;
+  for (const context of [null, {}, { kind: "unknown", request: frame }, { kind: "frame", request: { ...frame, layer: undefined } },
+    { kind: "frame", request: { ...frame, upper: {} } }, { kind: "proposal", request: { frame } },
+    { kind: "proposal", request: { frame, proposals: null } }, { kind: "proposal", request: { frame, proposals: [null] } }]) {
+    const broken = { ...valid, context };
+    assert.throws(() => normalizeOriginSource(broken), code("journal_request_invalid"));
+    assert.throws(() => originSourceKey(broken as unknown as OriginSource), code("journal_request_invalid"));
+    // Missing JSON fields, unlike an explicit undefined, are what a stored source can contain.
+    const json = JSON.parse(JSON.stringify(broken));
+    const record = gateRecord(store, `context-broken-${number++}`, gateFailure({ refusals: [entry({ origin: origin({ sources: [json] }) })] }));
+    const refusal = addressed(refusalOf(recordRefusal(store, { project: PROJECT, source: reference(record) })), "origin_source_invalid");
+    assert.ok(refusal.at.field!.startsWith("refusals.0.origin.sources.0.context"));
+  }
+  for (const value of [undefined, null, [], "source"]) assert.throws(() => normalizeOriginSource(value), code("journal_request_invalid"));
 });
