@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
@@ -9,14 +9,23 @@ import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
+import type { Question } from '../src/discovery/discovery.js';
+import { assessAnswer } from '../src/discovery/research-assessment.js';
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph } from '../src/graph/model.js';
 import { writeOmInput, readOmInput, prepareOmInput, buildOmInput, type InputStages, type InputBuildResult, type OmInputRecord } from '../src/om/input.js';
 import { applyAddressing, applyInputDecisions, inputDecisionWrite, prepareAddressing, writeAddressing,
-  ADDRESSING_CODES, ADDRESSING_KINDS, normalizeInputDecisionProposal, type AddressingRequest, type InputFieldDecision } from '../src/om/addressing.js';
+  prepareApplyAnswer, writeApplyAnswer, prepareReopenAnswers, writeReopenAnswers, ADDRESSING_CODES, ADDRESSING_KINDS, normalizeInputDecisionProposal,
+  type AddressingRequest, type ApplyAnswerRequest, type InputFieldDecision } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { fillObligations, prepareFrame } from '../src/om/frame-obligations.js';
 import { writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
+import { mc1FieldSpec, writeMc1Question, prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer,
+  type AnswerQuestionContract, type AnswerRequest, type Mc1QuestionRequest } from '../src/om/accepted-answer.js';
+import { prepareGapLines, writeGapLines, readGapLines, gapLineKey, gapLineExpectedResult, type GapLinesRequest } from '../src/om/gap-lines.js';
+import { confirmResults } from '../src/om/achievements.js';
+import { openSeries } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
@@ -33,27 +42,28 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
-function refused<T>(result: OmResult<T>, code?: string): void {
+function refused(result: OmResult<unknown>, code?: string): void {
   assert.equal(result.ok, false);
   if (!result.ok) { if (code) assert.equal(result.refusal.code, code); assert.ok(result.refusal.at.target); }
 }
-function fixture(t: TestContext) {
+function fixture(t: TestContext, unknowns: Json[] = [{ id: 'output-format',
+  question: 'Which output format does the repository support?', consumer: block,
+  blocksCurrentStage: false, resolution: 'Read repository facts during OM' }]) {
   const root = mkdtempSync(join(tmpdir(), 'omg-addressing-')), path = join(root, 'state.sqlite');
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const engine = new ProductEngine(store), { level: _level, ...l1 } = projectGraph(gardenGraph(), 1), project = 'garden';
+  let engine = new ProductEngine(store);
+  const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1), project = 'garden';
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
-    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'output-format',
-      question: 'Which output format does the repository support?', consumer: block,
-      blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = unknowns;
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const input = ok(writeOmInput(store, { project, expected: 0, stages })) as Revision<OmInputRecord>;
   const graph = store.get<Graph>(`graph:${project}`)!;
-  return { get store() { return store; }, project, input, graph, stages,
-    restart() { store.close(); store = new Store(path); },
+  return { get store() { return store; }, get engine() { return engine; }, root, project, input, graph, stages,
+    restart() { store.close(); store = new Store(path); engine = new ProductEngine(store); },
     pure(): InputBuildResult { return clone({ input: input.value.input, hash: input.value.hash, gaps: input.value.gaps, refusals: [] }); },
     request(base: Ref = reference(input), field: InputFieldDecision['field'] = 'address', target = question,
       value: Json = { consumer: block, kind: 'repository-fact' }): AddressingRequest {
@@ -70,6 +80,91 @@ function gapRequest(f: ReturnType<typeof fixture>, input: Revision<OmInputRecord
   return { project: f.project, input: reference(input), graph: reference(f.graph), horizon: reference(horizon.gate),
     operations: { frame, proposals: [] }, works: { state: 'upper-not-accepted', layer: reference(f.store.get('graph-layer:garden:2')!) } };
 }
+
+function factFixture(t: TestContext) {
+  const f = fixture(t), input = ok(writeAddressing(f.store, f.request()));
+  function gapsFor(inputRef: Ref) {
+    const current = ok(readOmInput(f.store, f.project, inputRef));
+    const sources = gapRequest(f, current, `fact-application-${inputRef.revision}`);
+    const gaps = ok(writeGaps(f.store, sources));
+    return { sources, records: gaps.records.map(reference), gap: gaps.records.find(row => row.value.gap.target === question) };
+  }
+  const gaps = gapsFor(reference(input));
+  assert.equal(gaps.gap!.value.gap.code, 'predecessor_question');
+  assert.equal(gaps.gap!.value.gap.kind, 'repository-fact');
+  assert.deepEqual(gaps.gap!.value.gap.routes, ['code', 'research']);
+  const command = { executable: process.execPath, args: ['-e',
+    `const req=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{verdict:'supported',reasons:[]}}));`] };
+  const environment = f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'fact-researcher', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'fact-assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
+  const source = f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json', 0);
+  function issue(current = gaps, resultForm: Json = { type: 'string' }) {
+    const gap = current.gap;
+    assert.ok(gap, 'MC1 requires the complete D1 set to contain the addressed question');
+    const currentInput = ok(readOmInput(f.store, f.project, current.sources.input));
+    const requestContract: AnswerQuestionContract = { establishes: currentInput.value.input.questions.find(row => row.id === question)!.question,
+      consumer: { blocks: [...gap.value.gap.consumers] }, requirements: [clone(currentInput.value.input.contracts[0]!) as unknown as Json], resultForm };
+    const draft = f.engine.discovery.create(f.project, 'om-g2', 'R1', block,
+      [mc1FieldSpec({ input: current.sources.input, gap: reference(gap), contract: requestContract })], [current.sources.input, reference(gap)]);
+    const issued = f.store.get<Question>(draft.value.questions[0]!)!;
+    const request: Mc1QuestionRequest = { project: f.project, input: current.sources.input,
+      gaps: { sources: current.sources, records: current.records }, gap: reference(gap), contract: requestContract,
+      requirements: [{ pointer: '/contracts/0' }], engineQuestion: reference(issued), draft: reference(draft) };
+    const saved = ok(writeMc1Question(f.store, request));
+    return { request, question: saved, issued, draft };
+  }
+  async function answer(q = issue(), attempt: AnswerRequest['attempt'] = null, value: Json = 'JSON') {
+    const assessment = await assessAnswer(f.store, q.issued, { action: 'answer', question: q.issued.id, value,
+      citations: [{ source: reference(f.store.get(source.id)!), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, f.root);
+    const draft = f.engine.discovery.researched(q.issued.id, q.issued.revision, reference(assessment));
+    const answered = f.store.get<Question>(q.issued.id)!;
+    const request: AnswerRequest = { project: f.project, question: reference(q.question), answer: answered.value.answer!,
+      answeredQuestion: reference(answered), draft: reference(draft), attempt };
+    return { ...q, assessment, answered, answeredDraft: draft, request };
+  }
+  async function accept(q = issue(), attempt: AnswerRequest['attempt'] = null, value: Json = 'JSON') {
+    const answered = await answer(q, attempt, value), saved = ok(writeAcceptedAnswer(f.store, answered.request));
+    const prepared = ok(prepareAcceptedAnswer(f.store, answered.request));
+    return { ...answered, saved, prepared, closure: prepared.closure };
+  }
+  return { ...f, input, gaps, source, environment, target: question, block,
+    get store() { return f.store; }, get engine() { return f.engine; }, gapsFor, issue, answer, accept,
+    refreshInventory() {
+      const prior = f.store.get('repo-inventory:garden');
+      const inventory = f.store.write({ id: 'repo-inventory:garden', kind: 'repo-inventory', expected: prior?.revision ?? 0,
+        value: { projectId: f.project, paths: [] } });
+      return ok(writeOmInput(f.store, { project: f.project, stages: f.stages,
+        expected: f.store.get(input.id)!.revision, inventory: reference(inventory) }));
+    },
+    changeEvidence(value: Json, advance = true) {
+      writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: value }));
+      return advance ? f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json',
+        f.store.get(source.id)!.revision) : f.store.get(source.id)!;
+    },
+  };
+}
+
+test('D3.1 native fact precondition retains the active D1 gap until application and refuses premature line closure', async t => {
+  const f = factFixture(t), accepted = await f.accept();
+  const checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(accepted.saved) }));
+  assert.equal(checked.record.value.value, 'JSON');
+  assert.equal(accepted.closure.reason, 'filled');
+  assert.deepEqual(accepted.closure.basis, reference(accepted.saved));
+  const linesRequest: GapLinesRequest = { project: f.project, pass: 1, previous: null,
+    gaps: { sources: f.gaps.sources, records: f.gaps.records }, closures: [] };
+  const lines = ok(writeGapLines(f.store, linesRequest));
+  const before = f.store.list().map(reference);
+  refused(prepareGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }));
+  refused(writeGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }));
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(ok(readGaps(f.store, linesRequest.gaps)).collection.gaps.some(gap => gap.target === question && gap.field === 'answer'), true);
+  f.restart();
+  assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(accepted.saved) })), checked);
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(f.input))), f.input);
+});
 
 test('D3 native first pass addresses a question through B1, horizon, frame and D1; history and repeat survive restart', t => {
   const f = fixture(t), initial = gapRequest(f, f.input, 'before-addressing');
@@ -385,4 +480,532 @@ test('D3 OM lower admission guards its own layer and current producer closure wh
   f.restart(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
   assert.deepEqual(ok(writeAddressing(f.store, firstRequest)), accepted);
   refused(prepareAddressing(f.store, next), 'input_stale');
+});
+
+test('D3.1 native fact application rederives B1, complete D1 and closed D2 with the same achievement after restart', async t => {
+  const f = factFixture(t), address = { project: f.project, block, line: 1 };
+  const goal = { key: 'answer-output-format', questions: [gapLineKey(f.project, question, 'answer')], result: gapLineExpectedResult(f.project, question, 'answer') };
+  ok(openSeries(f.store, { ...address, slice: 'fact-application', predecessor: null, basis: null }));
+  const series = ok(openAttempt(f.store, { ...address, attempt: 1, goal }));
+  const accepted = await f.accept(undefined, { series: reference(series), attempt: 1 });
+  const opened = ok(writeGapLines(f.store, { project: f.project, pass: 1, previous: null, gaps: f.gaps, closures: [] }));
+  const request: ApplyAnswerRequest = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+  const before = f.store.list().map(reference), prepared = ok(prepareApplyAnswer(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(prepared.writes.length, 1);
+  const applied = ok(writeApplyAnswer(f.store, request));
+  assert.equal(applied.revision, f.input.revision + 1);
+  assert.equal(applied.value.input.questions.some(q => q.id === question), false);
+  assert.deepEqual(applied.value.input.facts, [{ question: f.input.value.input.questions[0], value: 'JSON',
+    answer: reference(accepted.saved), mc1Question: reference(accepted.question) }]);
+  assert.equal(applied.value.hash, hashJson(applied.value.input));
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(applied))), applied);
+  assert.deepEqual(ok(prepareApplyAnswer(f.store, request)).writes, []);
+  assert.deepEqual(ok(writeApplyAnswer(f.store, { ...request, input: reference(applied) })), applied);
+  const current = f.gapsFor(reference(applied));
+  assert.equal(current.gap, undefined);
+  assert.ok(current.records.length > 0, 'Other gaps remain in the full D1 set');
+  const close: GapLinesRequest = { project: f.project, pass: 2, previous: reference(opened), gaps: current, closures: [accepted.closure] };
+  const closure = ok(prepareGapLines(f.store, close));
+  assert.equal(f.store.get(opened.id)!.revision, opened.revision);
+  assert.equal(closure.record.lines.find(line => line.target === question)!.status, 'closed');
+  const closed = ok(writeGapLines(f.store, close));
+  const line = closed.value.lines.find(line => line.target === question)!;
+  assert.equal(line.status, 'closed'); assert.deepEqual(line.basis, reference(accepted.saved));
+  const confirm = { project: f.project, block, target: series.id, goal, cancelling: [] };
+  const answerKey = ok(confirmResults(f.store, { ...confirm, accepting: [reference(accepted.saved)] })).achieved[0]!.key;
+  assert.equal(ok(confirmResults(f.store, { ...confirm, accepting: [reference(closed)] })).achieved[0]!.key, answerKey);
+  const completed = f.store.list().map(reference);
+  assert.deepEqual(ok(writeApplyAnswer(f.store, request)), applied);
+  assert.deepEqual(ok(writeGapLines(f.store, close)), closed);
+  assert.deepEqual(f.store.list().map(reference), completed);
+  f.changeEvidence('XML'); f.restart();
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(applied))), applied);
+  assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(closed) })), closed);
+  assert.equal(ok(confirmResults(f.store, { ...confirm, accepting: [reference(closed)] })).achieved[0]!.key, answerKey);
+  refused(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
+  refused(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: applied.revision }), 'answer_inapplicable');
+});
+
+test('D3.1 independent inventory refresh preserves the fact contract, addressing and late delivery identity', async t => {
+  const f = factFixture(t), accepted = await f.accept(), refreshed = f.refreshInventory();
+  const request: ApplyAnswerRequest = { project: f.project, input: reference(refreshed), answer: reference(accepted.saved), question: reference(accepted.question) };
+  const applied = ok(writeApplyAnswer(f.store, request));
+  assert.deepEqual(applied.value.input.inventory, refreshed.value.input.inventory);
+  assert.deepEqual(applied.value.input.facts![0]!.question.addressedBy, f.input.value.input.questions[0]!.addressedBy);
+  const refreshedAgain = f.refreshInventory(), before = f.store.list().map(reference);
+  assert.deepEqual(refreshedAgain.value.input.facts, applied.value.input.facts);
+  assert.deepEqual(ok(writeApplyAnswer(f.store, request)), applied);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.store.get(applied.id)!.revision, refreshedAgain.revision);
+  f.restart();
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(refreshedAgain))), refreshedAgain);
+  assert.deepEqual(ok(writeApplyAnswer(f.store, request)), applied);
+});
+
+test('D3.1 different contract and changed evidence refuse application without writing', async t => {
+  const f = factFixture(t), accepted = await f.accept(), changed = f.issue(f.gaps, { type: 'string', enum: ['JSON'] });
+  const request: ApplyAnswerRequest = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+  let before = f.store.list().map(reference);
+  refused(prepareApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
+  refused(writeApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
+  assert.deepEqual(f.store.list().map(reference), before);
+  for (const advance of [false, true]) {
+    f.changeEvidence('XML', advance); before = f.store.list().map(reference);
+    refused(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
+    refused(writeApplyAnswer(f.store, request), 'answer_inapplicable');
+    assert.deepEqual(f.store.list().map(reference), before);
+  }
+  f.restart();
+  ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(accepted.saved) }));
+  refused(writeApplyAnswer(f.store, request), 'answer_inapplicable');
+});
+
+test('D3.1 application guards include evidence, the exact fact, contract, base and stage proof; no partial neighbor write', async t => {
+  for (const dependency of ['source', 'answer', 'question', 'input', 'stage-proof'] as const) await t.test(dependency, async child => {
+    const f = factFixture(child), accepted = await f.accept();
+    const request: ApplyAnswerRequest = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+    const prepared = ok(prepareApplyAnswer(f.store, request));
+    const id = dependency === 'source' ? f.source.id : dependency === 'answer' ? accepted.saved.id : dependency === 'question'
+      ? accepted.question.id : dependency === 'input' ? f.input.id : 'source:garden:brief';
+    assert.ok(prepared.guards.some(ref => ref.id === id), `${dependency} must be guarded`);
+    const old = f.store.get(id)!;
+    f.store.write({ id, kind: old.kind, expected: old.revision, value: old.value });
+    const before = f.store.list().map(reference);
+    refused(writeGuarded(f.store, { unit: 'D3.1-test', target: f.input.id, guards: prepared.guards,
+      writes: [...prepared.writes, { id: 'neighbor:application', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.store.get('neighbor:application'), null);
+  });
+});
+
+test('D3.1 forged applied values and altered answer references cannot survive historical B1 rederivation', async t => {
+  for (const fault of ['value', 'question', 'basis'] as const) await t.test(fault, async child => {
+    const f = factFixture(child), accepted = await f.accept();
+    const request = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+    const prepared = ok(prepareApplyAnswer(f.store, request)), body = clone(prepared.record.value) as OmInputRecord;
+    if (fault === 'value') body.input.facts![0]!.value = 'counterfeit';
+    else if (fault === 'question') body.input.facts![0]!.question.consumer = otherBlock;
+    else body.input.facts![0]!.answer.hash = 'f'.repeat(64);
+    body.hash = hashJson(body.input);
+    const forged = f.store.write({ id: f.input.id, kind: 'om-input', expected: f.input.revision, value: body });
+    refused(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
+    f.restart(); refused(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
+  });
+});
+
+test('D3.1 rejects missing arguments, foreign or forged bases and status imitations before writing', async t => {
+  const f = factFixture(t), accepted = await f.accept();
+  const request: ApplyAnswerRequest = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+  const unreadable = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return () => assert.fail('Malformed arguments must not access storage');
+    const value: unknown = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const malformed: unknown[] = [undefined, null, [], {}];
+  for (const field of ['project', 'input', 'answer', 'question']) for (const value of [undefined, null, 42]) malformed.push({ ...request, [field]: value });
+  for (const fn of [prepareApplyAnswer, writeApplyAnswer]) for (const value of malformed)
+    assert.throws(() => fn(unreadable, value as ApplyAnswerRequest), (error: unknown) => error instanceof EngineError
+      && error.code === 'addressing_request_invalid' && !!error.details);
+  for (const fn of [prepareApplyAnswer, writeApplyAnswer])
+    refused(fn(f.store, { ...request, project: 'missing-project' }), 'addressing_source_invalid');
+  for (const change of [{ answer: { ...request.answer, id: 'om-answer:other:foreign' } },
+    { answer: { ...request.answer, hash: 'f'.repeat(64) } }, { question: { ...request.question, hash: 'e'.repeat(64) } },
+    { input: { ...request.input, id: 'om-input:other' } }]) {
+    const before = f.store.list().map(reference);
+    refused(prepareApplyAnswer(f.store, { ...request, ...change })); refused(writeApplyAnswer(f.store, { ...request, ...change }));
+    assert.deepEqual(f.store.list().map(reference), before);
+  }
+  const fake = f.store.write({ id: 'om-answer:garden:status-only', kind: 'accepted-answer', expected: 0,
+    value: { project: f.project, target: question, value: 'JSON', status: 'accepted' } });
+  const before = f.store.list().map(reference);
+  refused(writeApplyAnswer(f.store, { ...request, answer: reference(fake) }));
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test('D3.1 preserves literal accepted values and propagates execution exceptions without writes', async t => {
+  for (const value of [false, 0, null, [], JSON.parse('{"__proto__":{"kept":true},"values":[2,1,1]}') as Json]) await t.test(canonical(value), async child => {
+    const f = factFixture(child); f.changeEvidence(value);
+    const accepted = await f.accept(f.issue(f.gaps, {}), null, value);
+    const request = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
+    const failure = new EngineError('record_corrupt', 'Injected storage failure'), before = f.store.list().map(reference);
+    const broken = new Proxy(f.store, { get(target, key) {
+      if (key === 'get') return (id: string, revision?: number) => { if (id === accepted.saved.id) throw failure; return target.get(id, revision); };
+      const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    for (const fn of [prepareApplyAnswer, writeApplyAnswer]) assert.throws(() => fn(broken, request), error => error === failure);
+    assert.deepEqual(f.store.list().map(reference), before);
+    const applied = ok(writeApplyAnswer(f.store, request));
+    assert.deepEqual(applied.value.input.facts![0]!.value, value);
+    assert.equal(applied.value.hash, hashJson(applied.value.input));
+    assert.deepEqual(ok(readOmInput(f.store, f.project, reference(applied))), applied);
+  });
+});
+
+for (const advance of [true, false]) test(`D3.1 stale applied fact recovery completes D1 reopen and D5 reclosure after restart (source revision=${advance})`, async t => {
+  const f = factFixture(t), address = { project: f.project, block, line: 1 };
+  const goal = { key: 'recover-output-format', questions: [gapLineKey(f.project, question, 'answer')], result: gapLineExpectedResult(f.project, question, 'answer') };
+  ok(openSeries(f.store, { ...address, slice: 'fact-recovery', predecessor: null, basis: null }));
+  const series = ok(openAttempt(f.store, { ...address, attempt: 1, goal }));
+  const attempt = { series: reference(series), attempt: 1 };
+  const first = await f.accept(undefined, attempt);
+  const opened = ok(writeGapLines(f.store, { project: f.project, pass: 1, previous: null, gaps: f.gaps, closures: [] }));
+  const firstInput = ok(writeApplyAnswer(f.store, {
+    project: f.project, input: reference(f.input), answer: reference(first.saved), question: reference(first.question) }));
+  const closed = ok(writeGapLines(f.store, { project: f.project, pass: 2, previous: reference(opened),
+    gaps: f.gapsFor(reference(firstInput)), closures: [first.closure] }));
+  const confirmation = { project: f.project, block, target: series.id, goal, cancelling: [] };
+  const originalKey = ok(confirmResults(f.store, { ...confirmation, accepting: [reference(closed)] })).achieved[0]!.key;
+  const sourceRevision = f.store.get(f.source.id)!.revision;
+  f.changeEvidence('XML', advance); f.restart();
+  const request = { project: f.project, input: reference(firstInput) }, before = f.store.list().map(reference);
+  refused(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: firstInput.revision }), 'answer_inapplicable');
+  const prepared = ok(prepareReopenAnswers(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), before, 'Preparation must not write a Source or input');
+  assert.equal(prepared.writes.some(write => write.id === f.source.id), !advance);
+  const recovered = ok(writeReopenAnswers(f.store, request));
+  assert.equal(f.store.get(f.source.id)!.revision, sourceRevision + 1);
+  assert.deepEqual(recovered.value.input.questions.find(row => row.id === question), f.input.value.input.questions.find(row => row.id === question));
+  assert.equal(recovered.value.input.facts?.some(fact => fact.question.id === question), false);
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(recovered))), recovered);
+  assert.deepEqual(ok(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: recovered.revision })).record, recovered.value);
+  refused(prepareApplyAnswer(f.store, { project: f.project, input: reference(recovered),
+    answer: reference(first.saved), question: reference(first.question) }), 'answer_inapplicable');
+  const resumed = f.gapsFor(reference(recovered));
+  assert.ok(resumed.gap);
+  assert.equal(resumed.gap.value.gap.code, 'predecessor_question');
+  const reopened = ok(writeGapLines(f.store, { project: f.project, pass: 3, previous: reference(closed), gaps: resumed, closures: [] }));
+  const line = reopened.value.lines.find(row => row.target === question)!;
+  assert.equal(line.status, 'open'); assert.equal(line.reopened, 1); assert.equal(line.passes, 2);
+  assert.equal(Object.hasOwn(line, 'basis'), false);
+  assert.equal(ok(confirmResults(f.store, { ...confirmation, accepting: [reference(closed)] })).achieved[0]!.key, originalKey,
+    'Reopening does not cancel the previously achieved result');
+  f.restart();
+  assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(reopened) })), reopened);
+  assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(closed) })), closed);
+  const repeatBefore = f.store.list().map(reference);
+  assert.deepEqual(ok(writeReopenAnswers(f.store, request)), recovered);
+  assert.deepEqual(f.store.list().map(reference), repeatBefore);
+  const second = await f.accept(f.issue(resumed), attempt, 'XML');
+  const secondInput = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(recovered),
+    answer: reference(second.saved), question: reference(second.question) }));
+  const resolved = f.gapsFor(reference(secondInput)); assert.equal(resolved.gap, undefined);
+  const closedAgain = ok(writeGapLines(f.store, { project: f.project, pass: 4, previous: reference(reopened),
+    gaps: resolved, closures: [second.closure] }));
+  const secondLine = closedAgain.value.lines.find(row => row.target === question)!;
+  assert.equal(secondLine.status, 'closed'); assert.equal(secondLine.reopened, 1); assert.equal(secondLine.passes, 2);
+  assert.deepEqual(secondLine.basis, reference(second.saved));
+  const newKey = ok(confirmResults(f.store, { ...confirmation, accepting: [reference(closedAgain)] })).achieved[0]!.key;
+  assert.notEqual(newKey, originalKey);
+  f.restart();
+  for (const row of [firstInput, recovered, secondInput]) assert.deepEqual(ok(readOmInput(f.store, f.project, reference(row))), row);
+  for (const row of [closed, reopened, closedAgain]) assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(row) })), row);
+  const after = f.store.list().map(reference);
+  assert.deepEqual(ok(writeReopenAnswers(f.store, request)), recovered, 'Late recovery cannot withdraw the new confirmation');
+  assert.deepEqual(ok(writeReopenAnswers(f.store, { project: f.project, input: reference(secondInput) })), secondInput);
+  assert.deepEqual(f.store.list().map(reference), after);
+  assert.equal(f.store.get(firstInput.id)!.revision, secondInput.revision);
+  assert.equal(ok(confirmResults(f.store, { ...confirmation, accepting: [reference(closed)] })).achieved[0]!.key, originalKey);
+});
+
+test('D3.1 recovery protects source, input and stage dependencies in the shared transaction', async t => {
+  for (const dependency of ['source', 'input', 'stage-proof'] as const) await t.test(dependency, async child => {
+    const f = factFixture(child), accepted = await f.accept(), applied = ok(writeApplyAnswer(f.store, {
+      project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) }));
+    f.changeEvidence('XML', false);
+    const request = { project: f.project, input: reference(applied) }, prepared = ok(prepareReopenAnswers(f.store, request));
+    const id = dependency === 'source' ? f.source.id : dependency === 'input' ? f.input.id : 'source:garden:brief';
+    assert.ok(prepared.guards.some(guard => guard.id === id), `${dependency} has a current guard`);
+    const old = f.store.get(id)!;
+    f.store.write({ id, kind: old.kind, expected: old.revision, value: old.value });
+    const before = f.store.list().map(reference);
+    refused(writeGuarded(f.store, { unit: 'D3.1', target: applied.id, guards: prepared.guards,
+      writes: [...prepared.writes, { id: 'neighbor:recovery', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.store.get('neighbor:recovery'), null);
+    assert.equal(f.store.get(applied.id)!.revision, applied.revision + (dependency === 'input' ? 1 : 0));
+    if (dependency === 'stage-proof') refused(writeReopenAnswers(f.store, request));
+  });
+});
+
+test('D3.1 recovery refuses malformed requests before reading and foreign input without writes', async t => {
+  const f = factFixture(t);
+  const inaccessible = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return () => assert.fail('Malformed requests must not read');
+    const value: unknown = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  for (const fn of [prepareReopenAnswers, writeReopenAnswers]) {
+    for (const request of [null, {}, { project: f.project }, { project: '', input: reference(f.input) }])
+      assert.throws(() => fn(inaccessible, request as any), (error: unknown) => error instanceof EngineError && error.code === 'addressing_request_invalid');
+    const before = f.store.list().map(reference);
+    refused(fn(f.store, { project: f.project, input: { ...reference(f.input), id: 'om-input:other' } }));
+    assert.deepEqual(f.store.list().map(reference), before);
+  }
+});
+
+test('D3.1 historical recovery cannot be forged by a stale marker or by retaining the withdrawn value', async t => {
+  for (const fault of ['unchanged-source', 'foreign-source', 'retained-value'] as const) await t.test(fault, async child => {
+    const f = factFixture(child), accepted = await f.accept(), applied = ok(writeApplyAnswer(f.store, {
+      project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) }));
+    f.changeEvidence('XML');
+    const request = { project: f.project, input: reference(applied) }, prepared = ok(prepareReopenAnswers(f.store, request));
+    const body = clone(prepared.record.value) as OmInputRecord;
+    assert.ok(body.derivation && 'kind' in body.derivation && body.derivation.kind === 'reopen-facts');
+    const pair = body.derivation.invalidations[0]!.sources[0]!;
+    if (fault === 'unchanged-source') pair.after = pair.before;
+    else if (fault === 'foreign-source') pair.after = reference(f.store.get('source:garden:brief')!);
+    else body.input.facts = clone(applied.value.input.facts!) as NonNullable<OmInputRecord['input']['facts']>;
+    body.hash = hashJson(body.input);
+    const forged = f.store.write({ id: applied.id, kind: applied.kind, expected: applied.revision, value: body });
+    refused(readOmInput(f.store, f.project, reference(forged)));
+    f.restart(); refused(readOmInput(f.store, f.project, reference(forged)));
+  });
+});
+
+test('D3.1 one historical read checks each exact input once across the repeated fact DAG and releases its cache', async t => {
+  const f = factFixture(t), accepted = await f.accept(), applied = ok(writeApplyAnswer(f.store, {
+    project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) }));
+  const counts = new Map<number, number>();
+  let failure: Error | null = null;
+  const observed = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) => {
+      if (id === applied.id && revision !== undefined) {
+        if (failure) throw failure;
+        counts.set(revision, (counts.get(revision) ?? 0) + 1);
+      }
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  assert.deepEqual(ok(readOmInput(observed, f.project, reference(applied))), applied);
+  assert.deepEqual([...counts].sort(([a], [b]) => a - b), [[1, 1], [2, 1], [3, 1]]);
+  failure = new EngineError('record_corrupt', 'A later invocation must read again');
+  assert.throws(() => readOmInput(observed, f.project, reference(applied)), error => error === failure);
+  failure = null; counts.clear();
+  assert.deepEqual(ok(readOmInput(observed, f.project, reference(applied))), applied);
+  assert.deepEqual([...counts].sort(([a], [b]) => a - b), [[1, 1], [2, 1], [3, 1]]);
+});
+
+// Four real MC1 facts with literal requirement pointers. Hash buckets keep later insertions from
+// moving an already issued pointer; only native, independently assessed answers are used.
+async function dependentFacts(t: TestContext) {
+  const targets = { A: question, B: 'discovery:dependent-format', C: 'discovery:independent-format', D: 'discovery:downstream-format' };
+  type Role = keyof typeof targets;
+  const f = fixture(t, Object.values(targets).map(target => ({ id: target.slice('discovery:'.length),
+    question: `Which value establishes ${target}?`, consumer: block, blocksCurrentStage: false, resolution: 'Read repository evidence' })));
+  let input = ok(writeAddressing(f.store, { ...f.request(), decisions: Object.values(targets).flatMap(target =>
+    f.request(reference(f.input), 'address', target).decisions) }));
+  const command = { executable: process.execPath, args: ['-e',
+    `const r=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{verdict:'supported',reasons:[]}}));`] };
+  const environment = f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'dependency-researcher', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'dependency-assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
+  function gaps() {
+    const sources = gapRequest(f, input, `dependent-facts-${input.revision}`), saved = ok(writeGaps(f.store, sources));
+    return { sources, records: saved.records.map(reference), rows: saved.records };
+  }
+  function source(role: Role, value: string) {
+    const file = `${role}.json`, id = `source:garden:dependency-${role}`, old = f.store.get(id);
+    writeFileSync(join(f.root, file), JSON.stringify({ answer: value }));
+    return f.engine.discovery.evidence.file(f.project, `dependency-${role}`, f.root, file, 'application/json', old?.revision ?? 0);
+  }
+  async function fill(role: Role, value: string, dependency: Role | null) {
+    const currentGaps = gaps(), target = targets[role], gap = currentGaps.rows.find(row => row.value.gap.target === target)!;
+    assert.ok(gap);
+    const index = dependency === null ? -1 : input.value.input.facts!.findIndex(fact => fact.question.id === targets[dependency]);
+    if (dependency !== null) assert.ok(index >= 0);
+    const pointer = dependency === null ? '/contracts/0' : `/facts/${index}/value`;
+    const requirement = dependency === null ? input.value.input.contracts[0]! as unknown as Json : input.value.input.facts![index]!.value as Json;
+    const contract: AnswerQuestionContract = { establishes: input.value.input.questions.find(row => row.id === target)!.question,
+      consumer: { blocks: [...gap.value.gap.consumers] }, requirements: [requirement], resultForm: { type: 'string' } };
+    const evidence = source(role, value), bucket = { A: 0, C: 1, B: 2, D: 3 }[role];
+    for (let trial = 0; trial < 128; trial++) {
+      const draft = f.engine.discovery.create(f.project, 'om-g2', 'R1', block,
+        [mc1FieldSpec({ input: reference(input), gap: reference(gap), contract })], [reference(input), reference(gap)]);
+      const issued = f.store.get<Question>(draft.value.questions[0]!)!;
+      const mc1 = ok(writeMc1Question(f.store, { project: f.project, input: reference(input),
+        gaps: currentGaps, gap: reference(gap), contract, requirements: [{ pointer }], engineQuestion: reference(issued), draft: reference(draft) }));
+      const assessment = await assessAnswer(f.store, issued, { action: 'answer', question: issued.id, value,
+        citations: [{ source: reference(evidence), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, f.root);
+      const answeredDraft = f.engine.discovery.researched(issued.id, issued.revision, reference(assessment)), answered = f.store.get<Question>(issued.id)!;
+      const request: AnswerRequest = { project: f.project, question: reference(mc1), answer: answered.value.answer!,
+        answeredQuestion: reference(answered), draft: reference(answeredDraft), attempt: null };
+      const acceptance = ok(prepareAcceptedAnswer(f.store, request));
+      if (Math.floor(parseInt(acceptance.record.hash[0]!, 16) / 4) !== bucket) continue;
+      const accepted = ok(writeAcceptedAnswer(f.store, request)), closure = acceptance.closure;
+      input = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(input), answer: reference(accepted), question: reference(mc1) }));
+      return { accepted, closure, source: evidence, input };
+    }
+    assert.fail('Could not retain the native literal requirement index within the fixture bound');
+  }
+  const A = await fill('A', 'JSON', null), C = await fill('C', 'fixed', null), B = await fill('B', 'buffered JSON', 'A');
+  // After removing A, /facts/2/value temporarily selects D itself with the same value as B.
+  // Only the next round (which removes B) breaks D, distinguishing a fixed point from one pass.
+  const D = await fill('D', 'buffered JSON', 'B');
+  assert.deepEqual(input.value.input.facts!.map(fact => fact.question.id), [targets.A, targets.C, targets.B, targets.D]);
+  return { f, targets, A, B, C, D, source, fill, gaps, get input() { return input; },
+    recovered(next: Sealed<Revision<OmInputRecord>>) { input = next; } };
+}
+
+test('D3.1 recovery closes A to B to D contracts, preserves C, proves reasons and permits reconfirmation after restart', async t => {
+  const x = await dependentFacts(t), { f, targets } = x, original = x.input, independent = clone(original.value.input.facts!.find(fact => fact.question.id === targets.C)!) as NonNullable<OmInputRecord['input']['facts']>[number];
+  x.source('A', 'XML'); f.restart();
+  const request = { project: f.project, input: reference(original) }, before = f.store.list().map(reference);
+  const prepared = ok(prepareReopenAnswers(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), before);
+  const body = prepared.record.value, derivation = body.derivation;
+  assert.ok(derivation && 'kind' in derivation && derivation.kind === 'reopen-facts');
+  assert.deepEqual(derivation.invalidations.map(item => item.record), [reference(x.A.accepted)]);
+  const b = derivation.dependencies!.find(item => item.record.id === x.B.accepted.id)!;
+  const d = derivation.dependencies!.find(item => item.record.id === x.D.accepted.id)!;
+  assert.equal(derivation.dependencies!.length, 2);
+  assert.deepEqual(b.removed, [reference(x.A.accepted)]);
+  assert.deepEqual(b.conditions, [{ pointer: '/facts/0/value', before: 'JSON', after: { present: true, value: 'fixed' } }]);
+  assert.deepEqual(d.removed.map(canonical).sort(), [reference(x.A.accepted), reference(x.B.accepted)].map(canonical).sort());
+  assert.deepEqual(d.conditions, [{ pointer: '/facts/2/value', before: 'buffered JSON', after: { present: false } }]);
+  assert.deepEqual(body.input.facts, [independent]);
+  assert.deepEqual(body.input.questions.map(row => row.id).sort(), [targets.A, targets.B, targets.D].sort());
+  for (const value of [x.B, x.C, x.D]) for (const ref of [reference(value.accepted), reference(value.source)])
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)), `A dependent or surviving fact needs guard ${ref.id}`);
+
+  // Each counterexample is actually persisted with recomputed hashes in a temporary fork of the
+  // full native history, then read again after reopening that database.
+  const variants = ['cause', 'condition', 'missing', 'extra-independent'] as const;
+  for (const fault of variants) {
+    const path = join(f.root, `forged-${fault}.sqlite`); copyFileSync(join(f.root, 'state.sqlite'), path);
+    let branch = new Store(path);
+    try {
+      const forgedBody = clone(body) as OmInputRecord;
+      assert.ok(forgedBody.derivation && 'kind' in forgedBody.derivation && forgedBody.derivation.kind === 'reopen-facts');
+      const dependencies = forgedBody.derivation.dependencies!;
+      if (fault === 'cause') dependencies[0]!.removed = [reference(x.C.accepted)];
+      if (fault === 'condition') dependencies[0]!.conditions[0]!.before = 'invented';
+      if (fault === 'missing') delete forgedBody.derivation.dependencies;
+      if (fault === 'extra-independent') {
+        dependencies.push({ ...clone(dependencies[0]!), record: reference(x.C.accepted), question: independent.mc1Question });
+        forgedBody.input.facts = []; forgedBody.input.questions.push(independent.question);
+      }
+      forgedBody.hash = hashJson(forgedBody.input);
+      const forged = branch.write({ id: original.id, kind: original.kind, expected: original.revision, value: forgedBody });
+      refused(readOmInput(branch, f.project, reference(forged)), 'record_forged');
+      branch.close(); branch = new Store(path);
+      refused(readOmInput(branch, f.project, reference(forged)), 'record_forged');
+    } finally { branch.close(); }
+  }
+  for (const row of [x.B.source, x.C.source, x.D.source]) {
+    const path = join(f.root, `race-${row.id.split(':').at(-1)}.sqlite`); copyFileSync(join(f.root, 'state.sqlite'), path);
+    const branch = new Store(path);
+    try {
+      branch.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      const beforeRace = branch.list().map(reference);
+      refused(writeGuarded(branch, { unit: 'D3.1', target: original.id, guards: prepared.guards,
+        writes: [...prepared.writes, { id: 'neighbor:dependency-recovery', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
+      assert.deepEqual(branch.list().map(reference), beforeRace);
+    } finally { branch.close(); }
+  }
+  const recovered = ok(writeReopenAnswers(f.store, request)); x.recovered(recovered);
+  const gaps = x.gaps(), actualTargets = gaps.rows.map(row => row.value.gap.target);
+  for (const target of [targets.A, targets.B, targets.D]) assert.ok(actualTargets.includes(target));
+  assert.equal(actualTargets.includes(targets.C), false);
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(original))), original);
+  f.restart();
+  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(recovered))), recovered);
+  const stable = f.store.list().map(reference);
+  assert.deepEqual(ok(writeReopenAnswers(f.store, request)), recovered);
+  assert.deepEqual(f.store.list().map(reference), stable);
+  const newA = await x.fill('A', 'XML', null), newB = await x.fill('B', 'buffered XML', 'A'), newD = await x.fill('D', 'buffered XML', 'B');
+  const complete = x.gaps();
+  for (const target of Object.values(targets)) assert.equal(complete.rows.some(row => row.value.gap.target === target), false);
+  assert.deepEqual(x.input.value.input.facts!.find(fact => fact.question.id === targets.C), independent);
+  f.restart();
+  for (const row of [original, recovered, newA.input, newB.input, newD.input]) assert.deepEqual(ok(readOmInput(f.store, f.project, reference(row))), row);
+  const final = f.store.list().map(reference);
+  assert.deepEqual(ok(writeReopenAnswers(f.store, request)), recovered);
+  assert.deepEqual(f.store.list().map(reference), final);
+  assert.deepEqual(reference(f.store.get(original.id)!), reference(newD.input));
+});
+
+async function independentFactPrefixes(t: TestContext) {
+  const targets = Array.from({ length: 4 }, (_, index) => `discovery:cost-${index + 1}`);
+  const f = fixture(t, targets.map(target => ({ id: target.slice('discovery:'.length), question: `Which value establishes ${target}?`,
+    consumer: block, blocksCurrentStage: false, resolution: 'Read repository evidence' })));
+  let input = ok(writeAddressing(f.store, { ...f.request(), decisions: targets.flatMap(target =>
+    f.request(reference(f.input), 'address', target).decisions) }));
+  const command = { executable: process.execPath, args: ['-e',
+    `const r=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{verdict:'supported',reasons:[]}}));`] };
+  const environment = f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'cost-researcher', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'cost-assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
+  const prefixes: { count: number; path: string; input: Ref }[] = [];
+  for (const [index, target] of targets.entries()) {
+    const sources = gapRequest(f, input, `cost-${input.revision}`), gaps = ok(writeGaps(f.store, sources));
+    const gap = gaps.records.find(row => row.value.gap.target === target)!;
+    const contract: AnswerQuestionContract = { establishes: input.value.input.questions.find(row => row.id === target)!.question,
+      consumer: { blocks: [...gap.value.gap.consumers] }, requirements: [clone(input.value.input.contracts[0]!) as unknown as Json],
+      resultForm: { type: 'string' } };
+    const value = `value-${index}`, file = `cost-${index}.json`;
+    writeFileSync(join(f.root, file), JSON.stringify({ answer: value }));
+    const source = f.engine.discovery.evidence.file(f.project, `cost-${index}`, f.root, file, 'application/json', 0);
+    const draft = f.engine.discovery.create(f.project, 'om-g2', 'R1', block,
+      [mc1FieldSpec({ input: reference(input), gap: reference(gap), contract })], [reference(input), reference(gap)]);
+    const issued = f.store.get<Question>(draft.value.questions[0]!)!;
+    const question = ok(writeMc1Question(f.store, { project: f.project, input: reference(input),
+      gaps: { sources, records: gaps.records.map(reference) }, gap: reference(gap), contract,
+      requirements: [{ pointer: '/contracts/0' }], engineQuestion: reference(issued), draft: reference(draft) }));
+    const assessment = await assessAnswer(f.store, issued, { action: 'answer', question: issued.id, value,
+      citations: [{ source: reference(source), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, f.root);
+    const answeredDraft = f.engine.discovery.researched(issued.id, issued.revision, reference(assessment)), answered = f.store.get<Question>(issued.id)!;
+    const accepted = ok(writeAcceptedAnswer(f.store, { project: f.project, question: reference(question), answer: answered.value.answer!,
+      answeredQuestion: reference(answered), draft: reference(answeredDraft), attempt: null }));
+    input = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(input), answer: reference(accepted), question: reference(question) }));
+    if ([1, 2, 4].includes(index + 1)) {
+      f.restart();
+      const path = join(f.root, `prefix-${index + 1}.sqlite`); copyFileSync(join(f.root, 'state.sqlite'), path);
+      prefixes.push({ count: index + 1, path, input: reference(input) });
+    }
+  }
+  return { f, prefixes };
+}
+
+test('D3.1 operation history proves unique inputs and answers once per view at one, two and four facts', async t => {
+  const { f, prefixes } = await independentFactPrefixes(t);
+  function measured<T>(store: Store, action: () => OmResult<T>, views: number) {
+    const get = store.get.bind(store), counts = new Map<string, number>();
+    store.get = <V = Json>(id: string, revision?: number): Revision<V> | null => {
+      if (revision !== undefined && /^(om-input|om-answer|om-mc1-question):/.test(id)) {
+        const key = `${id}@${revision}`; counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      return get<V>(id, revision);
+    };
+    try {
+      const value = ok(action());
+      assert.ok(counts.size > 0, 'Every external operation must read and prove its exact history again');
+      for (const [key, count] of counts) assert.ok(count <= views,
+        `${key} was read ${count} times; at most one historical proof for each of ${views} Store views`);
+      return { value, counts };
+    } finally { store.get = get; }
+  }
+  for (const prefix of prefixes) {
+    writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'value-0' }));
+    const store = new Store(prefix.path), engine = new ProductEngine(store);
+    try {
+      const request = { project: f.project, input: prefix.input };
+      // Preparation has a base Store and an explicit pending-source overlay; their proofs stay separate.
+      const idle = measured(store, () => prepareReopenAnswers(store, request), 2);
+      assert.equal(idle.value.writes.length, 0);
+      assert.equal(idle.value.record.value.input.facts!.length, prefix.count);
+      const again = measured(store, () => prepareReopenAnswers(store, request), 2);
+      assert.deepEqual(again.counts, idle.counts);
+      const source = store.get('source:garden:cost-0')!;
+      writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'changed' }));
+      engine.discovery.evidence.file(f.project, 'cost-0', f.root, 'cost-0.json', 'application/json', source.revision);
+      const prepared = measured(store, () => prepareReopenAnswers(store, request), 2);
+      assert.equal(prepared.value.writes.length, 1, 'The next operation must observe the changed evidence head');
+      assert.equal(prepared.value.record.value.input.facts!.length, prefix.count - 1);
+      const saved = measured(store, () => writeReopenAnswers(store, request), 2).value;
+      assert.deepEqual(measured(store, () => readOmInput(store, f.project, reference(saved)), 1).value, saved);
+      assert.deepEqual(measured(store, () => readOmInput(store, f.project, reference(saved)), 1).value, saved);
+    } finally { store.close(); }
+  }
 });

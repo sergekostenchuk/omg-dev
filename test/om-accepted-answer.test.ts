@@ -7,6 +7,8 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Question, writeMc1Question,
   prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, applicableAnswer, confirmAnswerGapClosure,
+  checkAnswerInputBody, readAnswerForInput, answerSourceGuards,
+  prepareAnswerInvalidation, readAnswerInvalidation, type AnswerInvalidation,
   confirmAcceptedAnswerResult, ANSWER_REFUSAL_CODES, type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -15,7 +17,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requiremen
 import type { Question } from '../src/discovery/discovery.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { writeOmInput } from '../src/om/input.js';
+import { withHistoricalReads, writeOmInput, type OmInputRecord } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { ResearchAnswer, ResearchAssessment } from '../src/discovery/research-model.js';
@@ -161,14 +163,15 @@ function factFixture(t: TestContext) {
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
   writeFileSync(join(root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
   const source = engine.discovery.evidence.file(project, 'answer-source', root, 'answer.json', 'application/json', 0);
-  function issue(current = gaps, resultForm: Json = { type: 'string' }) {
+  function issue(current = gaps, resultForm: Json = { type: 'string' }, selected?: { pointers: string[]; values: Json[] }) {
     const requestContract: AnswerQuestionContract = { establishes: input.value.input.questions[0]!.question,
-      consumer: { blocks: [...current.gap.value.gap.consumers] }, requirements: [clone(input.value.input.contracts[0]!) as unknown as Json], resultForm };
+      consumer: { blocks: [...current.gap.value.gap.consumers] }, requirements: selected?.values ?? [clone(input.value.input.contracts[0]!) as unknown as Json], resultForm };
     const draft = engine.discovery.create(project, 'om-g2', 'R1', block,
       [mc1FieldSpec({ input: current.sources.input, gap: reference(current.gap), contract: requestContract })], [current.sources.input, reference(current.gap)]);
     const issued = store.get<Question>(draft.value.questions[0]!)!;
     const request: Mc1QuestionRequest = { project, input: current.sources.input, gaps: { sources: current.sources, records: current.records },
-      gap: reference(current.gap), contract: requestContract, requirements: [{ pointer: '/contracts/0' }], engineQuestion: reference(issued), draft: reference(draft) };
+      gap: reference(current.gap), contract: requestContract, requirements: (selected?.pointers ?? ['/contracts/0']).map(pointer => ({ pointer })),
+      engineQuestion: reference(issued), draft: reference(draft) };
     const question = ok(writeMc1Question(store, request));
     return { request, question, issued, draft };
   }
@@ -213,11 +216,21 @@ test('D5 applicability preserves unrelated input refresh but distinguishes chang
   const original = ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(saved) }));
   const inventory = f.store.write({ id: 'repo-inventory:garden', kind: 'repo-inventory', expected: 0, value: { projectId: f.project, paths: [] } });
   const refreshed = ok(writeOmInput(f.store, { project: f.project, stages: f.stages, expected: f.input.revision, inventory: reference(inventory) }));
+  // D3.1 applies an existing MC1 fact to the exact refreshed input without issuing another MC1 question.
+  const explicit = { project: f.project, record: reference(saved), question: reference(a.question), input: reference(refreshed) };
+  const current = ok(applicableAnswer(f.store, explicit));
+  assert.equal(current.applicable, true);
+  assert.ok(current.guards.some(ref => canonical(ref) === canonical(reference(refreshed))));
+  assert.ok(current.guards.some(ref => canonical(ref) === canonical(reference(inventory))));
+  const historical = ok(readAnswerForInput(f.store, { ...explicit, input: reference(f.input), current: false }));
+  assert.equal(historical.applicable, true); assert.deepEqual(historical.guards, []);
   const gaps = f.gapsFor(reference(refreshed)), next = f.issue(gaps);
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(saved), question: reference(next.question) })).applicable, true);
   const different = f.issue(gaps, { type: 'string', description: 'The supported streaming JSON format' });
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(saved), question: reference(different.question) })).applicable, false);
   writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'streaming JSON' }));
+  assert.equal(ok(applicableAnswer(f.store, explicit)).applicable, false);
+  assert.equal(ok(readAnswerForInput(f.store, { ...explicit, current: false })).applicable, true);
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(saved), question: reference(next.question) })).applicable, false);
   assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(saved) })), original);
   writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
@@ -226,9 +239,280 @@ test('D5 applicability preserves unrelated input refresh but distinguishes chang
   const renewed = await f.answer(next), reaccepted = ok(writeAcceptedAnswer(f.store, renewed.request));
   assert.equal(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(reaccepted) })).key, original.key);
   f.restart();
+  assert.deepEqual(ok(readAnswerForInput(f.store, { ...explicit, input: reference(f.input), current: false })), historical);
+  assert.equal(ok(applicableAnswer(f.store, explicit)).applicable, false);
   assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(saved) })), original);
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(saved), question: reference(next.question) })).applicable, false);
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(reaccepted), question: reference(next.question) })).applicable, true);
+});
+
+test('D5 applied-input binding preserves the full producer question and exact fact, beyond equal prose or values', async t => {
+  const f = factFixture(t), a = await f.answer(), saved = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(saved), question: reference(a.question) };
+  const input = clone(f.input.value) as OmInputRecord, sourceQuestion = input.input.questions[0]!;
+  input.input.questions = [];
+  input.input.facts = [{ question: sourceQuestion, value: 'JSON', answer: reference(saved), mc1Question: reference(a.question) }];
+  const checked = ok(checkAnswerInputBody(f.store, { ...request, input }));
+  assert.equal(checked.applicable, true); assert.deepEqual(checked.sourceQuestion, sourceQuestion);
+  assert.deepEqual(checked.guards, []);
+  const other = await f.answer(), otherAnswer = ok(writeAcceptedAnswer(f.store, other.request));
+  const equivalentQuestion = clone(input); equivalentQuestion.input.facts![0]!.mc1Question = reference(other.question);
+  assert.equal(ok(checkAnswerInputBody(f.store, { ...request, question: reference(other.question), input: equivalentQuestion })).applicable, true);
+  const changes: [string, (body: OmInputRecord) => void][] = [
+    ['question prose', body => { body.input.facts![0]!.question.question = 'An unrelated question'; }],
+    ['consumer', body => { body.input.facts![0]!.question.consumer = 'garden-consume-block'; }],
+    ['kind', body => { body.input.facts![0]!.question.kind = 'design-decision'; }],
+    ['source revision', body => { body.input.facts![0]!.question.source.revision++; }],
+    ['address decision', body => { delete body.input.facts![0]!.question.addressedBy; }],
+    ['requirements', body => { body.input.contracts[0]!.actor = 'another actor'; }],
+    ['value', body => { body.input.facts![0]!.value = 'streaming JSON'; }],
+    ['answer with equal value', body => { body.input.facts![0]!.answer = reference(otherAnswer); }],
+    ['question with equal contract', body => { body.input.facts![0]!.mc1Question = reference(other.question); }],
+  ];
+  for (const [name, mutate] of changes) {
+    const changed = clone(input); mutate(changed);
+    assert.equal(ok(checkAnswerInputBody(f.store, { ...request, input: changed })).applicable, false, name);
+  }
+  const missing = clone(input); missing.input.facts = [];
+  rejected(checkAnswerInputBody(f.store, { ...request, input: missing }), 'answer_inapplicable');
+  const duplicate = clone(input); duplicate.input.questions.push(clone(sourceQuestion));
+  rejected(checkAnswerInputBody(f.store, { ...request, input: duplicate }), 'answer_inapplicable');
+  f.restart();
+  assert.deepEqual(ok(checkAnswerInputBody(f.store, { ...request, input })), checked);
+});
+
+test('D5 requirement change evidence distinguishes changed values, absent target fields and explicit null across restart', async t => {
+  const f = factFixture(t), path = '/contracts/0/state/durability', before = clone(f.input.value.input.contracts[0]!.state.durability!) as Json;
+  const q = f.issue(f.gaps, { type: 'string' }, { pointers: [path], values: [before] });
+  const a = await f.answer(q), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted), question: reference(q.question) };
+  assert.deepEqual(ok(checkAnswerInputBody(f.store, { ...request, input: f.input.value as OmInputRecord })).requirementChanges, []);
+  const observations = [];
+  for (const value of ['permanent', null] as Json[]) {
+    const input = clone(f.input.value) as OmInputRecord; input.input.contracts[0]!.state.durability = value;
+    const checked = ok(checkAnswerInputBody(f.store, { ...request, input }));
+    assert.equal(checked.applicable, false);
+    assert.deepEqual(checked.requirementChanges, [{ pointer: path, before, after: { present: true, value } }]);
+    observations.push({ input, checked });
+  }
+  const missing = clone(f.input.value) as OmInputRecord; delete missing.input.contracts[0]!.state.durability;
+  const absent = ok(checkAnswerInputBody(f.store, { ...request, input: missing }));
+  assert.equal(absent.applicable, false);
+  assert.deepEqual(absent.requirementChanges, [{ pointer: path, before, after: { present: false } }]);
+  f.restart();
+  assert.deepEqual(ok(checkAnswerInputBody(f.store, { ...request, input: missing })), absent);
+  for (const { input, checked } of observations) assert.deepEqual(ok(checkAnswerInputBody(f.store, { ...request, input })), checked);
+  assert.equal(ok(readAnswerForInput(f.store, { ...request, input: reference(f.input), current: false })).applicable, true);
+});
+
+test('D5 literal requirement multisets preserve multiplicity without treating every changed pointer as lost applicability', async t => {
+  const f = factFixture(t), state = f.input.value.input.contracts[0]!.state;
+  const pointers = ['/contracts/0/state/authority', '/contracts/0/state/writer'];
+  const values = [clone(state.authority!) as Json, clone(state.writer!) as Json]; assert.notDeepEqual(values[0], values[1]);
+  const q = f.issue(f.gaps, { type: 'string' }, { pointers, values }), a = await f.answer(q);
+  const accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const input = clone(f.input.value) as OmInputRecord;
+  input.input.contracts[0]!.state.authority = values[1]!; input.input.contracts[0]!.state.writer = values[0]!;
+  const checked = ok(checkAnswerInputBody(f.store, { project: f.project, record: reference(accepted), question: reference(q.question), input }));
+  assert.equal(checked.applicable, true);
+  assert.deepEqual(checked.requirementChanges, [
+    { pointer: pointers[0], before: values[0], after: { present: true, value: values[1] } },
+    { pointer: pointers[1], before: values[1], after: { present: true, value: values[0] } },
+  ]);
+  const duplicated = f.issue(f.gaps, { type: 'string' }, { pointers: [pointers[0]!, pointers[0]!], values: [values[0]!, values[0]!] });
+  const duplicateAnswer = await f.answer(duplicated), duplicateAccepted = ok(writeAcceptedAnswer(f.store, duplicateAnswer.request));
+  delete input.input.contracts[0]!.state.authority;
+  const missing = ok(checkAnswerInputBody(f.store, { project: f.project, record: reference(duplicateAccepted), question: reference(duplicated.question), input }));
+  assert.equal(missing.applicable, false);
+  assert.deepEqual(missing.requirementChanges, [
+    { pointer: pointers[0], before: values[0], after: { present: false } },
+    { pointer: pointers[0], before: values[0], after: { present: false } },
+  ]);
+});
+
+test('D5 operation scope proves each accepted answer and MC1 once while checking each target body and current source anew', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const counts = new Map<string, number>();
+  const key = (id: string, revision?: number) => `${id}@${revision ?? 'head'}`;
+  const view = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      const read = key(id, revision); counts.set(read, (counts.get(read) ?? 0) + 1); return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const request = { project: f.project, record: reference(accepted), question: reference(a.question) };
+  withHistoricalReads(() => {
+    ok(readAcceptedAnswer(view, request));
+    ok(readMc1Question(view, { project: f.project, record: reference(a.question) }));
+    assert.equal(ok(readAnswerForInput(view, { ...request, input: reference(f.input), current: false })).applicable, true);
+    assert.equal(ok(checkAnswerInputBody(view, { ...request, input: f.input.value as OmInputRecord })).applicable, true);
+    const changed = clone(f.input.value) as OmInputRecord; changed.input.contracts[0]!.actor = 'Changed essential requirement';
+    const checked = ok(checkAnswerInputBody(view, { ...request, input: changed }));
+    assert.equal(checked.applicable, false); assert.equal(checked.requirementChanges.length, 1);
+    assert.deepEqual(ok(prepareAcceptedAnswer(view, a.request)).writes, []);
+    assert.equal(counts.get(key(accepted.id, accepted.revision)), 1);
+    assert.equal(counts.get(key(a.question.id, a.question.revision)), 1);
+    assert.equal(counts.get(key(a.assessment.id, a.assessment.revision)), 1);
+    assert.equal(counts.get(key(a.issued.id, a.issued.revision)), 1);
+    rejected(readAcceptedAnswer(view, { ...request, record: { ...request.record, hash: '0'.repeat(64) } }), 'record_forged');
+    rejected(readAcceptedAnswer(view, { ...request, project: 'foreign' }), 'record_foreign');
+    assert.equal(ok(answerSourceGuards(view, request)).applicable, true);
+    const source = f.store.get(f.source.id)!;
+    f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+    assert.equal(ok(answerSourceGuards(view, request)).applicable, false);
+    rejected(prepareAcceptedAnswer(view, a.request), 'input_stale');
+    ok(readAcceptedAnswer(view, request));
+    assert.equal(counts.get(key(a.assessment.id, a.assessment.revision)), 1);
+  });
+  const previous = counts.get(key(a.assessment.id, a.assessment.revision))!;
+  ok(readAcceptedAnswer(view, request));
+  assert.equal(counts.get(key(a.assessment.id, a.assessment.revision)), previous + 1);
+});
+
+test('D5 historical memo isolates Store views, full answer source requests and errors, and releases after an aborted operation', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted) };
+  const failure = new TypeError('historical reader unavailable');
+  let unavailable = true, reads = 0;
+  const flaky = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      if (id === a.assessment.id) { reads++; if (unavailable) throw failure; }
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const incompatible = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => id === a.assessment.id
+      ? { ...a.assessment, value: { ...a.assessment.value, verdict: 'insufficient' } } : target.get(id, revision);
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const q = f.issue();
+  withHistoricalReads(() => {
+    ok(readAcceptedAnswer(f.store, request));
+    rejected(readAcceptedAnswer(incompatible, request), 'answer_unconfirmed');
+    assert.throws(() => readAcceptedAnswer(flaky, request), error => error === failure);
+    unavailable = false;
+    ok(readAcceptedAnswer(flaky, request)); ok(readAcceptedAnswer(flaky, request)); assert.equal(reads, 2);
+    // The native answer reference is unchanged; the different exact MC1 request must still be checked.
+    rejected(prepareAcceptedAnswer(f.store, { ...a.request, question: reference(q.question) }), 'answer_unconfirmed');
+    assert.deepEqual(ok(prepareAcceptedAnswer(f.store, a.request)).writes, []);
+  });
+  const aborted = new Error('abort outer operation');
+  assert.throws(() => withHistoricalReads(() => { ok(readAcceptedAnswer(flaky, request)); throw aborted; }), error => error === aborted);
+  unavailable = true;
+  assert.throws(() => readAcceptedAnswer(flaky, request), error => error === failure);
+  unavailable = false;
+  ok(readAcceptedAnswer(flaky, request));
+});
+
+test('D5 exact target input and fact evidence guards reject races without admitting an unverified input body', async t => {
+  const f = factFixture(t), a = await f.answer(), saved = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(saved), question: reference(a.question), input: reference(f.input), current: true };
+  const prepared = ok(readAnswerForInput(f.store, request));
+  assert.equal(prepared.applicable, true);
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.source))));
+  assert.equal(ok(answerSourceGuards(f.store, request)).applicable, true);
+  const source = f.store.get(f.source.id)!;
+  f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+  rejected(writeGuarded(f.store, { unit: 'D5-test', target: f.target, guards: prepared.guards,
+    writes: [{ id: 'neighbour:fact:apply', kind: 'test-neighbour', expected: 0, value: {} }] }), 'input_stale');
+  assert.equal(f.store.get('neighbour:fact:apply'), null);
+  assert.equal(ok(readAnswerForInput(f.store, request)).applicable, false);
+  assert.equal(ok(answerSourceGuards(f.store, request)).applicable, false);
+  const forged = clone(f.input.value) as OmInputRecord; forged.input.questions[0]!.consumer = 'garden-consume-block'; forged.hash = hashJson(forged.input);
+  const row = f.store.write({ id: f.input.id, kind: f.input.kind, expected: f.input.revision, value: forged });
+  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }));
+  f.restart();
+  assert.equal(ok(readAnswerForInput(f.store, { ...request, current: false })).applicable, true);
+  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }));
+});
+
+test('D5 invalidation is derived from changed exact source heads and remains historical after another change and restart', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted) };
+  const unchanged = ok(prepareAnswerInvalidation(f.store, request));
+  assert.equal(unchanged.invalidation, null); assert.deepEqual(unchanged.writes, []);
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const source = f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json', f.source.revision);
+  const before = f.store.list().map(reference), prepared = ok(prepareAnswerInvalidation(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), before); assert.deepEqual(prepared.writes, []);
+  assert.deepEqual(prepared.invalidation, { record: reference(accepted), sources: [{ before: reference(f.source), after: reference(source) }] });
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(source))));
+  assert.ok(!prepared.guards.some(ref => canonical(ref) === canonical(reference(f.source))));
+  const invalidation = prepared.invalidation!;
+  const history = ok(readAnswerInvalidation(f.store, { project: f.project, invalidation }));
+  assert.ok(history.references.some(ref => canonical(ref) === canonical(reference(source))));
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'CSV' }));
+  f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json', source.revision);
+  rejected(writeGuarded(f.store, { unit: 'D5-test', target: f.target, guards: prepared.guards,
+    writes: [{ id: 'neighbour:fact:invalidation', kind: 'test-neighbour', expected: 0, value: {} }] }), 'input_stale');
+  assert.equal(f.store.get('neighbour:fact:invalidation'), null);
+  f.restart();
+  assert.deepEqual(ok(readAnswerInvalidation(f.store, { project: f.project, invalidation })), history);
+  ok(readAcceptedAnswer(f.store, request));
+});
+
+test('D5 captures file-only invalidation through the native source producer without writing during preparation', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const before = f.store.list().map(reference), prepared = ok(prepareAnswerInvalidation(f.store, { project: f.project, record: reference(accepted) }));
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(prepared.writes.length, 1);
+  assert.equal(prepared.writes[0]!.id, f.source.id); assert.equal(prepared.writes[0]!.expected, f.source.revision);
+  assert.equal(prepared.writes[0]!.kind, 'source');
+  assert.deepEqual(prepared.invalidation!.sources[0]!.before, reference(f.source));
+  assert.equal(prepared.invalidation!.sources[0]!.after.revision, f.source.revision + 1);
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.source))));
+  rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation: prepared.invalidation! }), 'record_missing');
+  const written = ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, guards: prepared.guards, writes: prepared.writes }));
+  assert.deepEqual(reference(written[0]!), prepared.invalidation!.sources[0]!.after);
+  const history = ok(readAnswerInvalidation(f.store, { project: f.project, invalidation: prepared.invalidation! }));
+  rmSync(join(f.root, 'answer.json')); f.restart();
+  assert.deepEqual(ok(readAnswerInvalidation(f.store, { project: f.project, invalidation: prepared.invalidation! })), history);
+  const after = f.store.list().map(reference);
+  rejected(prepareAnswerInvalidation(f.store, { project: f.project, record: reference(accepted) }), 'answer_inapplicable');
+  assert.deepEqual(f.store.list().map(reference), after);
+});
+
+test('D5 pending native invalidation capture is atomic against source races and rejects malformed current files', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted) };
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const prepared = ok(prepareAnswerInvalidation(f.store, request));
+  const source = f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json', f.source.revision);
+  const writes = [...prepared.writes, { id: 'neighbour:fact:capture', kind: 'test-neighbour', expected: 0, value: {} }];
+  rejected(writeGuarded(f.store, { unit: 'D5-test', target: f.target, guards: prepared.guards, writes }), 'input_stale');
+  assert.deepEqual(f.store.get(source.id), source); assert.equal(f.store.get('neighbour:fact:capture'), null);
+  const before = f.store.list().map(reference);
+  writeFileSync(join(f.root, 'answer.json'), '{invalid JSON');
+  rejected(prepareAnswerInvalidation(f.store, request), 'answer_inapplicable');
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test('D5 invalidation refuses unrelated, non-successor, duplicate and forged evidence without confusing later equal content with no change', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const source = f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json', f.source.revision);
+  const prepared = ok(prepareAnswerInvalidation(f.store, { project: f.project, record: reference(accepted) }));
+  assert.ok(prepared.invalidation, 'A newer source revision requires reconfirmation even with equal content');
+  const pair = { before: reference(f.source), after: reference(source) };
+  const other = f.engine.discovery.evidence.document(f.project, 'unrelated', '{"answer":"XML"}', 'application/json', 0);
+  const variants: AnswerInvalidation[] = [
+    { record: reference(accepted), sources: [] },
+    { record: reference(accepted), sources: [pair, pair] },
+    { record: reference(accepted), sources: [{ before: pair.before, after: pair.before }] },
+    { record: reference(accepted), sources: [{ before: pair.after, after: pair.before }] },
+    { record: reference(accepted), sources: [{ before: reference(other), after: pair.after }] },
+    { record: reference(accepted), sources: [{ before: pair.before, after: reference(other) }] },
+    { record: reference(accepted), sources: [{ ...pair, after: { ...pair.after, hash: '0'.repeat(64) } }] },
+  ];
+  const before = f.store.list().map(reference);
+  for (const invalidation of variants) rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation }));
+  assert.deepEqual(f.store.list().map(reference), before);
+  const foreign = f.store.write({ id: source.id, kind: 'source', expected: source.revision, value: { ...source.value, projectId: 'other' } });
+  rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation: { record: reference(accepted), sources: [{ before: pair.before, after: reference(foreign) }] } }), 'answer_unconfirmed');
+  rejected(prepareAnswerInvalidation(f.store, { project: f.project, record: reference(accepted) }), 'answer_unconfirmed');
+  f.restart();
+  ok(readAnswerInvalidation(f.store, { project: f.project, invalidation: prepared.invalidation! }));
 });
 
 test('D5 provider confirms the recorded attempt and G7 counts new fact content once across reconfirmation and A to B to A', async t => {
@@ -361,6 +645,8 @@ test('D5 saved MC1 questions recheck their complete D1 set, consumer, requiremen
     { ...q.request, contract: { ...q.request.contract, consumer: { blocks: ['garden-consume-block'] } } },
     { ...q.request, contract: { ...q.request.contract, requirements: ['invented requirement'] } },
     { ...q.request, requirements: [{ pointer: '/absent' }] },
+    { ...q.request, requirements: [{ pointer: '/contracts/0/state/~2bad' }] },
+    { ...q.request, requirements: [{ pointer: '/absent/~2bad' }] },
     { ...q.request, engineQuestion: f.issue().request.engineQuestion },
   ];
   for (const request of cases) {
@@ -388,6 +674,11 @@ test('D5 public boundaries reject missing arguments and required collections bef
   for (const malformed of [undefined, null, [], 1, 'request', {}]) {
     for (const action of [prepareAcceptedAnswer, writeAcceptedAnswer]) typed(() => action(guarded, malformed as AnswerRequest));
     for (const action of [readAcceptedAnswer, readMc1Question]) typed(() => action(guarded, malformed as { project: string; record: Ref }));
+    typed(() => answerSourceGuards(guarded, malformed as { project: string; record: Ref }));
+    typed(() => prepareAnswerInvalidation(guarded, malformed as { project: string; record: Ref }));
+    typed(() => readAnswerInvalidation(guarded, malformed as Parameters<typeof readAnswerInvalidation>[1]));
+    typed(() => readAnswerForInput(guarded, malformed as Parameters<typeof readAnswerForInput>[1]));
+    typed(() => checkAnswerInputBody(guarded, malformed as Parameters<typeof checkAnswerInputBody>[1]));
     for (const action of [prepareMc1Question, writeMc1Question]) typed(() => action(guarded, malformed as Mc1QuestionRequest));
     typed(() => applicableAnswer(guarded, malformed as { project: string; record: Ref; question: Ref }));
     typed(() => confirmAnswerGapClosure(guarded, malformed as Parameters<typeof confirmAnswerGapClosure>[1]));
@@ -403,6 +694,45 @@ test('D5 public boundaries reject missing arguments and required collections bef
     typed(() => prepareMc1Question(guarded, missing as unknown as Mc1QuestionRequest));
   }
   typed(() => prepareMc1Question(guarded, { ...q.request, gaps: { ...q.request.gaps, records: undefined } } as unknown as Mc1QuestionRequest));
+  for (const invalidation of [{}, { record: fake }, { record: fake, sources: null },
+    { record: fake, sources: [{}] }, { record: fake, sources: [{ before: fake }] }])
+    typed(() => readAnswerInvalidation(guarded, { project: f.project, invalidation } as Parameters<typeof readAnswerInvalidation>[1]));
+  for (const field of ['question', 'input', 'current'] as const) {
+    const missing: Record<string, unknown> = { project: f.project, record: fake, question: fake, input: fake, current: false };
+    delete missing[field];
+    typed(() => readAnswerForInput(guarded, missing as unknown as Parameters<typeof readAnswerForInput>[1]));
+  }
+  typed(() => checkAnswerInputBody(guarded, { project: f.project, record: fake, question: fake, input: {} } as Parameters<typeof checkAnswerInputBody>[1]));
+  const bodyFields: string[][] = [
+    ['projectId'], ['hash'], ['gaps'], ['input'],
+    ...['sources', 'inventory', 'requirements', 'criteria', 'contracts', 'features', 'questions', 'map'].map(field => ['input', field]),
+    ...['nodes', 'artifacts', 'connectors'].map(field => ['input', 'map', field]),
+    ...['id', 'revision', 'hash', 'stage', 'contractVersion'].map(field => ['input', 'sources', '0', field]),
+    ...['id', 'question', 'consumer', 'kind', 'blocks', 'source'].map(field => ['input', 'questions', '0', field]),
+    ...['id', 'nodes', 'requirements', 'outcome', 'actor', 'success', 'failures', 'forbiddenEffects', 'state', 'proof']
+      .map(field => ['input', 'contracts', '0', field]),
+  ];
+  for (const path of bodyFields) {
+    const changed = clone(f.input.value) as unknown as Record<string, any>;
+    const holder = path.slice(0, -1).reduce((row, key) => row[key] as Record<string, any>, changed);
+    delete holder[path.at(-1)!];
+    typed(() => checkAnswerInputBody(guarded, { project: f.project, record: fake, question: fake, input: changed as OmInputRecord }));
+  }
+  const wrongShapes: [string[], unknown][] = [
+    [['hash'], 1], [['gaps'], {}], [['gaps'], [null]], [['input'], []],
+    ...['sources', 'requirements', 'criteria', 'contracts', 'features', 'questions'].flatMap(field =>
+      [[['input', field], {}], [['input', field], [null]]] as [string[], unknown][]),
+    [['input', 'inventory'], {}], [['input', 'map'], []], [['input', 'map', 'nodes'], {}],
+    [['input', 'sources', '0', 'contractVersion'], {}], [['input', 'questions', '0', 'blocks'], 'false'],
+    [['input', 'contracts', '0', 'nodes'], {}], [['input', 'contracts', '0', 'state'], []],
+    [['input', 'facts'], {}], [['input', 'facts'], [{}]],
+  ];
+  for (const [path, value] of wrongShapes) {
+    const changed = clone(f.input.value) as unknown as Record<string, any>;
+    const holder = path.slice(0, -1).reduce((row, key) => row[key] as Record<string, any>, changed);
+    holder[path.at(-1)!] = value;
+    typed(() => checkAnswerInputBody(guarded, { project: f.project, record: fake, question: fake, input: changed as OmInputRecord }));
+  }
   typed(() => confirmAcceptedAnswerResult({ ...fake, kind: 'accepted-answer', value: {} }, undefined as unknown as Parameters<typeof confirmAcceptedAnswerResult>[1], guarded));
 });
 
@@ -417,6 +747,12 @@ test('D5 execution exceptions propagate unchanged through saved, current and pro
     for (const action of [() => readAcceptedAnswer(broken, read), () => prepareAcceptedAnswer(broken, a.request),
       () => writeAcceptedAnswer(broken, a.request), () => readMc1Question(broken, { project: f.project, record: a.request.question }),
       () => applicableAnswer(broken, { ...read, question: a.request.question }),
+      () => readAnswerForInput(broken, { ...read, question: a.request.question, input: reference(f.input), current: false }),
+      () => answerSourceGuards(broken, read),
+      () => prepareAnswerInvalidation(broken, read),
+      () => readAnswerInvalidation(broken, { project: f.project, invalidation: { record: reference(saved),
+        sources: [{ before: reference(f.source), after: { ...reference(f.source), revision: f.source.revision + 1 } }] } }),
+      () => checkAnswerInputBody(broken, { ...read, question: a.request.question, input: f.input.value as OmInputRecord }),
       () => confirmAcceptedAnswerResult(saved, { project: f.project, block: f.block, goal: { key: 'g', questions: [], result: 'r' } }, broken)])
       assert.throws(action, error => error === failure);
   }

@@ -8,7 +8,8 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } 
 import { readRecord, writeGuarded } from './refs.js';
 import { readLayerEnvelope, readLayerAcceptance, type LayerAcceptanceRequest } from './layer-basis.js';
 import { prepareLayerAcceptance } from './frame-obligations.js';
-import { readOmInput, prepareExistingOmInput, deriveOmInput, type InputBuildResult, type OmInput, type OmInputRecord, type InputGap } from './input.js';
+import { readOmInput, prepareExistingOmInput, prepareReopenOmInput, deriveOmInput, withHistoricalReads, type InputBuildResult, type OmInput, type OmInputRecord, type InputGap } from './input.js';
+import { readAnswerForInput } from './accepted-answer.js';
 
 export const ADDRESSING_KINDS = sealed([...ENGINE_KINDS]);
 export const ADDRESSING_CHECK_KINDS = sealed(['test', 'full-run', 'environment-observation'] as const);
@@ -28,6 +29,7 @@ export interface AddressingRequest { project: string; input: Ref; graph: Ref; de
 export interface PreparedAddressing {
   record: Revision<OmInputRecord>; writes: Write[]; guards: Ref[]; references: Ref[];
 }
+export interface ApplyAnswerRequest { project: string; input: Ref; answer: Ref; question: Ref }
 const object = (value: unknown): value is Record<string, any> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
@@ -45,8 +47,10 @@ function check(condition: unknown, code: string, target: string, field: string, 
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new AddressingFailure(result.refusal); return result.value; }
 function run<T>(action: () => T): OmResult<Sealed<T>> {
-  try { return delivered(action()); }
-  catch (error) { if (error instanceof AddressingFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  return withHistoricalReads(() => {
+    try { return delivered(action()); }
+    catch (error) { if (error instanceof AddressingFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  });
 }
 function invalid(field: string): never {
   throw new EngineError('addressing_request_invalid', 'Addressing needs explicit well-formed arguments', { unit: 'F5.3', target: 'om-input', field });
@@ -280,10 +284,90 @@ export function prepareAddressing(store: Store, request: AddressingRequest): OmR
   });
 }
 export function writeAddressing(store: Store, request: AddressingRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
-  const prepared = prepareAddressing(store, request); if (!prepared.ok) return prepared;
-  if (prepared.value.writes.length) {
-    const written = writeGuarded(store, { unit: 'F5.3', target: prepared.value.record.id, writes: prepared.value.writes, guards: prepared.value.guards });
-    if (!written.ok) return written;
-  }
-  return delivered(prepared.value.record);
+  return withHistoricalReads(() => {
+    const prepared = prepareAddressing(store, request); if (!prepared.ok) return prepared;
+    if (prepared.value.writes.length) {
+      const written = writeGuarded(store, { unit: 'F5.3', target: prepared.value.record.id, writes: prepared.value.writes, guards: prepared.value.guards });
+      if (!written.ok) return written;
+    }
+    return delivered(prepared.value.record);
+  });
+}
+
+/** The fact supplier proves acceptance and applicability; B1 owns the resulting input derivation. */
+export function prepareApplyAnswer(store: Store, request: ApplyAnswerRequest): OmResult<Sealed<PreparedAddressing>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.input)
+    || !isRef(request.answer) || !isRef(request.question)) invalid('answer');
+  request = copy(request);
+  return run(() => {
+    const current = store.get<OmInputRecord>(`om-input:${request.project}`);
+    check(current, 'addressing_source_invalid', request.project, 'input', 'Applying a fact requires an existing input');
+    const admitted = take(prepareExistingOmInput(store, request.project, reference(current)));
+    const derivation = { kind: 'fact' as const, previous: request.input, answer: request.answer, question: request.question };
+    let cursor = admitted.existing! as Revision<OmInputRecord>;
+    while (cursor.value.derivation) {
+      if (same(cursor.value.derivation, derivation)) return { record: cursor, writes: [], guards: admitted.guards as Ref[],
+        references: [reference(cursor), request.input, request.answer, request.question] };
+      cursor = take(readOmInput(store, request.project, cursor.value.derivation.previous)) as Revision<OmInputRecord>;
+    }
+    check(same(reference(current), request.input), 'addressing_conflict', request.input.id, 'input',
+      'A new fact application names the current input; an old base is only valid for an exact applied delivery');
+    const applicable = take(readAnswerForInput(store, { project: request.project, record: request.answer,
+      question: request.question, input: request.input, current: true }));
+    check(applicable.applicable, 'answer_inapplicable', request.input.id, 'answer',
+      'The accepted fact must still establish this exact input question under the same contract and sources');
+    const record = take(deriveOmInput(store, { project: request.project, ...derivation })) as OmInputRecord;
+    const guards = unique([...admitted.guards, ...applicable.guards]);
+    for (const guard of guards) {
+      const head = store.get(guard.id);
+      check(head && same(reference(head), guard), 'input_stale', guard.id, 'head', 'A fact application prerequisite changed');
+    }
+    if (same(current.value.input, record.input) && same(current.value.gaps, record.gaps))
+      return { record: current, writes: [], guards, references: applicable.references as Ref[] };
+    const next = { id: current.id, kind: current.kind, revision: current.revision + 1, hash: hashJson(record), value: record };
+    return { record: next, writes: [{ id: current.id, kind: current.kind, expected: current.revision, value: record }],
+      guards, references: applicable.references as Ref[] };
+  });
+}
+export function writeApplyAnswer(store: Store, request: ApplyAnswerRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+  return withHistoricalReads(() => {
+    const prepared = prepareApplyAnswer(store, request); if (!prepared.ok) return prepared;
+    if (prepared.value.writes.length) {
+      const written = writeGuarded(store, { unit: 'F5.3', target: prepared.value.record.id,
+        writes: prepared.value.writes, guards: prepared.value.guards });
+      if (!written.ok) return written;
+    }
+    return delivered(prepared.value.record);
+  });
+}
+
+/** Return stale applied facts to the unresolved set through B1's proven derivation. */
+export interface ReopenAnswersRequest { project: string; input: Ref }
+export function prepareReopenAnswers(store: Store, request: ReopenAnswersRequest): OmResult<Sealed<PreparedAddressing>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.input)) invalid('reopen');
+  request = copy(request);
+  return run(() => {
+    const prepared = take(prepareReopenOmInput(store, request));
+    const write = prepared.writes.find(write => write.id === `om-input:${request.project}`);
+    const record = write ? { id: write.id, kind: write.kind, revision: write.expected + 1,
+      value: prepared.record as OmInputRecord, hash: hashJson(prepared.record) } : prepared.existing as Revision<OmInputRecord>;
+    check(record, 'addressing_source_invalid', request.input.id, 'input', 'Recovery requires a verified input');
+    const derivation = record.value.derivation;
+    const evidence = derivation && 'kind' in derivation && derivation.kind === 'reopen-facts'
+      ? [...derivation.invalidations.flatMap(item => [item.record, ...item.sources.flatMap(pair => [pair.before, pair.after])]),
+        ...(derivation.dependencies ?? []).flatMap(item => [item.record, item.question, ...item.removed])] : [];
+    return { record, writes: prepared.writes as Write[], guards: prepared.guards as Ref[],
+      references: unique([request.input, reference(record), ...prepared.guards, ...evidence]) };
+  });
+}
+export function writeReopenAnswers(store: Store, request: ReopenAnswersRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+  return withHistoricalReads(() => {
+    const prepared = prepareReopenAnswers(store, request); if (!prepared.ok) return prepared;
+    if (prepared.value.writes.length) {
+      const written = writeGuarded(store, { unit: 'F5.3', target: prepared.value.record.id,
+        writes: prepared.value.writes, guards: prepared.value.guards });
+      if (!written.ok) return written;
+    }
+    return delivered(prepared.value.record);
+  });
 }

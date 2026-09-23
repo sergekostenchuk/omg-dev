@@ -12,6 +12,8 @@ import { Store, type Revision, type Write } from "../storage/store.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { deriveInputDecisions } from "./addressing.js";
+import { answerSourceGuards, checkAnswerInputBody, prepareAnswerInvalidation, readAnswerForInput,
+  readAnswerInvalidation, type AnswerInvalidation, type AnswerRequirementChange } from "./accepted-answer.js";
 
 // The producer still emits contract v3 without structured nodes or check kinds.
 export const NODES_REQUIRED_SINCE: number | null = null;
@@ -37,15 +39,21 @@ export interface OmInput {
   features: { index: number; title: string; outcome: string; behaviorIndexes: number[]; requirementIds: string[]; contracts: string[] }[];
   questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
     addressedBy?: Ref; originalConsumer?: string }[];
+  facts?: AppliedInputFact[];
   map: { nodes: string[]; artifacts: string[]; connectors: string[] };
 }
+export interface AppliedInputFact { question: OmInput['questions'][number]; value: Json; answer: Ref; mc1Question: Ref }
 export interface InputBuildResult { input: OmInput | null; hash: string | null; refusals: Refusal[]; gaps: InputGap[] }
 export interface InputRequest { project: string; stages: Record<UpstreamStage, Ref>; inventory?: Ref | null; expected: number }
 export interface DecisionInputDerivation { previous: Ref; graph: Ref; decisions: Ref[] }
 export interface RefreshInputDerivation { kind: "refresh"; previous: Ref; stages: Record<UpstreamStage, Ref>; inventory: Ref | null }
-export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation;
+export interface FactInputDerivation { kind: "fact"; previous: Ref; answer: Ref; question: Ref }
+export interface ReopenFactDependency { record: Ref; question: Ref; removed: Ref[]; conditions: AnswerRequirementChange[] }
+export interface ReopenFactInputDerivation { kind: "reopen-facts"; previous: Ref; invalidations: AnswerInvalidation[];
+  dependencies?: ReopenFactDependency[] }
+export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation | FactInputDerivation | ReopenFactInputDerivation;
 export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[]; derivation?: InputDerivation }
-export interface DerivedInputRequest extends DecisionInputDerivation { project: string }
+export type DerivedInputRequest = { project: string } & (DecisionInputDerivation | FactInputDerivation | ReopenFactInputDerivation);
 export interface PreparedOmInput { record: OmInputRecord; writes: Write[]; guards: Ref[]; existing: Revision<OmInputRecord> | null }
 export const INPUT_REFRESH_CONFLICT = "input_refresh_conflict";
 
@@ -467,6 +475,9 @@ function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed
 }
 
 export function prepareOmInput(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput>> {
+  return withHistoricalReads(() => prepareOmInputInScope(store, request));
+}
+function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput>> {
   requireInputRequest(store, request);
   request = copy(request);
   const derived = deriveInputRecord(store, request);
@@ -481,13 +492,15 @@ export function prepareOmInput(store: Store, request: InputRequest): OmResult<Se
     if (canonical(checked.value.value.input.sources) === canonical(derived.value.input.sources)
       && canonical(checked.value.value.input.inventory) === canonical(derived.value.input.inventory))
       return prepareExistingOmInput(store, request.project, reference(current));
-    const refreshed = refreshInputRecord(checked.value as Revision<OmInputRecord>, derived.value as OmInputRecord);
+    const refreshed = refreshInputRecord(store, checked.value as Revision<OmInputRecord>, derived.value as OmInputRecord);
     if (!refreshed.ok) return refreshed;
     const acceptance = currentAcceptance(store, request);
     if (!acceptance.ok) return acceptance;
+    const facts = currentFactGuards(store, refreshed.value as OmInputRecord);
+    if (!facts.ok) return facts;
     return delivered({ record: refreshed.value, existing: null,
       writes: [{ id, kind: "om-input", expected: request.expected, value: refreshed.value }],
-      guards: [...acceptance.value, reference(current)] });
+      guards: [...acceptance.value, ...facts.value, reference(current)] });
   }
   const acceptance = currentAcceptance(store, request);
   if (!acceptance.ok) return acceptance;
@@ -499,6 +512,9 @@ export function prepareOmInput(store: Store, request: InputRequest): OmResult<Se
 }
 
 export function writeOmInput(store: Store, request: InputRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+  return withHistoricalReads(() => writeOmInputInScope(store, request));
+}
+function writeOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
   const prepared = prepareOmInput(store, request);
   if (!prepared.ok) return prepared;
   if (prepared.value.existing) return delivered(prepared.value.existing);
@@ -508,7 +524,56 @@ export function writeOmInput(store: Store, request: InputRequest): OmResult<Seal
   return delivered(result.value[0]!);
 }
 
+export interface HistoricalReadKey { reader: string; project: string; ref: Ref; parameters?: Json }
+interface HistoricalView { active: Set<string>; proven: Map<string, unknown> }
+let historicalViews: WeakMap<Store, HistoricalView> | null = null;
+function synchronous<T>(action: () => T): T {
+  if (typeof action !== "function") invalid("history.action");
+  const result = action();
+  if (result !== null && (typeof result === "object" || typeof result === "function")
+    && typeof (result as { then?: unknown }).then === "function") invalid("history.async");
+  return result;
+}
+
+/** Share exact proofs for one synchronous product operation; heads and current admission stay fresh. */
+export function withHistoricalReads<T>(action: () => T): T {
+  if (historicalViews) return synchronous(action);
+  historicalViews = new WeakMap();
+  try { return synchronous(action); }
+  finally { historicalViews = null; }
+}
+
+/** Only immutable, successful proof results belong here, never applicability to a changing body. */
+export function historicalRead<T>(store: Store, key: HistoricalReadKey, action: () => T,
+  onCycle: () => T, cacheable: (value: T) => boolean = value => !(object(value) && value.ok === false)): T {
+  if (!(store instanceof Store) || !object(key) || !text(key.reader) || !text(key.project) || !isRef(key.ref)
+    || typeof action !== "function" || typeof onCycle !== "function" || typeof cacheable !== "function") invalid("history");
+  const exact = canonical(key);
+  return withHistoricalReads(() => {
+    const views = historicalViews!;
+    let view = views.get(store);
+    if (!view) { view = { active: new Set(), proven: new Map() }; views.set(store, view); }
+    if (view.active.has(exact)) return synchronous(onCycle);
+    if (view.proven.has(exact)) return view.proven.get(exact) as T;
+    view.active.add(exact);
+    try {
+      const result = synchronous(action);
+      if (!(object(result) && result.ok === false) && cacheable(result)) view.proven.set(exact, result);
+      return result;
+    } finally { view.active.delete(exact); }
+  });
+}
+
 export function readOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<OmInputRecord>>> {
+  return withHistoricalReads(() => {
+    requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
+    if (!isRef(ref)) return readInputRecord(store, project, ref);
+    return historicalRead(store, { reader: "B1.readOmInput", project, ref }, () => readInputRecord(store, project, ref),
+      () => refused("record_forged", "Input sources contain a cyclic derivation", at(ref.id, "derivation", ref), "producer"), value => value.ok);
+  });
+}
+
+function readInputRecord(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<OmInputRecord>>> {
   requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
   const read = readRecord<OmInputRecord>(store, ref, { unit: "G1", target: `om-input:${project}`, id: `om-input:${project}`, kind: "om-input" });
   if (!read.ok) return read;
@@ -521,7 +586,20 @@ export function readOmInput(store: Store, project: string, ref: Ref): OmResult<S
     if (!object(lineage) || !isRef(lineage.previous) || lineage.previous.id !== ref.id || lineage.previous.revision !== ref.revision - 1)
       return refused("record_forged", "Derived input needs its immediately preceding exact input", at(ref.id, "derivation", ref), "producer");
     let rebuilt: OmResult<Sealed<OmInputRecord>>;
-    if (Object.hasOwn(lineage, "kind")) {
+    if (lineage.kind === "fact") {
+      if (!isRef(lineage.answer) || !isRef(lineage.question))
+        return refused("record_forged", "An applied fact needs its exact accepted answer and MC1 question", at(ref.id, "derivation", ref), "producer");
+      rebuilt = deriveOmInput(store, { project, kind: "fact", previous: lineage.previous, answer: lineage.answer, question: lineage.question });
+    } else if (lineage.kind === "reopen-facts") {
+      const invalidations = normalizedInvalidations(lineage.invalidations);
+      if (!invalidations) return refused("record_forged", "Reopening facts needs a nonempty, unambiguous set of exact invalidations",
+        at(ref.id, "derivation.invalidations", ref), "producer");
+      const dependencies = Object.hasOwn(lineage, "dependencies") ? normalizedDependencies(lineage.dependencies) : undefined;
+      if (dependencies === null) return refused("record_forged", "Dependent recovery needs exact, unambiguous causes",
+        at(ref.id, "derivation.dependencies", ref), "producer");
+      rebuilt = deriveOmInput(store, { project, kind: "reopen-facts", previous: lineage.previous, invalidations,
+        ...(dependencies ? { dependencies } : {}) });
+    } else if (Object.hasOwn(lineage, "kind")) {
       if (lineage.kind !== "refresh" || !object(lineage.stages) || INPUT_STAGES.some(stage => !isRef(lineage.stages[stage]))
         || (lineage.inventory !== null && !isRef(lineage.inventory)))
         return refused("record_forged", "A refresh needs explicit exact stages and inventory", at(ref.id, "derivation", ref), "producer");
@@ -529,7 +607,7 @@ export function readOmInput(store: Store, project: string, ref: Ref): OmResult<S
       if (!previous.ok) return previous;
       const root = deriveInputRecord(store, { project, stages: lineage.stages as InputRequest['stages'], inventory: lineage.inventory, expected: 0 });
       if (!root.ok) return root;
-      rebuilt = refreshInputRecord(previous.value as Revision<OmInputRecord>, root.value as OmInputRecord);
+      rebuilt = refreshInputRecord(store, previous.value as Revision<OmInputRecord>, root.value as OmInputRecord);
     } else {
       if (!isRef(lineage.graph) || !Array.isArray(lineage.decisions) || !lineage.decisions.every(isRef))
         return refused("record_forged", "Addressed input needs its exact graph and decisions", at(ref.id, "derivation", ref), "producer");
@@ -568,7 +646,7 @@ export function readOmInput(store: Store, project: string, ref: Ref): OmResult<S
 
 // Both arguments have passed their source-derived historical readers. Inventory is the only independent
 // root source here: a stage change needs a separate resolution, never an implicit reset of D3 fields.
-function refreshInputRecord(previous: Revision<OmInputRecord>, root: OmInputRecord): OmResult<Sealed<OmInputRecord>> {
+function refreshInputRecord(store: Store, previous: Revision<OmInputRecord>, root: OmInputRecord): OmResult<Sealed<OmInputRecord>> {
   if (canonical(previous.value.input.sources) !== canonical(root.input.sources))
     return refused(INPUT_REFRESH_CONFLICT, "Changed stage sources require an explicit resolution of the accepted input decisions",
       at(previous.id, "sources", reference(previous)), "producer");
@@ -577,30 +655,188 @@ function refreshInputRecord(previous: Revision<OmInputRecord>, root: OmInputReco
     ...root.gaps.filter(gap => gap.code === "inventory_missing")]);
   const stages = Object.fromEntries(root.input.sources.map(source => [source.stage,
     { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'];
-  return delivered({ projectId: root.projectId, input, hash: hashJson(input), gaps,
-    derivation: { kind: "refresh", previous: reference(previous), stages, inventory: root.input.inventory } });
+  const body: OmInputRecord = { projectId: root.projectId, input, hash: hashJson(input), gaps,
+    derivation: { kind: "refresh", previous: reference(previous), stages, inventory: root.input.inventory } };
+  const checked = checkFactContracts(store, body);
+  return checked.ok ? delivered(body) : checked;
+}
+
+// A source update or another accepted decision may alter essential fact conditions. Historical
+// derivation checks the new body against the same D5 contract; current admission adds only heads.
+function checkFactContracts(store: Store, body: OmInputRecord): OmResult<Sealed<null>> {
+  for (const fact of body.input.facts ?? []) {
+    const checked = checkAnswerInputBody(store, { project: body.projectId, record: fact.answer,
+      question: fact.mc1Question, input: body });
+    if (!checked.ok) return checked;
+    if (!checked.value.applicable) return refused("answer_inapplicable", "The applied fact no longer matches the exact input contract",
+      at(fact.question.id, "answer", fact.answer), "producer");
+  }
+  return delivered(null);
+}
+
+function currentFactGuards(store: Store, body: OmInputRecord): OmResult<Sealed<Ref[]>> {
+  const guards: Ref[] = [];
+  for (const fact of body.input.facts ?? []) {
+    const checked = answerSourceGuards(store, { project: body.projectId, record: fact.answer });
+    if (!checked.ok) return checked;
+    if (!checked.value.applicable) return refused("answer_inapplicable", "An applied fact's evidence is no longer current",
+      at(fact.question.id, "answer", fact.answer), "producer");
+    guards.push(...checked.value.guards);
+  }
+  return delivered(sorted([...new Map(guards.map(ref => [canonical(ref), ref])).values()]));
+}
+
+function normalizedInvalidations(value: unknown): AnswerInvalidation[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const answers = new Set<string>(), result: AnswerInvalidation[] = [];
+  for (const item of value) {
+    if (!object(item) || !isRef(item.record) || answers.has(item.record.id)
+      || !Array.isArray(item.sources) || item.sources.length === 0) return null;
+    answers.add(item.record.id);
+    const sources = new Set<string>();
+    for (const source of item.sources) {
+      if (!object(source) || !isRef(source.before) || !isRef(source.after) || sources.has(source.before.id)) return null;
+      sources.add(source.before.id);
+    }
+    result.push({ record: item.record, sources: sorted(item.sources) });
+  }
+  return sorted(result);
+}
+
+function normalizedDependencies(value: unknown): ReopenFactDependency[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const seen = new Set<string>(), result: ReopenFactDependency[] = [];
+  for (const item of value) {
+    if (!object(item) || !isRef(item.record) || !isRef(item.question) || seen.has(item.record.id)
+      || !Array.isArray(item.removed) || item.removed.length === 0 || !item.removed.every(isRef)
+      || new Set(item.removed.map((ref: Ref) => ref.id)).size !== item.removed.length
+      || !Array.isArray(item.conditions) || item.conditions.length === 0
+      || !item.conditions.every((condition: unknown) => object(condition) && typeof condition.pointer === "string"
+        && Object.hasOwn(condition, "before") && object(condition.after)
+        && (condition.after.present === false && !Object.hasOwn(condition.after, "value")
+          || condition.after.present === true && Object.hasOwn(condition.after, "value")))) return null;
+    seen.add(item.record.id);
+    result.push({ record: item.record, question: item.question, removed: sorted(item.removed), conditions: sorted(item.conditions) });
+  }
+  return sorted(result);
 }
 
 /** Historical derivation shared by the addressing writer, restored reads and current admission. */
 export function deriveOmInput(store: Store, request: DerivedInputRequest): OmResult<Sealed<OmInputRecord>> {
+  return withHistoricalReads(() => deriveOmInputInScope(store, request));
+}
+function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmResult<Sealed<OmInputRecord>> {
   if (!object(request)) invalid("request");
   requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
   if (!isRef(request.previous)) invalid("previous");
-  if (!isRef(request.graph)) invalid("graph");
-  if (!Array.isArray(request.decisions) || !request.decisions.every(isRef)) invalid("decisions");
+  if ("kind" in request) {
+    if (request.kind === "reopen-facts") {
+      if (!normalizedInvalidations(request.invalidations)) invalid("invalidations");
+      if (Object.hasOwn(request, "dependencies") && !normalizedDependencies(request.dependencies)) invalid("dependencies");
+    } else {
+      if (request.kind !== "fact") invalid("kind");
+      if (!isRef(request.answer)) invalid("answer");
+      if (!isRef(request.question)) invalid("question");
+    }
+  } else {
+    if (!isRef(request.graph)) invalid("graph");
+    if (!Array.isArray(request.decisions) || !request.decisions.every(isRef)) invalid("decisions");
+  }
   request = copy(request);
   const previous = readOmInput(store, request.project, request.previous);
   if (!previous.ok) return previous;
+  if ("kind" in request && request.kind === "reopen-facts") {
+    const invalidations = normalizedInvalidations(request.invalidations)!;
+    const body = previous.value.value, originalFacts = body.input.facts ?? [], removed = new Map<string, AppliedInputFact>();
+    for (const invalidation of invalidations) {
+      const matching = originalFacts.filter(fact => canonical(fact.answer) === canonical(invalidation.record));
+      if (matching.length !== 1 || body.input.questions.some(question => question.id === matching[0]!.question.id))
+        return refused("answer_inapplicable", "Invalidation must name one applied fact whose original question is still filled",
+          at(request.previous.id, "facts", invalidation.record), "producer");
+      const checked = readAnswerInvalidation(store, { project: request.project, invalidation });
+      if (!checked.ok) return checked;
+      removed.set(canonical(invalidation.record), matching[0]! as AppliedInputFact);
+    }
+    const provisional = (): OmInputRecord => {
+      const input: OmInput = { ...body.input as OmInput,
+        questions: sorted([...body.input.questions, ...[...removed.values()].map(fact => fact.question)]) as OmInput['questions'],
+        facts: originalFacts.filter(fact => !removed.has(canonical(fact.answer))) as AppliedInputFact[] };
+      return { projectId: request.project, input, hash: hashJson(input), gaps: body.gaps as InputGap[] };
+    };
+    const dependencies: ReopenFactDependency[] = [];
+    let result = provisional();
+    // Evaluate a whole round against the same withdrawal set. Simultaneous additions and exact
+    // condition changes make the fixed point independent of iteration order and replayable later.
+    for (;;) {
+      const pending: { fact: AppliedInputFact; reason: ReopenFactDependency }[] = [];
+      const causes = sorted([...removed.values()].map(fact => fact.answer));
+      for (const fact of result.input.facts ?? []) {
+        const checked = checkAnswerInputBody(store, { project: request.project, record: fact.answer,
+          question: fact.mc1Question, input: result });
+        if (!checked.ok) return checked;
+        if (checked.value.applicable) continue;
+        if (checked.value.requirementChanges.length === 0)
+          return refused("answer_inapplicable", "Recovery cannot remove a fact without a changed essential condition",
+            at(fact.question.id, "answer", fact.answer), "producer");
+        pending.push({ fact, reason: { record: fact.answer, question: fact.mc1Question, removed: causes,
+          conditions: sorted(checked.value.requirementChanges) as AnswerRequirementChange[] } });
+      }
+      if (pending.length === 0) break;
+      for (const item of pending) {
+        removed.set(canonical(item.fact.answer), item.fact);
+        dependencies.push(item.reason);
+      }
+      result = provisional();
+    }
+    const normalized = sorted(dependencies);
+    if (Object.hasOwn(request, "dependencies")
+      && canonical(normalizedDependencies(request.dependencies)) !== canonical(normalized))
+      return refused("record_forged", "Dependent recovery causes must follow from the exact prior input and root invalidations",
+        at(request.previous.id, "derivation.dependencies", request.previous), "producer");
+    result.derivation = { kind: "reopen-facts", previous: request.previous, invalidations,
+      ...(normalized.length ? { dependencies: normalized } : {}) };
+    const contracts = checkFactContracts(store, result);
+    return contracts.ok ? delivered(result) : contracts;
+  }
+  if ("kind" in request) {
+    const checked = readAnswerForInput(store, { project: request.project, record: request.answer,
+      question: request.question, input: request.previous, current: false });
+    if (!checked.ok) return checked;
+    if (!checked.value.applicable) return refused("answer_inapplicable", "The accepted answer does not match this exact input contract",
+      at(request.previous.id, "answer", request.answer), "producer");
+    const question = checked.value.sourceQuestion as OmInput['questions'][number];
+    const fact: AppliedInputFact = { question, value: checked.value.checked.record.value.value as Json,
+      answer: request.answer, mc1Question: request.question };
+    const body = previous.value.value, existing = body.input.facts?.find(item => item.question.id === question.id);
+    if (existing) return canonical(existing) === canonical(fact) ? delivered(body)
+      : refused("addressing_conflict", "An applied fact cannot overwrite the already filled question",
+        at(question.id, "answer", request.answer), "producer");
+    const unresolved = body.input.questions.filter(item => item.id === question.id);
+    if (unresolved.length !== 1 || canonical(unresolved[0]) !== canonical(question))
+      return refused("answer_inapplicable", "The original question must be an exact unresolved input field",
+        at(question.id, "answer", request.answer), "producer");
+    const input: OmInput = { ...body.input as OmInput, questions: body.input.questions.filter(item => item.id !== question.id) as OmInput['questions'],
+      facts: sorted([...(body.input.facts ?? []), fact]) as AppliedInputFact[] };
+    const result: OmInputRecord = { projectId: request.project, input, hash: hashJson(input), gaps: body.gaps as InputGap[],
+      derivation: { kind: "fact", previous: request.previous, answer: request.answer, question: request.question } };
+    const contracts = checkFactContracts(store, result);
+    return contracts.ok ? delivered(result) : contracts;
+  }
   const decisions = sorted(request.decisions);
   const derived = deriveInputDecisions(store, { project: request.project, previous: previous.value as Revision<OmInputRecord>,
     graph: request.graph, decisions });
   if (!derived.ok) return derived;
-  return delivered({ projectId: request.project, input: derived.value.input, hash: hashJson(derived.value.input),
-    gaps: derived.value.gaps, derivation: { previous: request.previous, graph: request.graph, decisions } });
+  const result: OmInputRecord = { projectId: request.project, input: derived.value.input as OmInput, hash: hashJson(derived.value.input),
+    gaps: derived.value.gaps as InputGap[], derivation: { previous: request.previous, graph: request.graph, decisions: decisions as Ref[] } };
+  const contracts = checkFactContracts(store, result);
+  return contracts.ok ? delivered(result) : contracts;
 }
 
 /** Admit an exact saved version without reconstructing it as a stage-only root or requiring historical heads. */
 export function prepareExistingOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<PreparedOmInput>> {
+  return withHistoricalReads(() => prepareExistingOmInputInScope(store, project, ref));
+}
+function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref): OmResult<Sealed<PreparedOmInput>> {
   const read = readOmInput(store, project, ref);
   if (!read.ok) return read;
   const current = store.get<OmInputRecord>(ref.id);
@@ -612,5 +848,85 @@ export function prepareExistingOmInput(store: Store, project: string, ref: Ref):
       { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'],
     inventory: body.input.inventory, expected: ref.revision });
   if (!acceptance.ok) return acceptance;
-  return delivered({ record: body, existing: read.value, writes: [], guards: [...acceptance.value, ref] });
+  const facts = currentFactGuards(store, body as OmInputRecord);
+  if (!facts.ok) return facts;
+  return delivered({ record: body, existing: read.value, writes: [], guards: [...acceptance.value, ...facts.value, ref] });
+}
+
+/** The only recovery bypass is the stale fact being removed; stage acceptance remains current. */
+export function prepareReopenOmInput(store: Store, request: { project: string; input: Ref }): OmResult<Sealed<PreparedOmInput>> {
+  return withHistoricalReads(() => prepareReopenOmInputInScope(store, request));
+}
+function prepareReopenOmInputInScope(store: Store, request: { project: string; input: Ref }): OmResult<Sealed<PreparedOmInput>> {
+  if (!object(request)) invalid("request");
+  requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
+  if (!isRef(request.input)) invalid("input");
+  request = copy(request);
+  const read = readOmInput(store, request.project, request.input);
+  if (!read.ok) return read;
+  const current = store.get<OmInputRecord>(request.input.id);
+  if (!current) return refused("input_stale", "Recovery requires an existing input head", at(request.input.id, "head", request.input), "producer");
+  if (canonical(reference(current)) !== canonical(request.input)) {
+    const admitted = prepareExistingOmInput(store, request.project, reference(current));
+    if (!admitted.ok) return admitted;
+    let cursor = admitted.value.existing as Revision<OmInputRecord>;
+    while (cursor.value.derivation) {
+      const derivation = cursor.value.derivation;
+      if ("kind" in derivation && derivation.kind === "reopen-facts"
+        && canonical(derivation.previous) === canonical(request.input))
+        return delivered({ record: cursor.value, existing: cursor, writes: [], guards: admitted.value.guards });
+      const previous = readOmInput(store, request.project, derivation.previous);
+      if (!previous.ok) return previous;
+      cursor = previous.value as Revision<OmInputRecord>;
+    }
+    return refused("input_stale", "An old input can only repeat its exact saved recovery", at(request.input.id, "head", request.input), "producer");
+  }
+  const body = read.value.value as OmInputRecord;
+  const acceptance = currentAcceptance(store, { project: request.project,
+    stages: Object.fromEntries(body.input.sources.map(source => [source.stage,
+      { id: source.id, revision: source.revision, hash: source.hash }])) as InputRequest['stages'],
+    inventory: body.input.inventory, expected: request.input.revision });
+  if (!acceptance.ok) return acceptance;
+  const invalidations: AnswerInvalidation[] = [], writes = new Map<string, Write>();
+  const guards: Ref[] = [...acceptance.value, request.input];
+  for (const fact of body.input.facts ?? []) {
+    const prepared = prepareAnswerInvalidation(store, { project: request.project, record: fact.answer });
+    if (!prepared.ok) return prepared;
+    guards.push(...prepared.value.guards);
+    if (prepared.value.invalidation) invalidations.push(prepared.value.invalidation as AnswerInvalidation);
+    for (const write of prepared.value.writes) {
+      const old = writes.get(write.id);
+      if (old && canonical(old) !== canonical(write))
+        return refused("input_stale", "A source changed between fact invalidations", at(write.id, "head"), "producer");
+      writes.set(write.id, write as Write);
+    }
+  }
+  const pending = new Map([...writes.values()].map(write => [write.id,
+    { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(write.value), value: write.value }]));
+  const view = new Proxy(store, { get(target, property) {
+    if (property === "get") return <T = Json>(id: string, revision?: number): Revision<T> | null => {
+      const row = pending.get(id);
+      return row && (revision === undefined || row.revision === revision) ? row as Revision<T> : target.get<T>(id, revision);
+    };
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  const rebuilt = invalidations.length
+    ? deriveOmInput(view, { project: request.project, kind: "reopen-facts", previous: request.input, invalidations })
+    : delivered(body);
+  if (!rebuilt.ok) return rebuilt;
+  const facts = currentFactGuards(view, rebuilt.value as OmInputRecord);
+  if (!facts.ok) return facts;
+  guards.push(...facts.value);
+  const heads = new Map<string, Ref>();
+  for (const guard of guards) {
+    const previous = heads.get(guard.id);
+    if (previous && canonical(previous) !== canonical(guard))
+      return refused("input_stale", "Recovery observed conflicting source heads", at(guard.id, "head", previous), "producer");
+    heads.set(guard.id, guard);
+  }
+  if (!invalidations.length) return delivered({ record: body, existing: read.value, writes: [], guards: sorted([...heads.values()]) });
+  return delivered({ record: rebuilt.value, existing: null,
+    writes: [...writes.values(), { id: request.input.id, kind: "om-input", expected: request.input.revision, value: rebuilt.value }],
+    guards: sorted([...heads.values()]) });
 }

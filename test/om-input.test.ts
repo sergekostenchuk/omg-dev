@@ -11,7 +11,8 @@ import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import {
-  buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput,
+  buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput, prepareReopenOmInput,
+  withHistoricalReads, historicalRead, type HistoricalReadKey,
   INPUT_REFUSAL_CODES, NODES_REQUIRED_SINCE, INPUT_REFRESH_CONFLICT,
   type InputBuildResult, type InputOptions, type InputRequest, type InputStages, type OmInput, type OmInputRecord, type DerivedInputRequest,
 } from "../src/om/input.js";
@@ -831,7 +832,18 @@ test("B1 derived-input request shape is checked before storage reads", async t =
   const ref = reference(f.graphRevision);
   const valid: DerivedInputRequest = { project: f.project, previous: ref, graph: ref, decisions: [] };
   const cases: unknown[] = [undefined, null, {}, { ...valid, previous: null }, { ...valid, graph: null },
-    { ...valid, decisions: undefined }, { ...valid, decisions: null }, { ...valid, decisions: [null] }];
+    { ...valid, decisions: undefined }, { ...valid, decisions: null }, { ...valid, decisions: [null] },
+    { project: f.project, kind: "fact", previous: ref, answer: null, question: ref },
+    { project: f.project, kind: "fact", previous: ref, answer: ref, question: null },
+    { project: f.project, kind: "unapproved", previous: ref, answer: ref, question: ref },
+    { project: f.project, kind: "reopen-facts", previous: ref, invalidations: [] },
+    { project: f.project, kind: "reopen-facts", previous: ref, invalidations: [{ record: ref, sources: [] }] },
+    { project: f.project, kind: "reopen-facts", previous: ref,
+      invalidations: [{ record: ref, sources: [{ before: ref, after: null }] }] },
+    { project: f.project, kind: "reopen-facts", previous: ref,
+      invalidations: [{ record: ref, sources: [{ before: ref, after: ref }, { before: ref, after: ref }] }] },
+    { project: f.project, kind: "reopen-facts", previous: ref,
+      invalidations: [{ record: ref, sources: [{ before: ref, after: ref }] }, { record: ref, sources: [{ before: ref, after: ref }] }] }];
   const originalGet = f.store.get;
   f.store.get = () => { throw new Error("Malformed requests must not reach storage"); };
   try {
@@ -1026,4 +1038,231 @@ test("B1 refresh history cannot skip an accepted decision by naming an earlier r
   f.restart();
   refusal(readOmInput(f.store, f.project, reference(forged)), "record_forged");
   assert.deepEqual(delivered(readOmInput(f.store, f.project, reference(f.addressed))), f.addressed);
+});
+
+test("B1 does not trust fact derivation claims without exact accepted answer sources", t => {
+  const f = refreshFixture(t), previous = reference(f.addressed);
+  const missingAnswer = { id: "om-answer:garden:missing", revision: 1, hash: fakeHash };
+  const missingQuestion = { id: "om-mc1-question:garden:missing", revision: 1, hash: fakeHash };
+  const request: DerivedInputRequest = { project: f.project, kind: "fact", previous,
+    answer: missingAnswer, question: missingQuestion };
+  const before = f.store.list().map(reference);
+  refusal(deriveOmInput(f.store, request), "record_missing");
+  assert.deepEqual(f.store.list().map(reference), before);
+
+  const fake = clone(f.addressed.value) as OmInputRecord;
+  const original = fake.input.questions.shift()!;
+  fake.input.facts = [{ question: original, value: "invented", answer: missingAnswer, mc1Question: missingQuestion }];
+  fake.hash = hashJson(fake.input);
+  fake.derivation = { kind: "fact", previous, answer: missingAnswer, question: missingQuestion };
+  const saved = f.store.write({ id: f.addressed.id, kind: f.addressed.kind, expected: f.addressed.revision, value: fake });
+  for (const result of [readOmInput(f.store, f.project, reference(saved)), prepareExistingOmInput(f.store, f.project, reference(saved)),
+    prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: saved.revision })]) refusal(result as OmResult<unknown>, "record_missing");
+  assert.equal(f.store.get(saved.id)!.revision, saved.revision);
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, previous)), f.addressed);
+  f.restart();
+  refusal(readOmInput(f.store, f.project, reference(saved)), "record_missing");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, previous)), f.addressed);
+});
+
+test("B1 fact lineage requires both exact producer records and the immediate predecessor", t => {
+  for (const variant of ["answer", "question", "previous"]) {
+    const f = refreshFixture(t), previous = reference(f.addressed), exact = reference(f.base);
+    const lineage = variant === "answer" ? { kind: "fact", previous, answer: null, question: exact }
+      : variant === "question" ? { kind: "fact", previous, answer: exact }
+        : { kind: "fact", previous: exact, answer: exact, question: exact };
+    const body = { ...clone(f.addressed.value), derivation: lineage };
+    const head = f.store.get(f.addressed.id)!;
+    const saved = f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: body });
+    const result = refusal(readOmInput(f.store, f.project, reference(saved)), "record_forged");
+    assert.equal(result.at.field, "derivation");
+    f.restart();
+    refusal(readOmInput(f.store, f.project, reference(f.store.get(f.addressed.id)!)), "record_forged");
+    assert.deepEqual(delivered(readOmInput(f.store, f.project, previous)), f.addressed);
+  }
+});
+
+test("B1 recovery is a guarded no-op without invalidated facts and still requires current stages", t => {
+  const f = refreshFixture(t), ref = reference(f.addressed), before = f.store.list().map(reference);
+  const prepared = delivered(prepareReopenOmInput(f.store, { project: f.project, input: ref }));
+  assert.deepEqual(prepared.record, f.addressed.value);
+  assert.deepEqual(prepared.existing, f.addressed);
+  assert.deepEqual(prepared.writes, []);
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)));
+  assert.deepEqual(f.store.list().map(reference), before);
+  f.restart();
+  assert.deepEqual(delivered(prepareReopenOmInput(f.store, { project: f.project, input: ref })).existing, f.addressed);
+  const proof = reference(f.store.get(`source:${f.project}:brief`)!);
+  bumpProof(f.store, proof);
+  refusal(prepareReopenOmInput(f.store, { project: f.project, input: ref }), "stage_not_accepted");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
+});
+
+test("B1 cannot use a recovery claim to reopen a question with no applied fact", t => {
+  const f = refreshFixture(t), previous = reference(f.addressed);
+  const ref = { id: "om-answer:garden:invented", revision: 1, hash: fakeHash };
+  const source = { id: "source:garden:invented", revision: 1, hash: fakeHash };
+  const derivation = { kind: "reopen-facts" as const, previous,
+    invalidations: [{ record: ref, sources: [{ before: source, after: { ...source, revision: 2 } }] }] };
+  const before = f.store.list().map(reference);
+  refusal(deriveOmInput(f.store, { project: f.project, ...derivation }), "answer_inapplicable");
+  assert.deepEqual(f.store.list().map(reference), before);
+  const value = { ...clone(f.addressed.value), derivation };
+  const counterfeit = f.store.write({ id: f.addressed.id, kind: f.addressed.kind, expected: f.addressed.revision, value });
+  refusal(readOmInput(f.store, f.project, reference(counterfeit)), "answer_inapplicable");
+  refusal(prepareReopenOmInput(f.store, { project: f.project, input: reference(counterfeit) }), "answer_inapplicable");
+  f.restart();
+  refusal(readOmInput(f.store, f.project, reference(counterfeit)), "answer_inapplicable");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, previous)), f.addressed);
+});
+
+test("B1 recovery request shape is checked before storage access", async t => {
+  const f = await createOmFixture(t), original = f.store.get;
+  f.store.get = () => { throw new Error("Malformed recovery must not read storage"); };
+  try {
+    for (const request of [undefined, null, {}, { project: f.project }, { project: f.project, input: null }])
+      assert.throws(() => prepareReopenOmInput(f.store, request as Parameters<typeof prepareReopenOmInput>[1]), addressedError);
+  } finally { f.store.get = original; }
+});
+
+test("B1 historical memo ends with its outer read and never masks later storage failures or counterfeits", t => {
+  const f = refreshFixture(t), ref = reference(f.addressed), original = f.store.get;
+  let exactReads = 0;
+  f.store.get = function<T = Json>(id: string, revision?: number): Revision<T> | null {
+    if (id === ref.id && revision === ref.revision) exactReads++;
+    return original.call(this, id, revision) as Revision<T> | null;
+  };
+  try {
+    for (let pass = 1; pass <= 2; pass++) {
+      assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
+      assert.equal(exactReads, pass, "Each outer historical call must read its exact source again");
+    }
+    const failure = new EngineError("record_corrupt", "The next independent read must reach storage");
+    f.store.get = function<T = Json>(id: string, revision?: number): Revision<T> | null {
+      if (id === ref.id && revision === ref.revision) throw failure;
+      return original.call(this, id, revision) as Revision<T> | null;
+    };
+    assert.throws(() => readOmInput(f.store, f.project, ref), error => error === failure);
+    f.store.get = original;
+    assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed, "An exceptional read must discard its context too");
+    refusal(readOmInput(f.store, f.project, { ...ref, hash: fakeHash }), "record_forged");
+    refusal(readOmInput(f.store, "another-project", ref), "record_foreign");
+    assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
+  } finally { f.store.get = original; }
+});
+
+test("B1 dependent recovery rejects missing evidence and duplicate causes before storage", async t => {
+  const f = await createOmFixture(t), ref = reference(f.graphRevision);
+  const invalidations = [{ record: ref, sources: [{ before: ref, after: { ...ref, revision: ref.revision + 1 } }] }];
+  const dependency = { record: ref, question: ref, removed: [ref],
+    conditions: [{ pointer: "/facts/0/value", before: "JSON", after: { present: false } }] };
+  const broken: unknown[] = [undefined, null, [], [{ ...dependency, question: null }],
+    [{ ...dependency, removed: [] }], [{ ...dependency, removed: [ref, ref] }], [dependency, dependency],
+    [{ ...dependency, conditions: [] }], [{ ...dependency, conditions: [{ pointer: "/facts/0/value", after: { present: false } }] }],
+    [{ ...dependency, conditions: [{ pointer: "/facts/0/value", before: "JSON", after: { present: true } }] }],
+    [{ ...dependency, conditions: [{ pointer: "/facts/0/value", before: "JSON", after: { present: false, value: null } }] }]];
+  const original = f.store.get;
+  f.store.get = () => { throw new Error("Malformed dependency causes must not reach storage"); };
+  try {
+    for (const dependencies of broken) assert.throws(() => deriveOmInput(f.store,
+      { project: f.project, kind: "reopen-facts", previous: ref, invalidations, dependencies } as DerivedInputRequest), addressedError);
+  } finally { f.store.get = original; }
+});
+
+test("B1 saved recovery cannot hide malformed dependent causes as an absent set", t => {
+  const f = refreshFixture(t), previous = reference(f.addressed);
+  const answer = { id: "om-answer:garden:invented", revision: 1, hash: fakeHash };
+  const source = { id: "source:garden:invented", revision: 1, hash: fakeHash };
+  const body = { ...clone(f.addressed.value), derivation: { kind: "reopen-facts", previous,
+    invalidations: [{ record: answer, sources: [{ before: source, after: { ...source, revision: 2 } }] }],
+    dependencies: [{ record: answer, question: answer, removed: [answer],
+      conditions: [{ pointer: "/facts/0/value", after: { present: false } }] }] } };
+  const saved = f.store.write({ id: f.addressed.id, kind: f.addressed.kind, expected: f.addressed.revision, value: body });
+  const result = refusal(readOmInput(f.store, f.project, reference(saved)), "record_forged");
+  assert.equal(result.at.field, "derivation.dependencies");
+  refusal(prepareReopenOmInput(f.store, { project: f.project, input: reference(saved) }), "record_forged");
+  f.restart();
+  refusal(readOmInput(f.store, f.project, reference(saved)), "record_forged");
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, previous)), f.addressed);
+});
+
+function historicalStores(t: TestContext) {
+  const directory = mkdtempSync(join(tmpdir(), "om-history-scope-"));
+  const first = new Store(join(directory, "first.sqlite")), second = new Store(join(directory, "second.sqlite"));
+  t.after(() => { first.close(); second.close(); rmSync(directory, { recursive: true, force: true }); });
+  return { first, second };
+}
+
+test("historical operation scope joins nested calls and keys proofs by reader, view, project, exact ref and parameters", t => {
+  const { first, second } = historicalStores(t), view = new Proxy(first, {}), otherView = new Proxy(first, {});
+  const key: HistoricalReadKey = { reader: "scope.proof", project: "garden", ref: { id: "proof:garden", revision: 1, hash: fakeHash } };
+  let proofs = 0;
+  const cycle = () => { throw new Error("Unexpected history cycle"); };
+  const read = (store: Store, requested = key) => historicalRead(store, requested, () => ++proofs, cycle);
+  withHistoricalReads(() => {
+    assert.equal(read(first), 1);
+    assert.equal(withHistoricalReads(() => read(first)), 1, "A nested public operation shares its proven history");
+    assert.equal(read(view), 2);
+    assert.equal(read(view), 2);
+    assert.equal(read(otherView), 3);
+    assert.equal(read(second), 4);
+    assert.equal(read(first, { ...key, reader: "scope.other" }), 5);
+    assert.equal(read(first, { ...key, project: "other-project" }), 6);
+    assert.equal(read(first, { ...key, ref: { ...key.ref, id: "proof:other" } }), 7);
+    assert.equal(read(first, { ...key, ref: { ...key.ref, revision: 2 } }), 8);
+    assert.equal(read(first, { ...key, ref: { ...key.ref, hash: "f".repeat(64) } }), 9);
+    assert.equal(read(first, { ...key, parameters: { level: 2, scope: ["a", "b"] } }), 10);
+    assert.equal(read(first, { ...key, parameters: { scope: ["a", "b"], level: 2 } }), 10);
+    assert.equal(read(first, { ...key, parameters: { level: 3, scope: ["a", "b"] } }), 11);
+    assert.equal(read(first, { ...key, parameters: { level: 2, scope: ["b", "a"] } }), 12);
+    assert.equal(read(first), 1);
+  });
+  assert.equal(read(first), 13, "The next standalone operation must prove the exact source again");
+  assert.equal(read(first), 14);
+});
+
+test("historical scope does not cache refusals or exceptions, detects cycles and releases all outcomes", t => {
+  const { first } = historicalStores(t);
+  const key: HistoricalReadKey = { reader: "scope.outcome", project: "garden", ref: { id: "proof:garden", revision: 1, hash: fakeHash } };
+  type Outcome = { ok: boolean; value: string };
+  const cycle = (): Outcome => ({ ok: false, value: "cycle" });
+  const failed = (): Outcome => ({ ok: false, value: "unproven" });
+  const succeeded = (): Outcome => ({ ok: true, value: "proved" });
+  let attempts = 0;
+  withHistoricalReads(() => {
+    const refusal = () => { attempts++; return failed(); };
+    assert.deepEqual(historicalRead(first, key, refusal, cycle, () => true), failed());
+    assert.deepEqual(historicalRead(first, key, refusal, cycle, () => true), failed());
+    assert.equal(attempts, 2, "An explicit cache predicate cannot turn a refusal into a cached proof");
+    const failure = new EngineError("record_corrupt", "Uncaught source failure");
+    assert.throws(() => historicalRead(first, key, () => { attempts++; throw failure; }, cycle), error => error === failure);
+    assert.deepEqual(historicalRead(first, key, () => { attempts++; return succeeded(); }, cycle), succeeded());
+    assert.deepEqual(historicalRead(first, key, () => { throw new Error("Already proved"); }, cycle), succeeded());
+    assert.equal(attempts, 4);
+  });
+  const failure = new Error("Outer operation failed after proving a source");
+  assert.throws(() => withHistoricalReads(() => {
+    historicalRead(first, key, () => { attempts++; return succeeded(); }, cycle);
+    throw failure;
+  }), error => error === failure);
+  assert.deepEqual(historicalRead(first, key, () => { attempts++; return failed(); }, cycle), failed());
+  assert.equal(attempts, 6, "Neither successful scope exit nor exceptional exit retains cached proofs");
+  withHistoricalReads(() => {
+    assert.deepEqual(historicalRead(first, key,
+      () => historicalRead(first, key, () => { throw new Error("A cycle must not execute the recursive reader"); }, cycle), cycle), cycle());
+    assert.deepEqual(historicalRead(first, key, succeeded, cycle), succeeded(), "Cycle detection must remove the active entry on unwind");
+  });
+  assert.throws(() => withHistoricalReads(() => Promise.resolve("unsupported asynchronous operation")), addressedError);
+  assert.deepEqual(historicalRead(first, key, failed, cycle), failed(), "Rejected asynchronous scope must be released too");
+});
+
+test("B1 shares historical proofs inside an operation while current admission still sees changed heads", t => {
+  const f = refreshFixture(t), ref = reference(f.addressed);
+  withHistoricalReads(() => {
+    assert.deepEqual(delivered(prepareExistingOmInput(f.store, f.project, ref)).existing, f.addressed);
+    bumpProof(f.store, reference(f.store.get(`source:${f.project}:brief`)!));
+    assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
+    refusal(prepareExistingOmInput(f.store, f.project, ref), "stage_not_accepted");
+  });
+  assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
 });
