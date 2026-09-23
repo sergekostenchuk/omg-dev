@@ -12,6 +12,10 @@ export interface RoleBinding { actor: string; model: string; effort: string; com
 export interface Environment {
   projectId: string; workspace: string; implementer: RoleBinding; reviewer: RoleBinding;
   fullCheck: Command; timeoutMs: number;
+  requestCapacityChars?: number;
+}
+export function isRequestCapacityChars(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 export interface RepositoryState { root: string; head: string; tree: string; files: { path: string; hash: string | null }[] }
 export interface ExecutionRoot { projectId: string; sourceRoot: string; workspace: Ref; path: string; branch: string; base: string; head: string; state: "creating" | "ready" }
@@ -84,6 +88,10 @@ export class Environments {
   configure(projectId: string, value: Omit<Environment, "projectId">, expected: number): Revision<Environment> {
     requireCondition(value && typeof value.workspace === "string" && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 100 && value.timeoutMs <= 3_600_000,
       "environment_invalid", "Workspace and a bounded timeout are required");
+    // Absence belongs to the previous era; never materialize a default in saved environments.
+    if (Object.hasOwn(value, "requestCapacityChars") && !isRequestCapacityChars(value.requestCapacityChars))
+      throw new EngineError("environment_invalid", "Request capacity must be a positive safe integer measured in characters",
+        { target: `environment:${projectId}`, field: "requestCapacityChars" });
     const workspace = realpathSync(value.workspace);
     const root = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
     requireCondition(!root || root.value.sourceRoot === workspace, "workspace_in_use", "Create a new project to use another repository after execution has begun");
