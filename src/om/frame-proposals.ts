@@ -157,8 +157,8 @@ function fits(node: Node | undefined, row: ProposalFill, obligation: FrameObliga
   const contract = frame.upper.artifacts.find(item => item.id === obligation.artifact)?.contract;
   return !!port && port.direction === (obligation.role === 'producer' ? 'out' : 'in') && port.contract === contract;
 }
-function derive(frame: FrameRead, observations: ProposalObservation[]): ProposalResult {
-  const base = verifiedBase(frame), proposals = [...observations].sort((a, b) => order(a.reference.id, b.reference.id));
+function derive(frame: FrameRead, observations: ProposalObservation[], base: FilledFrame = verifiedBase(frame)): ProposalResult {
+  const proposals = [...observations].sort((a, b) => order(a.reference.id, b.reference.id));
   if (new Set(proposals.map(item => item.reference.id)).size !== proposals.length)
     reject('proposal_invalid', 'proposals', 'reference', 'Each proposal occurs once in the checked set');
   for (const proposal of proposals) checkProposal(proposal, frame);
@@ -243,7 +243,8 @@ function derive(frame: FrameRead, observations: ProposalObservation[]): Proposal
   return { obligations: base.obligations, fills: sorted(fills), open, representatives, joins: sorted(joins), proposals };
 }
 
-/** Pure application consumes the complete C2 result; storage entry points establish its accepted provenance. */
+/** Pure calls require complete structural correspondence. Partial rebases need read/prepareFrameProposals,
+ * whose C2 reader verifies the saved transition; caller-supplied markers never establish that provenance. */
 export function applyProposals(frame: FrameRead, proposals: ProposalObservation[]): OmResult<Sealed<ProposalResult>> {
   requireFrame(frame); requireObservations(proposals);
   frame = copy(frame); proposals = copy(proposals);
@@ -298,7 +299,8 @@ function loadProposals(store: Store, request: ProposalRequest): ProposalObservat
   });
 }
 function bundle(frame: FrameRead, proposals: ProposalObservation[]): FrameProposals {
-  const result = derive(frame, proposals);
+  // Only the storage entry points call this function, immediately after their own verified C2 read.
+  const result = derive(frame, proposals, frame.result);
   const references = sorted([...new Map([...frame.references, ...result.proposals.map(item => item.reference)]
     .map(ref => [canonical(ref), ref])).values()]);
   return { frame, proposals: result.proposals, result, gaps: gapsOf(frame, result), references };

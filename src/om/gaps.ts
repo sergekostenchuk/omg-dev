@@ -11,7 +11,7 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } 
 import { readRecord, writeGuarded } from './refs.js';
 import { readOmInput, type InputBuildResult, type InputGap, type OmInput } from './input.js';
 import { readHorizon } from './horizon.js';
-import { readLayerEnvelope } from './layer-basis.js';
+import { readUnacceptedLayer } from './layer-basis.js';
 import { prepareFrameProposals, readFrameProposals, type FrameGap, type ProposalRequest, type PreparedFrameProposals } from './frame-proposals.js';
 
 export const KNOWLEDGE_KINDS = sealed([...ENGINE_KINDS]);
@@ -340,17 +340,16 @@ function materialize(store: Store, request: GapRequest, current: boolean): Mater
   const operations = take(read(store, request.operations));
   let works: Sealed<{ gaps: FrameGap[]; references: Ref[]; guards?: Ref[] }>;
   if (unavailableWorks(request.works)) {
-    // The existing L2 envelope is positive evidence for this historical state and a guardable record.
-    const envelope = take(readLayerEnvelope(store, { project: request.project, level: 2, graph: request.graph, layer: request.works.layer }));
-    if (operations.frame.accepted !== null || horizon.horizon.value.request.refinement !== null
-      || (envelope.layer.value.layerProofs ?? []).some(proof => proof.level >= 2))
+    if (operations.frame.accepted !== null || horizon.horizon.value.request.refinement !== null)
       reject('gap_record_forged', request.project, 'works', 'The unavailable works source contradicts its saved upper-layer basis');
+    const envelope = take(readUnacceptedLayer(store,
+      { project: request.project, level: 2, graph: request.graph, layer: request.works.layer }));
     if (current) {
       const head = store.get(request.works.layer.id);
       if (!head || !same(reference(head), request.works.layer))
         reject('input_stale', request.works.layer.id, 'works.layer', 'The unavailable works source is no longer current');
     }
-    works = { gaps: [], references: envelope.references, guards: current ? [request.works.layer] : [] };
+    works = { gaps: [], references: envelope.references, guards: current ? envelope.currentReferences : [] };
   } else works = take(read(store, request.works)) as Sealed<PreparedFrameProposals>;
   const sources: GapSources = { inputResult: { input: input.value.input as OmInput, hash: input.value.hash, gaps: input.value.gaps as InputGap[], refusals: [] },
     graph: graph.value as Graph, horizon: { nodes: [...horizon.horizon.value.result.horizon.nodes] },

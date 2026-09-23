@@ -12,7 +12,7 @@ import { ProductEngine } from "../product/engine.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
 import { prepareOmInput, readOmInput, type InputRequest } from "./input.js";
 import { readRecord } from "./refs.js";
-import { readLayerBasis, type LayerBasis } from "./layer-basis.js";
+import { readLayerAcceptance, readLayerBasis, type LayerBasis } from "./layer-basis.js";
 
 export const FRAME_REFUSAL_CODES = Object.freeze([
   "frame_request_invalid", "upper_binding_ambiguous", "accepted_binding_ambiguous", "frame_upper_drift",
@@ -139,17 +139,22 @@ function acceptsFlowAnchor(upper: Graph, graph: Graph, flow: FrameFlow, binding:
   return !!anchor && anchor.outcome === flow.artifact && graph.nodes.some(node => node.id === anchor.owner && node.outcome === anchor.outcome)
     && graph.tests.some(test => test.id === anchor.test) && !!connector?.wakeTest && graph.tests.some(test => test.id === connector.wakeTest);
 }
-function checkFlowCorrespondence(upper: Graph, graph: Graph, obligations: FrameObligation[], rows: Map<string, FrameFill[]>, level: FrameLevel,
-  code: "frame_record_invalid" | "accepted_binding_ambiguous", target: string): void {
+interface FlowFault { connector: string; message: string; obligations: string[] }
+function flowFaults(upper: Graph, graph: Graph, obligations: FrameObligation[], rows: Map<string, FrameFill[]>, level: FrameLevel,
+  partial: boolean): FlowFault[] {
+  const faults: FlowFault[] = [];
   const flows = upperFlows(upper, level).map(flow => {
     const ends = obligations.filter(item => item.connector === flow.connector && item.flow === flow.key);
     const producers = rows.get(ends.find(item => item.role === "producer")!.id) ?? [];
-    if (producers.length > 1) frameReject(code, target, flow.connector, "An upper flow has several lower producers");
-    return { flow, producer: producers[0], consumers: new Set(ends.filter(item => item.role === "consumer")
+    if (producers.length > 1) faults.push({ connector: flow.connector, obligations: ends.map(item => item.id),
+      message: "An upper flow has several lower producers" });
+    return { flow, ends, producer: producers[0], consumers: new Set(ends.filter(item => item.role === "consumer")
       .flatMap(item => (rows.get(item.id) ?? []).map(frameEndpointKey))), actual: new Set<string>() };
   });
-  // The lower graph supplies every delivery, while rows supply exact renamed endpoints. Sleeping
-  // work deliveries may partition one upper flow, but no delivery may satisfy two upper flows.
+  const fault = (items: typeof flows, connector: string, message: string) => faults.push({ connector, message,
+    obligations: items.flatMap(item => item.ends.map(end => end.id)) });
+  // A verified partial frame leaves retired deliveries in the graph. Only unrepresented deliveries
+  // are ignored; every delivery belonging to a carried producer and anchor still has one whole flow.
   for (const connector of graph.connectors) {
     const expected = flows.filter(item => item.flow.connector === connector.id);
     if (!expected.length) continue;
@@ -160,27 +165,51 @@ function checkFlowCorrespondence(upper: Graph, graph: Graph, obligations: FrameO
       else deliveries.set(key, { ...binding, consumers: [...binding.consumers] });
     }
     for (const delivery of deliveries.values()) {
+      const owners = expected.filter(item => item.producer && frameEndpointKey(item.producer) === frameEndpointKey(delivery.producer)
+        && acceptsFlowAnchor(upper, graph, item.flow, delivery, level));
+      if (partial && !owners.length) continue;
       const consumers = delivery.consumers.map(frameEndpointKey);
       if (new Set(consumers).size !== consumers.length)
-        frameReject(code, target, connector.id, "The same consumer occurs twice in one accepted lower flow");
-      const candidates = expected.filter(item => item.producer && frameEndpointKey(item.producer) === frameEndpointKey(delivery.producer)
-        && acceptsFlowAnchor(upper, graph, item.flow, delivery, level) && consumers.every(endpoint => item.consumers.has(endpoint)));
-      if (candidates.length !== 1)
-        frameReject(code, target, connector.id, "Each accepted lower flow must correspond to exactly one whole upper flow");
+        fault(owners, connector.id, "The same consumer occurs twice in one accepted lower flow");
+      const candidates = owners.filter(item => consumers.every(endpoint => item.consumers.has(endpoint)));
+      if (candidates.length !== 1) {
+        fault(owners.length ? owners : expected, connector.id, "Each accepted lower flow must correspond to exactly one whole upper flow");
+        continue;
+      }
       const assigned = candidates[0]!;
       for (const endpoint of consumers) {
-        if (assigned.actual.has(endpoint)) frameReject(code, target, connector.id, "An upper consumer is repeated across active and sleeping deliveries");
+        if (assigned.actual.has(endpoint)) fault([assigned], connector.id, "An upper consumer is repeated across active and sleeping deliveries");
         assigned.actual.add(endpoint);
       }
     }
   }
-  for (const { flow, producer, consumers, actual } of flows) {
+  for (const item of flows) {
+    const { flow, producer, consumers, actual } = item;
     if ((producer && actual.size === 0) || consumers.size !== actual.size || [...consumers].some(endpoint => !actual.has(endpoint)))
-      frameReject(code, target, flow.connector, "The complete accepted lower flow differs from its recorded producer and consumers");
+      fault([item], flow.connector, "The complete accepted lower flow differs from its recorded producer and consumers");
   }
+  return faults;
 }
+function checkFlowCorrespondence(upper: Graph, graph: Graph, obligations: FrameObligation[], rows: Map<string, FrameFill[]>, level: FrameLevel,
+  code: "frame_record_invalid" | "accepted_binding_ambiguous", target: string, partial = false): void {
+  const first = flowFaults(upper, graph, obligations, rows, level, partial)[0];
+  if (first) frameReject(code, target, first.connector, first.message);
+}
+function fillMismatch(upper: Graph, graph: Graph, obligation: FrameObligation | undefined, row: FrameFill, level: FrameLevel,
+  relations: RefinementRelations): string | null {
+  const node = graph.nodes.find(item => item.id === row.node);
+  if (!obligation || !node || LEVEL[node.kind] !== level || !relations.refines(node.id, obligation.upper.node))
+    return "A recorded endpoint does not refine its obligation";
+  if (obligation.kind !== "connection-end")
+    return row.port !== undefined || node.outcome !== obligation.artifact ? "An outcome fill must produce this upper outcome" : null;
+  const port = node.ports.find(item => item.id === row.port), artifact = upper.artifacts.find(item => item.id === obligation.artifact);
+  return !port || port.direction !== (obligation.role === "producer" ? "out" : "in") || port.contract !== artifact?.contract
+    ? "A recorded endpoint has a different port direction or contract" : null;
+}
+const isFrameFill = (row: unknown): row is FrameFill => frameObject(row) && frameText(row['obligation']) && frameText(row['node'])
+  && (row['port'] === undefined || frameText(row['port'])) && (row['source'] === "accepted" || row['source'] === "identity") && isRef(row['basis']);
 
-function checkedAccepted(upper: Graph, accepted: AcceptedFrame, obligations: FrameObligation[], level: FrameLevel): Map<string, FrameFill[]> | null {
+function checkedAccepted(upper: Graph, accepted: AcceptedFrame, obligations: FrameObligation[], level: FrameLevel, permittedOpen: Set<string>): Map<string, FrameFill[]> | null {
   if (canonical(projectGraph(upper, (level - 1) as 1 | 2)) !== canonical(projectGraph(accepted.graph, (level - 1) as 1 | 2)))
     frameReject("frame_upper_drift", accepted.reference.id, "upper", "The accepted lower layer uses a different upper layer", "owner");
   if (!/^graph:[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(accepted.reference.id) || accepted.reference.hash !== hashJson(accepted.graph)) frameReject("frame_record_invalid", accepted.reference.id, "hash", "The accepted graph differs from its exact reference");
@@ -192,47 +221,44 @@ function checkedAccepted(upper: Graph, accepted: AcceptedFrame, obligations: Fra
     frameReject("frame_record_invalid", frameRef.id, "frame", "The accepted frame must identify its project, level and exact content");
   if (value.layerHash !== hashJson(projectGraph(accepted.graph, level)))
     frameReject("frame_layer_drift", frameRef.id, "layerHash", "The layer changed outside its accepted frame", "owner");
-  if (canonical(value.fills) !== canonical(frameSorted(value.fills)))
-    frameReject("frame_record_invalid", frameRef.id, "fills", "The accepted fill set must retain canonical order");
+  return checkedRows(upper, accepted.graph, obligations, value.fills, level, frameRef.id, permittedOpen);
+}
+function checkedRows(upper: Graph, graph: Graph, obligations: FrameObligation[], fills: FrameFill[], level: FrameLevel,
+  target: string, permittedOpen: Set<string>): Map<string, FrameFill[]> {
+  if (canonical(fills) !== canonical(frameSorted(fills)))
+    frameReject("frame_record_invalid", target, "fills", "The accepted fill set must retain canonical order");
   const byObligation = new Map(obligations.map(item => [item.id, item])), rows = new Map<string, FrameFill[]>();
-  const relations = new RefinementRelations(accepted.graph), classification = new Map<string, string>(), identities = new Map<string, string>();
+  const relations = new RefinementRelations(graph), classification = new Map<string, string>(), identities = new Map<string, string>();
   const identityForUpper = new Map<string, string>();
-  for (const row of value.fills) {
-    if (!frameObject(row) || !frameText(row.obligation) || !frameText(row.node) || (row.port !== undefined && !frameText(row.port))
-      || (row.source !== "accepted" && row.source !== "identity") || !isRef(row.basis))
-      frameReject("frame_record_invalid", frameRef.id, "fills", "A recorded fill needs its source, exact basis and endpoint");
-    const obligation = byObligation.get(row.obligation), node = accepted.graph.nodes.find(item => item.id === row.node);
-    if (!obligation || !node || LEVEL[node.kind] !== level || !relations.refines(node.id, obligation.upper.node))
-      frameReject("frame_record_invalid", frameRef.id, row.obligation, "A recorded endpoint does not refine its obligation");
+  for (const row of fills) {
+    if (!isFrameFill(row))
+      frameReject("frame_record_invalid", target, "fills", "A recorded fill needs its source, exact basis and endpoint");
+    const obligation = byObligation.get(row.obligation), mismatch = fillMismatch(upper, graph, obligation, row, level, relations);
+    if (mismatch) frameReject("frame_record_invalid", target, row.obligation, mismatch);
+    const node = graph.nodes.find(item => item.id === row.node)!;
+    if (!obligation) frameReject("frame_record_invalid", target, row.obligation, "A recorded endpoint needs its obligation");
     if (classification.has(node.id) && classification.get(node.id) !== row.source)
-      frameReject("frame_record_invalid", frameRef.id, row.obligation, "One accepted node cannot be both identity and real");
+      frameReject("frame_record_invalid", target, row.obligation, "One accepted node cannot be both identity and real");
     classification.set(node.id, row.source);
     if (row.source === "identity") {
       if (identities.has(node.id) && identities.get(node.id) !== obligation.upper.node)
-        frameReject("frame_record_invalid", frameRef.id, row.obligation, "An identity node represents exactly one upper node");
+        frameReject("frame_record_invalid", target, row.obligation, "An identity node represents exactly one upper node");
       if (identityForUpper.has(obligation.upper.node) && identityForUpper.get(obligation.upper.node) !== node.id)
-        frameReject("frame_record_invalid", frameRef.id, row.obligation, "An upper node has exactly one identity representative");
+        frameReject("frame_record_invalid", target, row.obligation, "An upper node has exactly one identity representative");
       identities.set(node.id, obligation.upper.node); identityForUpper.set(obligation.upper.node, node.id);
-    }
-    if (obligation.kind !== "connection-end") {
-      if (row.port !== undefined || node.outcome !== obligation.artifact)
-        frameReject("frame_record_invalid", frameRef.id, row.obligation, "An outcome fill must produce this upper outcome");
-    } else {
-      const port = node.ports.find(item => item.id === row.port), artifact = upper.artifacts.find(item => item.id === obligation.artifact);
-      if (!port || port.direction !== (obligation.role === "producer" ? "out" : "in") || port.contract !== artifact?.contract)
-        frameReject("frame_record_invalid", frameRef.id, row.obligation, "A recorded endpoint has a different port direction or contract");
     }
     const prior = rows.get(row.obligation) ?? [];
     if (prior.some(item => item.node === row.node && item.port === row.port))
-      frameReject("frame_record_invalid", frameRef.id, row.obligation, "The same recorded endpoint is duplicated");
+      frameReject("frame_record_invalid", target, row.obligation, "The same recorded endpoint is duplicated");
     prior.push(row); rows.set(row.obligation, prior);
   }
   for (const obligation of obligations) {
     const mine = rows.get(obligation.id);
+    if (!mine?.length && permittedOpen.has(obligation.id)) continue;
     if (!mine?.length || (obligation.role !== "consumer" && mine.length !== 1))
-      frameReject("frame_record_invalid", frameRef.id, obligation.id, "The accepted mapping must cover each source obligation with its declared cardinality");
+      frameReject("frame_record_invalid", target, obligation.id, "The accepted mapping must cover each source obligation with its declared cardinality");
   }
-  checkFlowCorrespondence(upper, accepted.graph, obligations, rows, level, "frame_record_invalid", frameRef.id);
+  checkFlowCorrespondence(upper, graph, obligations, rows, level, "frame_record_invalid", target, permittedOpen.size > 0);
   return rows;
 }
 function historicalFills(upper: Graph, graph: Graph, obligation: FrameObligation, level: FrameLevel, relations: RefinementRelations): Endpoint[] {
@@ -265,6 +291,9 @@ function historicalFills(upper: Graph, graph: Graph, obligation: FrameObligation
   return [...new Map(result.map(endpoint => [canonical([endpoint.node, endpoint.port]), endpoint])).values()];
 }
 export function fillObligations(upper: Graph, scope: FrameScope, accepted: AcceptedFrame | null, upperRef: Ref, level: FrameLevel): OmResult<Sealed<FilledFrame>> {
+  return fillFrame(upper, scope, accepted, upperRef, level, new Set());
+}
+function fillFrame(upper: Graph, scope: FrameScope, accepted: AcceptedFrame | null, upperRef: Ref, level: FrameLevel, permittedOpen: Set<string>): OmResult<Sealed<FilledFrame>> {
   requireFrameGraph(upper, "upper"); requireFrameScope(scope); requireFrameLevel(level);
   if (!isRef(upperRef)) frameInvalid("upperRef");
   if (accepted !== null) {
@@ -274,59 +303,131 @@ export function fillObligations(upper: Graph, scope: FrameScope, accepted: Accep
   }
   upper = frameCopy(upper); scope = frameCopy(scope); accepted = frameCopy(accepted); upperRef = frameCopy(upperRef);
   return frameResult(() => {
-    const obligations = obligationsOf(upper, scope, level), fills: FrameFill[] = [], open: FrameObligation[] = [];
-    const recorded = accepted ? checkedAccepted(upper, accepted, obligations, level) : null;
-    const relations = new RefinementRelations(accepted?.graph ?? upper);
-    const historical = new Map<string, FrameFill[]>();
-    if (accepted && !recorded) for (const obligation of obligations) historical.set(obligation.id,
-      historicalFills(upper, accepted.graph, obligation, level, relations).map(endpoint => ({
-        obligation: obligation.id, node: endpoint.node, ...(obligation.kind === "connection-end" ? { port: endpoint.port } : {}),
-        source: "accepted", basis: accepted.reference,
-      })));
-    const representatives = new Map<string, { node: Node; upper: string; ports: Set<string> }>();
-    for (const obligation of obligations) {
-      const entries = (recorded ?? historical).get(obligation.id) ?? [];
-      const real = entries.filter(entry => entry.source === "accepted");
-      if (obligation.role !== "consumer" && real.length > 1)
-        frameReject("accepted_binding_ambiguous", obligation.id, "fill", "The single-valued obligation has several real accepted endpoints");
-      if (real.length) {
-        for (const row of real) fills.push({ obligation: obligation.id, node: row.node, ...(row.port === undefined ? {} : { port: row.port }),
-          source: "accepted", basis: accepted!.frame?.reference ?? accepted!.reference });
-        continue;
-      }
-      if (obligation.zone === "horizon") { open.push(obligation); continue; }
-      const upperNode = upper.nodes.find(node => node.id === obligation.upper.node)!;
-      if (!upperNode) frameInvalid("upper.node", obligation.upper.node);
-      const kept = entries.filter(entry => entry.source === "identity");
-      if (kept.length > 1) frameReject("frame_record_invalid", obligation.id, "identity", "An upper node has only one identity representative");
-      const id = kept[0]?.node ?? representativeId(upperNode.id, level);
-      if (!representatives.has(id)) {
-        const old = accepted?.graph.nodes.find(node => node.id === id);
-        if (old && !kept.length) frameReject("representative_id_conflict", id, "id", "The reserved identity ID is already used by another accepted node");
-        const node: Node = old ? frameCopy(old) : { ...upperNode, id, kind: level === 2 ? "operation" : "work", parent: upperNode.id };
-        representatives.set(id, { node, upper: upperNode.id, ports: new Set() });
-      }
-      const port = kept[0]?.port ?? obligation.upper.port;
-      if (port !== undefined) representatives.get(id)!.ports.add(port);
-      fills.push({ obligation: obligation.id, node: id, ...(port === undefined ? {} : { port }), source: "identity", basis: upperRef });
+    const obligations = obligationsOf(upper, scope, level);
+    const recorded = accepted ? checkedAccepted(upper, accepted, obligations, level, permittedOpen) : null;
+    return fillResolved(upper, accepted, upperRef, level, obligations, recorded);
+  });
+}
+function fillResolved(upper: Graph, accepted: AcceptedFrame | null, upperRef: Ref, level: FrameLevel,
+  obligations: FrameObligation[], recorded: Map<string, FrameFill[]> | null): FilledFrame {
+  const fills: FrameFill[] = [], open: FrameObligation[] = [];
+  const relations = new RefinementRelations(accepted?.graph ?? upper);
+  const historical = new Map<string, FrameFill[]>();
+  if (accepted && !recorded) for (const obligation of obligations) historical.set(obligation.id,
+    historicalFills(upper, accepted.graph, obligation, level, relations).map(endpoint => ({
+      obligation: obligation.id, node: endpoint.node, ...(obligation.kind === "connection-end" ? { port: endpoint.port } : {}),
+      source: "accepted", basis: accepted.reference,
+    })));
+  const representatives = new Map<string, { node: Node; upper: string; ports: Set<string> }>();
+  for (const obligation of obligations) {
+    const entries = (recorded ?? historical).get(obligation.id) ?? [];
+    const real = entries.filter(entry => entry.source === "accepted");
+    if (obligation.role !== "consumer" && real.length > 1)
+      frameReject("accepted_binding_ambiguous", obligation.id, "fill", "The single-valued obligation has several real accepted endpoints");
+    if (real.length) {
+      for (const row of real) fills.push({ obligation: obligation.id, node: row.node, ...(row.port === undefined ? {} : { port: row.port }),
+        source: "accepted", basis: accepted!.frame?.reference ?? accepted!.reference });
+      continue;
     }
-    if (accepted && !recorded) checkFlowCorrespondence(upper, accepted.graph, obligations, historical, level,
-      "accepted_binding_ambiguous", accepted.reference.id);
-    for (const obligation of obligations.filter(item => item.role === "producer" && item.zone === "outside")) {
-      const external = upper.artifacts.find(item => item.id === obligation.artifact)?.external;
-      const needed = obligations.some(item => item.connector === obligation.connector && item.flow === obligation.flow
-        && item.role === "consumer" && item.zone === "horizon");
-      if (!external && needed && !fills.some(fill => fill.obligation === obligation.id && fill.source === "accepted"))
-        frameReject("horizon_producer_unrefined", obligation.id, "producer", "This flow needs a real refined producer outside the horizon", "readiness");
+    if (obligation.zone === "horizon") { open.push(obligation); continue; }
+    const upperNode = upper.nodes.find(node => node.id === obligation.upper.node)!;
+    if (!upperNode) frameInvalid("upper.node", obligation.upper.node);
+    const kept = entries.filter(entry => entry.source === "identity");
+    if (kept.length > 1) frameReject("frame_record_invalid", obligation.id, "identity", "An upper node has only one identity representative");
+    const id = kept[0]?.node ?? representativeId(upperNode.id, level);
+    if (!representatives.has(id)) {
+      const old = accepted?.graph.nodes.find(node => node.id === id);
+      if (old && !kept.length) frameReject("representative_id_conflict", id, "id", "The reserved identity ID is already used by another accepted node");
+      const node: Node = old ? frameCopy(old) : { ...upperNode, id, kind: level === 2 ? "operation" : "work", parent: upperNode.id };
+      representatives.set(id, { node, upper: upperNode.id, ports: new Set() });
     }
-    const joins: Graph['joins'] = [];
-    const nodes = [...representatives.values()].map(({ node, upper: upperId, ports }) => {
-      const result = { ...node, ports: node.ports.filter(port => ports.has(port.id)).sort((a, b) => frameOrder(a.id, b.id)) };
-      for (const join of upper.joins.filter(item => item.consumer === upperId)) joins.push({ ...join,
-        id: `om-identity-join:${level}:${hashJson([join.id, upperId])}`, consumer: node.id });
-      return result;
+    const port = kept[0]?.port ?? obligation.upper.port;
+    if (port !== undefined) representatives.get(id)!.ports.add(port);
+    fills.push({ obligation: obligation.id, node: id, ...(port === undefined ? {} : { port }), source: "identity", basis: upperRef });
+  }
+  if (accepted && !recorded) checkFlowCorrespondence(upper, accepted.graph, obligations, historical, level,
+    "accepted_binding_ambiguous", accepted.reference.id);
+  for (const obligation of obligations.filter(item => item.role === "producer" && item.zone === "outside")) {
+    const external = upper.artifacts.find(item => item.id === obligation.artifact)?.external;
+    const needed = obligations.some(item => item.connector === obligation.connector && item.flow === obligation.flow
+      && item.role === "consumer" && item.zone === "horizon");
+    if (!external && needed && !fills.some(fill => fill.obligation === obligation.id && fill.source === "accepted"))
+      frameReject("horizon_producer_unrefined", obligation.id, "producer", "This flow needs a real refined producer outside the horizon", "readiness");
+  }
+  const joins: Graph['joins'] = [];
+  const nodes = [...representatives.values()].map(({ node, upper: upperId, ports }) => {
+    const result = { ...node, ports: node.ports.filter(port => ports.has(port.id)).sort((a, b) => frameOrder(a.id, b.id)) };
+    for (const join of upper.joins.filter(item => item.consumer === upperId)) joins.push({ ...join,
+      id: `om-identity-join:${level}:${hashJson([join.id, upperId])}`, consumer: node.id });
+    return result;
+  });
+  return { obligations, fills: frameSorted(fills), open, representatives: nodes.sort((a, b) => frameOrder(a.id, b.id)), joins: frameSorted(joins) };
+}
+
+export interface FrameCarrySource { obligations: FrameObligation[]; fills: FrameFill[] }
+export interface CarriedFrame { fills: FrameFill[]; retired: FrameFill[]; open: FrameObligation[] }
+function isFrameObligation(value: unknown, level: FrameLevel): value is FrameObligation {
+  if (!frameObject(value) || !frameHash(value['id']) || value['level'] !== level
+    || !["block-outcome", "operation-outcome", "connection-end"].includes(value['kind'] as string)
+    || !frameObject(value['upper']) || !frameText(value['upper']['node']) || !frameText(value['artifact'])
+    || !["horizon", "outside"].includes(value['zone'] as string)) return false;
+  return value['kind'] === "connection-end" ? frameText(value['upper']['port']) && frameText(value['connector'])
+    && ["producer", "consumer"].includes(value['role'] as string) && frameHash(value['flow'])
+    : value['kind'] === (level === 2 ? "block-outcome" : "operation-outcome") && value['upper']['port'] === undefined
+      && value['connector'] === undefined && value['role'] === undefined && value['flow'] === undefined;
+}
+const obligationContent = ({ zone: _zone, ...value }: FrameObligation) => value;
+/** Carry only rows that still satisfy the same requirement and complete flow on the new upper basis. */
+export function carryFrameFills(upper: Graph, scope: FrameScope, accepted: Pick<AcceptedFrame, "graph" | "reference">,
+  previous: FrameCarrySource, upperRef: Ref, level: FrameLevel): OmResult<Sealed<CarriedFrame>> {
+  requireFrameGraph(upper, "upper"); requireFrameScope(scope); requireFrameLevel(level);
+  if (!frameObject(accepted) || !isRef(accepted.reference)) frameInvalid("accepted");
+  requireFrameGraph(accepted.graph, "accepted.graph");
+  if (!frameObject(previous) || !Array.isArray(previous.obligations) || !Array.from(previous.obligations).every(item => isFrameObligation(item, level))
+    || !Array.isArray(previous.fills) || !Array.from(previous.fills).every(isFrameFill)) frameInvalid("previous");
+  if (!isRef(upperRef)) frameInvalid("upperRef");
+  upper = frameCopy(upper); scope = frameCopy(scope); accepted = frameCopy(accepted); previous = frameCopy(previous); upperRef = frameCopy(upperRef);
+  return frameResult(() => {
+    if (accepted.reference.hash !== hashJson(accepted.graph))
+      frameReject("frame_record_invalid", accepted.reference.id, "hash", "The carried graph differs from its exact reference");
+    if (canonical(projectGraph(upper, (level - 1) as 1 | 2)) !== canonical(projectGraph(accepted.graph, (level - 1) as 1 | 2)))
+      frameReject("frame_upper_drift", accepted.reference.id, "upper", "The carried graph must preserve its named new upper", "owner");
+    const obligations = obligationsOf(upper, scope, level), old = new Map(previous.obligations.map(item => [item.id, item]));
+    if (old.size !== previous.obligations.length) frameInvalid("previous.obligations");
+    const byId = new Map(obligations.map(item => [item.id, item])), relations = new RefinementRelations(accepted.graph);
+    let fills = previous.fills.filter(row => {
+      const obligation = byId.get(row.obligation), before = old.get(row.obligation);
+      return obligation && before && canonical(obligationContent(obligation)) === canonical(obligationContent(before))
+        && fillMismatch(upper, accepted.graph, obligation, row, level, relations) === null;
     });
-    return { obligations, fills: frameSorted(fills), open, representatives: nodes.sort((a, b) => frameOrder(a.id, b.id)), joins: frameSorted(joins) };
+    const groups = upperFlows(upper, level).map(flow => obligations.filter(item => item.connector === flow.connector && item.flow === flow.key));
+    const invalid = new Set<string>();
+    for (const group of groups) {
+      const first = group[0]!, prior = previous.obligations.filter(item => item.connector === first.connector && item.flow === first.flow);
+      if (canonical(frameSorted(group.map(obligationContent))) !== canonical(frameSorted(prior.map(obligationContent)))
+        || group.some(item => !fills.some(fill => fill.obligation === item.id)))
+        for (const item of group) invalid.add(item.id);
+    }
+    fills = fills.filter(fill => !invalid.has(fill.obligation));
+    const rowsOf = (values: FrameFill[]) => {
+      const rows = new Map<string, FrameFill[]>();
+      for (const fill of values) rows.set(fill.obligation, [...(rows.get(fill.obligation) ?? []), fill]);
+      return rows;
+    };
+    while (true) {
+      const faults = flowFaults(upper, accepted.graph, obligations, rowsOf(fills), level, true);
+      const unfit = new Set(faults.flatMap(fault => fault.obligations));
+      const kept = fills.filter(fill => !unfit.has(fill.obligation));
+      if (kept.length === fills.length) break;
+      fills = kept;
+    }
+    fills = frameSorted(fills);
+    const kept = new Set(fills), retired = frameSorted(previous.fills.filter(fill => !kept.has(fill)));
+    // This is the structural absence in the saved mapping, including outside-horizon requirements.
+    const open = obligations.filter(item => !fills.some(fill => fill.obligation === item.id));
+    const rows = checkedRows(upper, accepted.graph, obligations, fills, level, accepted.reference.id, new Set(open.map(item => item.id)));
+    fillResolved(upper, { ...accepted, frame: null }, upperRef, level, obligations, rows);
+    return { fills, retired, open };
   });
 }
 
@@ -339,6 +440,7 @@ export interface FrameRead {
   request: FrameRequest; upper: Graph; upperRef: Ref; scope: FrameScope;
   accepted: AcceptedFrame | null; result: FilledFrame; references: Ref[];
 }
+export interface FrameBasis extends Omit<FrameRead, "result"> { obligations: FrameObligation[]; permittedOpen: string[] }
 export interface PreparedFrame extends FrameRead {
   guards: Ref[];
   // C5 must CAS all three writes in its single acceptance transaction. In particular a missing frame is
@@ -377,6 +479,12 @@ function frameReadLayer(store: Store, ref: Ref, project: string, level: 1 | 2 | 
     frameReject("frame_record_invalid", ref.id, "layer", "The layer has an invalid proof envelope");
   return saved;
 }
+function frameLayerAcceptance(store: Store, request: Parameters<typeof readLayerAcceptance>[1]) {
+  const basis = readLayerAcceptance(store, request);
+  if (!basis.ok) frameReject("frame_basis_unproven", basis.refusal.at.target,
+    basis.refusal.at.field ?? "acceptance", basis.refusal.message);
+  return basis.value;
+}
 function frameAcceptedHorizon(store: Store, project: string, ref: Ref, refs: Ref[]): HorizonRecords {
   const saved = frameTake(readHorizon(store, project, ref));
   if (saved.gate.value.state !== "accepted") frameReject("frame_basis_unproven", ref.id, "state", "The frame needs an accepted horizon");
@@ -397,7 +505,7 @@ function frameCompareUpper(layer: FrameLayer, graph: Graph, level: 1 | 2, target
 function frameReadConnection(store: Store, project: string, level: FrameLevel, ref: Ref | null, refs: Ref[]): AcceptedFrame['frame'] {
   return ref ? { reference: ref, value: frameReadRecord<ConnectionFrame>(store, ref, `om-frame:${project}:${level}`, "connection-frame", refs).value } : null;
 }
-function frameDerive(store: Store, request: FrameRequest): FrameRead {
+function frameSources(store: Store, request: FrameRequest): FrameBasis {
   const refs: Ref[] = [];
   const horizon = frameAcceptedHorizon(store, request.project, request.horizon, refs);
   const inputRef = horizon.horizon.value.request.input;
@@ -419,8 +527,16 @@ function frameDerive(store: Store, request: FrameRequest): FrameRead {
       frameReject("frame_basis_unproven", request.upper.horizon.id, "input", "The accepted L2 must belong to this OM input");
     const phaseRef = witness.horizon.value.request.refinement;
     if (!phaseRef) frameReject("frame_basis_unproven", request.upper.horizon.id, "refinement", "The upper witness must prove accepted L2");
-    const phase = frameReadRecord<{ layer: Ref }>(store, phaseRef, `phase:${request.project}:L2`, "phase", refs);
-    upperRef = phase.value.layer;
+    if (phaseRef.id === `graph-layer:${request.project}:2`) {
+      const basis = frameLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: phaseRef });
+      if (basis.producer !== "om" || canonical(basis.frame) !== canonical(request.upper.frame))
+        frameReject("frame_basis_unproven", phaseRef.id, "upper.frame", "The OM upper layer needs its exact accepted connection frame");
+      refs.push(...basis.references);
+      upperRef = phaseRef;
+    } else {
+      const phase = frameReadRecord<{ layer: Ref }>(store, phaseRef, `phase:${request.project}:L2`, "phase", refs);
+      upperRef = phase.value.layer;
+    }
     const l2 = frameReadLayer(store, upperRef, request.project, 2, refs);
     frameCompareUpper(l2.value, graph, 2, l2.id);
     const upperFrame = frameReadConnection(store, request.project, 2, request.upper.frame, refs);
@@ -436,35 +552,56 @@ function frameDerive(store: Store, request: FrameRequest): FrameRead {
     scope = { nodes, excluded: ownerScope.excluded, hash: hashJson([ownerScope.hash, 3, nodes]) };
   }
   let accepted: AcceptedFrame | null = null;
+  let permittedOpen: string[] = [];
   if (request.layer) {
     const lower = frameReadLayer(store, request.layer, request.project, request.level, refs);
-    const own = (lower.value.layerProofs ?? []).filter(proof => proof.level === request.level);
-    if (own.length !== 1) frameReject("frame_basis_unproven", request.layer.id, "layerProofs", "An accepted lower layer needs its own derivation proof");
-    const proof = own[0]!;
-    const upperBases = new Map(proof.inputs.filter(ref => ref.id === `graph-layer:${request.project}:${request.level - 1}`)
-      .map(ref => [canonical(ref), ref]));
-    if (upperBases.size !== 1) frameReject("frame_basis_unproven", request.layer.id, "inputs", "The lower proof must retain its exact upper basis");
-    const savedBase = [...upperBases.values()][0]!;
-    const base = frameReadLayer(store, savedBase, request.project, (request.level - 1) as 1 | 2, refs);
-    frameCompareUpper(base.value, graph, (request.level - 1) as 1 | 2, request.layer.id);
-    if (canonical(savedBase) !== canonical(upperRef))
-      frameReject("frame_basis_unproven", request.layer.id, "upper", "The saved upper basis is not the named accepted upper revision");
-    for (const upperProof of (lower.value.layerProofs ?? []).filter(item => item.level === request.level - 1))
-      if (upperProof.hash !== hashJson(projectGraph(graph, upperProof.level)))
-        frameReject("frame_upper_drift", request.layer.id, "layerProofs", "The present upper proof cannot be replaced by a fallback", "owner");
-    if (canonical(lower.value.projection) !== canonical(projectGraph(graph, request.level))
-      || proof.hash !== hashJson(projectGraph(graph, request.level)))
-      frameReject("frame_layer_drift", request.layer.id, "projection", "The accepted lower layer no longer matches this graph", "owner");
-    const basis = readLayerBasis(store, { project: request.project, level: request.level,
-      graph: request.graph, layer: request.layer, upper: savedBase });
-    if (!basis.ok) frameReject("frame_basis_unproven", basis.refusal.at.target, basis.refusal.at.field ?? "research", basis.refusal.message);
-    refs.push(...basis.value.references);
+    const omBasis = lower.value.acceptance !== undefined ? frameLayerAcceptance(store,
+      { project: request.project, level: request.level, graph: request.graph, layer: request.layer }) : null;
+    if (omBasis) {
+      if (omBasis.producer !== "om" || canonical(omBasis.upper) !== canonical(upperRef)
+        || canonical(omBasis.frame) !== canonical(request.frame))
+        frameReject("frame_basis_unproven", request.layer.id, "frame", "The OM layer needs its exact accepted upper and connection frame");
+      refs.push(...omBasis.references);
+      permittedOpen = [...omBasis.open];
+    } else {
+      const own = (lower.value.layerProofs ?? []).filter(proof => proof.level === request.level);
+      if (own.length !== 1) frameReject("frame_basis_unproven", request.layer.id, "layerProofs", "An accepted lower layer needs its own derivation proof");
+      const proof = own[0]!;
+      const upperBases = new Map(proof.inputs.filter(ref => ref.id === `graph-layer:${request.project}:${request.level - 1}`)
+        .map(ref => [canonical(ref), ref]));
+      if (upperBases.size !== 1) frameReject("frame_basis_unproven", request.layer.id, "inputs", "The lower proof must retain its exact upper basis");
+      const savedBase = [...upperBases.values()][0]!;
+      const base = frameReadLayer(store, savedBase, request.project, (request.level - 1) as 1 | 2, refs);
+      frameCompareUpper(base.value, graph, (request.level - 1) as 1 | 2, request.layer.id);
+      if (canonical(savedBase) !== canonical(upperRef))
+        frameReject("frame_basis_unproven", request.layer.id, "upper", "The saved upper basis is not the named accepted upper revision");
+      for (const upperProof of (lower.value.layerProofs ?? []).filter(item => item.level === request.level - 1))
+        if (upperProof.hash !== hashJson(projectGraph(graph, upperProof.level)))
+          frameReject("frame_upper_drift", request.layer.id, "layerProofs", "The present upper proof cannot be replaced by a fallback", "owner");
+      if (canonical(lower.value.projection) !== canonical(projectGraph(graph, request.level))
+        || proof.hash !== hashJson(projectGraph(graph, request.level)))
+        frameReject("frame_layer_drift", request.layer.id, "projection", "The accepted lower layer no longer matches this graph", "owner");
+      const basis = readLayerBasis(store, { project: request.project, level: request.level,
+        graph: request.graph, layer: request.layer, upper: savedBase });
+      if (!basis.ok) frameReject("frame_basis_unproven", basis.refusal.at.target, basis.refusal.at.field ?? "research", basis.refusal.message);
+      refs.push(...basis.value.references);
+    }
     accepted = { graph, reference: request.graph, frame: frameReadConnection(store, request.project, request.level, request.frame, refs) };
   } else if (request.frame) frameReject("frame_basis_unproven", request.frame.id, "layer", "A connection frame requires an accepted lower layer");
   const upper = frameProjection(graph, (request.level - 1) as 1 | 2);
-  const result = frameTake(fillObligations(upper, scope, accepted, upperRef, request.level));
-  return { request, upper, upperRef, scope, accepted, result: result as FilledFrame,
+  const obligations = frameTake(frameObligations(upper, scope, request.level)) as FrameObligation[];
+  return { request, upper, upperRef, scope, accepted, obligations, permittedOpen,
     references: frameSorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]) };
+}
+/** Resolve the common exact upper sources without prematurely inventing lower fills. */
+export function readFrameBasis(store: Store, request: FrameRequest): OmResult<Sealed<FrameBasis>> {
+  requireFrameRequest(store, request);
+  return frameResult(() => frameSources(store, frameCopy(request)));
+}
+function frameDerive(store: Store, request: FrameRequest): FrameRead {
+  const { obligations: _obligations, permittedOpen, ...basis } = frameSources(store, request);
+  const result = frameTake(fillFrame(basis.upper, basis.scope, basis.accepted, basis.upperRef, request.level, new Set(permittedOpen)));
+  return { ...basis, result: result as FilledFrame };
 }
 /** History is checked exclusively through immutable exact references, even after heads move. */
 export function readFrame(store: Store, request: FrameRequest): OmResult<Sealed<FrameRead>> {
@@ -504,7 +641,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
     if (request.upper && !request.upper.frame && traced.get(`om-frame:${request.project}:2`))
       frameReject("input_stale", `om-frame:${request.project}:2`, "upper.frame", "The accepted upper frame cannot be omitted");
     const layerHead = traced.get<FrameLayer>(`graph-layer:${request.project}:${request.level}`);
-    if (!request.layer && layerHead?.value.layerProofs?.some(proof => proof.level === request.level))
+    if (!request.layer && (layerHead?.value.acceptance !== undefined || layerHead?.value.layerProofs?.some(proof => proof.level === request.level)))
       frameReject("frame_basis_unproven", layerHead.id, "layer", "An accepted lower layer cannot be omitted");
     const horizon = frameTake(readHorizon(traced, request.project, request.horizon));
     current(reference(horizon.horizon));
@@ -520,13 +657,19 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
       frameReject("input_stale", inputRef.id, "input", "The frame needs the currently admitted OM input");
     for (const guard of prepared.guards) remember(guard);
     const engine = new ProductEngine(traced);
-    const gates = request.layer ? [engine.graphs.layerGate(request.project, request.level, request.layer),
+    const admission = request.layer && layerHead?.value.acceptance !== undefined ? frameLayerAcceptance(traced,
+      { project: request.project, level: request.level, graph: request.graph, layer: request.layer }) : null;
+    if (admission?.producer === "om") for (const ref of admission.currentReferences) current(ref);
+    const gates = request.layer && admission?.producer !== "om" ? [engine.graphs.layerGate(request.project, request.level, request.layer),
       engine.refinement.gate(request.project, request.level === 2 ? "R1" : "R2")] : [];
     if (request.upper) {
       const witness = frameTake(readHorizon(traced, request.project, request.upper.horizon));
       current(reference(witness.horizon));
       current(witness.horizon.value.request.refinement!);
-      gates.push(engine.refinement.gate(request.project, "L2"), engine.graphs.layerGate(request.project, 2, read.upperRef));
+      if (witness.horizon.value.request.refinement!.id === `graph-layer:${request.project}:2`) {
+        const upper = frameLayerAcceptance(traced, { project: request.project, level: 2, graph: request.graph, layer: read.upperRef });
+        for (const ref of upper.currentReferences) current(ref);
+      } else gates.push(engine.refinement.gate(request.project, "L2"), engine.graphs.layerGate(request.project, 2, read.upperRef));
     }
     for (const gate of gates) {
       if (gate.findings.length) {

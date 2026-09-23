@@ -16,16 +16,20 @@ import type { Source } from "../src/evidence/evidence.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store } from "../src/storage/store.js";
 import { writeOmInput } from "../src/om/input.js";
-import { writeHorizon, type HorizonRequest } from "../src/om/horizon.js";
+import { writeHorizon, prepareHorizon, readHorizon, type HorizonRequest } from "../src/om/horizon.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
 import {
-  frameObligations, fillObligations, flowKey, representativeId, FRAME_REFUSAL_CODES,
+  frameObligations, fillObligations, carryFrameFills, flowKey, representativeId, FRAME_REFUSAL_CODES,
   readFrame, prepareFrame, type FrameRequest,
   type AcceptedFrame, type ConnectionFrame, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
 import { gardenGraph, createOmFixture, type OmFixture, type FixtureLayer } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
+import { writeCandidate, gateCandidate } from "../src/om/frame-candidate.js";
+import { settleCandidate } from "../src/om/frame-accept.js";
+import { prepareGaps, writeGaps, readGaps, type GapRequest } from "../src/om/gaps.js";
+import type { LayerProposal } from "../src/om/frame-proposals.js";
 
 const clone = structuredClone;
 const levels = [2, 3] as const;
@@ -70,6 +74,74 @@ function malformed(error: unknown): boolean {
   assert.equal(typeof (error.details as { target?: unknown }).target, "string");
   return true;
 }
+
+test("C2 carry preserves renamed cross-flow correspondence and retires incompatible whole flows independently of open outcomes", () => {
+  for (const level of levels) {
+    const original = gardenGraph("cross"), oldUpper = upper(original, level), horizon = allScope(oldUpper, level);
+    const previous = delivered(fillObligations(oldUpper, horizon, accepted(original), upperRef, level));
+    const renamed = clone(original);
+    for (const node of renamed.nodes.filter(item => LEVEL[item.kind] === level))
+      for (const port of node.ports) port.id = `lower-${port.id}`;
+    for (const connector of renamed.connectors) for (const binding of connector.bindings.filter(item => item.level === level)) {
+      binding.producer.port = `lower-${binding.producer.port}`;
+      for (const endpoint of binding.consumers) endpoint.port = `lower-${endpoint.port}`;
+    }
+    const source = { obligations: [...previous.obligations], fills: previous.fills.map(fill => ({ ...fill,
+      ...(fill.port === undefined ? {} : { port: `lower-${fill.port}` }) })) };
+    const unchanged = delivered(carryFrameFills(oldUpper, horizon, accepted(renamed), source, upperRef, level));
+    assert.deepEqual(unchanged.fills, storedFrame(renamed, level, source.fills).fills);
+    assert.deepEqual(unchanged.retired, []);
+    assert.deepEqual(unchanged.open, []);
+
+    const producer = previous.obligations.find(item => item.connector === "garden-flow" && item.role === "producer" && item.upper.port === "out")!;
+    const affected = previous.obligations.filter(item => item.connector === producer.connector && item.flow === producer.flow);
+    const unaffected = previous.obligations.filter(item => item.connector === "garden-flow" && item.flow !== producer.flow);
+    for (const defect of ["consumers", "delivery", "direction", "contract", "anchor", "artifact"] as const) {
+      const changed = clone(renamed), flow = changed.connectors.find(item => item.id === "garden-flow")!;
+      const upperBinding = flow.bindings.find(item => item.level === level - 1 && item.producer.port === "out")!;
+      const lowerProducer = changed.nodes.find(item => item.id === (level === 2 ? "garden-produce-operation" : "garden-produce-work"))!;
+      if (defect === "consumers") upperBinding.consumers = upperBinding.consumers.filter(item => item.port !== "in-alt");
+      if (defect === "delivery") for (const binding of flow.bindings.filter(item => item.level === level && item.producer.port === "lower-out"))
+        binding.consumers = binding.consumers.filter(item => item.port !== "lower-in-alt");
+      if (defect === "direction") lowerProducer.ports.find(item => item.id === "lower-out")!.direction = "in";
+      if (defect === "contract") lowerProducer.ports.find(item => item.id === "lower-out")!.contract = "another-contract";
+      if (defect === "anchor") upperBinding.anchor = "changed-anchor";
+      if (defect === "artifact") flow.artifact = "garden-prep"; // Same port contract, different required artifact.
+      const outcomeNode = changed.nodes.find(item => item.id === (level === 2 ? "garden-consume-block" : "garden-consume-operation"))!;
+      const outcome = previous.obligations.find(item => item.kind !== "connection-end" && item.upper.node === outcomeNode.id)!;
+      outcomeNode.outcome = "garden-data";
+      const view = upper(changed, level), current = delivered(frameObligations(view, horizon, level));
+      assert.equal(current.find(item => item.kind !== "connection-end" && item.upper.node === outcomeNode.id)!.id, outcome.id);
+      const carried = delivered(carryFrameFills(view, horizon, accepted(changed), source, upperRef, level));
+      assert.ok(carried.retired.some(fill => fill.obligation === outcome.id), `${level}/${defect}: changed outcome`);
+      assert.ok(carried.open.some(item => item.id === outcome.id));
+      assert.ok(affected.every(item => !carried.fills.some(fill => fill.obligation === item.id)), `${level}/${defect}: whole flow`);
+      assert.ok(source.fills.filter(fill => affected.some(item => item.id === fill.obligation))
+        .every(fill => carried.retired.some(row => canonical(row) === canonical(fill))));
+      const newAffected = current.filter(item => item.connector === "garden-flow" && (defect === "artifact" || item.flow === flowKey(upperBinding)));
+      assert.ok(newAffected.every(item => carried.open.some(open => open.id === item.id)));
+      if (defect !== "artifact") assert.ok(unaffected.every(item => carried.fills.some(fill => fill.obligation === item.id)), `${level}/${defect}: independent flow`);
+      assert.equal(carried.fills.length + carried.retired.length, source.fills.length);
+      assert.ok(Object.isFrozen(carried) && Object.isFrozen(carried.fills));
+    }
+  }
+});
+
+test("C2 carry requires explicit source obligations and rows instead of treating absence as an empty mapping", () => {
+  const graph = gardenGraph(), view = upper(graph, 3), horizon = allScope(view, 3);
+  const prior = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 3));
+  const invoke = carryFrameFills as (...args: unknown[]) => unknown;
+  const args: unknown[] = [view, horizon, accepted(graph), { obligations: prior.obligations, fills: prior.fills }, upperRef, 3];
+  for (const index of [0, 1, 2, 3, 4, 5]) for (const missing of [undefined, null]) {
+    const bad = [...args]; bad[index] = missing;
+    assert.throws(() => invoke(...bad), malformed);
+  }
+  for (const previous of [{ fills: prior.fills }, { obligations: prior.obligations },
+    { obligations: prior.obligations, fills: null }, { obligations: "wrong", fills: prior.fills }]) {
+    const bad = [...args]; bad[3] = previous;
+    assert.throws(() => invoke(...bad), malformed);
+  }
+});
 
 test("frame obligations preserve every cross-flow endpoint and port at levels two and three", () => {
   for (const level of levels) {
@@ -780,4 +852,79 @@ test("frame storage boundaries reject malformed refs and preserve unexpected eng
       assert.deepEqual(revisions(f.store), before);
     }
   }
+});
+
+
+test("OM acceptance from L1 is consumed by C2, B2 and D1 with historical sources and current result guards", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-consumers-")), database = join(root, "state.sqlite");
+  let store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = gardenGraph(), { level: _level, ...projection } = projectGraph(graph, 1);
+  preparedFeatures(new ProductEngine(store), "garden", projection as Graph);
+  const initial = acceptedHorizon(store, null), input = initial.horizon.value.request.input;
+  const original: FrameRequest = { project: "garden", level: 2, horizon: reference(initial.gate),
+    graph: reference(store.get("graph:garden")!), layer: null, frame: null, upper: null };
+  const prepared = delivered(prepareFrame(store, original)), design = projectGraph(graph, 2);
+  const fills = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
+    { graph, reference: actualGraphRef(graph), frame: null }, prepared.upperRef, 2)).fills;
+  const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+    nodes: clone(design.nodes.filter(node => node.kind === "operation")),
+    fills: fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),
+    localConnectors: clone(design.connectors.map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))
+      .filter(connector => connector.bindings.length > 0)),
+    artifacts: clone(design.artifacts), contracts: clone(design.contracts), joins: clone(design.joins), tests: clone(design.tests),
+    edges: clone(design.edges ?? []), journeys: clone(design.journeys ?? []), packets: clone(design.packets ?? []),
+    transfers: clone(design.transfers ?? []), anchors: clone(design.anchors), removes: [], replaces: [], redefines: [] };
+  const offered = store.write({ id: "om-proposal:garden:consumer-design", kind: "layer-proposal", expected: 0, value: proposal });
+  const written = delivered(writeCandidate(store, { frame: original, proposals: [reference(offered)] }));
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
+  const candidate = reference(written.record), gate = delivered(gateCandidate(store, { project: "garden", candidate }));
+  const settled = delivered(settleCandidate(store, { project: "garden", level: 2, candidate,
+    outcome: { gate: "G3", candidate, graphHash: gate.graphHash, passed: true, codes: [] } }));
+  assert.equal(settled.state, "accepted"); assert.ok(settled.graph && settled.layer && settled.frame);
+  const request: FrameRequest = { ...original, graph: reference(settled.graph), layer: reference(settled.layer), frame: reference(settled.frame) };
+  const current = delivered(prepareFrame(store, request));
+  assert.deepEqual(current.result.open, []);
+  assert.equal(current.expected.frame, 1);
+  assert.ok(current.guards.some(ref => canonical(ref) === canonical(request.graph)));
+  assert.ok(current.guards.some(ref => canonical(ref) === canonical(request.frame)));
+  assert.ok(current.references.some(ref => canonical(ref) === canonical(reference(offered))));
+  assert.ok(!current.guards.some(ref => ref.id === offered.id));
+  refusedAs(prepareFrame(store, { ...request, frame: null }), "frame_basis_unproven");
+  const horizonRequest: HorizonRequest = { project: "garden", input, graph: request.graph, refinement: request.layer,
+    choice: { choiceVersion: "after-om-acceptance", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} };
+  const horizon = delivered(writeHorizon(store, horizonRequest));
+  assert.equal(horizon.gate.value.state, "accepted");
+  assert.ok(Object.values(horizon.horizon.value.result.horizon.refinement).every(value => value === "accepted"));
+  const operations: FrameRequest = { ...request, horizon: reference(horizon.gate) };
+  const works: FrameRequest = { ...operations, level: 3, layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: request.frame } };
+  const gapsRequest: GapRequest = { project: "garden", input, graph: request.graph, horizon: reference(horizon.gate),
+    operations: { frame: operations, proposals: [] }, works: { frame: works, proposals: [] } };
+  const gaps = delivered(writeGaps(store, gapsRequest));
+  assert.equal(gaps.gate.passed, true);
+  assert.ok(gaps.collection.gaps.some(gap => gap.field === "fill"));
+  refusedAs(prepareGaps(store, { ...gapsRequest, works: { state: "upper-not-accepted", layer: request.layer! } }), "gap_record_forged");
+  const historical = delivered(readFrame(store, request));
+  const before = revisions(store), preparedHorizon = delivered(prepareHorizon(store, horizonRequest));
+  assert.deepEqual(revisions(store), before);
+  assert.ok(preparedHorizon.guards.some(ref => canonical(ref) === canonical(request.frame)));
+  assert.ok(!preparedHorizon.guards.some(ref => ref.id === offered.id));
+  const latestProposal = store.get(offered.id)!;
+  store.write({ id: latestProposal.id, kind: latestProposal.kind, expected: latestProposal.revision, value: latestProposal.value });
+  assert.deepEqual(delivered(prepareFrame(store, request)).result, current.result);
+  assert.equal(delivered(prepareHorizon(store, horizonRequest)).existing?.gate.hash, horizon.gate.hash);
+  const frame = store.get(settled.frame.id)!;
+  store.write({ id: frame.id, kind: frame.kind, expected: frame.revision, value: frame.value });
+  refusedAs(writeGuarded(store, { unit: "consumer-test", target: "neighbor", guards: preparedHorizon.guards,
+    writes: [{ id: "neighbor:om-consumers", kind: "test", expected: 0, value: {} }] }), "input_stale");
+  assert.equal(store.get("neighbor:om-consumers"), null);
+  refusedAs(prepareFrame(store, request), "input_stale");
+  refusedAs(prepareHorizon(store, horizonRequest), "input_stale");
+  const source = store.get("source:garden:brief")!;
+  store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+  store.close(); store = new Store(database);
+  assert.deepEqual(delivered(readFrame(store, request)), historical);
+  assert.deepEqual(delivered(readHorizon(store, "garden", reference(horizon.gate))), horizon);
+  assert.deepEqual(delivered(readGaps(store, { sources: gapsRequest, records: gaps.records.map(reference) })), gaps);
 });

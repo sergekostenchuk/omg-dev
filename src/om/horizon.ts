@@ -14,7 +14,7 @@ import { ProductEngine } from "../product/engine.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { prepareOmInput, readOmInput, type InputRequest, type OmInputRecord } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
-import { readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
+import { readLayerAcceptance, readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
 
 export const HORIZON_REFUSAL_CODES = Object.freeze([
   "horizon_empty", "horizon_unclosed", "horizon_feature_unknown", "horizon_requires_excluded",
@@ -235,6 +235,18 @@ function exactClosure(store: Store, refs: Ref[]): OmResult<Sealed<Revision[]>> {
 }
 function readRefinement(store: Store, request: HorizonRequest, graph: Graph): OmResult<Sealed<string[]>> {
   if (!request.refinement) return delivered([]);
+  if (request.refinement.id === `graph-layer:${request.project}:2`) {
+    const basis = readLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
+    if (!basis.ok) return refused("horizon_refinement_unproven", basis.refusal.message,
+      address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
+    if (basis.value.producer !== "om") return refused("horizon_refinement_unproven", "Research refinement must retain its accepted milestone",
+      address(request.refinement.id, "producer", request.refinement), "producer");
+    const relations = new RefinementRelations(graph);
+    const frame = store.get<{ fills: { node: string; source: string }[] }>(basis.value.frame!.id, basis.value.frame!.revision)!;
+    const identities = new Set(frame.value.fills.filter(fill => fill.source === "identity").map(fill => fill.node));
+    return delivered(graph.nodes.filter(block => block.kind === "block" && graph.nodes.some(operation => operation.kind === "operation"
+      && !identities.has(operation.id) && relations.refines(operation.id, block.id))).map(block => block.id).sort(order));
+  }
   const read = readRecord<SavedPhase>(store, request.refinement, { unit: "G2", target: request.project,
     id: `phase:${request.project}:L2`, kind: "phase" });
   if (!read.ok) return read;
@@ -385,7 +397,16 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
     if (!prepared.value.existing || canonical(reference(prepared.value.existing)) !== canonical(request.input))
       return refused("input_stale", "Horizon needs the currently admitted input", address(request.input.id, "input", request.input), "producer");
     for (const guard of prepared.value.guards) remember(guard);
-    if (request.refinement) {
+    if (request.refinement?.id === `graph-layer:${request.project}:2`) {
+      const basis = readLayerAcceptance(traced, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
+      if (!basis.ok) return refused("horizon_refinement_unproven", basis.refusal.message,
+        address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
+      for (const ref of basis.value.currentReferences) {
+        const head = traced.get(ref.id);
+        if (!head || canonical(reference(head)) !== canonical(ref))
+          return refused("input_stale", "The accepted OM refinement is no longer current", address(ref.id, "head", ref), "producer");
+      }
+    } else if (request.refinement) {
       const engine = new ProductEngine(traced);
       const phase = traced.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
       for (const gate of [engine.refinement.gate(request.project, "L2"), engine.graphs.layerGate(request.project, 2, phase.value.layer!)]) {

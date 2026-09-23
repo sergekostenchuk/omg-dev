@@ -527,3 +527,26 @@ test("gap questions include introduced eligible nodes and exclude explicitly rem
     assert.ok(after.find(gap => gap.target === consumerGap.target)!.question.existing.includes(node.id));
   }
 });
+
+test("pure proposal APIs cannot authorize partial acceptance with caller-supplied rebase or open markers", () => {
+  for (const level of levels) {
+    const graph = gardenGraph(), frame = pureFrame(graph, level, true);
+    const missing = frame.result.obligations.find(item => item.zone === "horizon" && item.kind !== "connection-end")!;
+    const fills = frame.result.fills.filter(fill => fill.obligation !== missing.id);
+    const value = { project: "garden", level, candidateHash: hashJson(graph), layerHash: hashJson(projectGraph(graph, level)), fills,
+      rebase: { state: "accepted", graph: frame.request.graph, upper: frame.upperRef, open: [missing.id] } };
+    const ref = { id: `om-frame:garden:${level}`, revision: 1, hash: hashJson(value) };
+    frame.request.frame = ref;
+    frame.accepted!.frame = { reference: ref, value };
+    frame.result.fills = fills.map(fill => ({ ...fill, basis: ref }));
+    frame.result.open = [missing];
+    refusedAs(applyProposals(frame, []), "frame_record_invalid");
+    refusedAs(openObligationsToGaps(frame, { ...frame.result, proposals: [] }), "frame_record_invalid");
+    const claimed = pureFrame(graph, level, true);
+    claimed.result.fills = fills;
+    claimed.result.open = [missing];
+    Object.assign(claimed, { verified: true, acceptance: { state: "accepted", open: [missing.id] } });
+    refusedAs(applyProposals(claimed, []), "proposal_invalid");
+    refusedAs(openObligationsToGaps(claimed, { ...claimed.result, proposals: [] }), "proposal_invalid");
+  }
+});

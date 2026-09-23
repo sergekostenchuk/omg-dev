@@ -14,11 +14,16 @@ import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { writeOmInput } from "../src/om/input.js";
-import { readLayerBasis, readLayerEnvelope, type LayerBasis, type LayerEnvelopeRequest } from "../src/om/layer-basis.js";
+import { readLayerBasis, readLayerEnvelope, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame,
+  type LayerBasis, type OmAcceptedFrame, type OmRebasedFrame, type RebasedLayerRequest, type LayerEnvelopeRequest } from "../src/om/layer-basis.js";
 import { prepareHorizon, readHorizon, writeHorizon, type HorizonRecord, type HorizonRequest } from "../src/om/horizon.js";
 import { prepareFrame, readFrame, type FrameRequest } from "../src/om/frame-obligations.js";
 import { createOmFixture, type FixtureLayer, type OmFixture } from "./om-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
+import { writeCandidate, gateCandidate, type FrameCandidateRecord, type CandidateGate } from "../src/om/frame-candidate.js";
+import type { Revision, Write } from "../src/storage/store.js";
+import { prepareSettleCandidate, settleCandidate, type SettleCandidateRequest } from "../src/om/frame-accept.js";
+import type { Graph } from "../src/graph/model.js";
 
 type LayerBasisRequest = Parameters<typeof readLayerBasis>[1];
 const levels = [2, 3] as const;
@@ -284,4 +289,207 @@ test("all historical layer readers preserve captured research after source heads
       assert.deepEqual(revisions(f.store), before);
     }
   } finally { for (const [path, bytes] of changedFiles) writeFileSync(path, bytes); }
+});
+
+
+test("OM acceptance builders preserve exact fill sources, distinguish the own lower part, and validate every boundary", async t => {
+  const { f, horizon } = await fixture(t);
+  const candidateResult = delivered(writeCandidate(f.store, { frame: frameRequest(f, reference(horizon.gate), 2), proposals: [] }));
+  assert.equal(candidateResult.state, "candidate");
+  if (candidateResult.state !== "candidate") return;
+  const candidate = candidateResult.record as Revision<FrameCandidateRecord>;
+  const gate = delivered(gateCandidate(f.store, { project: f.project, candidate: reference(candidate) })) as CandidateGate;
+  const graph = { id: candidate.value.base.graph.id, revision: candidate.value.base.graph.revision + 1, hash: candidate.value.graphHash };
+  const upper = basisRequest(f, 2).upper, before = revisions(f.store);
+  const saved = omAcceptedFrame(candidate, gate, graph, upper);
+  assert.equal(saved.candidateHash, candidate.value.graphHash);
+  assert.deepEqual(saved.acceptance, { producer: "om", candidate: reference(candidate), gate: { name: "G3", ...gate }, graph, upper });
+  assert.deepEqual(saved.fills, acceptedCandidateFills(candidate.value.fills));
+  assert.deepEqual(saved.fills.map(fill => fill.basis).sort((a, b) => canonical(a).localeCompare(canonical(b))),
+    candidate.value.fills.map(fill => fill.basis).sort((a, b) => canonical(a).localeCompare(canonical(b))));
+  assert.ok(Object.isFrozen(saved) && Object.isFrozen(saved.fills) && Object.isFrozen(saved.acceptance));
+  const changed = clone(f.graph);
+  changed.nodes.find(node => node.kind === "operation")!.title += " changed only above works";
+  assert.equal(lowerLayerHash(changed, 3), lowerLayerHash(f.graph, 3));
+  changed.nodes.find(node => node.kind === "work")!.title += " changed work";
+  assert.notEqual(lowerLayerHash(changed, 3), lowerLayerHash(f.graph, 3));
+  for (const value of [undefined, null, [], 0, "bad"]) {
+    assert.throws(() => omAcceptedFrame(value as unknown as Revision<FrameCandidateRecord>, gate, graph, upper), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, value as unknown as CandidateGate, graph, upper), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, gate, value as unknown as Ref, upper), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, gate, graph, value as unknown as Ref), malformed);
+    assert.throws(() => lowerLayerHash(value as unknown as Graph, 2), malformed);
+    if (!Array.isArray(value)) assert.throws(() => acceptedCandidateFills(value as unknown as FrameCandidateRecord['fills']), malformed);
+  }
+  assert.throws(() => omAcceptedFrame(candidate, { ...gate, graphHash: "0".repeat(64) }, graph, upper), malformed);
+  assert.throws(() => omAcceptedFrame(candidate, gate, { ...graph, revision: graph.revision + 1 }, upper), malformed);
+  assert.throws(() => omAcceptedFrame(candidate, gate, graph, { ...upper, id: "graph-layer:foreign:1" }), malformed);
+  for (const field of ["obligation", "node", "source", "basis"] as const) {
+    const fills = clone(candidate.value.fills); delete (fills[0] as unknown as Record<string, unknown>)[field];
+    assert.throws(() => acceptedCandidateFills(fills), malformed);
+  }
+  assert.deepEqual(revisions(f.store), before);
+});
+
+test("the producer selector never turns an invalid OM claim or an accepted native layer into an unavailable source", async t => {
+  const { f } = await fixture(t), request = basisRequest(f, 2), before = revisions(f.store);
+  const { upper: _upper, ...automatic } = request;
+  assert.deepEqual(delivered(readLayerAcceptance(f.store, automatic)), delivered(readLayerBasis(f.store, request)));
+  refusedAs(readUnacceptedLayer(f.store, automatic), "layer_basis_unproven");
+  assert.deepEqual(revisions(f.store), before);
+  for (const value of [undefined, null, 0, [], "bad"]) {
+    assert.throws(() => readLayerAcceptance(f.store, value as unknown as typeof automatic), malformed);
+    assert.throws(() => readUnacceptedLayer(f.store, value as unknown as typeof automatic), malformed);
+  }
+  for (const marker of [null, {}, { producer: "research", frame: request.layer }, { producer: "om" },
+    { producer: "om", frame: { id: "om-frame:garden:2", revision: 1, hash: "0".repeat(64) } }]) {
+    const layer = f.store.write({ id: request.layer.id, kind: "graph-layer", expected: f.store.get(request.layer.id)!.revision,
+      value: { ...f.layers[2].value, acceptance: marker } });
+    const changed = { ...request, layer: reference(layer) }, snapshot = revisions(f.store);
+    refusedAs(readLayerBasis(f.store, changed), "layer_basis_unproven");
+    refusedAs(readLayerAcceptance(f.store, changed), "layer_basis_unproven");
+    refusedAs(readUnacceptedLayer(f.store, changed), "layer_basis_unproven");
+    assert.deepEqual(revisions(f.store), snapshot);
+  }
+});
+
+
+test("the OM historical layer reader rederives its exact accepted candidate and gate and rejects coherent frame forgeries", async t => {
+  const { f, horizon } = await fixture(t);
+  const frameRequestValue = frameRequest(f, reference(horizon.gate), 2);
+  const proposal = f.store.write({ id: "om-proposal:garden:basis", kind: "layer-proposal", expected: 0, value: {
+    base: { graph: frameRequestValue.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+    nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], anchors: [], joins: [], tests: [],
+    edges: [], journeys: [], packets: [], transfers: [], removes: [], replaces: [], redefines: [],
+  } });
+  const built = delivered(writeCandidate(f.store, { frame: frameRequestValue, proposals: [reference(proposal)] }));
+  assert.equal(built.state, "candidate"); if (built.state !== "candidate") return;
+  const request: SettleCandidateRequest = { project: f.project, level: 2, candidate: reference(built.record),
+    outcome: { gate: "G3", candidate: reference(built.record), graphHash: built.record.value.graphHash, passed: true, codes: [] } };
+  const prepared = delivered(prepareSettleCandidate(f.store, request));
+  assert.ok(prepared.result.graph && prepared.result.layer && prepared.result.frame);
+  const variants: { name: string; change: (frame: OmAcceptedFrame) => void }[] = [
+    { name: "gate", change: frame => { frame.acceptance.gate.name = "G5" as "G3"; } },
+    { name: "fills", change: frame => { frame.fills.pop(); } },
+    { name: "candidateHash", change: frame => { frame.candidateHash = "0".repeat(64); } },
+    { name: "producer", change: frame => { delete (frame.acceptance as Partial<OmAcceptedFrame['acceptance']>).producer; } },
+    { name: "proposal-transition", change: () => {} },
+    { name: "graph", change: frame => { frame.acceptance.graph = frameRequestValue.graph; } },
+  ];
+  for (const variant of variants) {
+    const store = new Store(join(f.root, `forged-${variant.name}.sqlite`));
+    try {
+      for (const head of f.store.list()) for (const record of f.store.history(head.id))
+        store.write({ id: record.id, kind: record.kind, expected: record.revision - 1, value: record.value });
+      const writes = clone(prepared.writes) as Write[];
+      const frameWrite = writes.find(write => write.kind === "connection-frame")!;
+      const frame = frameWrite.value as OmAcceptedFrame; variant.change(frame);
+      const oldFrame = reference(prepared.result.frame);
+      const changedFrame = { ...oldFrame, hash: hashJson(frame) };
+      const layerWrite = writes.find(write => write.kind === "graph-layer")!;
+      const layer = layerWrite.value as LayerBasis;
+      layer.acceptance!.frame = changedFrame;
+      const swap = (ref: Ref) => canonical(ref) === canonical(oldFrame) ? changedFrame : ref;
+      const normalize = (refs: Ref[]) => refs.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+      layer.inputs = normalize(layer.inputs.map(swap));
+      for (const proof of layer.layerProofs!) proof.inputs = normalize(proof.inputs.map(swap));
+      store.writeMany(variant.name === "proposal-transition" ? writes.filter(write => write.kind !== "layer-proposal") : writes);
+      const source = { project: f.project, level: 2 as const, graph: reference(store.get(`graph:${f.project}`)!),
+        layer: reference(store.get(layerWrite.id)!) };
+      const snapshot = revisions(store);
+      refusedAs(readLayerAcceptance(store, source), "layer_basis_unproven");
+      refusedAs(readLayerBasis(store, { ...source, upper: basisRequest(f, 2).upper }), "layer_basis_unproven");
+      refusedAs(readUnacceptedLayer(store, source), "layer_basis_unproven");
+      assert.deepEqual(revisions(store), snapshot);
+    } finally { store.close(); }
+  }
+  const settled = delivered(settleCandidate(f.store, request));
+  assert.ok(settled.graph && settled.layer && settled.frame);
+  const source = { project: f.project, level: 2 as const, graph: reference(settled.graph), layer: reference(settled.layer) };
+  const result = delivered(readLayerAcceptance(f.store, source));
+  assert.equal(result.producer, "om");
+  assert.deepEqual(result.frame, reference(settled.frame));
+  assert.deepEqual(result.upper, basisRequest(f, 2).upper);
+  assert.ok(result.references.some(ref => canonical(ref) === canonical(reference(proposal))), "The proposed source revision is retained historically");
+  assert.ok(result.references.some(ref => canonical(ref) === canonical(built.record.value.base.graph)));
+  assert.ok(!result.currentReferences.some(ref => ref.id === proposal.id || ref.id === built.record.value.base.graph.id));
+  refusedAs(readUnacceptedLayer(f.store, source), "layer_basis_unproven");
+  const proposalHead = f.store.get(proposal.id)!;
+  f.store.write({ id: proposalHead.id, kind: proposalHead.kind, expected: proposalHead.revision, value: proposalHead.value });
+  const oldGraph = f.store.get(settled.graph.id)!;
+  f.store.write({ id: oldGraph.id, kind: oldGraph.kind, expected: oldGraph.revision, value: oldGraph.value });
+  const snapshot = revisions(f.store);
+  assert.deepEqual(delivered(readLayerAcceptance(f.store, source)), result);
+  f.reopen();
+  assert.deepEqual(delivered(readLayerAcceptance(f.store, source)), result);
+  assert.deepEqual(revisions(f.store), snapshot);
+  for (const error of [new TypeError("OM reader failure"), new EngineError("record_corrupt", "OM reader corruption")]) {
+    const get = f.store.get.bind(f.store);
+    try {
+      f.store.get = ((id: string, revision?: number) => { if (id === settled.frame!.id) throw error; return get(id, revision); }) as Store['get'];
+      assert.throws(() => readLayerAcceptance(f.store, source), actual => actual === error);
+    } finally { f.store.get = get; }
+  }
+});
+
+
+async function nativeRebaseFixture(t: test.TestContext, forgedRetired = false) {
+  const { f, request: horizonRequest, horizon } = await fixture(t);
+  const original = frameRequest(f, reference(horizon.gate), 3);
+  const mapped = delivered(readFrame(f.store, original));
+  const nativeFrame = f.store.write({ id: "om-frame:garden:3", kind: "connection-frame", expected: 0, value: {
+    project: f.project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(f.layers[3].value.projection),
+    fills: mapped.result.fills, ...(forgedRetired ? { retired: [mapped.result.fills[0]!], rebase: {} } : {}),
+  } });
+  const from = { ...original, frame: reference(nativeFrame) };
+  delivered(readFrame(f.store, from));
+  const written = delivered(writeCandidate(f.store, { frame: frameRequest(f, reference(horizon.gate), 2), proposals: [] }));
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") assert.fail("The native fixture must produce an operation candidate");
+  const candidate = reference(written.record);
+  const accepted = delivered(settleCandidate(f.store, { project: f.project, level: 2, candidate,
+    outcome: { gate: "G3", candidate, graphHash: written.record.value.graphHash, passed: true, codes: [] } }));
+  assert.ok(accepted.graph && accepted.layer && accepted.frame);
+  const currentHorizon = delivered(writeHorizon(f.store, { ...horizonRequest, graph: reference(accepted.graph), refinement: reference(accepted.layer),
+    choice: { ...horizonRequest.choice, choiceVersion: "rebase-retired-injection" } }));
+  const to: FrameRequest = { project: f.project, level: 3, graph: reference(accepted.graph), horizon: reference(currentHorizon.gate),
+    layer: null, frame: null, upper: { horizon: reference(currentHorizon.gate), frame: reference(accepted.frame) } };
+  return { f, from, to, accepted };
+}
+
+test("a native frame cannot smuggle retired history into an otherwise lawful OM rebase", async t => {
+  const { f, from, to } = await nativeRebaseFixture(t, true);
+  // The frame's current correspondence is valid; the forged extra history is not a native producer fact.
+  const before = revisions(f.store);
+  const refused = refusedAs(readRebaseBasis(f.store, { from, to }), "layer_basis_unproven");
+  assert.equal(refused.at.field, "rebase.retired");
+  assert.deepEqual(revisions(f.store), before);
+});
+
+test("the rebase layer builder rejects forged graph hashes and malformed or noncanonical carried and retired fills", async t => {
+  const { f, from, to, accepted } = await nativeRebaseFixture(t);
+  const basis = delivered(readRebaseBasis(f.store, { from, to }));
+  const frame = clone(basis.frame) as OmRebasedFrame;
+  const request: RebasedLayerRequest = { frame,
+    reference: { id: from.frame!.id, revision: from.frame!.revision + 1, hash: hashJson(frame) },
+    graph: accepted.graph!.value as Graph, upper: accepted.layer as Revision<LayerBasis>,
+    previous: f.store.get<LayerBasis>(from.layer!.id, from.layer!.revision)! };
+  const before = revisions(f.store), layer = buildRebasedLayer(request);
+  assert.equal(layer.layerProofs!.find(proof => proof.level === 3)!.hash, frame.layerHash);
+  assert.ok(Object.isFrozen(layer) && Object.isFrozen(layer.layerProofs));
+  const rejects = (changed: unknown) => assert.throws(() => buildRebasedLayer({ ...request,
+    frame: changed as OmRebasedFrame, reference: { ...request.reference, hash: hashJson(changed) } }), malformed);
+  for (const field of ["layerHash", "upperHash", "lowerHash"] as const) rejects({ ...frame, [field]: "0".repeat(64) });
+  assert.ok(frame.fills.length > 1);
+  for (const field of ["fills", "retired"] as const) {
+    for (const value of [null, {}, [null], [{ ...frame.fills[0], source: "proposed" }],
+      [{ ...frame.fills[0], port: 7 }], [...frame.fills].reverse()]) rejects({ ...frame, [field]: value });
+    for (const missing of ["obligation", "node", "source", "basis"] as const) {
+      const row = clone(frame.fills[0]) as unknown as Record<string, unknown>;
+      delete row[missing]; rejects({ ...frame, [field]: [row] });
+    }
+    const changed = { ...frame, [field]: clone(frame.fills) };
+    assert.deepEqual(buildRebasedLayer({ ...request, frame: changed,
+      reference: { ...request.reference, hash: hashJson(changed) } }).projection, layer.projection);
+  }
+  assert.deepEqual(revisions(f.store), before);
 });
