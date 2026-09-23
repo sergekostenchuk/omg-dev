@@ -9,6 +9,8 @@ import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Que
   prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, applicableAnswer, confirmAnswerGapClosure,
   checkAnswerInputBody, readAnswerForInput, answerSourceGuards,
   prepareAnswerInvalidation, readAnswerInvalidation, type AnswerInvalidation,
+  prepareAnswerTask, writeAnswerTask, readAnswerTask, readAnswerTaskBasis, applicableAnswerTask, type AnswerTaskRequest,
+  prepareAnswerSearch, readAnswerSearch, answerIndexId, prepareAcceptedAnswers, ANSWER_INDEX_KIND, type AnswerIndex,
   confirmAcceptedAnswerResult, ANSWER_REFUSAL_CODES, type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -18,7 +20,7 @@ import type { Question } from '../src/discovery/discovery.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
 import { withHistoricalReads, writeOmInput, type OmInputRecord } from '../src/om/input.js';
-import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
+import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from '../src/om/addressing.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { ResearchAnswer, ResearchAssessment } from '../src/discovery/research-model.js';
 import { writeHorizon } from '../src/om/horizon.js';
@@ -163,15 +165,15 @@ function factFixture(t: TestContext) {
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
   writeFileSync(join(root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
   const source = engine.discovery.evidence.file(project, 'answer-source', root, 'answer.json', 'application/json', 0);
-  function issue(current = gaps, resultForm: Json = { type: 'string' }, selected?: { pointers: string[]; values: Json[] }) {
+  function issue(current = gaps, resultForm: Json = { type: 'string' }, selected?: { pointers: string[]; values: Json[] }, task?: Ref) {
     const requestContract: AnswerQuestionContract = { establishes: input.value.input.questions[0]!.question,
       consumer: { blocks: [...current.gap.value.gap.consumers] }, requirements: selected?.values ?? [clone(input.value.input.contracts[0]!) as unknown as Json], resultForm };
     const draft = engine.discovery.create(project, 'om-g2', 'R1', block,
-      [mc1FieldSpec({ input: current.sources.input, gap: reference(current.gap), contract: requestContract })], [current.sources.input, reference(current.gap)]);
+      [mc1FieldSpec({ input: current.sources.input, gap: reference(current.gap), contract: requestContract })], [current.sources.input, reference(current.gap), ...(task ? [task] : [])]);
     const issued = store.get<Question>(draft.value.questions[0]!)!;
     const request: Mc1QuestionRequest = { project, input: current.sources.input, gaps: { sources: current.sources, records: current.records },
       gap: reference(current.gap), contract: requestContract, requirements: (selected?.pointers ?? ['/contracts/0']).map(pointer => ({ pointer })),
-      engineQuestion: reference(issued), draft: reference(draft) };
+      engineQuestion: reference(issued), draft: reference(draft), ...(task ? { task } : {}) };
     const question = ok(writeMc1Question(store, request));
     return { request, question, issued, draft };
   }
@@ -188,11 +190,234 @@ function factFixture(t: TestContext) {
     restart() { store.close(); store = new Store(path); engine = new ProductEngine(store); } };
 }
 
+function producerTask(f: ReturnType<typeof factFixture>, current = f.gaps, resultForm: Json = { type: 'string' }): AnswerTaskRequest {
+  return { project: f.project, input: current.sources.input, gaps: { sources: current.sources, records: current.records },
+    gap: reference(current.gap), requirements: [{ pointer: '/contracts/0' }], resultForm };
+}
+
+test('D5 producer task precedes native MC1 and derives the full contract from exact complete sources', t => {
+  const f = factFixture(t), request = producerTask(f), before = f.store.list().map(reference);
+  const prepared = ok(prepareAnswerTask(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(prepared.writes.length, 1);
+  assert.equal(prepared.contract.establishes, f.input.value.input.questions[0]!.question);
+  assert.deepEqual(prepared.contract.consumer, { blocks: f.gaps.gap.value.gap.consumers });
+  assert.deepEqual(prepared.contract.requirements, [f.input.value.input.contracts[0]]);
+  assert.deepEqual(prepared.contract.resultForm, request.resultForm);
+  const pending = ok(readAnswerTaskBasis(f.store, { project: f.project, task: { pending: clone(prepared.writes[0]!) }, current: true }));
+  assert.deepEqual(pending.record, prepared.record);
+  assert.ok(!pending.guards.some(ref => ref.id === prepared.record.id));
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: prepared.writes, guards: prepared.guards }));
+  const saved = ok(readAnswerTask(f.store, { project: f.project, record: reference(prepared.record) }));
+  assert.deepEqual(saved.contract, prepared.contract); assert.deepEqual(saved.guards, []);
+  assert.deepEqual(ok(writeAnswerTask(f.store, request)), prepared.record);
+  assert.deepEqual(ok(prepareAnswerTask(f.store, request)).writes, []);
+  const q = f.issue(f.gaps, request.resultForm, undefined, reference(prepared.record));
+  assert.deepEqual(ok(readMc1Question(f.store, { project: f.project, record: reference(q.question) })).record.value.request.task, reference(prepared.record));
+  const different = ok(writeAnswerTask(f.store, producerTask(f, f.gaps, { type: 'string', description: 'Another form' })));
+  rejected(prepareMc1Question(f.store, { ...q.request, task: reference(different) }), 'answer_question_invalid');
+  f.restart();
+  assert.deepEqual(ok(readAnswerTask(f.store, { project: f.project, record: reference(prepared.record) })), saved);
+});
+
+test('D5 producer task rejects absent producer choices, malformed schemas, incomplete sources and status imitations', t => {
+  const f = factFixture(t), request = producerTask(f);
+  const guarded = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get' || prop === 'list') return () => assert.fail('Malformed producer task must be refused before reading');
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  for (const field of Object.keys(request)) {
+    const missing = { ...request } as Record<string, unknown>; delete missing[field];
+    assert.throws(() => prepareAnswerTask(guarded, missing as unknown as AnswerTaskRequest), (error: unknown) => error instanceof EngineError && error.code === 'answer_request_invalid');
+  }
+  assert.throws(() => prepareAnswerTask(guarded, { ...request, resultForm: undefined } as unknown as AnswerTaskRequest),
+    (error: unknown) => error instanceof EngineError && error.code === 'answer_request_invalid');
+  assert.equal(ok(prepareAnswerTask(f.store, { ...request, resultForm: false })).contract.resultForm, false);
+  for (const schema of [null, 3, 'string', { type: 'not-a-json-type' }, { unknownStrictKeyword: true }, { $ref: 'urn:unavailable' }] as Json[])
+    rejected(prepareAnswerTask(f.store, { ...request, resultForm: schema }), 'answer_question_invalid');
+  rejected(prepareAnswerTask(f.store, { ...request, gaps: { ...request.gaps, records: [] } }));
+  rejected(prepareAnswerTask(f.store, { ...request, requirements: [{ pointer: '/missing' }] }), 'answer_question_invalid');
+  const counterfeit = f.store.write({ id: 'om-answer-task:garden:pretend', kind: 'answer-task', expected: 0,
+    value: { project: f.project, fingerprint: 'x', status: 'accepted' } });
+  rejected(readAnswerTask(f.store, { project: f.project, record: reference(counterfeit) }), 'answer_question_invalid');
+  const before = f.store.list().map(reference), prepared = ok(prepareAnswerTask(f.store, request));
+  const corrupt = clone(prepared.writes[0]!) as Write; (corrupt.value as Record<string, any>).contract.establishes = 'Another fact';
+  rejected(readAnswerTaskBasis(f.store, { project: f.project, task: { pending: corrupt }, current: true }), 'answer_question_invalid');
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test('D5 task applicability reuses a fact without native MC1 issuance, distinguishes result form and preserves refresh and history', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const questions = f.store.list('question').map(reference), task = ok(writeAnswerTask(f.store, producerTask(f)));
+  const request = { project: f.project, record: reference(accepted), task: { record: reference(task) }, current: true };
+  const applicable = ok(applicableAnswerTask(f.store, request)); assert.equal(applicable.applicable, true); assert.equal(applicable.value, 'JSON');
+  const different = ok(writeAnswerTask(f.store, producerTask(f, f.gaps, { type: 'string', description: 'Streaming JSON' })));
+  assert.equal(ok(applicableAnswerTask(f.store, { ...request, task: { record: reference(different) } })).applicable, false);
+  const inventory = f.store.write({ id: 'repo-inventory:garden', kind: 'repo-inventory', expected: 0, value: { projectId: f.project, paths: [] } });
+  const refreshed = ok(writeOmInput(f.store, { project: f.project, stages: f.stages, expected: f.input.revision, inventory: reference(inventory) }));
+  const current = f.gapsFor(reference(refreshed)), next = ok(prepareAnswerTask(f.store, producerTask(f, current)));
+  const prepared = ok(applicableAnswerTask(f.store, { ...request, task: { pending: clone(next.writes[0]!) } }));
+  assert.equal(prepared.applicable, true); assert.equal(prepared.key, applicable.key);
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(refreshed))));
+  assert.deepEqual(f.store.list('question').map(reference), questions);
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: prepared.writes, guards: prepared.guards }));
+  const nextRequest = { ...request, task: { record: reference(next.record) } };
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const stale = ok(applicableAnswerTask(f.store, nextRequest));
+  assert.equal(stale.applicable, false); assert.ok(stale.invalidation); assert.equal(stale.writes.length, 1);
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: stale.writes, guards: stale.guards }));
+  const historicalRequest = { ...nextRequest, current: false, invalidation: clone(stale.invalidation) as AnswerInvalidation };
+  const history = ok(applicableAnswerTask(f.store, historicalRequest)); assert.equal(history.applicable, false);
+  assert.deepEqual(history.guards, []); assert.deepEqual(history.writes, []);
+  rmSync(join(f.root, 'answer.json')); f.restart();
+  assert.deepEqual(ok(applicableAnswerTask(f.store, historicalRequest)), history);
+  assert.equal(ok(applicableAnswerTask(f.store, { ...request, current: false, invalidation: null })).applicable, true);
+  assert.throws(() => applicableAnswerTask(f.store, { ...request, current: false }), (error: unknown) => error instanceof EngineError && error.code === 'answer_request_invalid');
+  const altered = ok(prepareAnswerTask(f.store, producerTask(f, current, { type: 'string', description: 'New producer format' })));
+  const mismatch = ok(applicableAnswerTask(f.store, { ...request, task: { pending: clone(altered.writes[0]!) } }));
+  assert.equal(mismatch.applicable, false); assert.equal(mismatch.invalidation, null);
+  assert.deepEqual(mismatch.writes.map(write => write.kind), ['answer-task']);
+  assert.ok(!mismatch.guards.some(ref => ref.id === f.source.id));
+});
+
+test('D5 index is a complete historical set and batches several admitted answers into one CAS', async t => {
+  const f = factFixture(t), a = await f.answer(), b = await f.answer(), before = f.store.list().map(reference);
+  const prepared = ok(prepareAcceptedAnswers(f.store, [a.request, b.request]));
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(prepared.writes.filter(write => write.kind === 'accepted-answer').length, 2);
+  assert.equal(prepared.writes.filter(write => write.kind === ANSWER_INDEX_KIND).length, 1);
+  const written = ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: prepared.writes, guards: prepared.guards }));
+  assert.ok(written);
+  for (const ref of prepared.references) assert.equal(f.store.get(ref.id, ref.revision)?.hash, ref.hash, `No unsaved intermediate index: ${ref.id}`);
+  const id = answerIndexId(f.project, f.target, 'answer'), first = f.store.get<AnswerIndex>(id)!;
+  assert.equal(first.revision, 1); assert.equal(first.value.previous, null); assert.equal(first.value.answers.length, 2);
+  const search = ok(prepareAnswerSearch(f.store, { project: f.project, target: f.target, field: 'answer' }));
+  assert.deepEqual(search.writes, []); assert.deepEqual(search.answers, first.value.answers);
+  assert.ok(search.guards.some(ref => canonical(ref) === canonical(reference(first))));
+  assert.deepEqual(ok(prepareAcceptedAnswers(f.store, [a.request, b.request])).writes, []);
+  const history = ok(readAnswerSearch(f.store, { project: f.project, record: reference(first) }));
+  const c = await f.answer(), saved = ok(writeAcceptedAnswer(f.store, c.request)), latest = f.store.get<AnswerIndex>(id)!;
+  assert.equal(latest.revision, 2); assert.deepEqual(latest.value.previous, reference(first));
+  assert.equal(latest.value.answers.length, 3); assert.ok(latest.value.answers.some(ref => canonical(ref) === canonical(reference(saved))));
+  f.restart();
+  const noList = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'list') return () => assert.fail('Historical index must not enumerate current answers');
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  assert.deepEqual(ok(readAnswerSearch(noList, { project: f.project, record: reference(first) })), history);
+});
+
+test('D5 negative initialization and first acceptance exclude one another atomically in both orders', async t => {
+  for (const first of ['search', 'answer']) {
+    const f = factFixture(t), a = await f.answer();
+    const search = ok(prepareAnswerSearch(f.store, { project: f.project, target: f.target, field: 'answer' }));
+    assert.equal(search.record.revision, 1); assert.deepEqual(search.answers, []); assert.equal(search.writes.length, 1);
+    const accepted = ok(prepareAcceptedAnswer(f.store, a.request));
+    const marker: Write = { id: `route-test:${first}`, kind: 'route-test', expected: 0, value: { selected: 'research' } };
+    const negative = () => writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: [...search.writes, marker], guards: search.guards });
+    const positive = () => writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: accepted.writes, guards: accepted.guards });
+    if (first === 'search') {
+      ok(negative()); rejected(positive(), 'revision_conflict'); assert.equal(f.store.get(accepted.record.id), null);
+      ok(writeAcceptedAnswer(f.store, a.request));
+    } else {
+      ok(positive()); rejected(negative(), 'revision_conflict'); assert.equal(f.store.get(marker.id), null);
+    }
+    assert.equal(f.store.get<AnswerIndex>(search.record.id)!.value.answers.length, 1);
+  }
+});
+
+test('D5 existing-index negative searches and competing acceptances preserve every committed answer', async t => {
+  const f = factFixture(t), first = await f.answer(); ok(writeAcceptedAnswer(f.store, first.request));
+  const a = await f.answer(), b = await f.answer(), preparedA = ok(prepareAcceptedAnswer(f.store, a.request)), preparedB = ok(prepareAcceptedAnswer(f.store, b.request));
+  const search = ok(prepareAnswerSearch(f.store, { project: f.project, target: f.target, field: 'answer' }));
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: preparedA.writes, guards: preparedA.guards }));
+  rejected(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: preparedB.writes, guards: preparedB.guards }), 'input_stale');
+  assert.equal(f.store.get(preparedB.record.id), null);
+  const marker: Write = { id: 'route-test:stale', kind: 'route-test', expected: 0, value: null };
+  rejected(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: [marker], guards: search.guards }), 'input_stale');
+  assert.equal(f.store.get(marker.id), null);
+  ok(writeAcceptedAnswer(f.store, b.request));
+  assert.equal(ok(prepareAnswerSearch(f.store, { project: f.project, target: f.target, field: 'answer' })).answers.length, 3);
+});
+
+test('D5 index bootstraps legacy exact answers but refuses partial, empty and foreign current catalogs', async t => {
+  for (const missing of [null, 'partial', 'all', 'foreign'] as const) {
+    const f = factFixture(t), a = await f.answer(), b = await f.answer(), batch = ok(prepareAcceptedAnswers(f.store, [a.request, b.request]));
+    // Accepted facts from the pre-index era retain their original exact content.
+    for (const write of batch.writes.filter(write => write.kind === 'accepted-answer')) f.store.write(write as Write);
+    const request = { project: f.project, target: f.target, field: 'answer' }, id = answerIndexId(f.project, f.target, 'answer');
+    if (missing === null) {
+      const before = f.store.list().map(reference), bootstrap = ok(prepareAnswerSearch(f.store, request));
+      assert.deepEqual(f.store.list().map(reference), before); assert.equal(bootstrap.answers.length, 2);
+      assert.equal(bootstrap.writes.length, 1); assert.equal(bootstrap.writes[0]!.expected, 0);
+      ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: bootstrap.writes, guards: bootstrap.guards }));
+      assert.deepEqual(ok(prepareAnswerSearch(f.store, request)).writes, []);
+      const wrong = f.store.write({ id: 'om-answer:garden:unreadable', kind: 'other-kind', expected: 0, value: {} });
+      assert.ok(wrong); rejected(prepareAnswerSearch(f.store, request));
+    } else {
+      const answers = missing === 'all' ? [] : missing === 'partial' ? [reference(batch.records[0]!)]
+        : [{ ...reference(batch.records[0]!), id: 'om-answer:other:foreign' }];
+      f.store.write({ id, kind: ANSWER_INDEX_KIND, expected: 0, value: { project: f.project, target: f.target, field: 'answer', answers, previous: null } });
+      const before = f.store.list().map(reference); rejected(prepareAnswerSearch(f.store, request));
+      assert.deepEqual(f.store.list().map(reference), before);
+      rejected(prepareAcceptedAnswer(f.store, a.request));
+    }
+  }
+});
+
+test('D5 independent obligation indices do not conflict when one line gains an answer', async t => {
+  const f = factFixture(t), otherRequest = { project: f.project, target: 'discovery:another-fact', field: 'answer' };
+  const own = ok(prepareAnswerSearch(f.store, { project: f.project, target: f.target, field: 'answer' })), other = ok(prepareAnswerSearch(f.store, otherRequest));
+  assert.notEqual(own.record.id, other.record.id);
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: [...own.writes, ...other.writes], guards: [...own.guards, ...other.guards] }));
+  const negativeOther = ok(prepareAnswerSearch(f.store, otherRequest)), a = await f.answer(); ok(writeAcceptedAnswer(f.store, a.request));
+  const marker: Write = { id: 'route-test:other-line', kind: 'route-test', expected: 0, value: null };
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: otherRequest.target, writes: [marker], guards: negativeOther.guards }));
+  assert.deepEqual(f.store.get(other.record.id), other.record);
+});
+
+test('D5 pending closure preparation carries the answer and its complete index while historical confirmation adds no index', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(f.input), answer: reference(accepted), question: a.request.question }));
+  const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(applied), graph: reference(f.graph), refinement: null, available: {},
+    choice: { choiceVersion: 'closed-fact', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project: f.project, input: reference(applied), graph: reference(f.graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project: f.project, level: 2, graph: reference(f.graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(f.store.get(`graph-layer:${f.project}:2`)!) } };
+  const current = ok(writeGaps(f.store, sources)); assert.ok(!current.records.some(row => row.value.gap.target === f.target));
+  const indexId = answerIndexId(f.project, f.target, 'answer'), before = f.store.list().map(reference);
+  // Bound the pending-closure API with real native sources: the contingent answer/index are supplied by its bundle, not by storage.
+  const view = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => [accepted.id, indexId].includes(id) ? null : target.get(id, revision);
+    if (prop === 'list') return (kind?: string) => target.list(kind).filter(row => ![accepted.id, indexId].includes(row.id));
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const request = { project: f.project, basis: { pending: { id: accepted.id, kind: accepted.kind, expected: 0, value: accepted.value } },
+    target: f.target, field: 'answer', prior: { sources: f.gaps.sources, records: f.gaps.records },
+    current: { sources, records: current.records.map(reference) }, attempt: null, currentOnly: true };
+  const prepared = ok(confirmAnswerGapClosure(view, request));
+  assert.deepEqual(prepared.writes.map(write => write.kind), ['accepted-answer', ANSWER_INDEX_KIND]);
+  assert.deepEqual((prepared.writes[1]!.value as unknown as AnswerIndex).answers, [reference(accepted)]);
+  assert.ok(!prepared.guards.some(ref => ref.id === accepted.id || ref.id === indexId));
+  const historical = ok(confirmAnswerGapClosure(view, { ...request, currentOnly: false }));
+  assert.deepEqual(historical.writes, []); assert.deepEqual(historical.guards, []);
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test('D5 public search cannot smuggle unadmitted pending writes past source freshness checks', t => {
+  const f = factFixture(t);
+  const noReads = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get' || prop === 'list') return () => assert.fail('Unsupported pending input must be rejected before storage reads');
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  assert.throws(() => prepareAnswerSearch(noReads, { project: f.project, target: f.target, field: 'answer', pending: [] } as never),
+    (error: unknown) => error instanceof EngineError && error.code === 'answer_request_invalid');
+});
+
 test('D5 accepts a native D3-addressed MC1 fact, rederives history and issues a closure without closing an active D1 gap', async t => {
   const f = factFixture(t), a = await f.answer(), before = f.store.list().map(reference);
   const prepared = ok(prepareAcceptedAnswer(f.store, a.request));
   assert.deepEqual(f.store.list().map(reference), before);
-  assert.equal(prepared.writes.length, 1); assert.ok('pending' in prepared.closure.answer);
+  assert.equal(prepared.writes.length, 2); assert.deepEqual(prepared.writes.map(write => write.kind), ['accepted-answer', ANSWER_INDEX_KIND]); assert.ok('pending' in prepared.closure.answer);
   const lineRequest: GapLinesRequest = { project: f.project, pass: 1, previous: null,
     gaps: { sources: f.gaps.sources, records: f.gaps.records }, closures: [] };
   const line = ok(writeGapLines(f.store, lineRequest));
@@ -621,9 +846,9 @@ test('D5 refuses missing or substituted MC1 sources and preserves every module r
   const incomplete = f.store.write({ id: 'om-mc1-question:garden:incomplete', kind: 'mc1-question', expected: 0, value: { project: f.project, request: {} } });
   collect(readMc1Question(f.store, { project: f.project, record: reference(incomplete) }), 'answer_question_invalid');
   const b = await f.answer(); collect(prepareAcceptedAnswer(f.store, { ...b.request, question: a.request.question }), 'answer_unconfirmed');
+  const saved = ok(writeAcceptedAnswer(f.store, a.request));
   const imitation = f.store.write({ id: 'om-answer:garden:imitation', kind: 'accepted-answer', expected: 0, value: { project: f.project, status: 'accepted' } });
   collect(readAcceptedAnswer(f.store, { project: f.project, record: reference(imitation) }), 'answer_record_invalid');
-  const saved = ok(writeAcceptedAnswer(f.store, a.request));
   collect(confirmAnswerGapClosure(f.store, { project: f.project, basis: { record: reference(saved) }, target: f.target, field: 'answer',
     prior: { sources: f.gaps.sources, records: f.gaps.records }, current: { sources: f.gaps.sources, records: f.gaps.records }, attempt: null, currentOnly: false }), 'answer_inapplicable');
   const address = { project: f.project, block: f.block, line: 1 };

@@ -1,7 +1,7 @@
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { delivered, refused, isPlainObject, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
-import { Ajv } from 'ajv';
+import { Ajv, MissingRefError } from 'ajv';
 import { basename, dirname } from 'node:path';
 import type { DiscoveryDraft, FieldSpec, Question } from '../discovery/discovery.js';
 import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-model.js';
@@ -55,6 +55,8 @@ export function answerContractFingerprint(contract: AnswerQuestionContract): str
 
 export const MC1_QUESTION_KIND = 'mc1-question';
 export const ACCEPTED_ANSWER_KIND = 'accepted-answer';
+export const ANSWER_TASK_KIND = 'answer-task';
+export const ANSWER_INDEX_KIND = 'answer-index';
 export const ANSWER_REFUSAL_CODES = Object.freeze([
   'answer_question_invalid', 'answer_unconfirmed', 'answer_record_invalid', 'answer_inapplicable', 'answer_attempt_invalid', 'input_stale',
 ] as const);
@@ -62,6 +64,17 @@ export interface Mc1QuestionRequest {
   project: string; input: Ref; gaps: GapReadRequest; gap: Ref;
   contract: AnswerQuestionContract; requirements: { pointer: string }[];
   engineQuestion: Ref; draft: Ref;
+  task?: Ref;
+}
+export interface AnswerTaskRequest {
+  project: string; input: Ref; gaps: GapReadRequest; gap: Ref;
+  requirements: { pointer: string }[]; resultForm: Json;
+}
+export interface AnswerTaskRecord { project: string; request: AnswerTaskRequest; contract: AnswerQuestionContract; fingerprint: string }
+export type AnswerTaskBasis = { record: Ref } | { pending: Write };
+export interface CheckedAnswerTask {
+  request: AnswerTaskRequest; record: Revision<AnswerTaskRecord>; contract: AnswerQuestionContract; gap: Gap;
+  references: Ref[]; guards: Ref[]; writes: Write[];
 }
 export interface Mc1QuestionRecord { project: string; request: Mc1QuestionRequest; fingerprint: string }
 export interface AnswerRequest {
@@ -84,6 +97,8 @@ export interface PreparedAnswer {
   closure: { id: string; reason: 'filled'; basis: Ref; acceptance: null; attempt: GapLineAttempt | null; answer: AnswerBasis };
 }
 export interface AnswerInvalidation { record: Ref; sources: { before: Ref; after: Ref }[] }
+export interface AnswerIndex { project: string; target: string; field: string; answers: Ref[]; previous: Ref | null }
+export interface PreparedAnswerSearch { record: Revision<AnswerIndex>; answers: Ref[]; writes: Write[]; guards: Ref[]; references: Ref[] }
 const object = (value: unknown): value is Record<string, any> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -121,8 +136,15 @@ function requireQuestion(value: unknown): asserts value is Mc1QuestionRequest {
   if (!object(value) || !text(value.project) || !isRef(value.input) || !isRef(value.gap)
     || !object(value.gaps) || !object(value.gaps.sources) || !Array.isArray(value.gaps.records)
     || !value.gaps.records.every(isRef) || !isRef(value.engineQuestion) || !isRef(value.draft)
-    || !Array.isArray(value.requirements) || !value.requirements.every(item => object(item) && typeof item.pointer === 'string')) requestInvalid('question');
+    || !Array.isArray(value.requirements) || !value.requirements.every(item => object(item) && typeof item.pointer === 'string')
+    || Object.hasOwn(value, 'task') && !isRef(value.task)) requestInvalid('question');
   normalizeAnswerContract(value.contract);
+}
+function requireTask(value: unknown): asserts value is AnswerTaskRequest {
+  if (!object(value) || !text(value.project) || !isRef(value.input) || !isRef(value.gap)
+    || !object(value.gaps) || !object(value.gaps.sources) || !Array.isArray(value.gaps.records) || !value.gaps.records.every(isRef)
+    || !Array.isArray(value.requirements) || !value.requirements.every(item => object(item) && typeof item.pointer === 'string')
+    || !Object.hasOwn(value, 'resultForm') || value.resultForm === undefined) requestInvalid('task');
 }
 function requireAnswer(value: unknown): asserts value is AnswerRequest {
   if (!object(value) || !text(value.project) || !['question', 'answer', 'answeredQuestion', 'draft'].every(key => isRef(value[key]))
@@ -159,6 +181,13 @@ export function acceptedAnswerNamespace(project: string): string {
 export function mc1QuestionNamespace(project: string): string {
   if (!text(project)) requestInvalid('project'); return `om-mc1-question:${project}:`;
 }
+export function answerTaskNamespace(project: string): string {
+  if (!text(project)) requestInvalid('project'); return `om-answer-task:${project}:`;
+}
+function normalizedTask(request: AnswerTaskRequest): AnswerTaskRequest {
+  return copy({ project: request.project, input: request.input, gaps: { ...request.gaps, records: sorted(request.gaps.records) },
+    gap: request.gap, requirements: sorted(request.requirements), resultForm: request.resultForm });
+}
 function normalizedQuestion(request: Mc1QuestionRequest): Mc1QuestionRequest {
   return copy({ ...request, requirements: sorted(request.requirements), contract: normalizeAnswerContract(request.contract),
     gaps: { ...request.gaps, records: sorted(request.gaps.records) } }) as Mc1QuestionRequest;
@@ -171,8 +200,26 @@ export function mc1FieldSpec(input: { input: Ref; gap: Ref; contract: AnswerQues
     prompt: canonical({ kind: 'MC1', input: input.input, gap: input.gap, contract }),
     risk: 'Unsupported evidence must leave the obligation open', schema: contract.resultForm }) as FieldSpec;
 }
-function questionContext(store: Store, request: Mc1QuestionRequest) {
-  const gaps = take(readGaps(store, request.gaps));
+function taskRequestForQuestion(request: Mc1QuestionRequest): AnswerTaskRequest {
+  return normalizedTask({ project: request.project, input: request.input, gaps: request.gaps, gap: request.gap,
+    requirements: request.requirements, resultForm: request.contract.resultForm });
+}
+function checkResultForm(schema: Json, target: string): void {
+  check(typeof schema === 'boolean' || object(schema), 'answer_question_invalid', target, 'resultForm', 'The result schema must be an object or boolean');
+  const validator = new Ajv({ strict: true, allowUnionTypes: true });
+  try {
+    check(validator.validateSchema(schema as object), 'answer_question_invalid', target, 'resultForm', 'The producer task must specify a valid result schema');
+    validator.compile(schema as object);
+  } catch (error) {
+    if (error instanceof MissingRefError || error instanceof SyntaxError || error instanceof Error && error.constructor === Error)
+      fail('answer_question_invalid', target, 'resultForm', 'The producer task must specify a supported result schema');
+    throw error;
+  }
+}
+function taskContext(store: Store, request: AnswerTaskRequest) {
+  const gaps = take(historicalRead(store, { reader: 'D5.question-gaps', project: request.project, ref: request.input,
+    parameters: request.gaps as unknown as Json }, () => readGaps(store, request.gaps),
+  () => fail('answer_question_invalid', request.gap.id, 'history', 'The producer task has cyclic gap sources')));
   const gapRecord = gaps.records.find(row => same(reference(row), request.gap));
   check(gaps.sources.project === request.project && same(gaps.sources.input, request.input) && gapRecord,
     'answer_question_invalid', request.gap.id, 'gaps', 'The question must name its exact complete D1 source and OM input');
@@ -183,30 +230,135 @@ function questionContext(store: Store, request: Mc1QuestionRequest) {
   const sourceQuestion = input.value.input.questions.find(item => item.id === gap.target);
   check(sourceQuestion && gap.field === 'answer' && sourceQuestion.kind === 'repository-fact',
     'answer_question_invalid', gap.target, 'target', 'This fact needs a producer question with a known address and knowledge kind');
-  const consumer = { blocks: [...gap.consumers], ...(gap.mechanism ? { mechanism: gap.mechanism } : {}), ...(gap.uses ? { uses: gap.uses } : {}) };
-  check(request.contract.establishes === sourceQuestion.question && same(request.contract.consumer, consumer)
-    && same(sorted(request.contract.requirements), sorted(request.requirements.map(item => pointer(input.value.input, item.pointer, gap.target)))),
-    'answer_question_invalid', gap.target, 'contract', 'The full contract must retain its D1 question, consumers and selected requirements');
+  const consumer = { blocks: [...gap.consumers], ...(gap.mechanism ? { mechanism: gap.mechanism } : {}), ...(gap.uses ? { uses: [...gap.uses] } : {}) };
+  checkResultForm(request.resultForm, gap.target);
+  const contract = normalizeAnswerContract({ establishes: sourceQuestion.question, consumer,
+    requirements: request.requirements.map(item => pointer(input.value.input, item.pointer, gap.target)), resultForm: request.resultForm }) as AnswerQuestionContract;
+  return { gap: gap as Gap, input, contract, references: unique([request.input, request.gap, ...request.gaps.records]), collection: gaps.collection, guards: [] as Ref[] };
+}
+function questionContext(store: Store, request: Mc1QuestionRequest) {
+  const taskRequest = taskRequestForQuestion(request);
+  const task = request.task ? loadAnswerTask(store, { project: request.project, record: request.task }) : null;
+  check(!task || same(task.request, taskRequest), 'answer_question_invalid', request.gap.id, 'task', 'The issued MC1 question must preserve its exact producer task');
+  const context = task?.context ?? taskContext(store, taskRequest), gap = context.gap;
+  check(same(request.contract, context.contract), 'answer_question_invalid', gap.target, 'contract',
+    'The full contract must retain its D1 question, consumers and selected requirements');
   const engine = exact<Question>(store, request.project, request.engineQuestion, 'question');
   const draft = exact<DiscoveryDraft>(store, request.project, request.draft, 'discovery-draft', `discovery:${request.project}:`);
   check(object(engine.value) && engine.value.projectId === request.project && engine.value.status === 'open' && engine.value.answer === null
     && engine.value.draftId === draft.id && object(draft.value) && draft.value.projectId === request.project
     && Array.isArray(draft.value.questions) && same(draft.value.questions, [engine.id]) && Array.isArray(draft.value.inputs)
     && draft.value.inputs.some(ref => same(ref, request.input)) && draft.value.inputs.some(ref => same(ref, request.gap))
+    && (!request.task || draft.value.inputs.some(ref => same(ref, request.task)))
     && engine.value.stage === draft.value.stage && engine.value.level === draft.value.level
     && gap.consumers.includes(engine.value.consumer) && engine.value.consumer === draft.value.consumer
     && object(engine.value.spec) && same(engine.value.spec, mc1FieldSpec(request)) && object(draft.value.fields)
     && Object.hasOwn(draft.value.fields, engine.value.spec.field) && hashJson(draft.value.fields[engine.value.spec.field]) === engine.value.beforeHash,
     'answer_question_invalid', gap.target, 'engineQuestion', 'The exact issued engine question and draft must implement this complete OM contract');
-  const references = unique([request.input, request.gap, request.engineQuestion, request.draft, ...request.gaps.records]);
-  return { gap: gap as Gap, input, engine, draft, references, collection: gaps.collection, guards: [] as Ref[] };
+  const references = unique([...context.references, request.engineQuestion, request.draft, ...(request.task ? [request.task] : [])]);
+  return { ...context, engine, draft, references };
 }
-function currentQuestionContext(store: Store, request: Mc1QuestionRequest, context: ReturnType<typeof questionContext>) {
+function currentTaskGuards(store: Store, request: AnswerTaskRequest, context: ReturnType<typeof taskContext>): Ref[] {
   const prepared = take(prepareGaps(store, request.gaps.sources));
   check(same(prepared.collection, context.collection), 'answer_question_invalid', context.gap.target, 'gaps', 'Current D1 must preserve the issued source set');
   const guards = unique([...prepared.guards, request.input, ...request.gaps.records]);
   for (const guard of guards) head(store, guard);
-  return { ...context, guards };
+  return guards;
+}
+function currentQuestionContext(store: Store, request: Mc1QuestionRequest, context: ReturnType<typeof questionContext>) {
+  const guards = currentTaskGuards(store, taskRequestForQuestion(request), context);
+  if (request.task) { head(store, request.task); guards.push(request.task); }
+  return { ...context, guards: unique(guards) };
+}
+function predictedTask(request: AnswerTaskRequest, contract: AnswerQuestionContract): Revision<AnswerTaskRecord> {
+  const value = { project: request.project, request, contract, fingerprint: answerContractFingerprint(contract) };
+  return { id: `${answerTaskNamespace(request.project)}${hashJson(request)}`, kind: ANSWER_TASK_KIND, revision: 1, hash: hashJson(value), value };
+}
+function checkTaskRecord(store: Store, project: string, record: Revision<AnswerTaskRecord>) {
+  check(record.kind === ANSWER_TASK_KIND && record.id.startsWith(answerTaskNamespace(project))
+    && object(record.value) && record.value.project === project && object(record.value.request),
+    'answer_question_invalid', record.id, 'task', 'A producer task must preserve its complete source request');
+  try { requireTask(record.value.request); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'answer_request_invalid')
+      fail('answer_question_invalid', record.id, 'task', 'The saved producer task is incomplete');
+    throw error;
+  }
+  const normalized = normalizedTask(record.value.request);
+  check(normalized.project === project && same(normalized, record.value.request),
+    'answer_question_invalid', record.id, 'task', 'The saved task must preserve its normalized project and complete sources');
+  const context = taskContext(store, normalized);
+  check(same(record, predictedTask(normalized, context.contract)), 'answer_question_invalid', record.id, 'task',
+    'The producer task and full contract must be derived from their exact sources');
+  return copy({ request: normalized, record, contract: context.contract, gap: context.gap,
+    references: unique([reference(record), ...context.references]), context });
+}
+function loadAnswerTask(store: Store, request: AnswerReadRequest) {
+  return historicalRead(store, { reader: 'D5.answer-task', project: request.project, ref: request.record }, () => {
+    const record = exact<AnswerTaskRecord>(store, request.project, request.record, ANSWER_TASK_KIND, answerTaskNamespace(request.project));
+    return checkTaskRecord(store, request.project, record);
+  }, () => fail('answer_question_invalid', request.record.id, 'history', 'The producer task has cyclic historical sources'));
+}
+export function prepareAnswerTask(store: Store, request: AnswerTaskRequest): OmResult<Sealed<CheckedAnswerTask>> {
+  requireStore(store); requireTask(request); request = normalizedTask(request);
+  return result(() => {
+    const context = taskContext(store, request), guards = currentTaskGuards(store, request, context);
+    const record = predictedTask(request, context.contract), old = store.get(record.id);
+    check(!old || same(old, record), 'answer_question_invalid', record.id, 'task', 'The producer task cannot be overwritten under the same source request');
+    return { request, record, contract: context.contract, gap: context.gap,
+      references: unique([reference(record), ...context.references]),
+      guards: unique([...guards, ...(old ? [reference(old)] : [])]),
+      writes: old ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }] };
+  });
+}
+export function writeAnswerTask(store: Store, request: AnswerTaskRequest): OmResult<Sealed<Revision<AnswerTaskRecord>>> {
+  return withHistoricalReads(() => {
+    const prepared = prepareAnswerTask(store, request);
+    if (!prepared.ok) return prepared;
+    if (prepared.value.writes.length) {
+      const written = writeGuarded(store, { unit: 'D5', target: prepared.value.record.id, writes: prepared.value.writes, guards: prepared.value.guards });
+      if (!written.ok) return written;
+    }
+    return delivered(prepared.value.record);
+  });
+}
+export function readAnswerTask(store: Store, request: AnswerReadRequest): OmResult<Sealed<CheckedAnswerTask>> {
+  requireRefRequest(store, request);
+  return result(() => {
+    const { context: _context, ...checked } = loadAnswerTask(store, request);
+    return { ...checked, guards: [], writes: [] };
+  });
+}
+function answerTaskBasis(store: Store, project: string, task: AnswerTaskBasis) {
+  check(object(task) && (Object.hasOwn(task, 'record') !== Object.hasOwn(task, 'pending')),
+    'answer_question_invalid', 'answer-task', 'task', 'The task basis must name a saved or pending producer task');
+  if ('record' in task) {
+    check(isRef(task.record), 'answer_question_invalid', 'answer-task', 'task.record', 'The producer task needs an exact saved reference');
+    return { checked: loadAnswerTask(store, { project, record: task.record }), writes: [] as Write[] };
+  }
+  const write = task.pending;
+  check(object(write) && text(write.id) && write.kind === ANSWER_TASK_KIND && write.expected === 0 && object(write.value),
+    'answer_question_invalid', 'answer-task', 'task.pending', 'A pending task uses the immutable producer task contract');
+  const row = { id: write.id, kind: write.kind, value: copy(write.value), revision: 1, hash: hashJson(write.value) };
+  const old = store.get(row.id);
+  check(!old || same(old, row), 'answer_question_invalid', row.id, 'task.pending', 'A pending task conflicts with an existing record');
+  if (old) return { checked: loadAnswerTask(store, { project, record: reference(old) }), writes: [] as Write[] };
+  const checked = historicalRead(store, { reader: 'D5.answer-task-pending', project, ref: reference(row), parameters: copy(write) as unknown as Json },
+    () => checkTaskRecord(store, project, row as Revision<AnswerTaskRecord>),
+    () => fail('answer_question_invalid', row.id, 'history', 'The pending producer task has cyclic sources'));
+  return { checked, writes: [write] };
+}
+export function readAnswerTaskBasis(store: Store, request: { project: string; task: AnswerTaskBasis; current: boolean }): OmResult<Sealed<CheckedAnswerTask>> {
+  requireStore(store);
+  if (!object(request) || !text(request.project) || !object(request.task) || typeof request.current !== 'boolean') requestInvalid('task');
+  request = copy(request);
+  return result(() => {
+    const basis = answerTaskBasis(store, request.project, request.task), checked = basis.checked;
+    const guards = request.current ? currentTaskGuards(store, checked.request, checked.context) : [];
+    if (request.current && !basis.writes.length) { head(store, reference(checked.record)); guards.push(reference(checked.record)); }
+    const { context: _context, ...answerTask } = checked;
+    return { ...answerTask, guards: unique(guards), writes: basis.writes };
+  });
 }
 export function prepareMc1Question(store: Store, request: Mc1QuestionRequest): OmResult<Sealed<{ record: Revision<Mc1QuestionRecord>; writes: Write[]; guards: Ref[] }>> {
   requireStore(store); requireQuestion(request); request = normalizedQuestion(request);
@@ -363,23 +515,111 @@ function predicted(value: AcceptedAnswerRecord): Revision<AcceptedAnswerRecord> 
   return { id: `${acceptedAnswerNamespace(value.project)}${hashJson(value.request)}`, kind: ACCEPTED_ANSWER_KIND,
     revision: 1, hash: hashJson(value), value };
 }
+function checkAcceptedRecord(store: Store, project: string, record: Revision<AcceptedAnswerRecord>): CheckedAnswer {
+  check(record.kind === ACCEPTED_ANSWER_KIND && record.id.startsWith(acceptedAnswerNamespace(project))
+    && object(record.value) && record.value.project === project && object(record.value.request),
+    'answer_record_invalid', record.id, 'record', 'An accepted fact must retain its source request');
+  try { requireAnswer(record.value.request); }
+  catch (error) { if (error instanceof EngineError && error.code === 'answer_request_invalid') fail('answer_record_invalid', record.id, 'request', 'The saved answer request is malformed'); throw error; }
+  check(record.value.request.project === project, 'answer_record_invalid', record.id, 'project', 'The source request belongs to this project');
+  const derived = deriveAnswer(store, record.value.request, false);
+  check(same(record, predicted(derived.value)), 'answer_record_invalid', record.id, 'content', 'Acceptance must be rederived from its exact saved sources');
+  return copy({ record, question: derived.question, gap: derived.gap, attempt: derived.attempt,
+    key: factResultKey({ project, target: record.value.target, field: record.value.field, contract: record.value.contract, value: record.value.value }),
+    references: unique([reference(record), ...derived.references]) });
+}
 function loadAnswer(store: Store, request: AnswerReadRequest): CheckedAnswer {
   return historicalRead(store, { reader: 'D5.accepted-answer', project: request.project, ref: request.record }, () => {
     const record = exact<AcceptedAnswerRecord>(store, request.project, request.record, ACCEPTED_ANSWER_KIND, acceptedAnswerNamespace(request.project));
-    check(object(record.value) && record.value.project === request.project && object(record.value.request),
-      'answer_record_invalid', record.id, 'record', 'An accepted fact must retain its source request');
-    try { requireAnswer(record.value.request); }
-    catch (error) { if (error instanceof EngineError && error.code === 'answer_request_invalid') fail('answer_record_invalid', record.id, 'request', 'The saved answer request is malformed'); throw error; }
-    check(record.value.request.project === request.project, 'answer_record_invalid', record.id, 'project', 'The source request belongs to this project');
-    const derived = deriveAnswer(store, record.value.request, false);
-    check(same(record, predicted(derived.value)), 'answer_record_invalid', record.id, 'content', 'Acceptance must be rederived from its exact saved sources');
-    return copy({ record, question: derived.question, gap: derived.gap, attempt: derived.attempt,
-      key: factResultKey({ project: request.project, target: record.value.target, field: record.value.field, contract: record.value.contract, value: record.value.value }),
-      references: unique([request.record, ...derived.references]) });
+    return checkAcceptedRecord(store, request.project, record);
   }, () => fail('answer_record_invalid', request.record.id, 'history', 'The accepted answer has cyclic historical sources'));
 }
 export function readAcceptedAnswer(store: Store, request: AnswerReadRequest): OmResult<Sealed<CheckedAnswer>> {
   requireRefRequest(store, request); return result(() => loadAnswer(store, request));
+}
+export function answerIndexId(project: string, target: string, field: string): string {
+  if (!text(project) || !text(target) || !text(field)) requestInvalid('search');
+  return `om-answer-index:${project}:${hashJson({ target, field })}`;
+}
+function loadAnswerSearch(store: Store, request: AnswerReadRequest): { record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] } {
+  return historicalRead(store, { reader: 'D5.answer-index', project: request.project, ref: request.record }, () => {
+    const record = exact<AnswerIndex>(store, request.project, request.record, ANSWER_INDEX_KIND, `om-answer-index:${request.project}:`), value = record.value;
+    check(object(value) && value.project === request.project && text(value.target) && text(value.field) && Array.isArray(value.answers)
+      && value.answers.every(isRef) && (value.previous === null || isRef(value.previous))
+      && record.id === answerIndexId(request.project, value.target, value.field) && same(value.answers, unique(value.answers))
+      && new Set(value.answers.map(ref => ref.id)).size === value.answers.length,
+      'answer_record_invalid', record.id, 'index', 'The answer index must preserve its exact line and canonical complete set');
+    const references: Ref[] = [request.record];
+    if (value.previous === null) check(record.revision === 1, 'answer_record_invalid', record.id, 'index.previous', 'Only the first index revision can omit its predecessor');
+    else {
+      check(value.previous.id === record.id && value.previous.revision === record.revision - 1,
+        'answer_record_invalid', record.id, 'index.previous', 'The index names its exact immediate predecessor');
+      const previous = loadAnswerSearch(store, { project: request.project, record: value.previous });
+      check(previous.answers.length < value.answers.length && previous.answers.every(ref => value.answers.some(item => same(item, ref))),
+        'answer_record_invalid', record.id, 'index.answers', 'An index revision only adds answers and never loses a previous answer');
+      references.push(...previous.references);
+    }
+    for (const ref of value.answers) {
+      const checked = loadAnswer(store, { project: request.project, record: ref });
+      check(checked.record.value.target === value.target && checked.record.value.field === value.field,
+        'answer_record_invalid', record.id, 'index.answers', 'Every indexed answer must belong to this exact obligation');
+      references.push(...checked.references);
+    }
+    return copy({ record, answers: value.answers, references: unique(references) });
+  }, () => fail('answer_record_invalid', request.record.id, 'index.previous', 'The answer index history is cyclic'));
+}
+export function readAnswerSearch(store: Store, request: AnswerReadRequest): OmResult<Sealed<{ record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] }>> {
+  requireRefRequest(store, request); return result(() => loadAnswerSearch(store, request));
+}
+function prepareAnswerIndex(store: Store, request: { project: string; target: string; field: string; pending?: Write[] }): OmResult<Sealed<PreparedAnswerSearch>> {
+  requireStore(store);
+  if (!object(request) || !text(request.project) || !text(request.target) || !text(request.field)
+    || Object.hasOwn(request, 'pending') && !Array.isArray(request.pending)) requestInvalid('search');
+  request = copy(request);
+  return result(() => {
+    const id = answerIndexId(request.project, request.target, request.field), old = store.get<AnswerIndex>(id);
+    const indexed = old ? loadAnswerSearch(store, { project: request.project, record: reference(old) }) : null;
+    const existing: Ref[] = [], references: Ref[] = [...(indexed?.references ?? [])];
+    for (const row of store.list()) if (row.id.startsWith(acceptedAnswerNamespace(request.project))) {
+      const checked = loadAnswer(store, { project: request.project, record: reference(row) });
+      if (checked.record.value.target === request.target && checked.record.value.field === request.field) {
+        existing.push(reference(checked.record)); references.push(...checked.references);
+      }
+    }
+    const current = unique(existing);
+    check(!indexed || same(indexed.answers, current), 'answer_record_invalid', id, 'index.answers',
+      'The current index must contain every saved answer of this obligation, without omissions or extra entries');
+    const writes: Write[] = [], additions: Ref[] = [], pendingIds = new Set<string>();
+    for (const write of request.pending ?? []) {
+      check(object(write) && write.kind === ACCEPTED_ANSWER_KIND && text(write.id) && write.expected === 0 && object(write.value)
+        && !pendingIds.has(write.id), 'answer_record_invalid', id, 'pending', 'A pending search contains distinct immutable accepted-answer writes');
+      pendingIds.add(write.id);
+      const row = { id: write.id, kind: write.kind, revision: 1, value: write.value, hash: hashJson(write.value) } as Revision<AcceptedAnswerRecord>;
+      const previous = store.get(row.id);
+      check(!previous || same(previous, row), 'answer_record_invalid', row.id, 'pending', 'A pending answer must not replace existing content');
+      const checked = previous ? loadAnswer(store, { project: request.project, record: reference(previous) })
+        : historicalRead(store, { reader: 'D5.pending-answer', project: request.project, ref: reference(row), parameters: write as unknown as Json },
+          () => checkAcceptedRecord(store, request.project, row), () => fail('answer_record_invalid', row.id, 'history', 'A pending answer has cyclic sources'));
+      check(checked.record.value.target === request.target && checked.record.value.field === request.field,
+        'answer_record_invalid', row.id, 'pending', 'A pending answer belongs to the indexed obligation');
+      additions.push(reference(checked.record)); references.push(...checked.references);
+      if (!previous) writes.push(write);
+    }
+    const answers = unique([...current, ...additions]);
+    const value: AnswerIndex = { project: request.project, target: request.target, field: request.field, answers,
+      previous: old ? reference(old) : null };
+    const change = !old || !same(current, answers);
+    const record = change ? { id, kind: ANSWER_INDEX_KIND, revision: (old?.revision ?? 0) + 1, hash: hashJson(value), value } : old;
+    if (change) writes.push({ id, kind: ANSWER_INDEX_KIND, expected: old?.revision ?? 0, value });
+    return { record: record!, answers, writes, guards: unique([...(old ? [reference(old)] : []), ...current]),
+      references: unique([...references, reference(record!)]) };
+  });
+}
+/** Current enumeration is read-only except for its index. Accepted facts enter only through admitted D5 writers. */
+export function prepareAnswerSearch(store: Store, request: { project: string; target: string; field: string }): OmResult<Sealed<PreparedAnswerSearch>> {
+  requireStore(store);
+  if (!object(request) || !text(request.project) || !text(request.target) || !text(request.field) || Object.hasOwn(request, 'pending')) requestInvalid('search');
+  return prepareAnswerIndex(store, request);
 }
 export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<PreparedAnswer>> {
   requireStore(store); requireAnswer(request); request = copy(request);
@@ -387,9 +627,37 @@ export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmR
     const checked = deriveAnswer(store, request, true), record = predicted(checked.value), old = store.get(record.id);
     check(!old || same(old, record), 'answer_record_invalid', record.id, 'record', 'A fact acceptance cannot be overwritten under the same source request');
     const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
-    return { record, writes: old ? [] : [write], guards: unique([...checked.guards, ...(old ? [reference(old)] : [])]), references: checked.references,
+    const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target, field: checked.gap.field, pending: old ? [] : [write] }));
+    return { record, writes: search.writes as Write[], guards: unique([...checked.guards, ...search.guards]), references: unique([...checked.references, ...search.references]),
       closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record), acceptance: null, attempt: request.attempt,
         answer: old ? { record: reference(record) } : { pending: write } } };
+  });
+}
+/** A neighbour needing several answers takes this whole bundle; one line receives one final index CAS. */
+export function prepareAcceptedAnswers(store: Store, requests: AnswerRequest[]): OmResult<Sealed<{
+  records: Revision<AcceptedAnswerRecord>[]; closures: PreparedAnswer['closure'][]; writes: Write[]; guards: Ref[]; references: Ref[];
+}>> {
+  requireStore(store);
+  if (!Array.isArray(requests) || requests.length === 0) requestInvalid('answers');
+  for (const request of requests) requireAnswer(request);
+  requests = copy(requests);
+  return result(() => {
+    const prepared = requests.map(request => take(prepareAcceptedAnswer(store, request)));
+    check(new Set(prepared.map(item => item.record.id)).size === prepared.length, 'answer_record_invalid', 'accepted-answer', 'answers',
+      'A combined preparation names distinct accepted answers');
+    const groups = new Map<string, { project: string; target: string; field: string; pending: Write[] }>();
+    for (const item of prepared) {
+      const { project, target, field } = item.record.value, id = answerIndexId(project, target, field);
+      const group = groups.get(id) ?? { project, target, field, pending: [] };
+      group.pending.push(...item.writes.filter(write => write.kind === ACCEPTED_ANSWER_KIND) as Write[]); groups.set(id, group);
+    }
+    const searches = [...groups.values()].map(group => take(prepareAnswerIndex(store, group)));
+    const intermediate = new Set(prepared.flatMap(item => item.writes.filter(write => write.kind === ANSWER_INDEX_KIND).map(write =>
+      canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }))));
+    return { records: prepared.map(item => item.record) as Revision<AcceptedAnswerRecord>[],
+      closures: prepared.map(item => item.closure) as PreparedAnswer['closure'][], writes: searches.flatMap(item => item.writes) as Write[],
+      guards: unique([...prepared.flatMap(item => item.guards), ...searches.flatMap(item => item.guards)]),
+      references: unique([...prepared.flatMap(item => item.references).filter(ref => !intermediate.has(canonical(ref))), ...searches.flatMap(item => item.references)]) };
   });
 }
 export function writeAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<Revision<AcceptedAnswerRecord>>> {
@@ -567,6 +835,43 @@ export function readAnswerInvalidation(store: Store, request: { project: string;
     return { references: unique([...checked.references, ...sources.flatMap(pair => [pair.before, pair.after])]) };
   });
 }
+export interface AnswerTaskApplicationRequest {
+  project: string; record: Ref; task: AnswerTaskBasis; current: boolean; invalidation?: AnswerInvalidation | null;
+}
+export function applicableAnswerTask(store: Store, request: AnswerTaskApplicationRequest): OmResult<Sealed<{
+  applicable: boolean; value: Json; key: string; task: Ref; invalidation: AnswerInvalidation | null;
+  guards: Ref[]; references: Ref[]; writes: Write[];
+}>> {
+  requireRefRequest(store, request);
+  if (!object(request.task) || typeof request.current !== 'boolean'
+    || !request.current && (!Object.hasOwn(request, 'invalidation') || request.invalidation === undefined)) requestInvalid('task.applicability');
+  request = copy(request);
+  return result(() => {
+    const task = take(readAnswerTaskBasis(store, { project: request.project, task: request.task, current: request.current }));
+    const checked = loadAnswer(store, request);
+    const contractMatches = checked.record.value.target === task.gap.target && checked.record.value.field === task.gap.field
+      && same(checked.record.value.contract, task.contract);
+    let invalidation: AnswerInvalidation | null;
+    const guards: Ref[] = [...task.guards], references: Ref[] = [...task.references, ...checked.references], writes: Write[] = [...task.writes];
+    if (request.current && !contractMatches) {
+      head(store, request.record); guards.push(request.record); invalidation = null;
+    } else if (request.current) {
+      const evidence = take(prepareAnswerInvalidation(store, request));
+      invalidation = evidence.invalidation as AnswerInvalidation | null;
+      guards.push(...evidence.guards); references.push(...evidence.references); writes.push(...evidence.writes);
+    } else {
+      invalidation = request.invalidation!;
+      if (invalidation !== null) {
+        check(object(invalidation) && isRef(invalidation.record) && same(invalidation.record, request.record),
+          'answer_inapplicable', request.record.id, 'invalidation', 'The saved evidence change must belong to this exact accepted answer');
+        references.push(...take(readAnswerInvalidation(store, { project: request.project, invalidation })).references);
+      }
+    }
+    return { applicable: invalidation === null && contractMatches,
+      value: checked.record.value.value, key: checked.key, task: reference(task.record), invalidation,
+      guards: unique(guards), references: unique(references), writes };
+  });
+}
 export function readAnswerForInput(store: Store, request: AnswerInputRequest): OmResult<Sealed<AnswerInputBody & { input: Revision<OmInputRecord> }>> {
   requireRefRequest(store, request);
   if (!isRef(request.question) || !isRef(request.input) || typeof request.current !== 'boolean') requestInvalid('input');
@@ -646,7 +951,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
   request = copy(request);
   return result(() => {
     const view = basisView(store, request.basis), checked = loadAnswer(view.store, { project: request.project, record: view.ref });
-    const old = take(readGaps(store, request.prior)), now = take(readGaps(store, request.current));
+    const old = take(readGaps(view.store, request.prior)), now = take(readGaps(view.store, request.current));
     const gap = old.collection.gaps.find(item => item.target === request.target && item.field === request.field);
     check(old.sources.project === request.project && now.sources.project === request.project && gap
       && checked.record.value.target === gap.target && checked.record.value.field === gap.field
@@ -667,7 +972,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       'A line may not reattribute a fact to a different attempt');
     const guards: Ref[] = [];
     if (request.currentOnly) {
-      const prepared = take(prepareGaps(store, now.sources as GapRequest));
+      const prepared = take(prepareGaps(view.store, now.sources as GapRequest));
       check(same(prepared.collection, now.collection), 'answer_inapplicable', request.target, 'closure.current', 'The closing D1 source must be current');
       guards.push(...prepared.guards, now.sources.input, ...request.current.records);
       const sources = currentAnswerSources(view.store, request.project, checked);
@@ -680,7 +985,11 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
         for (const guard of acceptance.guards) { head(store, guard); guards.push(guard); }
       }
     }
-    return { key: checked.key, references: unique([...checked.references, ...bindings.flatMap(binding => binding.references), ...request.prior.records, ...request.current.records]),
-      guards: unique(guards), writes: view.writes, attempt: checked.attempt };
+    const search = request.currentOnly && view.writes.length ? take(prepareAnswerIndex(store, { project: request.project,
+      target: request.target, field: request.field, pending: view.writes })) : null;
+    return { key: checked.key, references: unique([...checked.references, ...bindings.flatMap(binding => binding.references), ...request.prior.records,
+      ...request.current.records, ...(search?.references ?? [])]),
+      guards: unique([...guards, ...(search?.guards ?? [])].filter(ref => !view.writes.length || !same(ref, view.ref))),
+      writes: request.currentOnly ? (search?.writes as Write[] | undefined) ?? view.writes : [], attempt: checked.attempt };
   });
 }
