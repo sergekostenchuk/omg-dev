@@ -1,5 +1,5 @@
 import { Ajv } from "ajv";
-import { canonical, digest, hashJson, type Json } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { controlPredecessors } from "../graph/dependencies.js";
 import type { Graph } from "../graph/model.js";
@@ -10,12 +10,11 @@ import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal,
 import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
-import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "../graph/layer-design.js";
-import { runtimeEvidenceDependencies, type RuntimeEvidence } from "../graph/runtime-evidence.js";
 import { ProductEngine } from "../product/engine.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { prepareOmInput, readOmInput, type InputRequest, type OmInputRecord } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
+import { readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
 
 export const HORIZON_REFUSAL_CODES = Object.freeze([
   "horizon_empty", "horizon_unclosed", "horizon_feature_unknown", "horizon_requires_excluded",
@@ -208,11 +207,6 @@ function receiptShape(value: unknown, project: string, artifact: string): value 
     || !value['value']['files'].every(file => object(file) && text(file['path']) && (file['hash'] === null || text(file['hash'])))) return false;
   return (value['plan'] === undefined || isRef(value['plan'])) && (value['run'] === undefined || isRef(value['run']));
 }
-interface SavedLayer {
-  projection: ReturnType<typeof projectGraph>; inputs: Ref[];
-  obligations: { node: string; field: string; valueHash: string; inputs: Ref[] }[];
-  layerProofs?: { level: 1 | 2 | 3; hash: string; inputs: Ref[] }[];
-}
 interface SavedPhase { projectId: string; phase: string; inputs: Ref[]; layer: Ref | null; draft: Ref | null; contractVersion?: number }
 // Resolve the producer's recorded proof closure historically; only current admission below reads heads.
 function exactClosure(store: Store, refs: Ref[]): OmResult<Sealed<Revision[]>> {
@@ -239,136 +233,6 @@ function exactClosure(store: Store, refs: Ref[]): OmResult<Sealed<Revision[]>> {
   }
   return delivered(records);
 }
-const L2_DESIGN_SPEC = sealed(layerDesignSpec(2));
-const validL2Design = schema.compile(L2_DESIGN_SPEC.schema as object);
-function proveL2Design(store: Store, request: HorizonRequest, graph: Graph, phase: SavedPhase,
-  savedProof: NonNullable<SavedLayer['layerProofs']>[number]): OmResult<Sealed<null>> {
-  const at = (field: string) => address(phase.layer!.id, `layerProofs.${field}`, phase.layer!);
-  function check(condition: unknown, field: string, message: string): asserts condition {
-    if (!condition) throw new EngineError("horizon_refinement_unproven", message, at(field));
-  }
-  try {
-    const records = new Map<string, Revision<Record<string, unknown>>>();
-    for (const ref of savedProof.inputs) {
-      const found = store.get<Record<string, unknown>>(ref.id, ref.revision);
-      check(found && found.hash === ref.hash && object(found.value), "inputs", "The layer proof needs the exact recorded prerequisite");
-      const previous = records.get(ref.id);
-      check(!previous || canonical(reference(previous)) === canonical(ref), "inputs", "The layer proof names conflicting prerequisite revisions");
-      records.set(ref.id, found);
-    }
-    const proof = (ref: unknown, kind?: string): Revision<Record<string, unknown>> => {
-      check(isRef(ref), "inputs", "The layer proof needs an exact reference");
-      const found = records.get(ref.id);
-      check(found && canonical(reference(found)) === canonical(ref) && (!kind || found.kind === kind),
-        "inputs", "The layer proof does not contain this exact source");
-      return found;
-    };
-    const product = graph.nodes.filter(node => node.kind === "product");
-    check(product.length === 1, "draft", "Layer design must name its unique product");
-    const candidates = [...records.values()].filter(record => record.kind === "discovery-draft"
-      && record.value['stage'] === "om-g2" && record.value['level'] === "R1" && record.value['consumer'] === product[0]!.id);
-    check(candidates.length === 1, "draft", "L2 needs one exact source research draft for its layer design");
-    const draftRecord = candidates[0]!, draft = draftRecord.value;
-    check(draftRecord.id.startsWith(`discovery:${request.project}:`) && draft['projectId'] === request.project
-      && draft['contractVersion'] === LAYER_DESIGN_VERSION && object(draft['fields']) && Object.hasOwn(draft['fields'], "layerDesign")
-      && Array.isArray(draft['inputs']) && draft['inputs'].every(isRef)
-      && Array.isArray(draft['questions']) && draft['questions'].length === 1 && draft['questions'].every(text),
-    "draft", "Layer research must preserve its project, contract, explicit inputs and one design question");
-    const draftInputs = draft['inputs'] as Ref[];
-    for (const input of draftInputs) proof(input);
-    for (const id of [`phase:${request.project}:R1`, `graph-layer:${request.project}:1`]) {
-      const expected = phase.inputs.filter(ref => ref.id === id);
-      check(expected.length === 1 && draftInputs.some(ref => canonical(ref) === canonical(expected[0])),
-        "inputs", "Layer research must use the accepted exact R1 and upper L1 of its phase");
-    }
-    const questionRecord = records.get(draft['questions'][0]!);
-    check(questionRecord?.kind === "question", "question", "Layer research must retain its exact question");
-    const question = questionRecord.value;
-    check(questionRecord.id.startsWith(`question:${request.project}:`) && question['projectId'] === request.project
-      && question['draftId'] === draftRecord.id && question['stage'] === "om-g2" && question['level'] === "R1"
-      && question['consumer'] === product[0]!.id && question['status'] === "answered" && isRef(question['answer'])
-      && object(question['spec']) && canonical(question['spec']) === canonical(L2_DESIGN_SPEC), "question", "Layer research must answer the declared L2 design contract");
-    const answerRecord = proof(question['answer'], "research-answer"), answer = answerRecord.value;
-    check(answerRecord.id.startsWith(`research-answer:${request.project}:`) && answer['projectId'] === request.project
-      && answer['question'] === questionRecord.id && isRef(answer['assessment']) && Object.hasOwn(answer, "value"),
-    "answer", "The layer answer must belong to this project and question");
-    const assessmentRecord = proof(answer['assessment'], "research-assessment"), assessment = assessmentRecord.value;
-    check(assessmentRecord.id.startsWith("research-assessment:") && assessment['projectId'] === request.project
-      && assessment['verdict'] === "supported" && text(assessment['researcher']) && text(assessment['assessor'])
-      && assessment['researcher'] !== assessment['assessor'] && isRef(assessment['question']) && isRef(assessment['environment'])
-      && Object.hasOwn(assessment, "value") && Array.isArray(assessment['reasons']) && assessment['reasons'].every(item => typeof item === "string")
-      && Array.isArray(assessment['observations']) && assessment['observations'].length > 0,
-    "assessment", "Layer research needs a supported independent assessment and explicit saved observations");
-    const environment = store.get<Record<string, unknown>>(assessment['environment'].id, assessment['environment'].revision);
-    check(environment?.kind === "environment" && environment.id === `environment:${request.project}`
-      && environment.hash === assessment['environment'].hash && object(environment.value) && environment.value['projectId'] === request.project,
-    "assessment.environment", "Assessment must retain its exact historical environment");
-    const issued = store.get<Record<string, unknown>>(assessment['question'].id, assessment['question'].revision);
-    check(issued?.kind === "question" && issued.id === questionRecord.id && issued.hash === assessment['question'].hash
-      && object(issued.value) && issued.value['projectId'] === request.project && issued.value['draftId'] === draftRecord.id
-      && issued.value['stage'] === "om-g2" && issued.value['level'] === "R1" && issued.value['consumer'] === product[0]!.id
-      && object(issued.value['spec']) && canonical(issued.value['spec']) === canonical(L2_DESIGN_SPEC),
-    "assessment.question", "Assessment must bind the exact historically issued design question");
-    for (const raw of assessment['observations']) {
-      check(object(raw) && raw['projectId'] === request.project && isRef(raw['source']) && object(raw['selector'])
-        && Object.hasOwn(raw, "value"), "observation", "A layer observation needs its exact source and selector");
-      const sourceRecord = proof(raw['source'], "source"), source = sourceRecord.value;
-      check(sourceRecord.id.startsWith(`source:${request.project}:`) && source['projectId'] === request.project
-        && typeof source['content'] === "string" && digest(source['content']) === source['sha256']
-        && (source['mediaType'] === "text/plain" || source['mediaType'] === "application/json") && object(source['origin'])
-        && (source['origin']['kind'] === "file" || source['origin']['kind'] === "owner-document") && typeof source['origin']['location'] === "string",
-      "observation.source", "Saved evidence must preserve its content, digest, project and origin");
-      const selector = raw['selector'];
-      let selected: unknown;
-      if (selector['kind'] === "text-range") {
-        const start = selector['start'], end = selector['end'];
-        check(typeof start === "number" && Number.isSafeInteger(start) && typeof end === "number" && Number.isSafeInteger(end)
-          && start >= 0 && end > start && end <= source['content'].length, "observation.selector", "Text evidence must select a nonempty saved range");
-        selected = source['content'].slice(start, end);
-      } else {
-        const pointer = selector['pointer'];
-        check(selector['kind'] === "json-pointer" && source['mediaType'] === "application/json" && typeof pointer === "string"
-          && (pointer === "" || pointer.startsWith("/")), "observation.selector", "JSON evidence needs its saved pointer");
-        try { selected = JSON.parse(source['content']); }
-        catch (error) {
-          if (error instanceof SyntaxError) check(false, "observation.source", "The saved JSON evidence cannot be parsed");
-          throw error;
-        }
-        if (pointer) for (const encoded of pointer.slice(1).split("/")) {
-          check(!/~(?![01])/.test(encoded), "observation.selector", "JSON pointer has an invalid escape");
-          const key = encoded.replaceAll("~1", "/").replaceAll("~0", "~");
-          check(selected !== null && typeof selected === "object" && Object.hasOwn(selected, key), "observation.selector", "The selected saved field is absent");
-          selected = (selected as Record<string, unknown>)[key];
-        }
-      }
-      check(canonical(selected) === canonical(raw['value']), "observation.value", "The observation must be derived from its saved source");
-    }
-    if (assessment['runtimeProofs'] !== undefined) {
-      const runtime = assessment['runtimeProofs'];
-      check(Array.isArray(runtime) && runtime.every(item => object(item) && text(item['obligation']) && text(item['document'])
-        && isRef(item['observation']) && isRef(item['source']) && isRef(item['authorization']) && Array.isArray(item['code']) && item['code'].every(isRef)),
-      "assessment.runtimeProofs", "Runtime evidence must retain explicit exact dependencies");
-      for (const dependency of runtimeEvidenceDependencies(runtime as RuntimeEvidence[])) proof(dependency);
-    }
-    check(canonical(assessment['value']) === canonical(answer['value']) && canonical(answer['value']) === canonical(draft['fields']['layerDesign'])
-      && validL2Design(answer['value']), "layerDesign", "The layer design must be the schema-valid value supported by its exact answer and assessment");
-    let composed: Graph;
-    try { composed = composeLayer(graph, 2, draft['fields']['layerDesign']); }
-    catch (error) {
-      if (error instanceof EngineError && ["graph_upgrade_required", "layer_design_missing", "derived_field_conflict", "layer_assembly_invalid",
-        "graph_invalid", "layer_detail_invalid", "upper_layer_drift", "layer_outcome_uncovered", "layer_connector_uncovered"].includes(error.code))
-        check(false, "layerDesign", error.message);
-      throw error;
-    }
-    check(canonical(projectGraph(composed, 2)) === canonical(projectGraph(graph, 2)),
-      "layerDesign", "The accepted L2 must derive from this exact saved research design");
-    return delivered(null);
-  } catch (error) {
-    if (error instanceof EngineError && error.code === "horizon_refinement_unproven")
-      return refused(error.code, error.message, error.details as ReturnType<typeof address>, "producer");
-    throw error;
-  }
-}
 function readRefinement(store: Store, request: HorizonRequest, graph: Graph): OmResult<Sealed<string[]>> {
   if (!request.refinement) return delivered([]);
   const read = readRecord<SavedPhase>(store, request.refinement, { unit: "G2", target: request.project,
@@ -382,27 +246,18 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
     || !phase.inputs.some(ref => canonical(ref) === canonical(phase.layer))
     || !phase.inputs.some(ref => ref.id === `phase:${request.project}:R1`)
     || (phase.contractVersion !== undefined && phase.contractVersion !== 2)) return reject("inputs");
-  const layerRead = readRecord<SavedLayer>(store, phase.layer, { unit: "G2", target: request.project,
+  const layerRead = readRecord<LayerBasis>(store, phase.layer, { unit: "G2", target: request.project,
     id: `graph-layer:${request.project}:2`, kind: "graph-layer" });
   if (!layerRead.ok) return layerRead;
   const layer = layerRead.value.value;
-  if (!object(layer) || !object(layer.projection) || canonical(layer.projection) !== canonical(projectGraph(graph, 2))
-    || !Array.isArray(layer.inputs) || !layer.inputs.every(isRef) || !Array.isArray(layer.obligations)
-    || (layer.layerProofs !== undefined && !Array.isArray(layer.layerProofs))) return reject("layer");
-  for (const obligation of layer.obligations) {
-    if (!object(obligation) || !text(obligation.node) || !text(obligation.field) || !Array.isArray(obligation.inputs) || !obligation.inputs.every(isRef)) return reject("obligations");
-    const node = graph.nodes.find(item => item.id === obligation.node);
-    if (!node || !Object.hasOwn(node, obligation.field)
-      || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) return reject("obligations");
+  if (!object(layer) || !object(layer.projection) || !Array.isArray(layer.inputs) || !layer.inputs.every(isRef)
+    || !Array.isArray(layer.obligations) || (layer.layerProofs !== undefined && !Array.isArray(layer.layerProofs))) return reject("layer");
+  if (graph.version === 2 && !layer.layerProofs?.some(proof => object(proof) && proof.level === 2)) return reject("layerProofs");
+  if (graph.version === 1) {
+    const checked = readLayerEnvelope(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer });
+    if (!checked.ok) return refused("horizon_refinement_unproven", checked.refusal.message,
+      address(checked.refusal.at.target, checked.refusal.at.field ?? "inputs", phase.layer), "producer");
   }
-  for (const proof of layer.layerProofs ?? []) {
-    if (!object(proof) || (proof.level !== 1 && proof.level !== 2 && proof.level !== 3) || !Array.isArray(proof.inputs) || !proof.inputs.every(isRef)
-      || hashJson(projectGraph(graph, proof.level)) !== proof.hash) return reject("layerProofs");
-  }
-  if (graph.version === 2 && !layer.layerProofs?.some(proof => proof.level === 2)) return reject("layerProofs");
-  const proofInputs = [...layer.obligations.flatMap(item => item.inputs), ...(layer.layerProofs ?? []).flatMap(item => item.inputs)];
-  const unique = (refs: readonly Ref[]) => sorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]);
-  if (canonical(unique(layer.inputs)) !== canonical(unique(proofInputs))) return reject("inputs");
   const closure = exactClosure(store, [request.refinement, ...layer.inputs]);
   if (!closure.ok) return closure;
   const phaseOrder = ["R0", "L1", "R1", "L2"];
@@ -442,9 +297,15 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
         || canonical(savedLayer.value['projection']) !== canonical(projectGraph(graph, level))) return reject("layer", source);
     }
   }
-  if (graph.version === 2) for (const proof of layer.layerProofs!.filter(item => item.level === 2)) {
-    const checked = proveL2Design(store, request, graph, phase as SavedPhase, proof as NonNullable<SavedLayer['layerProofs']>[number]);
-    if (!checked.ok) return checked;
+  if (graph.version === 2) {
+    const upper = phase.inputs.filter(ref => ref.id === `graph-layer:${request.project}:1`);
+    if (upper.length !== 1) return reject("inputs");
+    const checked = readLayerBasis(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer, upper: upper[0]! });
+    if (!checked.ok) return refused("horizon_refinement_unproven", checked.refusal.message,
+      address(checked.refusal.at.target, `layerProofs.${checked.refusal.at.field ?? "inputs"}`, phase.layer), "producer");
+    const research = phase.inputs.filter(ref => ref.id === `phase:${request.project}:R1`);
+    const ownProof = layer.layerProofs!.find(proof => proof.level === 2)!;
+    if (research.length !== 1 || !ownProof.inputs.some((ref: Ref) => canonical(ref) === canonical(research[0]))) return reject("inputs");
   }
   const relations = new RefinementRelations(graph);
   return delivered(graph.nodes.filter(block => block.kind === "block" && graph.nodes.some(operation => operation.kind === "operation"
@@ -462,7 +323,7 @@ function deriveHorizon(store: Store, request: HorizonRequest): OmResult<Sealed<H
   const stage = readRecord<StageArtifact>(store, map, { unit: "G2", target: request.project, id: `stage:${request.project}:operation-map`, kind: "stage" });
   if (!stage.ok) return stage;
   const layerRef = object(stage.value.value.content) ? stage.value.value.content['graph'] : null;
-  const layer = readRecord<SavedLayer>(store, layerRef, { unit: "G2", target: request.project, id: `graph-layer:${request.project}:1`, kind: "graph-layer" });
+  const layer = readRecord<LayerBasis>(store, layerRef, { unit: "G2", target: request.project, id: `graph-layer:${request.project}:1`, kind: "graph-layer" });
   if (!layer.ok) return layer;
   if (canonical(projectGraph(graph, 1)) !== canonical(layer.value.value.projection))
     return refused("horizon_unclosed", "The graph must retain the exact accepted upper layer from OM input", address(request.graph.id, "upper", request.graph), "producer");
