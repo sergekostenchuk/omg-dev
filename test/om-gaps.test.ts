@@ -1,0 +1,718 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { canonical, hashJson } from "../src/canonical.js";
+import { EngineError } from "../src/errors.js";
+import { LEVEL, type Graph } from "../src/graph/model.js";
+import { projectGraph } from "../src/graph/project.js";
+import { KNOWLEDGE_KINDS, RESOLUTION_MOMENTS } from "../src/graph/obligation-policy.js";
+import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
+import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { Store } from "../src/storage/store.js";
+import { ProductEngine } from "../src/product/engine.js";
+import { writeOmInput, type OmInput } from "../src/om/input.js";
+import { writeHorizon } from "../src/om/horizon.js";
+import { fillObligations, type FrameLevel, type FrameRead, type FrameScope } from "../src/om/frame-obligations.js";
+import { applyProposals, openObligationsToGaps, prepareFrameProposals, type FrameGap, type ProposalRequest } from "../src/om/frame-proposals.js";
+import { writeGuarded } from "../src/om/refs.js";
+import type { OmResult, Refusal } from "../src/om/refusal.js";
+import { collectGaps, gateGaps, gapId, prepareGaps, writeGaps, readGaps, GAP_REFUSAL_CODES,
+  type GapSources, type GapCollection, type GapRequest, type GapRecord } from "../src/om/gaps.js";
+import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
+import { answerTechnicalFixture } from "./technical-research-fixture.js";
+import { answerLayerFixture } from "./layer-design-fixture.js";
+
+const clone = structuredClone;
+const fakeRef = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
+const revisions = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
+type SourceQuestion = NonNullable<GapSources["inputResult"]["input"]>["questions"][number];
+type SourceGap = GapSources["inputResult"]["gaps"][number];
+function delivered<T>(value: OmResult<T>): T {
+  if (!value.ok) assert.fail(`Unexpected ${value.refusal.code}: ${value.refusal.message}`);
+  return value.value;
+}
+function addressed(refusal: Refusal): void {
+  assert.ok(refusal.at.target.length > 0);
+  assert.ok(refusal.at.field || refusal.at.ref);
+  assert.ok(["producer", "gap", "owner", "readiness"].includes(refusal.route));
+}
+function refusedAs(value: OmResult<unknown>, code: string): Refusal {
+  if (value.ok) assert.fail(`Expected ${code}, received success`);
+  assert.equal(value.refusal.code, code); addressed(value.refusal); return value.refusal;
+}
+function hasCode(value: { refusals: readonly Refusal[] }, code: string): Refusal {
+  const refusal = value.refusals.find(item => item.code === code);
+  assert.ok(refusal, `${code} absent from ${value.refusals.map(item => item.code).join(", ")}`);
+  addressed(refusal); return refusal;
+}
+function malformed(error: unknown): boolean {
+  assert.ok(error instanceof EngineError); assert.equal(error.code, "gap_request_invalid"); return true;
+}
+function sources(): GapSources {
+  const graph = gardenGraph("cross");
+  const input: OmInput = {
+    sources: UPSTREAM_STAGES.map(stage => ({ ...fakeRef(`stage:garden:${stage}`), stage, contractVersion: 3 })),
+    inventory: null, requirements: [{ id: "garden-R1", section: "garden-concept" }, { id: "garden-R2", section: "garden-concept" }],
+    criteria: [], contracts: [], questions: [], features: [
+      { index: 0, title: "Produce", outcome: "garden-data", behaviorIndexes: [0], requirementIds: ["garden-R1"], contracts: [] },
+      { index: 1, title: "Consume", outcome: "garden-result", behaviorIndexes: [1], requirementIds: ["garden-R1"], contracts: [] },
+      { index: 2, title: "Later", outcome: "garden-later", behaviorIndexes: [2], requirementIds: ["garden-R2"], contracts: [] },
+    ], map: { nodes: graph.nodes.map(node => node.id), artifacts: graph.artifacts.map(item => item.id), connectors: graph.connectors.map(item => item.id) },
+  };
+  return { inputResult: { input, hash: hashJson(input), gaps: [], refusals: [] }, frameGaps: { operations: [], works: [] },
+    horizon: { nodes: graph.nodes.filter(node => node.kind === "block").map(node => node.id) }, graph };
+}
+function stamp(source: GapSources): void { source.inputResult.hash = hashJson(source.inputResult.input); }
+function question(id: string, kind: SourceQuestion["kind"] = "design-decision", consumer = "garden-consume-operation"): SourceQuestion {
+  return { id, question: `Resolve ${id}`, consumer, kind, blocks: false, source: fakeRef("stage:garden:features") };
+}
+function inputGap(code: string, target: string, field: string, consumer: SourceGap["consumer"]): SourceGap {
+  return { code, target, field, consumer, message: `Resolve ${target}/${field}`, source: fakeRef("stage:garden:concept") };
+}
+function inventoryGap(): SourceGap {
+  return { code: "inventory_missing", target: "repo-inventory", field: "inventory", source: null,
+    consumer: { mechanism: "M6", uses: ["code-answer", "project-question-package"] }, message: "Repository inventory is unavailable" };
+}
+function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
+  const { level: _level, ...projected } = projectGraph(graph, level === 2 ? 1 : 2);
+  const upper = projected as Graph;
+  const nodes = upper.nodes.filter(node => LEVEL[node.kind] === level - 1).map(node => node.id);
+  const scope: FrameScope = { nodes, excluded: [], hash: hashJson({ nodes: [...nodes].sort(), excluded: [] }) };
+  const upperRef = fakeRef(`graph-layer:garden:${level - 1}`);
+  const frame: FrameRead = { request: { project: "garden", level, graph: fakeRef("graph:garden"), horizon: fakeRef("om-horizon:garden:choice"),
+    layer: null, frame: null, upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: null } },
+    upper, upperRef, scope, accepted: null, references: [upperRef],
+    result: clone(delivered(fillObligations(upper, scope, null, upperRef, level))) as FrameRead["result"] };
+  return clone(delivered(openObligationsToGaps(frame, delivered(applyProposals(frame, [])) as Parameters<typeof openObligationsToGaps>[1]))) as FrameGap[];
+}
+function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
+  const input = delivered(writeOmInput(f.store, { project: f.project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const horizon = delivered(writeHorizon(f.store, { project: f.project, input: reference(input), graph: reference(f.graphRevision),
+    refinement: reference(f.store.get(`phase:${f.project}:L2`)!), available: {},
+    choice: { choiceVersion: "gaps-choice", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const frame = (level: FrameLevel): ProposalRequest => ({ proposals: [], frame: { project: f.project, level,
+    graph: reference(f.graphRevision), horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: null,
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
+  return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
+}
+
+test("the four explicit gap sources merge accepted input and both real C3 outputs without losing flow neighbors", () => {
+  const source = sources();
+  source.inputResult.gaps = [inputGap("acceptance_kind_missing", "garden-R1#1", "checkKind", { requirement: "garden-R1" })];
+  source.inputResult.input!.questions = [question("known-question", "repository-fact", "garden-produce-work")];
+  source.frameGaps.operations = frameGaps(source.graph, 2); source.frameGaps.works = frameGaps(source.graph, 3);
+  stamp(source);
+  const result = collectGaps(source);
+  assert.deepEqual(result.refusals, []);
+  assert.equal(result.gaps.length, source.frameGaps.operations.length + source.frameGaps.works.length + 2);
+  assert.equal(new Set(result.gaps.map(gap => gap.id)).size, result.gaps.length);
+  const gate = gateGaps(result as GapCollection, source);
+  assert.equal(gate.passed, true); assert.deepEqual(gate.codes, []);
+  for (const frame of [...source.frameGaps.operations, ...source.frameGaps.works]) {
+    const gap = result.gaps.find(item => item.target === frame.target && item.field === "fill")!;
+    assert.equal(gap.id, gapId(frame.target, "fill"));
+    assert.equal(gap.kind, "design-decision"); assert.deepEqual(gap.routes, ["design"]);
+    assert.equal(gap.moment, "om-pass"); assert.equal(gap.blocking, true);
+    assert.deepEqual(gap.neighbors, frame.neighbors);
+    assert.ok(gap.evidence.some(item => canonical(item).includes(frame.target)));
+    assert.ok(gap.consumers.every(id => source.graph.nodes.some(node => node.id === id && node.kind === "block")));
+  }
+  const multiplex = source.frameGaps.operations.filter(gap => gap.consumer === "garden-consume-block" && gap.question.port === "in");
+  assert.equal(multiplex.length, 2);
+  assert.notEqual(multiplex[0]!.target, multiplex[1]!.target);
+  assert.ok(result.gaps.some(gap => (gap.neighbors?.length ?? 0) === 3));
+  assert.ok(Object.isFrozen(result.gaps) && Object.isFrozen(result.gaps[0]!.routes));
+  const before = canonical(result);
+  source.frameGaps.operations[0]!.question.existing.push("caller-edit");
+  source.inputResult.input!.questions[0]!.question = "caller-edit";
+  assert.equal(canonical(result), before);
+});
+
+test("inventory stays open, nonblocking and code-only across horizons while ordinary repository questions retain research", () => {
+  const source = sources(); source.inputResult.gaps = [inventoryGap()];
+  source.inputResult.input!.questions = [question("repo-question", "repository-fact")];
+  stamp(source);
+  let previousInventory: unknown;
+  for (const nodes of [source.horizon.nodes, [], ["garden-later-block"], ["garden-consume-block"]]) {
+    source.horizon.nodes = nodes;
+    const result = collectGaps(source); assert.deepEqual(result.refusals, []);
+    const inventory = result.gaps.find(gap => gap.code === "inventory_missing")!;
+    assert.equal(inventory.kind, "repository-fact"); assert.equal(inventory.moment, "om-pass");
+    assert.equal(inventory.blocking, false); assert.equal(inventory.mechanism, "M6");
+    assert.deepEqual(inventory.routes, ["code"]);
+    assert.deepEqual(inventory.uses, ["code-answer", "project-question-package"]);
+    assert.deepEqual(inventory.consumers, []); assert.equal(inventory.deferral, undefined);
+    if (previousInventory) assert.deepEqual(inventory, previousInventory);
+    previousInventory = inventory;
+    const repository = result.gaps.find(gap => gap.target === "repo-question")!;
+    assert.deepEqual(repository.routes, ["code", "research"]);
+    assert.equal(repository.blocking, nodes.includes("garden-consume-block"));
+    assert.equal(gateGaps(result as GapCollection, source).passed, true);
+  }
+});
+
+test("inventory consumer uses are mandatory and every malformed form is an addressed D1 refusal on collection and G4", () => {
+  const validSource = sources(); validSource.inputResult.gaps = [inventoryGap()];
+  const valid = collectGaps(validSource); assert.deepEqual(valid.refusals, []);
+  const cases = [
+    { name: "absent", missing: true },
+    { name: "null", value: null },
+    { name: "string", value: "code-answer" },
+    { name: "object", value: { "code-answer": true } },
+    { name: "empty", value: [] },
+    { name: "non-string", value: ["code-answer", 7] },
+    { name: "missing package consumer", value: ["code-answer"] },
+    { name: "wrong route-like consumer", value: ["research", "project-question-package"] },
+    { name: "extra consumer", value: ["code-answer", "project-question-package", "M8"] },
+    { name: "repeated wrong content", value: ["code-answer", "code-answer"] },
+  ];
+  for (const entry of cases) {
+    const source = clone(validSource), consumer = source.inputResult.gaps[0]!.consumer as Record<string, unknown>;
+    if (entry.missing) delete consumer.uses; else consumer.uses = entry.value;
+    const refusal = hasCode(collectGaps(source), "gap_class_conflict");
+    assert.equal(refusal.at.target, "repo-inventory", entry.name);
+    assert.equal(refusal.at.field, "consumer.uses", entry.name);
+    const gate = gateGaps(valid as GapCollection, source);
+    assert.equal(gate.passed, false, entry.name);
+    assert.ok(gate.codes.includes("gap_class_conflict"), entry.name);
+    const gateRefusal = gate.findings.find(item => item.code === "gap_class_conflict")!;
+    addressed(gateRefusal);
+    assert.equal(gateRefusal.at.target, "repo-inventory", entry.name);
+    assert.equal(gateRefusal.at.field, "consumer.uses", entry.name);
+  }
+  const reordered = clone(validSource);
+  (reordered.inputResult.gaps[0]!.consumer as { uses: string[] }).uses.reverse();
+  const normalized = collectGaps(reordered);
+  assert.deepEqual(normalized.refusals, []); assert.deepEqual(normalized.gaps[0]!.uses, valid.gaps[0]!.uses);
+  assert.equal(gateGaps(normalized as GapCollection, reordered).passed, true);
+});
+
+test("knowledge moments use defaults only for new questions and preserve an explicit feasibility deadline", () => {
+  const source = sources();
+  const cases = [
+    ["repository-fact", "om-pass", ["code", "research"]], ["design-decision", "om-pass", ["design"]],
+    ["owner-decision", "om-pass", ["owner"]], ["environment-confirmation", "task-start", ["environment"]],
+    ["post-implementation-proof", "task-result", ["task-result"]],
+  ] as const;
+  source.inputResult.input!.questions = cases.map(([kind]) => question(kind, kind));
+  source.inputResult.input!.questions.push({ ...question("environment-before-G6", "environment-confirmation"), moment: "feasibility" });
+  stamp(source);
+  const result = collectGaps(source); assert.deepEqual(result.refusals, []);
+  for (const [kind, moment, routes] of cases) {
+    const gap = result.gaps.find(item => item.target === kind)!;
+    assert.equal(gap.kind, kind); assert.equal(gap.moment, moment); assert.deepEqual(gap.routes, routes);
+    assert.equal(gap.blocking, moment === "om-pass");
+  }
+  const existing = result.gaps.find(item => item.target === "environment-before-G6")!;
+  assert.equal(existing.moment, "feasibility"); assert.equal(existing.blocking, false);
+  const unaddressed = sources();
+  unaddressed.inputResult.input!.questions = [{ ...question("historical-prose", "environment-confirmation", "the backend team"), moment: "feasibility" }];
+  stamp(unaddressed);
+  const address = collectGaps(unaddressed); assert.deepEqual(address.refusals, []);
+  assert.equal(address.gaps[0]!.code, "question_unaddressed"); assert.equal(address.gaps[0]!.field, "address");
+  assert.equal(address.gaps[0]!.mechanism, "M5:addressing");
+  assert.ok(canonical(address.gaps[0]!.evidence).includes("feasibility"));
+  assert.ok(canonical(address.gaps[0]!.evidence).includes("environment-confirmation"));
+  unaddressed.inputResult.input!.questions = [question("unclassified-historical", null)];
+  stamp(unaddressed);
+  const unclassified = collectGaps(unaddressed); assert.deepEqual(unclassified.refusals, []);
+  assert.equal(unclassified.gaps[0]!.field, "address"); assert.equal(unclassified.gaps[0]!.kind, "design-decision");
+});
+
+test("feature, requirement, operation and work consumers resolve every native parent and realizes block", () => {
+  const source = sources();
+  source.graph.edges!.push({ id: "work-also-realizes-later", relation: "realizes", source: "garden-consume-work",
+    target: "garden-later-operation", condition: "One work fulfills both roles" });
+  source.inputResult.gaps = [
+    inputGap("contract_node_unbound", "feature-contract", "nodes", { features: [{ feature: 0, title: "Produce" }, { feature: 1, title: "Consume" }] }),
+    inputGap("acceptance_kind_missing", "requirement-criterion", "checkKind", { requirement: "garden-R1" }),
+  ];
+  source.inputResult.input!.questions = [question("operation", "design-decision", "garden-consume-operation"),
+    question("work", "design-decision", "garden-consume-work")];
+  stamp(source);
+  let result = collectGaps(source); assert.deepEqual(result.refusals, []);
+  for (const target of ["feature-contract", "requirement-criterion"])
+    assert.deepEqual(result.gaps.find(gap => gap.target === target)!.consumers, ["garden-consume-block", "garden-produce-block"]);
+  assert.deepEqual(result.gaps.find(gap => gap.target === "operation")!.consumers, ["garden-consume-block"]);
+  assert.deepEqual(result.gaps.find(gap => gap.target === "work")!.consumers, ["garden-consume-block", "garden-later-block"]);
+  const partiallyUnbound = clone(source);
+  partiallyUnbound.inputResult.gaps = partiallyUnbound.inputResult.gaps.filter(gap => gap.target === "requirement-criterion");
+  partiallyUnbound.inputResult.input!.questions = [];
+  partiallyUnbound.inputResult.input!.features[0]!.outcome = "no-such-block-outcome";
+  stamp(partiallyUnbound);
+  hasCode(collectGaps(partiallyUnbound), "gap_consumer_missing");
+  const identities = result.gaps.map(gap => gap.id);
+  source.horizon.nodes = ["garden-produce-block"];
+  result = collectGaps(source); assert.deepEqual(result.refusals, []);
+  assert.deepEqual(result.gaps.map(gap => gap.id), identities);
+  const deferred = result.gaps.find(gap => gap.target === "work")!;
+  assert.equal(deferred.blocking, false); assert.equal(deferred.deferral!.until, "horizon-entry");
+  assert.deepEqual(deferred.deferral!.blocks, ["garden-consume-block", "garden-later-block"]);
+  source.horizon.nodes = ["garden-later-block"];
+  const awake = collectGaps(source).gaps.find(gap => gap.target === "work")!;
+  assert.equal(awake.id, deferred.id); assert.equal(awake.blocking, true);
+});
+
+test("same-identity evidence merges canonically while conflicting classifications never choose the first source", () => {
+  const source = sources();
+  const a = inputGap("contract_node_unbound", "shared-contract", "nodes", { features: [{ feature: 0, title: "Produce" }] });
+  const b = inputGap("contract_node_unbound", "shared-contract", "nodes", { features: [{ feature: 1, title: "Consume" }] });
+  source.inputResult.gaps = [a, b];
+  const result = collectGaps(source); assert.deepEqual(result.refusals, []); assert.equal(result.gaps.length, 1);
+  assert.deepEqual(result.gaps[0]!.consumers, ["garden-consume-block", "garden-produce-block"]);
+  assert.equal(result.gaps[0]!.evidence.length, 2);
+  source.inputResult.gaps.reverse(); source.horizon.nodes.reverse(); source.graph.nodes.reverse();
+  assert.deepEqual(collectGaps(source), result);
+  const textChanged = clone(source); textChanged.inputResult.gaps[0]!.message += " clarified";
+  assert.equal(collectGaps(textChanged).gaps[0]!.id, result.gaps[0]!.id);
+  const differentSources = sources(), frame = frameGaps(differentSources.graph, 2)[0]!;
+  differentSources.frameGaps.operations = [frame];
+  differentSources.inputResult.gaps = [inputGap("obligation_open", frame.target, "fill", frame.consumer)];
+  const combined = collectGaps(differentSources); assert.deepEqual(combined.refusals, []);
+  assert.equal(combined.gaps.length, 1); assert.deepEqual(combined.gaps[0]!.origins, ["frame", "input"]);
+  assert.equal(combined.gaps[0]!.node, frame.consumer);
+  assert.equal(combined.gaps[0]!.evidence.length, 2);
+  for (const mutation of [
+    (q: SourceQuestion) => { q.kind = "repository-fact"; },
+    (q: SourceQuestion) => { q.moment = "task-start"; },
+  ]) {
+    const conflicts = sources(), first = question("same-question"), second = clone(first); mutation(second);
+    for (const questions of [[first, second], [second, first]]) {
+      conflicts.inputResult.input!.questions = questions;
+      stamp(conflicts);
+      const conflict = collectGaps(conflicts); hasCode(conflict, "gap_class_conflict");
+      assert.equal(gateGaps(conflict as GapCollection, conflicts).passed, false);
+    }
+  }
+  const mechanisms = sources();
+  mechanisms.inputResult.gaps = [inputGap("contract_node_unbound", "same-mechanism-slot", "nodes", { mechanism: "M3" }),
+    inputGap("contract_node_unbound", "same-mechanism-slot", "nodes", { mechanism: "M6" })];
+  hasCode(collectGaps(mechanisms), "gap_class_conflict");
+  mechanisms.inputResult.gaps.reverse(); hasCode(collectGaps(mechanisms), "gap_class_conflict");
+  for (const level of [2, 3] as const) {
+    const ambiguous = sources(), origin = level === 2 ? "operations" : "works";
+    const actual = frameGaps(ambiguous.graph, level), first = actual.find(gap => gap.consumer.includes("consume"))!;
+    const second = clone(actual.find(gap => gap.consumer.includes("produce"))!);
+    second.target = first.target;
+    assert.notEqual(first.consumer, second.consumer);
+    for (const frameSources of [[first, second], [second, first]]) {
+      ambiguous.frameGaps[origin] = frameSources;
+      const conflict = collectGaps(ambiguous);
+      hasCode(conflict, "gap_class_conflict");
+      assert.ok(!conflict.gaps.some(gap => gap.target === first.target));
+    }
+  }
+});
+
+test("all mandatory source sets are explicit and malformed classes, consumers and moments refuse with addresses", () => {
+  const initial = sources();
+  assert.deepEqual(collectGaps(initial).gaps, []); assert.deepEqual(collectGaps(initial).refusals, []);
+  for (const field of ["inputResult", "frameGaps", "horizon", "graph"] as const) {
+    const absent = clone(initial) as Partial<GapSources>; delete absent[field];
+    hasCode(collectGaps(absent as GapSources), "gap_source_missing");
+  }
+  const absentSets = [
+    (source: GapSources) => { delete (source.inputResult as Partial<GapSources["inputResult"]>).gaps; },
+    (source: GapSources) => { delete (source.inputResult as Partial<GapSources["inputResult"]>).hash; },
+    (source: GapSources) => { delete (source.inputResult.input! as Partial<NonNullable<GapSources["inputResult"]["input"]>>).questions; },
+    (source: GapSources) => { delete (source.inputResult.input! as Partial<NonNullable<GapSources["inputResult"]["input"]>>).features; },
+    (source: GapSources) => { delete (source.frameGaps as Partial<GapSources["frameGaps"]>).operations; },
+    (source: GapSources) => { delete (source.frameGaps as Partial<GapSources["frameGaps"]>).works; },
+    (source: GapSources) => { delete (source.horizon as Partial<GapSources["horizon"]>).nodes; },
+  ];
+  for (const remove of absentSets) { const absent = clone(initial); remove(absent); hasCode(collectGaps(absent), "gap_source_missing"); }
+  for (const bad of [undefined, null, [], "source"])
+    hasCode(collectGaps(bad as unknown as GapSources), "gap_source_missing");
+  for (const field of ["blocks", "source"] as const) {
+    const source = sources(), incomplete = question("incomplete") as Partial<SourceQuestion>;
+    delete incomplete[field]; source.inputResult.input!.questions = [incomplete as SourceQuestion];
+    stamp(source);
+    hasCode(collectGaps(source), "gap_source_missing");
+  }
+  for (const field of ["message", "source"] as const) {
+    const source = sources(), incomplete = inputGap("acceptance_kind_missing", "criterion", "checkKind", { requirement: "garden-R1" }) as Partial<SourceGap>;
+    delete incomplete[field]; source.inputResult.gaps = [incomplete as SourceGap];
+    hasCode(collectGaps(source), "gap_source_missing");
+  }
+  for (const level of [2, 3] as const) {
+    const origin = level === 2 ? "operations" : "works", frame = frameGaps(initial.graph, level)[0]!;
+    for (const field of ["level", "upper", "artifact", "role", "port", "portContract", "existing", "allowNew"] as const) {
+      const source = sources(), incomplete = clone(frame);
+      delete (incomplete.question as Partial<FrameGap["question"]>)[field];
+      source.frameGaps[origin] = [incomplete]; hasCode(collectGaps(source), "gap_source_missing");
+    }
+    for (const field of ["id", "level", "kind", "upper", "artifact", "zone"] as const) {
+      const source = sources(), incomplete = clone(frame);
+      assert.ok(incomplete.neighbors.length > 0);
+      delete (incomplete.neighbors[0] as Partial<FrameGap["neighbors"][number]>)[field];
+      source.frameGaps[origin] = [incomplete]; hasCode(collectGaps(source), "gap_source_missing");
+    }
+  }
+  for (const code of ["unknown-source", "constructor", "toString", "__proto__"]) {
+    const source = sources(); source.inputResult.gaps = [inputGap(code, "unknown", "nodes", { requirement: "garden-R1" })];
+    hasCode(collectGaps(source), "gap_class_unknown");
+  }
+  const unknownKind = sources(); unknownKind.inputResult.input!.questions = [question("unknown-kind", "new-model-kind")];
+  stamp(unknownKind);
+  hasCode(collectGaps(unknownKind), "gap_kind_unknown");
+  const unknownMoment = sources(); unknownMoment.inputResult.input!.questions = [{ ...question("bad-moment"), moment: "later" as NonNullable<SourceQuestion["moment"]> }];
+  stamp(unknownMoment);
+  hasCode(collectGaps(unknownMoment), "gap_moment_unknown");
+  const proseMoment = sources();
+  proseMoment.inputResult.input!.questions = [{ ...question("prose-moment", "environment-confirmation", "the backend team"), moment: "later" as NonNullable<SourceQuestion["moment"]> }];
+  stamp(proseMoment);
+  hasCode(collectGaps(proseMoment), "gap_moment_unknown");
+  const proseAddressing = sources();
+  proseAddressing.inputResult.input!.questions = [{ ...question("prose-addressing", "design-decision", "the backend team"), addressedBy: { id: "broken-addressing" } as Ref }];
+  stamp(proseAddressing);
+  hasCode(collectGaps(proseAddressing), "gap_source_missing");
+  const noConsumer = sources(); noConsumer.inputResult.gaps = [inputGap("contract_node_unbound", "unbound", "nodes", { features: [] })];
+  hasCode(collectGaps(noConsumer), "gap_consumer_missing");
+  const badField = sources(); badField.inputResult.gaps = [inputGap("contract_node_unbound", "unbound", "inventory", { requirement: "garden-R1" })];
+  hasCode(collectGaps(badField), "gap_class_conflict");
+  const disguised = sources(); disguised.inputResult.gaps = [{ ...inputGap("contract_node_unbound", "unbound", "nodes", { requirement: "garden-R1" }), kind: "repository-fact" }];
+  hasCode(collectGaps(disguised), "gap_class_conflict");
+  const hashMask = sources(); hashMask.inputResult.hash = "0".repeat(64);
+  hasCode(collectGaps(hashMask), "gap_record_forged");
+  const absentHash = sources(); absentHash.inputResult.hash = null;
+  hasCode(collectGaps(absentHash), "gap_record_forged");
+  for (const bad of [undefined, null, "", 4]) {
+    assert.throws(() => gapId(bad as unknown as string, "field"), malformed);
+    assert.throws(() => gapId("target", bad as unknown as string), malformed);
+  }
+});
+
+test("G4 derives the whole claimed set and rejects omissions, foreign rows, duplicates and rehashed status masks", () => {
+  const source = sources(); source.inputResult.gaps = [inventoryGap()];
+  source.inputResult.input!.questions = [question("one"), question("two", "repository-fact", "garden-later-operation")];
+  stamp(source);
+  const expected = collectGaps(source); assert.deepEqual(expected.refusals, []);
+  const check = (claim: unknown, code: string) => {
+    const result = gateGaps(claim as GapCollection, source);
+    assert.equal(result.passed, false); assert.ok(result.codes.includes(code), result.codes.join(", "));
+    addressed(result.findings.find(item => item.code === code)!);
+  };
+  check(undefined, "gap_set_missing"); check({}, "gap_set_missing");
+  check({ ...clone(expected), gaps: [] }, "gap_missing");
+  const missing = clone(expected) as GapCollection; missing.gaps.pop(); check(missing, "gap_missing");
+  const duplicate = clone(expected) as GapCollection; duplicate.gaps.push(clone(duplicate.gaps[0]!)); check(duplicate, "gap_duplicate");
+  const foreign = clone(expected) as GapCollection, extra = clone(foreign.gaps[0]!); extra.target = "forged-target"; extra.id = gapId(extra.target, extra.field); foreign.gaps.push(extra);
+  check(foreign, "gap_foreign");
+  const masked = clone(expected) as GapCollection; masked.gaps[0]!.blocking = !masked.gaps[0]!.blocking; check(masked, "gap_record_forged");
+  const diverted = clone(expected) as GapCollection; diverted.gaps.find(gap => gap.code === "inventory_missing")!.routes = ["research"];
+  check(diverted, "gap_record_forged");
+  const outside = sources(); outside.horizon.nodes = [];
+  outside.inputResult.input!.questions = [question("deferred")];
+  stamp(outside);
+  const raw = clone(collectGaps(outside)) as GapCollection; delete raw.gaps[0]!.deferral;
+  const gate = gateGaps(raw as GapCollection, outside);
+  assert.equal(gate.passed, false); assert.ok(gate.codes.includes("gap_outside_horizon"));
+  assert.equal(gateGaps(expected as GapCollection, source).passed, true);
+});
+
+test("gap policy is an immutable snapshot and addressed source evidence preserves own JSON keys", () => {
+  const source = sources();
+  const addressedBy = JSON.parse('{"id":"decision:garden:address","revision":1,"hash":"' + "a".repeat(64) + '","__proto__":{"keep":true}}');
+  source.inputResult.input!.questions = [{ ...question("addressed", "repository-fact"), addressedBy }];
+  stamp(source);
+  const expected = collectGaps(source); assert.deepEqual(expected.refusals, []);
+  assert.ok(canonical(expected.gaps[0]!.evidence).includes('"__proto__"'));
+  assert.ok(canonical(expected.gaps[0]!.evidence).includes('"keep":true'));
+  const kinds = KNOWLEDGE_KINDS as unknown as string[], moments = RESOLUTION_MOMENTS as unknown as string[];
+  const originalKinds = [...kinds], originalMoments = [...moments];
+  try {
+    kinds.splice(0, kinds.length, "invented-kind"); moments.splice(0, moments.length, "whenever");
+    assert.deepEqual(collectGaps(source), expected);
+    source.inputResult.input!.questions.push(question("invented", "invented-kind"));
+    stamp(source);
+    hasCode(collectGaps(source), "gap_kind_unknown");
+  } finally { kinds.splice(0, kinds.length, ...originalKinds); moments.splice(0, moments.length, ...originalMoments); }
+  addressedBy.__proto__.keep = false;
+  assert.ok(canonical(expected.gaps[0]!.evidence).includes('"keep":true'));
+  assert.ok(Object.isFrozen(expected.gaps[0]!.evidence));
+});
+
+test("native D1 prepares without writes, persists exact B1 and C3 sources and repeats without extra revisions", async t => {
+  const f = await createOmFixture(t), request = nativeRequest(f), before = revisions(f.store);
+  const prepared = delivered(prepareGaps(f.store, request));
+  assert.equal(prepared.gate.passed, true); assert.deepEqual(prepared.collection.refusals, []);
+  assert.ok(prepared.collection.gaps.some(gap => gap.code === "inventory_missing"));
+  assert.equal(prepared.existing.length, 0);
+  assert.equal(prepared.writes.length, prepared.collection.gaps.length);
+  assert.deepEqual(prepared.sources, request);
+  assert.deepEqual(revisions(f.store), before);
+  const saved = delivered(writeGaps(f.store, request));
+  assert.equal(saved.records.length, prepared.collection.gaps.length);
+  assert.equal(f.store.list("gap").length, saved.records.length);
+  assert.deepEqual(saved.collection, prepared.collection);
+  for (const row of saved.records) {
+    assert.equal(row.kind, "gap"); assert.equal(row.id, `om-gap:garden:${row.value.gap.id}`);
+    assert.equal(row.revision, 1); assert.equal(row.value.project, "garden");
+    assert.deepEqual(row.value.sources, request);
+    assert.equal(row.hash, hashJson(row.value));
+  }
+  const read = delivered(readGaps(f.store, { sources: request, records: saved.records.map(reference) }));
+  assert.deepEqual(read.collection, saved.collection); assert.deepEqual(read.records, saved.records);
+  const after = revisions(f.store), repeated = delivered(writeGaps(f.store, request));
+  assert.deepEqual(repeated, saved); assert.deepEqual(revisions(f.store), after);
+  const reuse = delivered(prepareGaps(f.store, request));
+  assert.deepEqual(reuse.writes, []); assert.equal(reuse.existing.length, saved.records.length);
+  for (const row of saved.records) assert.ok(reuse.guards.some(ref => canonical(ref) === canonical(reference(row))));
+  assert.deepEqual(revisions(f.store), after);
+  assert.ok(Object.isFrozen(saved.records[0]!.value.gap.evidence));
+});
+
+test("stored gap history survives source and graph heads plus reopen while G4 rejects missing or self-consistent forged records", async t => {
+  const f = await createOmFixture(t), request = nativeRequest(f), saved = delivered(writeGaps(f.store, request));
+  const refs = saved.records.map(reference), before = revisions(f.store);
+  assert.ok(refs.length > 1, "the native input supplies several independent gaps");
+  refusedAs(readGaps(f.store, { sources: request, records: [] }), "gap_missing");
+  refusedAs(readGaps(f.store, { sources: request, records: refs.slice(1) }), "gap_missing");
+  refusedAs(readGaps(f.store, { sources: request, records: [...refs, refs[0]!] }), "gap_duplicate");
+  assert.deepEqual(revisions(f.store), before);
+  const victim = saved.records.find(row => row.value.gap.code === "inventory_missing")!;
+  const counterfeit = clone(victim.value) as GapRecord;
+  counterfeit.gap.blocking = true; counterfeit.gap.routes = ["research"];
+  const forged = f.store.write<GapRecord>({ id: victim.id, kind: "gap", expected: victim.revision, value: counterfeit });
+  assert.equal(forged.hash, hashJson(counterfeit));
+  const forgedRefs = refs.map(ref => ref.id === forged.id ? reference(forged) : ref), afterForgery = revisions(f.store);
+  refusedAs(readGaps(f.store, { sources: request, records: forgedRefs }), "gap_record_forged");
+  assert.deepEqual(delivered(readGaps(f.store, { sources: request, records: refs })).collection, saved.collection);
+  assert.deepEqual(revisions(f.store), afterForgery);
+  const graph = f.store.get("graph:garden")!, source = f.store.get("source:garden:brief")!;
+  f.store.write({ id: graph.id, kind: graph.kind, expected: graph.revision, value: graph.value });
+  f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+  const afterDrift = revisions(f.store);
+  refusedAs(prepareGaps(f.store, request), "input_stale");
+  refusedAs(writeGaps(f.store, request), "input_stale");
+  const historic = delivered(readGaps(f.store, { sources: request, records: refs }));
+  assert.deepEqual(historic.collection, saved.collection);
+  assert.deepEqual(revisions(f.store), afterDrift);
+  f.reopen();
+  assert.deepEqual(delivered(readGaps(f.store, { sources: request, records: refs })), historic);
+  assert.deepEqual(revisions(f.store), afterDrift);
+});
+
+test("new and reused gap preparations guard source, graph, proposals and saved gaps before any neighbor write", async t => {
+  const f = await createOmFixture(t), request = nativeRequest(f);
+  const proposal = f.store.write({ id: "om-proposal:garden:gaps", kind: "layer-proposal", expected: 0, value: {
+    base: { graph: request.graph, frame: null }, level: 2, source: "input", status: "proposed", nodes: [], fills: [], localConnectors: [],
+    artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [],
+  } });
+  request.operations.proposals = [reference(proposal)];
+  let newSnapshot = "";
+  for (const mode of ["new", "existing"] as const) {
+    if (mode === "existing") delivered(writeGaps(f.store, request));
+    const prepared = delivered(prepareGaps(f.store, request));
+    assert.equal(prepared.writes.length === 0, mode === "existing");
+    const snapshot = await f.store.snapshot(join(f.root, `gap-${mode}-snapshot`));
+    if (mode === "new") newSnapshot = snapshot.path;
+    const dependencies = [request.input, request.graph, request.horizon, request.works.frame.layer!, reference(proposal),
+      reference(f.store.get("source:garden:brief")!), ...(mode === "existing" ? [reference(prepared.existing[0]!)] : [])];
+    for (const [index, dependency] of dependencies.entries()) {
+      const path = join(f.root, `gap-${mode}-${index}.sqlite`); copyFileSync(snapshot.path, path);
+      const store = new Store(path);
+      try {
+        const old = store.get(dependency.id)!;
+        store.write({ id: old.id, kind: old.kind, expected: old.revision, value: old.value });
+        const before = revisions(store);
+        refusedAs(writeGuarded(store, { unit: "M5-neighbor", target: "gap-pass:garden", guards: prepared.guards,
+          writes: [...prepared.writes, { id: "gap-pass:garden", kind: "gap-pass", expected: 0, value: { gaps: prepared.collection.gaps } },
+            { id: "gap-pass-status:garden", kind: "gap-pass-status", expected: 0, value: { state: "accepted" } }] }), "input_stale");
+        assert.equal(store.get("gap-pass:garden"), null); assert.equal(store.get("gap-pass-status:garden"), null);
+        assert.deepEqual(revisions(store), before);
+        assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(dependency)), `${mode}: ${dependency.id}`);
+      } finally { store.close(); }
+    }
+  }
+  const raceStorePath = join(f.root, "gap-write-race.sqlite");
+  copyFileSync(newSnapshot, raceStorePath);
+  const store = new Store(raceStorePath), writeMany = store.writeMany.bind(store);
+  let injected = false;
+  try {
+    store.writeMany = ((writes, guards) => {
+      if (!injected) {
+        injected = true;
+        const source = store.get("source:garden:brief")!;
+        writeMany([{ id: source.id, kind: source.kind, expected: source.revision, value: source.value }]);
+      }
+      return writeMany(writes, guards);
+    }) as Store["writeMany"];
+    const beforeGaps = store.list("gap").map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
+    const result = writeGaps(store, request);
+    assert.equal(injected, true);
+    refusedAs(result, "input_stale");
+    assert.deepEqual(store.list("gap").map(row => ({ head: reference(row), history: store.history(row.id).map(reference) })), beforeGaps);
+  } finally { store.writeMany = writeMany; store.close(); }
+});
+
+test("storage boundaries reject foreign exact references and status imitations without swallowing execution faults", async t => {
+  const f = await createOmFixture(t), request = nativeRequest(f), saved = delivered(writeGaps(f.store, request));
+  const records = saved.records.map(reference), fakeInput = f.store.write({ id: "om-input:foreign", kind: "om-input", expected: 0,
+    value: { state: "accepted", input: {}, hash: hashJson({}), gaps: [] } });
+  const before = revisions(f.store);
+  for (const action of [prepareGaps, writeGaps]) {
+    assert.throws(() => action(undefined as unknown as Store, request), malformed);
+    for (const bad of [undefined, null, [], "request"]) assert.throws(() => action(f.store, bad as unknown as GapRequest), malformed);
+    for (const field of ["project", "input", "horizon", "graph", "operations", "works"] as const) {
+      const absent = clone(request) as Partial<GapRequest>; delete absent[field];
+      assert.throws(() => action(f.store, absent as GapRequest), malformed);
+    }
+    refusedAs(action(f.store, { ...request, input: reference(fakeInput) }), "record_foreign");
+    refusedAs(action(f.store, { ...request, input: { ...request.input, hash: "0".repeat(64) } }), "record_forged");
+    for (const fault of [new TypeError("gap-read-fault"), new EngineError("record_corrupt", "Exact source broken", { input: request.input.id })]) {
+      const get = f.store.get.bind(f.store);
+      try {
+        f.store.get = ((id: string, revision?: number) => { if (id === request.input.id) throw fault; return get(id, revision); }) as Store["get"];
+        assert.throws(() => action(f.store, request), error => error === fault);
+        assert.throws(() => readGaps(f.store, { sources: request, records }), error => error === fault);
+      } finally { f.store.get = get; }
+    }
+  }
+  assert.throws(() => readGaps(undefined as unknown as Store, { sources: request, records }), malformed);
+  assert.throws(() => readGaps(f.store, { sources: request } as Parameters<typeof readGaps>[1]), malformed);
+  refusedAs(readGaps(f.store, { sources: request, records: [{ ...records[0]!, hash: "0".repeat(64) }, ...records.slice(1)] }), "record_forged");
+  assert.deepEqual(revisions(f.store), before);
+  assert.deepEqual([...GAP_REFUSAL_CODES].sort(), ["gap_request_invalid", "gap_source_missing", "gap_set_missing", "gap_record_forged", "gap_missing",
+    "gap_foreign", "gap_duplicate", "gap_class_unknown", "gap_kind_unknown", "gap_class_conflict", "gap_consumer_missing", "gap_moment_unknown", "gap_outside_horizon"].sort());
+});
+
+test("native first-pass gaps accept an explicit unaccepted work upper, then expose works after L2 without rewriting history", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-gap-first-pass-")), database = join(root, "state.sqlite");
+  let store = new Store(database);
+  const engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  writeFileSync(join(root, "README.md"), "Deterministic first-pass garden product.\n");
+  const desired = gardenGraph(), { level: _level, ...projection } = projectGraph(desired, 1);
+  preparedFeatures(engine, "garden", projection as Graph);
+  const command = { executable: process.execPath, args: ["--version"] };
+  engine.environments.configure("garden", { workspace: root,
+    implementer: { actor: "first-pass-implementer", model: "fixture", effort: "high", command },
+    reviewer: { actor: "first-pass-reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 10_000 }, 0);
+  const input = delivered(writeOmInput(store, { project: "garden", expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const initialGraph = store.get<Graph>("graph:garden")!, rawLayer2 = store.get("graph-layer:garden:2")!;
+  assert.ok(initialGraph.value.nodes.every(node => LEVEL[node.kind] <= 1));
+  assert.equal(engine.graphs.layerIsDerived("garden", 2), false);
+  assert.equal(engine.graphs.layerIsDerived("garden", 3), false);
+  const firstHorizon = delivered(writeHorizon(store, { project: "garden", input: reference(input), graph: reference(initialGraph),
+    refinement: null, available: {}, choice: { choiceVersion: "first-pass", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const operations: ProposalRequest = { proposals: [], frame: { project: "garden", level: 2, graph: reference(initialGraph),
+    horizon: reference(firstHorizon.gate), layer: null, frame: null, upper: null } };
+  const request: GapRequest = { project: "garden", input: reference(input), graph: reference(initialGraph), horizon: reference(firstHorizon.gate),
+    operations, works: { state: "upper-not-accepted", layer: reference(rawLayer2) } };
+  const initialState = revisions(store);
+  for (const works of [null, {}, { state: "upper-not-accepted" }, { layer: reference(rawLayer2) },
+    { state: "unknown", layer: reference(rawLayer2) }, { state: "upper-not-accepted", layer: null },
+    { state: "upper-not-accepted", layer: reference(rawLayer2), gaps: [] }]) {
+    const malformedSource = { ...request, works } as GapRequest;
+    assert.throws(() => prepareGaps(store, malformedSource), malformed);
+    assert.throws(() => writeGaps(store, malformedSource), malformed);
+    assert.throws(() => readGaps(store, { sources: malformedSource, records: [] }), malformed);
+  }
+  for (const layer of [{ ...reference(rawLayer2), hash: "0".repeat(64) },
+    { ...reference(rawLayer2), id: "graph-layer:other:2" }, reference(store.get("graph-layer:garden:1")!)]) {
+    const foreignBasis: GapRequest = { ...request, works: { state: "upper-not-accepted", layer } };
+    refusedAs(prepareGaps(store, foreignBasis), "layer_basis_unproven");
+    refusedAs(writeGaps(store, foreignBasis), "layer_basis_unproven");
+    refusedAs(readGaps(store, { sources: foreignBasis, records: [] }), "layer_basis_unproven");
+  }
+  assert.deepEqual(revisions(store), initialState);
+  const operationSource = delivered(prepareFrameProposals(store, operations));
+  assert.equal(operationSource.gaps.length, 4);
+  const beforePreparation = revisions(store), prepared = delivered(prepareGaps(store, request));
+  assert.equal(prepared.gate.passed, true);
+  assert.deepEqual(prepared.collection.refusals, []);
+  assert.equal(prepared.collection.gaps.length, input.value.gaps.length + operationSource.gaps.length);
+  for (const gap of operationSource.gaps) assert.ok(prepared.collection.gaps.some(item => item.target === gap.target && item.field === gap.field));
+  assert.ok(prepared.collection.gaps.every(gap => gap.evidence.every(evidence => evidence.origin !== "works")));
+  assert.deepEqual(revisions(store), beforePreparation);
+  const firstSnapshot = await store.snapshot(join(root, "initial-source-snapshot"));
+  const first = delivered(writeGaps(store, request)), firstRefs = first.records.map(reference);
+  const firstHistory = delivered(readGaps(store, { sources: request, records: firstRefs }));
+  assert.deepEqual(firstHistory.collection, first.collection);
+  const reused = delivered(prepareGaps(store, request));
+  assert.deepEqual(reused.writes, []);
+  const reusedSnapshot = await store.snapshot(join(root, "reused-source-snapshot"));
+  for (const [name, preparation, snapshot] of [["new", prepared, firstSnapshot], ["reused", reused, reusedSnapshot]] as const) {
+    for (const dependency of [reference(initialGraph), reference(rawLayer2)]) {
+      const path = join(root, `${name}-${dependency.id.includes("graph-layer") ? "layer" : "graph"}.sqlite`);
+      copyFileSync(snapshot.path, path);
+      const branch = new Store(path);
+      try {
+        const old = branch.get(dependency.id)!;
+        branch.write({ id: old.id, kind: old.kind, expected: old.revision, value: old.value });
+        const before = revisions(branch);
+        refusedAs(writeGuarded(branch, { unit: "M5-neighbor", target: "first-pass:garden", guards: preparation.guards,
+          writes: [...preparation.writes,
+            { id: "first-pass:garden", kind: "first-pass", expected: 0, value: { state: "accepted" } },
+            { id: "first-pass-status:garden", kind: "first-pass-status", expected: 0, value: { state: "accepted" } }] }), "input_stale");
+        assert.equal(branch.get("first-pass:garden"), null);
+        assert.equal(branch.get("first-pass-status:garden"), null);
+        assert.deepEqual(revisions(branch), before);
+        assert.ok(preparation.guards.some(ref => canonical(ref) === canonical(dependency)), `${name}: ${dependency.id}`);
+      } finally { branch.close(); }
+    }
+  }
+  const absent = clone(request) as Partial<GapRequest>; delete absent.works;
+  const beforeAbsent = revisions(store);
+  assert.throws(() => prepareGaps(store, absent as GapRequest), malformed);
+  assert.throws(() => writeGaps(store, absent as GapRequest), malformed);
+  assert.throws(() => readGaps(store, { sources: absent as GapRequest, records: firstRefs }), malformed);
+  assert.deepEqual(revisions(store), beforeAbsent);
+
+  const r0 = engine.refinement.begin("garden", "R0");
+  engine.refinement.finishResearch("garden", "R0", reference(r0), 0);
+  engine.refinement.sealLayer("garden", 1, 0);
+  const r1 = engine.refinement.begin("garden", "R1");
+  answerTechnicalFixture(engine, "garden", r1);
+  engine.refinement.finishResearch("garden", "R1", reference(store.get(r1.id)!), 0);
+  const design = engine.refinement.prepareLayer("garden", 2);
+  const answered = answerLayerFixture(engine, "garden", design, 2, desired);
+  const nextGraph = engine.refinement.buildLayer("garden", 2, reference(answered), store.get("graph:garden")!.revision, "fixture-researcher");
+  const layer2 = engine.refinement.sealLayer("garden", 2, 0);
+  assert.ok(nextGraph.value.nodes.some(node => node.kind === "operation"));
+  assert.ok(nextGraph.value.nodes.every(node => LEVEL[node.kind] <= 2));
+  assert.equal(engine.graphs.layerIsDerived("garden", 2), true);
+  assert.equal(engine.graphs.layerIsDerived("garden", 3), false);
+  const beforeStale = revisions(store);
+  refusedAs(prepareGaps(store, request), "input_stale");
+  refusedAs(writeGaps(store, request), "input_stale");
+  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
+  assert.deepEqual(revisions(store), beforeStale);
+
+  const workHorizon = delivered(writeHorizon(store, { project: "garden", input: reference(input), graph: reference(nextGraph),
+    refinement: reference(layer2), available: {}, choice: { choiceVersion: "first-work-pass", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const current: GapRequest & { works: ProposalRequest } = { project: "garden", input: reference(input), graph: reference(nextGraph), horizon: reference(workHorizon.gate),
+    operations: { proposals: [], frame: { project: "garden", level: 2, graph: reference(nextGraph), horizon: reference(workHorizon.gate),
+      layer: reference(store.get("graph-layer:garden:2")!), frame: null, upper: null } },
+    works: { proposals: [], frame: { project: "garden", level: 3, graph: reference(nextGraph), horizon: reference(workHorizon.gate),
+      layer: null, frame: null, upper: { horizon: reference(workHorizon.gate), frame: null } } } };
+  const workSource = delivered(prepareFrameProposals(store, current.works));
+  assert.ok(workSource.gaps.length > 0);
+  const falseEmpty: GapRequest = { ...current, works: { state: "upper-not-accepted", layer: reference(store.get("graph-layer:garden:2")!) } };
+  const beforeMask = revisions(store);
+  for (const result of [prepareGaps(store, falseEmpty), writeGaps(store, falseEmpty), readGaps(store, { sources: falseEmpty, records: [] })]) {
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("An accepted L2 cannot be presented as an unavailable work source");
+    assert.ok(["gap_record_forged", "layer_basis_unproven"].includes(result.refusal.code), result.refusal.code);
+    addressed(result.refusal);
+  }
+  assert.deepEqual(revisions(store), beforeMask);
+  const next = delivered(writeGaps(store, current));
+  for (const gap of workSource.gaps) {
+    const saved = next.collection.gaps.find(item => item.target === gap.target && item.field === gap.field);
+    assert.ok(saved, gap.target);
+    assert.ok(saved.evidence.some(evidence => evidence.origin === "works"));
+  }
+  assert.ok(firstRefs.some(ref => next.records.some(record => record.id === ref.id && record.revision > ref.revision)));
+  const nextRefs = next.records.map(reference), nextHistory = delivered(readGaps(store, { sources: current, records: nextRefs }));
+  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
+  store.close(); store = new Store(database);
+  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
+  assert.deepEqual(delivered(readGaps(store, { sources: current, records: nextRefs })), nextHistory);
+});
