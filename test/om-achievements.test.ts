@@ -12,6 +12,7 @@ import {
   confirmResults, ACCEPTANCE_CODES, ACCEPTANCE_PROVIDERS, CANCELLATION_PROVIDERS, type ConfirmRequest,
 } from "../src/om/achievements.js";
 import type { AttemptGoal } from "../src/om/series.js";
+import { gapLinesId, gapLinesNamespace, type GapLinesRecord } from "../src/om/gap-lines.js";
 
 const UNIT = "om-acceptance";
 const PROJECT = "alpha";
@@ -53,10 +54,12 @@ const request = (over: Partial<ConfirmRequest> = {}): ConfirmRequest =>
 const written = (store: Store, kind: string, value: Record<string, unknown> = { accepted: true, keys: ["line:cart:price"] }): Ref =>
   reference(store.write({ id: `${kind}:${PROJECT}:${next()}`, kind, expected: 0, value: value as Json }));
 
-test("both tables of providers are empty until a provider is connected, frozen, and closed to any caller", () => {
+test("the D2 acceptance provider and empty cancellation table are frozen and closed to callers", () => {
   for (const table of [ACCEPTANCE_PROVIDERS, CANCELLATION_PROVIDERS]) {
-    assert.deepEqual(Object.keys(table), []);
+    const expected = table === ACCEPTANCE_PROVIDERS ? ["gap-line"] : [];
+    assert.deepEqual(Object.keys(table), expected);
     assert.ok(Object.isFrozen(table));
+    for (const provider of Object.values(table)) assert.ok(Object.isFrozen(provider));
     // No prototype: a kind that names a member of Object.prototype finds nothing there.
     assert.equal(Object.getPrototypeOf(table), null);
     for (const kind of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
@@ -67,8 +70,11 @@ test("both tables of providers are empty until a provider is connected, frozen, 
     const own = { namespace: () => `om-gap-line:${PROJECT}:`, confirm: () => ({ keys: ["line:cart:price"] }) };
     assert.throws(() => { (table as Record<string, unknown>)["om-gap-line"] = own; }, TypeError);
     assert.throws(() => Object.defineProperty(table, "om-gap-line", { value: own }), TypeError);
-    assert.deepEqual(Object.keys(table), []);
+    assert.deepEqual(Object.keys(table), expected);
   }
+  const provider = ACCEPTANCE_PROVIDERS["gap-line"]!;
+  assert.equal(provider.namespace(PROJECT), gapLinesNamespace(PROJECT));
+  assert.throws(() => { (provider as unknown as Record<string, unknown>)["confirm"] = () => ({ keys: ["forged"] }); }, TypeError);
   assert.ok(Object.isFrozen(ACCEPTANCE_CODES));
   assert.throws(() => { (ACCEPTANCE_CODES as unknown as string[]).push("invented"); }, TypeError);
 });
@@ -90,7 +96,7 @@ test("every refusal code of the contract is produced, addressed and routed", t =
   assert.deepEqual([...new Set(seen)].sort(), [...ACCEPTANCE_CODES].sort());
 });
 
-test("while no provider is connected, no record of any kind confirms a result or a cancellation", t => {
+test("unsupported kinds cannot confirm a result or cancellation, including the distinct om-gap-line kind", t => {
   const { store } = fixture(t);
   // A refusal as the ground of "acceptance", a candidate, a gap line, and records whose kinds name members of a
   // prototype: none of them has a provider, and no content they carry is read.
@@ -117,6 +123,60 @@ test("while no provider is connected, no record of any kind confirms a result or
   }
   // Without an attempt to confirm for, nothing is confirmed either.
   assert.equal(refusalOf(confirmResults(store, request({ goal: null, accepting: [line] }))).code, "achievement_unconfirmed");
+});
+
+test("the registered gap-line provider requires real historical sources despite fabricated acceptance fields", t => {
+  const { store } = fixture(t);
+  const ref = (id: string): Ref => ({ id, revision: 1, hash: hex("a") });
+  const graph = ref(`graph:${PROJECT}`), horizon = ref(`om-horizon:${PROJECT}:choice`);
+  const value: GapLinesRecord = { project: PROJECT, lines: [], request: { project: PROJECT, previous: null, pass: 1,
+    gaps: { records: [], sources: { project: PROJECT, input: ref(`om-input:${PROJECT}`), graph, horizon,
+      operations: { proposals: [], frame: { project: PROJECT, level: 2, graph, horizon, layer: null, frame: null, upper: null } },
+      works: { state: "upper-not-accepted", layer: ref(`graph-layer:${PROJECT}:2`) },
+    } }, closures: [] } };
+  const line = reference(store.write({ id: gapLinesId(PROJECT), kind: "gap-line", expected: 0,
+    value: { ...value, accepted: true, status: "closed", keys: ["fabricated-result"] } as unknown as Json }));
+  const result = refusalOf(confirmResults(store, request({ accepting: [line] })));
+  assert.equal(result.code, "achievement_unconfirmed");
+  assert.equal(result.at.field, "outcome.accepting.0");
+  assert.match(result.message, /record_missing/);
+  assert.deepEqual(result.at.ref, line);
+  assert.equal(refusalOf(confirmResults(store, request({ goal: null, accepting: [line] }))).at.field, "attempt");
+});
+
+test("the registered gap-line provider refuses an absent saved request", t => {
+  const { store } = fixture(t);
+  const line = reference(store.write({ id: gapLinesId(PROJECT), kind: "gap-line", expected: 0,
+    value: { project: PROJECT, lines: [], accepted: true, keys: ["fabricated-result"] } }));
+  const result = refusalOf(confirmResults(store, request({ accepting: [line] })));
+  assert.equal(result.code, "achievement_unconfirmed");
+  assert.equal(result.at.field, "outcome.accepting.0");
+  assert.match(result.message, /gap_line_forged.*request/i);
+});
+
+test("gap-line project namespace and saved project cannot be substituted", t => {
+  const { store } = fixture(t);
+  const foreign = reference(store.write({ id: gapLinesId(`${PROJECT}bet`), kind: "gap-line", expected: 0,
+    value: { project: `${PROJECT}bet`, lines: [], accepted: true } }));
+  const result = refusalOf(confirmResults(store, request({ accepting: [foreign] })));
+  assert.equal(result.code, "achievement_unconfirmed");
+  assert.equal(result.at.field, "outcome.accepting.0.id");
+  assert.match(result.message, /outside/);
+  const forged = reference(store.write({ id: gapLinesId(PROJECT), kind: "gap-line", expected: 0,
+    value: { project: "foreign", lines: [], accepted: true } }));
+  const body = refusalOf(confirmResults(store, request({ accepting: [forged] })));
+  assert.equal(body.code, "achievement_unconfirmed");
+  assert.match(body.message, /gap_line_forged/);
+});
+
+test("registered gap-line acceptance does not grant cancellation authority", t => {
+  const { store } = fixture(t);
+  const line = reference(store.write({ id: gapLinesId(PROJECT), kind: "gap-line", expected: 0,
+    value: { project: PROJECT, lines: [], closedBy: "cancelled", accepted: true } }));
+  const result = refusalOf(confirmResults(store, request({ cancelling: [line] })));
+  assert.equal(result.code, "cancellation_unconfirmed");
+  assert.equal(result.at.field, "outcome.cancelling.0.kind");
+  assert.match(result.message, /gap-line/);
 });
 
 test("an outcome that names no result is confirmed as exactly that, and handed out as a frozen copy", t => {

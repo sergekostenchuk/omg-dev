@@ -4,6 +4,7 @@ import { isRef, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
 import type { Achievement, AttemptGoal } from "./series.js";
+import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 
 /**
  * The contract of the PROVIDERS OF ACCEPTANCE: who may say that a result was accepted, and what its lasting key is.
@@ -23,8 +24,8 @@ import type { Achievement, AttemptGoal } from "./series.js";
  * question), which a single stated key could not say.
  *
  * The providers are the units that write accepting records — the closing of a gap line (D2), the checked answer (D5),
- * the accepted frame (C5). None of them is written yet, so both tables are EMPTY and every result and every
- * cancellation is refused: until a provider is connected, an unconfirmed result is no result. Connecting one is one
+ * the accepted frame (C5). D2 verifies its historical closing grounds and recorded goal through its registered
+ * provider, then derives the shared structural result identity. Cancellation providers remain unconnected. Connecting a provider is one
  * line in its table below; nothing in G7 changes, and no caller can hand a table of its own to any function here.
  */
 const UNIT = "om-acceptance";
@@ -49,7 +50,7 @@ export type Confirmation =
  */
 export interface AcceptanceProvider {
   readonly namespace: (project: string) => string;
-  readonly confirm: (record: Sealed<Revision<Json>>, context: AcceptanceContext) => Confirmation;
+  readonly confirm: (record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store) => Confirmation;
 }
 
 // A table keyed by kinds that come out of the store. It has no prototype, so a record whose kind is "constructor" or
@@ -65,11 +66,10 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
 }
 
 /**
- * Kind of an ACCEPTING record → its provider. One line per provider, for example
- *   "om-gap-line-closure": { namespace: gapLineClosureNamespace, confirm: confirmGapLineClosure },
- * written by the unit that writes those records (D2 the closing of a gap line, D5 the checked answer, C5 the frame).
+ * Kind of an ACCEPTING record → the provider written by its producing unit.
+ * Historical grounds and semantic result identity are interpreted by that provider, never by this table.
  */
-export const ACCEPTANCE_PROVIDERS = providers({});
+export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult } });
 
 /**
  * Kind of a TRANSITION that cancelled an earlier result → its provider, which derives the keys of the results it
@@ -159,7 +159,7 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
   if (request.goal === null) {
     return problem(side.code, "No attempt of that ordinal stands, so nothing it accepted can be confirmed for it", request.target, "attempt", ref);
   }
-  const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal });
+  const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal }, store);
   const keys = keysOf(answer);
   if (keys === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
   return keys;
