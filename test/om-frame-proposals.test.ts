@@ -15,7 +15,7 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { fillObligations, representativeId, readFrame, prepareFrame,
+import { fillObligations, representativeId, readFrame, prepareFrame, WORKS_FRAME_CONTRACT,
   type FrameLevel, type FrameRead, type FrameRequest, type FrameScope,
   type ConnectionFrame } from "../src/om/frame-obligations.js";
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, readFrameProposals, prepareFrameProposals,
@@ -247,6 +247,74 @@ test("proposals fill both first layers and preserve every cross-flow consumer, p
     assert.ok(Object.isFrozen(result) && Object.isFrozen(result.fills) && Object.isFrozen(result.proposals[0]!.value.nodes));
     proposal.value.nodes[0]!.title += " caller mutation";
     assert.deepEqual(result.proposals[0], original);
+  }
+});
+
+function workProposal() {
+  const graph = gardenGraph("cross");
+  for (const node of graph.nodes.filter(node => node.kind === "work" && node.ports.length && !node.code.length))
+    node.code = [{ path: `${node.id}.ts`, access: "write", status: "planned" }];
+  const producer = graph.nodes.find(node => node.id === "garden-produce-work")!;
+  producer.code.push({ path: "src/producer.ts", symbol: "produce", access: "write", status: "planned" });
+  const frame = pureFrame(graph, 3), proposal = proposalFor(frame, graph).value;
+  proposal.worksContract = WORKS_FRAME_CONTRACT;
+  for (const fill of proposal.fills) if (fill.port !== undefined)
+    fill.codeRef = clone(proposal.nodes.find(node => node.id === fill.node)!.code.at(-1)!);
+  return { graph, frame, proposal };
+}
+
+test("works-frame proposals retain the exact planned code reference among multiple declared paths", () => {
+  const { frame, proposal } = workProposal(), original = clone(proposal);
+  const result = delivered(applyProposals(frame, [observe(proposal)]));
+  assert.deepEqual(result.open, []);
+  for (const fill of result.fills) {
+    const source = proposal.fills.find(row => row.obligation === fill.obligation && row.node === fill.node)!;
+    assert.deepEqual(fill.codeRef, source.codeRef);
+    if (fill.port !== undefined) assert.ok(Object.isFrozen(fill.codeRef));
+    else assert.ok(!Object.hasOwn(fill, "codeRef"));
+  }
+  assert.ok(result.fills.some(fill => fill.codeRef?.path === "src/producer.ts" && fill.codeRef.symbol === "produce"));
+  assert.deepEqual(delivered(openObligationsToGaps(frame, result as ProposalResult)), []);
+  assert.deepEqual(proposal, original);
+});
+
+test("works-frame proposals refuse missing, foreign or inexact code and code on outcome fills", () => {
+  for (const mutation of ["missing", "foreign", "symbol", "status", "access", "outcome", "null"] as const) {
+    const { frame, proposal } = workProposal();
+    const fill = proposal.fills.find(row => row.node === "garden-produce-work" && row.port !== undefined)!;
+    if (mutation === "missing") delete fill.codeRef;
+    if (mutation === "foreign") fill.codeRef!.path = "foreign.ts";
+    if (mutation === "symbol") fill.codeRef!.symbol = "other";
+    if (mutation === "status") fill.codeRef!.status = "existing";
+    if (mutation === "access") fill.codeRef!.access = "read";
+    if (mutation === "outcome") proposal.fills.find(row => row.port === undefined)!.codeRef = clone(fill.codeRef!);
+    if (mutation === "null") (fill as unknown as Record<string, unknown>)['codeRef'] = null;
+    const refusal = refusedAs(applyProposals(frame, [observe(proposal)]), mutation === "null" ? "proposal_invalid" : "slot_fill_foreign");
+    assert.equal(refusal.at.field, mutation === "null" ? "fills" : "codeRef");
+  }
+});
+
+test("work proposal contracts reject unknown, null and own-undefined markers and are forbidden on L2", () => {
+  for (const marker of ["works-frame/v2", null, undefined]) {
+    const { frame, proposal } = workProposal(), observation = observe(proposal);
+    (observation.value as unknown as Record<string, unknown>)['worksContract'] = marker;
+    assert.equal(refusedAs(applyProposals(frame, [observation]), "proposal_invalid").at.field, "worksContract");
+  }
+  const graph = gardenGraph(), frame = pureFrame(graph, 2), proposal = proposalFor(frame, graph).value;
+  proposal.worksContract = WORKS_FRAME_CONTRACT;
+  assert.equal(refusedAs(applyProposals(frame, [observe(proposal)]), "proposal_invalid").at.field, "worksContract");
+});
+
+test("legacy proposal outputs remain unchanged and never acquire endpoint code references", () => {
+  for (const level of levels) {
+    const graph = gardenGraph("cross"), frame = pureFrame(graph, level), proposal = proposalFor(frame, graph);
+    const first = delivered(applyProposals(frame, [proposal])), before = hashJson(first);
+    assert.ok(first.fills.every(fill => !Object.hasOwn(fill, "codeRef")));
+    assert.ok(!Object.hasOwn(first.proposals[0]!.value, "worksContract"));
+    assert.equal(hashJson(delivered(applyProposals(frame, [clone(proposal)]))), before);
+    const unexpected = clone(proposal.value), end = unexpected.fills.find(fill => fill.port !== undefined)!;
+    end.codeRef = { path: "uncontracted.ts", access: "write", status: "planned" };
+    refusedAs(applyProposals(frame, [observe(unexpected)]), "proposal_invalid");
   }
 });
 

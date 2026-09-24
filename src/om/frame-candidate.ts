@@ -1,29 +1,38 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { composeLayer, layerDesignOf } from '../graph/layer-design.js';
-import type { Binding, Endpoint, Graph } from '../graph/model.js';
+import { type Binding, type Endpoint, type Graph } from '../graph/model.js';
+import { RefinementRelations } from '../graph/relations.js';
+import { bindTaskObligations, taskBindingId, taskObligations } from '../graph/task-obligations.js';
+import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
+import { L3_ASSEMBLY, assembleL3 } from '../graph/layer-assembly.js';
 import { projectGraph } from '../graph/project.js';
 import { requireGraph, validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameRead, type PreparedFrame } from './frame-obligations.js';
+import { WORKS_FRAME_CONTRACT, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
   type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
+import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
+import { withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 
 export const CANDIDATE_REFUSAL_CODES = Object.freeze([
   'candidate_level_unsupported', 'candidate_missing', 'candidate_graph_mismatch',
+  'works_contract_invalid', 'works_obligations_invalid', 'works_code_missing', 'works_code_foreign',
+  'sleeping_anchor_underivable', 'sleeping_wake_test_missing', 'works_upper_drift',
   'derived_field_conflict', 'slot_fill_conflict', 'replacement_leaves_dangling', 'operation_port_unbound', 'graph_invalid',
 ] as const);
 export type CandidateResult<T> = { readonly ok: true; readonly value: Sealed<T> }
   | { readonly ok: false; readonly refusal: Sealed<Refusal & { findings?: Finding[] }> };
 export interface FrameCandidate {
-  project: string; level: 2; graphHash: string; layerHash: string; upperHash: string; graph: Graph;
+  project: string; level: 2 | 3; works?: WorksCandidateInput; graphHash: string; layerHash: string; upperHash: string; graph: Graph;
   fills: ProposalResult['fills']; base: { graph: Ref; frame: Ref | null }; proposals: Ref[];
 }
 export type CandidateAssembly = { state: 'gaps'; gaps: FrameGap[] } | { state: 'candidate'; candidate: FrameCandidate };
-export type CandidateRequest = ProposalRequest;
+export interface WorksCandidateInput { contract: typeof WORKS_FRAME_CONTRACT; producer: Ref; ledger: Ref; bindings: TaskObligationBinding[] }
+export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput }
 export interface FrameCandidateRecord extends FrameCandidate { request: CandidateRequest }
 export type PreparedCandidate = { guards: Ref[]; expected: PreparedFrame['expected']; writes: Write[] } & (
   { state: 'gaps'; gaps: FrameGap[]; existing: null }
@@ -33,7 +42,7 @@ export type CandidateWriteResult = { state: 'gaps'; gaps: FrameGap[] }
 export interface CandidateReadRequest { project: string; candidate: Ref }
 export interface CandidateGateRequest extends CandidateReadRequest { graph?: unknown }
 export interface CandidateGate { passed: true; candidate: Ref; graphHash: string; findings: Finding[] }
-export interface ObservedCandidate { record: Revision<FrameCandidateRecord>; definitions: string[]; references: Ref[]; sources: ProposalRequest }
+export interface ObservedCandidate { record: Revision<FrameCandidateRecord>; definitions: string[]; references: Ref[]; sources: CandidateRequest }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -63,16 +72,19 @@ function take<T>(result: OmResult<T>): T {
   return result.value;
 }
 function outcome<T>(action: () => T): CandidateResult<T> {
-  try { return delivered(action()); }
-  catch (error) {
-    if (error instanceof CandidateFailure) return { ok: false, refusal: sealed(error.refusal) };
-    throw error;
-  }
+  return withHistoricalReads(() => {
+    try { return delivered(action()); }
+    catch (error) {
+      if (error instanceof CandidateFailure) return { ok: false, refusal: sealed(error.refusal) };
+      throw error;
+    }
+  });
 }
-function requireLevel(frame: unknown): void {
+function requireLevel(frame: unknown, works?: WorksCandidateInput): void {
   if (!object(frame) || !object(frame['request'])) invalid('frame');
   if (frame['request']['level'] !== 2 && frame['request']['level'] !== 3) invalid('frame.level');
-  if (frame['request']['level'] === 3) reject('candidate_level_unsupported', 'candidate:3', 'level', 'L3 needs the F2 code-reference and obligation-handoff contract');
+  if (frame['request']['level'] === 3) requireWorks(works);
+  else if (works !== undefined) reject('works_contract_invalid', 'candidate:2', 'works', 'A works contract belongs only to L3');
 }
 function requireStore(store: Store): void { if (!(store instanceof Store)) invalid('store'); }
 function requireRequest(value: unknown): asserts value is CandidateRequest {
@@ -85,15 +97,33 @@ function requireRequest(value: unknown): asserts value is CandidateRequest {
     || (frame['upper']['frame'] !== null && !isRef(frame['upper']['frame']))) invalid('frame.upper');
   if (!Array.isArray(value['proposals']) || !value['proposals'].every(isRef)) invalid('proposals');
 }
-function normalizeRequest(request: CandidateRequest): CandidateRequest {
-  return copy({ frame: request.frame, proposals: sorted(request.proposals) });
+function requireWorks(value: unknown): asserts value is WorksCandidateInput {
+  if (!object(value) || value['contract'] !== WORKS_FRAME_CONTRACT
+    || !isRef(value['producer']) || !isRef(value['ledger']) || !Array.isArray(value['bindings'])
+    || Object.keys(value).some(key => !['contract', 'producer', 'ledger', 'bindings'].includes(key)))
+    reject('works_contract_invalid', 'candidate:3', 'works', 'L3 requires its explicit contract, exact OM producer and ledger, and task bindings');
+  for (const binding of value['bindings']) if (!object(binding) || !text(binding['id']) || !isRef(binding['scope'])
+    || !text(binding['obligation']) || !Array.isArray(binding['consumers']) || !binding['consumers'].every((consumer: unknown) =>
+      object(consumer) && text(consumer['node']) && Array.isArray(consumer['tests']) && consumer['tests'].every(text)))
+    reject('works_obligations_invalid', 'candidate:3', 'bindings', 'Task bindings retain their explicit identity, scope, work and test selections');
 }
+function normalizedWorks(works: WorksCandidateInput): WorksCandidateInput {
+  requireWorks(works);
+  return copy({ ...works, bindings: sorted(works.bindings.map(binding => ({ ...binding,
+    consumers: sorted(binding.consumers.map(consumer => ({ ...consumer, tests: sorted(consumer.tests) }))) }))) });
+}
+function normalizeRequest(request: CandidateRequest): CandidateRequest {
+  return copy({ frame: request.frame, proposals: sorted(request.proposals),
+    ...(Object.hasOwn(request, 'works') ? { works: normalizedWorks(request.works!) } : {}) });
+}
+
 function requireRead(value: unknown): asserts value is CandidateReadRequest {
   if (!object(value) || !text(value['project'])) invalid('project');
   if (!isRef(value['candidate'])) invalid('candidate');
 }
 function idOf(value: FrameCandidate): string {
-  return `om-candidate:${value.project}:${hashJson([value.graphHash, value.base, value.proposals])}`;
+  return `om-candidate:${value.project}:${hashJson(value.level === 3
+    ? [value.level, value.graphHash, value.base, value.proposals, value.works!] : [value.graphHash, value.base, value.proposals])}`;
 }
 
 // Only typed node references count. Text and JSON Schema may legitimately contain a removed node's name.
@@ -141,8 +171,10 @@ function danglingReferences(graph: Graph, removed: Set<string>): Finding[] {
 function bindingSet(bindings: readonly Binding[]): Binding[] {
   return sorted(bindings.map(binding => ({ ...binding, consumers: sorted(binding.consumers) })));
 }
-function mergeConnector(accepted: Graph['connectors'][number] | undefined, proposed: Graph['connectors'][number]): Graph['connectors'][number] {
+function mergeConnector(accepted: Graph['connectors'][number] | undefined, proposed: Graph['connectors'][number], level: 2 | 3): Graph['connectors'][number] {
   if (!accepted) return proposed;
+  if (level === 3) return { ...proposed, bindings: [...accepted.bindings.filter(binding => binding.level !== 3),
+    ...proposed.bindings.filter(binding => binding.level === 3)] };
   const carried = accepted.bindings.filter(binding => binding.level === 3);
   const supplied = proposed.bindings.filter(binding => binding.level === 3);
   // Omitting the future slice is not a deletion. An explicitly supplied slice must describe all of it.
@@ -239,22 +271,103 @@ function requireUnchangedWorks(accepted: Graph, graph: Graph): void {
     if (!same(accepted[field] ?? null, graph[field] ?? null))
       reject('candidate_level_unsupported', graph.id, field, 'The accepted work horizon and research obligations must remain unchanged');
 }
-function checkedGraph(graph: Graph, upper: Graph): void {
+function checkedGraph(graph: Graph, upper: Graph, level: 2 | 3): void {
   const validation = validateGraph(graph);
   if (validation.findings.length) reject('graph_invalid', validation.findings[0]!.target || graph.id, 'graph',
     'The candidate failed the native graph validator', validation.findings);
   // requireGraph remains the native graph contract; composeLayer validates the derived L2 without pruning the saved graph.
-  try { requireGraph(graph); composeLayer(upper, 2, layerDesignOf(graph, 2)); }
+  try { requireGraph(graph); composeLayer(upper, level, layerDesignOf(graph, level)); }
   catch (error) {
     if (!(error instanceof EngineError)) throw error;
     if (error.code === 'graph_invalid') reject(error.code, graph.id, 'graph', error.message, error.details as Finding[]);
     if (['layer_outcome_uncovered', 'layer_connector_uncovered', 'upper_layer_drift', 'derived_field_conflict',
-      'layer_detail_invalid', 'graph_upgrade_required', 'layer_design_missing'].includes(error.code))
+      'layer_detail_invalid', 'graph_upgrade_required', 'layer_design_missing', 'layer_port_unbound', 'horizon_empty'].includes(error.code))
       reject(error.code, graph.id, 'layer', error.message);
     throw error;
   }
 }
-function assemble(frame: FrameRead, result: ProposalResult): CandidateAssembly {
+/** Enrich only the NEW candidate. Legacy C2 output remains a faithful historical value. */
+function workCodeFills(frame: FrameRead, result: ProposalResult, graph: Graph): ProposalResult {
+  return { ...result, fills: sorted(result.fills.map(fill => {
+    const obligation = result.obligations.find(item => item.id === fill.obligation)!;
+    if (obligation.kind !== 'connection-end' || fill.source === 'identity') {
+      if (Object.hasOwn(fill, 'codeRef')) reject('works_code_foreign', fill.node, fill.obligation, 'Only real connection ends carry a code reference');
+      return fill;
+    }
+    let codeRef = fill.codeRef;
+    if (!codeRef && fill.source === 'accepted') {
+      codeRef = take(workFillCode(frame.upper, frame.accepted!, obligation, fill as FrameFill));
+    }
+    if (!codeRef) reject('works_code_missing', fill.node, fill.obligation, 'A real work end needs an exact declared code reference, including on an inherited end');
+    if (!graph.nodes.find(node => node.id === fill.node)?.code.some(ref => same(ref, codeRef)))
+      reject('works_code_foreign', fill.node, fill.obligation, 'The fill code reference must equal a complete CodeRef declared by this work');
+    return { ...fill, codeRef: copy(codeRef) };
+  })) };
+}
+function workDeliveries(graph: Graph, connector: Graph['connectors'][number], binding: Binding, flow: string): Binding[] {
+  const activeProducer = graph.horizon.includes(binding.producer.node);
+  const awake = binding.consumers.filter(endpoint => !activeProducer || graph.horizon.includes(endpoint.node));
+  const sleeping = binding.consumers.filter(endpoint => activeProducer && !graph.horizon.includes(endpoint.node));
+  const result: Binding[] = awake.length ? [{ ...binding, consumers: awake, anchor: null }] : [];
+  if (sleeping.length) {
+    const producer = graph.nodes.find(node => node.id === binding.producer.node);
+    if (!producer || producer.kind !== 'work' || producer.outcome !== connector.artifact)
+      reject('sleeping_anchor_underivable', connector.id, binding.producer.node, 'The sleeping flow needs its producer work to produce this exact artifact');
+    const tests = graph.tests.filter(test => test.node === producer.id && producer.tests.includes(test.id) && test.covers.includes(connector.id));
+    if (tests.length !== 1) reject('sleeping_wake_test_missing', connector.id, producer.id,
+      'Exactly one producer-owned covering test must determine the sleeping flow; no first-match selection');
+    const test = tests[0]!;
+    const id = workAnchorId(connector.id, flow, binding.producer);
+    const anchor = { id, owner: producer.id, outcome: connector.artifact, test: test.id };
+    const existing = graph.anchors.find(item => item.id === id);
+    if (existing && !same(existing, anchor)) reject('sleeping_anchor_underivable', id, 'anchor', 'The mechanical anchor address has conflicting content');
+    if (!existing) graph.anchors.push(anchor);
+    // Keep an already accepted upper wake test; the lower anchor carries its work-owned test.
+    connector.wakeTest ??= test.id;
+    result.push({ ...binding, consumers: sleeping, anchor: id });
+  }
+  return result;
+}
+function checkWorkEndpoints(graph: Graph, result: ProposalResult): void {
+  const identities = new Set(result.fills.filter(fill => fill.source === 'identity').map(fill => fill.node));
+  for (const connector of graph.connectors) for (const binding of connector.bindings.filter(item => item.level === 3))
+    for (const endpoint of [binding.producer, ...binding.consumers]) {
+      if (identities.has(endpoint.node)) {
+        if (Object.hasOwn(endpoint, 'codeRef')) reject('works_code_foreign', endpoint.node, connector.id, 'Identity has no implemented endpoint');
+      } else {
+        if (!endpoint.codeRef) reject('works_code_missing', endpoint.node, connector.id, 'Every real work connection end must name code');
+        if (!graph.nodes.find(node => node.id === endpoint.node)?.code.some(ref => same(ref, endpoint.codeRef)))
+          reject('works_code_foreign', endpoint.node, connector.id, 'Endpoint code belongs to its own work');
+      }
+    }
+}
+function checkedWorksBasis(store: Store, request: CandidateRequest, current: boolean) {
+  requireWorks(request.works);
+  const saved = take(readOmObligations(store, { project: request.frame.project, producer: request.works.producer }));
+  if (!same(reference(saved.record), request.works.ledger))
+    reject('works_obligations_invalid', request.works.ledger.id, 'ledger', 'The candidate names the complete ledger of this exact OM producer');
+  const works = saved.producer.value.request.gaps.sources.works;
+  if ('state' in works || !same(works, { frame: request.frame, proposals: sorted(request.proposals) }))
+    reject('works_obligations_invalid', request.works.producer.id, 'context', 'The handoff and candidate must name exactly the same checked D1 works request');
+  if (!current) return { ...saved, guards: [] as Ref[] };
+  const prepared = take(prepareOmObligations(store, saved.producer.value.request as ObligationRequest));
+  if (prepared.writes.length || !same(reference(prepared.producer), request.works.producer) || !same(reference(prepared.record), request.works.ledger))
+    reject('works_obligations_invalid', request.works.producer.id, 'admission', 'The current handoff must already exist at the exact declared references');
+  return prepared;
+}
+function checkWorkObligations(store: Store, request: CandidateRequest, candidate: FrameCandidate): void {
+  const basis = checkedWorksBasis(store, request, false);
+  const identities = new Set(candidate.fills.filter(fill => fill.source === 'identity').map(fill => fill.node));
+  for (const binding of candidate.graph.researchObligations ?? []) if (binding.consumers.some(consumer => identities.has(consumer.node)))
+    reject('works_obligations_invalid', binding.id, 'consumers', 'An identity representative cannot act as a concrete task consumer');
+  const checked = bindTaskObligations(store, request.frame.project, candidate.graph, basis.handoff as OmObligationHandoff);
+  if (checked.findings.length) reject('works_obligations_invalid', checked.findings[0]!.target, 'bindings',
+    'The assembled work bindings failed the common task obligation contract', checked.findings);
+  for (const obligation of taskObligations(basis.handoff as OmObligationHandoff)) if (!candidate.graph.researchObligations?.some(binding => binding.id === taskBindingId(obligation)))
+    reject('works_obligations_invalid', obligation.obligation, 'bindings', 'Every carried task assignment must retain its own binding');
+}
+function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput): CandidateAssembly {
+  const level = frame.request.level;
   const gaps = take(openObligationsToGaps(frame, result)) as FrameGap[];
   if (gaps.length) return { state: 'gaps', gaps };
   // Keep the complete accepted content, including local definitions and authored descendants.
@@ -284,7 +397,7 @@ function assemble(frame: FrameRead, result: ProposalResult): CandidateAssembly {
     }
     for (const connector of sorted(proposal.localConnectors)) {
       const accepted = graph.connectors.find(item => item.id === connector.id);
-      const incoming = mergeConnector(accepted, connector);
+      const incoming = mergeConnector(accepted, connector, level);
       merge('connectors', graph.connectors, incoming, proposal.redefines.includes(connector.id));
     }
   }
@@ -296,59 +409,88 @@ function assemble(frame: FrameRead, result: ProposalResult): CandidateAssembly {
     const index = graph.joins.findIndex(item => item.id === join.id);
     if (index < 0) graph.joins.push(structuredClone(join));
   }
+  if (level === 3) {
+    const identities = new Set(result.fills.filter(fill => fill.source === 'identity').map(fill => fill.node));
+    const relations = new RefinementRelations(graph);
+    graph.horizon = graph.nodes.filter(node => node.kind === 'work' && !identities.has(node.id)
+      && frame.scope.nodes.some(id => relations.refines(node.id, id))).map(node => node.id).sort(order);
+    graph.researchObligations = copy(works!.bindings);
+    result = workCodeFills(frame, result, graph);
+  }
   const obligations = new Map(result.obligations.map(obligation => [obligation.id, obligation]));
   for (const connector of graph.connectors) {
-    const upper = connector.bindings.filter(binding => binding.level === 1);
+    const upper = connector.bindings.filter(binding => binding.level === level - 1);
     if (!upper.length) continue;
     const endpoints = (binding: Binding, role: 'producer' | 'consumer', endpoint: Endpoint): Endpoint[] => unique(result.fills.filter(fill => {
       const obligation = obligations.get(fill.obligation)!;
       return obligation.connector === connector.id && obligation.flow === flowKey(binding) && obligation.role === role
         && obligation.upper.node === endpoint.node && obligation.upper.port === endpoint.port;
-    }).map(fill => ({ node: fill.node, port: fill.port! })));
+    }).map(fill => ({ node: fill.node, port: fill.port!, ...(level === 3 && fill.codeRef ? { codeRef: fill.codeRef } : {}) })));
     const lower = upper.map(binding => {
       const producers = endpoints(binding, 'producer', binding.producer);
       if (producers.length !== 1) reject('slot_fill_conflict', connector.id, 'producer', 'Each upper flow has exactly one lower producer');
-      return { level: 2 as const, producer: producers[0]!,
+      return { level, producer: producers[0]!,
         consumers: unique(binding.consumers.flatMap(endpoint => endpoints(binding, 'consumer', endpoint))), anchor: binding.anchor };
     });
     if (new Set(lower.map(flowKey)).size !== lower.length)
       reject('slot_fill_conflict', connector.id, 'flow', 'Distinct upper flows cannot share one lower producer/port/anchor flow');
-    const previous = connector.bindings.filter(binding => binding.level === 2);
-    if (!same(bindingSet(previous), bindingSet(lower)))
-      connector.bindings = [...connector.bindings.filter(binding => binding.level !== 2), ...lower];
+    const deliveries = level === 3 ? lower.flatMap((binding, index) => workDeliveries(graph, connector, binding, flowKey(upper[index]!))) : lower;
+    const previous = connector.bindings.filter(binding => binding.level === level);
+    if (!same(bindingSet(previous), bindingSet(deliveries)))
+      connector.bindings = [...connector.bindings.filter(binding => binding.level !== level), ...deliveries];
   }
-  requireUnchangedWorks(frame.accepted?.graph ?? frame.upper, graph);
+  if (level === 2) requireUnchangedWorks(frame.accepted?.graph ?? frame.upper, graph);
+  else {
+    // Local work connections have no upper flow, but obey the same code/sleeping contract.
+    for (const connector of graph.connectors.filter(item => !item.bindings.some(binding => binding.level === 2)))
+      connector.bindings = connector.bindings.flatMap(binding => binding.level === 3
+        ? workDeliveries(graph, connector, binding, flowKey(binding)) : [binding]);
+    checkWorkEndpoints(graph, result);
+    if (!same(projectGraph(graph, 2), projectGraph(frame.upper, 2)))
+      reject('works_upper_drift', graph.id, 'upper', 'A works candidate cannot change the accepted operation projection');
+    // Use the native typed assembly for the work-owned test and join relations.
+    try {
+      const native = assembleL3(frame.upper, layerDesignOf(graph, 3, L3_ASSEMBLY) as Record<string, unknown>);
+      Object.assign(graph, native);
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      reject(error.code, graph.id, 'layer', error.message, error.code === 'graph_invalid' ? error.details as Finding[] : undefined);
+    }
+  }
   const actuallyRemoved = new Set([...removed].filter(id => !graph.nodes.some(node => node.id === id)));
   const dangling = danglingReferences(graph, actuallyRemoved);
   if (dangling.length) reject('replacement_leaves_dangling', dangling[0]!.target, 'references',
     'Definitions still reference removed nodes', dangling);
-  for (const node of graph.nodes.filter(node => node.kind === 'operation')) for (const port of node.ports.filter(port => port.direction === 'in')) {
-    if (!graph.connectors.some(connector => connector.bindings.some(binding => binding.level === 2
+  for (const node of graph.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work') && (level === 2 || graph.horizon.includes(node.id)))) for (const port of node.ports.filter(port => port.direction === 'in')) {
+    if (!graph.connectors.some(connector => connector.bindings.some(binding => binding.level === level
       && binding.consumers.some(endpoint => endpoint.node === node.id && endpoint.port === port.id))))
       reject('operation_port_unbound', node.id, port.id, 'Every operation input needs a connector binding');
   }
-  checkedGraph(graph, frame.upper);
+  checkedGraph(graph, frame.upper, level);
   // Reuse C2's structural correspondence check on the FINAL graph, after redefines have been applied.
   // These local references identify computed values only: they are neither persisted nor evidence of acceptance.
-  const mapping: ConnectionFrame = { project: frame.request.project, level: 2, candidateHash: hashJson(graph),
-    layerHash: hashJson(projectGraph(graph, 2)),
-    fills: result.fills.map(fill => ({ ...fill, source: fill.source === 'proposed' ? 'accepted' : fill.source })) };
+  const mapping: ConnectionFrame = { project: frame.request.project, level, ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}), candidateHash: hashJson(graph),
+    layerHash: hashJson(projectGraph(graph, level)),
+    fills: level === 3 ? sorted(result.fills.map(fill => ({ ...fill, source: fill.source === 'proposed' ? 'accepted' as const : fill.source })))
+      : result.fills.map(fill => ({ ...fill, source: fill.source === 'proposed' ? 'accepted' : fill.source })) };
   take(fillObligations(frame.upper, frame.scope, {
     graph, reference: { ...frame.request.graph, hash: hashJson(graph) },
-    frame: { reference: { id: `om-frame:${frame.request.project}:2`, revision: 1, hash: hashJson(mapping) }, value: mapping },
-  }, frame.upperRef, 2));
-  return { state: 'candidate', candidate: { project: frame.request.project, level: 2, graphHash: hashJson(graph),
-    layerHash: hashJson(projectGraph(graph, 2)), upperHash: hashJson(projectGraph(graph, 1)), graph,
+    frame: { reference: { id: `om-frame:${frame.request.project}:${level}`, revision: 1, hash: hashJson(mapping) }, value: mapping },
+  }, frame.upperRef, level));
+  return { state: 'candidate', candidate: { project: frame.request.project, level, ...(level === 3 ? { works: normalizedWorks(works!) } : {}), graphHash: hashJson(graph),
+    layerHash: hashJson(projectGraph(graph, level)), upperHash: hashJson(projectGraph(graph, (level - 1) as 1 | 2)), graph,
     fills: result.fills, base: { graph: frame.request.graph, frame: frame.request.frame },
     proposals: sorted(result.proposals.map(proposal => proposal.reference)) } };
 }
 /** Pure F4.5: open obligations remain M5 gaps; this function never invents a completion or writes a frame. */
-export function assembleCandidate(frame: FrameRead, proposals: ProposalObservation[]): CandidateResult<CandidateAssembly> {
+export function assembleCandidate(frame: FrameRead, proposals: ProposalObservation[], works?: WorksCandidateInput): CandidateResult<CandidateAssembly> {
   return outcome(() => {
-    requireLevel(frame);
+    requireLevel(frame, works);
     if (!Array.isArray(proposals)) invalid('proposals');
     const result = take(applyProposals(frame, proposals)) as ProposalResult;
-    return assemble(copy(frame), result);
+    if (frame.request.level === 3 && proposals.some(item => item.value.worksContract !== WORKS_FRAME_CONTRACT))
+      reject('works_contract_invalid', 'candidate:3', 'proposals', 'New works assembly needs proposals of its declared era');
+    return assemble(copy(frame), result, works && normalizedWorks(works));
   });
 }
 function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project: string): void {
@@ -362,10 +504,13 @@ function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project
       reject('candidate_graph_mismatch', row.id, 'request', 'The saved candidate source request is incomplete');
     throw error;
   }
-  if (value.request.frame.project !== project || value.request.frame.level !== 2 || !same(value.request, normalizeRequest(value.request)))
+  if (value.request.frame.project !== project || ![2, 3].includes(value.request.frame.level) || !same(value.request, normalizeRequest(value.request)))
     reject('candidate_graph_mismatch', row.id, 'request', 'A candidate must have canonical sources for its own project and supported level');
+  requireLevel({ request: value.request.frame }, value.request.works);
   const sources = take(readFrameProposals(store, value.request));
-  const expected = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[]));
+  if (value.level === 3) checkedWorksBasis(store, value.request, false);
+  const expected = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], value.request.works));
+  if (expected.state === 'candidate' && value.level === 3) checkWorkObligations(store, value.request, expected.candidate as FrameCandidate);
   if (expected.state !== 'candidate' || !same(value, { ...expected.candidate, request: value.request }) || row.id !== idOf(expected.candidate as FrameCandidate))
     reject('candidate_graph_mismatch', row.id, 'graph', 'The complete candidate must be rederived from its saved sources');
 }
@@ -390,7 +535,7 @@ export function observeCandidate(store: Store, request: CandidateReadRequest): C
     const record = take(readRecord<FrameCandidateRecord>(store, request.candidate, { unit: 'G3', target: request.candidate.id,
       idPrefix: `om-candidate:${request.project}:`, kind: 'frame-candidate' })) as Revision<FrameCandidateRecord>;
     const value = record.value;
-    if (!object(value) || value.project !== request.project || value.level !== 2 || record.revision !== 1
+    if (!object(value) || value.project !== request.project || ![2, 3].includes(value.level) || record.revision !== 1
       || !object(value.graph) || !object(value.base) || !isRef(value.base.graph)
       || value.base.frame !== null && !isRef(value.base.frame) || !Array.isArray(value.proposals) || !value.proposals.every(isRef)
       || !Array.isArray(value.fills) || ![value.graphHash, value.layerHash, value.upperHash].every(item => typeof item === 'string' && /^[a-f0-9]{64}$/.test(item)))
@@ -403,14 +548,17 @@ export function observeCandidate(store: Store, request: CandidateReadRequest): C
     }
     if (value.request.frame.project !== request.project || value.request.frame.level !== value.level
       || !same(value.base, { graph: value.request.frame.graph, frame: value.request.frame.frame })
-      || !same(sorted(value.proposals), sorted(value.request.proposals)))
+      || !same(sorted(value.proposals), sorted(value.request.proposals))
+      || value.level === 3 && !same(value.works ?? null, value.request.works ?? null))
       reject('candidate_graph_mismatch', record.id, 'request', 'The candidate must name precisely the same base, level and proposal set as its source request');
     if (value.graphHash !== hashJson(value.graph) || record.id !== idOf(value))
       reject('candidate_graph_mismatch', record.id, 'graphHash', 'The observed candidate must retain its own graph hash and content address');
+    requireLevel({ request: value.request.frame }, value.request.works);
+    const basis = value.level === 3 ? checkedWorksBasis(store, value.request, false) : null;
     const frame = take(readFrame(store, value.request.frame));
     if (value.graph.id !== frame.upper.id)
       reject('candidate_graph_mismatch', record.id, 'graph.id', 'The observed graph belongs to another product');
-    const references: Ref[] = [reference(record), ...frame.references];
+    const references: Ref[] = [reference(record), ...frame.references, ...(basis?.inputs ?? [])];
     // C3 observes the whole named set in one historical base read, including every participant's linkage.
     if (value.request.proposals.length) references.push(...take(observeProposal(store, {
       project: request.project, proposal: value.request.proposals[0]!, request: value.request,
@@ -421,12 +569,16 @@ export function observeCandidate(store: Store, request: CandidateReadRequest): C
 }
 /** Current preparation inherits C3's complete admission guards, including when an immutable candidate already exists. */
 export function prepareCandidate(store: Store, request: CandidateRequest): CandidateResult<PreparedCandidate> {
-  requireStore(store); requireRequest(request); request = normalizeRequest(request);
+  requireStore(store); requireRequest(request);
   return outcome(() => {
-    requireLevel({ request: request.frame });
+    request = normalizeRequest(request);
+    requireLevel({ request: request.frame }, request.works);
     const sources = take(prepareFrameProposals(store, request));
-    const built = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[]));
-    const common = { guards: [...sources.guards] as Ref[], expected: sources.expected as PreparedFrame['expected'] };
+    if (request.frame.level === 3) request = normalizeRequest({ ...request, frame: sources.frame.request as CandidateRequest['frame'] });
+    const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
+    const built = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works));
+    if (built.state === 'candidate' && request.frame.level === 3) checkWorkObligations(store, request, built.candidate as FrameCandidate);
+    const common = { guards: unique([...sources.guards, ...(basis?.guards ?? [])]) as Ref[], expected: sources.expected as PreparedFrame['expected'] };
     if (built.state === 'gaps') return { ...common, state: 'gaps', gaps: built.gaps as FrameGap[], writes: [], existing: null };
     const candidate: FrameCandidateRecord = { ...built.candidate as FrameCandidate, request }, id = idOf(candidate);
     const existing = store.get<FrameCandidateRecord>(id);
@@ -457,6 +609,7 @@ export function gateCandidate(store: Store, request: CandidateGateRequest): Cand
   return outcome(() => {
     if (Object.hasOwn(request, 'graph')) reject('candidate_graph_mismatch', request.candidate.id, 'graph', 'G3 accepts the graph in the candidate record only');
     const row = take(readCandidate(store, request));
+    if (row.value.level !== 2) reject('candidate_level_unsupported', row.id, 'gate', 'A works candidate requires G5; G3 cannot authorize its acceptance');
     return { passed: true, candidate: reference(row), graphHash: row.value.graphHash, findings: [] };
   });
 }

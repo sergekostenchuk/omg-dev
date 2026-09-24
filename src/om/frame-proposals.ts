@@ -1,7 +1,7 @@
 import { Ajv } from "ajv";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { LEVEL, type Graph, type Node } from "../graph/model.js";
+import { LEVEL, type CodeRef, type Graph, type Node } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -9,7 +9,7 @@ import { Store, type Revision } from "../storage/store.js";
 import { readRecord } from "./refs.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import {
-  fillObligations, prepareFrame, readFrame, representativeId,
+  fillObligations, prepareFrame, readFrame, representativeId, WORKS_FRAME_CONTRACT,
   type FilledFrame, type FrameFill, type FrameLevel, type FrameObligation,
   type FrameRead, type FrameRequest, type PreparedFrame,
 } from "./frame-obligations.js";
@@ -18,7 +18,7 @@ export const PROPOSAL_REFUSAL_CODES = Object.freeze([
   "proposal_request_invalid", "proposal_invalid", "proposal_not_proposed", "proposal_base_stale",
   "slot_fill_foreign", "slot_fill_conflict", "proposal_node_reserved", "input_stale",
 ] as const);
-export interface ProposalFill { obligation: string; node: string; port?: string }
+export interface ProposalFill { obligation: string; node: string; port?: string; codeRef?: CodeRef }
 export interface ProposalReplacement {
   obligation: string; base: { node: string; graph: Ref };
   with: { node: string; port: string | null }; basis: string;
@@ -26,6 +26,7 @@ export interface ProposalReplacement {
 export interface LayerProposal {
   base: { graph: Ref; frame: Ref | null }; level: FrameLevel; source: "input" | "decision";
   status: "proposed" | "accepted" | "rejected";
+  worksContract?: typeof WORKS_FRAME_CONTRACT;
   verdict?: { candidateHash: string; candidate: Ref; codes: string[] };
   nodes: Node[]; fills: ProposalFill[]; localConnectors: Graph['connectors'];
   artifacts: Graph['artifacts']; contracts: Graph['contracts']; joins: Graph['joins']; tests: Graph['tests'];
@@ -60,6 +61,7 @@ const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const parts = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const;
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
+const codeShape = schemas.compile(sealed(graphV2Schema.properties['nodes'].items.properties.code.items));
 const partShapes = new Map(parts.map(part => [part, schemas.compile(sealed(graphV2Schema.properties[part === 'localConnectors' ? 'connectors' : part].items))]));
 const graphParts = ['nodes', 'connectors', 'artifacts', 'contracts', 'anchors', 'joins', 'tests'] as const;
 const graphV2Parts = ['actors', 'requirements', 'edges', 'journeys', 'transfers', 'packets'] as const;
@@ -115,8 +117,14 @@ function requireObservations(value: unknown): asserts value is ProposalObservati
   if (!Array.isArray(value)) invalid('proposals');
   for (const observation of value) if (!object(observation) || !isRef(observation['reference']) || !Object.hasOwn(observation, 'value')) invalid('proposals.reference');
 }
+function checkWorksContract(proposal: unknown, target: string): void {
+  if (object(proposal) && Object.hasOwn(proposal, 'worksContract')
+    && (proposal['level'] !== 3 || proposal['worksContract'] !== WORKS_FRAME_CONTRACT))
+    reject('proposal_invalid', target, 'worksContract', 'The work proposal contract must be known and apply to L3');
+}
 function checkProposal(observation: ProposalObservation, frame: FrameRead): void {
   const { reference: ref, value: proposal } = observation;
+  checkWorksContract(proposal, ref.id);
   if (!ref.id.startsWith(`om-proposal:${frame.request.project}:`) || hashJson(proposal) !== ref.hash)
     reject('proposal_invalid', ref.id, 'reference', 'The proposal must belong to this project and match its exact content');
   if (!object(proposal)) reject('proposal_invalid', ref.id, 'value', 'A layer proposal is an explicit record');
@@ -134,7 +142,9 @@ function checkProposal(observation: ProposalObservation, frame: FrameRead): void
     if (new Set(ids).size !== ids.length) reject('proposal_invalid', ref.id, part, 'Introduced definitions have distinct IDs');
   }
   const fillShape = (row: unknown) => object(row) && text(row['obligation']) && text(row['node'])
-    && (row['port'] === undefined || text(row['port'])) && Object.keys(row).every(key => ['obligation', 'node', 'port'].includes(key));
+    && (row['port'] === undefined || text(row['port']))
+    && (!Object.hasOwn(row, 'codeRef') || proposal.worksContract === WORKS_FRAME_CONTRACT && codeShape(row['codeRef']))
+    && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.worksContract === WORKS_FRAME_CONTRACT ? ['codeRef'] : [])].includes(key));
   if (!Array.isArray(proposal.fills) || !proposal.fills.every(fillShape)) reject('proposal_invalid', ref.id, 'fills', 'Fills must be explicit complete endpoints');
   for (const field of ['removes', 'redefines'] as const)
     if (!Array.isArray(proposal[field]) || !proposal[field].every(text) || new Set(proposal[field]).size !== proposal[field].length)
@@ -203,6 +213,10 @@ function derive(frame: FrameRead, observations: ProposalObservation[], base: Fil
       if ((!own && !frame.accepted?.graph.nodes.some(item => item.id === row.node))
         || !obligation || !fits(node, row, obligation, frame, relations) || (removed.has(row.node) && !own))
         reject('slot_fill_foreign', row.obligation, 'fill', 'The endpoint must be accepted or defined in this proposal and refine the named upper end');
+      if (proposal.worksContract === WORKS_FRAME_CONTRACT && (obligation.kind === 'connection-end'
+        ? !Object.hasOwn(row, 'codeRef') || !node!.code.some(code => same(code, row.codeRef))
+        : Object.hasOwn(row, 'codeRef')))
+        reject('slot_fill_foreign', row.obligation, 'codeRef', 'A real connection end needs one exact declared code reference; outcome fills carry none');
       const values = additions.get(row.obligation) ?? [];
       if (values.some(item => endpointKey(item) === endpointKey(row)) || (obligation.role !== 'consumer' && values.length > 0))
         reject('slot_fill_conflict', row.obligation, 'fill', 'Different proposals cannot compete for a single endpoint or single-valued obligation');
@@ -251,8 +265,11 @@ function derive(frame: FrameRead, observations: ProposalObservation[], base: Fil
  * whose C2 reader verifies the saved transition; caller-supplied markers never establish that provenance. */
 export function applyProposals(frame: FrameRead, proposals: ProposalObservation[]): OmResult<Sealed<ProposalResult>> {
   requireFrame(frame); requireObservations(proposals);
-  frame = copy(frame); proposals = copy(proposals);
-  return outcome(() => derive(frame, proposals));
+  return outcome(() => {
+    for (const proposal of proposals) checkWorksContract(proposal.value, proposal.reference.id);
+    frame = copy(frame); proposals = copy(proposals);
+    return derive(frame, proposals);
+  });
 }
 function gapsOf(frame: FrameRead, result: ProposalResult): FrameGap[] {
   const base = frame.accepted?.graph ?? frame.upper;
@@ -283,8 +300,9 @@ export function openObligationsToGaps(frame: FrameRead, result: ProposalResult):
   if (!object(result)) invalid('result');
   requireObservations(result.proposals);
   for (const field of ['obligations', 'fills', 'open', 'representatives', 'joins'] as const) if (!Array.isArray(result[field])) invalid(`result.${field}`);
-  frame = copy(frame); result = copy(result);
   return outcome(() => {
+    for (const proposal of result.proposals) checkWorksContract(proposal.value, proposal.reference.id);
+    frame = copy(frame); result = copy(result);
     const derived = derive(frame, result.proposals);
     if (!same(derived, result)) reject('proposal_invalid', frame.request.graph.id, 'result', 'Gap sources must equal the complete result derived from the checked proposals');
     return gapsOf(frame, derived);
@@ -337,6 +355,7 @@ export function observeProposal(store: Store, request: ObserveProposalRequest): 
       const record = take(readRecord<LayerProposal>(store, ref, { unit: 'F4.3', target: ref.id,
         idPrefix: `om-proposal:${request.project}:`, kind: 'layer-proposal' })) as Revision<LayerProposal>;
       const proposal = record.value;
+      checkWorksContract(proposal, ref.id);
       if (!object(proposal) || !object(proposal.base) || !isRef(proposal.base.graph)
         || proposal.base.frame !== null && !isRef(proposal.base.frame) || ![2, 3].includes(proposal.level)
         || !['input', 'decision'].includes(proposal.source) || !['proposed', 'accepted', 'rejected'].includes(proposal.status))
