@@ -8,20 +8,74 @@ import { Evidence, type Observation, type Source } from '../evidence/evidence.js
 import { isRef, reference, uniqueRefs, type Ref } from '../pipeline/contracts.js';
 import type { Store, Revision } from '../storage/store.js';
 import { researchScope } from '../graph/research-scope.js';
-import { obligationAssignment, type RuntimeCheck } from '../graph/obligation-policy.js';
-import { Environments, workspacePath, executablePath } from './environment.js';
+import { obligationAssignment, type RuntimeCheck, type CarriedObligation } from '../graph/obligation-policy.js';
+import { Environments, workspacePath, executablePath, uniqueTransactionGuards } from './environment.js';
 import { readerPilot } from '../discovery/reader-pilot.js';
 import { processStart } from './process-identity.js';
 import { runProcess, type ProcessResult } from './process.js';
 import type { ModelCall } from './model-usage.js';
 import { runtimeSource, type RuntimeObservation } from './runtime-observation-model.js';
+import { readOmObligationLedger } from '../om/obligations.js';
+import { taskBindingId } from '../graph/task-obligations.js';
 
 export interface RuntimeObservationRequest { scope: Ref; obligation: string; key: string }
 export interface RuntimeObservationResult { observation: Revision<RuntimeObservation>; source: Revision<Source> | null }
 
+/** The OM declaration is the complete proved D7 handoff, not a model's check
+ * field. Historical consumers retain that exact authority after its heads move.
+ * New observation admission guards the producer and its mandatory ledger. */
+function omRuntimeDeclaration(store: Store, project: string, scope: Ref, current = false) {
+  requireCondition(isRef(scope) && scope.id.startsWith(`om-obligations:${project}:`),
+    'runtime_check_not_declared', 'An OM runtime check needs the exact obligation ledger of this project');
+  const found = readOmObligationLedger(store, { project, ledger: scope });
+  if (!found.ok) throw new EngineError('runtime_check_not_declared',
+    'The OM runtime declaration must be derived from its exact owner authority and complete sources', found.refusal);
+  const guards = [reference(found.value.producer), reference(found.value.record)];
+  if (current) for (const ref of guards) {
+    const head = store.get(ref.id);
+    requireCondition(head && canonical(reference(head)) === canonical(ref), 'runtime_observation_scope_stale',
+      `Observe the exact current OM declaration: ${ref.id}`);
+  }
+  return { obligations: found.value.handoff.obligations, guards: current ? guards : [] };
+}
+
+/** Address selection does not prove authority; omRuntimeAssignment checks the
+ * complete declaration before accepting this address for an observation. */
+export function runtimeObligationId(obligation: CarriedObligation): string {
+  requireCondition(obligation && isRef(obligation.scope) && typeof obligation.obligation === 'string'
+    && obligation.obligation.length > 0, 'runtime_check_not_declared', 'An observation needs an exact carried assignment');
+  if (obligation.scope.id.startsWith('om-obligations:')) requireCondition(obligation.original && isRef(obligation.original.record)
+    && typeof obligation.original.pointer === 'string' && obligation.original.pointer.length > 0
+    && typeof obligation.responsibleNode === 'string' && obligation.responsibleNode.length > 0
+    && typeof obligation.responsibleConsumer === 'string' && obligation.responsibleConsumer.length > 0,
+  'runtime_check_not_declared', 'An OM observation needs both responsible addresses of its original assignment');
+  return obligation.scope.id.startsWith('om-obligations:') ? taskBindingId(obligation) : obligation.obligation;
+}
+
+export function omRuntimeAssignment(store: Store, project: string, scope: Ref, id: string, current = false) {
+  const declaration = omRuntimeDeclaration(store, project, scope, current);
+  const matches = declaration.obligations.filter(item => runtimeObligationId(item as CarriedObligation) === id);
+  if (matches.length !== 1) throw new EngineError('runtime_check_not_declared',
+    'An OM runtime check must address exactly one declared assignment', { scope, obligation: id });
+  return { assignment: matches[0]!, guards: declaration.guards };
+}
+
+function observationDeclaration(store: Store, project: string, request: RuntimeObservationRequest) {
+  if (request.scope.id.startsWith('om-obligations:')) {
+    const found = omRuntimeAssignment(store, project, request.scope, request.obligation, true);
+    return { scope: { ...found.assignment.scope }, assignment: found.assignment, guards: found.guards };
+  }
+  const scope = researchScope(store, project);
+  requireCondition(scope && canonical(reference(scope)) === canonical(request.scope),
+    'runtime_observation_scope_stale', 'Observe the exact current scope');
+  return { scope: reference(scope), assignment: obligationAssignment(scope.value, request.obligation), guards: [reference(scope)] };
+}
+
 export function runtimeContext(store: Store, project: string) {
-  const effective = new Environments(store).effective(project), pilot = readerPilot(store,project);
-  const configured = store.get(`reader-pilot:${project}`);
+  const effective = new Environments(store).effective(project), configured = store.get(`reader-pilot:${project}`);
+  const pilot = readerPilot(store,project), checked = store.get(`reader-pilot:${project}`);
+  requireCondition(canonical(checked ? reference(checked) : null) === canonical(configured ? reference(configured) : null),
+    'runtime_observation_stale', 'The reader configuration changed while its runtime binding was checked');
   const binding = { environment:effective.environment.value,root:effective.root,
     identity:{uid:process.getuid?.()??null,gid:process.getgid?.()??null,euid:process.geteuid?.()??null,egid:process.getegid?.()??null,groups:process.getgroups?.().sort((a,b)=>a-b)??[]},
     // PATH is checked through resolved declared executables: an irrelevant
@@ -30,7 +84,8 @@ export function runtimeContext(store: Store, project: string) {
     pilot:pilot ? {reader:pilot.value.reader,agentCommand:pilot.value.agentCommand,callTimeoutMs:pilot.value.callTimeoutMs??null} : null,
     platform:{os:platform(),release:release(),arch:arch(),node:process.version} };
   return { ...effective,binding:binding as unknown as Json,
-    guards:uniqueRefs([reference(effective.environment),...effective.guards,...(configured?[reference(configured)]:[])]) };
+    guards:uniqueRefs([reference(effective.environment),...effective.guards,...(configured?[reference(configured)]:[])]),
+    admissionGuards:uniqueTransactionGuards([...effective.admissionGuards,...(configured?[]:[{id:`reader-pilot:${project}`,absent:true as const}])]) };
 }
 
 export function runtimeCode(store: Store, project: string, check: RuntimeCheck, root: string | null): Observation[] {
@@ -87,7 +142,7 @@ function recordedResult(store: Store, observation: Revision<RuntimeObservation>)
 /** Only an explicit operator command executes the source declared in owner
  * policy. ResearchAction remains read-only and cannot invent an executable. */
 export async function observeRuntime(store: Store, project: string, request: RuntimeObservationRequest, signal?: AbortSignal): Promise<RuntimeObservationResult> {
-  requireCondition(request && isRef(request.scope) && request.scope.id===`research-scope:${project}:R2`
+  requireCondition(request && isRef(request.scope) && (request.scope.id===`research-scope:${project}:R2` || request.scope.id.startsWith('om-obligations:'))
     && typeof request.obligation==='string' && request.obligation.trim() && typeof request.key==='string' && request.key.trim(),
   'runtime_observation_invalid','An observation needs its exact scope, obligation and stable operation key');
   const id=`runtime-observation:${hashJson([project,request.key])}`,old=store.get<RuntimeObservation>(id);
@@ -97,12 +152,10 @@ export async function observeRuntime(store: Store, project: string, request: Run
     'runtime_observation_conflict','The operation key already belongs to another observation');
     return recordedResult(store,old);
   }
-  const scope=researchScope(store,project);
-  requireCondition(scope && canonical(reference(scope))===canonical(request.scope),'runtime_observation_scope_stale','Observe the exact current scope');
-  const assignment=obligationAssignment(scope.value,request.obligation);
+  const declaration=observationDeclaration(store,project,request),scope=declaration.scope,assignment=declaration.assignment;
   requireCondition(assignment?.kind==='environment-confirmation' && assignment.runtimeCheck,
     'runtime_check_not_declared','The owner policy must declare the check; the model cannot select a program');
-  const check=assignment.runtimeCheck,current=runtimeContext(store,project),codeRoot=checkCodeRoot(store,project,check,current),code=runtimeCode(store,project,check,codeRoot);
+  const check=structuredClone(assignment.runtimeCheck) as RuntimeCheck,current=runtimeContext(store,project),codeRoot=checkCodeRoot(store,project,check,current),code=runtimeCode(store,project,check,codeRoot);
   const executablePath=realpathSync(process.execPath),identity=runtimeExecutableIdentity(executablePath);
   const executable={path:executablePath,hash:await executableHash(executablePath),identity};
   requireCondition(canonical(identity)===canonical(runtimeExecutableIdentity(executablePath)),
@@ -124,14 +177,15 @@ export async function observeRuntime(store: Store, project: string, request: Run
   requireCondition(!store.list<ModelCall>('model-call').some(c=>c.value.projectId===project&&c.value.status==='running')
     && !store.list<RuntimeObservation>('runtime-observation').some(c=>c.value.projectId===project&&c.value.status==='running'),
   'runtime_observation_busy','Finish or recover the active project invocation before observing the runtime');
-  const guards=uniqueRefs([reference(scope),...current.guards,...code.map(o=>o.source)]);
+  const guards=uniqueRefs([...declaration.guards,...current.guards,...code.map(o=>o.source)]);
   let record:Revision<RuntimeObservation>;
   try {
     record=store.writeMany<RuntimeObservation>([{id,kind:'runtime-observation',expected:0,value:{version:1,projectId:project,key:request.key,
-      scope:reference(scope),requestedFor:request.obligation,check,environment:reference(current.environment),context:guards,root:current.root,codeRoot,
+      scope,requestedFor:request.obligation,check,environment:reference(current.environment),context:guards,root:current.root,codeRoot,
       runtimeBinding:current.binding,platform:{os:platform(),release:release(),arch:arch(),node:process.version},executable,subjects,
       snapshot:null,invocation:null,owner:{pid:owner.pid,started:owner.started},child:null,startedAt:Date.now(),finishedAt:null,status:'running',result:null,error:null} satisfies RuntimeObservation},
-      {id:counterId,kind:'project-dispatch',expected:counter?.revision??0,value:{projectId:project,serial:(counter?.value.serial??0)+1}}],guards)[0]!;
+      {id:counterId,kind:'project-dispatch',expected:counter?.revision??0,value:{projectId:project,serial:(counter?.value.serial??0)+1}}],
+    uniqueTransactionGuards([...guards,...current.admissionGuards]))[0]!;
   } catch(error) {
     if(error instanceof EngineError&&['revision_conflict','input_stale'].includes(error.code)){
       const concurrent=store.get<RuntimeObservation>(id);
@@ -153,7 +207,7 @@ export async function observeRuntime(store: Store, project: string, request: Run
     const invocation={executable:executable.path,args:[join(snapshot,codeRoot===null?'check.mjs':relative(codeRoot,script.value.origin.location)),...check.args]};
     record=store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,snapshot,invocation}});
     result=await runProcess(invocation,current.root,
-      canonical({protocol:'omg-runtime-observation/v1',scope:reference(scope),obligation:assignment.original,runtime:current.binding}),check.timeoutMs,signal,true,pid=>{
+      canonical({protocol:'omg-runtime-observation/v1',scope,obligation:assignment.original,runtime:current.binding}),check.timeoutMs,signal,true,pid=>{
         const started=processStart(pid);
         if(!started){
           try{process.kill(pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')return;throw error;}
@@ -173,7 +227,8 @@ export async function observeRuntime(store: Store, project: string, request: Run
     const completed={id:record.id,kind:record.kind,revision:record.revision+1,hash:hashJson(value),value};
     const source=runtimeSource(completed);
     const saved=store.writeMany<RuntimeObservation|Source>([{id:record.id,kind:record.kind,expected:record.revision,value},
-      {id:source.id,kind:'source',expected:0,value:source.value}],uniqueRefs([reference(record),reference(scope),...after.guards,...code.map(o=>o.source)]));
+      {id:source.id,kind:'source',expected:0,value:source.value}],
+    uniqueTransactionGuards([reference(record),...declaration.guards,...after.guards,...current.admissionGuards,...after.admissionGuards,...code.map(o=>o.source)]));
     return {observation:saved[0]! as Revision<RuntimeObservation>,source:saved[1]! as Revision<Source>};
   } catch(error) {
     const code=error instanceof EngineError?error.code:'runtime_observation_failed';

@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { digest } from "../canonical.js";
 import type { Command, Graph } from "../graph/model.js";
@@ -16,6 +16,41 @@ export interface Environment {
 }
 export function isRequestCapacityChars(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+export function uniqueTransactionGuards(values: readonly TransactionGuard[]): TransactionGuard[] {
+  requireCondition(Array.isArray(values), "invalid_guard", "Transaction guards must be an array");
+  const checked = Array.from(values, (guard: unknown, index): TransactionGuard => {
+    requireCondition(guard !== null && typeof guard === "object" && !Array.isArray(guard),
+      "invalid_guard", `Guard ${index} must be a record`);
+    const fields = guard as Record<string, unknown>;
+    const id = fields['id'];
+    requireCondition(typeof id === "string" && id.length > 0, "invalid_guard", `Guard ${index} needs a nonempty ID`);
+    if ('absent' in fields) {
+      requireCondition(fields['absent'] === true && !('revision' in fields) && !('hash' in fields),
+        "invalid_guard", `Guard ${index} for ${id} must declare only absence`);
+      return { id, absent: true };
+    }
+    const revision = fields['revision'], hash = fields['hash'];
+    requireCondition(typeof revision === "number" && Number.isSafeInteger(revision) && revision > 0
+      && typeof hash === "string" && /^[a-f0-9]{64}$/i.test(hash),
+    "invalid_guard", `Guard ${index} for ${id} needs an exact revision and SHA-256 hash`);
+    return { id, revision, hash };
+  });
+  const key = (guard: TransactionGuard) => JSON.stringify('absent' in guard
+    ? [guard.id, 'absent'] : [guard.id, 'ref', guard.revision, guard.hash]);
+  // Preserve uniqueRefs ordering for positive guards while retaining both variants of an address.
+  const order = (guard: TransactionGuard) => 'absent' in guard ? `${guard.id}:absent` : `${guard.id}:${guard.revision}:${guard.hash}`;
+  return [...new Map(checked.map(guard => [key(guard), guard])).entries()]
+    .sort(([leftKey, left], [rightKey, right]) => order(left).localeCompare(order(right)) || leftKey.localeCompare(rightKey))
+    .map(([, guard]) => guard);
+}
+export function transactionGuardsCurrent(store: Store, guards: readonly TransactionGuard[]): boolean {
+  requireCondition(store !== null && typeof store === "object" && typeof store.get === "function",
+    "invalid_guard", "Current guard validation needs a readable Store");
+  return uniqueTransactionGuards(guards).every(guard => {
+    const current = store.get(guard.id);
+    return 'absent' in guard ? current === null : current !== null && current.revision === guard.revision && current.hash === guard.hash;
+  });
 }
 export interface RepositoryState { root: string; head: string; tree: string; files: { path: string; hash: string | null }[] }
 export interface ExecutionRoot { projectId: string; sourceRoot: string; workspace: Ref; path: string; branch: string; base: string; head: string; state: "creating" | "ready" }
@@ -112,9 +147,9 @@ export class Environments {
     const environment = this.store.get<Environment>(`environment:${projectId}`);
     requireCondition(environment && environment.kind === "environment", "environment_missing", "Choose a workspace and executor roles first"); return environment;
   }
-  effective(projectId: string): { environment: Revision<Environment>; root: string; guards: Ref[] } {
+  effective(projectId: string): { environment: Revision<Environment>; root: string; guards: Ref[]; admissionGuards: TransactionGuard[] } {
     const environment = this.get(projectId); const execution = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
-    if (!execution) return { environment, root: environment.value.workspace, guards: [] };
+    if (!execution) return { environment, root: environment.value.workspace, guards: [], admissionGuards: [{ id: `execution-root:${projectId}`, absent: true }] };
     const workspace = this.store.get(`workspace:${projectId}`);
     requireCondition(execution.kind === "execution-root" && execution.value.projectId === projectId && execution.value.state === "ready"
       && workspace && execution.value.workspace.hash === workspace.hash && execution.value.sourceRoot === environment.value.workspace,
@@ -125,6 +160,6 @@ export class Environments {
     "execution_root_recovery", "The managed worktree head differs from its accepted state");
     const common = (path: string) => realpathSync(resolve(path, git(path, ["rev-parse", "--git-common-dir"])));
     requireCondition(common(current.path) === common(current.sourceRoot), "execution_root_foreign", "Worktree belongs to another repository");
-    return { environment, root: current.path, guards: [reference(execution)] };
+    return { environment, root: current.path, guards: [reference(execution)], admissionGuards: [] };
   }
 }

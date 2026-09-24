@@ -1,5 +1,5 @@
-import { Store, type Revision, type Write } from "../storage/store.js";
-import { git, type Environment, type ExecutionRoot } from "../runtime/environment.js";
+import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { git, transactionGuardsCurrent, type Environment, type ExecutionRoot } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
 import { prepareWriterIndex } from "../ownership/writer-index.js";
 import { digest, hashJson } from "../canonical.js";
@@ -27,7 +27,7 @@ export function requireGates(run: TaskRun, task: CompiledTask, environment: Envi
   requireTaskObligationProofs(store, run, task);
 }
 export function commitIntent(store: Store, root: Revision<ExecutionRoot>, run: Revision<TaskRun>, plan: MachinePlan,
-  task: CompiledTask, environment: Environment, guards: Ref[]): Revision<TaskRun> {
+  task: CompiledTask, environment: Environment, guards: TransactionGuard[]): Revision<TaskRun> {
   requirePlanTaskObligations(store, plan, task);
   const proof = taskResultProofs(store, run.value, task);
   const candidate = { ...run.value, ...(task.researchObligations !== undefined ? { obligationResultProofs: proof.proofs } : {}) };
@@ -40,10 +40,8 @@ export function commitIntent(store: Store, root: Revision<ExecutionRoot>, run: R
   } catch (error) {
     // A changed late confirmation is a pause, never an automatic code retry.
     if (error instanceof EngineError && error.code === 'input_stale') {
-      requireCondition(!proof.guards.some(ref => {
-        const current = store.get(ref.id);
-        return !current || current.revision !== ref.revision || current.hash !== ref.hash;
-      }), 'task_obligation_result_required', 'A result-confirmation input changed before acceptance; preserve the checked candidate');
+      requireCondition(transactionGuardsCurrent(store, proof.guards),
+        'task_obligation_result_required', 'A result-confirmation input changed before acceptance; preserve the checked candidate');
       requireCurrentTaskResult(store, candidate, task);
     }
     throw error;

@@ -1,7 +1,8 @@
 import { canonical, hashJson } from '../canonical.js';
 import { requireCondition } from '../errors.js';
-import { reference, uniqueRefs, type Ref } from '../pipeline/contracts.js';
-import type { Store } from '../storage/store.js';
+import { reference } from '../pipeline/contracts.js';
+import type { Store, TransactionGuard } from '../storage/store.js';
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import type { CompiledTask, MachinePlan } from '../compiler/model.js';
 import type { Feasibility } from '../graph/refinement.js';
 import type { Graph } from '../graph/model.js';
@@ -34,13 +35,14 @@ export function requirePlanTaskObligations(store: Store, plan: MachinePlan, task
 }
 
 export function taskStartProofs(store: Store, run: TaskRun, task: CompiledTask) {
-  const proofs: TaskRuntimeProof[] = [], guards: Ref[] = [];
+  const proofs: TaskRuntimeProof[] = [], guards: TransactionGuard[] = [];
   for (const bound of task.researchObligations ?? []) if (bound.requirement.moment === 'task-start') {
     const found = findObligationConfirmation(store, run.projectId, bound.requirement);
     requireCondition(found, 'task_obligation_start_required', `[${bound.requirement.obligation}] Actual confirmation is required before this task starts`);
-    proofs.push({ binding: bound.binding, subject: taskStartSubject(run), kind: 'runtime', confirmation: found.proof }); guards.push(...found.guards);
+    proofs.push({ binding: bound.binding, subject: taskStartSubject(run), kind: 'runtime', confirmation: found.proof });
+    guards.push(...found.guards, ...found.admissionGuards);
   }
-  return { proofs, guards: uniqueRefs(guards) };
+  return { proofs, guards: uniqueTransactionGuards(guards) };
 }
 
 export function requireCurrentTaskStart(store: Store, run: TaskRun, task: CompiledTask): void {
@@ -67,16 +69,17 @@ function implementationProof(run: TaskRun, task: CompiledTask, binding: string, 
 }
 
 export function taskResultProofs(store: Store, run: TaskRun, task: CompiledTask) {
-  const proofs: TaskObligationProof[] = [], guards: Ref[] = [];
+  const proofs: TaskObligationProof[] = [], guards: TransactionGuard[] = [];
   for (const bound of task.researchObligations ?? []) if (bound.requirement.moment === 'task-result') {
     if (bound.requirement.kind === 'post-implementation-proof') proofs.push(implementationProof(run, task, bound.binding, bound.tests));
     else {
       const found = findObligationConfirmation(store, run.projectId, bound.requirement);
       requireCondition(found, 'task_obligation_result_required', `[${bound.requirement.obligation}] Actual confirmation is required before accepting this result`);
-      proofs.push({ binding: bound.binding, subject: resultSubject(run), kind: 'runtime', confirmation: found.proof }); guards.push(...found.guards);
+      proofs.push({ binding: bound.binding, subject: resultSubject(run), kind: 'runtime', confirmation: found.proof });
+      guards.push(...found.guards, ...found.admissionGuards);
     }
   }
-  return { proofs, guards: uniqueRefs(guards) };
+  return { proofs, guards: uniqueTransactionGuards(guards) };
 }
 
 /** Before an unpublished intent moves Git, its late runtime evidence must
