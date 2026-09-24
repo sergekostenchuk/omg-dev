@@ -101,7 +101,7 @@ function frozen(value: unknown): boolean {
   return value === null || typeof value !== "object" || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
 
-function routesFixture(t: TestContext) {
+function routesFixture(t: TestContext, withEncoding = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-routes-")), path = join(root, "state.sqlite");
   let store = new Store(path), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -111,14 +111,18 @@ function routesFixture(t: TestContext) {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "output-format",
       question: "Which output format does the repository support?", consumer: block,
-      blocksCurrentStage: false, resolution: "Read repository facts during OM" }];
+      blocksCurrentStage: false, resolution: "Read repository facts during OM" }, ...(withEncoding ? [{ id: "encoding",
+        question: "Which encoding does the repository support?", consumer: "garden-consume-block",
+        blocksCurrentStage: false, resolution: "Read repository facts during OM" }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
     clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target, field: "address", value: { consumer: block, kind: "repository-fact" } } })) as Write }] }));
+      decision: { target, field: "address", value: { consumer: block, kind: "repository-fact" } } })) as Write },
+    ...(withEncoding ? [{ pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: "discovery:encoding", field: "address", value: { consumer: "garden-consume-block", kind: "repository-fact" } } })) as Write }] : [])] }));
   function gapsFor(inputRef: Ref) {
     const horizon = ok(writeHorizon(store, { project, input: inputRef, graph: reference(graph), refinement: null, available: {},
       choice: { choiceVersion: `routes-fixture-${inputRef.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -223,20 +227,22 @@ test("D4 distinguishes the code-only inventory gap from research fallback for or
   }
 });
 
-test("D4 batches ordinary facts while retaining separate gap identities and all consumers", () => {
+test("D4 batches ordinary facts only by exact consumer sets without duplicating partially shared gaps", () => {
   const sources = source();
   sources.inputResult.input!.questions = [question("format", "repository-fact", "garden-produce-operation"),
     question("format", "repository-fact", "garden-consume-operation"), question("encoding")];
   const gaps = collection(sources), result = ok(planGapRoutes(gaps, sources, noAddresses()));
   assert.equal(gaps.gaps.length, 2);
   assert.equal(result.routes.length, 2);
-  assert.equal(result.batches.length, 1);
-  const batch = result.batches[0]!;
-  assert.equal(batch.model, "MC1"); assert.equal(batch.task, "fact"); assert.equal(batch.kind, "repository-fact");
-  assert.equal(batch.node, null); assert.equal(batch.level, null);
-  assert.deepEqual(normalize(batch.items.map(item => item.gap)), normalize(gaps.gaps.map(item => item.id)));
-  assert.equal(new Set(batch.items.map(item => item.gap)).size, 2);
-  const format = batch.items.find(item => item.target === "format")!;
+  assert.equal(result.batches.length, 2, "[produce, consume] and [consume] are distinct consumer sets");
+  for (const batch of result.batches) {
+    assert.equal(batch.model, "MC1"); assert.equal(batch.task, "fact"); assert.equal(batch.kind, "repository-fact");
+    assert.equal(batch.node, null); assert.equal(batch.level, null); assert.equal(batch.items.length, 1);
+  }
+  const items = result.batches.flatMap(batch => batch.items);
+  assert.deepEqual(normalize(items.map(item => item.gap)), normalize(gaps.gaps.map(item => item.id)));
+  assert.equal(new Set(items.map(item => item.gap)).size, 2);
+  const format = items.find(item => item.target === "format")!;
   assert.equal(format.field, "answer");
   assert.deepEqual(format.consumers, ["garden-consume-block", "garden-produce-block"]);
   assert.ok(format.addresses.records.some(item => canonical(item) === canonical(ref("stage:garden:features"))));
@@ -254,11 +260,11 @@ test("D4 groups missing fields by their own class and keeps question addressing 
   const result = plan(sources);
   assert.equal(result.routes.length, 6);
   assert.ok(result.routes.every(item => item.route === "design" && item.state === "pending"));
-  assert.equal(result.batches.length, 3);
+  assert.equal(result.batches.length, 4);
   assert.ok(result.batches.every(batch => batch.model === "MC2" && batch.task === "input-field"
     && batch.kind === "design-decision" && batch.node === null && batch.level === null));
   assert.deepEqual(normalize(result.batches.map(batch => normalize(batch.items.map(item => item.target)))),
-    normalize([["criterion-1", "criterion-2"], ["contract-1", "contract-2"], ["unaddressed-1", "unaddressed-2"]]));
+    normalize([["criterion-1", "criterion-2"], ["contract-1"], ["contract-2"], ["unaddressed-1", "unaddressed-2"]]));
 });
 
 test("D4 gives MC2 a complete node-expansion batch for each upper node and level", () => {
@@ -376,10 +382,12 @@ test("D4 canonicalizes batches and catalogs without losing multiplicity or mutat
 });
 
 function requestFor(f: ReturnType<typeof routesFixture>, current = f.gaps, resultForm: Json = { type: 'string' }, previous: Ref | null = null): RoutesRequest {
-  const task = ok(prepareAnswerTask(f.store, { project: f.project, input: current.sources.input,
-    gaps: { sources: current.sources, records: current.records }, gap: reference(current.gap), requirements: [{ pointer: '/contracts/0' }], resultForm }));
+  const tasks = current.records.map(ref => f.store.get<{ gap: { kind: string; code: string; deferral?: unknown } }>(ref.id, ref.revision)!)
+    .filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
+    .map(row => ok(prepareAnswerTask(f.store, { project: f.project, input: current.sources.input,
+      gaps: { sources: current.sources, records: current.records }, gap: reference(row), requirements: [{ pointer: '/contracts/0' }], resultForm })));
   return { project: f.project, gaps: { sources: current.sources, records: current.records },
-    tasks: task.writes.length ? [{ pending: clone(task.writes[0]!) }] : [{ record: reference(task.record) }], catalog: noAddresses(), previous };
+    tasks: tasks.map(task => task.writes.length ? { pending: clone(task.writes[0]!) } : { record: reference(task.record) }), catalog: noAddresses(), previous };
 }
 const snapshot = (store: Store) => store.list().map(reference);
 function writePrepared(store: Store, prepared: ReturnType<typeof prepareRoutes>, neighbor = false) {
@@ -717,5 +725,82 @@ test('D4 native batched D5 answers flow through routing, application and D2 clos
       assert.deepEqual(ok(writeRoutes(f.store, routeRequest)), route);
       assert.deepEqual(snapshot(f.store), historical);
     });
+  }
+});
+
+test('D4 normalizes complete consumer sets for both small task kinds without merging partial intersections', () => {
+  const sources = source();
+  sources.inputResult.input!.questions = [
+    question('format', 'repository-fact', 'garden-produce-operation'),
+    question('format', 'repository-fact', 'garden-consume-operation'),
+    question('encoding', 'repository-fact', 'garden-consume-operation'),
+    question('encoding', 'repository-fact', 'garden-produce-operation'),
+    question('single', 'repository-fact', 'garden-consume-operation'),
+  ];
+  sources.inputResult.gaps = [
+    missing('contract_node_unbound', 'contract-both-a', 'nodes', { features: [{ feature: 0 }, { feature: 1 }] }),
+    missing('contract_node_unbound', 'contract-both-b', 'nodes', { features: [{ feature: 1 }, { feature: 0 }] }),
+    missing('contract_node_unbound', 'contract-single', 'nodes', { features: [{ feature: 1 }] }),
+  ];
+  const result = plan(sources);
+  assert.deepEqual(normalize(result.batches.map(batch => normalize(batch.items.map(item => item.target)))),
+    normalize([['encoding', 'format'], ['single'], ['contract-both-a', 'contract-both-b'], ['contract-single']]));
+  const gapIds = result.batches.flatMap(batch => batch.items.map(item => item.gap));
+  assert.equal(gapIds.length, 6); assert.equal(new Set(gapIds).size, 6);
+  for (const batch of result.batches) assert.ok(batch.items.every(item => canonical(item.consumers) === canonical(batch.items[0]!.consumers)));
+  const reordered = clone(sources);
+  reordered.inputResult.input!.questions.reverse();
+  reordered.inputResult.gaps.reverse();
+  assert.deepEqual(plan(reordered), result, 'Permuting full producer consumer sets does not change grouping or batch identity');
+});
+
+test('D4 preserves the explicit original routing era and creates a guarded consumer-set successor from native stages', t => {
+  const f = routesFixture(t, true), request = requestFor(f), prepared = ok(prepareRoutes(f.store, request));
+  assert.equal(prepared.record.value.grouping, 'consumer-set-v1');
+  assert.equal(prepared.record.value.batches.filter(batch => batch.model === 'MC1').length, 2);
+  // Reconstruct the original D4 wire contract from its genuine source records, before committing any route.
+  const legacy = clone(prepared.record.value) as RoutesRecord;
+  delete legacy.grouping;
+  const facts = legacy.batches.filter(batch => batch.model === 'MC1');
+  assert.deepEqual(normalize(facts.flatMap(batch => batch.items.map(item => item.target))),
+    ['discovery:encoding', 'discovery:output-format']);
+  const { id: _oldId, ...shape } = facts[0]!;
+  const body = { ...shape, items: facts.flatMap(batch => batch.items).sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0) };
+  legacy.batches = [...legacy.batches.filter(batch => batch.model !== 'MC1'), { id: hashJson(body), ...body }]
+    .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  ok(writeGuarded(f.store, { unit: 'D4-era-fixture', target: prepared.record.id, guards: prepared.guards,
+    writes: prepared.writes.map(write => write.id === prepared.record.id ? { ...write, value: legacy } : clone(write)) }));
+  const old = f.store.get<RoutesRecord>(prepared.record.id)!;
+  assert.deepEqual(ok(readRoutes(f.store, { project: f.project, record: reference(old) })).record, old);
+  const unchanged = snapshot(f.store);
+  rejected(prepareRoutes(f.store, request), 'route_stale');
+  rejected(writeRoutes(f.store, request), 'route_stale');
+  assert.deepEqual(snapshot(f.store), unchanged, 'An old era cannot be silently promoted to current admission');
+  const successorRequest = { ...request, previous: reference(old) };
+  const next = ok(writeRoutes(f.store, successorRequest));
+  assert.equal(next.value.grouping, 'consumer-set-v1');
+  assert.deepEqual(next.value.request.previous, reference(old));
+  assert.equal(next.value.batches.filter(batch => batch.model === 'MC1').length, 2);
+  assert.equal(new Set(next.value.batches.flatMap(batch => batch.items.map(item => item.gap))).size,
+    next.value.batches.flatMap(batch => batch.items).length);
+  assert.deepEqual(f.store.get(old.id), old, 'The historical record is neither revised nor reclassified');
+  assert.deepEqual(ok(writeRoutes(f.store, successorRequest)), next);
+  const pending = ok(prepareRoutes(f.store, { ...request, previous: reference(next) }));
+  const index = f.store.get<AnswerIndex>(next.value.searches[0]!.index.id)!;
+  assert.ok(pending.guards.some(guard => canonical(guard) === canonical(reference(index))));
+  f.store.write({ id: index.id, kind: index.kind, expected: index.revision, value: index.value });
+  const afterRace = snapshot(f.store);
+  rejected(writeGuarded(f.store, { unit: 'M6', target: pending.record.id, writes: pending.writes, guards: pending.guards }), 'input_stale');
+  assert.deepEqual(snapshot(f.store), afterRace); assert.equal(f.store.get(pending.record.id), null);
+  f.restart();
+  for (const record of [old, next]) assert.deepEqual(ok(readRoutes(f.store, { project: f.project, record: reference(record) })).record, record);
+  assert.deepEqual(ok(writeRoutes(f.store, successorRequest)), next);
+  rejected(writeRoutes(f.store, request), 'route_stale');
+  for (const grouping of ['consumer-set-v1', 'unknown-era']) {
+    const counterfeit = { ...clone(legacy), grouping, request: { ...clone(legacy.request), previous: reference(next),
+      catalog: grouping === 'consumer-set-v1' ? clone(legacy.request.catalog) : { paths: [grouping], records: [] } } };
+    const row = f.store.write({ id: `om-routes:${f.project}:${hashJson(counterfeit.request)}`, kind: old.kind, expected: 0, value: counterfeit });
+    const failure = rejected(readRoutes(f.store, { project: f.project, record: reference(row) }), 'route_record_invalid');
+    assert.equal(failure.at.field, grouping === 'unknown-era' ? 'grouping' : 'content', 'An explicit era never falls back to the other algorithm');
   }
 });

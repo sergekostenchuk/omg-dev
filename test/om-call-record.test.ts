@@ -18,7 +18,7 @@ import {
   ORIGIN_DECISION_KIND, type OriginHold,
 } from "../src/om/repeat-gate.js";
 import {
-  callLedgerId, callRecordId, recordCall, settleCall,
+  callLedgerId, callRecordId, readCall, recordCall, settleCall,
   CALL_LEDGER_KIND, CALL_PURPOSES, CALL_RECORD_CODES, CALL_RECORD_KIND,
   type CallLedger, type CallRecord, type RecordCallRequest,
 } from "../src/om/call-record.js";
@@ -207,6 +207,104 @@ function liftByOwner(store: Store, project: string, hold: Ref): Ref {
 const heldCall = (f: Fixture, name = "research-price-1"): Revision<CallRecord> | null =>
   f.store.get<CallRecord>(callRecordId(PROJECT, name));
 const heldLedger = (f: Fixture): Revision<CallLedger> | null => f.store.get<CallLedger>(callLedgerId(PROJECT));
+
+class CallReadStore extends Store {
+  onRead: ((id: string, revision: number | undefined) => void) | null = null;
+  override get<T = Json>(id: string, revision?: number): Revision<T> | null {
+    this.onRead?.(id, revision);
+    return super.get<T>(id, revision);
+  }
+}
+
+test("readCall returns sealed exact history after settlement and source or call head movement", t => {
+  const f = fixture(t, "read-history", CallReadStore), store = f.store as CallReadStore;
+  const admitted = deliveredOf(recordCall(store, PROJECT, request(f)));
+  const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "succeeded"));
+  for (const source of [f.adapter, f.config, f.series]) {
+    store.write({ id: source.id, kind: source.kind, expected: source.revision, value: { later: true } });
+  }
+  store.write({ id: admitted.call.id, kind: CALL_RECORD_KIND, expected: 2, value: null });
+  store.write({ id: settled.ledger.id, kind: CALL_LEDGER_KIND, expected: settled.ledger.revision, value: null });
+  const reads: { id: string; revision: number | undefined }[] = [];
+  store.onRead = (id, revision) => { reads.push({ id, revision }); };
+
+  const open = deliveredOf(readCall(store, PROJECT, reference(admitted.call)));
+  const closed = deliveredOf(readCall(store, PROJECT, reference(settled.call)));
+  assert.deepEqual(open, admitted.call);
+  assert.deepEqual(closed, settled.call);
+  assert.ok(deeplyFrozen(open) && deeplyFrozen(closed));
+  assert.notEqual(open, admitted.call);
+  assert.deepEqual(reads, [
+    { id: admitted.call.id, revision: 1 },
+    { id: admitted.call.id, revision: 2 },
+    { id: admitted.call.id, revision: 1 },
+  ]);
+  assert.equal(store.history(admitted.call.id).length, 3);
+  assert.equal(store.history(settled.ledger.id).length, 3);
+});
+
+test("readCall rejects malformed arguments and foreign namespaces before storage", t => {
+  const f = fixture(t, "read-arguments", CallReadStore), store = f.store as CallReadStore;
+  const ref = reference(deliveredOf(recordCall(store, PROJECT, request(f))).call);
+  store.onRead = () => assert.fail("Invalid read arguments must not access storage");
+  for (const invalid of [undefined, null, {}, [], "store"]) {
+    assert.throws(() => readCall(invalid as never, PROJECT, ref), code("call_request_invalid"));
+  }
+  for (const invalid of [undefined, null, {}, [], 7, "", "alpha:child", "x".repeat(201)]) {
+    addressed(readCall(store, invalid as never, ref), "call_request_invalid");
+  }
+  for (const invalid of [undefined, null, {}, [], "ref", 7,
+    { ...ref, id: "" }, { ...ref, revision: 0 }, { ...ref, revision: 1.5 }, { ...ref, hash: "forged" },
+    { ...ref, extra: true },
+    ...["id", "revision", "hash"].map(field => Object.fromEntries(Object.entries(ref).filter(([key]) => key !== field))),
+    ...[callRecordId("beta", "call"), callRecordId("alphabet", "call"), callLedgerId(PROJECT),
+      `call-record:${PROJECT}:`, `call-record:${PROJECT}:not-a-hash`, `${ref.id}:extra`].map(id => ({ ...ref, id })),
+  ]) addressed(readCall(store, PROJECT, invalid as never), "call_unresolved");
+});
+
+test("readCall refuses missing or forged references, kinds, identities and historical bodies", t => {
+  const f = fixture(t, "read-forged");
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  const ref = reference(admitted.call);
+  for (const forged of [
+    { ...ref, id: callRecordId(PROJECT, "missing") }, { ...ref, hash: "f".repeat(64) }, { ...ref, revision: 2 },
+  ]) addressed(readCall(f.store, PROJECT, forged), "call_unresolved");
+  const wrongKind = f.store.write({ id: callRecordId(PROJECT, "wrong-kind"), kind: "other", expected: 0, value: admitted.call.value });
+  addressed(readCall(f.store, PROJECT, reference(wrongKind)), "call_unresolved");
+  const copied = f.store.write({ id: callRecordId(PROJECT, "copied"), kind: CALL_RECORD_KIND, expected: 0, value: admitted.call.value });
+  assert.equal(copied.hash, admitted.call.hash);
+  addressed(readCall(f.store, PROJECT, reference(copied)), "call_record_invalid");
+  const foreign = f.store.write({ id: callRecordId(PROJECT, "foreign"), kind: CALL_RECORD_KIND, expected: 0,
+    value: { ...admitted.call.value, call: "foreign", projectId: "beta" } });
+  addressed(readCall(f.store, PROJECT, reference(foreign)), "call_record_invalid");
+  for (const field of Object.keys(admitted.call.value)) {
+    const call = `missing-${field}`, value: Record<string, unknown> = { ...admitted.call.value, call };
+    delete value[field];
+    const malformed = f.store.write({ id: callRecordId(PROJECT, call), kind: CALL_RECORD_KIND, expected: 0, value });
+    addressed(readCall(f.store, PROJECT, reference(malformed)), "call_record_invalid");
+  }
+  const forgedSettlement = f.store.write({ id: ref.id, kind: CALL_RECORD_KIND, expected: 1,
+    value: { ...admitted.call.value, block: "forged", status: "succeeded", usage, settledAt: admitted.call.value.openedAt } });
+  addressed(readCall(f.store, PROJECT, reference(forgedSettlement)), "call_record_invalid");
+  const invalidRevision = f.store.write({ id: ref.id, kind: CALL_RECORD_KIND, expected: 2, value: admitted.call.value });
+  addressed(readCall(f.store, PROJECT, reference(invalidRevision)), "call_record_invalid");
+  assert.deepEqual(deliveredOf(readCall(f.store, PROJECT, ref)), admitted.call);
+});
+
+test("readCall preserves storage exceptions from either the requested revision or its admission", t => {
+  const f = fixture(t, "read-storage", CallReadStore), store = f.store as CallReadStore;
+  const admitted = deliveredOf(recordCall(store, PROJECT, request(f)));
+  const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "failed"));
+  for (const revision of [1, 2]) {
+    for (const failure of [new EngineError("record_corrupt", "checksum mismatch"), new Error("storage unavailable")]) {
+      store.onRead = (_id, reading) => { if (reading === revision) throw failure; };
+      assert.throws(() => readCall(store, PROJECT, reference(settled.call)), error => error === failure);
+    }
+  }
+  store.onRead = null;
+  assert.equal(store.history(admitted.call.id).length, 2);
+  assert.equal(store.history(settled.ledger.id).length, 2);
+});
 
 test("recordCall writes the call and the one project-ledger row before dispatch, as sealed copies", t => {
   const f = fixture(t, "record");

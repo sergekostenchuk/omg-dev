@@ -179,6 +179,22 @@ export function callLedgerId(project: string): string {
   return `${CALL_LEDGER_KIND}:${project}`;
 }
 
+/** Reads one exact historical call revision without admitting a dispatch or consulting later source heads. */
+export function readCall(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CallRecord>>> {
+  requireCondition(store instanceof Store, "call_request_invalid", "A call is read through a store");
+  if (!validProject(project)) return problem("call_request_invalid", "A call belongs to one named project without a namespace separator", "call", "project");
+  if (!exactReference(ref)) return problem("call_unresolved", "A call is read by an exact reference", targetOf(ref), "call");
+  const namespace = callRecordNamespace(project);
+  if (!ref.id.startsWith(namespace) || !/^[a-f0-9]{64}$/.test(ref.id.slice(namespace.length))) {
+    return problem("call_unresolved", "The call reference belongs to this project's call namespace", ref.id, "call", "producer", ref);
+  }
+  const record = store.get<CallRecord>(ref.id, ref.revision);
+  if (!record || record.id !== ref.id || record.revision !== ref.revision || record.hash !== ref.hash || record.kind !== CALL_RECORD_KIND) {
+    return problem("call_unresolved", "No call record stands at this exact reference", ref.id, "call", "producer", ref);
+  }
+  return checkedCall(store, record, project, ref.id);
+}
+
 /**
  * Records the call and its project-ledger row in one guarded transaction before dispatch.
  * The running series, adapter and configuration are all guarded heads: a change in the read/write window admits
