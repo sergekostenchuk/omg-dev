@@ -1,4 +1,5 @@
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
+import { recoverOmModelCall } from "../om/model-call.js";
 import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
 import { recoverResearchResponse } from '../discovery/response-recovery.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';
@@ -204,7 +205,13 @@ export class ProductEngine {
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);
       case 'recover-runtime-observation': this.#project(command.project); return recoverRuntimeObservation(this.store,command.project,command.observation);
       case 'apply-obligation-policy': this.#project(command.project); return applyObligationPolicy(this.store,command.project,command.scope,command.policy);
-      case "recover-model-call": this.#project(command.project); return recoverModelCall(this.store,command.project,command.call);
+      case "recover-model-call": {
+        this.#project(command.project);
+        const value = this.store.get<Record<string, unknown>>(command.call.id)?.value;
+        return value && ('om' in value || 'transport' in value)
+          ? recoverOmModelCall(this.store, command.project, command.call)
+          : recoverModelCall(this.store, command.project, command.call);
+      }
       case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
       case 'retry-planned-read': this.#project(command.project); return retryPlannedRead(this.store,command.project,command.child);
       case 'allocate-research-trial': this.#project(command.project); return allocateResearchTrial(this.store,command.project,command);

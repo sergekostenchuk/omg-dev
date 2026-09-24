@@ -18,3 +18,14 @@ test("process adapter preserves split UTF-8 output and refuses an already-cancel
 test("timeout terminates the owned child group instead of accepting unfinished output", async () => {
   await assert.rejects(runProcess({ executable: process.execPath, args: ["-e", "setInterval(()=>{},1000)"] }, process.cwd(), "", 150), /timeout/);
 });
+
+test('request bytes are transferred only after successful awaited spawn authorization', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-process-authorize-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const target = join(root, 'received');
+  const adapter = { executable: process.execPath, args: ['-e', `const fs=require('node:fs');const request=fs.readFileSync(0,'utf8');if(request)fs.writeFileSync(${JSON.stringify(target)},request)`] };
+  await assert.rejects(runProcess(adapter, root, 'must-not-transfer', 2000, undefined, true, async () => { await Promise.resolve(); throw Error('authorization rejected'); }), { code: 'process_record_failed' });
+  assert.equal(existsSync(target), false);
+  let authorized = false;
+  const result = await runProcess({ executable: process.execPath, args: ['-e', "const fs=require('node:fs');process.stdout.write(fs.readFileSync(0,'utf8'))"] }, root, 'authorized-only', 2000, undefined, true, async () => { await Promise.resolve(); authorized = true; });
+  assert.equal(authorized, true); assert.equal(result.stdout, 'authorized-only');
+});

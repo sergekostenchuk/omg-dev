@@ -51,6 +51,21 @@ test("usage counts every audited role and failed response without adding cached 
   assert.ok(store.list<ModelCall>("model-call").every(record => record.value.finishedAt !== null && record.value.request.bytes > 0));
 });
 
+test('every audited discovery call commits physical ownership and request authorization before its receipt', async t => {
+  const { store, environment } = fixture(t), env = environment('normal');
+  await researchCall(env.implementer, env, 'Physical execution contract', {}, undefined, { store, draftId: 'draft-p', purpose: 'reader' });
+  const call = store.list<ModelCall>('model-call')[0]!, history = store.history<ModelCall>(call.id);
+  assert.equal(history[0]!.value.execution!.phase, 'claimed');
+  assert.equal(history[0]!.value.execution!.provider, null);
+  assert.equal(history[0]!.value.ownerProcess!.pid, process.pid);
+  assert.equal(history[1]!.value.execution!.phase, 'authorized');
+  assert.ok(history[1]!.value.providerProcess!.pid > 0);
+  assert.equal(history[1]!.value.response, null);
+  assert.equal(call.value.status, 'succeeded');
+  assert.equal(call.value.usage!.inputTokens, 120);
+  assert.deepEqual(modelUsage(store, 'p', 0).interruptions, []);
+});
+
 test("absent, foreign, malformed and timed-out usage is never reported as a measured zero", async t => {
   const { store, environment } = fixture(t);
   for (const scenario of ["unknown", "foreign", "invalid", "timeout"]) {

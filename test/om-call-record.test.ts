@@ -19,10 +19,11 @@ import {
   ORIGIN_DECISION_KIND, type OriginHold,
 } from "../src/om/repeat-gate.js";
 import {
-  callLedgerId, callRecordId, readCall, recordCall, settleCall,
+  callLedgerId, callRecordId, readCall, prepareCallDispatch, recordCall, settleCall,
   CALL_LEDGER_KIND, CALL_PURPOSES, CALL_RECORD_CODES, CALL_RECORD_KIND,
   type CallLedger, type CallRecord, type RecordCallRequest, type MechanismRecordCallRequest, type AnyCallRecord,
 } from "../src/om/call-record.js";
+import { writeGuarded } from "../src/om/refs.js";
 
 import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
@@ -712,21 +713,24 @@ test("foreign series, forged hashes and status masquerades cannot stand for exac
     block: longBlock, series: reference(longSeries),
   })), "call_series_unresolved");
 
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
-  const forged = f.store.write({
+  // A malformed record occupying the successor address also blocks fresh work on the predecessor.
+  addressed(recordCall(f.store, PROJECT, request(f)), "call_series_unresolved");
+  const clean = fixture(t, "call-masquerade");
+  const admitted = deliveredOf(recordCall(clean.store, PROJECT, request(clean)));
+  const forged = clean.store.write({
     id: admitted.call.id, kind: CALL_RECORD_KIND, expected: admitted.call.revision,
     value: {
       ...admitted.call.value, block: "block:forged", status: "succeeded",
       usage, settledAt: admitted.call.value.openedAt,
     },
   });
-  addressed(settleCall(f.store, reference(forged), usage, "succeeded"), "call_record_invalid");
-  assert.equal(heldLedger(f)!.revision, 1);
-  const emptyCall = f.store.write({
+  addressed(settleCall(clean.store, reference(forged), usage, "succeeded"), "call_record_invalid");
+  assert.equal(heldLedger(clean)!.revision, 1);
+  const emptyCall = clean.store.write({
     id: forged.id, kind: CALL_RECORD_KIND, expected: forged.revision, value: null,
   });
-  addressed(settleCall(f.store, reference(emptyCall), usage, "succeeded"), "call_record_invalid");
-  assert.equal(heldLedger(f)!.revision, 1);
+  addressed(settleCall(clean.store, reference(emptyCall), usage, "succeeded"), "call_record_invalid");
+  assert.equal(heldLedger(clean)!.revision, 1);
 });
 
 test("every record and settlement path rejects partial or total ledger loss derived from saved calls", t => {
@@ -1170,6 +1174,9 @@ test("E1 analyses an inherited stop after a real A to A+B successor and guards c
   assert.deepEqual("admission" in fresh.call.value && fresh.call.value.admission, f.fresh.admission);
   addressed(recordCall(store, PROJECT, { ...f.ordinary, call: "ordinary-after-successor", series: reference(f.successor), attempt: 3 }), "call_series_unresolved");
   f.refreshInventory();
+  assert.deepEqual(deliveredOf(prepareCallDispatch(store, PROJECT, reference(admitted.call))).call, admitted.call,
+    "The inherited stop uses its historical assignment after the producer changed");
+  addressed(prepareCallDispatch(store, PROJECT, reference(fresh.call)), "call_series_unresolved");
   const beforeStale = accountingSnapshot(store);
   addressed(recordCall(store, PROJECT, { ...extra, call: "stale-additional-analysis-sources" }), "call_series_unresolved");
   assert.deepEqual(accountingSnapshot(store), beforeStale);
@@ -1268,4 +1275,128 @@ test("E1 analyses an inherited origin hold after D3 and a full D1 successor, wit
     assert.deepEqual(accountingSnapshot(reopened), snapshot);
     addressed(recordCall(reopened, PROJECT, { ...input, call: "new-origin-analysis-after-restart" }), "call_basis_unresolved");
   } finally { reopened.close(); }
+});
+
+test("block successor and call admission serialize both orders without partial accounting or loss of historical settlement", t => {
+  for (const successorFirst of [false, true]) {
+    const f = fixture(t, `block-successor-${successorFirst}`, MechanismCommitRaceStore), store = f.store as MechanismCommitRaceStore;
+    const stopped = stoppedSeries(f), wanted = analysisGoal("block predecessor stop");
+    const input = request(f, { call: "block-line-analysis", purpose: "stop-analysis", attempt: 3, series: reference(stopped),
+      basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, goal: wanted,
+      gaps: analysisGaps(stopped.id, wanted, "stop") });
+    const successorRequest = { project: PROJECT, block: BLOCK, line: 2, slice: "slice:cart@2", predecessor: reference(stopped),
+      basis: { ground: "inputs-changed" as const, text: "Added a question to the block horizon" } };
+    let saved: ReturnType<typeof recordCall> | null = null;
+    if (successorFirst) {
+      store.race = other => { deliveredOf(openSeries(other, successorRequest)); };
+      const before = accountingSnapshot(store);
+      assert.equal(refusalOf(recordCall(store, PROJECT, input)).code, "input_stale");
+      assert.deepEqual(accountingSnapshot(store), before, "Successor winning immediately before call write leaves neither call nor ledger");
+    } else {
+      saved = recordCall(store, PROJECT, input);
+      const admitted = deliveredOf(saved), launch = deliveredOf(prepareCallDispatch(store, PROJECT, reference(admitted.call)));
+      deliveredOf(openSeries(store, successorRequest));
+      assert.equal(refusalOf(writeGuarded(store, { unit: "E4-test", target: "launch:old-line",
+        writes: [{ id: "launch:old-line", kind: "launch", expected: 0, value: {} }], guards: launch.guards })).code, "input_stale");
+      assert.equal(store.get("launch:old-line"), null);
+      addressed(prepareCallDispatch(store, PROJECT, reference(admitted.call)), "call_series_unresolved");
+    }
+    const claimed = store.get<RepairSeries>(stopped.id)!, successor = store.get<RepairSeries>(seriesId(PROJECT, BLOCK, 2))!;
+    assert.equal(claimed.revision, stopped.revision + 1);
+    assert.deepEqual(claimed.value, stopped.value);
+    for (const ref of [reference(stopped), reference(claimed)]) {
+      addressed(recordCall(store, PROJECT, { ...input, call: `forbidden-${ref.revision}`, series: ref,
+        basis: { kind: "series-stop", series: ref, attempt: 3 } }), "call_series_unresolved");
+    }
+    const inheritedInput = { ...input, call: "inherited-stop-analysis", series: reference(successor),
+      basis: { kind: "series-stop" as const, series: reference(successor), attempt: 3 } };
+    const inherited = deliveredOf(recordCall(store, PROJECT, inheritedInput));
+    assert.deepEqual(deliveredOf(prepareCallDispatch(store, PROJECT, reference(inherited.call))).call, inherited.call);
+    const restarted = new Store(f.path);
+    try {
+      addressed(recordCall(restarted, PROJECT, { ...input, call: "old-after-restart" }), "call_series_unresolved");
+      assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(stopped))), stopped);
+      assert.equal(deliveredOf(recordCall(restarted, PROJECT, inheritedInput)).repeated, true);
+      if (saved) {
+        const admitted = deliveredOf(saved);
+        assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(admitted.call))), admitted.call);
+        assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).repeated, true);
+        const accounted = deliveredOf(settleCall(restarted, reference(admitted.call), usage, "succeeded"));
+        assert.equal(accounted.settled, true);
+        assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).call.revision, 2);
+        assert.equal(deliveredOf(settleCall(restarted, reference(admitted.call), usage, "succeeded")).repeated, true);
+      }
+    } finally { restarted.close(); }
+  }
+});
+
+test("current admission rejects a legacy block predecessor even when succession left its exact head unchanged", t => {
+  const f = fixture(t, "legacy-successor"), stopped = stoppedSeries(f), wanted = analysisGoal("legacy stop");
+  const input = request(f, { call: "legacy-admitted", purpose: "stop-analysis", series: reference(stopped), attempt: 3,
+    basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, goal: wanted, gaps: analysisGaps(stopped.id, wanted, "stop") });
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, input));
+  // Reconstruct the historical era's valid record shape; its writer did not claim the predecessor.
+  const legacyValue: RepairSeries = { ...stopped.value, line: 2, slice: "legacy:second-slice", predecessor: reference(stopped),
+    basis: { ground: "inputs-changed", text: "The historical slice moved" }, inherited: stopped.value.attempts, attempts: [] };
+  const legacy = f.store.write({ id: seriesId(PROJECT, BLOCK, 2), kind: stopped.kind, expected: 0, value: legacyValue });
+  const restarted = new Store(f.path);
+  try {
+    assert.deepEqual(reference(restarted.get(stopped.id)!), reference(stopped));
+    assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(legacy))), legacy);
+    addressed(recordCall(restarted, PROJECT, { ...input, call: "new-on-legacy-predecessor" }), "call_series_unresolved");
+    addressed(prepareCallDispatch(restarted, PROJECT, reference(admitted.call)), "call_series_unresolved");
+    assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(admitted.call))), admitted.call);
+    assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).repeated, true);
+    assert.equal(deliveredOf(settleCall(restarted, reference(admitted.call), usage, "failed")).settled, true);
+  } finally { restarted.close(); }
+});
+
+test("prepareCallDispatch uses current purpose, call and configuration guards while readCall stays historical", t => {
+  const f = fixture(t, "prepare-dispatch"), admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  const proof = deliveredOf(prepareCallDispatch(f.store, PROJECT, reference(admitted.call)));
+  assert.deepEqual(proof.call, admitted.call);
+  assert.ok(deeplyFrozen(proof));
+  for (const source of [admitted.call, f.series, f.adapter, f.config])
+    assert.ok(proof.guards.some(ref => ref.id === source.id && ref.revision === source.revision && ref.hash === source.hash));
+  addressed(prepareCallDispatch(f.store, PROJECT, undefined as never), "call_unresolved");
+  addressed(prepareCallDispatch(f.store, PROJECT, { ...reference(admitted.call), hash: "f".repeat(64) }), "call_unresolved");
+  addressed(prepareCallDispatch(f.store, "beta", reference(admitted.call)), "call_unresolved");
+  const moved = f.store.write({ id: f.config.id, kind: f.config.kind, expected: f.config.revision, value: { model: "changed" } });
+  addressed(prepareCallDispatch(f.store, PROJECT, reference(admitted.call)), "dispatch_contract_unresolved");
+  assert.equal(refusalOf(writeGuarded(f.store, { unit: "E4-test", target: "launch:changed-config",
+    writes: [{ id: "launch:changed-config", kind: "launch", expected: 0, value: {} }], guards: proof.guards })).code, "input_stale");
+  assert.equal(f.store.get("launch:changed-config"), null);
+  assert.equal(moved.revision, 2);
+  assert.deepEqual(deliveredOf(readCall(f.store, PROJECT, reference(admitted.call))), admitted.call);
+  const settled = deliveredOf(settleCall(f.store, reference(admitted.call), usage, "succeeded"));
+  addressed(prepareCallDispatch(f.store, PROJECT, reference(admitted.call)), "call_unresolved");
+  addressed(prepareCallDispatch(f.store, PROJECT, reference(settled.call)), "call_unresolved");
+
+  const g = fixture(t, "dispatch-ended-attempt"), ordinary = deliveredOf(recordCall(g.store, PROJECT, request(g)));
+  deliveredOf(completeAttempt(g.store, { project: PROJECT, block: BLOCK, line: 1, attempt: 1,
+    outcome: { reason: "off-form", achieved: [], cancelled: [], refusals: [] } }));
+  addressed(prepareCallDispatch(g.store, PROJECT, reference(ordinary.call)), "call_series_unresolved");
+  assert.deepEqual(deliveredOf(readCall(g.store, PROJECT, reference(ordinary.call))), ordinary.call);
+});
+
+test("block origin analysis follows its inherited current hold and rejects a lifted hold on a fresh process launch", t => {
+  const f = fixture(t, "inherited-block-origin"), held = raisedHold(f.store, PROJECT, f.goal), wanted = analysisGoal("inherited block hold");
+  const input = request(f, { call: "block-origin-old", purpose: "origin-analysis", series: reference(held.series), attempt: 1,
+    basis: { kind: "origin-hold", hold: held.hold }, goal: wanted, gaps: analysisGaps(held.hold.id, wanted, "origin") });
+  const old = deliveredOf(recordCall(f.store, PROJECT, input));
+  const successor = deliveredOf(openSeries(f.store, { project: PROJECT, block: BLOCK, line: 2, slice: "slice:cart@2", predecessor: reference(held.series),
+    basis: { ground: "inputs-changed", text: "The inherited origin remains unresolved" } }));
+  addressed(prepareCallDispatch(f.store, PROJECT, reference(old.call)), "call_series_unresolved");
+  const inherited = deliveredOf(recordCall(f.store, PROJECT, { ...input, call: "block-origin-inherited", series: reference(successor) }));
+  const proof = deliveredOf(prepareCallDispatch(f.store, PROJECT, reference(inherited.call)));
+  assert.ok(proof.guards.some(ref => ref.id === held.hold.id));
+  liftByOwner(f.store, PROJECT, held.hold);
+  addressed(prepareCallDispatch(f.store, PROJECT, reference(inherited.call)), "call_basis_unresolved");
+  const restarted = new Store(f.path);
+  try {
+    assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(old.call))), old.call);
+    assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(inherited.call))), inherited.call);
+    assert.equal(deliveredOf(settleCall(restarted, reference(inherited.call), usage, "succeeded")).settled, true);
+    assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).repeated, true);
+  } finally { restarted.close(); }
 });

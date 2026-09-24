@@ -568,6 +568,28 @@ function readSeriesHistory(store: Store, project: string, ref: Ref): OmResult<Se
   return broken ?? delivered(read.value as Revision<AnyRepairSeries>);
 }
 
+/** Current admission is shared by both owners; exact historical reads never acquire this requirement. */
+export function prepareSeriesLineAdmission(
+  store: Store, project: string, ref: Ref,
+): OmResult<Sealed<{ readonly series: Revision<AnyRepairSeries>; readonly guards: readonly Ref[] }>> {
+  return withHistoricalReads(() => {
+    const read = readAnySeriesAt(store, project, ref);
+    if (!read.ok) return read;
+    const address = seriesAddress(seriesRequestOf(read.value.value));
+    const current = store.get(ref.id);
+    if (!current || !sameRef(reference(current), ref))
+      return problem("series_conflict", "Current admission requires this exact series head", { target: ref.id, ref }, "line");
+    const obsolete = currentLineProblem(store, address, ref);
+    return obsolete ?? delivered({ series: read.value, guards: [exactRef(ref)] });
+  });
+}
+
+function currentLineProblem(store: Store, address: Address, ref?: Ref): OmResult<never> | null {
+  return store.get(ownerSeriesId(address.project, address.owner, address.line + 1))
+    ? problem("series_conflict", "New work belongs to the current successor of this lineage", { target: address.id, ref }, "line")
+    : null;
+}
+
 /**
  * THE HISTORY OF THE STOPS of one line, inherited ones included — for a consumer that has to speak about a stop the
  * series has already answered: which goals it was counted over, what answered it, and what ended the window its
@@ -691,8 +713,8 @@ function prepareOpen(store: Store, request: AnyOpenSeriesRequest): OmResult<Prep
       && hashJson(held.predecessor) === hashJson(predecessor) && hashJson(held.basis) === hashJson(basis);
     if (same) {
       if (mechanism && "owner" in held && canonical(normalizedScope(request.scope)) !== canonical(normalizedScope(held.scope))) {
-        if (store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
-          return problem("series_conflict", "Fresh work cannot return to an older line after its successor exists", { target: address.id, ref: reference(standing.value) }, "line");
+        const obsolete = currentLineProblem(store, address, reference(standing.value));
+        if (obsolete) return obsolete;
         const fresh = projectMechanismSlice(store, address.project, request.scope, true);
         if (!fresh.ok) return fresh;
         return unchanged(standing.value, fresh.value.guards);
@@ -727,8 +749,8 @@ function prepareOpen(store: Store, request: AnyOpenSeriesRequest): OmResult<Prep
     predecessor, basis, inherited, attempts: [], continuations: carried, escalations: escalated,
   } as SeriesDraft);
   // Claim the old line in the same CAS transaction. Its unchanged body remains historical, while its new revision
-  // invalidates a previously prepared attempt on that old line in either transaction ordering.
-  const claim: PreparedWrite[] = mechanism && earlier ? [{ id: earlier.id, kind: REPAIR_SERIES_KIND,
+  // invalidates previously prepared work on that old line in either transaction ordering.
+  const claim: PreparedWrite[] = earlier ? [{ id: earlier.id, kind: REPAIR_SERIES_KIND,
     expected: earlier.revision, value: earlier.value }] : [];
   return change(address, value, 0, [...sourceGuards, ...(predecessor === null ? [] : [predecessor])], null, claim);
 }
@@ -761,6 +783,8 @@ function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<P
     }
     return problem("attempt_conflict", `Attempt ${request.attempt} was begun for another goal, and a later goal does not replace it`, context, "goal");
   }
+  const obsolete = currentLineProblem(store, address, reference(head));
+  if (obsolete) return obsolete;
   let admission: SeriesAdmissionProof | null = null;
   if ("owner" in request) {
     const admitted = prepareSeriesAdmission(store, request, request.admission);
@@ -872,8 +896,8 @@ function prepareResume(store: Store, request: AnyResumeSeriesRequest): OmResult<
     if (hashJson(continuationOf(already)) === hashJson(basis)) return unchanged(head);
     return problem("continuation_conflict", `The stop after attempt ${request.stop} is continued already, and a later ground does not replace the earlier one`, context, "ground");
   }
-  if (address.owner.kind === "mechanism" && store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
-    return problem("series_conflict", "A new continuation or escalation belongs to the existing successor", context, "line");
+  const obsolete = currentLineProblem(store, address, reference(head));
+  if (obsolete) return obsolete;
   const stop = held.stop;
   if (stop === null || stop.attempt !== request.stop) {
     return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
@@ -922,8 +946,8 @@ function prepareEscalate(store: Store, request: AnyEscalateSeriesRequest): OmRes
     if (sameRef(already.review, escalation.review)) return unchanged(head);
     return problem("escalation_conflict", `The stop after attempt ${request.stop} was sent to the owner on another review already, and a later review does not replace it`, context, "review");
   }
-  if (address.owner.kind === "mechanism" && store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
-    return problem("series_conflict", "A new continuation or escalation belongs to the existing successor", context, "line");
+  const obsolete = currentLineProblem(store, address, reference(head));
+  if (obsolete) return obsolete;
   const stop = held.stop;
   if (stop === null || stop.attempt !== request.stop) {
     return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
@@ -1977,8 +2001,8 @@ function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admis
       throw new Error('Unreachable cycle refusal');
     });
   if (!current) return historical;
-  mechanismCheck(!store.get(ownerSeriesId(request.project, request.owner, request.line + 1)),
-    ownerSeriesId(request.project, request.owner, request.line), 'line', 'Current admission belongs to the latest mechanism successor');
+  const obsolete = currentLineProblem(store, seriesAddress(request));
+  if (obsolete) mechanismTake(obsolete);
   const scope = mechanismProjection(store, request.project, admission.gaps, true);
   const saved = mechanismTake(readRoutes(store, { project: request.project, record: admission.routes })).record.value.request;
   const prepared = mechanismTake(prepareRoutes(store, { ...saved, gaps: normalizedScope(saved.gaps),
@@ -2016,7 +2040,12 @@ function deriveMechanismAdmission(store: Store, request: MechanismSeriesRequest,
 export function prepareSeriesAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): OmResult<Sealed<SeriesAdmissionProof>> {
   requireStore(store); const address = seriesAddress(request); requireAdmission(admission);
   requireCondition(address.owner.kind === 'mechanism', 'series_request_invalid', 'This admission belongs to a mechanism');
-  return mechanismResult(() => mechanismAdmission(store, request, admission, true));
+  return mechanismResult(() => {
+    const read = mechanismTake(readAnySeries(store, request));
+    const line = mechanismTake(prepareSeriesLineAdmission(store, request.project, reference(read)));
+    const proof = mechanismAdmission(store, request, admission, true);
+    return { ...proof, guards: refsUnique([...proof.guards, ...line.guards]) };
+  });
 }
 interface MechanismAdmissionRequest {
   project: string; series: Ref; attempt: number; admission: MechanismAdmission; current: boolean;
@@ -2047,26 +2076,22 @@ function readMechanismAttemptAdmission(store: Store, request: MechanismAdmission
     const admitted = value.admissions.find(row => row.attempt === request.attempt);
     mechanismCheck(attempt && admitted, request.series.id, 'admission', 'The admission belongs to this exact saved attempt');
     const address = { project: request.project, owner: value.owner, line: value.line };
+    const line = request.current ? mechanismTake(prepareSeriesLineAdmission(store, request.project, request.series)) : null;
     if (purpose === 'analysis') {
       const original = mechanismAdmission(store, address, admitted.basis, false);
-      if (request.current) {
-        const head = store.get(request.series.id);
-        mechanismCheck(head && canonical(reference(head)) === canonical(request.series)
-          && !store.get(ownerSeriesId(request.project, value.owner, value.line + 1)),
-        request.series.id, 'line', 'A new analysis belongs to the current successor of the mechanism lineage');
-      }
       const sameSources = canonical(normalizedAdmission(request.admission)) === canonical(normalizedAdmission(admitted.basis));
       const sources = sameSources ? original : mechanismAdmission(store, address, request.admission, request.current);
       return { ...original, series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal,
         references: refsUnique([...original.references, ...sources.references, request.series]),
-        guards: request.current ? refsUnique([request.series, ...(sameSources ? [] : sources.guards)]) : [] };
+        guards: request.current ? refsUnique([...line!.guards, ...(sameSources ? [] : sources.guards)]) : [] };
     }
     const proof = mechanismAdmission(store, address, request.admission, request.current);
     const original = mechanismProjection(store, request.project, admitted.basis.gaps, false);
     mechanismCheck(proof.slice === original.slice, request.series.id, 'admission.scope', 'A refreshed admission must preserve the exact semantic task and consumer conditions');
     mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
       request.series.id, 'goal', 'The complete selected task must equal the declared goal');
-    return { ...proof, series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal };
+    return { ...proof, guards: refsUnique([...proof.guards, ...(line?.guards ?? [])]),
+      series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal };
   });
 }
 

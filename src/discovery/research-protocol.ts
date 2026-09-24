@@ -1,7 +1,7 @@
 import { normalizeResearchAction } from './research-action-normalization.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
-import { processStart } from "../runtime/process-identity.js";
+import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview } from './research-preview.js';
@@ -195,14 +195,13 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
       value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
   }
-  const ownerProcess=packetState?{pid:process.pid,started:processStart(process.pid)}:null;
-  requireCondition(!ownerProcess||ownerProcess.started,'model_call_identity_missing','Research owner identity must be saved before dispatch');
+  const ownership = audit ? physicalClaim() : null;
   consumeInvocationAllowance();
   let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
-      ...(ownerProcess?{ownerProcess}:{}),
+      ...(ownership ?? {}),
       profile: audit.pilot ? reference(audit.pilot) : null,
       questionId: audit.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
@@ -213,11 +212,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       response: null, usage: null, usageSource: "unavailable", error: null } }, ...reservation.writes], reservation.guards)[0]! : null;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
+  let physicalResult: import('../runtime/process.js').ProcessResult | null = null;
   try {
     const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, signal, true, pid=>{
-      if(call&&audit&&packetState){const started=processStart(pid);requireCondition(started,'model_call_identity_missing','Provider identity could not be recorded');
-        call=audit.store.write<ModelCall>({id:call.id,kind:call.kind,expected:call.revision,value:{...call.value,providerProcess:{pid,started}}});}
+      if(call&&audit) call = authorizeModelDispatch(audit.store, reference(call), pid);
     });
+    physicalResult = result;
     rawResponse = result.stdout;
     patch.response = { chars: result.stdout.length, bytes: Buffer.byteLength(result.stdout) };
     let response: { protocol?: unknown; requestId?: unknown; research?: unknown; usage?: unknown; confirmed?: unknown } | null = null;
@@ -250,9 +250,18 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         responseWrites.push(saved);
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
-      call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision,
-        value: { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
-          ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) } }, ...responseWrites])[0]!;
+      try {
+        call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision,
+          value: { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
+            ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) } }, ...responseWrites])[0]!;
+      } catch (error) {
+        if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code) || !physicalResult) throw error;
+        // A recovery may win the runtime CAS. Keep the observed physical bytes
+        // under the same authorized dispatch instead of dropping paid evidence.
+        const late = prepareLateModelReceipt(audit.store, environment.projectId, reference(call), { process: physicalResult, launchError: null });
+        audit.store.writeMany(late.writes, late.guards);
+        throw error;
+      }
       if (segment && budgetUsage(audit.store, segment).measured > segment.value.limit) {
         audit.store.write({ id: `budget-incident:${requestId}`, kind: "budget-incident", expected: 0,
           value: { projectId: environment.projectId, segment: reference(segment), call: reference(call), reason: "Actual provider usage exceeded the experimental forecast and the owner budget; further calls are forbidden" } });

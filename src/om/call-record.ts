@@ -8,7 +8,7 @@ import { readStopContext, readOriginHoldAt } from "./repeat-gate.js";
 import { writeGuarded } from "./refs.js";
 import { withHistoricalReads } from "./input.js";
 import {
-  readSeriesAt, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
+  prepareSeriesLineAdmission, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
   type AttemptGoal, type MechanismAdmission, type SeriesOwner,
 } from "./series.js";
 
@@ -226,6 +226,27 @@ function readCallInScope(store: Store, project: string, ref: Ref): OmResult<Seal
     return problem("call_unresolved", "No call record stands at this exact reference", ref.id, "call", "producer", ref);
   }
   return checkedCall(store, record, project, ref.id);
+}
+
+/**
+ * Authorizes a NEW process launch using the same purpose-specific admission as recordCall. The transport includes
+ * these guards in its launch transaction; saved-response replay and settlement use historical readCall instead.
+ */
+export function prepareCallDispatch(
+  store: Store, project: string, callRef: Ref,
+): OmResult<Sealed<{ readonly call: Revision<AnyCallRecord>; readonly guards: readonly Ref[] }>> {
+  return withHistoricalReads(() => {
+    const read = readCallInScope(store, project, callRef);
+    if (!read.ok) return read;
+    const head = store.get(callRef.id);
+    if (read.value.value.status !== "open" || !head || !sameRef(reference(head), callRef))
+      return problem("call_unresolved", "A new dispatch requires the exact open call head", callRef.id, "call", "producer", callRef);
+    const dispatch = resolveDispatch(store, read.value.value.dispatch, callRef.id);
+    if (!dispatch.ok) return dispatch;
+    const series = resolveSeries(store, project, read.value.value, callRef.id);
+    if (!series.ok) return series;
+    return delivered({ call: read.value, guards: uniqueRefs([callRef, ...dispatch.value, ...series.value]) });
+  });
 }
 
 /**
@@ -521,18 +542,15 @@ function resolveDispatch(store: Store, dispatch: DispatchContract, target: strin
 
 function resolveSeries(store: Store, project: string, request: CheckedRequest, target: string): OmResult<Sealed<readonly Ref[]>> {
   if ("owner" in request) return resolveMechanismSeries(store, project, request, target, true);
-  const read = readSeriesAt(store, project, request.series);
-  if (!read.ok || read.value.value.block !== request.block) {
-    return problem("call_series_unresolved", "The call's exact valid series does not belong to this project and block",
+  const admission = prepareSeriesLineAdmission(store, project, request.series);
+  if (!admission.ok || "owner" in admission.value.series.value || admission.value.series.value.block !== request.block) {
+    return problem("call_series_unresolved", "The call requires its exact valid current series on this project's current block line",
       target, "series", "producer", request.series);
   }
-  // Historical ownership is common A3 work; admission separately requires its current guarded head.
-  const current = store.get(request.series.id);
-  if (!current || !sameRef(reference(current), request.series)) {
-    return problem("call_series_unresolved", "The call names the current valid series head", target, "series", "producer", request.series);
-  }
-  const line = read.value.value.line;
-  const attempt = [...read.value.value.inherited, ...read.value.value.attempts].find(item => item.ordinal === request.attempt);
+  const read = admission.value.series;
+  const guards = admission.value.guards;
+  const line = read.value.line;
+  const attempt = [...read.value.inherited, ...read.value.attempts].find(item => item.ordinal === request.attempt);
   if (request.purpose === "model-research" || request.purpose === "model-design") {
     if (!attempt || attempt.outcome !== null) {
       return problem("call_series_unresolved", "An ordinary model call belongs to an attempt that is currently running",
@@ -541,7 +559,7 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
     if (hashJson(copyGoal(attempt.goal)) !== hashJson(request.goal)) {
       return problem("call_goal_conflict", "The call goal is not the goal recorded before this attempt began", target, "goal", "gap", request.series);
     }
-    return delivered([exactRef(request.series)]);
+    return delivered(guards);
   }
   if (!attempt || attempt.outcome === null) {
     return problem("call_basis_unresolved", "An analysis call belongs to a completed attempt at its saved ground",
@@ -549,14 +567,14 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
   }
   if (request.purpose === "stop-analysis") {
     const basis = request.basis as SeriesStopBasis;
-    const stop = read.value.value.stop;
+    const stop = read.value.stop;
     if (!sameRef(basis.series, request.series) || basis.attempt !== request.attempt || stop === null
       || stop.attempt !== request.attempt || !stop.attempts.includes(request.attempt)
-      || !read.value.value.ladder.grounds.includes("review-record")) {
+      || !read.value.ladder.grounds.includes("review-record")) {
       return problem("call_basis_unresolved", "The call names its current saved stop on the rung that admits a review",
         target, "basis", "producer", basis.series);
     }
-    return delivered([exactRef(request.series)]);
+    return delivered(guards);
   }
   const basis = request.basis as OriginHoldBasis;
   const context = readStopContext(store, { project, block: request.block, line });
@@ -569,7 +587,7 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
     return problem("call_basis_unresolved", "The call names its exact current origin hold and the attempt that raised it",
       target, "basis", "producer", basis.hold);
   }
-  return delivered(uniqueRefs([request.series, ...context.value.reads]));
+  return delivered(uniqueRefs([...guards, ...context.value.reads]));
 }
 
 /** The admission proof is common A3 work; E1 only binds its own dispatch address and purpose to it. */

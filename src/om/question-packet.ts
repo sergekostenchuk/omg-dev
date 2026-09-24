@@ -1,7 +1,8 @@
 import { Ajv } from 'ajv';
 import type { Selector } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
-import { readCall } from './call-record.js';
+import { readCall, type AnyCallRecord } from './call-record.js';
+import { readContinuationEvidence, prepareModelAttemptFinish } from './model-call.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { boundedContext } from '../compiler/context.js';
 import { Discovery } from '../discovery/discovery.js';
@@ -16,7 +17,7 @@ import { readCapacity } from './capacity.js';
 import { prepareRoutes, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, type FrameObligation } from './frame-obligations.js';
-import { readSeries, type RepairSeries } from './series.js';
+import { readSeries, readAnySeriesAt, readMechanismAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
 import { prepareGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
@@ -28,7 +29,7 @@ export const QUESTION_PACKET_CODES = Object.freeze([
   'question_packet_request_invalid', 'packet_task_set_invalid', 'packet_attempt_invalid', 'packet_record_invalid',
   'packet_series_unsupported',
   'packet_context_unbounded', 'packet_too_large', 'node_unexpandable', 'packet_batch_invalid', 'packet_chain_invalid',
-  'part_result_invalid', 'part_answer_invalid',
+  'part_result_invalid', 'part_answer_invalid', 'research_no_progress',
 ] as const);
 export interface QuestionTaskRequest {
   project: string;
@@ -132,10 +133,12 @@ export interface QuestionPacketRequest {
   project: string; routes: Ref; batch: string | null; environment: Ref;
   attempt: { series: Ref; ordinal: number } | null;
   previous: { packet: Ref; proposal: Ref; result: Ref }[];
+  continuation?: { packet: Ref; call: Ref; response: Ref; deliveries: Ref[] };
 }
 export interface QuestionPacketRecord {
   project: string; request: QuestionPacketRequest; state: 'ready' | 'blocked' | 'empty';
   answerProtocol?: 'omg-answer/v2';
+  packetContract?: 'om-packet/v3';
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -147,10 +150,11 @@ export interface PreparedQuestionPacket {
 export const QUESTION_PACKET_KIND = 'question-packet';
 const packetNamespace = (project: string) => `om-question-packet:${project}:`;
 export const PACKET_ANSWER_PROTOCOL = 'omg-answer/v2' as const;
-const packetKey = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol']) =>
-  hashJson(protocol ? { protocol, request } : request);
-const packetId = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol']) =>
-  `${packetNamespace(request.project)}${packetKey(request, protocol)}`;
+export const PACKET_CONTRACT = 'om-packet/v3' as const;
+const packetKey = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol'], contract?: QuestionPacketRecord['packetContract']) =>
+  hashJson(contract ? { contract, protocol, request } : protocol ? { protocol, request } : request);
+const packetId = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol'], contract?: QuestionPacketRecord['packetContract']) =>
+  `${packetNamespace(request.project)}${packetKey(request, protocol, contract)}`;
 const json = (value: unknown) => copy(value) as Json;
 function requirePacket(store: Store, value: unknown): asserts value is QuestionPacketRequest {
   if (!(store instanceof Store) || !object(value) || !text(value.project) || !isRef(value.routes)
@@ -160,7 +164,12 @@ function requirePacket(store: Store, value: unknown): asserts value is QuestionP
       && Object.keys(value.attempt).every(key => ['series', 'ordinal'].includes(key))))
     || !Array.isArray(value.previous) || !value.previous.every(item => object(item) && isRef(item.packet) && isRef(item.proposal) && isRef(item.result)
       && Object.keys(item).every(key => ['packet', 'proposal', 'result'].includes(key)))
-    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous'].includes(key))) invalid('request');
+    || Object.hasOwn(value, 'continuation') && (!object(value.continuation)
+      || ![value.continuation.packet, value.continuation.call, value.continuation.response].every(isRef)
+      || !Array.isArray(value.continuation.deliveries) || !value.continuation.deliveries.length
+      || !value.continuation.deliveries.every(isRef)
+      || Object.keys(value.continuation).some(key => !['packet', 'call', 'response', 'deliveries'].includes(key)))
+    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous', 'continuation'].includes(key))) invalid('request');
 }
 function head(store: Store, ref: Ref) {
   const found = store.get(ref.id);
@@ -174,13 +183,21 @@ function pinned(store: Store, record: Revision<unknown>): Store {
   } });
 }
 function previousRefusals(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, gaps: GapRecords, current: boolean,
-  savedJournal: Ref | null | undefined, guards: Ref[], references: Ref[]) {
+  savedJournal: Ref | null | undefined, guards: Ref[], references: Ref[], contract: QuestionPacketRecord['packetContract']) {
   if (!request.attempt) fail('packet_attempt_invalid', batch.id, 'attempt', 'A model packet needs the attempt declared before assembly');
   const ref = request.attempt.series;
-  const record = take(readRecord<RepairSeries>(store, ref, { unit: 'E2', target: batch.id,
+  const record = take(readRecord<AnyRepairSeries>(store, ref, { unit: 'E2', target: batch.id,
     idPrefix: `repair-series:${request.project}:`, kind: 'repair-series' }));
   const value = record.value;
-  const checked = take(readSeries(pinned(store, record), { project: request.project, block: value.block, line: value.line }));
+  const mechanism = contract === PACKET_CONTRACT && 'owner' in value;
+  if ('owner' in value && !mechanism)
+    fail('packet_series_unsupported', batch.id, 'attempt', 'This historical packet era does not admit mechanism-owned series', ref);
+  const proof = mechanism ? take(readMechanismAdmission(store, { project: request.project, series: ref,
+    attempt: request.attempt.ordinal, admission: { routes: request.routes, batch: batch.id,
+      gaps: { sources: gaps.sources, records: gaps.records.map(reference) } }, current })) : null;
+  const checked = proof?.series ?? take(readSeries(pinned(store, record), { project: request.project,
+    block: (value as RepairSeries).block, line: value.line }));
+  if (proof) { guards.push(...proof.guards); references.push(...proof.references); }
   const attempt = checked.value.attempts.find(item => item.ordinal === request.attempt!.ordinal);
   if (!attempt || attempt.outcome !== null || checked.value.stop)
     fail('packet_attempt_invalid', batch.id, 'attempt', 'This exact series does not contain the declared running attempt');
@@ -189,13 +206,13 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   for (const item of batch.items) {
     const gap = gaps.records.find(row => same(reference(row), item.record))?.value.gap;
     if (!gap) fail('packet_batch_invalid', item.target, 'gap', 'The routed item has no exact D1 source');
-    if (!gap.consumers.length && gap.mechanism)
+    if (!mechanism && !gap.consumers.length && gap.mechanism)
       fail('packet_series_unsupported', item.target, item.field,
         `Серия механизма не поддержана: ${gap.mechanism}; необходим договор владельца серии A3`, item.record);
     if (!attempt.goal.questions.includes(gapLineKey(request.project, item.target, item.field))
       || attempt.goal.result !== gapLineExpectedResult(request.project, item.target, item.field)
-      || !gap.consumers.includes(checked.value.block)
-      || batch.task === 'node-expansion' && batch.level === 2 && checked.value.block !== batch.node)
+      || !mechanism && (!gap.consumers.includes((checked.value as RepairSeries).block)
+      || batch.task === 'node-expansion' && batch.level === 2 && (checked.value as RepairSeries).block !== batch.node))
       fail('packet_attempt_invalid', item.target, 'attempt.goal',
         'The declared attempt must name this result at its exact gap-line address and belong to its consumer', item.record);
   }
@@ -334,8 +351,51 @@ function expansionContext(frame: FrameProposals, node: string) {
     reserved: frame.result.representatives.map(item => item.id).sort(order), previous: [] as Json[] };
 }
 
-function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord) {
+function deriveContinuation(store: Store, request: QuestionPacketRequest, current: boolean) {
+  const continuation = request.continuation!;
+  const prior = loadPacket(store, request.project, continuation.packet);
+  const { continuation: _priorContinuation, ...priorRoot } = prior.value.request;
+  const { continuation: _continuation, ...root } = request;
+  if (prior.value.packetContract !== PACKET_CONTRACT || prior.value.state !== 'ready' || !object(prior.value.packet)
+    || !same(root, priorRoot))
+    fail('packet_chain_invalid', continuation.packet.id, 'continuation',
+      'A continuation preserves the exact ready assignment, sources and attempt of its current-contract predecessor');
+  // Reuse the saved native questions and part assignment while checking today's admission dependencies.
+  const priorDerived = derivePacket(store, prior.value.request, current, prior.value as QuestionPacketRecord);
+  const evidence = take(readContinuationEvidence(store, { project: request.project, ...continuation }, current));
+  const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
+  const guards = [...priorDerived.guards, ...capacity.guards, ...evidence.guards];
+  if (current) {
+    for (const ref of [continuation.packet, continuation.response]) { head(store, ref); guards.push(ref); }
+    // Admission is revision one; an already settled call legitimately has a later current head.
+    guards.push(reference(store.get(continuation.call.id)!));
+  }
+  const requestId = packetKey(request, PACKET_ANSWER_PROTOCOL, PACKET_CONTRACT);
+  const payload = prior.value.packet;
+  const packet = json({ ...payload, version: 'om-question-packet/v3', requestId,
+    responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
+    sourceDeliveries: [...(Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : []),
+      { ...continuation, data: evidence.data }] });
+  const fingerprint = bounded(packet, capacity.maxRequestChars);
+  const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: PACKET_CONTRACT,
+    state: evidence.novel && fingerprint ? 'ready' : 'blocked', packet: evidence.novel && fingerprint ? packet : null,
+    fingerprint: evidence.novel ? fingerprint : null, fullChars: canonical(packet).length,
+    refusal: !evidence.novel ? { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt',
+      at: { unit: 'E2', target: request.batch!, field: 'continuation', ref: continuation.response }, route: 'producer' }
+      : fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
+  return { value, guards: unique(guards), references: unique([...priorDerived.references, continuation.packet,
+    ...capacity.references, ...evidence.references]), writes: [] as Write[] };
+}
+function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord): {
+  value: QuestionPacketRecord; guards: Ref[]; references: Ref[]; writes: Write[];
+} {
   const protocol = saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL;
+  const contract = saved ? saved.packetContract : PACKET_CONTRACT;
+  if (request.continuation) {
+    if (contract !== PACKET_CONTRACT)
+      fail('packet_record_invalid', request.continuation.packet.id, 'packetContract', 'A historical packet cannot acquire continuation semantics');
+    return deriveContinuation(store, request, current);
+  }
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
   const references: Ref[] = [...routes.references, request.routes], guards: Ref[] = [];
   if (current) {
@@ -349,7 +409,8 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
   if (request.batch !== null && !batch || request.batch === null && routes.record.value.batches.length)
     fail('packet_batch_invalid', request.routes.id, 'batch', 'Name an exact routed model batch; absence is valid only without routed work');
-  const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}), state: 'empty', packet: null, fingerprint: null,
+  const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}),
+    ...(contract ? { packetContract: contract } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
@@ -358,7 +419,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
   guards.push(...capacity.guards); references.push(...capacity.references);
   const gaps = take(readGaps(store, routes.record.value.request.gaps)) as GapRecords;
-  const retry = previousRefusals(store, request, batch, gaps, current, saved?.journal, guards, references);
+  const retry = previousRefusals(store, request, batch, gaps, current, saved?.journal, guards, references, contract);
   base.journal = retry.journal;
   const tasks: CheckedAnswerTask[] = [];
   const questions = batch.items.map(item => {
@@ -377,8 +438,8 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       ...(batch.task === 'node-expansion' ? {} : { question: gap.value.gap.evidence.map(entry => ({ origin: entry.origin, value: entry.value })) }) };
   });
   ownRequirements(tasks);
-  const requestId = packetKey(request, protocol);
-  const common = { version: protocol ? 'om-question-packet/v2' : 'om-question-packet/v1', requestId, model: batch.model,
+  const requestId = packetKey(request, protocol, contract);
+  const common = { version: contract ? 'om-question-packet/v3' : protocol ? 'om-question-packet/v2' : 'om-question-packet/v1', requestId, model: batch.model,
     purpose: batch.model === 'MC1' ? 'model-research' : 'model-design', task: batch.task, kind: batch.kind, questions,
     responseForm: protocol ? { protocol, requestId, schema: packetAnswerSchema(batch.task === 'node-expansion' ? 'node' : batch.model === 'MC1' ? 'fact' : 'field') }
       : batch.task === 'node-expansion'
@@ -413,7 +474,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       assignments.at(-1)!.obligations.push(...open.filter(item => !item.connector).map(item => item.id));
       assignments.forEach(item => item.obligations.sort(order));
       base.plan = { mode: 'parts', assignments, position: request.previous.length };
-      context.previous = previousParts(store, request, base.plan, references, protocol);
+      context.previous = previousParts(store, request, base.plan, references, protocol, contract);
       context.reserved = unique([...context.reserved, ...context.previous.flatMap(item => (item as unknown as {nodes: Graph['nodes']}).nodes.map(node => node.id))]);
       if (request.previous.length === assignments.length)
         return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
@@ -463,11 +524,17 @@ function loadPacket(store: Store, project: string, ref: Ref): Revision<QuestionP
     const request = record.value.request;
     if (record.value.answerProtocol !== undefined && record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL)
       fail('packet_record_invalid', ref.id, 'answerProtocol', 'The packet answer contract era is unsupported');
-    if (request.project !== project || record.id !== packetId(request, record.value.answerProtocol) || record.revision !== 1)
+    if (record.value.packetContract !== undefined && (record.value.packetContract !== PACKET_CONTRACT
+      || record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL))
+      fail('packet_record_invalid', ref.id, 'packetContract', 'The packet derivation contract era is unsupported');
+    if (request.project !== project || record.id !== packetId(request, record.value.answerProtocol, record.value.packetContract) || record.revision !== 1)
       fail('packet_record_invalid', ref.id, 'request', 'A packet preserves the identity of its exact immutable source request');
     const expected = derivePacket(store, request, false, record.value as QuestionPacketRecord);
     if (!same(expected.value, record.value))
       fail('packet_record_invalid', ref.id, 'value', 'The complete packet, assignment and native bindings must follow from their exact sources');
+    const completion = continuationFinish(store, record.value as QuestionPacketRecord);
+    if (completion?.writes.length)
+      fail('packet_record_invalid', ref.id, 'completion', 'The no-progress packet and its completed attempt must be saved together');
     return record as Revision<QuestionPacketRecord>;
   }, () => fail('packet_chain_invalid', ref.id, 'previous', 'The packet history contains a cycle'));
 }
@@ -475,24 +542,44 @@ export function readQuestionPacket(store: Store, request: { project: string; rec
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
   return result(() => loadPacket(store, request.project, request.record));
 }
+function continuationFinish(store: Store, record: QuestionPacketRecord) {
+  const continuation = record.request.continuation;
+  if (record.refusal?.code !== 'research_no_progress' || !continuation) return null;
+  return take(prepareModelAttemptFinish(store, { project: record.project, packet: continuation.packet,
+    call: continuation.call, response: continuation.response, reason: 'refused', code: record.refusal.code,
+    message: record.refusal.message, evidence: continuation.deliveries }));
+}
 export function prepareQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
   requirePacket(store, request); request = copy(request);
   return result(() => {
-    const old = store.get<QuestionPacketRecord>(packetId(request, PACKET_ANSWER_PROTOCOL));
+    const old = store.get<QuestionPacketRecord>(packetId(request, PACKET_ANSWER_PROTOCOL, PACKET_CONTRACT));
     const checked = old ? loadPacket(store, request.project, reference(old)) : undefined;
+    // A completed no-progress transition is a technical repeat, not a new admission.
+    if (checked?.value.refusal?.code === 'research_no_progress') {
+      return { record: checked, existing: true, writes: [], guards: [], references: [reference(checked)] };
+    }
     const derived = derivePacket(store, request, true, checked?.value);
     if (checked && !same(checked.value, derived.value))
       fail('packet_record_invalid', checked.id, 'value', 'An existing packet cannot change without a new source request');
-    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, PACKET_ANSWER_PROTOCOL), kind: QUESTION_PACKET_KIND,
+    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, PACKET_ANSWER_PROTOCOL, PACKET_CONTRACT), kind: QUESTION_PACKET_KIND,
       revision: 1, hash: hashJson(derived.value), value: derived.value };
+    const finished = continuationFinish(store, record.value);
     return { record, existing: Boolean(checked), references: derived.references,
-      guards: unique([...derived.guards, ...(checked ? [reference(checked)] : [])]),
-      writes: [...derived.writes, ...(checked ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }])] };
+      guards: unique([...derived.guards, ...(finished?.guards ?? []), ...(checked ? [reference(checked)] : [])]),
+      writes: [...derived.writes, ...(finished?.writes ?? []), ...(checked ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }])] };
   });
 }
 export function writeQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
   requirePacket(store, request);
   return result(() => {
+    // Replaying a saved delivery transition does not admit another physical call.
+    // Dispatch still requires prepareQuestionPacket's fresh current admission.
+    const old = request.continuation || request.previous.length > 0
+      ? store.get(packetId(request, PACKET_ANSWER_PROTOCOL, PACKET_CONTRACT)) : null;
+    if (old) {
+      const record = loadPacket(store, request.project, reference(old));
+      return { record, existing: true, writes: [], guards: [], references: [reference(record)] };
+    }
     const prepared = take(prepareQuestionPacket(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'E2', target: prepared.record.id,
       writes: prepared.writes, guards: prepared.guards }));
@@ -502,6 +589,9 @@ export function writeQuestionPacket(store: Store, request: QuestionPacketRequest
 
 export interface PartResponseRecord { project: string; packet: Ref; call: Ref; requestId: string; raw: string }
 export interface PartResultRequest { project: string; packet: Ref; call: Ref; response: Ref }
+export interface PreparePartResultRequest extends Omit<PartResultRequest, 'response'> {
+  response: Ref | { pending: Write };
+}
 export interface PartResultRecord { project: string; request: PartResultRequest; proposal: Ref }
 export interface CheckedPartResult { record: Revision<PartResultRecord>; proposal: Revision<LayerProposal>; references: Ref[] }
 export const PART_RESPONSE_KIND = 'part-response';
@@ -723,20 +813,38 @@ export function derivePartProposal(store: Store, request: PacketAnswerRequest): 
     return { packet: checked.packet as Revision<QuestionPacketRecord>, proposal: derived.proposal, references: derived.references };
   });
 }
-function partSource(store: Store, request: PartResultRequest) {
+export interface CheckedPacketResponse {
+  record: Revision<PartResponseRecord>; packet: Revision<QuestionPacketRecord>; call: Revision<AnyCallRecord>; references: Ref[];
+}
+/** Common packet/call/response provenance. Content parsing and acceptance remain separate. */
+export function readPacketResponse(store: Store, request: PartResultRequest): OmResult<Sealed<CheckedPacketResponse>> {
+  requirePart(store, request); request = copy(request);
+  return result(() => packetResponse(store, request));
+}
+function packetResponse(store: Store, request: PartResultRequest): CheckedPacketResponse {
   const packet = loadPacket(store, request.project, request.packet);
-  const { value, payload, expansion, routes, batch, frameSource } = partContext(store, request.project, packet);
+  const value = packet.value;
+  if (value.state !== 'ready' || !object(value.packet) || !value.request.attempt || !value.fingerprint)
+    fail('part_result_invalid', packet.id, 'packet', 'A response needs an exact ready assignment and its declared attempt');
+  const payload = value.packet;
+  const routes = take(readRoutes(store, { project: request.project, record: value.request.routes }));
+  const batch = routes.record.value.batches.find(item => item.id === value.request.batch)!;
   const call = take(readCall(store, request.project, request.call));
-  const series = take(readRecord<RepairSeries>(store, value.request.attempt!.series, { unit: 'E2', target: request.packet.id,
-    idPrefix: `repair-series:${request.project}:`, kind: 'repair-series' }));
+  const series = take(readAnySeriesAt(store, request.project, value.request.attempt.series));
   const goal = series.value.attempts.find(item => item.ordinal === value.request.attempt!.ordinal)!.goal;
-  const assigned = new Set(expansion.assigned);
-  const addressed = sorted(batch.items.filter(item => assigned.has(item.target)).flatMap(item => item.consumers.map(consumer =>
-    ({ id: item.target, goal: item.target, field: item.field, consumer }))));
+  const assigned = new Set((payload.questions as { id: string }[]).map(item => item.id));
+  const addressed = sorted(batch.items.filter(item => assigned.has(item.gap)).flatMap(item =>
+    ('owner' in series.value ? [series.value.owner] : item.consumers).map(consumer =>
+    ({ id: 'owner' in series.value ? item.gap : item.target, goal: item.target, field: item.field, consumer }))));
   const fingerprint = value.fingerprint!;
-  if (call.revision !== 1 || call.value.call !== payload.requestId || call.value.purpose !== 'model-design' || call.value.basis !== null
+  const ownerMatches = 'owner' in series.value ? 'owner' in call.value && same(call.value.owner, series.value.owner)
+    && same(call.value.admission.routes, value.request.routes) && call.value.admission.batch === value.request.batch
+    && same(call.value.admission.gaps.sources, routes.record.value.request.gaps.sources)
+    && same(sorted(call.value.admission.gaps.records), sorted(routes.record.value.request.gaps.records))
+    : !('owner' in call.value) && call.value.block === series.value.block;
+  if (call.revision !== 1 || call.value.call !== payload.requestId || call.value.purpose !== payload.purpose || call.value.basis !== null
     || !same(call.value.series, value.request.attempt!.series) || call.value.attempt !== value.request.attempt!.ordinal
-    || !same(call.value.goal, goal) || call.value.block !== series.value.block || !same(sorted(call.value.gaps), addressed)
+    || !same(call.value.goal, goal) || !ownerMatches || !same(sorted<unknown>(call.value.gaps), addressed)
     || !same(call.value.packet, { hash: fingerprint.hash, chars: fingerprint.chars, bytes: fingerprint.utf8Bytes }))
     fail('part_result_invalid', request.call.id, 'call', 'The admitted call must name this exact packet, attempt, goal and assigned questions');
   const response = take(readRecord<PartResponseRecord>(store, request.response, { unit: 'E2', target: request.call.id,
@@ -747,6 +855,13 @@ function partSource(store: Store, request: PartResultRequest) {
     || response.value.requestId !== payload.requestId || typeof response.value.raw !== 'string'
     || Object.keys(response.value).some(key => !['project', 'packet', 'call', 'requestId', 'raw'].includes(key)))
     fail('part_result_invalid', request.response.id, 'response', 'The immutable adapter response must belong to the sent request and admitted call');
+  return { record: response as Revision<PartResponseRecord>, packet, call: call as Revision<AnyCallRecord>,
+    references: unique([request.packet, request.call, request.response, value.request.attempt.series, ...routes.references]) };
+}
+function partSource(store: Store, request: PartResultRequest) {
+  const checked = packetResponse(store, request);
+  const { frameSource } = partContext(store, request.project, checked.packet);
+  const response = checked.record;
   const derived = take(derivePartProposal(store, { project: request.project, packet: request.packet, raw: response.value.raw }));
   const proposalValue = derived.proposal as LayerProposal;
   const key = hashJson(request);
@@ -755,7 +870,7 @@ function partSource(store: Store, request: PartResultRequest) {
   const resultValue: PartResultRecord = { project: request.project, request, proposal: reference(proposal) };
   const record: Revision<PartResultRecord> = { id: `om-part-result:${request.project}:${key}`, kind: PART_RESULT_KIND,
     revision: 1, hash: hashJson(resultValue), value: resultValue };
-  return { record, proposal, frameSource, references: unique([request.packet, request.call, request.response, ...derived.references, ...routes.references]) };
+  return { record, proposal, frameSource, references: unique([...checked.references, ...derived.references]) };
 }
 function checkedPart(store: Store, project: string, ref: Ref): CheckedPartResult {
   return historicalRead(store, { reader: 'E2.part-result', project, ref }, () => {
@@ -782,34 +897,60 @@ export function readPartResult(store: Store, request: { project: string; record:
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('part.read');
   return result(() => checkedPart(store, request.project, request.record));
 }
-/** E4 owns persistence. It adds this prepared proposal/result pair to its single guarded response transaction. */
-export function preparePartResult(store: Store, request: PartResultRequest): OmResult<Sealed<CheckedPartResult & { writes: Write[]; guards: Ref[] }>> {
-  requirePart(store, request); request = copy(request);
+/** E4 owns persistence. An unsaved response and its derived pair share one guarded transaction. */
+export function preparePartResult(store: Store, request: PreparePartResultRequest): OmResult<Sealed<CheckedPartResult & { writes: Write[]; guards: Ref[] }>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || ![request.packet, request.call].every(isRef)
+    || !(isRef(request.response) || object(request.response) && Object.keys(request.response).length === 1
+      && object(request.response.pending) && text(request.response.pending.id) && text(request.response.pending.kind)
+      && Number.isSafeInteger(request.response.pending.expected) && Object.hasOwn(request.response.pending, 'value')
+      && Object.keys(request.response.pending).every(key => ['id', 'kind', 'expected', 'value'].includes(key)))
+    || Object.keys(request).some(key => !['project', 'packet', 'call', 'response'].includes(key))) invalid('part');
+  request = copy(request);
   return result(() => {
-    const expected = partSource(store, request);
-    const packet = loadPacket(store, request.project, request.packet);
-    const current = take(prepareQuestionPacket(store, packet.value.request));
-    if (!same(reference(current.record), reference(packet)))
-      fail('part_result_invalid', packet.id, 'answerProtocol', 'An old packet cannot become a current-era admission');
+    const pending = isRef(request.response) ? null : request.response.pending;
+    if (pending && (pending.expected !== 0 || pending.kind !== PART_RESPONSE_KIND
+      || pending.id !== partResponseId(request.project, request.call)))
+      fail('part_result_invalid', request.call.id, 'response', 'A pending response creates the original exact adapter-response identity');
+    const response: Revision<PartResponseRecord> | null = pending ? { id: pending.id, kind: pending.kind,
+      revision: 1, hash: hashJson(pending.value), value: pending.value as PartResponseRecord } : null;
+    const stored = response ? store.get(response.id) : null;
+    if (stored && !same(stored, response))
+      fail('part_result_invalid', stored.id, 'response', 'A saved response cannot be replaced under its original identity');
+    const source: PartResultRequest = { ...request, response: response ? reference(response) : request.response as Ref };
+    const view = response && !stored ? new Proxy(store, { get(target, key) {
+      if (key === 'get') return (id: string, revision?: number) => id === response.id && (revision === undefined || revision === 1)
+        ? response : target.get(id, revision);
+      const member: unknown = Reflect.get(target, key, target);
+      return typeof member === 'function' ? member.bind(target) : member;
+    } }) : store;
+    const expected = partSource(view, source);
     const old = store.get(expected.record.id);
     if (old) {
       const existing = checkedPart(store, request.project, reference(old));
       if (!same(existing.record, expected.record)) fail('part_result_invalid', old.id, 'record', 'The result identity cannot be reused');
-      return { ...existing, writes: [], guards: unique([...current.guards, reference(old)]) };
+      return { ...existing, writes: [], guards: [reference(old)] };
     }
+    const packet = loadPacket(store, request.project, request.packet);
+    const current = take(prepareQuestionPacket(store, packet.value.request));
+    if (!same(reference(current.record), reference(packet)))
+      fail('part_result_invalid', packet.id, 'answerProtocol', 'An old packet cannot become a current-era admission');
     if (store.get(expected.proposal.id)) fail('part_result_invalid', expected.proposal.id, 'proposal', 'The proposal must be saved atomically with its result');
     return { record: expected.record, proposal: expected.proposal, references: expected.references,
-      guards: unique([...current.guards, request.response]), writes: [expected.proposal, expected.record].map(record =>
-        ({ id: record.id, kind: record.kind, expected: 0, value: record.value })) };
+      guards: unique([...current.guards, request.packet, reference(store.get(request.call.id)!),
+        ...(response && !stored ? [] : [source.response])]), writes: [...(pending && !stored ? [pending] : []),
+        ...[expected.proposal, expected.record].map(record => ({ id: record.id, kind: record.kind, expected: 0, value: record.value }))] };
   });
 }
 function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNullable<QuestionPacketRecord['plan']>, references: Ref[],
-  protocol: QuestionPacketRecord['answerProtocol']) {
+  protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract']) {
   if (request.previous.length > plan.assignments.length) fail('packet_chain_invalid', request.batch!, 'previous', 'The chain exceeds its assigned parts');
   return request.previous.map((item, index) => {
     const prior = loadPacket(store, request.project, item.packet);
-    const expected = { ...request, previous: request.previous.slice(0, index) };
-    if (prior.value.answerProtocol !== protocol || !same(prior.value.request, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'
+    const { continuation: _continuation, ...priorRequest } = prior.value.request;
+    const { continuation: _currentContinuation, ...rootRequest } = request;
+    const expected = { ...rootRequest, previous: request.previous.slice(0, index) };
+    if (prior.value.answerProtocol !== protocol || prior.value.packetContract !== contract
+      || !same(priorRequest, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'
       || prior.value.plan.position !== index || !same(prior.value.plan.assignments, plan.assignments))
       fail('packet_chain_invalid', item.packet.id, 'previous', 'A prior packet must be the preceding assignment of this same chain');
     const checked = checkedPart(store, request.project, item.result);

@@ -3,12 +3,25 @@ import type { RoleBinding } from "./environment.js";
 import { requireCondition } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { budgetUsage, workingLimit, type BudgetSegment } from './research-budget.js';
+import { readModelCallRecovery } from '../discovery/model-call-recovery.js';
+import { reference } from '../pipeline/contracts.js';
 
 export interface TokenUsage {
   inputTokens: number; outputTokens: number;
   cachedInputTokens: number | null; reasoningOutputTokens: number | null;
 }
+export interface ProcessIdentity { pid: number; started: string }
+/** In this era the adapter must wait for its stdin request before any model
+ * interaction. `authorized` is committed before runProcess transfers stdin. */
+export interface ModelExecution {
+  version: 'model-execution/v1';
+  phase: 'claimed' | 'authorized';
+  owner: ProcessIdentity;
+  provider: (ProcessIdentity & { group: number | null }) | null;
+}
 export interface ModelCall {
+  execution?: ModelExecution;
+  recovery?: Ref;
   runtime?: import('./call-runtime.js').CallRuntimeEvidence;
   projectId: string; draftId: string; purpose: string; requestId: string;
   profile?: Ref | null;
@@ -75,6 +88,11 @@ export function modelUsage(store: Store, project: string, since: number) {
       return { purpose, model, effort, requestedSpeed: speed,
         confirmedSpeeds: [...new Set(selected.map(record => record.value.confirmed.speed))],
         cumulative: summarize(selected), period: summarize(selected.filter(record => recent.includes(record))) };
+    }),
+    interruptions: calls.filter(record => record.value.error === 'process_lost').map(record => {
+      const proof = record.value.recovery ? readModelCallRecovery(store, project, reference(record)).proof : null;
+      return { id: record.id, recovery: record.value.recovery ?? null, usageKnown: record.value.usage !== null,
+        request: proof?.request ?? 'unknown', physical: proof?.physical ?? 'unknown' };
     }),
     active: calls.filter(record => record.value.status === "running").map(record => ({ id: record.id,
       draftId: record.value.draftId, questionId: record.value.questionId ?? null, purpose: record.value.purpose, model: record.value.requested.model,

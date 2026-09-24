@@ -15,7 +15,7 @@ import {
 } from "../src/om/refusal-journal.js";
 import {
   beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, readSeriesAt, readStopHistory, resumeSeries, seriesId,
-  prepareBeginAttempt, prepareCompleteAttempt, prepareEscalateSeries, prepareOpenSeries, prepareResumeSeries,
+  prepareBeginAttempt, prepareCompleteAttempt, prepareEscalateSeries, prepareOpenSeries, prepareResumeSeries, prepareSeriesLineAdmission,
   inputFixNamespace, ownerDecisionNamespace, stopReviewNamespace,
   ATTEMPT_VERDICTS, COMPLETION_REASONS, CONTINUATION_GROUNDS, INPUT_FIX_KIND, OWNER_DECISION_KIND,
   REPAIR_SERIES_KIND, SERIES_CODES, STOP_REVIEW_KIND, SUCCESSION_GROUNDS,
@@ -878,9 +878,10 @@ test("prepared changes of several series are applied by one transaction, or by n
   // A prepared change is a write and its guards, and nothing has been written yet.
   const one = prepare(BLOCK, first);
   const two = prepare(other, second);
-  assert.equal(one.writes.length, 1);
+  assert.equal(one.writes.length, 2);
   assert.equal(one.writes[0]!.kind, REPAIR_SERIES_KIND);
   assert.equal(one.writes[0]!.expected, 0);
+  assert.deepEqual(one.writes[1], { id: first.id, kind: REPAIR_SERIES_KIND, expected: first.revision, value: first.value });
   assert.deepEqual(one.guards, [reference(first)]);
   assert.deepEqual(one.value.inherited, []);
   assert.equal(store.get(seriesId(PROJECT, BLOCK, 2)), null);
@@ -913,9 +914,9 @@ test("prepared changes of several series are applied by one transaction, or by n
 
   // Nothing prevented: both successors and the transition are written by one transaction.
   const done = deliveredOf(apply([one, ready], [reference(store.get(g2.id)!)]));
-  assert.equal(done.length, 3);
+  assert.equal(done.length, 5);
   assert.deepEqual(done.map(record => record.id),
-    [seriesId(PROJECT, BLOCK, 2), seriesId(PROJECT, other, 2), "om-series-transition:alpha:7"]);
+    [seriesId(PROJECT, BLOCK, 2), first.id, seriesId(PROJECT, other, 2), second.id, "om-series-transition:alpha:7"]);
   // What was written is a series this unit reads back as its own, history and all.
   const carried = deliveredOf(readSeries(store, at(other, 2)));
   assert.equal(carried.value.inherited.length, 1);
@@ -2080,10 +2081,11 @@ test("an escalation outlives a successor and a change of slice, and a successor 
     assert.deepEqual(series.value.stop, first.value.stop);
     assert.deepEqual(series.value.ladder, first.value.ladder);
     for (const ground of [byReview(store, "long", 3), byFix(store, "long", base)]) {
-      addressed(refusalOf(resumeSeries(store, { ...at(line), stop: 3, ...ground })), "owner_required", "long", line);
+      addressed(refusalOf(resumeSeries(store, { ...at(line), stop: 3, ...ground })), line === 2 ? "series_conflict" : "owner_required", "long", line);
     }
     // The escalation it inherited is its own: the same request again is a repeat, another review a conflict.
-    assert.equal(deliveredOf(escalateSeries(store, { ...at(line), stop: 3, review: { ref: first.value.escalations[0]!.review } })).revision, series.revision);
+    assert.equal(deliveredOf(escalateSeries(store, { ...at(line), stop: 3, review: { ref: first.value.escalations[0]!.review } })).revision,
+      series.revision + (line === 2 ? 1 : 0)); // Opening line three claimed line two without changing its body.
     addressed(refusalOf(escalateSeries(store, { ...at(line), stop: 3, review: { ref: undecided(store, "long", 3) } })), "escalation_conflict", "long", line);
   }
 
@@ -3119,4 +3121,68 @@ test('A3.3 public A4 and D2 readers load independently in fresh Node processes w
     assert.equal(child.status, 0, `${entry} must initialize as the first OM entrypoint in its own process: ${child.stderr}`);
     assert.deepEqual(JSON.parse(child.stdout), Object.fromEntries(exports.map(name => [name, 'function'])));
   }
+});
+
+test("block successor CAS excludes competing work in both transaction orders and retains exact history after restart", t => {
+  for (const successorFirst of [false, true]) {
+    const { store, path } = fixture(t);
+    const first = opened(store);
+    const admission = deliveredOf(prepareSeriesLineAdmission(store, PROJECT, reference(first)));
+    assert.deepEqual(admission.series, first);
+    assert.deepEqual(admission.guards, [reference(first)]);
+    const attempt = deliveredOf(prepareBeginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+    const successorRequest: OpenSeriesRequest = { ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(first),
+      basis: { ground: "inputs-changed", text: "The horizon added a question" } };
+    const successor = deliveredOf(prepareOpenSeries(store, successorRequest));
+    assert.equal(successor.writes.length, 2);
+    assert.deepEqual(successor.writes[1], { id: first.id, kind: REPAIR_SERIES_KIND, expected: first.revision, value: first.value });
+    const apply = (transition: typeof successor) => writeGuarded(store, { unit: UNIT, target: transition.writes[0]!.id,
+      writes: transition.writes, guards: transition.guards });
+    deliveredOf(apply(successorFirst ? successor : attempt));
+    const won = store.list().map(reference);
+    assert.equal(refusalOf(apply(successorFirst ? attempt : successor)).code, "input_stale");
+    assert.deepEqual(store.list().map(reference), won);
+    const restarted = new Store(path);
+    try {
+      assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(first))), first);
+      if (successorFirst) {
+        const claimed = restarted.get<RepairSeries>(first.id)!;
+        assert.equal(claimed.revision, first.revision + 1);
+        assert.deepEqual(claimed.value, first.value);
+        assert.equal(refusalOf(prepareSeriesLineAdmission(restarted, PROJECT, reference(claimed))).code, "series_conflict");
+        assert.equal(refusalOf(beginAttempt(restarted, { ...address(PROJECT), attempt: 1, goal: goal() })).code, "series_conflict");
+        assert.equal(deliveredOf(openSeries(restarted, successorRequest)).revision, 1);
+        assert.equal(deliveredOf(beginAttempt(restarted, { ...address(PROJECT, 2), attempt: 1, goal: goal() })).value.attempts.length, 1);
+      } else {
+        assert.equal(restarted.get(seriesId(PROJECT, BLOCK, 2)), null);
+        assert.equal(deliveredOf(beginAttempt(restarted, { ...address(PROJECT), attempt: 1, goal: goal() })).revision, first.revision + 1);
+      }
+    } finally { restarted.close(); }
+  }
+});
+
+test("a block stop can be answered only on its current successor while old exact deliveries remain historical", t => {
+  const { store, path } = fixture(t);
+  opened(store);
+  for (let n = 0; n < 3; n++) cycle(store, PROJECT, goal(), fruitless());
+  const stopped = held(store)!;
+  const ground = byReview(store, PROJECT, 3);
+  const pending = deliveredOf(prepareResumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
+  const successor = deliveredOf(openSeries(store, { ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(stopped),
+    basis: { ground: "inputs-changed", text: "The horizon moved with its stop intact" } }));
+  assert.equal(refusalOf(writeGuarded(store, { unit: UNIT, target: stopped.id, writes: pending.writes, guards: pending.guards })).code, "input_stale");
+  assert.equal(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground })).code, "series_conflict");
+  assert.equal(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: undecided(store, PROJECT, 3) } })).code, "series_conflict");
+  assert.deepEqual(deliveredOf(readSeriesAt(store, PROJECT, reference(stopped))), stopped);
+  const stable = store.list(REPAIR_SERIES_KIND).map(reference);
+  deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 3, outcome: fruitless() }));
+  assert.deepEqual(store.list(REPAIR_SERIES_KIND).map(reference), stable);
+  const continued = deliveredOf(resumeSeries(store, { ...address(PROJECT, 2), stop: 3, ...ground }));
+  assert.equal(continued.value.stop, null);
+  const restarted = new Store(path);
+  try {
+    assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(successor))), successor);
+    assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(stopped))), stopped);
+    assert.equal(deliveredOf(resumeSeries(restarted, { ...address(PROJECT, 2), stop: 3, ...ground })).revision, continued.revision);
+  } finally { restarted.close(); }
 });
