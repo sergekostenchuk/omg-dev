@@ -1261,11 +1261,12 @@
 - Отдаёт: M9 · Передать компилятору; Журнал отказов ворот; Записи OM в SQLite
 - Читает записи: принятый граф уровня работ; environment; основания готовности и квитанции; обязательства с моментом «проверка реализуемости»
 - Пишет записи: feasibility
-- Разрешённые пути: `src/om/feasibility.ts`, `test/om-feasibility.test.ts`
+- Разрешённые пути: `src/om/feasibility.ts`, `src/om/refs.ts`, `test/om-feasibility.test.ts`
 - Из движка как есть: inspectRepository — src/runtime/environment.ts; readinessObligations — src/graph/obligation-readiness.ts; resolveArtifact — src/compiler/inputs.ts (подлинность квитанций); Feasibility (форма записи), REFINEMENT_CONTRACT_VERSION — src/graph/refinement.ts, src/graph/research-contracts.ts; Refinement.feasibilityGate — src/graph/refinement.ts:219 (не правится)
 - После: F5, D7, D8, B1.1
 - **Изменение движка:** оркестрация: проверку реализуемости вызывает блок OM после G5; функции проверок остаются как есть
 - Тесты сверх обязательных:
+  - ОСМОТР СТЫКОВ оркестратором (после D8.1, договор №823): G1 — первый OM-потребитель источника отрицательных охран: readinessObligations после D8.1 отдаёт admissionGuards с {id, absent:true} (отсутствие reader-pilot/execution-root); №823 требует, чтобы такая задача сама несла сквозную передачу — запись feasibility идёт одной транзакцией с ПОЛНЫМ набором TransactionGuard (общие uniqueTransactionGuards/transactionGuardsCurrent), без isRef-фильтра; если запись идёт через writeGuarded (om/refs.ts:86; staleGuard/referenceField читают только revision/hash) — принять TransactionGuard и проверять отсутствие общим предикатом (путь добавлен); сохраняемые feasibility.inputs — Ref; мосты OM с om_admission_guard_unsupported G1 не обходит; E4 (модель) в G1 не участвует — подтвердить; регрессия: штатное создание reader-pilot/execution-root вторым Store после подготовки G1 → атомарный отказ без записи feasibility
   - стык эры OM (№596): запись-производитель M8 обязана сохранять точное основание производителя OM и ссылку на ведомость обязательств; удаление из inputs сразу основания И ведомости не превращает OM в legacy/null — тест удаления обеих ссылок
   - запись реализуемости — вида feasibility, той же формы и версии контракта, что действующая: проходит ДЕЙСТВУЮЩИЙ feasibilityGate без его правки
   - каждый код G6 воспроизведён
