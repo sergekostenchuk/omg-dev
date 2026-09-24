@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +15,7 @@ import type { Question } from "../src/discovery/discovery.js";
 import type { Source } from "../src/evidence/evidence.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store } from "../src/storage/store.js";
-import { writeOmInput } from "../src/om/input.js";
+import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeHorizon, prepareHorizon, readHorizon, type HorizonRequest } from "../src/om/horizon.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
@@ -1297,4 +1297,58 @@ test("C2 work-zone contracts are explicit in history and unknown contracts never
   f.reopen();
   assert.deepEqual(delivered(readFrame(f.store, legacy)), historical);
   assert.deepEqual(delivered(readFrame(f.store, prepared.request)).result, prepared.result);
+});
+
+function historicalFrameFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), "omg-frame-history-scope-")), store = new Store(join(root, "state.sqlite"));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  preparedFeatures(new ProductEngine(store), "garden", upper(gardenGraph(), 2));
+  const horizon = acceptedHorizon(store, null);
+  const request: FrameRequest = { project: "garden", level: 2, graph: reference(store.get("graph:garden")!),
+    horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
+  return { store, horizon, request };
+}
+
+test("C2 historical scope preserves complete requests and replays dependencies through transparent readers", t => {
+  const f = historicalFrameFixture(t), nextHorizonRequest = clone(f.horizon.horizon.value.request) as HorizonRequest;
+  nextHorizonRequest.choice.choiceVersion = "frame-history-next";
+  const nextHorizon = delivered(writeHorizon(f.store, nextHorizonRequest));
+  const nextRequest = { ...f.request, horizon: reference(nextHorizon.gate) };
+  const expected = delivered(readFrame(f.store, f.request)), nextExpected = delivered(readFrame(f.store, nextRequest));
+  const first: Ref[] = [], second: Ref[] = [];
+  const firstView = historicalTrace(f.store, (ref, head) => { if (!head) first.push(ref); });
+  const secondView = historicalTrace(f.store, (ref, head) => { if (!head) second.push(ref); });
+  const before = revisions(f.store);
+  withHistoricalReads(() => {
+    assert.deepEqual(delivered(readFrame(firstView, f.request)), expected);
+    assert.deepEqual(delivered(readFrame(secondView, f.request)), expected);
+    assert.ok(first.length > 0);
+    assert.deepEqual(second, first, "A proof hit must replay every exact read, including its original multiplicity");
+    const basis = delivered(readFrameBasis(f.store, f.request));
+    assert.deepEqual(basis.references, expected.references);
+    assert.deepEqual(basis.obligations, expected.result.obligations);
+    assert.deepEqual(delivered(readFrame(f.store, nextRequest)), nextExpected);
+    assert.notDeepEqual(nextExpected.request, expected.request, "The same graph does not identify a complete frame request");
+  });
+  assert.deepEqual(revisions(f.store), before);
+});
+
+test("C2 cached history does not admit an omitted new frame or hide an opaque source view", t => {
+  const f = historicalFrameFixture(t), expected = delivered(readFrame(f.store, f.request));
+  const hidden = new Proxy(f.store, { get(target, key) {
+    if (key === "get") return (id: string, revision?: number) => id === f.request.graph.id ? null : target.get(id, revision);
+    const value: unknown = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  withHistoricalReads(() => {
+    assert.deepEqual(delivered(readFrame(f.store, f.request)), expected);
+    refusedAs(readFrame(hidden, f.request), "record_missing");
+    assert.equal(delivered(prepareFrame(f.store, f.request)).expected.frame, 0);
+    f.store.write({ id: "om-frame:garden:2", kind: "connection-frame", expected: 0, value: {} });
+    const before = revisions(f.store);
+    refusedAs(prepareFrame(f.store, f.request), "input_stale");
+    assert.deepEqual(delivered(readFrame(f.store, f.request)), expected);
+    assert.deepEqual(revisions(f.store), before);
+  });
+  assert.deepEqual(delivered(readFrame(f.store, f.request)), expected);
 });

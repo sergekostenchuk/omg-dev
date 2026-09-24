@@ -12,7 +12,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requiremen
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Write } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { writeOmInput, type OmInput } from "../src/om/input.js";
+import { withHistoricalReads, writeOmInput, type OmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { fillObligations, type FrameLevel, type FrameRead, type FrameScope } from "../src/om/frame-obligations.js";
@@ -100,6 +100,71 @@ function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
     upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
   return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
 }
+
+test("S1 D1 shares the full historical set only inside one operation and keeps current admission fresh", async t => {
+  const f = await createOmFixture(t), saved = delivered(writeGaps(f.store, nativeRequest(f)));
+  const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
+  let gets = 0, recordsRead = 0;
+  const gapRecords = new Set(request.records.map(ref => `${ref.id}@${ref.revision}`));
+  const measured = f.store, get = measured.get.bind(measured);
+  measured.get = ((id: string, revision?: number) => {
+    gets++;
+    if (gapRecords.has(`${id}@${revision}`)) recordsRead++;
+    return get(id, revision);
+  }) as Store["get"];
+  const rival = new Store(f.database);
+  t.after(() => rival.close());
+  withHistoricalReads(() => {
+    const first = delivered(readGaps(measured, request)), warmed = recordsRead;
+    assert.equal(warmed, request.records.length, "the complete immutable gap set is read once");
+    assert.deepEqual(delivered(readGaps(measured, { ...request, records: [...request.records].reverse() })), first);
+    assert.equal(recordsRead, warmed, "cached complete-set validation does not reread its exact gap records");
+    refusedAs(readGaps(measured, { ...request, records: request.records.slice(1) }), "gap_missing");
+    refusedAs(readGaps(measured, { ...request, records: [...request.records, request.records[0]!] }), "gap_duplicate");
+    const prepared = delivered(prepareCurrentGaps(measured, request)), currentReads = gets;
+    assert.deepEqual(delivered(prepareCurrentGaps(measured, request)), prepared);
+    assert.ok(gets > currentReads, "historical reuse never replaces a fresh current admission");
+    const input = rival.get(request.sources.input.id)!;
+    rival.write({ id: input.id, kind: input.kind, expected: input.revision, value: input.value });
+    assert.deepEqual(delivered(readGaps(measured, request)), first);
+    refusedAs(prepareCurrentGaps(measured, request), "input_stale");
+    refusedAs(writeGuarded(measured, { unit: "S1", target: "s1:d1-neighbor", guards: prepared.guards,
+      writes: [{ id: "s1:d1-neighbor", kind: "s1-test", expected: 0, value: { gaps: request.records } }] }), "input_stale");
+    assert.equal(rival.get("s1:d1-neighbor"), null);
+  });
+  const outside = recordsRead;
+  assert.deepEqual(delivered(readGaps(measured, request)).records, saved.records);
+  assert.ok(recordsRead > outside, "a new external operation reads exact gap history again");
+});
+
+test("S1 D1 separates semantic Store views and never caches a failed historical read", async t => {
+  const f = await createOmFixture(t), saved = delivered(writeGaps(f.store, nativeRequest(f)));
+  const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
+  const sentinel = new Error("historical storage failure");
+  let failRead = true, gets = 0;
+  const alternate = new Proxy(f.store, { get(target, property) {
+    if (property === "get") return (id: string, revision?: number) => {
+      gets++;
+      if (id === request.sources.input.id && revision === request.sources.input.revision && failRead) throw sentinel;
+      return target.get(id, revision);
+    };
+    const member = Reflect.get(target, property, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    const proved = delivered(readGaps(f.store, request));
+    assert.throws(() => readGaps(alternate, request), error => error === sentinel,
+      "a distinct semantic view cannot borrow the base Store's proof");
+    failRead = false;
+    const before = gets;
+    assert.deepEqual(delivered(readGaps(alternate, request)), proved);
+    assert.ok(gets > before, "a failed derivation must run again");
+    assert.deepEqual(delivered(readGaps(alternate, request)), proved);
+  });
+  const reopened = new Store(f.database);
+  try { assert.deepEqual(delivered(readGaps(reopened, request)).records, saved.records); }
+  finally { reopened.close(); }
+});
 
 test("the four explicit gap sources merge accepted input and both real C3 outputs without losing flow neighbors", () => {
   const source = sources();

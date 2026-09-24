@@ -1,20 +1,23 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import type { Graph, Node } from "../src/graph/model.js";
 import { fillObligations, prepareFrame, type FrameFill, type FrameObligation, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { extractResultSlice, factResultKey, normalizeResultContent, readResultIdentity, type FactResultIdentity, type ResultIdentityRequest, type ResultDependencySlice, RESULT_SLICE_REFUSAL_CODES } from "../src/om/result-identity.js";
-import { Store } from "../src/storage/store.js";
+import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { projectGraph } from "../src/graph/project.js";
-import { withHistoricalReads, writeOmInput } from "../src/om/input.js";
+import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
@@ -585,33 +588,114 @@ function identityFixture(t: TestContext, research = false, options: { thirdPort?
     reopen() { store.close(); store = new Store(database); } };
 }
 
-test("different result obligations share one exact C5 history per operation and read it again after the operation", t => {
+const identityCostName = "different result obligations share one exact C5 history per operation and read it again after the operation";
+// Count completed-history bodies inside an isolated module graph, independently of physical Store reads.
+const identityCostLoader = String.raw`
+import ts from TYPESCRIPT;
+let root;
+export function initialize(data) { root = data.root; }
+const bodies = {
+  'src/om/layer-basis.js': { verifyHistoricalBasis: ['C5.layerBasis', 'request'] },
+  'src/om/result-identity.js': { deriveIdentityHistory: ['D2.resultIdentityHistory', 'initial'] },
+};
+export async function load(url, context, next) {
+  const loaded = await next(url, context);
+  if (!url.startsWith(root) || loaded.format !== 'module') return loaded;
+  const file = decodeURIComponent(url.slice(root.length));
+  if (!bodies[file] && file !== 'src/om/input.js') return loaded;
+  let source = String(loaded.source);
+  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const edits = [], found = new Set();
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
+      const name = node.name.getText(tree), entry = bodies[file]?.[name];
+      if (entry) {
+        const [family, key] = entry; found.add(name);
+        edits.push({ pos: node.body.getStart(tree) + 1,
+          text: '\nglobalThis.__identityCost?.hit(' + JSON.stringify(family) + ', store, ' + key + ');\n' });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(tree);
+  for (const name of Object.keys(bodies[file] ?? {})) if (!found.has(name)) throw new Error('Missing actual proof body: ' + name);
+  for (const edit of edits.sort((a, b) => b.pos - a.pos)) source = source.slice(0, edit.pos) + edit.text + source.slice(edit.pos);
+  if (file === 'src/om/input.js') source += '\nglobalThis.__identityCostInternals = { sourceView, footprint: () => checkingFootprint > 0 };\n';
+  return { ...loaded, source };
+}
+`;
+
+test(identityCostName, t => {
+  const runtime = globalThis as unknown as {
+    __identityCostInternals?: { sourceView(store: Store): Store; footprint(): boolean };
+    __identityCost?: { hit(family: string, store: Store, key: unknown): void };
+  };
+  const internals = runtime.__identityCostInternals;
+  if (!internals) {
+    const directory = mkdtempSync(join(tmpdir(), "omg-identity-cost-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const loader = join(directory, "loader.mjs");
+    const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+    writeFileSync(loader, identityCostLoader.replace("TYPESCRIPT", JSON.stringify(typescript)));
+    const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(new URL('../', import.meta.url).href)} } });`;
+    const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+      "--test", `--test-name-pattern=${identityCostName}`, fileURLToPath(import.meta.url)],
+    { encoding: "utf8", timeout: 120_000, maxBuffer: 4_000_000, env: environment });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 0, `${child.stdout}\n${child.stderr}`);
+    assert.match(child.stdout, /identity-cost-measured/, "The isolated child must execute the instrumented proof assertions");
+    return;
+  }
   const fixture = identityFixture(t), acceptance = fixture.acceptance;
   const fills = fixture.store.get<{ fills: FrameFill[] }>(acceptance.frame.id, acceptance.frame.revision)!.value.fills;
   const other = fills.find(fill => fill.source === "accepted" && fill.obligation !== fixture.obligation)?.obligation;
   assert.ok(other, "The real accepted frame supplies a second complete obligation");
-  let reads = 0;
-  const store = new Proxy(fixture.store, { get(target, property) {
-    if (property === "get") return (id: string, revision?: number) => { reads++; return target.get(id, revision); };
-    const member: unknown = Reflect.get(target, property, target); return typeof member === "function" ? member.bind(target) : member;
-  } });
+  type Cost = { bodies: Map<string, number>; bodyReads: number; footprintReads: number };
+  const fresh = (): Cost => ({ bodies: new Map(), bodyReads: 0, footprintReads: 0 });
+  let sample = fresh(), nextView = 0;
+  const views = new WeakMap<Store, number>();
+  runtime.__identityCost = { hit(family, store, key) {
+    const view = internals.sourceView(store);
+    if (!views.has(view)) views.set(view, ++nextView);
+    const identity = canonical([family, views.get(view), key]);
+    sample.bodies.set(identity, (sample.bodies.get(identity) ?? 0) + 1);
+  } };
+  const base = fixture.store, get = base.get.bind(base);
+  base.get = <T>(id: string, revision?: number): Revision<T> | null => {
+    if (internals.footprint()) sample.footprintReads++;
+    else sample.bodyReads++;
+    return get<T>(id, revision);
+  };
+  t.after(() => { base.get = get; delete runtime.__identityCost; });
+  const store = historicalTrace(base);
+  const cost = () => ({ bodies: [...sample.bodies].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+    bodyReads: sample.bodyReads, footprintReads: sample.footprintReads,
+    physicalReads: sample.bodyReads + sample.footprintReads });
   const read = (obligation: string) => delivered(readResultIdentity(store, { acceptance, obligation }));
   const results = withHistoricalReads(() => {
-    const first = read(fixture.obligation), afterFirst = reads;
-    assert.ok(afterFirst > 0);
+    const first = read(fixture.obligation), afterFirst = cost();
+    assert.ok(afterFirst.physicalReads > 0);
+    assert.ok(afterFirst.bodies.some(([key]) => JSON.parse(key)[0] === "C5.layerBasis"));
+    assert.ok(afterFirst.bodies.some(([key]) => JSON.parse(key)[0] === "D2.resultIdentityHistory"));
+    for (const [key, count] of afterFirst.bodies) assert.equal(count, 1, `${key} must execute once per unchanged view`);
     const second = read(other);
-    assert.equal(reads, afterFirst, "A different obligation must reuse the exact acceptance history, not unfold C5 again");
+    assert.deepEqual(cost(), afterFirst, "A different obligation must reuse the exact acceptance history without more proof bodies, physical gets or footprint reads");
     assert.deepEqual(read(fixture.obligation), first);
-    assert.equal(reads, afterFirst);
+    assert.deepEqual(cost(), afterFirst);
     assert.notEqual(second.key, first.key, "Only shared sources are cached; each obligation still gets its own content identity");
     return { first, second };
   });
-  const beforeNext = reads;
+  sample = fresh();
   assert.deepEqual(read(other), results.second);
-  assert.ok(reads > beforeNext, "A completed external operation must not retain its proof cache");
+  assert.ok(cost().physicalReads > 0, "A completed external operation must read its sources again");
+  assert.ok(cost().bodies.some(([key]) => JSON.parse(key)[0] === "C5.layerBasis"), "A completed external operation must not retain its proof cache");
+  for (const [key, count] of cost().bodies) assert.equal(count, 1, `${key} must execute once in the new operation`);
+  base.get = get; delete runtime.__identityCost;
   fixture.reopen();
   assert.deepEqual(delivered(readResultIdentity(fixture.store, { acceptance, obligation: fixture.obligation })), results.first);
   assert.deepEqual(delivered(readResultIdentity(fixture.store, { acceptance, obligation: other })), results.second);
+  t.diagnostic("identity-cost-measured");
 });
 
 test("shared C5/C2 identity survives technical acceptance, editorial changes, typed rename chains and A→B→A after restart", t => {

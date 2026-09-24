@@ -1,4 +1,4 @@
-import { canonical, hashJson } from '../canonical.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { composeLayer, layerDesignOf } from '../graph/layer-design.js';
 import { type Binding, type Endpoint, type Graph } from '../graph/model.js';
@@ -14,7 +14,7 @@ import { WORKS_FRAME_CONTRACT, workAnchorId, workFillCode, fillObligations, flow
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
   type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
-import { withHistoricalReads } from './input.js';
+import { historicalProof, withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 
@@ -507,6 +507,12 @@ function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project
   if (value.request.frame.project !== project || ![2, 3].includes(value.request.frame.level) || !same(value.request, normalizeRequest(value.request)))
     reject('candidate_graph_mismatch', row.id, 'request', 'A candidate must have canonical sources for its own project and supported level');
   requireLevel({ request: value.request.frame }, value.request.works);
+  historicalProof(store, { reader: 'C4.verifyRecord', project, ref: reference(row), parameters: value.request as unknown as Json },
+    source => verifyRecordSources(source, row),
+    () => reject('candidate_graph_mismatch', row.id, 'history', 'The exact candidate must not depend on itself'));
+}
+function verifyRecordSources(store: Store, row: Revision<FrameCandidateRecord>): void {
+  const value = row.value;
   const sources = take(readFrameProposals(store, value.request));
   if (value.level === 3) checkedWorksBasis(store, value.request, false);
   const expected = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], value.request.works));

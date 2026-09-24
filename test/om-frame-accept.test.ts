@@ -9,13 +9,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
+import type { Question } from '../src/discovery/discovery.js';
+import type { ResearchAssessment } from '../src/discovery/research-model.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
 import { reference, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { git } from '../src/runtime/environment.js';
-import { writeOmInput } from '../src/om/input.js';
+import { withHistoricalReads, writeOmInput } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { WORKS_FRAME_CONTRACT, flowKey, workAnchorId, fillObligations, prepareFrame, readFrame, type ConnectionFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import { prepareFrameProposals, readFrameProposals, type LayerProposal, type ProposalRequest } from '../src/om/frame-proposals.js';
@@ -810,8 +812,40 @@ export async function load(url, context, next) {
       assert.equal(canonical(ok(readLayerAcceptance(store, history.research))), history.researchBytes);
       assert.equal(canonical(ok(readFrame(store, history.researchFrame))), history.researchFrameBytes);
       assert.equal(canonical(ok(readAcceptedFrame(store, history.accepted))), history.acceptedBytes);
-      assert.equal(canonical(ok(readLayerAcceptance(store, history.rebased))), history.rebasedBytes);
-      assert.equal(canonical(ok(readRebaseBasis(store, history.frame.value.rebase as { from: FrameRequest; to: FrameRequest }))), history.rebaseBasisBytes);
+      const nativeLayer = store.get<LayerBasis>(history.research.layer.id, history.research.layer.revision)!;
+      const operationProof = nativeLayer.value.layerProofs!.find(proof => proof.level === 2)!;
+      assert.ok(operationProof);
+      const nativeGraph = store.get<Graph>(history.research.graph.id, history.research.graph.revision)!;
+      const product = nativeGraph.value.nodes.find(node => node.kind === 'product')!;
+      const designQuestions = operationProof.inputs.filter(ref => ref.id.startsWith('question:'))
+        .map(ref => store.get<Question>(ref.id, ref.revision)!)
+        .filter(row => row.value.stage === 'om-g2' && row.value.level === 'R1' && row.value.consumer === product.id);
+      assert.equal(designQuestions.length, 1);
+      const assessments = operationProof.inputs.filter(ref => ref.id.startsWith('research-assessment:'))
+        .map(ref => store.get<ResearchAssessment>(ref.id, ref.revision)!)
+        .filter(row => row.value.question.id === designQuestions[0]!.id);
+      assert.equal(assessments.length, 1);
+      const issuedQuestion = assessments[0]!.value.question;
+      assert.equal(issuedQuestion.revision, 1);
+      assert.deepEqual(reference(store.get(issuedQuestion.id, issuedQuestion.revision)!), issuedQuestion);
+      // S1 restores the one dependency omitted by the old cache; all other DTO fields and saved rows stay exact.
+      const completeReferences = (bytes: string): string => {
+        const expected = JSON.parse(bytes) as { references: Ref[] };
+        assert.ok(!expected.references.some(ref => canonical(ref) === canonical(issuedQuestion)));
+        expected.references = [...expected.references, issuedQuestion]
+          .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+        return canonical(expected);
+      };
+      const expectedRebased = completeReferences(history.rebasedBytes);
+      withHistoricalReads(() => {
+        for (let read = 0; read < 2; read++)
+          assert.equal(canonical(ok(readLayerAcceptance(store, history.rebased))), expectedRebased);
+      });
+      const expectedRebaseBasis = completeReferences(history.rebaseBasisBytes);
+      withHistoricalReads(() => {
+        for (let read = 0; read < 2; read++)
+          assert.equal(canonical(ok(readRebaseBasis(store, history.frame.value.rebase as { from: FrameRequest; to: FrameRequest }))), expectedRebaseBasis);
+      });
       const replay = ok(rebaseFrame(store, history.request));
       assert.equal(replay.state, 'unchanged');
       assert.equal(canonical(replay.frame), canonical(history.frame));

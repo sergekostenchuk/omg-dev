@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { writeGuarded } from "../src/om/refs.js";
@@ -2768,7 +2770,7 @@ import type { Graph } from '../src/graph/model.js';
 import type { Question } from '../src/discovery/discovery.js';
 import { designOf } from '../src/graph/builder.js';
 import { projectGraph } from '../src/graph/project.js';
-import { writeOmInput, withHistoricalReads } from '../src/om/input.js';
+import { historicalTrace, writeOmInput, withHistoricalReads } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapReadRequest, type GapRequest } from '../src/om/gaps.js';
 import { writeRoutes } from '../src/om/routes.js';
@@ -2984,19 +2986,104 @@ test('mechanism prepared admissions guard all fresh sources and successor atomic
   assert.deepEqual(oldProof, opening);
 });
 
-test('mechanism historical proof cost follows unique bases rather than repeated attempt paths and expires per operation', t => {
+const mechanismCostName = 'mechanism historical proof cost follows unique bases rather than repeated attempt paths and expires per operation';
+// Instrument private proof bodies in the child module graph; no production API exists only for these counters.
+const mechanismCostLoader = String.raw`
+import ts from TYPESCRIPT;
+let root;
+export function initialize(data) { root = data.root; }
+const bodies = {
+  'src/om/gaps.js': {
+    deriveMaterialized: ['D1.materialize', 'request', '!current'],
+    deriveGapRecords: ['D1.records', 'request'],
+  },
+  'src/om/series.js': {
+    deriveMechanismProjection: ['A3.slice', '{project, scope}'],
+    deriveMechanismAdmission: ['A3.admission', '{request, admission}'],
+  },
+};
+export async function load(url, context, next) {
+  const loaded = await next(url, context);
+  if (!url.startsWith(root) || loaded.format !== 'module') return loaded;
+  const file = decodeURIComponent(url.slice(root.length));
+  if (!bodies[file] && file !== 'src/om/input.js') return loaded;
+  let source = String(loaded.source);
+  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const edits = [], found = new Set();
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
+      const name = node.name.getText(tree), entry = bodies[file]?.[name];
+      if (entry) {
+        const [family, key, condition = 'true'] = entry;
+        found.add(name);
+        edits.push({ pos: node.body.getStart(tree) + 1,
+          text: '\nif (' + condition + ') globalThis.__mechanismCost?.hit(' + JSON.stringify(family) + ', store, ' + key + ');\n' });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(tree);
+  for (const name of Object.keys(bodies[file] ?? {})) if (!found.has(name)) throw new Error('Missing actual proof body: ' + name);
+  for (const edit of edits.sort((a, b) => b.pos - a.pos)) source = source.slice(0, edit.pos) + edit.text + source.slice(edit.pos);
+  if (file === 'src/om/input.js') source += '\nglobalThis.__mechanismCostInternals = { sourceView, footprint: () => checkingFootprint > 0 };\n';
+  return { ...loaded, source };
+}
+`;
+
+test(mechanismCostName, t => {
+  const runtime = globalThis as unknown as {
+    __mechanismCostInternals?: { sourceView(store: Store): Store; footprint(): boolean };
+    __mechanismCost?: { hit(family: string, store: Store, key: unknown): void };
+  };
+  const internals = runtime.__mechanismCostInternals;
+  if (!internals) {
+    const directory = mkdtempSync(join(tmpdir(), 'omg-series-cost-'));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const loader = join(directory, 'loader.mjs');
+    const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+    writeFileSync(loader, mechanismCostLoader.replace('TYPESCRIPT', JSON.stringify(typescript)));
+    const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(new URL('../', import.meta.url).href)} } });`;
+    const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+      '--test', `--test-name-pattern=${mechanismCostName}`, fileURLToPath(import.meta.url)],
+    { encoding: 'utf8', timeout: 120_000, maxBuffer: 4_000_000, env: environment });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 0, `${child.stdout}\n${child.stderr}`);
+    assert.match(child.stdout, /mechanism-cost-measured/, 'The isolated child must execute the instrumented proof assertions');
+    return;
+  }
   const f = mechanismFixture(t, ['A']), native = f.publish();
   deliveredOf(openSeries(f.store, { ...f.request, scope: native.gaps, predecessor: null, basis: null }));
   const watched = native.gaps.records.find(ref => ref.id.includes('gap:')) ?? native.gaps.records[0]!;
-  let reads = 0;
-  const counted = new Proxy(f.store, { get(target, property) {
-    if (property === 'get') return (id: string, revision?: number) => {
-      if (id === watched.id && revision === watched.revision) reads++;
-      return target.get(id, revision);
-    };
-    const value: unknown = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
-  } });
-  const counts: number[] = [];
+  type Cost = { bodies: Map<string, number>; bodyReads: number; footprintReads: number };
+  let active: Cost | null = null, nextView = 0;
+  const views = new WeakMap<Store, number>();
+  runtime.__mechanismCost = { hit(family, store, key) {
+    if (!active) return;
+    const view = internals.sourceView(store);
+    if (!views.has(view)) views.set(view, ++nextView);
+    const identity = canonical([family, views.get(view), key]);
+    active.bodies.set(identity, (active.bodies.get(identity) ?? 0) + 1);
+  } };
+  const get = f.store.get.bind(f.store);
+  f.store.get = <T>(id: string, revision?: number): Revision<T> | null => {
+    if (active && id === watched.id && revision === watched.revision) {
+      if (internals.footprint()) active.footprintReads++;
+      else active.bodyReads++;
+    }
+    return get<T>(id, revision);
+  };
+  t.after(() => { f.store.get = get; delete runtime.__mechanismCost; });
+  const counted = historicalTrace(f.store);
+  function measured(action: () => unknown) {
+    const sample: Cost = { bodies: new Map(), bodyReads: 0, footprintReads: 0 };
+    assert.equal(active, null); active = sample;
+    try { action(); } finally { active = null; }
+    return { bodies: [...sample.bodies].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+      bodyReads: sample.bodyReads, footprintReads: sample.footprintReads,
+      physicalReads: sample.bodyReads + sample.footprintReads };
+  }
+  const counts: ReturnType<typeof measured>[] = [];
   let latest: Ref | null = null;
   for (let attempt = 1; attempt <= 4; attempt++) {
     deliveredOf(beginAttempt(f.store, { ...f.request, attempt, goal: native.goal!, admission: native.admission! }));
@@ -3004,16 +3091,16 @@ test('mechanism historical proof cost follows unique bases rather than repeated 
       outcome: { reason: 'awaiting-owner', achieved: [], cancelled: [], refusals: [] } }));
     latest = reference(closed);
     if ([1, 2, 4].includes(attempt)) {
-      reads = 0; deliveredOf(readAnySeriesAt(counted, 'garden', latest)); counts.push(reads);
+      counts.push(measured(() => assert.deepEqual(deliveredOf(readAnySeriesAt(counted, 'garden', latest!)), closed)));
     }
   }
-  assert.ok(counts[0]! > 0);
+  assert.ok(counts[0]!.bodyReads > 0);
+  assert.ok(counts[0]!.bodies.length > 0);
+  for (const [key, count] of counts[0]!.bodies) assert.equal(count, 1, `${key} must execute once per unchanged view`);
   assert.deepEqual(counts, [counts[0], counts[0], counts[0]], 'Each whole historical proof must expand the same complete D1 once irrespective of repeated attempt paths');
-  reads = 0;
-  deliveredOf(readAnySeriesAt(counted, 'garden', latest!));
-  assert.equal(reads, counts[0]);
-  deliveredOf(readAnySeriesAt(counted, 'garden', latest!));
-  assert.equal(reads, counts[0]! * 2, 'A new external operation must read exact sources anew');
+  assert.deepEqual(measured(() => deliveredOf(readAnySeriesAt(counted, 'garden', latest!))), counts[0]);
+  assert.deepEqual(measured(() => deliveredOf(readAnySeriesAt(counted, 'garden', latest!))), counts[0],
+    'A new external operation must read exact sources and execute their proof bodies anew');
   let otherReads = 0;
   const other = new Proxy(f.store, { get(target, property) {
     if (property === 'get') return (id: string, revision?: number) => {
@@ -3027,6 +3114,7 @@ test('mechanism historical proof cost follows unique bases rather than repeated 
     deliveredOf(readAnySeriesAt(other, 'garden', latest!));
   });
   assert.ok(otherReads > 0, 'Different Store presentations retain independent proof scopes');
+  t.diagnostic('mechanism-cost-measured');
 });
 
 

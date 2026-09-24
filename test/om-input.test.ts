@@ -12,7 +12,7 @@ import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/
 import { Store, type Revision } from "../src/storage/store.js";
 import {
   buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput, prepareReopenOmInput,
-  withHistoricalReads, historicalRead, type HistoricalReadKey,
+  withHistoricalReads, historicalRead, historicalProof, historicalTrace, type HistoricalReadKey,
   INPUT_REFUSAL_CODES, NODES_REQUIRED_SINCE, INPUT_REFRESH_CONFLICT,
   type InputBuildResult, type InputOptions, type InputRequest, type InputStages, type OmInput, type OmInputRecord, type DerivedInputRequest,
 } from "../src/om/input.js";
@@ -1265,4 +1265,269 @@ test("B1 shares historical proofs inside an operation while current admission st
     refusal(prepareExistingOmInput(f.store, f.project, ref), "stage_not_accepted");
   });
   assert.deepEqual(delivered(readOmInput(f.store, f.project, ref)), f.addressed);
+});
+
+test("S1 cold and cached proofs replay nested dependencies to every transparent collector in order with multiplicity", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'proof:a', kind: 'proof', expected: 0, value: { a: 1 } });
+  const b = first.write({ id: 'proof:b', kind: 'proof', expected: 0, value: { b: 2 } });
+  const key = { reader: 'S1.outer', project: 'garden', ref: reference(a) };
+  const innerKey = { ...key, reader: 'S1.inner' };
+  const cycle = (): never => { throw new Error('Unexpected cycle'); };
+  let outer = 0, inner = 0;
+  const read = (store: Store) => historicalProof(store, key, source => {
+    outer++;
+    const first = source.get(a.id, a.revision);
+    const child = historicalProof(source, innerKey, nested => {
+      inner++;
+      return [nested.get(b.id, b.revision), nested.get(b.id, b.revision)];
+    }, cycle);
+    return [first, ...child, source.get(a.id, a.revision)];
+  }, cycle);
+  withHistoricalReads(() => {
+    const value = read(first);
+    const left: Ref[] = [], right: Ref[] = [];
+    const trace = historicalTrace(historicalTrace(first, ref => left.push(ref)), ref => right.push(ref));
+    assert.deepEqual(read(trace), value);
+    assert.deepEqual(left, [a, b, b, a].map(reference));
+    assert.deepEqual(right, left);
+    const warmChild: Ref[] = [];
+    historicalProof(historicalTrace(first, ref => warmChild.push(ref)), { ...key, reader: 'S1.parent' }, source => read(source), cycle);
+    assert.deepEqual(warmChild, left, 'A nested cached proof replays its own nested proof dependencies too');
+    assert.equal(outer, 1); assert.equal(inner, 1);
+  });
+  read(first); assert.equal(outer, 2); assert.equal(inner, 2);
+});
+
+test("S1 deep repeated DAG stays compact without external observers", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'proof:dag', kind: 'proof', expected: 0, value: { value: 1 } });
+  const depth = 32, calls = Array<number>(depth + 1).fill(0);
+  const cycle = (): never => { throw new Error('Unexpected DAG cycle'); };
+  const read = (store: Store, level: number): number => historicalProof(store,
+    { reader: 'S1.deep-dag', project: 'garden', ref: reference(row), parameters: { level } }, source => {
+      calls[level] = calls[level]! + 1;
+      if (level === 0) { assert.deepEqual(source.get(row.id, row.revision), row); return 1; }
+      return read(source, level - 1) + read(source, level - 1);
+    }, cycle);
+  const originalPush = Array.prototype.push;
+  // Bound the regression itself: a broken flat journal must fail before allocating billions of
+  // repeated events. The synchronous proof has 33 nodes and no external stream to materialize.
+  Array.prototype.push = function <T>(this: T[], ...items: T[]): number {
+    assert.ok(this.length + items.length <= 4096, 'A small proof DAG must not flatten an unobserved exponential read stream');
+    return Reflect.apply(originalPush, this, items) as number;
+  };
+  try {
+    withHistoricalReads(() => {
+      assert.equal(read(first, depth), 2 ** depth);
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
+      assert.equal(read(first, depth), 2 ** depth);
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'The same DAG expands each exact proof once');
+    });
+    assert.equal(read(first, depth), 2 ** depth);
+    assert.deepEqual(calls, Array<number>(depth + 1).fill(2), 'The next external operation proves the DAG again');
+  } finally { Array.prototype.push = originalPush; }
+});
+
+test("S1 distinct collectors traverse a deep repeated DAG once and keep unique ref method and head observations", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'proof:distinct-a', kind: 'proof', expected: 0, value: { value: 'a' } });
+  const b = first.write({ id: 'proof:distinct-b', kind: 'proof', expected: 0, value: { value: 'b' } });
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  const expected: Observation[] = [
+    { ref: reference(a), head: false, method: 'get' },
+    { ref: reference(a), head: true, method: 'get' },
+    { ref: reference(a), head: false, method: 'list' },
+    { ref: reference(b), head: false, method: 'list' },
+    { ref: reference(a), head: false, method: 'history' },
+    { ref: reference(b), head: false, method: 'get' },
+  ];
+  const depth = 32, calls = Array<number>(depth + 1).fill(0);
+  const cycle = (): never => { throw new Error('Unexpected DAG cycle'); };
+  const read = (store: Store, level: number): number => historicalProof(store,
+    { reader: 'S1.distinct-dag', project: 'garden', ref: reference(a), parameters: { level } }, source => {
+      calls[level] = calls[level]! + 1;
+      if (level === 0) {
+        source.get(a.id, a.revision); source.get(a.id); source.list('proof'); source.history(a.id); source.get(b.id, b.revision);
+        return 1;
+      }
+      return read(source, level - 1) + read(source, level - 1);
+    }, cycle);
+  const collect = (observations: Observation[]) => historicalTrace(first, (ref, head, method) => {
+    assert.ok(observations.length < expected.length, 'A distinct collector cannot receive a duplicate observation');
+    observations.push({ ref, head, method });
+  }, 'distinct');
+  const originalPush = Array.prototype.push;
+  Array.prototype.push = function <T>(this: T[], ...items: T[]): number {
+    assert.ok(this.length + items.length <= 4096, 'Distinct observation must not flatten the repeated proof DAG');
+    return Reflect.apply(originalPush, this, items) as number;
+  };
+  try {
+    withHistoricalReads(() => {
+      const cold: Observation[] = [], traced = collect(cold);
+      assert.equal(read(traced, depth), 2 ** depth);
+      assert.deepEqual(cold, expected);
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
+      assert.equal(read(traced, depth), 2 ** depth);
+      assert.deepEqual(cold, expected, 'The original collector remains a set during cached replay');
+      const fresh: Observation[] = [];
+      assert.equal(read(collect(fresh), depth), 2 ** depth);
+      assert.deepEqual(fresh, expected, 'A newly registered collector receives the full unique dependency set from the cached DAG');
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
+    });
+    const next: Observation[] = [];
+    assert.equal(read(collect(next), depth), 2 ** depth);
+    assert.deepEqual(next, expected);
+    assert.deepEqual(calls, Array<number>(depth + 1).fill(2));
+  } finally { Array.prototype.push = originalPush; }
+});
+
+test("S1 observed repeated DAG preserves complete cold and replayed streams in order with multiplicity", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'proof:dag-a', kind: 'proof', expected: 0, value: { value: 'a' } });
+  const b = first.write({ id: 'proof:dag-b', kind: 'proof', expected: 0, value: { value: 'b' } });
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  const atA: Observation = { ref: reference(a), head: false, method: 'get' };
+  const atHead: Observation = { ref: reference(b), head: true, method: 'get' };
+  const atHistory: Observation = { ref: reference(b), head: false, method: 'history' };
+  const expected = (level: number): Observation[] => level === 0 ? [atA, atHead, atA]
+    : [atA, ...expected(level - 1), atHistory, ...expected(level - 1), atA];
+  const depth = 3, calls = Array<number>(depth + 1).fill(0);
+  const cycle = (): never => { throw new Error('Unexpected DAG cycle'); };
+  const read = (store: Store, level: number): number => historicalProof(store,
+    { reader: 'S1.observed-dag', project: 'garden', ref: reference(a), parameters: { level } }, source => {
+      calls[level] = calls[level]! + 1;
+      source.get(a.id, a.revision);
+      let value: number;
+      if (level === 0) { source.get(b.id); value = 1; }
+      else {
+        value = read(source, level - 1);
+        source.history(b.id);
+        value += read(source, level - 1);
+      }
+      source.get(a.id, a.revision);
+      return value;
+    }, cycle);
+  const stream = expected(depth);
+  withHistoricalReads(() => {
+    for (const phase of ['cold', 'cached']) {
+      const left: Observation[] = [], right: Observation[] = [];
+      const order: (Observation & { observer: 'left' | 'right' })[] = [];
+      const traced = historicalTrace(historicalTrace(first, (ref, head, method) => {
+        left.push({ ref, head, method }); order.push({ observer: 'left', ref, head, method });
+      }), (ref, head, method) => {
+        right.push({ ref, head, method }); order.push({ observer: 'right', ref, head, method });
+      });
+      assert.equal(read(traced, depth), 2 ** depth);
+      assert.deepEqual(left, stream, phase + ': every actual observed reference retains its original multiplicity');
+      assert.deepEqual(right, stream);
+      assert.deepEqual(order, stream.flatMap(observation => [
+        { observer: 'left', ...observation }, { observer: 'right', ...observation },
+      ]), phase + ': each read reaches nested collectors in the original order');
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
+    }
+  });
+});
+
+test("S1 mutable opaque sources invalidate their proof snapshot and never alias the base or another Store", t => {
+  const { first, second } = historicalStores(t);
+  const original = first.write({ id: 'proof:garden', kind: 'proof', expected: 0, value: { answer: 1 } });
+  second.write({ id: original.id, kind: original.kind, expected: 0, value: original.value });
+  const key = { reader: 'S1.visible', project: 'garden', ref: reference(original) };
+  let hidden = false, changed = false, calls = 0;
+  const pending = new Proxy(first, { get(target, member) {
+    if (member === 'get') return (id: string, revision?: number) => {
+      if (id === original.id) return hidden ? null : changed ? { ...original, value: { answer: 2 } } : original;
+      return target.get(id, revision);
+    };
+    const value: unknown = Reflect.get(target, member, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const read = (store: Store) => historicalProof(store, key, source => { calls++; return source.get(original.id, original.revision); },
+    (): never => { throw new Error('Unexpected cycle'); });
+  withHistoricalReads(() => {
+    assert.deepEqual(read(first), original);
+    assert.deepEqual(read(pending), original); assert.equal(calls, 2);
+    assert.deepEqual(read(historicalTrace(pending)), original); assert.equal(calls, 2);
+    hidden = true; assert.equal(read(pending), null); assert.equal(calls, 3);
+    assert.deepEqual(read(first), original); assert.equal(calls, 3);
+    hidden = false; changed = true;
+    assert.deepEqual(read(pending)?.value, { answer: 2 }); assert.equal(calls, 4, 'A forged unchanged hash does not hide a changed opaque source body');
+    assert.deepEqual(read(second), original); assert.equal(calls, 5);
+  });
+});
+
+test("S1 exact absence and heads are read afresh and transparent cycles release their operation after exceptions", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'proof:garden', kind: 'proof', expected: 0, value: { value: 1 } });
+  const key = { reader: 'S1.head', project: 'garden', ref: reference(row) };
+  const cycle = () => ({ ok: false as const, reason: 'cycle' });
+  let calls = 0;
+  const read = () => historicalProof(first, key, source => {
+    calls++; return [source.get(row.id), source.get(row.id, 2)];
+  }, (): never => { throw new Error('Unexpected cycle'); });
+  withHistoricalReads(() => {
+    assert.deepEqual(read(), [row, null]);
+    const next = first.write({ id: row.id, kind: row.kind, expected: 1, value: { value: 2 } });
+    assert.deepEqual(read(), [next, next]); assert.equal(calls, 2);
+    assert.deepEqual(historicalProof(first, { ...key, reader: 'S1.cycle' }, source =>
+      historicalProof(historicalTrace(source), { ...key, reader: 'S1.cycle' }, () => { throw new Error('Cycle ran'); }, cycle), cycle), cycle());
+  });
+  const failure = new Error('Scope failed');
+  assert.throws(() => withHistoricalReads(() => { read(); throw failure; }), error => error === failure);
+  read(); assert.equal(calls, 4);
+  for (const operation of [
+    () => historicalTrace(null as unknown as Store),
+    () => historicalTrace(first, 3 as unknown as (ref: Ref) => void),
+    () => historicalTrace(first, undefined, 'unknown' as 'ordered'),
+    () => historicalTrace(first, undefined, null as unknown as 'ordered'),
+    () => historicalProof(first, null as unknown as HistoricalReadKey, () => null, () => null),
+    () => historicalProof(first, key, null as unknown as (store: Store) => null, () => null),
+  ]) assert.throws(operation, addressedError);
+});
+
+test("S1 replay preserves each collector's get-only or complete observation contract", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'proof:selection', kind: 'proof', expected: 0, value: { value: 1 } });
+  const key = { reader: 'S1.selection', project: 'garden', ref: reference(row) };
+  let calls = 0;
+  const read = (store: Store) => historicalProof(store, key, source => {
+    calls++; source.get(row.id, row.revision); source.list('proof'); source.history(row.id);
+  }, (): never => { throw new Error('Unexpected cycle'); });
+  withHistoricalReads(() => {
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const all: Ref[] = [], gets: Ref[] = [], order: string[] = [];
+      const traced = historicalTrace(historicalTrace(first, ref => { all.push(ref); order.push('all'); }), (ref, _head, method) => {
+        if (method === 'get') { gets.push(ref); order.push('get'); }
+      });
+      read(traced);
+      assert.deepEqual(gets, [reference(row)]);
+      assert.deepEqual(all, [reference(row), reference(row), reference(row)]);
+      assert.deepEqual(order, ['all', 'get', 'all', 'all'], 'Replay keeps the inner-to-outer observer order of the actual read');
+    }
+    assert.equal(calls, 1);
+  });
+});
+
+test("S1 opaque synthetic reads never become observations of a source collector during replay", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'proof:opaque', kind: 'proof', expected: 0, value: { value: 1 } });
+  const key = { reader: 'S1.opaque-parent', project: 'garden', ref: reference(row) };
+  const cycle = (): never => { throw new Error('Unexpected cycle'); };
+  const read = (store: Store) => historicalProof(store, key, source => {
+    source.get(row.id, row.revision);
+    const opaque = new Proxy(source, { get(target, member) {
+      if (member === 'get') return () => ({ ...row, revision: 2 });
+      const value: unknown = Reflect.get(target, member, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    historicalProof(opaque, { ...key, reader: 'S1.opaque-child' }, pending => pending.get(row.id, 2), cycle);
+  }, cycle);
+  withHistoricalReads(() => {
+    const cold: Ref[] = [], warm: Ref[] = [];
+    read(historicalTrace(first, ref => cold.push(ref)));
+    read(historicalTrace(first, ref => warm.push(ref)));
+    assert.deepEqual(cold, [reference(row)]);
+    assert.deepEqual(warm, cold, 'Synthetic reads behind an opaque boundary were never read through the source collector');
+  });
 });

@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
@@ -13,7 +17,7 @@ import type { Question } from '../src/discovery/discovery.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph } from '../src/graph/model.js';
-import { writeOmInput, readOmInput, prepareOmInput, buildOmInput, type InputStages, type InputBuildResult, type OmInputRecord } from '../src/om/input.js';
+import { historicalTrace, withHistoricalReads, writeOmInput, readOmInput, prepareOmInput, buildOmInput, type InputStages, type InputBuildResult, type OmInputRecord } from '../src/om/input.js';
 import { applyAddressing, applyInputDecisions, inputDecisionWrite, prepareAddressing, writeAddressing,
   prepareApplyAnswer, writeApplyAnswer, prepareReopenAnswers, writeReopenAnswers, ADDRESSING_CODES, ADDRESSING_KINDS, normalizeInputDecisionProposal,
   type AddressingRequest, type ApplyAnswerRequest, type InputFieldDecision } from '../src/om/addressing.js';
@@ -761,28 +765,124 @@ test('D3.1 historical recovery cannot be forged by a stale marker or by retainin
   });
 });
 
+type PhysicalReads = { body: number; footprint: number };
+type ProofSample = { bodies: Map<string, number>; physical: Map<string, PhysicalReads>; all: PhysicalReads };
+interface AddressingCostMonitor { sample: ProofSample | null }
+const addressingCost = () => (globalThis as typeof globalThis & { __addressingCost?: AddressingCostMonitor }).__addressingCost;
+// Actual proof entries and physical reads are different counters. The subprocess instruments only
+// these bodies in memory; it does not modify the production modules or run another test's fixture.
+async function costSubprocess(t: TestContext): Promise<boolean> {
+  if (addressingCost()) return false;
+  const directory = mkdtempSync(join(tmpdir(), 'omg-addressing-cost-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const loader = join(directory, 'loader.mjs'), preload = join(directory, 'preload.mjs');
+  const root = new URL('../', import.meta.url).href;
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import ts from ${JSON.stringify(typescript)};
+const root=${JSON.stringify(root)}, monitor='globalThis.__addressingCost';
+export async function load(url, context, next) {
+ const result=await next(url,context);
+ if(!url.startsWith(root)||result.format!=='module')return result;
+ const file=url.slice(root.length);
+ if(!['src/om/input.js','src/om/accepted-answer.js','src/storage/store.js'].includes(file))return result;
+ let source=String(result.source);
+ const tree=ts.createSourceFile(file,source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS), edits=[], found=new Set();
+ function add(body,code){edits.push({pos:body.getStart(tree)+1,text:code});}
+ function visit(node){
+  if((ts.isFunctionDeclaration(node)||ts.isMethodDeclaration(node))&&node.name&&node.body){
+   const name=node.name.getText(tree);
+   if(file==='src/om/input.js'&&name==='readInputRecord'){add(node.body,monitor+".hit('B1',store,project,ref);");found.add(name);}
+   if(file==='src/om/accepted-answer.js'&&name==='checkAcceptedRecord'){add(node.body,monitor+".hit('D5',store,project,{id:record.id,revision:record.revision,hash:record.hash});");found.add(name);}
+   if(file==='src/om/accepted-answer.js'&&name==='loadMc1Question'){
+    const statement=node.body.statements.find(item=>ts.isReturnStatement(item)), action=statement?.expression?.arguments?.[2];
+    if(!action||!ts.isArrowFunction(action)||!ts.isBlock(action.body))throw new Error('The MC1 full verifier is absent');
+    add(action.body,monitor+".hit('MC1',store,request.project,request.record);");found.add(name);
+   }
+   if(file==='src/storage/store.js'&&name==='get'){
+    add(node.body,'return '+monitor+'.read(this,id,revision,()=>{');edits.push({pos:node.body.end-1,text:'});'});found.add(name);
+   }
+  }
+  ts.forEachChild(node,visit);
+ }
+ visit(tree);
+ const expected=file==='src/om/input.js'?['readInputRecord']:file==='src/storage/store.js'?['get']:['checkAcceptedRecord','loadMc1Question'];
+ for(const name of expected)if(!found.has(name))throw new Error('Full proof body absent: '+name);
+ for(const edit of edits.sort((a,b)=>b.pos-a.pos))source=source.slice(0,edit.pos)+edit.text+source.slice(edit.pos);
+ if(file==='src/om/input.js')source+='\\n'+monitor+'.view=sourceView;'+monitor+'.footprint=()=>checkingFootprint>0;';
+ return {...result,source};
+}`);
+  writeFileSync(preload, `import {register} from 'node:module';
+register(${JSON.stringify(loader)},import.meta.url);
+const views=new WeakMap();let nextView=0;
+globalThis.__addressingCost={sample:null,view:store=>store,footprint:()=>false,
+ hit(reader,store,project,ref){const sample=this.sample;if(!sample)return;const view=this.view(store);
+  if(!views.has(view))views.set(view,++nextView);
+  const key=JSON.stringify({reader,project,ref,view:views.get(view)});sample.bodies.set(key,(sample.bodies.get(key)||0)+1);},
+ read(store,id,revision,action){const sample=this.sample,category=this.footprint()?'footprint':'body';
+  if(sample)sample.all[category]++;
+  const row=action();
+  if(sample&&row&&revision!==undefined&&/^(om-input|om-answer|om-mc1-question):/.test(id)){
+   const key=JSON.stringify({id:row.id,revision:row.revision,hash:row.hash}), counts=sample.physical.get(key)||{body:0,footprint:0};
+   counts[category]++;sample.physical.set(key,counts);
+  }return row;}
+};`);
+  const name = t.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const result = await promisify(execFile)(process.execPath,
+    ['--import', preload, '--test', `--test-name-pattern=^${name}$`, fileURLToPath(import.meta.url)],
+    { maxBuffer: 4 * 1024 * 1024, env: environment }).catch((error: Error & { stdout?: string; stderr?: string }) => {
+    throw new Error(`${error.message}\n${error.stdout ?? ''}${error.stderr ?? ''}`, { cause: error });
+  });
+  assert.match(result.stdout, /# fail 0/);
+  return true;
+}
+function measureProof<T>(action: () => OmResult<T>): { value: T; sample: ProofSample } {
+  const monitor = addressingCost()!;
+  assert.equal(monitor.sample, null);
+  const sample: ProofSample = { bodies: new Map(), physical: new Map(), all: { body: 0, footprint: 0 } };
+  monitor.sample = sample;
+  try {
+    const value = ok(action());
+    for (const [key, count] of sample.bodies) assert.equal(count, 1, `A full proof runs once per exact version and semantic view: ${key}`);
+    return { value, sample };
+  } finally { monitor.sample = null; }
+}
+function inputPhysical(sample: ProofSample, id: string): [number, number][] {
+  return [...sample.physical].flatMap(([key, counts]) => {
+    const ref = JSON.parse(key) as Ref;
+    return ref.id === id ? [[ref.revision, counts.body + counts.footprint] as [number, number]] : [];
+  }).sort(([a], [b]) => a - b);
+}
+
 test('D3.1 one historical read checks each exact input once across the repeated fact DAG and releases its cache', async t => {
+  if (await costSubprocess(t)) return;
   const f = factFixture(t), accepted = await f.accept(), applied = ok(writeApplyAnswer(f.store, {
     project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) }));
-  const counts = new Map<number, number>();
   let failure: Error | null = null;
-  const observed = new Proxy(f.store, { get(target, key) {
-    if (key === 'get') return (id: string, revision?: number) => {
-      if (id === applied.id && revision !== undefined) {
-        if (failure) throw failure;
-        counts.set(revision, (counts.get(revision) ?? 0) + 1);
-      }
-      return target.get(id, revision);
-    };
-    const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
-  assert.deepEqual(ok(readOmInput(observed, f.project, reference(applied))), applied);
-  assert.deepEqual([...counts].sort(([a], [b]) => a - b), [[1, 1], [2, 1], [3, 1]]);
+  const get = f.store.get.bind(f.store);
+  f.store.get = <V = Json>(id: string, revision?: number): Revision<V> | null => {
+    if (id === applied.id && revision !== undefined && failure) throw failure;
+    return get<V>(id, revision);
+  };
+  const observed = historicalTrace(f.store);
+  const read = () => measureProof(() => readOmInput(observed, f.project, reference(applied)));
+  const first = read();
+  assert.deepEqual(first.value, applied);
+  assert.deepEqual(inputPhysical(first.sample, applied.id), [[1, 1], [2, 1], [3, 1]]);
+  assert.equal([...first.sample.bodies].filter(([key]) => JSON.parse(key).reader === 'B1').length, 3);
+  withHistoricalReads(() => {
+    const cold = read(), warm = read();
+    assert.deepEqual(warm.value, cold.value);
+    assert.equal(warm.sample.bodies.size, 0);
+    assert.equal(warm.sample.physical.size, 0, 'Repeated paths to immutable inputs do not add body or footprint reads');
+  });
   failure = new EngineError('record_corrupt', 'A later invocation must read again');
-  assert.throws(() => readOmInput(observed, f.project, reference(applied)), error => error === failure);
-  failure = null; counts.clear();
-  assert.deepEqual(ok(readOmInput(observed, f.project, reference(applied))), applied);
-  assert.deepEqual([...counts].sort(([a], [b]) => a - b), [[1, 1], [2, 1], [3, 1]]);
+  assert.throws(read, error => error === failure);
+  failure = null;
+  const retried = read();
+  assert.deepEqual(retried.value, applied);
+  assert.deepEqual(inputPhysical(retried.sample, applied.id), [[1, 1], [2, 1], [3, 1]]);
 });
 
 // Four real MC1 facts with literal requirement pointers. Hash buckets keep later insertions from
@@ -969,43 +1069,53 @@ async function independentFactPrefixes(t: TestContext) {
 }
 
 test('D3.1 operation history proves unique inputs and answers once per view at one, two and four facts', async t => {
+  if (await costSubprocess(t)) return;
   const { f, prefixes } = await independentFactPrefixes(t);
-  function measured<T>(store: Store, action: () => OmResult<T>, views: number) {
-    const get = store.get.bind(store), counts = new Map<string, number>();
-    store.get = <V = Json>(id: string, revision?: number): Revision<V> | null => {
-      if (revision !== undefined && /^(om-input|om-answer|om-mc1-question):/.test(id)) {
-        const key = `${id}@${revision}`; counts.set(key, (counts.get(key) ?? 0) + 1);
-      }
-      return get<V>(id, revision);
-    };
-    try {
-      const value = ok(action());
-      assert.ok(counts.size > 0, 'Every external operation must read and prove its exact history again');
-      for (const [key, count] of counts) assert.ok(count <= views,
-        `${key} was read ${count} times; at most one historical proof for each of ${views} Store views`);
-      return { value, counts };
-    } finally { store.get = get; }
+  function measured<T>(action: () => OmResult<T>) {
+    const result = measureProof(action);
+    assert.ok(result.sample.bodies.size > 0, 'Every external operation must prove its exact history again');
+    assert.ok(result.sample.physical.size > 0, 'Physical reads remain a checked cost, including footprint');
+    return result;
   }
+  const previousCommon = new Map<string, { proofs: number; counts: PhysicalReads }>();
   for (const prefix of prefixes) {
     writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'value-0' }));
     const store = new Store(prefix.path), engine = new ProductEngine(store);
     try {
       const request = { project: f.project, input: prefix.input };
+      // Physical instrumentation lives in Store.get, so the ordinary public preparation
+      // receives its original semantic Store rather than an artificial overlay.
+      const observed = store;
       // Preparation has a base Store and an explicit pending-source overlay; their proofs stay separate.
-      const idle = measured(store, () => prepareReopenAnswers(store, request), 2);
+      const idle = measured(() => prepareReopenAnswers(observed, request));
       assert.equal(idle.value.writes.length, 0);
       assert.equal(idle.value.record.value.input.facts!.length, prefix.count);
-      const again = measured(store, () => prepareReopenAnswers(store, request), 2);
-      assert.deepEqual(again.counts, idle.counts);
+      for (const [ref, counts] of idle.sample.physical) {
+        const proofs = [...idle.sample.bodies.keys()].filter(key =>
+          canonical((JSON.parse(key) as { ref: Ref }).ref) === canonical(JSON.parse(ref))).length;
+        assert.ok(proofs > 0, `Every exact physical foundation belongs to its proven history: ${ref}`);
+        assert.equal(counts.body + counts.footprint, proofs,
+          `An immutable foundation is fetched once for each distinct proof/view, including footprint cost: ${ref}`);
+        const previous = previousCommon.get(ref);
+        // A later fact may introduce another view of an earlier exact input. Only that new
+        // proof/view permits another fetch; more paths within an existing view do not.
+        if (previous && previous.proofs === proofs) assert.deepEqual(counts, previous.counts,
+          `More fact paths must not multiply physical body/footprint reads of the same exact foundation: ${ref}`);
+        previousCommon.set(ref, { proofs, counts });
+      }
+      const again = measured(() => prepareReopenAnswers(observed, request));
+      assert.deepEqual(again.sample.physical, idle.sample.physical);
+      assert.deepEqual(again.sample.all, idle.sample.all, 'A repeated external operation has the same total physical cost');
+      assert.deepEqual(again.value, idle.value);
       const source = store.get('source:garden:cost-0')!;
       writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'changed' }));
       engine.discovery.evidence.file(f.project, 'cost-0', f.root, 'cost-0.json', 'application/json', source.revision);
-      const prepared = measured(store, () => prepareReopenAnswers(store, request), 2);
+      const prepared = measured(() => prepareReopenAnswers(observed, request));
       assert.equal(prepared.value.writes.length, 1, 'The next operation must observe the changed evidence head');
       assert.equal(prepared.value.record.value.input.facts!.length, prefix.count - 1);
-      const saved = measured(store, () => writeReopenAnswers(store, request), 2).value;
-      assert.deepEqual(measured(store, () => readOmInput(store, f.project, reference(saved)), 1).value, saved);
-      assert.deepEqual(measured(store, () => readOmInput(store, f.project, reference(saved)), 1).value, saved);
+      const saved = measured(() => writeReopenAnswers(observed, request)).value;
+      assert.deepEqual(measured(() => readOmInput(observed, f.project, reference(saved))).value, saved);
+      assert.deepEqual(measured(() => readOmInput(observed, f.project, reference(saved))).value, saved);
     } finally { store.close(); }
   }
 });

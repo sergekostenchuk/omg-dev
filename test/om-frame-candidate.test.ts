@@ -17,7 +17,7 @@ import { type LayerProposal, type ProposalObservation, type ProposalRequest } fr
 import { assembleCandidate, observeCandidate, prepareCandidate, writeCandidate, readCandidate, gateCandidate,
   CANDIDATE_REFUSAL_CODES, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { writeOmInput } from "../src/om/input.js";
+import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
@@ -366,6 +366,54 @@ test("historical candidates survive changed heads and reopening while fresh prep
     assert.equal(delivered(gateCandidate(reopened, request)).passed, true);
     assert.deepEqual(revisions(reopened), before);
   } finally { reopened.close(); }
+});
+
+test("C4 historical scope replays complete dependencies while candidate admission remains current", t => {
+  const f = firstPass(t), written = delivered(writeCandidate(f.store, f.request));
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
+  const request = { project: "garden", candidate: reference(written.record) };
+  const first: Ref[] = [], second: Ref[] = [];
+  const firstView = historicalTrace(f.store, (ref, head) => { if (!head) first.push(ref); });
+  const secondView = historicalTrace(f.store, (ref, head) => { if (!head) second.push(ref); });
+  withHistoricalReads(() => {
+    assert.deepEqual(delivered(readCandidate(firstView, request)), written.record);
+    assert.deepEqual(delivered(readCandidate(secondView, request)), written.record);
+    assert.ok(first.some(ref => canonical(ref) === canonical(f.proposalRef)));
+    assert.deepEqual(second, first, "The cached rederivation must replay its exact proposal and frame dependencies");
+    assert.equal(delivered(gateCandidate(f.store, request)).passed, true);
+    const proposal = f.store.get(f.proposalRef.id)!;
+    f.store.write({ id: proposal.id, kind: proposal.kind, expected: proposal.revision, value: proposal.value });
+    const before = revisions(f.store);
+    refusedAs(prepareCandidate(f.store, f.request), "input_stale");
+    refusedAs(writeCandidate(f.store, f.request), "input_stale");
+    assert.deepEqual(delivered(readCandidate(f.store, request)), written.record);
+    assert.deepEqual(revisions(f.store), before);
+  });
+});
+
+test("C4 historical proofs remain local to their Store and are discarded after an interrupted operation", t => {
+  const f = firstPass(t), written = delivered(writeCandidate(f.store, f.request));
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
+  const request = { project: "garden", candidate: reference(written.record) };
+  const isolated = new Store(join(f.root, "isolated.sqlite"));
+  t.after(() => isolated.close());
+  isolated.write({ id: written.record.id, kind: written.record.kind, expected: 0, value: written.record.value });
+  const interrupted = new Error("operation interrupted after historical proof");
+  assert.throws(() => withHistoricalReads(() => {
+    assert.deepEqual(delivered(readCandidate(f.store, request)), written.record);
+    refusedAs(readCandidate(isolated, request), "record_missing");
+    throw interrupted;
+  }), error => error === interrupted);
+  const get = f.store.get.bind(f.store), unavailable = new Error("exact proposal source unavailable");
+  f.store.get = <T>(id: string, revision?: number) => {
+    if (id === f.proposalRef.id && revision === f.proposalRef.revision) throw unavailable;
+    return get<T>(id, revision);
+  };
+  try {
+    assert.throws(() => readCandidate(f.store, request), error => error === unavailable,
+      "A completed proof from the interrupted operation must not hide a new source failure");
+  } finally { f.store.get = get; }
+  assert.deepEqual(delivered(readCandidate(f.store, request)), written.record);
 });
 
 test("current accepted fixtures preserve their exact bases and return accepted fills without rewriting neighbors", async t => {

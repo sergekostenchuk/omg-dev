@@ -14,7 +14,7 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } 
 import type { AcceptanceContext, Confirmation } from './achievements.js';
 import { readResultIdentity } from './result-identity.js';
 import { confirmAnswerGapClosure, type AnswerBasis } from './accepted-answer.js';
-import { withHistoricalReads } from './input.js';
+import { historicalProof, withHistoricalReads } from './input.js';
 
 export const GAP_LINE_KIND = 'gap-line';
 export const GAP_LINE_CODES = Object.freeze([
@@ -350,9 +350,11 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
     guards: fresh ? guardsOf([...fresh.guards,
       ...(attempt ? [attempt.series] : [])]) : [] };
 }
-function loadHistory(store: Store, project: string, ref: Ref, cache: Map<string, History>): History {
-  const key = canonical(ref), cached = cache.get(key);
-  if (cached) return cached;
+function loadHistory(store: Store, project: string, ref: Ref): History {
+  return historicalProof(store, { reader: 'D2.loadHistory', project, ref }, store => deriveHistory(store, project, ref),
+    () => fail('gap_line_forged', ref.id, 'previous', 'A historical line cannot depend cyclically on itself'));
+}
+function deriveHistory(store: Store, project: string, ref: Ref): History {
   const row = take(readRecord<GapLinesRecord>(store, ref, { unit: 'F5.2', target: ref.id, id: gapLinesId(project), kind: GAP_LINE_KIND })) as Revision<GapLinesRecord>;
   const value = row.value;
   if (!object(value) || value.project !== project || !Array.isArray(value.lines) || !value.lines.every(lineShape))
@@ -367,7 +369,7 @@ function loadHistory(store: Store, project: string, ref: Ref, cache: Map<string,
   const previousRef = value.request.previous;
   if (row.revision === 1 ? previousRef !== null : previousRef === null || previousRef.id !== row.id || previousRef.revision !== row.revision - 1)
     fail('gap_line_forged', row.id, 'previous', 'A snapshot must include every preceding line through its exact preceding revision');
-  const previous = previousRef ? loadHistory(store, project, previousRef, cache) : null;
+  const previous = previousRef ? loadHistory(store, project, previousRef) : null;
   if (previous && value.request.pass <= previous.row.value.request.pass)
     fail('gap_line_forged', row.id, 'pass', 'Saved passes must strictly advance');
   const gaps = take(readGaps(store, value.request.gaps)) as GapRecords;
@@ -376,13 +378,12 @@ function loadHistory(store: Store, project: string, ref: Ref, cache: Map<string,
   if (!same(merged.lines, value.lines)) fail('gap_line_forged', row.id, 'lines', 'The full set and every state must follow from saved sources and prior lines');
   const closures = value.request.closures.map(closure => confirmClosure(store, project,
     value.lines.find(line => line.id === closure.id)!, closure, previous, value.request.gaps, false));
-  const result: History = { row, gaps, closures, previous, references: unique([ref,
+  return { row, gaps, closures, previous, references: unique([ref,
     ...value.request.gaps.records, ...closures.flatMap(item => item.references)]) };
-  cache.set(key, result); return result;
 }
 export function readGapLines(store: Store, request: GapLinesReadRequest): OmResult<Sealed<Revision<GapLinesRecord>>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
-  return run(() => loadHistory(store, request.project, request.record, new Map()).row);
+  return run(() => loadHistory(store, request.project, request.record).row);
 }
 export function prepareGapLines(store: Store, request: GapLinesRequest): OmResult<Sealed<PreparedGapLines>> {
   requireRequest(store, request);
@@ -391,7 +392,7 @@ export function prepareGapLines(store: Store, request: GapLinesRequest): OmResul
   request = normalize(request);
   return run(() => {
     const latest = store.get<GapLinesRecord>(gapLinesId(request.project));
-    const previous = latest ? loadHistory(store, request.project, reference(latest), new Map()) : null;
+    const previous = latest ? loadHistory(store, request.project, reference(latest)) : null;
     // Exact old deliveries are history, never a command to overwrite the current state.
     for (let item = previous; item; item = item.previous) if (item.row.value.request.pass === request.pass) {
       if (!same(item.row.value.request, request)) fail('pass_conflict', item.row.id, 'request', 'A recorded pass cannot be changed');
@@ -436,7 +437,7 @@ export function confirmGapLineResult(record: Sealed<Revision<Json>>, context: Ac
     || !text(context.goal.key) || !text(context.goal.result) || !Array.isArray(context.goal.questions)
     || !Array.from(context.goal.questions).every(text)) invalid('context');
   const result = run(() => {
-    const history = loadHistory(store, context.project, reference(record), new Map());
+    const history = loadHistory(store, context.project, reference(record));
     const closures = history.closures.filter(closure => closure.attempt !== null && closure.attempt.block === context.block
       && same({ ...closure.attempt.goal, questions: sorted(closure.attempt.goal.questions) },
         { ...context.goal, questions: sorted(context.goal.questions) }));

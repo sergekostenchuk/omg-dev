@@ -1,3 +1,4 @@
+import { isProxy } from "node:util/types";
 import { Ajv, type AnySchema } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
@@ -525,8 +526,19 @@ function writeOmInputInScope(store: Store, request: InputRequest): OmResult<Seal
 }
 
 export interface HistoricalReadKey { reader: string; project: string; ref: Ref; parameters?: Json }
-interface HistoricalView { active: Set<string>; proven: Map<string, unknown> }
+type ReadObservation = { source: Store; method: 'get' | 'list' | 'history'; id: string | undefined; revision: number | undefined; references: Ref[] };
+type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observations: ReadObservation[] };
+interface ReadJournal { entries: (ReadEvent | ReadJournal)[]; sources: Set<Store>; footprint: ReadEvent[] }
+interface HistoricalProof { value: unknown; events: ReadJournal; footprint: ReadEvent[]; complete: boolean }
+interface HistoricalView { active: Set<string>; proven: Map<string, HistoricalProof> }
+interface HistoricalTrace { source: Store; observe: ((ref: Ref, head: boolean, method: ReadEvent['method']) => void) | undefined; mode: 'ordered' | 'distinct'; seen: Set<string>; journals: WeakSet<ReadJournal> }
+const historicalTraces = new WeakMap<Store, HistoricalTrace>();
+// Only internally constructed, frozen overlays qualify; an arbitrary Proxy has no snapshot guarantee.
+const historicalSnapshots = new WeakSet<Store>();
 let historicalViews: WeakMap<Store, HistoricalView> | null = null;
+let proofCaptures: ReadJournal[] = [];
+let readStack: ReadObservation[][] = [];
+let checkingFootprint = 0;
 function synchronous<T>(action: () => T): T {
   if (typeof action !== "function") invalid("history.action");
   const result = action();
@@ -534,41 +546,170 @@ function synchronous<T>(action: () => T): T {
     && typeof (result as { then?: unknown }).then === "function") invalid("history.async");
   return result;
 }
-
+function sourceView(store: Store): Store {
+  for (;;) { const trace = historicalTraces.get(store); if (!trace) return store; store = trace.source; }
+}
+function traceObservers(store: Store): HistoricalTrace[] {
+  const observers: HistoricalTrace[] = [];
+  for (;;) {
+    const trace = historicalTraces.get(store); if (!trace) return observers.reverse();
+    if (trace.observe) observers.push(trace);
+    store = trace.source;
+  }
+}
+function observeReference(trace: HistoricalTrace, ref: Ref, head: boolean, method: ReadEvent['method']): void {
+  if (trace.mode === 'distinct') {
+    const key = canonical([ref, head, method]);
+    if (trace.seen.has(key)) return;
+    trace.seen.add(key);
+  }
+  trace.observe?.({ ...ref }, head, method);
+}
+function recordRead(event: ReadEvent | ReadJournal): void {
+  if (!checkingFootprint) proofCaptures.at(-1)?.entries.push(event);
+}
+function readSignature(source: Store, records: readonly Revision<unknown>[]): string {
+  return digest(canonical(isProxy(source) && !historicalSnapshots.has(source) ? records : records.map(row => ({ ...reference(row), kind: row.kind }))));
+}
+function observedRead<T>(store: Store, method: ReadEvent['method'], id: string | undefined, revision: number | undefined, action: () => T): T {
+  const observations: ReadObservation[] = []; readStack.push(observations);
+  let value: T;
+  try { value = action(); } finally { readStack.pop(); }
+  const records = (method === 'get' ? value === null ? [] : [value] : value) as Revision<unknown>[];
+  const refs = records.map(reference), source = sourceView(store);
+  const trace = historicalTraces.get(store)!;
+  if (!checkingFootprint && trace.observe) for (const ref of refs) observeReference(trace, ref, method === 'get' && revision === undefined, method);
+  // Transparent wrappers observe one call; an opaque view may answer without reaching its source collector.
+  const child = observations.at(-1);
+  if (!child || child.source !== source || child.method !== method || child.id !== id || child.revision !== revision)
+    observations.push({ source, method, id, revision, references: refs });
+  if (readStack.length) readStack.at(-1)!.push(...observations);
+  else if (!checkingFootprint && historicalViews && proofCaptures.length) {
+    recordRead({ source, method, id, revision, references: refs, observations,
+      signature: readSignature(source, records), mutable: isProxy(source) && !historicalSnapshots.has(source) || method !== 'get' || revision === undefined || value === null });
+  }
+  return value;
+}
+/** Construct, rather than trust a claim about, a transparent source view. Opaque/pending views keep their identity. */
+export function historicalTrace(store: Store, observe?: (ref: Ref, head: boolean, method: ReadEvent['method']) => void,
+  mode: 'ordered' | 'distinct' = 'ordered'): Store {
+  if (!(store instanceof Store) || (observe !== undefined && typeof observe !== 'function') || !['ordered', 'distinct'].includes(mode)) invalid('history.trace');
+  const view = new Proxy(store, { get(target, key) {
+    if (key === 'get') return <T>(id: string, revision?: number): Revision<T> | null =>
+      observedRead(view, 'get', id, revision, () => target.get<T>(id, revision));
+    if (key === 'list') return <T>(kind?: string): Revision<T>[] => observedRead(view, 'list', kind, undefined, () => target.list<T>(kind));
+    if (key === 'history') return <T>(id: string): Revision<T>[] => observedRead(view, 'history', id, undefined, () => target.history<T>(id));
+    const value: unknown = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  historicalTraces.set(view, { source: store, observe, mode, seen: new Set(), journals: new WeakSet() });
+  return view;
+}
+function completeJournal(journal: ReadJournal): void {
+  const checked = new WeakMap<Store, Set<string>>();
+  const remember = (event: ReadEvent) => {
+    let keys = checked.get(event.source); if (!keys) { keys = new Set(); checked.set(event.source, keys); }
+    const key = canonical([event.method, event.id ?? null, event.revision ?? null, event.signature]);
+    if (!keys.has(key)) { keys.add(key); journal.footprint.push(event); }
+  };
+  // Child journals are already complete. Repeated edges retain multiplicity without copying their leaves.
+  const children = new Set<ReadJournal>();
+  for (const entry of journal.entries) {
+    if ('entries' in entry) {
+      if (children.has(entry)) continue;
+      children.add(entry);
+      for (const source of entry.sources) journal.sources.add(source);
+      for (const event of entry.footprint) remember(event);
+    } else {
+      for (const observation of entry.observations) journal.sources.add(observation.source);
+      if (entry.mutable) remember(entry);
+    }
+  }
+}
+function currentFootprint(footprint: readonly ReadEvent[]): boolean {
+  checkingFootprint++;
+  try {
+    for (const event of footprint) {
+      const records = event.method === 'get' ? (() => { const row = event.source.get<unknown>(event.id!, event.revision); return row ? [row] : []; })()
+        : event.method === 'list' ? event.source.list<unknown>(event.id) : event.source.history<unknown>(event.id!);
+      if (readSignature(event.source, records) !== event.signature) return false;
+    }
+    return true;
+  } finally { checkingFootprint--; }
+}
+function replayProof(store: Store, events: ReadJournal): void {
+  const source = sourceView(store), observers = traceObservers(store);
+  const replay = (journal: ReadJournal, active: HistoricalTrace[]): void => {
+    if (!journal.sources.has(source)) return;
+    const collecting = active.filter(trace => trace.mode === 'ordered' || !trace.journals.has(journal));
+    if (!collecting.length) return;
+    for (const trace of collecting) if (trace.mode === 'distinct') trace.journals.add(journal);
+    for (const entry of journal.entries) {
+      if ('entries' in entry) replay(entry, collecting);
+      else for (const observation of entry.observations) if (observation.source === source)
+        for (const trace of collecting) for (const ref of observation.references)
+          observeReference(trace, ref, observation.method === 'get' && observation.revision === undefined, observation.method);
+    }
+  };
+  // Ordered observers receive the full stream; declared sets visit shared subproofs only once.
+  if (observers.length) replay(events, observers);
+  recordRead(events);
+}
 /** Share exact proofs for one synchronous product operation; heads and current admission stay fresh. */
 export function withHistoricalReads<T>(action: () => T): T {
   if (historicalViews) return synchronous(action);
   historicalViews = new WeakMap();
   try { return synchronous(action); }
-  finally { historicalViews = null; }
+  finally { historicalViews = null; proofCaptures = []; }
 }
-
-/** Only immutable, successful proof results belong here, never applicability to a changing body. */
-export function historicalRead<T>(store: Store, key: HistoricalReadKey, action: () => T,
-  onCycle: () => T, cacheable: (value: T) => boolean = value => !(object(value) && value.ok === false)): T {
+function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (source: Store) => T,
+  onCycle: () => T, cacheable: (value: T) => boolean, traced: boolean): T {
   if (!(store instanceof Store) || !object(key) || !text(key.reader) || !text(key.project) || !isRef(key.ref)
-    || typeof action !== "function" || typeof onCycle !== "function" || typeof cacheable !== "function") invalid("history");
+    || typeof action !== 'function' || typeof onCycle !== 'function' || typeof cacheable !== 'function') invalid('history');
   const exact = canonical(key);
   return withHistoricalReads(() => {
-    const views = historicalViews!;
-    let view = views.get(store);
-    if (!view) { view = { active: new Set(), proven: new Map() }; views.set(store, view); }
+    const views = historicalViews!, source = sourceView(store);
+    let view = views.get(source);
+    if (!view) { view = { active: new Set(), proven: new Map() }; views.set(source, view); }
     if (view.active.has(exact)) return synchronous(onCycle);
-    if (view.proven.has(exact)) return view.proven.get(exact) as T;
+    const complete = traced || historicalTraces.has(store), previous = view.proven.get(exact);
+    if (previous && (!complete || previous.complete)) {
+      if (currentFootprint(previous.footprint)) { replayProof(store, previous.events); return previous.value as T; }
+      // A mutable opaque view now exposes another snapshot. No proof of its previous snapshot survives.
+      view.proven.clear();
+    }
     view.active.add(exact);
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [] }; proofCaptures.push(events);
+    let completed = false;
     try {
-      const result = synchronous(action);
-      if (!(object(result) && result.ok === false) && cacheable(result)) view.proven.set(exact, result);
+      const result = synchronous(() => action(traced ? historicalTrace(store) : store));
+      // Replaying through an opaque forwarding view must not bypass collectors hidden behind that view.
+      completeJournal(events); completed = true;
+      const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);
+      if (replayable && !(object(result) && result.ok === false) && cacheable(result)) view.proven.set(exact, { value: result, events, footprint: events.footprint, complete });
       return result;
-    } finally { view.active.delete(exact); }
+    } finally {
+      if (!completed) completeJournal(events);
+      proofCaptures.pop(); recordRead(events); view.active.delete(exact);
+    }
   });
+}
+/** Existing historical readers retain their interface; traced callers also retain their dependency journal. */
+export function historicalRead<T>(store: Store, key: HistoricalReadKey, action: () => T,
+  onCycle: () => T, cacheable: (value: T) => boolean = value => !(object(value) && value.ok === false)): T {
+  return useHistoricalProof(store, key, action, onCycle, cacheable, false);
+}
+/** The callback uses this source for every read, so even a cold proof records its full transitive dependencies. */
+export function historicalProof<T>(store: Store, key: HistoricalReadKey, action: (source: Store) => T,
+  onCycle: () => T, cacheable: (value: T) => boolean = value => !(object(value) && value.ok === false)): T {
+  return useHistoricalProof(store, key, action, onCycle, cacheable, true);
 }
 
 export function readOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<OmInputRecord>>> {
   return withHistoricalReads(() => {
     requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
     if (!isRef(ref)) return readInputRecord(store, project, ref);
-    return historicalRead(store, { reader: "B1.readOmInput", project, ref }, () => readInputRecord(store, project, ref),
+    return historicalProof(store, { reader: "B1.readOmInput", project, ref }, source => readInputRecord(source, project, ref),
       () => refused("record_forged", "Input sources contain a cyclic derivation", at(ref.id, "derivation", ref), "producer"), value => value.ok);
   });
 }
@@ -902,7 +1043,7 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
     }
   }
   const pending = new Map([...writes.values()].map(write => [write.id,
-    { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(write.value), value: write.value }]));
+    { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(write.value), value: copy(write.value) }]));
   const view = new Proxy(store, { get(target, property) {
     if (property === "get") return <T = Json>(id: string, revision?: number): Revision<T> | null => {
       const row = pending.get(id);
@@ -911,11 +1052,15 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
     const member: unknown = Reflect.get(target, property, target);
     return typeof member === "function" ? member.bind(target) : member;
   } });
+  // This map is complete before use and never changes. Exact fallback reads are immutable only for a known source.
+  const base = sourceView(store);
+  if (!isProxy(base) || historicalSnapshots.has(base)) historicalSnapshots.add(view);
+  const pendingSource = historicalTrace(view);
   const rebuilt = invalidations.length
-    ? deriveOmInput(view, { project: request.project, kind: "reopen-facts", previous: request.input, invalidations })
+    ? deriveOmInput(pendingSource, { project: request.project, kind: "reopen-facts", previous: request.input, invalidations })
     : delivered(body);
   if (!rebuilt.ok) return rebuilt;
-  const facts = currentFactGuards(view, rebuilt.value as OmInputRecord);
+  const facts = currentFactGuards(pendingSource, rebuilt.value as OmInputRecord);
   if (!facts.ok) return facts;
   guards.push(...facts.value);
   const heads = new Map<string, Ref>();

@@ -9,7 +9,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { readOmInput, type InputBuildResult, type InputGap, type OmInput } from './input.js';
+import { historicalProof, readOmInput, withHistoricalReads, type InputBuildResult, type InputGap, type OmInput } from './input.js';
 import { readHorizon } from './horizon.js';
 import { readUnacceptedLayer } from './layer-basis.js';
 import { prepareFrameProposals, readFrameProposals, type FrameGap, type ProposalRequest, type PreparedFrameProposals } from './frame-proposals.js';
@@ -106,8 +106,10 @@ function take<T>(result: OmResult<T>): T {
   return result.value;
 }
 function outcome<T>(action: () => T): OmResult<Sealed<T>> {
-  try { return delivered(action()); }
-  catch (error) { if (error instanceof GapFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  return withHistoricalReads(() => {
+    try { return delivered(action()); }
+    catch (error) { if (error instanceof GapFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  });
 }
 export function gapId(target: string, field: string): string {
   if (!text(target) || !text(field)) invalid('identity');
@@ -325,6 +327,12 @@ function normalizedRequest(request: GapRequest): GapRequest {
 }
 interface Materialized { request: GapRequest; sources: GapSources; collection: GapCollection; gate: GapGate; references: Ref[]; guards: Ref[] }
 function materialize(store: Store, request: GapRequest, current: boolean): Materialized {
+  if (current) return deriveMaterialized(store, request, true);
+  return historicalProof(store, { reader: 'D1.materialize', project: request.project, ref: request.input,
+    parameters: request as unknown as Json }, store => deriveMaterialized(store, request, false),
+  () => reject('gap_record_forged', request.project, 'sources', 'Historical gap sources cannot contain a cyclic derivation'));
+}
+function deriveMaterialized(store: Store, request: GapRequest, current: boolean): Materialized {
   for (const [name, level] of [['operations', 2], ['works', 3]] as const) {
     const frame = name === 'operations' ? request.operations.frame : unavailableWorks(request.works) ? null : request.works.frame;
     if (frame === null) continue;
@@ -423,22 +431,26 @@ export function readGaps(store: Store, request: GapReadRequest): OmResult<Sealed
   requireStore(store);
   if (!object(request) || !Array.isArray(request.records) || !request.records.every(isRef)) invalid('records');
   requireRequest(request.sources); request = copy(request);
-  return outcome(() => {
-    const sources = normalizedRequest(request.sources), basis = materialize(store, sources, false);
-    const cache = new Map([[canonical(sources), basis]]), records: Revision<GapRecord>[] = [], seen = new Set<string>();
-    const expected = new Set(basis.collection.gaps.map(gap => recordId(sources.project, gap)));
-    for (const ref of request.records) {
-      if (seen.has(ref.id)) reject('gap_duplicate', ref.id, 'records', 'Each gap occurs once in the historical set');
-      seen.add(ref.id);
-      const row = take(readRecord<GapRecord>(store, ref, { unit: 'G4', target: ref.id, idPrefix: `om-gap:${sources.project}:`, kind: 'gap' })) as Revision<GapRecord>;
-      verifyRecord(store, row, cache);
-      if (!expected.has(row.id)) reject('gap_foreign', row.id, 'records', 'The gap is outside this source snapshot');
-      if (!same(row.value.sources, sources)) reject('gap_record_forged', row.id, 'sources', 'Historical rows must share the exact supplied snapshot');
-      records.push(row);
-    }
-    for (const id of expected) if (!seen.has(id)) reject('gap_missing', id, 'records', 'A source gap is absent from the historical set');
-    return { sources, records: records.sort((a, b) => order(a.id, b.id)), collection: basis.collection, gate: basis.gate };
-  });
+  return outcome(() => historicalProof(store, { reader: 'D1.readGaps', project: request.sources.project, ref: request.sources.input,
+    parameters: { sources: normalizedRequest(request.sources), records: sorted(request.records) } as unknown as Json },
+  store => deriveGapRecords(store, request),
+  () => reject('gap_record_forged', request.sources.project, 'records', 'A historical gap set cannot depend cyclically on itself')));
+}
+function deriveGapRecords(store: Store, request: GapReadRequest): GapRecords {
+  const sources = normalizedRequest(request.sources), basis = materialize(store, sources, false);
+  const cache = new Map([[canonical(sources), basis]]), records: Revision<GapRecord>[] = [], seen = new Set<string>();
+  const expected = new Set(basis.collection.gaps.map(gap => recordId(sources.project, gap)));
+  for (const ref of request.records) {
+    if (seen.has(ref.id)) reject('gap_duplicate', ref.id, 'records', 'Each gap occurs once in the historical set');
+    seen.add(ref.id);
+    const row = take(readRecord<GapRecord>(store, ref, { unit: 'G4', target: ref.id, idPrefix: `om-gap:${sources.project}:`, kind: 'gap' })) as Revision<GapRecord>;
+    verifyRecord(store, row, cache);
+    if (!expected.has(row.id)) reject('gap_foreign', row.id, 'records', 'The gap is outside this source snapshot');
+    if (!same(row.value.sources, sources)) reject('gap_record_forged', row.id, 'sources', 'Historical rows must share the exact supplied snapshot');
+    records.push(row);
+  }
+  for (const id of expected) if (!seen.has(id)) reject('gap_missing', id, 'records', 'A source gap is absent from the historical set');
+  return { sources, records: records.sort((a, b) => order(a.id, b.id)), collection: basis.collection, gate: basis.gate };
 }
 
 /** New work requires the exact saved current derivation, even when two eras yield the same empty set. */

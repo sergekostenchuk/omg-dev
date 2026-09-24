@@ -16,6 +16,7 @@ import { gateCandidate, type CandidateGate, type FrameCandidateRecord } from "./
 import { WORKS_FRAME_CONTRACT, readFrame, readFrameBasis, carryFrameFills, type FrameFill, type FrameRequest, type ConnectionFrame, type FrameCarrySource } from "./frame-obligations.js";
 import type { LayerProposal } from "./frame-proposals.js";
 import { readAtomicGate, type AtomicGateRecord } from "./atomic-gate.js";
+import { withHistoricalReads, historicalProof, historicalTrace } from "./input.js";
 
 export const LAYER_BASIS_REFUSAL_CODES = Object.freeze(["layer_basis_request_invalid", "layer_basis_unproven"] as const);
 export interface LayerBasis {
@@ -58,13 +59,6 @@ const text = (value: unknown): value is string => typeof value === "string" && v
 const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(values: T[]) => [...values].sort((a, b) => order(canonical(a), canonical(b)));
-interface HistoricalReads { checked: Map<string, HistoricalLayerBasis>; active: Set<string> }
-const historicalReads = new WeakMap<Store, HistoricalReads>();
-function withinHistoricalRead<T>(store: Store, action: () => T): T {
-  if (historicalReads.has(store)) return action();
-  historicalReads.set(store, { checked: new Map(), active: new Set() });
-  try { return action(); } finally { historicalReads.delete(store); }
-}
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
 class BasisFailure extends Error {
@@ -143,13 +137,13 @@ export function readLayerEnvelope(store: Store, request: LayerEnvelopeRequest): 
 export function readLayerBasis(store: Store, request: HistoricalLayerRequest): OmResult<Sealed<HistoricalLayerBasis>> {
   requireRequest(store, request);
   if ((request.level !== 2 && request.level !== 3) || !isRef(request.upper)) invalidRequest();
-  return result(() => withinHistoricalRead(store, () => historicalBasis(store, request, envelope(store, request))));
+  return result(() => withHistoricalReads(() => historicalBasis(store, request, envelope(store, request))));
 }
 /** Resolve the producer's recorded upper basis rather than a current graph-layer head. */
 export function readLayerAcceptance(store: Store, request: LayerAcceptanceRequest): OmResult<Sealed<HistoricalLayerBasis>> {
   requireRequest(store, request);
   if (request.level !== 2 && request.level !== 3) invalidRequest();
-  return result(() => withinHistoricalRead(store, () => {
+  return result(() => withHistoricalReads(() => {
     const found = envelope(store, request), proofs = found.layer.value.layerProofs ?? [];
     const own = proofs.filter(proof => proof.level === request.level);
     if (own.length !== 1) reject(request.layer.id, "layerProofs", "An accepted layer needs exactly one own derivation proof");
@@ -159,16 +153,9 @@ export function readLayerAcceptance(store: Store, request: LayerAcceptanceReques
   }));
 }
 function historicalBasis(store: Store, request: HistoricalLayerRequest, found: LayerEnvelope): HistoricalLayerBasis {
-  const reads = historicalReads.get(store)!, key = canonical(request);
-  const checked = reads.checked.get(key);
-  if (checked) return checked;
-  if (reads.active.has(key)) reject(request.layer.id, "acceptance", "A historical layer cannot depend cyclically on its own acceptance");
-  reads.active.add(key);
-  try {
-    const checked = verifyHistoricalBasis(store, request, found);
-    reads.checked.set(key, checked);
-    return checked;
-  } finally { reads.active.delete(key); }
+  return historicalProof(store, { reader: "C5.layerBasis", project: request.project, ref: request.layer,
+    parameters: { ...request, graph: { ...request.graph }, layer: { ...request.layer }, upper: { ...request.upper } } }, store => verifyHistoricalBasis(store, request, found),
+  () => reject(request.layer.id, "acceptance", "A historical layer cannot depend cyclically on its own acceptance"));
 }
 function verifyHistoricalBasis(store: Store, request: HistoricalLayerRequest, found: LayerEnvelope): HistoricalLayerBasis {
   const { project, level, layer: layerRef, upper: upperRef } = request;
@@ -289,18 +276,8 @@ function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revisi
     || !('basis' in frame.acceptance.gate) || !isRef(frame.acceptance.gate.basis)))
     reject(frameRef.id, "acceptance.contract", "A work acceptance needs its exact works contract and original G5 basis");
   const witness = frame.acceptance;
-  const traced = new Proxy(store, { get(target, key) {
-    if (key === "get") return <T>(id: string, revision?: number): Revision<T> | null => {
-      const record = target.get<T>(id, revision);
-      if (record) refs.push(reference(record));
-      return record;
-    };
-    const value: unknown = Reflect.get(target, key, target);
-    return typeof value === "function" ? value.bind(target) : value;
-  } });
-  const reads = historicalReads.get(store);
-  if (reads) historicalReads.set(traced, reads);
-  try {
+  const traced = historicalTrace(store, (ref, _head, method) => { if (method === 'get') refs.push(ref); }, 'distinct');
+  {
     const candidate = exactRecord<FrameCandidateRecord>(traced, witness.candidate, witness.candidate.id, "frame-candidate", refs);
     let verifiedGate: AcceptedFrameGate;
     if (level === 3) {
@@ -350,7 +327,7 @@ function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revisi
     if (canonical(lower.value.obligations) !== canonical(upper.obligations)
       || canonical(lower.value.layerProofs) !== canonical([...(upper.layerProofs ?? []), proof]))
       reject(lower.id, "acceptance.inputs", "The OM layer must retain exactly its upper proof envelope and own accepted transition");
-  } finally { historicalReads.delete(traced); }
+  }
 }
 
 function validRebaseRequest(request: unknown): request is FrameRebaseRequest {
@@ -372,7 +349,7 @@ function rebaseTake<T>(value: OmResult<T>): T {
 /** A rebase carries a previously accepted mapping; it never claims a new work-layer candidate or G5. */
 export function readRebaseBasis(store: Store, request: FrameRebaseRequest): OmResult<Sealed<RebaseBasis>> {
   requireRebaseRequest(store, request);
-  return result(() => withinHistoricalRead(store, () => {
+  return result(() => withHistoricalReads(() => {
     const before = rebaseTake(readFrame(store, request.from));
     const after = rebaseTake(readFrameBasis(store, request.to));
     const project = request.to.project, refs = [...before.references, ...after.references];

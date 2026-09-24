@@ -1,5 +1,5 @@
 import { Ajv } from "ajv";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEVEL, type Binding, type CodeRef, type Endpoint, type Graph, type Node } from "../graph/model.js";
 import { projectGraph } from "../graph/project.js";
@@ -11,7 +11,7 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRo
 import { Store, type Revision } from "../storage/store.js";
 import { ProductEngine } from "../product/engine.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
-import { prepareExistingOmInput, readOmInput } from "./input.js";
+import { historicalProof, historicalTrace, withHistoricalReads, prepareExistingOmInput, readOmInput } from "./input.js";
 import { readRecord } from "./refs.js";
 import { readLayerAcceptance, readLayerBasis, type HistoricalLayerBasis, type LayerAcceptanceRequest, type LayerBasis } from "./layer-basis.js";
 
@@ -60,8 +60,10 @@ function frameReject(code: string, target: string, field: string, message: strin
   throw new EngineError("frame_internal_error", "Refusal unexpectedly produced a value");
 }
 function frameResult<T>(action: () => T): OmResult<Sealed<T>> {
-  try { return delivered(action()); }
-  catch (error) { if (error instanceof FrameFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  return withHistoricalReads(() => {
+    try { return delivered(action()); }
+    catch (error) { if (error instanceof FrameFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  });
 }
 function requireFrameLevel(level: unknown): asserts level is FrameLevel {
   if (level !== 2 && level !== 3) frameInvalid("level");
@@ -775,18 +777,28 @@ function frameSources(store: Store, request: FrameRequest): FrameBasis {
 export function readFrameBasis(store: Store, request: FrameRequest): OmResult<Sealed<FrameBasis>> {
   if (!(store instanceof Store)) frameInvalid("store");
   requireFrameRequest(request);
-  return frameResult(() => frameSources(store, frameCopy(request)));
+  return frameResult(() => frameBasis(store, frameCopy(request)));
+}
+function frameBasis(store: Store, request: FrameRequest): FrameBasis {
+  return historicalProof(store, { reader: "C2.frameBasis", project: request.project, ref: request.graph,
+    parameters: request as unknown as Json }, source => frameCopy(frameSources(source, request)),
+  () => frameReject("frame_basis_unproven", request.graph.id, "history", "The exact frame basis must not depend on itself"));
 }
 function frameDerive(store: Store, request: FrameRequest): FrameRead {
-  const { obligations: _obligations, permittedOpen, ...basis } = frameSources(store, request);
+  const { obligations: _obligations, permittedOpen, ...basis } = frameBasis(store, request);
   const result = frameTake(fillFrame(basis.upper, basis.scope, basis.accepted, basis.upperRef, request.level, new Set(permittedOpen)));
   return { ...basis, result: result as FilledFrame };
+}
+function frameReading(store: Store, request: FrameRequest): FrameRead {
+  return historicalProof(store, { reader: "C2.frameDerive", project: request.project, ref: request.graph,
+    parameters: request as unknown as Json }, source => frameCopy(frameDerive(source, request)),
+  () => frameReject("frame_basis_unproven", request.graph.id, "history", "The exact frame derivation must not depend on itself"));
 }
 /** History is checked exclusively through immutable exact references, even after heads move. */
 export function readFrame(store: Store, request: FrameRequest): OmResult<Sealed<FrameRead>> {
   if (!(store instanceof Store)) frameInvalid("store");
   requireFrameRequest(request);
-  return frameResult(() => frameDerive(store, frameCopy(request)));
+  return frameResult(() => frameReading(store, frameCopy(request)));
 }
 function frameCurrentSources(store: Store) {
   const guards = new Map<string, Ref>();
@@ -796,15 +808,7 @@ function frameCurrentSources(store: Store) {
       frameReject("input_stale", ref.id, "head", "A frame prerequisite changed during preparation");
     guards.set(ref.id, ref);
   };
-  const traced = new Proxy(store, { get(target, key) {
-    if (key === "get") return <T>(id: string, revision?: number): Revision<T> | null => {
-      const result = target.get<T>(id, revision);
-      if (revision === undefined && result) remember(reference(result));
-      return result;
-    };
-    const value: unknown = Reflect.get(target, key, target);
-    return typeof value === "function" ? value.bind(target) : value;
-  } });
+  const traced = historicalTrace(store, (ref, head) => { if (head) remember(ref); }, 'distinct');
   const current = (ref: Ref) => {
     const head = traced.get(ref.id);
     if (!head || canonical(reference(head)) !== canonical(ref))
@@ -845,7 +849,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
   requireFrameRequest(request);
   request = currentFrameRequest(request);
   return frameResult(() => {
-    const read = frameDerive(store, request);
+    const read = frameReading(store, request);
     const { traced, guards, remember, current, acceptGate } = frameCurrentSources(store);
     for (const ref of [request.graph, request.horizon, ...(request.layer ? [request.layer] : []),
       ...(request.frame ? [request.frame] : []), ...(request.upper ? [request.upper.horizon, ...(request.upper.frame ? [request.upper.frame] : [])] : [])]) current(ref);

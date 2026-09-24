@@ -17,7 +17,7 @@ import { Store } from "../src/storage/store.js";
 import { gapId, readGaps, writeGaps, type Gap, type GapRequest, type GapReadRequest } from "../src/om/gaps.js";
 import { mergeLines, prepareGapLines, writeGapLines, readGapLines, gapLinesId, gapLineKey, gapLineExpectedResult, GAP_LINE_KIND,
   type GapLine, type GapLineClosure, type GapLinesRequest, type GapLinesRecord, type GapClosureRequest } from "../src/om/gap-lines.js";
-import { writeOmInput } from "../src/om/input.js";
+import { withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
@@ -287,6 +287,72 @@ function firstPassFixture(t: TestContext) {
   return { root, database, store, graph, frame, input: reference(input), gaps, initial,
     request: { project: "garden", previous: null, pass: 1, gaps: initial, closures: [] } as GapLinesRequest };
 }
+
+test("S1 D2 shares exact predecessor proofs across readers while each current preparation checks fresh heads", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const second = ok(writeGapLines(f.store, { ...f.request, previous: reference(first), pass: 2 }));
+  const thirdRequest = { ...f.request, previous: reference(second), pass: 3 };
+  const third = ok(writeGapLines(f.store, thirdRequest));
+  const reads = new Map<string, number>();
+  const measured = f.store, get = measured.get.bind(measured);
+  measured.get = ((id: string, revision?: number) => {
+    const key = `${id}@${revision ?? "head"}`;
+    reads.set(key, (reads.get(key) ?? 0) + 1);
+    return get(id, revision);
+  }) as Store["get"];
+  const rival = new Store(f.database);
+  t.after(() => rival.close());
+  withHistoricalReads(() => {
+    assert.deepEqual(ok(readGapLines(measured, { project: "garden", record: reference(third) })), third);
+    const expanded = [first, second, third].map(row => reads.get(`${row.id}@${row.revision}`));
+    assert.deepEqual(expanded, [1, 1, 1], "the immutable line chain is read once");
+    for (const row of [first, second, third]) {
+      assert.deepEqual(ok(readGapLines(measured, { project: "garden", record: reference(row) })), row);
+    }
+    assert.deepEqual([first, second, third].map(row => reads.get(`${row.id}@${row.revision}`)), expanded,
+      "cached predecessor proofs do not reread their immutable line records");
+    const next = { ...f.request, previous: reference(third), pass: 4 };
+    const prepared = ok(prepareGapLines(measured, next));
+    const headKey = `${third.id}@head`, before = reads.get(headKey)!;
+    assert.deepEqual(ok(prepareGapLines(measured, next)), prepared);
+    assert.ok(reads.get(headKey)! > before, "current line admission is never memoized");
+    const input = rival.get(f.input.id)!;
+    rival.write({ id: input.id, kind: input.kind, expected: input.revision, value: input.value });
+    denied(prepareGapLines(measured, next), "input_stale");
+    denied(writeGuarded(measured, { unit: "S1", target: third.id, guards: prepared.guards, writes: prepared.writes }), "input_stale");
+    assert.deepEqual(reference(rival.get(third.id)!), reference(third));
+    assert.deepEqual(ok(readGapLines(measured, { project: "garden", record: reference(third) })), third);
+    assert.deepEqual(ok(prepareGapLines(measured, thirdRequest)).existing, third,
+      "the exact old pass remains a historical replay after current input changes");
+  });
+  const before = reads.get(`${third.id}@${third.revision}`)!;
+  assert.deepEqual(ok(readGapLines(measured, { project: "garden", record: reference(third) })), third);
+  assert.ok(reads.get(`${third.id}@${third.revision}`)! > before);
+  const restarted = new Store(f.database);
+  try { assert.deepEqual(ok(readGapLines(restarted, { project: "garden", record: reference(third) })), third); }
+  finally { restarted.close(); }
+});
+
+test("S1 D2 does not share a proof with a different Store view or a forged exact revision", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const second = ok(writeGapLines(f.store, { ...f.request, previous: reference(first), pass: 2 }));
+  const alternate = new Proxy(f.store, { get(target, property) {
+    if (property === "get") return (id: string, revision?: number) =>
+      id === first.id && revision === first.revision ? null : target.get(id, revision);
+    const member = Reflect.get(target, property, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    assert.deepEqual(ok(readGapLines(f.store, { project: "garden", record: reference(second) })), second);
+    denied(readGapLines(alternate, { project: "garden", record: reference(second) }), "record_missing");
+    const forged = clone(second.value) as GapLinesRecord;
+    forged.request.previous = reference(second); forged.request.pass = 3;
+    const row = f.store.write({ id: second.id, kind: second.kind, expected: second.revision, value: forged });
+    denied(readGapLines(f.store, { project: "garden", record: reference(row) }), "gap_line_forged");
+    assert.deepEqual(ok(readGapLines(f.store, { project: "garden", record: reference(second) })), second);
+  });
+});
+
 function acceptOperations(f: ReturnType<typeof firstPassFixture>) {
   const { store, frame, graph } = f;
   const current = ok(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
