@@ -14,8 +14,9 @@ import { readGaps, type GapReadRequest } from './gaps.js';
 import { inputDecisionWrite, deriveInputDecisions, prepareAddressing, type InputFieldDecision } from './addressing.js';
 import { readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
 import { readPacketAnswer, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
-  type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest } from './question-packet.js';
+  type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest, type WorksPartBindings } from './question-packet.js';
 import type { LayerProposal } from './frame-proposals.js';
+import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 
 export const ANSWER_FORM_CODES = Object.freeze([
@@ -27,7 +28,7 @@ export interface NodeAnswerFormRequest { project: string; packet: Ref; raw: stri
 export interface FactValueFormRequest { project: string; question: Ref; value: Json }
 export interface NodeAnswerForm {
   kind: 'node-form'; task: Extract<AnswerTaskAddress, { kind: 'node-expansion' }>;
-  proposal: PartProposalBody; references: Ref[];
+  proposal: PartProposalBody; bindings?: TaskObligationBinding[]; references: Ref[];
 }
 export interface FactValueForm {
   kind: 'fact-value-form'; task: Extract<AnswerTaskAddress, { kind: 'fact' }>;
@@ -94,7 +95,9 @@ export function checkNodeAnswerForm(store: Store, request: NodeAnswerFormRequest
     if (checked.answer.action !== 'answer' || !('proposal' in checked.answer))
       fail('answer_form_invalid', request.packet, 'reply', 'This check requires a substantive node answer');
     return { kind: 'node-form', task: { project: request.project, kind: 'node-expansion', packet: request.packet },
-      proposal: checked.answer.proposal as PartProposalBody, references: checked.references as Ref[] } satisfies NodeAnswerForm;
+      proposal: checked.answer.proposal as PartProposalBody,
+      ...(checked.answer.bindings ? { bindings: checked.answer.bindings as TaskObligationBinding[] } : {}),
+      references: checked.references as Ref[] } satisfies NodeAnswerForm;
   });
 }
 
@@ -120,7 +123,7 @@ export interface InputDecisionsForm {
 interface AssignedQuestion { id: string; target: string; field: string; consumers: string[] }
 interface PacketOutcomeBase { unanswered: string[]; task: { project: string; packet: Ref }; references: Ref[] }
 export type CheckedAnswerForm = PacketOutcomeBase & (
-  | { kind: 'node-proposal'; proposal: LayerProposal }
+  | { kind: 'node-proposal'; proposal: LayerProposal; works?: WorksPartBindings }
   | { kind: 'fact-candidates'; facts: { questionId: string; question: Ref; value: Json; grounds: AnswerGround[] }[] }
   | InputDecisionsForm
   | { kind: 'need-source'; questionIds: string[]; missing: string; reads: PacketRead[]; questions: AssignedQuestion[] }
@@ -288,6 +291,7 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
     const filled = new Set([...derived.proposal.fills, ...derived.proposal.replaces].map(fill => fill.obligation));
     return { task, unanswered: (payload.questions as unknown as AssignedQuestion[]).filter(q => !filled.has(q.target)).map(q => q.id).sort(order),
       kind: 'node-proposal', proposal: derived.proposal as LayerProposal,
+      ...(derived.works ? { works: derived.works as WorksPartBindings } : {}),
       references: references([...refs, ...derived.references]), guards: references(guards) };
   }
   if (payload.model === 'MC1') {

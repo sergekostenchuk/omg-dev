@@ -8,6 +8,9 @@ import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
+import { bindTaskObligations, checkTaskObligationBinding, taskBindingId } from '../src/graph/task-obligations.js';
+import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
+import type { ObligationHandoff } from '../src/graph/obligation-handoff.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Write } from '../src/storage/store.js';
@@ -15,10 +18,12 @@ import { inputDecisionWrite, writeAddressing, prepareAddressing } from '../src/o
 import { readMc1Question, readAnswerCitations } from '../src/om/accepted-answer.js';
 import { checkNodeAnswerForm, checkFactValueForm, checkAnswerForm, prepareAnswerForm, checkInputFieldAnswer, prepareInputFieldAnswer } from '../src/om/answer-form.js';
 import { prepareFrameProposals } from '../src/om/frame-proposals.js';
+import { WORKS_FRAME_CONTRACT } from '../src/om/frame-obligations.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
-import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { writeOmInput, readOmInput } from '../src/om/input.js';
+import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment, writeOmObligations } from '../src/om/obligations.js';
+import { writeOmInput, readOmInput, withHistoricalReads } from '../src/om/input.js';
 import { normalizePartAnswer, prepareQuestionTasks, writeQuestionPacket, type PartProposalBody, derivePartProposal, PACKET_ANSWER_PROTOCOL } from '../src/om/question-packet.js';
 import { writeRoutes, type RoutedBatch } from '../src/om/routes.js';
 import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
@@ -518,4 +523,234 @@ test('E3 partial MC1 and MC2 result sets explicitly retain the unanswered task a
   assert.equal(historical.kind, 'fact-candidates'); if (historical.kind !== 'fact-candidates') assert.fail('Expected fact candidates');
   assert.deepEqual(historical.unanswered, factIds.slice(1));
   assert.deepEqual(ok(checkInputFieldAnswer(f.store, fieldRequest)).unanswered, [f.fieldBatch.items[1]!.gap]);
+});
+
+/** A content-only form specimen, without a fabricated packet, call or D7 acceptance. */
+function worksFormBody(): PartProposalBody {
+  const graph = gardenGraph(), work = clone(graph.nodes.find(node => node.id === 'garden-produce-work')!);
+  const code = { path: 'src/output.ts', symbol: 'serialize', access: 'write' as const, status: 'planned' as const };
+  work.code = [code];
+  return { nodes: [work], fills: [{ obligation: hashJson('works-form-connection-end'), node: work.id, port: 'out', codeRef: clone(code) }],
+    localConnectors: [], artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [],
+    anchors: [], removes: [], replaces: [], redefines: [] };
+}
+
+test('E3 shared L3 form retains the complete code reference while the historical form remains unchanged', () => {
+  const body = worksFormBody(), original = clone(body), checked = ok(normalizePartAnswer(body, WORKS_FRAME_CONTRACT));
+  assert.deepEqual(checked.fills, original.fills);
+  assert.deepEqual(checked.fills[0]!.codeRef, { path: 'src/output.ts', symbol: 'serialize', access: 'write', status: 'planned' });
+  assert.deepEqual(body, original); assert.ok(frozen(checked));
+  assert.notStrictEqual(checked.fills[0]!.codeRef, body.fills[0]!.codeRef);
+  assert.equal(hashJson(checked), hashJson(ok(normalizePartAnswer(clone(original), WORKS_FRAME_CONTRACT))));
+  rejected(normalizePartAnswer(original), 'part_answer_invalid');
+  const historical = clone(original); delete historical.fills[0]!.codeRef;
+  assert.deepEqual(ok(normalizePartAnswer(historical)).fills, historical.fills);
+  body.fills[0]!.codeRef!.symbol = 'callerMutation';
+  assert.equal(checked.fills[0]!.codeRef!.symbol, 'serialize');
+});
+
+test('E3 shared L3 form rejects incomplete malformed or service-bearing code references', () => {
+  const body = worksFormBody(), complete = body.fills[0]!.codeRef!;
+  const missing = ['path', 'access', 'status'].map(field => {
+    const code = clone(complete) as unknown as Record<string, unknown>; delete code[field]; return code;
+  });
+  const invalid: unknown[] = [null, false, 1, 'src/output.ts', [], {}, ...missing,
+    { ...complete, path: '' }, { ...complete, path: 7 }, { ...complete, access: 'execute' },
+    { ...complete, access: null }, { ...complete, status: 'accepted' }, { ...complete, status: null },
+    { ...complete, symbol: '' }, { ...complete, symbol: null }, { ...complete, symbol: [] },
+    { ...complete, accepted: true }, { ...complete, owner: 'model' }, { ...complete, hash: hashJson(complete) }];
+  for (const codeRef of invalid) {
+    const proposed = { ...clone(body), fills: [{ ...clone(body.fills[0]!), codeRef }] };
+    rejected(normalizePartAnswer(proposed, WORKS_FRAME_CONTRACT), 'part_answer_invalid');
+  }
+  for (const extra of [{ worksContract: WORKS_FRAME_CONTRACT }, { status: 'accepted' }, { source: 'model' },
+    { level: 3 }, { producer: { id: 'unproven', revision: 1, hash: hashJson('unproven') } }])
+    rejected(normalizePartAnswer({ ...body, ...extra }, WORKS_FRAME_CONTRACT), 'part_answer_invalid');
+  assert.deepEqual(body, worksFormBody());
+});
+
+/** Native D3/D1/D2/D7 authority; works below it are proposed consumers, not an accepted L3. */
+function bindingAuthority(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-binding-form-')), database = join(root, 'state.sqlite'), project = 'garden';
+  let store = new Store(database);
+  const engine = new ProductEngine(store), desired = gardenGraph();
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const { level: _level, ...projection } = projectGraph(desired, 1);
+  preparedFeatures(engine, project, projection as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [0, 1].map(index => ({ id: `late-${index}`,
+      question: `Which post-implementation proof is required for result ${index}?`, consumer: 'garden-produce-block',
+      blocksCurrentStage: false, resolution: 'Retain and address this question in OM' }));
+    return value;
+  });
+  const graph = store.get<Graph>(`graph:${project}`)!, base = ok(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [0, 1].map(index => ({
+    pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: `discovery:late-${index}`, field: 'address', value: { consumer: 'garden-produce-block', kind: 'post-implementation-proof' } } })) as Write,
+  })) }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: 'binding-authority', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = ok(writeGapLines(store, { project, gaps: gapRead, previous: null, pass: 1, closures: [] }));
+  const assignments = [0, 1].map(index => {
+    const gap = gaps.records.find(row => row.value.gap.target === `discovery:late-${index}`)!;
+    const value = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project,
+      context: { gaps: gapRead, lines: reference(lines) }, gap: reference(gap),
+      assignments: gap.value.gap.consumers.map(consumer => ({ responsibleNode: consumer, responsibleConsumer: consumer,
+        reason: `The owner requires the proof for result ${index}`, returnCondition: `Verify retained result ${index}`, wake: null })) });
+    return { pending: { id: `om-owner-gap-assignment:${project}:${hashJson(value)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0,
+      value: clone(value) } as Write };
+  });
+  const saved = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments }));
+  const handoff = clone(saved.handoff) as ObligationHandoff, work = desired.nodes.find(node => node.id === 'garden-produce-work')!;
+  assert.equal(handoff.obligations.length, 2); assert.ok(work.tests.length);
+  const bindings: TaskObligationBinding[] = handoff.obligations.map(obligation => ({ id: taskBindingId(obligation), scope: clone(obligation.scope),
+    obligation: obligation.obligation, consumers: [{ node: work.id, tests: [...work.tests] }] }));
+  desired.researchObligations = bindings;
+  return { project, database, graph: desired, handoff, work, bindings, get store() { return store; },
+    restart() { store.close(); store = new Store(database); } };
+}
+
+test('E3 shared task binding check uses the complete native D7 authority without claiming set completeness', t => {
+  const f = bindingAuthority(t), before = snapshot(f.store), full = bindTaskObligations(f.store, f.project, f.graph, f.handoff);
+  assert.deepEqual(full.findings, []);
+  const rows = f.bindings.map(binding => checkTaskObligationBinding(f.store, f.project, f.graph, f.handoff, binding));
+  assert.ok(rows.every(row => row.findings.length === 0));
+  assert.deepEqual(rows.flatMap(row => row.byNode.get(f.work.id) ?? []).sort((a, b) => a.binding.localeCompare(b.binding)), full.byNode.get(f.work.id));
+  const partial = { ...clone(f.graph), researchObligations: [clone(f.bindings[0]!)] };
+  assert.deepEqual(checkTaskObligationBinding(f.store, f.project, partial, f.handoff, f.bindings[0]!), rows[0]);
+  const incomplete = bindTaskObligations(f.store, f.project, partial, f.handoff);
+  assert.deepEqual(incomplete.findings.map(finding => finding.code), ['task_obligation_consumer_missing']);
+  assert.equal(incomplete.findings[0]!.target, f.bindings[1]!.obligation);
+  const sliced = { ...clone(f.handoff), obligations: [clone(f.handoff.obligations[0]!)] };
+  assert.throws(() => checkTaskObligationBinding(f.store, f.project, partial, sliced, f.bindings[0]!), error =>
+    error instanceof EngineError && error.code === 'task_obligation_scope_foreign');
+  assert.deepEqual(snapshot(f.store), before);
+  f.restart();
+  assert.deepEqual(checkTaskObligationBinding(f.store, f.project, f.graph, f.handoff, f.bindings[0]!), rows[0]);
+  assert.deepEqual(bindTaskObligations(f.store, f.project, f.graph, f.handoff), full);
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('E3 one binding and the full binder share identity, concrete work, test and deadline refusals', t => {
+  const f = bindingAuthority(t), binding = f.bindings[0]!;
+  const candidates: Array<[TaskObligationBinding, string]> = [
+    [{ ...clone(binding), id: 'borrowed-binding' }, 'task_obligation_foreign'],
+    [{ ...clone(binding), obligation: f.bindings[1]!.obligation }, 'task_obligation_foreign'],
+    [{ ...clone(binding), scope: { ...binding.scope, hash: hashJson('foreign-scope') } }, 'task_obligation_foreign'],
+    [{ ...clone(binding), consumers: [{ node: 'garden-consume-work', tests: [] }] }, 'task_obligation_consumer_foreign'],
+    [{ ...clone(binding), consumers: [{ node: 'garden-produce-operation', tests: [] }] }, 'task_obligation_consumer_foreign'],
+    [{ ...clone(binding), consumers: [{ node: f.work.id, tests: ['foreign-test'] }] }, 'task_obligation_test_foreign'],
+    [{ ...clone(binding), consumers: [{ node: f.work.id, tests: [] }] }, 'task_obligation_resolution_required'],
+    [{ ...clone(binding), consumers: [clone(binding.consumers[0]!), clone(binding.consumers[0]!)] }, 'task_obligation_consumer_missing'],
+  ];
+  for (const [candidate, code] of candidates) {
+    const graph = { ...clone(f.graph), researchObligations: [candidate, clone(f.bindings[1]!)] };
+    const single = checkTaskObligationBinding(f.store, f.project, graph, f.handoff, candidate), full = bindTaskObligations(f.store, f.project, graph, f.handoff);
+    assert.deepEqual(single.findings.map(finding => finding.code), [code]);
+    assert.deepEqual(single.findings, full.findings.filter(finding => finding.target === candidate.id));
+    assert.equal(single.byNode.size, 0);
+  }
+  const duplicate = { ...clone(f.graph), researchObligations: [clone(binding), ...clone(f.bindings)] };
+  assert.equal(bindTaskObligations(f.store, f.project, duplicate, f.handoff).findings[0]!.code, 'task_obligation_duplicate');
+  const forged = clone(f.handoff); forged.obligations[0]!.moment = 'task-start';
+  assert.throws(() => checkTaskObligationBinding(f.store, f.project, f.graph, forged, binding), error =>
+    error instanceof EngineError && error.code === 'task_obligation_scope_foreign');
+  assert.throws(() => checkTaskObligationBinding(f.store, 'other-project', f.graph, f.handoff, binding), error => error instanceof EngineError);
+});
+
+test('E3 public task binding check rejects malformed arguments before Store access and preserves storage faults', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-binding-arguments-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const noIo = new Proxy(store, { get(target, property) {
+    if (['get', 'list', 'history', 'write', 'writeMany'].includes(String(property))) return () => assert.fail('Malformed binding arguments reached storage');
+    const member: unknown = Reflect.get(target, property, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const ref: Ref = { id: 'source:garden', revision: 1, hash: hashJson('exact-source') }, graph = gardenGraph();
+  const handoff = { era: 'om-obligations/v1', producer: ref, scope: ref, obligations: [] };
+  const binding: TaskObligationBinding = { id: 'binding', scope: ref, obligation: 'gap', consumers: [{ node: 'garden-produce-work', tests: [] }] };
+  const invoke = checkTaskObligationBinding as (...args: unknown[]) => unknown;
+  const args: unknown[] = [noIo, 'garden', graph, handoff, binding];
+  const malformed = (error: unknown) => error instanceof EngineError && error.code === 'task_obligation_request_invalid'
+    && Boolean((error.details as { target: string; field: string }).target) && Boolean((error.details as { target: string; field: string }).field);
+  for (let index = 0; index < args.length; index++) for (const value of [undefined, null, false, [], '']) {
+    const values = [...args]; values[index] = value; assert.throws(() => invoke(...values), malformed);
+  }
+  for (const [index, value] of [
+    [2, { ...graph, nodes: null }], [2, { ...graph, horizon: null }], [2, { ...graph, tests: [null] }],
+    [3, { ...handoff, producer: {} }], [3, { ...handoff, obligations: null }], [3, { ...handoff, obligations: [null] }],
+    [3, { ...handoff, scope: { ...ref, revision: 0 } }], [3, { ...handoff, scope: { ...ref, hash: '' } }],
+    [3, { ...handoff, r2: ref }], [3, { ...handoff, accepted: true }],
+    [4, { ...binding, scope: { ...ref, revision: 0 } }], [4, { ...binding, consumers: [] }],
+    [4, { ...binding, consumers: [{ node: 'garden-produce-work', tests: null }] }], [4, { ...binding, status: 'accepted' }],
+  ] as Array<[number, unknown]>) {
+    const values = [...args]; values[index] = value; assert.throws(() => invoke(...values), malformed);
+  }
+  const fault = new TypeError('native binding reader storage fault'), broken = new Proxy(store, { get(target, property) {
+    if (property === 'get') return () => { throw fault; };
+    const member: unknown = Reflect.get(target, property, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const omRef: Ref = { ...ref, id: 'om-obligation-basis:garden:missing' };
+  assert.throws(() => invoke(broken, 'garden', graph, { ...handoff, producer: omRef,
+    scope: { ...ref, id: 'om-obligations:garden:missing' } }, binding), error => error === fault);
+});
+
+test('E3 binding rows share one exact D7 proof per operation while callers, Store views and failures remain distinct', t => {
+  const f = bindingAuthority(t);
+  if ('r2' in f.handoff) assert.fail('The fixture must provide native OM authority');
+  const handoff = f.handoff, fault = new TypeError('exact D7 proof read failed'), counts = new Map<string, number>();
+  let rejectPrimary = false, onPrimaryRead: (() => void) | undefined;
+  function counted(store: Store, name: string): Store {
+    return new Proxy(store, { get(target, property) {
+      if (property === 'get') return (id: string, revision?: number) => {
+        if (id === handoff.producer.id && revision === handoff.producer.revision) {
+          counts.set(name, (counts.get(name) ?? 0) + 1);
+          if (name === 'primary') { onPrimaryRead?.(); if (rejectPrimary) throw fault; }
+        }
+        return target.get(id, revision);
+      };
+      const member: unknown = Reflect.get(target, property, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+  }
+  const primary = counted(f.store, 'primary'), anotherProxy = counted(f.store, 'other-proxy'), reopened = new Store(f.database);
+  t.after(() => reopened.close());
+  const anotherStore = counted(reopened, 'other-store');
+  const check = (store = primary, binding = f.bindings[0]!, authority: ObligationHandoff = handoff) =>
+    checkTaskObligationBinding(store, f.project, f.graph, authority, binding);
+  withHistoricalReads(() => {
+    for (const binding of [...f.bindings, ...f.bindings]) assert.deepEqual(check(primary, binding).findings, []);
+    assert.equal(counts.get('primary'), 1, 'The complete producer is read once across all binding rows');
+    const full = bindTaskObligations(primary, f.project, f.graph, handoff);
+    assert.deepEqual(full.findings, []); assert.equal(counts.get('primary'), 1, 'The full binder shares the same historical proof');
+    const sliced = { ...clone(handoff), obligations: [clone(handoff.obligations[0]!)] };
+    const forged = clone(handoff); forged.obligations[0]!.returnCondition = 'Forged caller condition';
+    for (const authority of [sliced, forged]) assert.throws(() => check(primary, f.bindings[0]!, authority), error =>
+      error instanceof EngineError && error.code === 'task_obligation_scope_foreign');
+    assert.equal(counts.get('primary'), 1, 'Cache hits must still compare every caller against the full proved ledger');
+    assert.deepEqual(check(anotherProxy).findings, []);
+    assert.deepEqual(check(anotherStore).findings, []);
+    assert.equal(counts.get('other-proxy'), 1); assert.equal(counts.get('other-store'), 1);
+  });
+  withHistoricalReads(() => assert.deepEqual(check().findings, []));
+  assert.equal(counts.get('primary'), 2, 'The next external operation must read its source again');
+  rejectPrimary = true;
+  assert.throws(() => withHistoricalReads(() => check()), error => error === fault);
+  assert.equal(counts.get('primary'), 3, 'A failed source read is visible after a prior successful operation');
+  withHistoricalReads(() => {
+    assert.throws(() => check(), error => error === fault);
+    rejectPrimary = false;
+    assert.deepEqual(check().findings, []); assert.deepEqual(check().findings, []);
+  });
+  assert.equal(counts.get('primary'), 5, 'Exceptions leave no active or proved cache entry; a retry then proves the same exact source');
+  onPrimaryRead = () => { check(); };
+  assert.throws(() => withHistoricalReads(() => check()), error =>
+    error instanceof EngineError && error.code === 'task_obligation_scope_foreign');
+  assert.equal(counts.get('primary'), 6, 'A recursive proof must be refused before reading the producer again');
+  onPrimaryRead = undefined;
+  assert.deepEqual(check().findings, []);
+  assert.equal(counts.get('primary'), 7, 'Cycle cleanup must not poison the next external operation');
 });

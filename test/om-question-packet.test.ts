@@ -1,8 +1,11 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -19,24 +22,27 @@ import { readAnswerTask, readMc1Question, writeAcceptedAnswer, readAcceptedAnswe
 import { confirmResults } from '../src/om/achievements.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest, type GapRecord } from '../src/om/gaps.js';
-import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
+import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND } from '../src/om/obligations.js';
+import { taskBindingId } from '../src/graph/task-obligations.js';
+import type { CarriedObligation } from '../src/graph/obligation-policy.js';
+import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
+import { checkAnswerForm, checkNodeAnswerForm } from '../src/om/answer-form.js';
 import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   preparePartResult, readPartResult, readPacketResponse, partResponseId, type PartResponseRecord,
-  normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
-import { openSeries, beginAttempt, completeAttempt, type AttemptGoal } from '../src/om/series.js';
+  normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, WORKS_PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
+import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
-import type { FrameObligation } from '../src/om/frame-obligations.js';
+import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { deliverModelSources } from '../src/om/model-call.js';
+import { deliverModelSources, assembleModelParts, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
-import { answerTechnicalFixture } from './technical-research-fixture.js';
-import { answerLayerFixture } from './layer-design-fixture.js';
 
 const clone = structuredClone;
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
@@ -1171,49 +1177,122 @@ test('E2 admits an MC2 missing input field with a proven block consumer under th
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(blocked) })), blocked);
 });
 
-test('E2 work expansion belongs to its proven consumer block rather than the upper operation id', t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e2-work-goal-')), database = join(root, 'state.sqlite'), project = 'garden';
-  let store = new Store(database);
+// Dynamic imports let the same fixture run under the immutable historical producer's complete module graph.
+async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
+  const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
+  const { canonical } = await import('../src/canonical.js');
+  const { Store } = await import('../src/storage/store.js');
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { projectGraph } = await import('../src/graph/project.js');
+  const { reference } = await import('../src/pipeline/contracts.js');
+  const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
+  const { writeOmInput } = await import('../src/om/input.js');
+  const { writeHorizon } = await import('../src/om/horizon.js');
+  const { writeGaps } = await import('../src/om/gaps.js');
+  const { writeRoutes } = await import('../src/om/routes.js');
+  const { gapLineKey, gapLineExpectedResult } = await import('../src/om/gap-lines.js');
+  const { gardenGraph } = await import('./om-fixture.js');
+  const { preparedFeatures } = await import('./product-fixture.js');
+  const { answerTechnicalFixture } = await import('./technical-research-fixture.js');
+  const { answerLayerFixture } = await import('./layer-design-fixture.js');
+  const { preparedField } = await import('./preparation-fixture.js');
+  const { inputDecisionWrite, writeAddressing } = await import('../src/om/addressing.js');
+  const { prepareFrame } = await import('../src/om/frame-obligations.js');
+  const { normalizePartAnswer } = await import('../src/om/question-packet.js');
+  const ok = <T>(result: OmResult<T>): T => {
+    if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
+    return result.value;
+  };
+  const project = 'garden', store = new Store(database);
   const engine = new ProductEngine(store);
+  try {
+    writeFileSync(join(root, 'README.md'), 'A deterministic garden product for typed refinement tests.\n');
+    const desired = gardenGraph();
+    if (late && late !== 'initial-realizes') desired.edges!.push({ id: 'e21-shared-consumer', relation: 'realizes',
+      source: late === 'multiple' ? 'garden-produce-operation' : 'garden-consume-operation',
+      target: late === 'multiple' ? 'garden-consume-block' : 'garden-produce-block', condition: 'The operation also serves this accepted consumer' });
+    const { level: _level, ...l1 } = projectGraph(desired, 1);
+    const responsible = late === 'initial-realizes' ? 'garden-consume-operation'
+      : late === 'multiple' ? 'garden-produce-operation' : 'garden-produce-block';
+    preparedFeatures(engine, project, l1 as Graph, field => {
+      const value = preparedField(project, field);
+      if (late && field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'work-proof',
+        question: 'Which result proof do these work consumers retain?', consumer: responsible,
+        blocksCurrentStage: false, resolution: 'Carry this result proof until work execution' }];
+      return value;
+    });
+    const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+    let input = ok(writeOmInput(store, { project, expected: 0, stages }));
+    const command = { executable: process.execPath, args: ['--version'] };
+    const environment = engine.environments.configure(project, { workspace: root,
+      implementer: { actor: 'fixture-researcher', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'fixture-assessor', model: 'fixture', effort: 'high', command },
+      fullCheck: command, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
+    const r0 = engine.refinement.begin(project, 'R0');
+    engine.refinement.finishResearch(project, 'R0', reference(r0), 0); engine.refinement.sealLayer(project, 1, 0);
+    const r1 = engine.refinement.begin(project, 'R1'); answerTechnicalFixture(engine, project, r1);
+    engine.refinement.finishResearch(project, 'R1', reference(store.get(r1.id)!), 0);
+    const design = engine.refinement.prepareLayer(project, 2), answered = answerLayerFixture(engine, project, design, 2, desired);
+    const graph = engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, 'fixture-researcher');
+    const layer = engine.refinement.sealLayer(project, 2, 0);
+    if (late) input = ok(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
+      decisions: [{ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph),
+        layers: late !== 'overlap' ? [reference(store.get(`graph-layer:${project}:2`)!)] : [],
+        decision: { target: 'discovery:work-proof', field: 'address', value: { consumer: responsible, kind: 'post-implementation-proof' } } }) as Write }] }));
+    const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: reference(layer), available: {},
+      choice: { choiceVersion: 'e2-first-work-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+    const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+      operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
+        layer: reference(store.get(`graph-layer:${project}:2`)!), frame: null, upper: null } },
+      works: { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
+        layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } };
+    if (initialWorks) {
+      assert.ok(!('state' in sources.works));
+      const frame = ok(prepareFrame(store, sources.works.frame));
+      sources.works.frame = structuredClone(frame.request) as FrameRequest;
+      const work = desired.nodes.find(node => node.id === 'garden-produce-work')!;
+      const obligation = frame.result.obligations.find(item => item.upper.node === 'garden-produce-operation' && item.kind === 'connection-end')!;
+      const nodes = desired.nodes.filter(node => ['garden-produce-work', 'garden-consume-work'].includes(node.id));
+      const body = ok(normalizePartAnswer({ nodes, fills: [{ obligation: obligation.id, node: work.id,
+        port: obligation.upper.port!, codeRef: work.code[0]! }], tests: desired.tests.filter(test => nodes.some(node => node.tests.includes(test.id))),
+        localConnectors: [], artifacts: [], contracts: [], joins: [],
+        edges: late === 'initial-realizes' ? [{ id: 'initial-work-realizes', relation: 'realizes', source: work.id,
+          target: 'garden-consume-operation', condition: 'The initial work also serves this accepted operation' }] : [],
+        journeys: [], packets: [], transfers: [], anchors: [],
+        removes: [], replaces: [], redefines: [] }, 'works-frame/v1'));
+      sources.works.proposals = [reference(store.write({ id: `om-proposal:${project}:initial-work`, kind: 'layer-proposal', expected: 0,
+        value: { base: { graph: frame.request.graph, frame: frame.request.frame }, level: 3, worksContract: 'works-frame/v1',
+          source: 'decision', status: 'proposed', ...body } }))];
+    }
+    const gaps = ok(writeGaps(store, sources));
+    const routes = ok(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, tasks: [],
+      catalog: { paths: [], records: [] }, previous: null }));
+    const batch = routes.value.batches.find(batch => batch.level === 3 && batch.node === 'garden-produce-operation')!;
+    assert.ok(batch);
+    assert.ok(batch.items.every(item => late ? item.consumers.includes('garden-produce-block') : canonical(item.consumers) === canonical(['garden-produce-block'])));
+    const goal: AttemptGoal = { key: 'e2-work-node-goal', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+    return { store, project, desired, input, graph, environment, gaps, routes, batch, goal };
+  } catch (error) { store.close(); throw error; }
+}
+
+test('E2 work expansion belongs to its proven consumer block rather than the upper operation id', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e2-work-goal-')), database = join(root, 'state.sqlite');
+  const fixture = await workExpansionFixture(database, root);
+  let { store } = fixture;
+  const { project, environment, gaps, routes, batch, goal } = fixture;
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  writeFileSync(join(root, 'README.md'), 'A deterministic garden product for typed refinement tests.\n');
-  const desired = gardenGraph(), { level: _level, ...l1 } = projectGraph(desired, 1);
-  preparedFeatures(engine, project, l1 as Graph);
-  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-  const input = ok(writeOmInput(store, { project, expected: 0, stages }));
-  const command = { executable: process.execPath, args: ['--version'] };
-  const environment = engine.environments.configure(project, { workspace: root,
-    implementer: { actor: 'fixture-researcher', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'fixture-assessor', model: 'fixture', effort: 'high', command },
-    fullCheck: command, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
-  const r0 = engine.refinement.begin(project, 'R0');
-  engine.refinement.finishResearch(project, 'R0', reference(r0), 0); engine.refinement.sealLayer(project, 1, 0);
-  const r1 = engine.refinement.begin(project, 'R1'); answerTechnicalFixture(engine, project, r1);
-  engine.refinement.finishResearch(project, 'R1', reference(store.get(r1.id)!), 0);
-  const design = engine.refinement.prepareLayer(project, 2), answered = answerLayerFixture(engine, project, design, 2, desired);
-  const graph = engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, 'fixture-researcher');
-  const layer = engine.refinement.sealLayer(project, 2, 0);
-  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: reference(layer), available: {},
-    choice: { choiceVersion: 'e2-first-work-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
-    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: reference(store.get(`graph-layer:${project}:2`)!), frame: null, upper: null } },
-    works: { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } };
-  const gaps = ok(writeGaps(store, sources));
-  const routes = ok(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, tasks: [],
-    catalog: { paths: [], records: [] }, previous: null }));
-  const batch = routes.value.batches.find(batch => batch.level === 3 && batch.node === 'garden-produce-operation')!;
-  assert.ok(batch);
-  assert.ok(batch.items.every(item => canonical(item.consumers) === canonical(['garden-produce-block'])));
-  const goal: AttemptGoal = { key: 'e2-work-node-goal', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
-    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const ledger = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+  const works = { producer: reference(ledger.producer), ledger: reference(ledger.record) };
   let acceptedPacket: Ref | null = null;
   for (const block of ['garden-produce-block', batch.node!]) {
     ok(openSeries(store, { project, block, line: 1, slice: 'e2-work-node-goal', predecessor: null, basis: null }));
     const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
     const request: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(environment),
-      attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+      attempt: { series: reference(series), ordinal: 1 }, previous: [], works };
     const before = snapshot(store), prepared = prepareQuestionPacket(store, request);
     assert.deepEqual(snapshot(store), before);
     if (block === 'garden-produce-block') {
@@ -1227,6 +1306,235 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
   store.close(); store = new Store(database);
   assert.ok(acceptedPacket);
   assert.equal(ok(readQuestionPacket(store, { project, record: acceptedPacket })).value.state, 'ready');
+});
+
+async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e21-works-')), database = join(root, 'state.sqlite');
+  const base = await workExpansionFixture(database, root, late, initialWorks);
+  let store = base.store;
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const gaps = { sources: clone(base.gaps.sources) as GapRequest, records: base.gaps.records.map(reference) };
+  const lines = ok(writeGapLines(store, { project: base.project, previous: null, pass: 1, gaps, closures: [] }));
+  const assignments: { pending: Write }[] = [];
+  if (late) {
+    const gap = base.gaps.records.find(item => item.value.gap.target === 'discovery:work-proof')!;
+    const value = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project: base.project,
+      context: { gaps, lines: reference(lines) }, gap: reference(gap),
+      assignments: gap.value.gap.consumers.map(consumer => ({ responsibleNode: late === 'initial-realizes' ? 'garden-consume-operation'
+        : late === 'multiple' ? 'garden-produce-operation' : 'garden-produce-block',
+        responsibleConsumer: consumer, reason: 'Preserve the result duty for this particular consumer',
+        returnCondition: `Prove the concrete work result for ${consumer}`, wake: null })) });
+    assignments.push({ pending: { id: `om-owner-gap-assignment:${base.project}:${hashJson(value)}`,
+      kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: value as unknown as Json } });
+  }
+  const ledger = ok(writeOmObligations(store, { project: base.project, gaps, lines: reference(lines), assignments }));
+  function request(node = base.batch.node!, block = 'garden-produce-block') {
+    const batch = base.routes.value.batches.find(item => item.task === 'node-expansion' && item.level === 3 && item.node === node)!;
+    assert.ok(batch);
+    const goal: AttemptGoal = { key: `e21:${node}`, questions: batch.items.map(item => gapLineKey(base.project, item.target, item.field)),
+      result: gapLineExpectedResult(base.project, batch.items[0]!.target, batch.items[0]!.field) };
+    ok(openSeries(store, { project: base.project, block, line: 1, slice: `e21:${node}`, predecessor: null, basis: null }));
+    const series = ok(beginAttempt(store, { project: base.project, block, line: 1, attempt: 1, goal }));
+    return { project: base.project, routes: reference(base.routes), batch: batch.id, environment: reference(base.environment),
+      attempt: { series: reference(series), ordinal: 1 }, previous: [],
+      works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } } satisfies QuestionPacketRequest;
+  }
+  function answer(packet: Sealed<Revision<QuestionPacketRecord>>) {
+    const payload = packet.value.packet as Record<string, any>, node = payload.expansion.upper.id;
+    const work = clone(base.desired.nodes.find(item => item.kind === 'work' && item.parent === node && item.code.length)!);
+    assert.ok(work);
+    const proposal: PartProposalBody = { nodes: [work], fills: payload.expansion.obligations.filter((item: FrameObligation) => payload.expansion.assigned.includes(item.id))
+      .map((item: FrameObligation) => ({ obligation: item.id, node: work.id,
+        ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: clone(work.code[0]!) } : {}) })),
+      tests: clone(base.desired.tests.filter(item => item.node === work.id)), localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [],
+      journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+    const bindings: TaskObligationBinding[] = ledger.handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item as CarriedObligation)))
+      .map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
+        consumers: [{ node: work.id, tests: [...work.tests] }] }));
+    return { protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, action: 'answer', proposal, bindings };
+  }
+  return { ...base, get store() { return store; }, root, database, ledger, gaps, lines, request, answer,
+    restart() { store.close(); store = new Store(database); } };
+}
+
+test('E2.1 measures the complete L3 form and authentic D7 task before issuing a packet', async t => {
+  const f = await worksPacketFixture(t, 'multiple'), request = f.request(), before = snapshot(f.store);
+  const prepared = ok(prepareQuestionPacket(f.store, request)), packet = prepared.record, payload = packet.value.packet as Record<string, any>;
+  assert.deepEqual(snapshot(f.store), before);
+  assert.equal(packet.value.packetContract, WORKS_PACKET_CONTRACT);
+  assert.equal(payload.version, 'om-question-packet/works-v1');
+  assert.equal(payload.responseForm.schema.oneOf[0].properties.bindings.type, 'array');
+  assert.ok(payload.responseForm.schema.oneOf[0].properties.proposal.properties.fills.items.properties.codeRef);
+  assert.deepEqual(payload.works.obligations, f.ledger.handoff.obligations);
+  assert.equal(payload.works.assigned.length, 2, 'Two consumers of one original gap retain separate identities');
+  assert.equal(new Set(payload.works.assigned).size, 2);
+  assert.deepEqual(payload.works.assigned, payload.works.nodeAssignments);
+  assert.equal(packet.value.fingerprint!.hash, hashJson(payload));
+  assert.equal(packet.value.fingerprint!.chars, canonical(payload).length);
+  assert.equal(packet.value.fullChars, canonical(payload).length);
+  for (const ref of [request.works.producer, request.works.ledger, reference(f.lines)])
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)));
+  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(f.answer(saved));
+  const checked = ok(checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw }));
+  assert.equal(checked.kind, 'node-proposal'); if (checked.kind !== 'node-proposal') return;
+  assert.equal(checked.proposal.worksContract, 'works-frame/v1');
+  assert.deepEqual(checked.works?.bindings.map(item => item.id).sort(), payload.works.assigned);
+  assert.equal(Object.hasOwn(checked.proposal, 'bindings'), false);
+  assert.deepEqual(ok(checkNodeAnswerForm(f.store, { project: f.project, packet: reference(saved), raw })).bindings, checked.works!.bindings);
+  const multiple = f.answer(saved), extra = clone(multiple.proposal.nodes[0]!);
+  extra.id = `${extra.id}-second`; extra.tests = [`${extra.id}-test`];
+  extra.code[0]!.path = `${extra.id}.ts`;
+  const proof = clone(multiple.proposal.tests[0]!); proof.id = extra.tests[0]!; proof.node = extra.id;
+  proof.contract!.entrypoint.path = extra.code[0]!.path;
+  multiple.proposal.nodes.push(extra); multiple.proposal.tests.push(proof);
+  multiple.bindings[0]!.consumers.push({ node: extra.id, tests: [...extra.tests] });
+  const plural = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw: JSON.stringify(multiple) }));
+  assert.equal(plural.works!.bindings.find(row => row.id === multiple.bindings[0]!.id)!.consumers.length, 2);
+  assert.equal(f.store.list('om-part-result:').length, 0, 'Checking the form claims neither a call nor provenance');
+  const history = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw }));
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
+  assert.deepEqual(ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw })), history);
+});
+
+test('E2.1 requires an explicit complete same-task D7 basis and refuses forged or foreign ledgers without writes', async t => {
+  const f = await worksPacketFixture(t, 'multiple'), request = f.request();
+  const { works: _works, ...missing } = request;
+  rejected(prepareQuestionPacket(f.store, missing), 'packet_task_set_invalid');
+  for (const works of [null, {}, { producer: request.works.producer }, { ledger: request.works.ledger }])
+    assert.throws(() => prepareQuestionPacket(f.store, { ...request, works } as unknown as QuestionPacketRequest), malformed);
+  for (const changed of [
+    { ...request.works, ledger: { ...request.works.ledger, id: request.works.ledger.id.replace(':garden:', ':foreign:') } },
+    { ...request.works, ledger: { ...request.works.ledger, hash: '0'.repeat(64) } },
+  ]) {
+    const before = snapshot(f.store);
+    rejected(writeQuestionPacket(f.store, { ...request, works: changed }), 'packet_task_set_invalid');
+    assert.deepEqual(snapshot(f.store), before);
+  }
+  const value = { ...clone(f.ledger.record.value), assignments: [...clone(f.ledger.record.value.assignments)] }; value.assignments.pop();
+  const forged = f.store.write({ id: `om-obligations:${f.project}:${hashJson(value)}`, kind: f.ledger.record.kind, expected: 0, value });
+  const producerValue = { ...clone(f.ledger.producer.value), ledger: reference(forged) };
+  const producer = f.store.write({ id: `om-obligation-basis:${f.project}:${hashJson(producerValue)}`, kind: f.ledger.producer.kind, expected: 0, value: producerValue });
+  const before = snapshot(f.store), bad = writeQuestionPacket(f.store, { ...request, works: { producer: reference(producer), ledger: reference(forged) } });
+  assert.equal(bad.ok, false); assert.deepEqual(snapshot(f.store), before);
+});
+
+test('E2.1 rejects omitted assignments foreign work tests and code references through the shared E3 derivation', async t => {
+  const f = await worksPacketFixture(t, 'multiple'), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  const good = f.answer(packet), before = snapshot(f.store);
+  const parse = (value: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(value) });
+  const mutations: ((value: typeof good) => void)[] = [
+    value => { value.bindings.pop(); },
+    value => { value.bindings.push(clone(value.bindings[0]!)); },
+    value => { value.bindings[0]!.scope.hash = '0'.repeat(64); },
+    value => { value.bindings[0]!.consumers[0]!.node = 'garden-consume-work'; },
+    value => { value.bindings[0]!.consumers[0]!.node = 'w-garden-produce-operation'; },
+    value => { value.bindings[0]!.consumers[0]!.tests = ['garden-consume-work-test']; },
+    value => { delete value.proposal.fills.find(item => item.codeRef)!.codeRef; },
+    value => { value.proposal.fills.find(item => item.codeRef)!.codeRef!.path = 'foreign.ts'; },
+    value => { value.proposal.fills.find(item => !item.port)!.codeRef = clone(value.proposal.nodes[0]!.code[0]!); },
+    value => { value.proposal.nodes.push(clone(value.proposal.nodes[0]!)); },
+    value => { value.proposal.tests.push(clone(value.proposal.tests[0]!)); },
+  ];
+  for (const mutate of mutations) { const value = clone(good); mutate(value); assert.equal(parse(value).ok, false); }
+  const { bindings: _bindings, ...absent } = good;
+  rejected(parse(absent), 'part_answer_invalid'); rejected(parse({ ...good, bindings: null }), 'part_answer_invalid');
+  const supported = ok(parse(good)); assert.equal(supported.kind, 'node-proposal');
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('E2.1 explicit empty bindings survive normal parsing but absence does not', async t => {
+  const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record, good = f.answer(packet);
+  assert.deepEqual(good.bindings, []);
+  const parsed = ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(good) }));
+  assert.deepEqual(parsed.works!.bindings, []);
+  const { bindings: _bindings, ...absent } = good;
+  rejected(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(absent) }), 'part_answer_invalid');
+});
+
+test('E2.1 D7 source race is atomic while the exact saved assignment remains readable after restart', async t => {
+  const f = await worksPacketFixture(t, 'multiple'), request = f.request();
+  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(f.answer(saved));
+  const history = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw }));
+  const next = f.request('garden-consume-operation', 'garden-consume-block'), prepared = ok(prepareQuestionPacket(f.store, next));
+  const owner = f.ledger.producer.value.request.assignments[0]!;
+  assert.ok('record' in owner);
+  const command = f.store.get(owner.record.id)!;
+  f.store.write({ id: command.id, kind: command.kind, expected: command.revision, value: command.value });
+  rejected(writeGuarded(f.store, { unit: 'E2.1-test', target: prepared.record.id,
+    writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.equal(f.store.get(prepared.record.id), null);
+  assert.equal(prepareQuestionPacket(f.store, request).ok, false);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
+  assert.deepEqual(ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw })), history);
+});
+
+test('E2.1 overlapping node assignments keep the same D7 identity and each concrete consumer transfer', async t => {
+  const f = await worksPacketFixture(t, 'overlap');
+  const packets = [f.request(), f.request('garden-consume-operation', 'garden-consume-block')]
+    .map(request => ok(writeQuestionPacket(f.store, request)).record);
+  const transfers = packets.map(packet => ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(f.answer(packet)) })).works!);
+  assert.equal(transfers[0]!.bindings.length, 1); assert.equal(transfers[1]!.bindings.length, 1);
+  assert.equal(transfers[0]!.bindings[0]!.id, transfers[1]!.bindings[0]!.id);
+  assert.deepEqual(transfers.map(item => item.bindings[0]!.consumers[0]!.node).sort(), ['garden-consume-work', 'garden-produce-work']);
+});
+
+for (const late of ['multiple', 'initial-realizes'] as const) test(`E2.1 initial checked works and tests remain available without redeclaration (${late})`, async t => {
+  const f = await worksPacketFixture(t, late, true), request = f.request(), packet = ok(writeQuestionPacket(f.store, request)).record;
+  const payload = packet.value.packet as Record<string, any>, answer = f.answer(packet);
+  assert.equal(payload.works.assigned.length, late === 'multiple' ? 2 : 1);
+  const source = f.gaps.sources.works; assert.ok(!('state' in source));
+  const initial = f.store.get<LayerProposal>(source.proposals[0]!.id, source.proposals[0]!.revision)!;
+  assert.ok(initial.value.nodes.some(node => node.id === 'garden-produce-work'));
+  assert.ok(initial.value.nodes.some(node => node.id === 'garden-consume-work'), 'The foreign work is real but belongs to another node assignment');
+  const extra = answer.proposal.nodes[0]!; extra.id += '-additional';
+  extra.code = extra.code.map(code => ({ ...code, path: 'src/additional-work.ts' }));
+  extra.tests = extra.tests.map(id => `${id}-additional`);
+  answer.proposal.tests = answer.proposal.tests.map(test => ({ ...test, id: `${test.id}-additional`, node: extra.id,
+    contract: { ...test.contract!, entrypoint: { ...test.contract!.entrypoint, path: extra.code[0]!.path } } }));
+  answer.proposal.fills = answer.proposal.fills.map(fill => ({ ...fill, node: extra.id, ...(fill.codeRef ? { codeRef: extra.code[0]! } : {}) }));
+  const raw = JSON.stringify(answer), at = { project: f.project, packet: reference(packet), raw }, before = snapshot(f.store);
+  const form = ok(checkAnswerForm(f.store, at)), content = ok(derivePartProposal(f.store, at));
+  assert.equal(form.kind, 'node-proposal'); if (form.kind !== 'node-proposal') return;
+  assert.deepEqual(form.works, content.works);
+  assert.ok(content.works!.bindings.every(binding => binding.consumers.every(consumer => consumer.node === 'garden-produce-work')));
+  assert.deepEqual(content.proposal.nodes.map(node => node.id), [extra.id]);
+  assert.ok(content.proposal.tests.every(test => test.node === extra.id));
+  for (const foreign of ['work', 'test'] as const) {
+    const wrong = clone(answer);
+    if (foreign === 'work') wrong.bindings[0]!.consumers[0]!.node = 'garden-consume-work';
+    else wrong.bindings[0]!.consumers[0]!.tests = [...initial.value.nodes.find(node => node.id === 'garden-consume-work')!.tests];
+    rejected(checkAnswerForm(f.store, { ...at, raw: JSON.stringify(wrong) }), 'part_result_invalid');
+  }
+  assert.deepEqual(snapshot(f.store), before);
+  const series = f.store.get<RepairSeries>(request.attempt.series.id, request.attempt.series.revision)!;
+  const adapter = f.store.write({ id: `adapter:${f.project}:initial-work`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:initial-work`, kind: 'dispatch-config', expected: 0,
+    value: { projectId: f.project, model: 'fixture' } });
+  const assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
+  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: 'model-design', basis: null,
+    block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0]!.goal,
+    gaps: f.batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+      id: item.target, goal: item.target, field: item.field, consumer }))),
+    dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(packet.value.packet) as Json })).call;
+  const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
+    value: { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId, raw } };
+  const partRequest = { project: f.project, packet: reference(packet), call: reference(call), response: { pending: responseWrite } };
+  const prepared = ok(preparePartResult(f.store, partRequest));
+  ok(writeGuarded(f.store, { unit: 'E2.1-initial-work', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+  const part = ok(readPartResult(f.store, { project: f.project, record: reference(prepared.record) }));
+  assert.deepEqual(part.record.value.works, content.works); assert.deepEqual(part.proposal.value, content.proposal);
+  const assembly = ok(assembleModelParts(f.store, { project: f.project, results: [reference(part.record)] }));
+  assert.deepEqual(assembly.record.value.works, content.works);
+  assert.deepEqual(assembly.proposal.value.nodes.map(node => node.id), [extra.id], 'Assembly retains the initial proposal as a source, without redeclaring it');
+  const snapshotBeforeRestart = snapshot(f.store); f.restart();
+  assert.deepEqual(ok(checkAnswerForm(f.store, at)), form);
+  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(part.record) })), part);
+  assert.deepEqual(ok(readPartAssembly(f.store, { project: f.project, record: reference(assembly.record) })).record, assembly.record);
+  assert.deepEqual(ok(preparePartResult(f.store, partRequest)).writes, []);
+  assert.deepEqual(snapshot(f.store), snapshotBeforeRestart);
 });
 
 test('E2 declares every new content and control branch before dispatch and shares its exact reply parser', t => {
@@ -1348,6 +1656,131 @@ test('E2 preserves original packet and part-result history strictly in its old a
   const wrong = f.store.write({ id: `${packet.id}:changed-era`, kind: 'question-packet', expected: 0, value: changed as unknown as Json });
   rejected(readQuestionPacket(f.store, { project: f.project, record: reference(wrong) }), 'packet_record_invalid');
   assert.equal(snapshot(f.store).length, before.length + 1);
+});
+
+/** Runs in another process: every production module and imported fixture is loaded from the accepted Git base. */
+async function producePreWorksPacket(database: string, root: string, fixture: typeof workExpansionFixture) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
+  const { canonical } = await import('../src/canonical.js');
+  const { reference } = await import('../src/pipeline/contracts.js');
+  const { openSeries, beginAttempt } = await import('../src/om/series.js');
+  const { recordCall } = await import('../src/om/call-record.js');
+  const { writeQuestionPacket, preparePartResult, readPartResult, partResponseId } = await import('../src/om/question-packet.js');
+  const { writeGuarded } = await import('../src/om/refs.js');
+  const ok = <T>(result: OmResult<T>): T => {
+    if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
+    return result.value;
+  };
+  const { store, project, graph, environment, routes, batch, goal } = await fixture(database, root);
+  try {
+    const block = 'garden-produce-block';
+    ok(openSeries(store, { project, block, line: 1, slice: 'e2-work-history', predecessor: null, basis: null }));
+    const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+    const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+      environment: reference(environment), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+    assert.equal(packet.value.packetContract, 'om-packet/v3');
+    assert.equal(packet.value.state, 'ready');
+    const payload = packet.value.packet as Record<string, any>, expansion = payload.expansion;
+    const oldShape = payload.responseForm.schema.oneOf[0].properties.proposal;
+    assert.equal(Object.hasOwn(oldShape.properties, 'worksContract'), false);
+    assert.equal(Object.hasOwn(oldShape.properties.fills.items.properties, 'codeRef'), false);
+    const assigned = (expansion.obligations as FrameObligation[]).filter(obligation => expansion.assigned.includes(obligation.id));
+    assert.equal(assigned.length, expansion.assigned.length);
+    assert.ok(assigned.some(obligation => obligation.kind === 'connection-end'));
+    const upper = graph.value.nodes.find(node => node.id === batch.node)!;
+    const node: Node = { ...structuredClone(upper), id: 'garden-historical-work', kind: 'work', parent: upper.id,
+      title: 'Historical work answer', ports: assigned.filter(obligation => obligation.kind === 'connection-end').map((obligation, index) => ({
+        id: `historical-port-${index}`, direction: obligation.role === 'producer' ? 'out' : 'in',
+        contract: graph.value.artifacts.find(artifact => artifact.id === obligation.artifact)!.contract,
+      })), code: [{ path: 'src/historical-work.ts', access: 'write', status: 'planned' }], tests: [] };
+    let port = 0;
+    const body = { nodes: [node], fills: assigned.map(obligation => ({ obligation: obligation.id, node: node.id,
+      ...(obligation.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
+      joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+    const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0,
+      value: { projectId: project, protocol: 'fixture' } });
+    const config = store.write({ id: `config:${project}`, kind: 'dispatch-config', expected: 0,
+      value: { projectId: project, model: 'fixture' } });
+    const questions = new Set((payload.questions as { id: string }[]).map(question => question.id));
+    const call = ok(recordCall(store, project, { call: payload.requestId, purpose: 'model-design', basis: null, block,
+      gaps: batch.items.filter(item => questions.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+        id: item.target, goal: item.target, field: item.field, consumer }))), series: reference(series), attempt: 1, goal,
+      dispatch: { adapter: reference(adapter), config: reference(config) }, packet: payload })).call;
+    const response = store.write<PartResponseRecord>({ id: partResponseId(project, reference(call)), kind: 'part-response', expected: 0,
+      value: { project, packet: reference(packet), call: reference(call), requestId: payload.requestId,
+        raw: JSON.stringify({ protocol: payload.responseForm.protocol, requestId: payload.requestId, action: 'answer', proposal: body }) } });
+    const prepared = ok(preparePartResult(store, { project, packet: reference(packet), call: reference(call), response: reference(response) }));
+    ok(writeGuarded(store, { unit: 'E2-history-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+    const part = ok(readPartResult(store, { project, record: reference(prepared.record) }));
+    assert.equal(part.proposal.value.level, 3);
+    assert.equal(Object.hasOwn(part.proposal.value, 'worksContract'), false);
+    assert.ok(part.proposal.value.fills.every(fill => !Object.hasOwn(fill, 'codeRef')));
+    return { project, packet: reference(packet), result: reference(part.record), response: reference(response),
+      packetBytes: canonical(packet), resultBytes: canonical(part.record), proposalBytes: canonical(part.proposal),
+      responseBytes: canonical(response), raw: response.value.raw };
+  } finally { store.close(); }
+}
+
+function preWorksPacketHistory(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e2-works-history-')), database = join(root, 'state.sqlite');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(root, 'accepted-packet-producer-loader.mjs');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', '30f8d753cf8ab3d6186c952f050aba2219b97a2b:' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}
+`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const historicalImports = (source: string) => source
+    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
+    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
+  const producer = historicalImports(producePreWorksPacket.toString()), fixture = historicalImports(workExpansionFixture.toString());
+  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})(${JSON.stringify(database)}, ${JSON.stringify(root)}, ${fixture})));`],
+  { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
+  return { database, ...JSON.parse(output) as Awaited<ReturnType<typeof producePreWorksPacket>> };
+}
+
+test('E2.1 reads the immutable pre-works L3 producer history byte-for-byte and rejects codeRef in its old answer form', t => {
+  const history = preWorksPacketHistory(t), store = new Store(history.database);
+  try {
+    const before = snapshot(store);
+    const packet = ok(readQuestionPacket(store, { project: history.project, record: history.packet }));
+    const part = ok(readPartResult(store, { project: history.project, record: history.result }));
+    assert.equal(canonical(packet), history.packetBytes);
+    assert.equal(canonical(part.record), history.resultBytes);
+    assert.equal(canonical(part.proposal), history.proposalBytes);
+    assert.equal(canonical(store.get(history.response.id, history.response.revision)), history.responseBytes);
+    assert.equal(packet.value.packetContract, 'om-packet/v3');
+    assert.equal(part.proposal.value.level, 3);
+    assert.equal(Object.hasOwn(part.proposal.value, 'worksContract'), false);
+    assert.ok(part.proposal.value.fills.every(fill => !Object.hasOwn(fill, 'codeRef')));
+    const answer = { project: history.project, packet: history.packet, raw: history.raw };
+    assert.equal(canonical(ok(derivePartProposal(store, answer)).proposal), canonical(part.proposal.value));
+    const extended = JSON.parse(history.raw);
+    const fill = extended.proposal.fills.find((row: { port?: string }) => row.port !== undefined);
+    assert.ok(fill);
+    fill.codeRef = extended.proposal.nodes.find((node: Node) => node.id === fill.node).code[0];
+    rejected(readPacketAnswer(store, { ...answer, raw: JSON.stringify(extended) }), 'part_answer_invalid');
+    rejected(derivePartProposal(store, { ...answer, raw: JSON.stringify(extended) }), 'part_answer_invalid');
+    assert.deepEqual(snapshot(store), before);
+  } finally { store.close(); }
 });
 
 test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', t => {

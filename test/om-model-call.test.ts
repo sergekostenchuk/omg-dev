@@ -245,14 +245,21 @@ import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { prepareQuestionTasks, prepareQuestionPacket, readQuestionPacket, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord,
+import { prepareQuestionTasks, prepareQuestionPacket, readQuestionPacket, readPartResult, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord,
   type PartProposalBody } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, beginAttempt, seriesRequestOf } from '../src/om/series.js';
-import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
-import { prepareFrameProposals } from '../src/om/frame-proposals.js';
+import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
+import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
+import { prepareFrame, fillObligations, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { writeCandidate } from '../src/om/frame-candidate.js';
+import { settleCandidate } from '../src/om/frame-accept.js';
+import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, writeOmObligations } from '../src/om/obligations.js';
+import { taskBindingId } from '../src/graph/task-obligations.js';
+import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import { runModelCall, readModelCall, readModelCallState, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
 import { readCall } from '../src/om/call-record.js';
+import { checkAnswerForm } from '../src/om/answer-form.js';
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-dispatch-')), database = join(root, 'state.sqlite');
@@ -353,6 +360,104 @@ function e4Node(f: ReturnType<typeof e4Fixture>, packet: Revision<QuestionPacket
     ...(item.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
   return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', proposal };
+}
+
+/** A first works pass through C2/C4/C5, with a genuine owner assignment and no accepted L3. */
+function e4WorksFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e4-works-')), database = join(root, 'state.sqlite'), project = 'garden';
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const desired = gardenGraph('cross'), { level: _level, ...l1 } = projectGraph(desired, 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'late-proof',
+      question: 'Which result proof must the concrete producer provide?', consumer: 'garden-produce-operation',
+      blocksCurrentStage: false, resolution: 'Retain the result proof for the concrete work' }];
+    return value;
+  });
+  let input = valueOf(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const initial = valueOf(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
+    refinement: null, available: {}, choice: { choiceVersion: 'e4-work-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const frame2: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!), horizon: reference(initial.gate),
+    layer: null, frame: null, upper: null };
+  const frame = valueOf(prepareFrame(store, frame2)), projected = projectGraph(desired, 2);
+  const fills = valueOf(fillObligations(frame.upper as Graph, frame.scope as FrameScope, { graph: desired,
+    reference: { ...frame.request.graph, hash: hashJson(desired) }, frame: null }, frame.upperRef, 2));
+  const nodes = projected.nodes.filter(node => node.kind === 'operation'), nodeIds = new Set(nodes.map(node => node.id));
+  const proposalValue: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level: 2, source: 'decision', status: 'proposed', nodes,
+    fills: fills.fills.filter(fill => nodeIds.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
+      ...(fill.port === undefined ? {} : { port: fill.port }) })),
+    localConnectors: projected.connectors.map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))
+      .filter(connector => connector.bindings.length), artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
+    tests: projected.tests, edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [],
+    transfers: projected.transfers ?? [], anchors: projected.anchors, removes: [], replaces: [], redefines: [] };
+  const proposal = store.write({ id: `om-proposal:${project}:e4-work-upper`, kind: 'layer-proposal', expected: 0, value: proposalValue });
+  const candidate = valueOf(writeCandidate(store, { frame: frame2, proposals: [reference(proposal)] }));
+  assert.equal(candidate.state, 'candidate'); if (candidate.state !== 'candidate') throw new Error('Missing upper candidate');
+  const accepted = valueOf(settleCandidate(store, { project, level: 2, candidate: reference(candidate.record), outcome: {
+    gate: 'G3', candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
+  const graph = reference(accepted.graph!), layer2 = reference(accepted.layer!), upperFrame = reference(accepted.frame!);
+  input = valueOf(writeAddressing(store, { project, input: reference(input), graph, decisions: [{ pending: inputDecisionWrite({ project,
+    input: reference(input), graph, layers: [layer2], decision: { target: 'discovery:late-proof', field: 'address',
+      value: { consumer: 'garden-produce-operation', kind: 'post-implementation-proof' } } }) as Write }] }));
+  const horizon = valueOf(writeHorizon(store, { project, input: reference(input), graph, refinement: layer2, available: {},
+    choice: { choiceVersion: 'e4-work-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { ...frame2, graph, horizon: reference(horizon.gate), layer: layer2, frame: upperFrame } },
+    works: { proposals: [], frame: { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
+      upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
+  const gaps = valueOf(writeGaps(store, sources)), gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = valueOf(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const late = gaps.records.find(row => row.value.gap.target === 'discovery:late-proof')!; assert.ok(late);
+  const assignment = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project, context: { gaps: gapRead, lines: reference(lines) },
+    gap: reference(late), assignments: late.value.gap.consumers.map(consumer => ({ responsibleNode: 'garden-produce-operation',
+      responsibleConsumer: consumer, reason: 'Retain the concrete result test', returnCondition: `Prove result for ${consumer}`, wake: null })) });
+  const ledger = valueOf(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [{ pending: {
+    id: `om-owner-gap-assignment:${project}:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } }] }));
+  const routes = valueOf(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(batch => batch.level === 3 && batch.node === 'garden-produce-operation')!; assert.ok(batch);
+  const address = { project, block: 'garden-produce-block', line: 1 };
+  valueOf(openSeries(store, { ...address, slice: 'e4-work', predecessor: null, basis: null }));
+  const series = valueOf(beginAttempt(store, { ...address, attempt: 1, goal: { key: 'e4-work',
+    questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) } }));
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
+  const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
+  function environment(requestCapacityChars = 100_000) {
+    return engine.environments.configure(project, { workspace: root,
+      implementer: { actor: 'e4-work-producer', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'e4-work-reviewer', model: 'fixture', effort: 'high', command },
+      fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars },
+    store.get(`environment:${project}`)?.revision ?? 0);
+  }
+  const configured = environment(), adapter = store.write({ id: `adapter:${project}:e4-work`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } });
+  const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
+    attempt: { series: reference(series), ordinal: 1 }, previous: [], works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } };
+  const packet = valueOf(writeQuestionPacket(store, packetRequest)).record;
+  const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
+  const work = structuredClone(desired.nodes.find(node => node.id === 'garden-produce-work')!);
+  const tests = structuredClone(desired.tests.filter(test => work.tests.includes(test.id)));
+  const worksSource = gapRead.sources.works; assert.ok(!('state' in worksSource));
+  const obligations = valueOf(prepareFrameProposals(store, worksSource)).frame.result.obligations.filter(item => item.upper.node === batch.node);
+  const bindings = ledger.handoff.obligations.map(obligation => ({ id: taskBindingId(obligation as CarriedObligation),
+    scope: obligation.scope, obligation: obligation.obligation, consumers: [{ node: work.id, tests: work.tests }] }));
+  assert.ok(bindings.length);
+  function answer(current = packet as Revision<QuestionPacketRecord>, position = current.value.plan!.position) {
+    const plan = current.value.plan!, assigned = obligations.filter(item => plan.assignments[position]!.obligations.includes(item.id));
+    const proposal: PartProposalBody = { nodes: position === 0 ? [work] : [], tests: position === 0 ? tests : [],
+      fills: assigned.map(item => ({ obligation: item.id, node: work.id,
+        ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
+      localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+      removes: [], replaces: [], redefines: [] };
+    return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', proposal,
+      bindings: position === plan.assignments.length - 1 ? bindings : [] };
+  }
+  return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured,
+    get store() { return store; }, restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
 }
 
 test('E4 admits before spawning, saves MC1 candidates and actual usage, and replays exact history without native reissuance', async t => {
@@ -628,6 +733,99 @@ test('E4 cycle assembles all node parts after a source continuation with exact c
   valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
   assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: cycle.record.value.results as Ref[] })).record, assembly.record);
   valueOf(await runModelCycle(f.store, request)); assert.deepEqual(f.store.list().map(reference), snapshot);
+});
+
+test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', async t => {
+  for (const split of [false, true]) await t.test(split ? 'split with prior work and test' : 'whole node', async t => {
+    const f = e4WorksFixture(t), config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+    const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
+    assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
+    const count = packet.value.plan!.assignments.length;
+    assert.ok(split ? count > 1 : count === 1);
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    const payload = packet.value.packet as { requestId: string; works: { assigned: string[]; nodeAssignments: string[] } };
+    const beforeForm = f.store.list().map(reference), answer = f.answer(packet as Revision<QuestionPacketRecord>);
+    const raw = (body: object) => JSON.stringify({ ...body, requestId: payload.requestId });
+    const { bindings: _bindings, ...missing } = answer;
+    assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw(missing) }).ok, false);
+    if (split) {
+      assert.deepEqual(payload.works.assigned, []); assert.ok(payload.works.nodeAssignments.length);
+      assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw({ ...answer, bindings: f.bindings }) }).ok, false);
+    }
+    assert.deepEqual(f.store.list().map(reference), beforeForm); assert.equal(f.sent().length, 0);
+    f.steps(Array.from({ length: count }, (_, position) => ({ research: f.answer(packet as Revision<QuestionPacketRecord>, position), usage })));
+    const acceptedIds = [`graph:${f.project}`, `graph-layer:${f.project}:2`, `graph-layer:${f.project}:3`, `om-frame:${f.project}:3`];
+    const acceptedBefore = acceptedIds.map(id => f.store.get(id));
+    if (split) {
+      const writeMany = f.store.writeMany.bind(f.store); let stopped = false;
+      f.store.writeMany = ((writes, guards) => {
+        const saved = writeMany(writes, guards);
+        if (!stopped && writes.some(write => write.kind === 'part-result')) {
+          stopped = true; throw new Error('E4 stop after saved work part');
+        }
+        return saved;
+      }) as Store['writeMany'];
+      await assert.rejects(runModelCycle(f.store, request), /E4 stop after saved work part/);
+      f.store.writeMany = writeMany; assert.equal(f.sent().length, 1); f.restart();
+    }
+    const cycle = valueOf(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, 'assembled'); assert.ok(cycle.assembly); assert.equal(f.sent().length, count);
+    const assembly = valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly }));
+    const expected = { contract: 'works-frame/v1', producer: reference(f.ledger.producer), ledger: reference(f.ledger.record), bindings: f.bindings };
+    assert.deepEqual(assembly.record.value.works, expected); assert.equal(assembly.proposal.value.worksContract, 'works-frame/v1');
+    assert.equal(assembly.proposal.value.status, 'proposed'); assert.equal(Object.hasOwn(assembly.proposal.value, 'bindings'), false);
+    const parts = cycle.record.value.results.map(record => valueOf(readPartResult(f.store, { project: f.project, record })));
+    assert.equal(parts.length, count);
+    parts.forEach((part, position) => {
+      const issued = f.store.get<QuestionPacketRecord>(part.record.value.request.packet.id, part.record.value.request.packet.revision)!;
+      const context = issued.value.packet as { works: { obligations: unknown[]; nodeAssignments: string[]; assigned: string[] } };
+      assert.deepEqual(context.works.obligations, f.ledger.handoff.obligations);
+      assert.deepEqual(context.works.nodeAssignments, payload.works.nodeAssignments);
+      assert.deepEqual(context.works.assigned, position === count - 1 ? payload.works.nodeAssignments : []);
+      assert.equal(issued.value.fingerprint!.chars, canonical(issued.value.packet).length);
+      assert.ok(issued.value.fingerprint!.chars <= config.value.requestCapacityChars!);
+      assert.deepEqual(part.record.value.works, { ...expected, bindings: position === count - 1 ? f.bindings : [] });
+      const response = f.store.get<{ raw: string }>(part.record.value.request.response.id, part.record.value.request.response.revision)!;
+      assert.deepEqual(JSON.parse(response.value.raw).bindings, position === count - 1 ? f.bindings : []);
+      const runtime = cycle.record.value.steps[position]!;
+      const call = valueOf(readModelCall(f.store, { project: f.project, record: runtime.record }));
+      assert.equal(call.outcome?.kind, 'node-proposal');
+      if (call.outcome?.kind === 'node-proposal') assert.deepEqual(call.outcome.works, part.record.value.works);
+      assert.deepEqual(valueOf(readCall(f.store, f.project, reference(f.store.get(call.call.id)!))).value.usage, usage);
+    });
+    if (split) {
+      assert.ok(parts[0]!.proposal.value.nodes.some(node => node.id === f.work.id));
+      assert.deepEqual(parts.at(-1)!.proposal.value.nodes, []); assert.deepEqual(parts.at(-1)!.proposal.value.tests, []);
+    }
+    assert.deepEqual(acceptedIds.map(id => f.store.get(id)), acceptedBefore);
+    assert.equal(f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!.value.attempts[0]!.outcome, null);
+    assert.equal(f.store.list('accepted-answer').length, 0);
+    const snapshot = f.store.list().map(reference); f.restart();
+    assert.deepEqual(valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly })).record, assembly.record);
+    assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
+    valueOf(await runModelCycle(f.store, request)); valueOf(await runModelCall(f.store, request));
+    assert.deepEqual(f.store.list().map(reference), snapshot); assert.equal(f.sent().length, count);
+    for (const substitute of [null, { ...expected, bindings: [] }]) {
+      const value = structuredClone(assembly.record.value) as import('../src/om/model-call.js').PartAssemblyRecord;
+      if (substitute) value.works = substitute as NonNullable<typeof value.works>; else delete value.works;
+      const forged = { ...assembly.record, hash: hashJson(value), value };
+      const view = new Proxy(f.store, { get(target, key) {
+        if (key === 'get') return (id: string, revision?: number) => id === forged.id && (revision === undefined || revision === forged.revision)
+          ? forged : target.get(id, revision);
+        const member = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+      } });
+      const denied = readPartAssembly(view, { project: f.project, record: reference(forged) });
+      assert.equal(denied.ok, false); if (!denied.ok) assert.equal(denied.refusal.code, 'model_parts_invalid');
+    }
+    if (split) {
+      const measured = packet.value.packet as { responseForm: unknown; works: unknown };
+      const tooSmall = f.environment(canonical(measured.responseForm).length + canonical(measured.works).length - 1);
+      const blocked = valueOf(prepareQuestionPacket(f.store, { ...f.packetRequest, environment: reference(tooSmall) }));
+      assert.equal(blocked.record.value.state, 'blocked');
+      assert.equal(blocked.record.value.refusal?.code, 'node_unexpandable');
+      assert.equal(blocked.record.value.packet, null); assert.equal(f.sent().length, count);
+    }
+  });
 });
 
 test('E4 delivery reader rejects substituted data, response and source even when record hashes are recomputed', async t => {

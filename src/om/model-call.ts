@@ -17,9 +17,10 @@ import { readRecord, writeGuarded } from './refs.js';
 import { readAnswerCitations, prepareAnswerCitations } from './accepted-answer.js';
 import { checkAnswerForm, prepareAnswerForm } from './answer-form.js';
 import { readPacketResponse, readPartResult, readQuestionPacket, writeQuestionPacket, normalizePartAnswer,
-  type PacketRead, type QuestionPacketRecord, type PartProposalBody } from './question-packet.js';
+  type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
 import { readRoutes } from './routes.js';
 import { readFrameProposals, prepareFrameProposals, type LayerProposal } from './frame-proposals.js';
+import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
 import { withHistoricalReads, historicalRead } from './input.js';
 
 export const MODEL_CALL_CODES = Object.freeze([
@@ -300,7 +301,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
 
 
 export interface PartAssemblyRequest { project: string; results: Ref[] }
-export interface PartAssemblyRecord { project: string; results: Ref[]; proposal: Ref }
+export interface PartAssemblyRecord { project: string; results: Ref[]; proposal: Ref; works?: WorksPartBindings }
 export const PART_ASSEMBLY_KIND = 'om-part-assembly';
 const definitionSections = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const;
 function requireAssembly(store: Store, value: unknown): asserts value is PartAssemblyRequest {
@@ -311,6 +312,12 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   const parts = request.results.map(record => take(readPartResult(store, { project: request.project, record })));
   const packets = parts.map(part => take(readQuestionPacket(store, { project: request.project, record: part.record.value.request.packet })));
   const first = packets[0]!, last = packets.at(-1)!, plan = last.value.plan;
+  const worksContract = parts[0]!.proposal.value.worksContract;
+  const works = parts.at(-1)!.record.value.works;
+  if (worksContract !== undefined && (worksContract !== WORKS_FRAME_CONTRACT || parts[0]!.proposal.value.level !== 3))
+    fail('model_parts_invalid', first.id, 'worksContract', 'A works assembly requires the supported L3 proposal contract', reference(first));
+  if ((worksContract !== undefined) !== (works !== undefined))
+    fail('model_parts_invalid', first.id, 'works', 'A works assembly retains the checked final part handoff', reference(first));
   const root = (packet: QuestionPacketRecord) => {
     const { previous: _previous, continuation: _continuation, ...rest } = packet.request; return rest;
   };
@@ -321,12 +328,18 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
     fail('model_parts_invalid', request.project, 'assignments', 'Part assignments do not overlap');
   for (let index = 0; index < parts.length; index++) {
     const packet = packets[index]!, proposal = parts[index]!.proposal.value, payload = packet.value.packet;
+    const transfer = parts[index]!.record.value.works;
+    if (works ? !transfer || transfer.contract !== works.contract || !same(transfer.producer, works.producer)
+      || !same(transfer.ledger, works.ledger) || (index < parts.length - 1 && transfer.bindings.length !== 0)
+      : transfer !== undefined)
+      fail('model_parts_invalid', packet.id, 'works', 'Every work part must retain one exact handoff; only the final part supplies bindings', reference(packet));
     const prefix = parts.slice(0, index).map((part, prior) => ({ packet: reference(packets[prior]!),
       proposal: reference(part.proposal), result: reference(part.record) }));
     if (!object(payload) || payload.task !== 'node-expansion' || !same(root(packet.value as QuestionPacketRecord), root(first.value as QuestionPacketRecord))
       || !packet.value.plan || !same(packet.value.plan.assignments, plan.assignments) || packet.value.plan.position !== index
       || !same(packet.value.request.previous, prefix) || !same(proposal.base, parts[0]!.proposal.value.base)
-      || proposal.level !== parts[0]!.proposal.value.level)
+      || proposal.level !== parts[0]!.proposal.value.level || proposal.worksContract !== worksContract
+      || packet.value.packetContract !== first.value.packetContract || packet.value.answerProtocol !== first.value.answerProtocol)
       fail('model_parts_invalid', packet.id, 'chain', 'Parts must be consecutive results of one exact node assignment', reference(packet));
     const assigned = new Set(plan.assignments[index]!.obligations);
     const covered = new Set([...proposal.fills, ...proposal.replaces].map(fill => fill.obligation));
@@ -346,12 +359,12 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   }
   const set = (name: 'removes' | 'redefines') => [...new Set(parts.flatMap(part => part.proposal.value[name]))];
   const body = take(normalizePartAnswer({ ...definitions, fills: parts.flatMap(part => part.proposal.value.fills),
-    replaces: parts.flatMap(part => part.proposal.value.replaces), removes: set('removes'), redefines: set('redefines') }));
+    replaces: parts.flatMap(part => part.proposal.value.replaces), removes: set('removes'), redefines: set('redefines') }, worksContract));
   const proposalValue: LayerProposal = { base: parts[0]!.proposal.value.base as LayerProposal['base'], level: parts[0]!.proposal.value.level,
-    source: 'input', status: 'proposed', ...body as PartProposalBody };
+    source: 'input', status: 'proposed', ...body as PartProposalBody, ...(worksContract ? { worksContract } : {}) };
   const key = hashJson(request), proposal: Revision<LayerProposal> = { id: `om-proposal:${request.project}:assembly:${key}`,
     kind: 'layer-proposal', revision: 1, hash: hashJson(proposalValue), value: proposalValue };
-  const value: PartAssemblyRecord = { ...request, proposal: reference(proposal) };
+  const value: PartAssemblyRecord = { ...request, proposal: reference(proposal), ...(works ? { works: works as WorksPartBindings } : {}) };
   const record: Revision<PartAssemblyRecord> = { id: `om-part-assembly:${request.project}:${key}`, kind: PART_ASSEMBLY_KIND,
     revision: 1, hash: hashJson(value), value };
   const routes = take(readRoutes(store, { project: request.project, record: first.value.request.routes }));
@@ -364,8 +377,12 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   const remaining = new Set(historical.result.open.map(item => item.id));
   if (allAssigned.some(id => remaining.has(id))) fail('model_parts_invalid', record.id, 'coverage', 'The assembled proposal leaves an assigned obligation open');
   const prepared = current ? take(prepareFrameProposals(view, proposalRequest)) : null;
+  const packetAdmission = current && works ? take(prepareQuestionPacket(store, last.value.request as QuestionPacketRequest)) : null;
+  if (packetAdmission && (packetAdmission.writes.length || !same(packetAdmission.record, last)))
+    fail('model_parts_invalid', last.id, 'works', 'Assembly requires the current saved assignment and handoff, without producing another packet', reference(last));
   return { record, proposal, references: refs([...parts.flatMap(part => part.references), ...historical.references,
-    ...packets.map(reference)]), guards: prepared ? refs(prepared.guards.filter(ref => ref.id !== proposal.id)) : [] };
+    ...packets.map(reference)]), guards: prepared ? refs([...prepared.guards.filter(ref => ref.id !== proposal.id),
+      ...(packetAdmission?.guards ?? [])]) : [] };
 }
 export function readPartAssembly(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
   record: Revision<PartAssemblyRecord>; proposal: Revision<LayerProposal>; references: Ref[];
@@ -931,7 +948,8 @@ export function readModelCallState(store: Store, request: { project: string; rec
       if (!value.om.part) fail('model_call_record_invalid', record.id, 'part', 'A node answer needs the atomic proposal/result pair');
       const part = take(readPartResult(store, { project: request.project, record: value.om.part.result }));
       if (!same(part.record.value.request, { project: request.project, packet: value.om.request.packet, call: value.om.call, response })
-        || !same(reference(part.proposal), value.om.part.proposal) || !same(part.proposal.value, outcome.proposal))
+        || !same(reference(part.proposal), value.om.part.proposal) || !same(part.proposal.value, outcome.proposal)
+        || !same(part.record.value.works ?? null, outcome.works ?? null))
         fail('model_call_record_invalid', record.id, 'part', 'The part result must derive from this exact response');
     } else if (value.om.part !== null) fail('model_call_record_invalid', record.id, 'part', 'Only node answers supply part results');
     if (outcome?.kind === 'input-decisions') {
@@ -1000,6 +1018,8 @@ function applyReceivedModelCall(store: Store, state: Extract<ModelCallState, { s
         outcome = form as CheckedAnswerForm; guards.push(...formGuards);
         if (outcome.kind === 'node-proposal') {
           const produced = take(preparePartResult(store, { project: request.project, packet: request.packet, call, response: { pending: responseWrite } }));
+          if (!same(produced.record.value.works ?? null, outcome.works ?? null))
+            fail('model_call_record_invalid', id, 'works', 'The part handoff must derive from the same checked saved response');
           writes.push(...produced.writes); guards.push(...produced.guards);
           part = { proposal: reference(produced.proposal), result: reference(produced.record) };
         } else {
