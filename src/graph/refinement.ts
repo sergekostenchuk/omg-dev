@@ -1,8 +1,8 @@
 import { researchScope, scopedQuestions, researchGapDeferred, type ResearchScope } from "./research-scope.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
 import { GraphRepository } from "./repository.js";
-import { Environments, inspectRepository, type RepositoryState } from "../runtime/environment.js";
+import { Environments, inspectRepository, uniqueTransactionGuards, transactionGuardsCurrent, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { reference, isRef, uniqueRefs, stageId, type StageArtifact, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { canonical, type Json } from "../canonical.js";
@@ -32,16 +32,20 @@ export interface Feasibility { contractVersion?: number; projectId: string; read
 export class Refinement {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly graphs: GraphRepository,
     private readonly environments: Environments, private readonly pipeline: Pipeline) {}
-  #milestone(id: string, expected: number, value: Milestone, guards: Ref[]): Revision<Milestone> {
+  #milestone(id: string, expected: number, value: Milestone, guards: TransactionGuard[]): Revision<Milestone> {
     const previous = this.store.get<Milestone>(id);
-    if (previous?.revision === expected && canonical(previous.value) === canonical(value)) return previous;
-    return this.store.writeMany<Milestone>([{ id, kind: "phase", expected, value }], uniqueRefs(guards))[0]!;
+    if (previous?.revision === expected && canonical(previous.value) === canonical(value)) {
+      requireCondition(transactionGuardsCurrent(this.store, guards), "input_stale", "A phase admission input changed before its exact repeat");
+      return previous;
+    }
+    return this.store.writeMany<Milestone>([{ id, kind: "phase", expected, value }], uniqueTransactionGuards(guards))[0]!;
   }
-  #inputs(project: string, phase: Phase): Ref[] {
+  #inputs(project: string, phase: Phase, admissionGuards: TransactionGuard[] = []): Ref[] {
     const features = this.pipeline.inspect(project, "features");
     requireCondition(features.state === "accepted", "features_not_ready", "Prepared features must be current and accepted");
     const index = PHASES.indexOf(phase); requireCondition(index >= 0, "phase_invalid", "Unknown refinement phase");
     const guards = [...features.guards];
+    admissionGuards.push(...(features.admissionGuards ?? []));
     if (index > 0) {
       const previous = this.gate(project, PHASES[index - 1]!);
       requireCondition(previous.findings.length === 0, "phase_not_ready", "The preceding refinement phase is missing or stale");
@@ -49,6 +53,7 @@ export class Refinement {
       requireCondition(milestone?.value.contractVersion === REFINEMENT_CONTRACT_VERSION,
         "refinement_upgrade_required", "New refinement needs the enriched predecessor; accepted historical phases remain readable");
       guards.push(...previous.guards);
+      admissionGuards.push(...(previous.admissionGuards ?? []));
     }
     return uniqueRefs(guards);
   }
@@ -97,7 +102,8 @@ export class Refinement {
     assertPilotBoundary(this.store, project, level);
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
     const scope = level === "R2" ? researchScope(this.store, project) : null;
-    const inputs = uniqueRefs([...this.#inputs(project, level), ...(scope ? [reference(scope)] : []), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
+    const admissionGuards: TransactionGuard[] = [];
+    const inputs = uniqueRefs([...this.#inputs(project, level, admissionGuards), ...(scope ? [reference(scope)] : []), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
     requireCondition(checked.findings.length === 0, "research_unresolved", "Research is unresolved or stale");
     const draft = this.store.get<DiscoveryDraft>(draftRef.id)!;
     requireCondition(draft.value.level === level && draft.value.stage === "om-g2" && draft.value.consumer === "compilation", "research_foreign", "Research belongs to a different refinement phase");
@@ -111,6 +117,7 @@ export class Refinement {
     const runtimeAdmissionGuards:Ref[]=[];
     if (level !== "R0") {
       const effective = this.environments.effective(project);
+      admissionGuards.push(...effective.admissionGuards);
       const graph = this.store.get<Graph>(`graph:${project}`);
       requireCondition(graph, "graph_missing", "Technical research needs the current operation map");
       const findings = technicalResearchFindings(this.store, this.discovery, draft.value, graph.value, effective.root,runtimeAdmissionGuards);
@@ -121,14 +128,15 @@ export class Refinement {
     return this.#milestone(`phase:${project}:${level}`, expected,
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase: level, inputs: guards, draft: draftRef, layer: null,
         ...(scope?.value.policy ? { carried: carriedObligations(scope), carriedContract: 'r3-v1' as const } : {}) },
-      uniqueRefs([...guards,...runtimeAdmissionGuards, ...(graphAtStart ? [reference(graphAtStart)] : [])]));
+      uniqueTransactionGuards([...guards, ...admissionGuards, ...runtimeAdmissionGuards, ...(checked.admissionGuards ?? []), ...(graphAtStart ? [reference(graphAtStart)] : [])]));
   }
   sealLayer(project: string, level: 1 | 2 | 3, expected: number, expectedGraph?: Ref): Revision<Milestone> {
     assertPilotBoundary(this.store, project, `L${level}`);
     const graphAtStart = this.store.get<Graph>(`graph:${project}`);
     requireCondition(!expectedGraph || (graphAtStart && canonical(reference(graphAtStart)) === canonical(expectedGraph)),
       "graph_stale", "The constructed graph changed before layer acceptance");
-    const phase = `L${level}` as Phase; const inputs = this.#inputs(project, phase);
+    const admissionGuards: TransactionGuard[] = [];
+    const phase = `L${level}` as Phase; const inputs = this.#inputs(project, phase, admissionGuards);
     const checked = this.graphs.layerGate(project, level);
     requireCondition(checked.findings.length === 0, "layer_not_ready", "Graph layer is missing or stale");
     const graph = this.store.get<Graph>(`graph:${project}`);
@@ -142,7 +150,7 @@ export class Refinement {
     return this.#milestone(`phase:${project}:${phase}`, expected,
       { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, phase, inputs: guards, draft: null, layer: reference(layer),
         ...(handoff ? { taskObligationContract: TASK_OBLIGATION_CONTRACT } : {}) },
-      [...guards, ...(graphAtStart ? [reference(graphAtStart)] : [])]);
+      uniqueTransactionGuards([...guards, ...admissionGuards, ...(checked.admissionGuards ?? []), ...(graphAtStart ? [reference(graphAtStart)] : [])]));
   }
   prepareLayer(project: string, level: 2 | 3): Revision<DiscoveryDraft> {
     assertPilotBoundary(this.store, project, `L${level}`);
@@ -180,6 +188,7 @@ export class Refinement {
       if (index > 0) {
         const prior = this.gate(project, PHASES[index - 1]!);
         result.findings.push(...prior.findings); result.guards.push(...prior.guards);
+        if (prior.admissionGuards?.length) result.admissionGuards = uniqueTransactionGuards(prior.admissionGuards);
       }
       if (phase === "R2" && milestone.value.draft) {
         const draft = this.store.get<DiscoveryDraft>(milestone.value.draft.id, milestone.value.draft.revision);
@@ -200,11 +209,14 @@ export class Refinement {
       }
     }
     result.guards = uniqueRefs(result.guards);
+    if (!result.findings.length && result.admissionGuards?.length && !transactionGuardsCurrent(this.store, [...result.guards, ...result.admissionGuards]))
+      result.findings.push({ code: "phase_stale", target: milestone.id, message: "A phase input changed while its admission was checked" });
     return result;
   }
   assess(project: string, expected: number): Revision<Feasibility> {
     assertPilotBoundary(this.store, project, "R3");
-    const inputs = this.#inputs(project, "R3"); const effective = this.environments.effective(project); const environment = effective.environment;
+    const admissionGuards: TransactionGuard[] = [];
+    const inputs = this.#inputs(project, "R3", admissionGuards); const effective = this.environments.effective(project); const environment = effective.environment;
     const graph = this.store.get<Graph>(`graph:${project}`);
     requireCondition(graph && graph.kind === "graph", "graph_missing", "Operation map is missing");
     const graphGate = this.graphs.gate(project); const inspected = inspectRepository({ ...environment.value, workspace: effective.root }, graph.value);
@@ -214,7 +226,7 @@ export class Refinement {
     return this.store.writeMany<Feasibility>([{ id: `feasibility:${project}`, kind: "feasibility", expected,
       value: { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, ready: findings.length === 0, graph: reference(graph), environment: reference(environment),
         repository: inspected.state, inputs: guards, findings, ...(obligations.value ? { obligations: obligations.value } : {}) } }],
-      uniqueRefs([...guards, ...obligations.guards]))[0]!;
+      uniqueTransactionGuards([...guards, ...admissionGuards, ...(graphGate.admissionGuards ?? []), ...effective.admissionGuards, ...obligations.guards, ...obligations.admissionGuards]))[0]!;
   }
   feasibilityGate(project: string, ref: Ref, allowHistorical = false): GateResult {
     if (!isRef(ref)) return { findings: [{ code: "feasibility_missing", target: project, message: "R3 result reference is required" }], guards: [] };
@@ -227,7 +239,7 @@ export class Refinement {
     const result: GateResult = { findings: [], guards: [reference(record)] };
     const obligations = readinessObligations(this.store, project, record.value.inputs, record.value.obligations, 'consume', allowHistorical);
     result.findings.push(...obligations.findings);
-    if (obligations.guards.length) result.admissionGuards = obligations.guards;
+    const admissionGuards = uniqueTransactionGuards([...obligations.guards, ...obligations.admissionGuards]);
     for (const input of uniqueRefs(record.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.revision !== input.revision || current.hash !== input.hash
@@ -237,10 +249,14 @@ export class Refinement {
     const graph = this.store.get<Graph>(`graph:${project}`);
     try {
       const effective = this.environments.effective(project);
+      admissionGuards.push(...effective.admissionGuards);
       const inspected = inspectRepository({ ...effective.environment.value, workspace: effective.root }, graph!.value);
       result.findings.push(...inspected.findings);
       if (canonical(inspected.state) !== canonical(record.value.repository)) result.findings.push({ code: "repository_stale", target: project, message: "Repository state changed after R3" });
     } catch { result.findings.push({ code: "environment_missing", target: project, message: "Environment is unavailable" }); }
+    if (admissionGuards.length) result.admissionGuards = uniqueTransactionGuards(admissionGuards);
+    if (!result.findings.length && !transactionGuardsCurrent(this.store, [...result.guards, ...admissionGuards]))
+      result.findings.push({ code: "feasibility_stale", target: ref.id, message: "An R3 input changed while its admission was checked" });
     return result;
   }
   publish(project: string, ref: Ref, expected: number) {
@@ -248,6 +264,6 @@ export class Refinement {
     const result = this.feasibilityGate(project, ref);
     requireCondition(result.findings.length === 0, "feasibility_not_ready", "The current R3 result is not ready");
     return this.pipeline.draft(project, "om-g2", { feasibility: ref } as unknown as Json, expected,
-      uniqueRefs([...result.guards, ...(result.admissionGuards ?? [])]));
+      uniqueTransactionGuards([...result.guards, ...(result.admissionGuards ?? [])]));
   }
 }

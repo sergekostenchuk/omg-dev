@@ -1,12 +1,12 @@
 import { Store, type Revision } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { Refinement, type Feasibility } from "../graph/refinement.js";
-import { Environments, type Environment } from "../runtime/environment.js";
+import { Environments, transactionGuardsCurrent, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
 import { requireGraph } from "../graph/validate.js";
 import type { Graph } from "../graph/model.js";
 import { hashJson, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
-import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { isRef, reference, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import type { MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
@@ -42,14 +42,18 @@ export class Compiler {
       stage: reference(stage.artifact), feasibility: feasibilityRef, base: feasibility.value.repository,
       guards, tasks: derived.tasks, graphSnapshot: graph };
     const value: MachinePlan = { ...body, hash: hashJson(body) }; const id = `plan:${project}:${value.hash}`;
+    const admissionGuards = uniqueTransactionGuards([...guards, ...(stage.admissionGuards ?? []), ...(checked.admissionGuards ?? [])]);
     const existing = this.store.get<MachinePlan>(id);
-    if (existing) return existing;
+    if (existing) {
+      requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while compiling");
+      return existing;
+    }
     const pointer = this.store.get<Ref>(`current-plan:${project}`);
     return this.store.writeMany<MachinePlan>([
       { id, kind: "plan", expected: 0, value },
       { id: `current-plan:${project}`, kind: "current-plan", expected: pointer?.revision ?? 0,
         value: { id, revision: 1, hash: hashJson(value) } },
-    ], uniqueRefs([...guards, ...(stage.admissionGuards ?? []), ...(checked.admissionGuards ?? [])]))[0]!;
+    ], admissionGuards)[0]!;
   }
   read(id: string): Revision<MachinePlan> {
     const plan = this.store.get<MachinePlan>(id);
@@ -81,7 +85,8 @@ export class Compiler {
     const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
     const obligations = readinessObligations(this.store, project, basis.value.inputs, basis.value.obligations, 'consume', allowHistorical);
     result.findings.push(...obligations.findings);
-    if (obligations.guards.length) result.admissionGuards = obligations.guards;
+    if (obligations.guards.length || obligations.admissionGuards.length)
+      result.admissionGuards = uniqueTransactionGuards([...obligations.guards, ...obligations.admissionGuards]);
     if (basis.value.contractVersion !== REFINEMENT_CONTRACT_VERSION && !(allowHistorical && basis.value.contractVersion === undefined))
       result.findings.push({ code: "refinement_upgrade_required", target: plan.value.feasibility.id, message: "New plan admission requires the enriched refinement contract" });
     for (const input of plan.value.guards) {
@@ -90,30 +95,34 @@ export class Compiler {
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "plan_stale", target: input.id, message: "A source used to compile this plan changed" });
       else result.guards.push(reference(current));
     }
+    if (!result.findings.length && result.admissionGuards?.length && !transactionGuardsCurrent(this.store, [...result.guards, ...result.admissionGuards]))
+      result.findings.push({ code: "plan_stale", target: ref.id, message: "An admission dependency changed while this plan was checked" });
     return result;
   }
   publish(project: string, planRef: Ref, expected: number) {
     const checked = this.gate(project, planRef); requireCondition(checked.findings.length === 0, "plan_stale", "Plan inputs are not current");
     return this.pipeline.draft(project, "compilation", { plan: planRef } as unknown as Json, expected,
-      uniqueRefs([...checked.guards, ...(checked.admissionGuards ?? [])]));
+      uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]));
   }
-  #contextPlan(project: string, planRef: Ref, task: string): Revision<MachinePlan> {
+  #contextPlan(project: string, planRef: Ref, task: string) {
     const checked = this.gate(project, planRef);
     requireCondition(checked.findings.length === 0, "plan_stale", "Task context needs current exact plan inputs");
     const plan = this.store.get<MachinePlan>(planRef.id)!;
     requireCondition(plan.value.tasks.some(item => item.id === task), "task_foreign", "Task does not belong to this machine plan");
-    return plan;
+    return { plan, admissionGuards: uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]) };
   }
   context(project: string, planRef: Ref, task: string, maxChars: number) {
-    const plan = this.#contextPlan(project, planRef, task);
+    const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
     const ref = plan.value.environment;
     const environment = this.store.get<Environment>(ref.id, ref.revision);
     requireCondition(environment?.kind === "environment" && environment.hash === ref.hash && environment.value.projectId === project,
       "context_environment_foreign", "Full-run criteria must come from the exact plan environment");
-    return taskContext(plan, environment.value.fullCheck, task, maxChars);
+    const context = taskContext(plan, environment.value.fullCheck, task, maxChars);
+    requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task context");
+    return context;
   }
   detail(project: string, planRef: Ref, task: string, kind: "graph" | "evidence" | "evidence-index", selector: DetailSelector, maxChars: number) {
-    const plan = this.#contextPlan(project, planRef, task);
+    const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
     const evidence = plan.value.guards.flatMap(ref => {
       const record = this.store.get(ref.id, ref.revision);
       return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
@@ -133,6 +142,8 @@ export class Compiler {
         .flat().find(item => item.id === selector.id);
       requireCondition(value, "context_detail_missing", "Graph entity is absent from this exact plan");
     }
-    return boundedContext({ binding: { plan: reference(plan), task, source }, kind, selector, value: selectDetail(value, selector) }, maxChars);
+    const detail = boundedContext({ binding: { plan: reference(plan), task, source }, kind, selector, value: selectDetail(value, selector) }, maxChars);
+    requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task detail");
+    return detail;
   }
 }

@@ -11,7 +11,7 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRo
 import { Store, type Revision } from "../storage/store.js";
 import { ProductEngine } from "../product/engine.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
-import { historicalProof, historicalTrace, withHistoricalReads, prepareExistingOmInput, readOmInput } from "./input.js";
+import { historicalProof, historicalTrace, withHistoricalReads, prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord } from "./refs.js";
 import { readLayerAcceptance, readLayerBasis, type HistoricalLayerBasis, type LayerAcceptanceRequest, type LayerBasis } from "./layer-basis.js";
 
@@ -814,12 +814,13 @@ function frameCurrentSources(store: Store) {
     if (!head || canonical(reference(head)) !== canonical(ref))
       frameReject("input_stale", ref.id, "head", "The frame prerequisite is no longer current");
   };
-  const acceptGate = (gate: GateResult) => {
+  const acceptGate = (gate: GateResult, name: string) => {
+    const admission = frameTake(readOmAdmissionGuards(gate.admissionGuards, name, "F4"));
     if (gate.findings.length) {
       const finding = gate.findings[0]!;
       frameReject("frame_basis_unproven", finding.target, finding.code, finding.message);
     }
-    for (const guard of [...gate.guards, ...(gate.admissionGuards ?? [])]) remember(guard);
+    for (const guard of [...gate.guards, ...admission]) remember(guard);
   };
   return { traced, guards, remember, current, acceptGate };
 }
@@ -831,8 +832,9 @@ export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceReq
     for (const ref of [request.graph, request.layer, ...basis.currentReferences]) current(ref);
     if (basis.producer === "research") {
       const engine = new ProductEngine(traced);
-      acceptGate(engine.graphs.layerGate(request.project, request.level, request.layer));
-      acceptGate(engine.refinement.gate(request.project, request.level === 2 ? "R1" : "R2"));
+      acceptGate(engine.graphs.layerGate(request.project, request.level, request.layer), `layer.${request.level}`);
+      const phase = request.level === 2 ? "R1" : "R2";
+      acceptGate(engine.refinement.gate(request.project, phase), `refinement.${phase}`);
     }
     return { ...basis, guards: frameSorted([...guards.values()]) };
   });
@@ -875,7 +877,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
         { project: request.project, level: request.level, graph: request.graph, layer: request.layer }));
       for (const guard of admission.guards) remember(guard);
     }
-    const gates: GateResult[] = [];
+    const gates: { name: string; gate: GateResult }[] = [];
     if (request.upper) {
       const witness = frameTake(readHorizon(traced, request.project, request.upper.horizon));
       current(reference(witness.horizon));
@@ -883,9 +885,10 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
       if (witness.horizon.value.request.refinement!.id === `graph-layer:${request.project}:2`) {
         const upper = frameLayerAcceptance(traced, { project: request.project, level: 2, graph: request.graph, layer: read.upperRef });
         for (const ref of upper.currentReferences) current(ref);
-      } else gates.push(engine.refinement.gate(request.project, "L2"), engine.graphs.layerGate(request.project, 2, read.upperRef));
+      } else gates.push({ name: "refinement.L2", gate: engine.refinement.gate(request.project, "L2") },
+        { name: "layer.2", gate: engine.graphs.layerGate(request.project, 2, read.upperRef) });
     }
-    for (const gate of gates) acceptGate(gate);
+    for (const { name, gate } of gates) acceptGate(gate, name);
     return { ...read, guards: frameSorted([...guards.values()]),
       expected: { graph: request.graph.revision, layer: layerHead?.revision ?? 0, frame: frameHead?.revision ?? 0 } };
   });

@@ -9,7 +9,8 @@ import { projectGraph } from "../graph/project.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { ProductEngine } from "../product/engine.js";
-import { Store, type Revision, type Write } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { deriveInputDecisions } from "./addressing.js";
@@ -67,6 +68,29 @@ const at = (target: string, field: string, ref?: Ref) => ({ unit: "G1", target, 
 function invalid(field: string): never { throw new EngineError("input_request_invalid", "OM input needs a well-formed request", at("om-input", field)); }
 function copy<T>(value: T): T {
   try { return sealed(value) as T; } catch { return invalid("json"); }
+}
+
+/** Current OM gates may carry positive admission refs; absence needs a different producer contract. */
+export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): OmResult<Sealed<Ref[]>> {
+  if (!text(gate) || !["G1", "G2", "F4"].includes(unit))
+    throw new EngineError("om_admission_guard_invalid", "An admission channel needs its named gate and unit",
+      { unit: "OM", target: "admissionGuards", field: !text(gate) ? "gate" : "unit" });
+  let checked: TransactionGuard[];
+  try { checked = uniqueTransactionGuards(value === undefined ? [] : value as TransactionGuard[]); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === "invalid_guard")
+      return refused("om_admission_guard_invalid", `${gate}: ${error.message}`,
+        { unit, target: gate, field: "admissionGuards" }, "producer");
+    throw error;
+  }
+  const refs: Ref[] = [];
+  for (const guard of checked) {
+    if ('absent' in guard)
+      return refused("om_admission_guard_unsupported", `${gate} declares an absence not supported by this OM producer`,
+        { unit, target: guard.id, field: `${gate}.admissionGuards` }, "producer");
+    refs.push(guard);
+  }
+  return delivered(refs);
 }
 
 /** Pure normalization; persistence independently resolves and checks the saved source records. */
@@ -461,12 +485,14 @@ function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed
         return refused("input_stale", "The requested input source is no longer current", at(ref.id, "head", ref), "producer");
     }
     const projection = new ProductEngine(traced).pipeline.inspect(request.project, "features");
+    const admission = readOmAdmissionGuards(projection.admissionGuards, "pipeline.features", "G1");
+    if (!admission.ok) return admission;
     if (projection.state !== "accepted") {
       const finding = projection.findings[0];
       return refused("stage_not_accepted", finding?.message ?? "The current stages are not accepted",
         at(finding?.target ?? request.stages.features.id, finding?.field ?? finding?.code ?? "status", request.stages.features), "producer");
     }
-    for (const ref of [...projection.guards, ...(projection.admissionGuards ?? [])]) remember(ref);
+    for (const ref of [...projection.guards, ...admission.value]) remember(ref);
     return delivered(sorted([...heads.values()]));
   } catch (error) {
     if (error instanceof EngineError && error.code === "input_stale")

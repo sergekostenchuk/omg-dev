@@ -12,7 +12,7 @@ import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { ProductEngine } from "../product/engine.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
-import { prepareExistingOmInput, readOmInput } from "./input.js";
+import { prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { readLayerAcceptance, readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
 
@@ -403,12 +403,15 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
     } else if (request.refinement) {
       const engine = new ProductEngine(traced);
       const phase = traced.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
-      for (const gate of [engine.refinement.gate(request.project, "L2"), engine.graphs.layerGate(request.project, 2, phase.value.layer!)]) {
+      for (const [name, gate] of [["refinement.L2", engine.refinement.gate(request.project, "L2")],
+        ["layer.2", engine.graphs.layerGate(request.project, 2, phase.value.layer!)]] as const) {
+        const admission = readOmAdmissionGuards(gate.admissionGuards, name, "G2");
+        if (!admission.ok) return admission;
         if (gate.findings.length) {
           const finding = gate.findings[0]!;
           return refused("horizon_refinement_unproven", finding.message, address(finding.target, finding.code, request.refinement), "producer");
         }
-        for (const guard of [...gate.guards, ...(gate.admissionGuards ?? [])]) remember(guard);
+        for (const guard of [...gate.guards, ...admission.value]) remember(guard);
       }
     }
     return delivered(sorted([...heads.values()]));

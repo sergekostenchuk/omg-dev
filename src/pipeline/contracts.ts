@@ -1,5 +1,5 @@
 import type { Json } from "../canonical.js";
-import type { Revision } from "../storage/store.js";
+import type { Revision, TransactionGuard } from "../storage/store.js";
 
 export const STAGES = ["discovery", "concept", "operation-map", "specification", "features", "om-g2", "compilation", "execution"] as const;
 export type Stage = typeof STAGES[number];
@@ -20,10 +20,10 @@ export interface GateContext {
   inputs: ReadonlyArray<Revision<StageArtifact>>;
   accepted?: boolean;
 }
-export interface GateResult { findings: Finding[]; guards: Ref[]; admissionGuards?: Ref[] }
+export interface GateResult { findings: Finding[]; guards: Ref[]; admissionGuards?: TransactionGuard[] }
 export type StageValidator = (context: GateContext) => GateResult;
 export type StageValidators = Record<Stage, StageValidator>;
-export interface StageProjection { stage: Stage; state: StageState; artifact: Revision<StageArtifact> | null; findings: Finding[]; guards: Ref[]; admissionGuards?: Ref[] }
+export interface StageProjection { stage: Stage; state: StageState; artifact: Revision<StageArtifact> | null; findings: Finding[]; guards: Ref[]; admissionGuards?: TransactionGuard[] }
 
 export const stageId = (project: string, stage: Stage): string => `stage:${project}:${stage}`;
 export const reference = (record: Revision<unknown>): Ref => ({ id: record.id, revision: record.revision, hash: record.hash });

@@ -1,6 +1,7 @@
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Json } from "../canonical.js";
+import { uniqueTransactionGuards, transactionGuardsCurrent } from "../runtime/environment.js";
 import { STAGES, predecessor, reference, stageId, isRef, uniqueRefs, type Stage, type StageArtifact,
   type StageProjection, type StageValidators, type Finding, type Ref } from "./contracts.js";
 
@@ -15,11 +16,11 @@ export class Pipeline {
   #requireStage(stage: Stage): void {
     requireCondition(STAGES.includes(stage), "unknown_stage", "Unknown pipeline stage");
   }
-  draft(projectId: string, stage: Stage, content: Json, expected: number, admissionGuards: Ref[] = []): Revision<StageArtifact> {
+  draft(projectId: string, stage: Stage, content: Json, expected: number, admissionGuards: TransactionGuard[] = []): Revision<StageArtifact> {
     this.#requireProject(projectId); this.#requireStage(stage);
     const prior = predecessor(stage);
     let input: Revision<StageArtifact> | null = null;
-    const guards: Ref[] = [...admissionGuards];
+    const guards = uniqueTransactionGuards(admissionGuards);
     if (prior) {
       const projection = this.inspect(projectId, prior);
       requireCondition(projection.state === "accepted", "predecessor_not_ready", `${prior} must be accepted and current`);
@@ -29,7 +30,7 @@ export class Pipeline {
     return this.store.writeMany<StageArtifact>([{
       id: stageId(projectId, stage), kind: "stage", expected,
       value: { projectId, stage, status: "draft", content, inputs: input ? [reference(input)] : [], proofs: [] },
-    }], guards)[0]!;
+    }], uniqueTransactionGuards(guards))[0]!;
   }
   inspect(projectId: string, stage: Stage): StageProjection {
     this.#requireProject(projectId); this.#requireStage(stage);
@@ -44,7 +45,7 @@ export class Pipeline {
     "artifact_invalid", "Stored stage artifact has missing or malformed fields");
     const findings: Finding[] = [];
     const guards: Ref[] = [reference(artifact)];
-    const admissionGuards: Ref[] = [];
+    const admissionGuards: TransactionGuard[] = [];
     const inputs: Revision<StageArtifact>[] = [];
     const prior = predecessor(stage);
     if (artifact.value.inputs.length !== (prior ? 1 : 0)) findings.push({ code: "input_set_invalid", target: artifact.id, message: "Stage input set is incomplete or contains extras" });
@@ -71,14 +72,16 @@ export class Pipeline {
       else guards.push(reference(current));
     }
     if (findings.length) return { stage, state: artifact.value.status === "accepted" ? "stale" : "blocked", artifact, findings, guards: uniqueRefs(guards),
-      ...(admissionGuards.length ? { admissionGuards: uniqueRefs(admissionGuards) } : {}) };
+      ...(admissionGuards.length ? { admissionGuards: uniqueTransactionGuards(admissionGuards) } : {}) };
     const validation = this.validators[stage]({ projectId, content: artifact.value.content, inputs, accepted: artifact.value.status === "accepted" });
     findings.push(...validation.findings);
     guards.push(...validation.guards);
     admissionGuards.push(...(validation.admissionGuards ?? []));
+    if (!findings.length && admissionGuards.length && !transactionGuardsCurrent(this.store, [...guards, ...admissionGuards]))
+      findings.push({ code: "input_stale", target: artifact.id, message: "An admission dependency changed while this stage was checked" });
     const state = findings.length ? (artifact.value.status === "accepted" ? "stale" : "blocked") : artifact.value.status;
     return { stage, state, artifact, findings, guards: uniqueRefs(guards),
-      ...(admissionGuards.length ? { admissionGuards: uniqueRefs(admissionGuards) } : {}) };
+      ...(admissionGuards.length ? { admissionGuards: uniqueTransactionGuards(admissionGuards) } : {}) };
   }
   accept(projectId: string, stage: Stage, expected: number): Revision<StageArtifact> {
     const checked = this.inspect(projectId, stage);
@@ -89,7 +92,7 @@ export class Pipeline {
     return this.store.writeMany<StageArtifact>([{
       id: checked.artifact.id, kind: "stage", expected,
       value: { ...checked.artifact.value, status: "accepted", proofs: checked.guards.filter(ref => ref.id !== checked.artifact!.id) },
-    }], uniqueRefs([...checked.guards, ...(checked.admissionGuards ?? [])]))[0]!;
+    }], uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]))[0]!;
   }
   project(projectId: string): StageProjection[] { return STAGES.map(stage => this.inspect(projectId, stage)); }
 }
