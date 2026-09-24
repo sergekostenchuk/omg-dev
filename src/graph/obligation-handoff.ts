@@ -1,17 +1,28 @@
 import { canonical } from '../canonical.js';
-import { requireCondition } from '../errors.js';
+import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import type { DiscoveryDraft } from '../discovery/discovery.js';
 import type { ResearchScope } from './research-scope.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
+import { readOmObligationHandoff, type OmObligationHandoff } from '../om/obligations.js';
 
-export interface ObligationHandoff { r2: Ref; scope: Ref; obligations: CarriedObligation[] }
+export interface LegacyObligationHandoff { r2: Ref; scope: Ref; obligations: CarriedObligation[] }
+export type ObligationHandoff = LegacyObligationHandoff | OmObligationHandoff;
 interface ResearchMilestone { projectId: string; phase: string; draft: Ref | null; inputs: Ref[]; carried?: CarriedObligation[] }
+
+/** The OM producer and its explicit ledger establish their own immutable era. */
+export function omObligationHandoff(store: Store, project: string, inputs: Ref[]): OmObligationHandoff | null {
+  const result = readOmObligationHandoff(store, project, inputs);
+  if (!result.ok) throw new EngineError(result.refusal.code, result.refusal.message, result.refusal.at);
+  return result.value as OmObligationHandoff | null;
+}
 
 /** Read the immutable R2 era named by the consumer, never today's policy in
  * place of an accepted historical basis. The whole handoff survives R3. */
 export function obligationHandoff(store: Store, project: string, inputs: Ref[]): ObligationHandoff | null {
+  const om = omObligationHandoff(store, project, inputs);
+  if (om) return om;
   const r2 = inputs.find(ref => ref.id === `phase:${project}:R2`);
   const l3Ref = inputs.find(ref => ref.id === `phase:${project}:L3`);
   if (l3Ref) {

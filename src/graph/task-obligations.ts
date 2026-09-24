@@ -3,21 +3,26 @@ import { EngineError, requireCondition } from '../errors.js';
 import { type Finding, type Ref } from '../pipeline/contracts.js';
 import { Ajv } from 'ajv';
 import type { Store } from '../storage/store.js';
+import type { GapRecord } from '../om/gaps.js';
 import type { Graph } from './model.js';
 import type { ResearchScope } from './research-scope.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
 import { RefinementRelations } from './relations.js';
-import { obligationHandoff, type ObligationHandoff } from './obligation-handoff.js';
+import { obligationHandoff, omObligationHandoff, type ObligationHandoff } from './obligation-handoff.js';
 import { taskObligationBindingSchema, type BoundTaskObligation, type TaskObligationBinding } from './task-obligation-model.js';
 const validBindings = new Ajv({ allErrors: true }).compile<TaskObligationBinding[]>({ type: 'array', items: taskObligationBindingSchema });
 
 export const TASK_OBLIGATION_CONTRACT = 'task-obligations-v1';
-export const taskBindingId = (obligation: CarriedObligation): string => `obligation:${hashJson([obligation.scope, obligation.original]).slice(0, 40)}`;
+export const taskBindingId = (obligation: CarriedObligation): string => `obligation:${hashJson(obligation.scope.id.startsWith('om-obligations:')
+  ? [obligation.scope, obligation.original, obligation.responsibleNode, obligation.responsibleConsumer]
+  : [obligation.scope, obligation.original]).slice(0, 40)}`;
 export const taskObligations = (handoff: ObligationHandoff) => handoff.obligations.filter(item => ['task-start','task-result'].includes(item.moment));
 
 /** Historical plans follow the immutable producing L3, not a missing field on
  * a mutable current plan. New L3 seals explicitly opt into task consumers. */
 export function taskObligationHandoff(store: Store, project: string, inputs: Ref[]): ObligationHandoff | null {
+  const om = omObligationHandoff(store, project, inputs);
+  if (om) return om;
   const ref = inputs.find(input => input.id === `phase:${project}:L3`);
   if (!ref) return null;
   const producer = store.get<{ projectId: string; taskObligationContract?: string }>(ref.id, ref.revision);
@@ -38,11 +43,19 @@ export function bindTaskObligations(store: Store, project: string, graph: Graph,
     if (graph.researchObligations?.length) fail('task_obligation_foreign', graph.id, 'Task obligations need their exact R2 handoff');
     return { findings, byNode };
   }
-  const scope = store.get<ResearchScope>(handoff.scope.id, handoff.scope.revision);
-  requireCondition(scope?.kind === 'research-scope' && scope.hash === handoff.scope.hash && scope.value.projectId === project,
-    'task_obligation_scope_foreign', 'The task consumers must use the exact policy scope');
-  requireCondition(canonical(handoff.obligations) === canonical(carriedObligations(scope)),
-    'task_obligation_scope_foreign', 'L3 must not change the original kind, deadline, owner or return condition');
+  let scope: ResearchScope | null = null;
+  if (!('r2' in handoff)) {
+    const verified = omObligationHandoff(store, project, [handoff.producer, handoff.scope]);
+    requireCondition(verified && canonical(verified) === canonical(handoff),
+      'task_obligation_scope_foreign', 'Task consumers must retain the exact OM producer and its complete obligation ledger');
+  } else {
+    const record = store.get<ResearchScope>(handoff.scope.id, handoff.scope.revision);
+    requireCondition(record?.kind === 'research-scope' && record.hash === handoff.scope.hash && record.value.projectId === project,
+      'task_obligation_scope_foreign', 'The task consumers must use the exact policy scope');
+    requireCondition(canonical(handoff.obligations) === canonical(carriedObligations(record)),
+      'task_obligation_scope_foreign', 'L3 must not change the original kind, deadline, owner or return condition');
+    scope = record.value;
+  }
   const obligations = taskObligations(handoff), bindings = graph.researchObligations;
   if (!Array.isArray(bindings)) {
     fail('task_obligation_bindings_missing', graph.id, 'L3 must explicitly retain task bindings, including an empty set when nothing is due');
@@ -53,13 +66,23 @@ export function bindTaskObligations(store: Store, project: string, graph: Graph,
   }
   const relations = new RefinementRelations(graph);
   const active = graph.nodes.filter(node => graph.horizon.includes(node.id));
-  const scoped = [...scope.value.nodes, ...scope.value.boundaries.map(item => item.node), ...scope.value.expansions.map(item => item.node)];
-  const changedPaths = [...scope.value.changedPaths, ...active.flatMap(node => node.code.filter(code => code.access === 'write').map(code => code.path))];
+  const scoped = scope ? [...scope.nodes, ...scope.boundaries.map(item => item.node), ...scope.expansions.map(item => item.node)] : [];
+  const changedPaths = [...(scope?.changedPaths ?? []), ...active.flatMap(node => node.code.filter(code => code.access === 'write').map(code => code.path))];
   const awakened = (obligation: CarriedObligation) => {
-    const original = scope.value.obligations.find(item => item.gap.id === obligation.obligation)!;
     const wake = obligation.wake;
-    const triggered = Boolean(wake && (wake.uiRequired && scope.value.uiRequired || wake.nodes.some(id => scoped.includes(id)
+    const triggered = Boolean(wake && (wake.uiRequired && scope?.uiRequired || wake.nodes.some(id => scoped.includes(id)
       || active.some(node => relations.refines(node.id, id))) || wake.paths.some(path => changedPaths.some(changed => changed === path || changed.startsWith(path + '/')))));
+    if (!scope) {
+      // The common OM reader has proved this exact /gap. Its original deferral
+      // survives the handoff; a new work refinement can make its consumer due.
+      const original = store.get<GapRecord>(obligation.original.record.id, obligation.original.record.revision)!.value.gap;
+      const realizes = (node: Graph['nodes'][number]) => node.kind === 'work'
+        && relations.refines(node.id, obligation.responsibleNode) && relations.refines(node.id, obligation.responsibleConsumer);
+      // Graphs have no uiRequired signal. Retain that explicit wake term without
+      // inventing a UI classification; responsible active work still wakes it.
+      return triggered || (original.deferral ? active : graph.nodes).some(realizes);
+    }
+    const original = scope.obligations.find(item => item.gap.id === obligation.obligation)!;
     // An active research obligation can concern a boundary whose work has not
     // been detailed yet. Keep it in the exact R2 handoff until a valid consumer
     // exists; each later L3 is checked again. Product ancestry still counts.
@@ -78,7 +101,8 @@ export function bindTaskObligations(store: Store, project: string, graph: Graph,
     }
     for (const consumer of binding.consumers) {
       const node = graph.nodes.find(item => item.id === consumer.node);
-      if (node?.kind !== 'work' || !relations.refines(node.id, obligation.responsibleNode)) {
+      if (node?.kind !== 'work' || !relations.refines(node.id, obligation.responsibleNode)
+        || !scope && !relations.refines(node.id, obligation.responsibleConsumer)) {
         fail('task_obligation_consumer_foreign', binding.id, 'The named work must realize the original responsible node'); continue;
       }
       if (!Array.isArray(consumer.tests) || new Set(consumer.tests).size !== consumer.tests.length

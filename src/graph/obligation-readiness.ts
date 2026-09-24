@@ -14,6 +14,8 @@ export interface ObligationConfirmation { obligation: string; source: Ref; obser
 export interface ReadinessObligations { handoff: ObligationHandoff; confirmations: ObligationConfirmation[] }
 
 function confirmation(store: Store, project: string, obligation: CarriedObligation, source: Ref) {
+  // D7 carries the owner contract; OM runtime observations are a D8 producer.
+  if (obligation.scope.id.startsWith('om-obligations:')) return null;
   if (obligation.kind !== 'environment-confirmation' || !obligation.returnCondition
     || obligation.runtimeCheck?.satisfies !== obligation.returnCondition) return null;
   const found = runtimeSupport(store, project, obligation, source);
@@ -46,6 +48,7 @@ export function findObligationConfirmation(store: Store, project: string, obliga
  * changes do not rewrite the fact that the condition was met at task start. */
 export function frozenObligationConfirmation(store: Store, project: string, obligation: CarriedObligation, proof: ObligationConfirmation): boolean {
   try {
+    if (obligation.scope.id.startsWith('om-obligations:')) return false;
     if (obligation.kind !== 'environment-confirmation' || !obligation.returnCondition
       || obligation.runtimeCheck?.satisfies !== obligation.returnCondition || proof.obligation !== obligation.obligation
       || !isRef(proof.source) || !isRef(proof.observation)) return false;
@@ -82,11 +85,13 @@ export function readinessObligations(store: Store, project: string, inputs: Ref[
     return { findings, guards, dependencies, value: undefined };
   }
   const due = handoff.obligations.filter(obligation => obligation.moment === 'R3');
-  // The immutable producing R2 establishes the era. The missing R3 field by
-  // itself is never sufficient to waive the new handoff contract.
-  const producer = store.get<{ carriedContract?: string }>(handoff.r2.id, handoff.r2.revision)!;
-  if (mode === 'consume' && saved === undefined && allowHistorical && producer.value.carriedContract === undefined)
-    return { findings, guards, dependencies, value: undefined };
+  // Only a legacy producing R2 can waive the old R3 field. An OM ledger,
+  // including an empty one, always survives into the saved readiness result.
+  if ('r2' in handoff) {
+    const producer = store.get<{ carriedContract?: string }>(handoff.r2.id, handoff.r2.revision)!;
+    if (mode === 'consume' && saved === undefined && allowHistorical && producer.value.carriedContract === undefined)
+      return { findings, guards, dependencies, value: undefined };
+  }
   if (mode === 'consume' && saved === undefined) {
     findings.push({ code: 'obligation_handoff_missing', target: 'R3', message: 'This scoped R3 result omitted its required obligation handoff; do not infer it as accepted' });
     return { findings, guards, dependencies, value: undefined };
