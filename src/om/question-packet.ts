@@ -1,4 +1,5 @@
 import { Ajv } from 'ajv';
+import type { Selector } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall } from './call-record.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -134,6 +135,7 @@ export interface QuestionPacketRequest {
 }
 export interface QuestionPacketRecord {
   project: string; request: QuestionPacketRequest; state: 'ready' | 'blocked' | 'empty';
+  answerProtocol?: 'omg-answer/v2';
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -144,7 +146,11 @@ export interface PreparedQuestionPacket {
 }
 export const QUESTION_PACKET_KIND = 'question-packet';
 const packetNamespace = (project: string) => `om-question-packet:${project}:`;
-const packetId = (request: QuestionPacketRequest) => `${packetNamespace(request.project)}${hashJson(request)}`;
+export const PACKET_ANSWER_PROTOCOL = 'omg-answer/v2' as const;
+const packetKey = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol']) =>
+  hashJson(protocol ? { protocol, request } : request);
+const packetId = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol']) =>
+  `${packetNamespace(request.project)}${packetKey(request, protocol)}`;
 const json = (value: unknown) => copy(value) as Json;
 function requirePacket(store: Store, value: unknown): asserts value is QuestionPacketRequest {
   if (!(store instanceof Store) || !object(value) || !text(value.project) || !isRef(value.routes)
@@ -329,6 +335,7 @@ function expansionContext(frame: FrameProposals, node: string) {
 }
 
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord) {
+  const protocol = saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL;
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
   const references: Ref[] = [...routes.references, request.routes], guards: Ref[] = [];
   if (current) {
@@ -342,7 +349,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
   if (request.batch !== null && !batch || request.batch === null && routes.record.value.batches.length)
     fail('packet_batch_invalid', request.routes.id, 'batch', 'Name an exact routed model batch; absence is valid only without routed work');
-  const base: QuestionPacketRecord = { project: request.project, request, state: 'empty', packet: null, fingerprint: null,
+  const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
@@ -370,10 +377,12 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       ...(batch.task === 'node-expansion' ? {} : { question: gap.value.gap.evidence.map(entry => ({ origin: entry.origin, value: entry.value })) }) };
   });
   ownRequirements(tasks);
-  const common = { version: 'om-question-packet/v1', requestId: hashJson(request), model: batch.model,
+  const requestId = packetKey(request, protocol);
+  const common = { version: protocol ? 'om-question-packet/v2' : 'om-question-packet/v1', requestId, model: batch.model,
     purpose: batch.model === 'MC1' ? 'model-research' : 'model-design', task: batch.task, kind: batch.kind, questions,
-    responseForm: batch.task === 'node-expansion'
-      ? { protocol: 'omg-part/v1', requestId: hashJson(request), proposal: PART_PROPOSAL_SCHEMA }
+    responseForm: protocol ? { protocol, requestId, schema: packetAnswerSchema(batch.task === 'node-expansion' ? 'node' : batch.model === 'MC1' ? 'fact' : 'field') }
+      : batch.task === 'node-expansion'
+      ? { protocol: 'omg-part/v1', requestId, proposal: PART_PROPOSAL_SCHEMA }
       : batch.model === 'MC1'
         ? { results: 'One result per question id', value: 'The question contract resultForm', citations: 'Exact source reference and text-range or JSON-pointer selector' }
         : { results: 'One result per target and field', fields: ['target', 'field', 'value', 'basis'],
@@ -404,7 +413,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       assignments.at(-1)!.obligations.push(...open.filter(item => !item.connector).map(item => item.id));
       assignments.forEach(item => item.obligations.sort(order));
       base.plan = { mode: 'parts', assignments, position: request.previous.length };
-      context.previous = previousParts(store, request, base.plan, references);
+      context.previous = previousParts(store, request, base.plan, references, protocol);
       context.reserved = unique([...context.reserved, ...context.previous.flatMap(item => (item as unknown as {nodes: Graph['nodes']}).nodes.map(node => node.id))]);
       if (request.previous.length === assignments.length)
         return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
@@ -452,7 +461,9 @@ function loadPacket(store: Store, project: string, ref: Ref): Revision<QuestionP
       throw error;
     }
     const request = record.value.request;
-    if (request.project !== project || record.id !== packetId(request) || record.revision !== 1)
+    if (record.value.answerProtocol !== undefined && record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL)
+      fail('packet_record_invalid', ref.id, 'answerProtocol', 'The packet answer contract era is unsupported');
+    if (request.project !== project || record.id !== packetId(request, record.value.answerProtocol) || record.revision !== 1)
       fail('packet_record_invalid', ref.id, 'request', 'A packet preserves the identity of its exact immutable source request');
     const expected = derivePacket(store, request, false, record.value as QuestionPacketRecord);
     if (!same(expected.value, record.value))
@@ -467,12 +478,12 @@ export function readQuestionPacket(store: Store, request: { project: string; rec
 export function prepareQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
   requirePacket(store, request); request = copy(request);
   return result(() => {
-    const old = store.get<QuestionPacketRecord>(packetId(request));
+    const old = store.get<QuestionPacketRecord>(packetId(request, PACKET_ANSWER_PROTOCOL));
     const checked = old ? loadPacket(store, request.project, reference(old)) : undefined;
     const derived = derivePacket(store, request, true, checked?.value);
     if (checked && !same(checked.value, derived.value))
       fail('packet_record_invalid', checked.id, 'value', 'An existing packet cannot change without a new source request');
-    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request), kind: QUESTION_PACKET_KIND,
+    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, PACKET_ANSWER_PROTOCOL), kind: QUESTION_PACKET_KIND,
       revision: 1, hash: hashJson(derived.value), value: derived.value };
     return { record, existing: Boolean(checked), references: derived.references,
       guards: unique([...derived.guards, ...(checked ? [reference(checked)] : [])]),
@@ -539,20 +550,184 @@ export function normalizePartAnswer(value: unknown): OmResult<Sealed<PartProposa
         bindings: sorted(connector.bindings.map(binding => ({ ...binding, consumers: sorted(binding.consumers) }))) }))) } as PartProposalBody;
   });
 }
-function partSource(store: Store, request: PartResultRequest) {
-  const packet = loadPacket(store, request.project, request.packet), value = packet.value;
+export type PacketRead =
+  | { action: 'read'; path: string; media: 'text/plain' | 'application/json' }
+  | { action: 'read_source'; source: Ref; selector: Selector }
+  | { action: 'read_context'; record: Ref; pointer: string }
+  | { action: 'search'; within: string | Ref; query: string };
+export interface PacketAnswerRequest { project: string; packet: Ref; raw: string }
+export type PacketAnswer =
+  | { action: 'answer'; proposal: PartProposalBody }
+  | { action: 'answer'; results: { questionId: string; value: Json; citations: { source: Ref; selector: Selector }[] }[] }
+  | { action: 'answer'; results: { target: string; field: string; value: Json; basis: Ref }[] }
+  | { action: 'need_source'; questionIds: string[]; missing: string; reads: PacketRead[] }
+  | { action: 'need_owner'; questionIds: string[]; reason: string; decision: string }
+  | { action: 'cannot_answer' | 'pause'; questionIds: string[]; reason: string };
+export interface CheckedPacketAnswer {
+  packet: Revision<QuestionPacketRecord>; answer: PacketAnswer; references: Ref[];
+}
+const nonempty = { type: 'string', minLength: 1, pattern: '\\S' };
+const selectorShape = { oneOf: [
+  { type: 'object', additionalProperties: false, required: ['kind', 'pointer'], properties: {
+    kind: { const: 'json-pointer' }, pointer: { type: 'string' } } },
+  { type: 'object', additionalProperties: false, required: ['kind', 'start', 'end'], properties: {
+    kind: { const: 'text-range' }, start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } } },
+] };
+const readShapes = [
+  { action: { const: 'read' }, path: nonempty, media: { enum: ['text/plain', 'application/json'] } },
+  { action: { const: 'read_source' }, source: refShape, selector: selectorShape },
+  { action: { const: 'read_context' }, record: refShape, pointer: { type: 'string' } },
+  { action: { const: 'search' }, within: { oneOf: [nonempty, refShape] }, query: nonempty },
+].map(properties => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties }));
+const factResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
+  required: ['questionId', 'value', 'citations'], properties: { questionId: nonempty, value: {},
+    citations: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
+      required: ['source', 'selector'], properties: { source: refShape, selector: selectorShape } } } } } };
+const fieldResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
+  required: ['target', 'field', 'value', 'basis'], properties: { target: nonempty, field: nonempty, value: {}, basis: refShape } } };
+function responseShape(properties: Record<string, unknown>) {
+  const fields = { protocol: { const: PACKET_ANSWER_PROTOCOL }, requestId: nonempty, ...properties };
+  return { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: fields };
+}
+const controls = [
+  responseShape({ action: { const: 'need_source' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
+    missing: nonempty, reads: { type: 'array', minItems: 1, items: { oneOf: readShapes } } }),
+  responseShape({ action: { const: 'need_owner' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
+    reason: nonempty, decision: nonempty }),
+  ...['cannot_answer', 'pause'].map(action => responseShape({ action: { const: action },
+    questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty }, reason: nonempty })),
+];
+const answerSchemas = sealed({
+  node: { oneOf: [responseShape({ action: { const: 'answer' }, proposal: PART_PROPOSAL_SCHEMA }), ...controls] },
+  fact: { oneOf: [responseShape({ action: { const: 'answer' }, results: factResults }), ...controls] },
+  field: { oneOf: [responseShape({ action: { const: 'answer' }, results: fieldResults }), ...controls] },
+});
+/** One stable schema family for producer payloads, E3 and E4; it is not compiled per packet. */
+export function packetAnswerSchema(kind: keyof typeof answerSchemas): Sealed<Json> {
+  if (kind !== 'node' && kind !== 'fact' && kind !== 'field') invalid('answer.schema');
+  return answerSchemas[kind] as Sealed<Json>;
+}
+const answerSchemasAjv = new Ajv({ strict: true, allowUnionTypes: true });
+const answerValidators = { node: answerSchemasAjv.compile(answerSchemas.node), fact: answerSchemasAjv.compile(answerSchemas.fact),
+  field: answerSchemasAjv.compile(answerSchemas.field) };
+const legacyResultValidators = {
+  fact: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: factResults } }),
+  field: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: fieldResults } }),
+};
+function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): PacketAnswer {
+  const value = packet.value, payload = value.packet;
+  if (value.state !== 'ready' || !object(payload))
+    fail('part_answer_invalid', packet.id, 'packet', 'An answer must name a ready, saved assignment');
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); }
+  catch (error) { if (error instanceof SyntaxError) fail('part_answer_invalid', packet.id, 'raw', 'The reply is not typed JSON'); throw error; }
+  try { parsed = sealed(parsed); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'unsealable_value')
+      fail('part_answer_invalid', packet.id, 'raw', 'A reply must contain finite JSON values');
+    throw error;
+  }
+  if (!object(parsed)) fail('part_answer_invalid', packet.id, 'raw', 'An answer has exactly one typed envelope');
+  const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
+  if (value.answerProtocol) {
+    const validate = answerValidators[kind];
+    if (!validate(parsed)) fail('part_answer_invalid', packet.id, validate.errors?.[0]?.instancePath || 'reply',
+      'The reply must use exactly one branch of the declared answer form without service fields');
+    if (parsed.requestId !== payload.requestId)
+      fail('part_result_invalid', packet.id, 'requestId', 'The reply must echo the exact sent request identifier');
+    if (parsed.action !== 'answer') {
+      const questionIds = parsed.questionIds as string[];
+      const assigned = (payload.questions as unknown as { id: string }[]).map(item => item.id);
+      if (questionIds.some(id => !assigned.includes(id)))
+        fail('part_answer_invalid', packet.id, 'questionIds', 'A control reply may name only questions of its exact assignment');
+    }
+  } else if (kind === 'node') {
+    if (parsed.protocol !== 'omg-part/v1' || parsed.requestId !== payload.requestId || !Object.hasOwn(parsed, 'proposal')
+      || Object.keys(parsed).some(key => !['protocol', 'requestId', 'proposal'].includes(key)))
+      fail('part_result_invalid', packet.id, 'requestId', 'The old packet accepts only its original exact node reply envelope');
+  } else {
+    const validate = legacyResultValidators[kind];
+    if (!validate(parsed)) fail('part_answer_invalid', packet.id, 'results', 'The old packet accepts only its declared results form');
+  }
+  const { protocol: _protocol, requestId: _requestId, ...body } = parsed;
+  // Only the declared set boundaries are normalized; values, schemas and address strings stay literal.
+  // Preserve duplicates for downstream coverage/conflict checks rather than silently shrinking the reply.
+  if (value.answerProtocol) {
+    if (Array.isArray(body.results)) body.results = sorted(body.results.map(item => {
+      const row = item as Record<string, unknown>;
+      return kind === 'fact' ? { ...row, citations: sorted(row.citations as unknown[]) } : row;
+    }));
+    if (Array.isArray(body.questionIds)) body.questionIds = sorted(body.questionIds);
+    if (Array.isArray(body.reads)) body.reads = sorted(body.reads);
+  }
+  return json({ ...body, action: body.action ?? 'answer',
+    ...(kind === 'node' && (body.action === undefined || body.action === 'answer')
+      ? { proposal: take(normalizePartAnswer(body.proposal)) } : {}) }) as unknown as PacketAnswer;
+}
+/** Observes content only. A reply parsed here is not proof of an admitted or completed call. */
+export function readPacketAnswer(store: Store, request: PacketAnswerRequest): OmResult<Sealed<CheckedPacketAnswer>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.packet) || typeof request.raw !== 'string'
+    || Object.keys(request).some(key => !['project', 'packet', 'raw'].includes(key))) invalid('answer');
+  request = copy(request);
+  return result(() => {
+    const packet = loadPacket(store, request.project, request.packet);
+    return { packet, answer: packetReply(packet, request.raw), references: [request.packet] };
+  });
+}
+
+function partContext(store: Store, project: string, packet: Revision<QuestionPacketRecord>) {
+  const value = packet.value;
   if (value.state !== 'ready' || !value.packet || !value.plan || !value.request.attempt)
-    fail('part_result_invalid', request.packet.id, 'packet', 'A part result needs an issued node-expansion packet');
+    fail('part_result_invalid', packet.id, 'packet', 'A part result needs an issued node-expansion packet');
   const payload = value.packet as Record<string, Json>, expansion = payload.expansion as unknown as ReturnType<typeof expansionContext>;
   if (payload.model !== 'MC2' || payload.task !== 'node-expansion' || !expansion)
-    fail('part_result_invalid', request.packet.id, 'packet', 'This packet does not assign a node expansion');
-  const routes = take(readRoutes(store, { project: request.project, record: value.request.routes }));
+    fail('part_result_invalid', packet.id, 'packet', 'This packet does not assign a node expansion');
+  const routes = take(readRoutes(store, { project, record: value.request.routes }));
   const source = routes.record.value.request.gaps.sources;
   const batch = routes.record.value.batches.find(item => item.id === value.request.batch)!;
   const frameSource = batch.level === 2 ? source.operations : source.works;
-  if ('state' in frameSource) fail('part_result_invalid', request.packet.id, 'frame', 'A part needs an available frame source');
+  if ('state' in frameSource) fail('part_result_invalid', packet.id, 'frame', 'A part needs an available frame source');
+  return { value, payload, expansion, routes, batch, frameSource };
+}
+function partProposal(store: Store, project: string, packet: Revision<QuestionPacketRecord>, body: PartProposalBody) {
+  const { value, expansion, routes, frameSource } = partContext(store, project, packet);
+  const assigned = new Set(expansion.assigned);
+  if (body.fills.some(fill => !assigned.has(fill.obligation)) || body.replaces.some(fill => !assigned.has(fill.obligation)))
+    fail('part_result_invalid', packet.id, 'assigned', 'A previous answer may address only the obligations assigned to its own packet');
+  const previousNodes = expansion.previous.flatMap(item => (item as unknown as { nodes: Graph['nodes'] }).nodes);
+  const frame = take(readFrameProposals(store, frameSource as import('./frame-proposals.js').ProposalRequest));
+  const initial = frame.frame.accepted?.graph ?? frame.frame.upper;
+  const graph = { ...initial, nodes: [...new Map([...initial.nodes, ...frame.proposals.flatMap(item => item.value.nodes)]
+    .map(node => [node.id, node] as const)).values()], edges: [...(initial.edges ?? []), ...frame.proposals.flatMap(item => item.value.edges)] } as Graph;
+  const scopedGraph = { ...graph, nodes: [...graph.nodes.filter(node => !body.nodes.some(item => item.id === node.id)),
+    ...previousNodes.filter(node => !body.nodes.some(item => item.id === node.id) && !graph.nodes.some(item => item.id === node.id)), ...body.nodes],
+    edges: [...(graph.edges ?? []), ...value.request.previous.flatMap(item => checkedPart(store, project, item.result).proposal.value.edges), ...body.edges] } as Graph;
+  const relations = new RefinementRelations(scopedGraph);
+  if (body.nodes.some(node => LEVEL[node.kind] !== frameSource.frame.level || !relations.refines(node.id, expansion.upper.id))
+    || body.fills.some(fill => !relations.refines(fill.node, expansion.upper.id)))
+    fail('part_result_invalid', packet.id, 'node', 'Every used lower node must belong to this upper-node assignment');
+  const proposalValue: LayerProposal = { ...body, base: { graph: frameSource.frame.graph, frame: frameSource.frame.frame },
+    level: frameSource.frame.level, source: 'decision', status: 'proposed' };
+  return { proposal: proposalValue, frameSource, references: unique([reference(packet), ...frame.references, ...routes.references]) };
+}
+export interface DerivedPartProposal {
+  packet: Revision<QuestionPacketRecord>; proposal: LayerProposal; references: Ref[];
+}
+/** E3 and E4 share this derivation; it supplies content, never an invented call or proposal reference. */
+export function derivePartProposal(store: Store, request: PacketAnswerRequest): OmResult<Sealed<DerivedPartProposal>> {
+  return result(() => {
+    const checked = take(readPacketAnswer(store, request));
+    if (checked.answer.action !== 'answer' || !('proposal' in checked.answer))
+      fail('part_answer_invalid', request.packet.id, 'reply', 'A node proposal requires the substantive node branch');
+    const derived = partProposal(store, request.project, checked.packet as Revision<QuestionPacketRecord>, checked.answer.proposal as PartProposalBody);
+    return { packet: checked.packet as Revision<QuestionPacketRecord>, proposal: derived.proposal, references: derived.references };
+  });
+}
+function partSource(store: Store, request: PartResultRequest) {
+  const packet = loadPacket(store, request.project, request.packet);
+  const { value, payload, expansion, routes, batch, frameSource } = partContext(store, request.project, packet);
   const call = take(readCall(store, request.project, request.call));
-  const series = take(readRecord<RepairSeries>(store, value.request.attempt.series, { unit: 'E2', target: request.packet.id,
+  const series = take(readRecord<RepairSeries>(store, value.request.attempt!.series, { unit: 'E2', target: request.packet.id,
     idPrefix: `repair-series:${request.project}:`, kind: 'repair-series' }));
   const goal = series.value.attempts.find(item => item.ordinal === value.request.attempt!.ordinal)!.goal;
   const assigned = new Set(expansion.assigned);
@@ -560,7 +735,7 @@ function partSource(store: Store, request: PartResultRequest) {
     ({ id: item.target, goal: item.target, field: item.field, consumer }))));
   const fingerprint = value.fingerprint!;
   if (call.revision !== 1 || call.value.call !== payload.requestId || call.value.purpose !== 'model-design' || call.value.basis !== null
-    || !same(call.value.series, value.request.attempt.series) || call.value.attempt !== value.request.attempt.ordinal
+    || !same(call.value.series, value.request.attempt!.series) || call.value.attempt !== value.request.attempt!.ordinal
     || !same(call.value.goal, goal) || call.value.block !== series.value.block || !same(sorted(call.value.gaps), addressed)
     || !same(call.value.packet, { hash: fingerprint.hash, chars: fingerprint.chars, bytes: fingerprint.utf8Bytes }))
     fail('part_result_invalid', request.call.id, 'call', 'The admitted call must name this exact packet, attempt, goal and assigned questions');
@@ -572,36 +747,15 @@ function partSource(store: Store, request: PartResultRequest) {
     || response.value.requestId !== payload.requestId || typeof response.value.raw !== 'string'
     || Object.keys(response.value).some(key => !['project', 'packet', 'call', 'requestId', 'raw'].includes(key)))
     fail('part_result_invalid', request.response.id, 'response', 'The immutable adapter response must belong to the sent request and admitted call');
-  let answer: unknown;
-  try { answer = JSON.parse(response.value.raw); }
-  catch (error) { if (error instanceof SyntaxError) fail('part_answer_invalid', request.response.id, 'raw', 'The adapter response is not typed JSON'); throw error; }
-  if (!object(answer) || answer.protocol !== 'omg-part/v1' || answer.requestId !== payload.requestId
-    || !Object.hasOwn(answer, 'proposal') || Object.keys(answer).some(key => !['protocol', 'requestId', 'proposal'].includes(key)))
-    fail('part_result_invalid', request.response.id, 'requestId', 'The adapter reply must echo the exact sent request identifier');
-  const body = take(normalizePartAnswer(answer.proposal)) as PartProposalBody;
-  if (body.fills.some(fill => !assigned.has(fill.obligation)) || body.replaces.some(fill => !assigned.has(fill.obligation)))
-    fail('part_result_invalid', request.response.id, 'assigned', 'A previous answer may address only the obligations assigned to its own packet');
-  const previousNodes = expansion.previous.flatMap(item => (item as unknown as { nodes: Graph['nodes'] }).nodes);
-  const frame = take(readFrameProposals(store, frameSource as import('./frame-proposals.js').ProposalRequest));
-  const initial = frame.frame.accepted?.graph ?? frame.frame.upper;
-  const graph = { ...initial, nodes: [...new Map([...initial.nodes, ...frame.proposals.flatMap(item => item.value.nodes)]
-    .map(node => [node.id, node] as const)).values()], edges: [...(initial.edges ?? []), ...frame.proposals.flatMap(item => item.value.edges)] } as Graph;
-  const scopedGraph = { ...graph, nodes: [...graph.nodes.filter(node => !body.nodes.some(item => item.id === node.id)),
-    ...previousNodes.filter(node => !body.nodes.some(item => item.id === node.id) && !graph.nodes.some(item => item.id === node.id)), ...body.nodes],
-    edges: [...(graph.edges ?? []), ...value.request.previous.flatMap(item => checkedPart(store, request.project, item.result).proposal.value.edges), ...body.edges] } as Graph;
-  const relations = new RefinementRelations(scopedGraph);
-  if (body.nodes.some(node => LEVEL[node.kind] !== frameSource.frame.level || !relations.refines(node.id, expansion.upper.id))
-    || body.fills.some(fill => !relations.refines(fill.node, expansion.upper.id)))
-    fail('part_result_invalid', request.response.id, 'node', 'Every used lower node must belong to this upper-node assignment');
-  const proposalValue: LayerProposal = { ...body, base: { graph: frameSource.frame.graph, frame: frameSource.frame.frame },
-    level: frameSource.frame.level, source: 'decision', status: 'proposed' };
+  const derived = take(derivePartProposal(store, { project: request.project, packet: request.packet, raw: response.value.raw }));
+  const proposalValue = derived.proposal as LayerProposal;
   const key = hashJson(request);
   const proposal: Revision<LayerProposal> = { id: `om-proposal:${request.project}:part:${key}`, kind: 'layer-proposal',
     revision: 1, hash: hashJson(proposalValue), value: proposalValue };
   const resultValue: PartResultRecord = { project: request.project, request, proposal: reference(proposal) };
   const record: Revision<PartResultRecord> = { id: `om-part-result:${request.project}:${key}`, kind: PART_RESULT_KIND,
     revision: 1, hash: hashJson(resultValue), value: resultValue };
-  return { record, proposal, frameSource, references: unique([request.packet, request.call, request.response, ...frame.references, ...routes.references]) };
+  return { record, proposal, frameSource, references: unique([request.packet, request.call, request.response, ...derived.references, ...routes.references]) };
 }
 function checkedPart(store: Store, project: string, ref: Ref): CheckedPartResult {
   return historicalRead(store, { reader: 'E2.part-result', project, ref }, () => {
@@ -635,6 +789,8 @@ export function preparePartResult(store: Store, request: PartResultRequest): OmR
     const expected = partSource(store, request);
     const packet = loadPacket(store, request.project, request.packet);
     const current = take(prepareQuestionPacket(store, packet.value.request));
+    if (!same(reference(current.record), reference(packet)))
+      fail('part_result_invalid', packet.id, 'answerProtocol', 'An old packet cannot become a current-era admission');
     const old = store.get(expected.record.id);
     if (old) {
       const existing = checkedPart(store, request.project, reference(old));
@@ -647,12 +803,13 @@ export function preparePartResult(store: Store, request: PartResultRequest): OmR
         ({ id: record.id, kind: record.kind, expected: 0, value: record.value })) };
   });
 }
-function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNullable<QuestionPacketRecord['plan']>, references: Ref[]) {
+function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNullable<QuestionPacketRecord['plan']>, references: Ref[],
+  protocol: QuestionPacketRecord['answerProtocol']) {
   if (request.previous.length > plan.assignments.length) fail('packet_chain_invalid', request.batch!, 'previous', 'The chain exceeds its assigned parts');
   return request.previous.map((item, index) => {
     const prior = loadPacket(store, request.project, item.packet);
     const expected = { ...request, previous: request.previous.slice(0, index) };
-    if (!same(prior.value.request, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'
+    if (prior.value.answerProtocol !== protocol || !same(prior.value.request, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'
       || prior.value.plan.position !== index || !same(prior.value.plan.assignments, plan.assignments))
       fail('packet_chain_invalid', item.packet.id, 'previous', 'A prior packet must be the preceding assignment of this same chain');
     const checked = checkedPart(store, request.project, item.result);

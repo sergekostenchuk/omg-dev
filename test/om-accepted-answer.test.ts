@@ -11,7 +11,9 @@ import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Que
   prepareAnswerInvalidation, readAnswerInvalidation, type AnswerInvalidation,
   prepareAnswerTask, writeAnswerTask, readAnswerTask, readAnswerTaskBasis, applicableAnswerTask, type AnswerTaskRequest,
   prepareAnswerSearch, readAnswerSearch, answerIndexId, prepareAcceptedAnswers, ANSWER_INDEX_KIND, type AnswerIndex,
+  readAnswerCitations, prepareAnswerCitations, ANSWER_GROUNDS_ERA,
   confirmAcceptedAnswerResult, ANSWER_REFUSAL_CODES, type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
+import { Evidence, type Selector, type Source } from '../src/evidence/evidence.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -177,9 +179,9 @@ function factFixture(t: TestContext) {
     const question = ok(writeMc1Question(store, request));
     return { request, question, issued, draft };
   }
-  async function answer(q = issue(), attempt: AnswerRequest['attempt'] = null, value: Json = 'JSON') {
+  async function answer(q = issue(), attempt: AnswerRequest['attempt'] = null, value: Json = 'JSON', citation?: { source: Ref; selector: Selector }) {
     const assessment = await assessAnswer(store, q.issued, { action: 'answer', question: q.issued.id, value,
-      citations: [{ source: reference(store.get(source.id)!), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, root);
+      citations: [citation ?? { source: reference(store.get(source.id)!), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, root);
     const draft = engine.discovery.researched(q.issued.id, q.issued.revision, reference(assessment)), answered = store.get<Question>(q.issued.id)!;
     const request: AnswerRequest = { project, question: reference(q.question), answer: answered.value.answer!,
       answeredQuestion: reference(answered), draft: reference(draft), attempt };
@@ -1046,4 +1048,126 @@ test('D5 does not accept a fingerprint or status in place of the complete saved 
     if (!result.ok) { assert.equal(result.refusal.code, 'answer_question_invalid'); assert.ok(result.refusal.at.target && result.refusal.at.field); }
     assert.deepEqual(store.list().map(reference), before);
   }
+});
+
+
+function citationFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-answer-citations-')), path = join(root, 'state.sqlite');
+  let store = new Store(path);
+  const project = 'citations';
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  writeFileSync(join(root, 'fact.json'), '{"answer":"JSON","__proto__":{"literal":"kept"}}');
+  const file = new Evidence(store).file(project, 'file', root, 'fact.json', 'application/json', 0);
+  const document = new Evidence(store).document(project, 'document', 'The owner reports JSON execution.', 'text/plain', 0);
+  return { root, project, file, document, get store() { return store; },
+    restart() { store.close(); store = new Store(path); } };
+}
+
+test('D5 shared citation reader computes observation and limits without treating a document or provenance as intent or runtime proof', t => {
+  const f = citationFixture(t), document = f.store.write<Source>({ id: f.document.id, kind: 'source', expected: f.document.revision,
+    value: { ...f.document.value, provenance: { kind: 'runtime-observation', record: reference(f.file) } } });
+  const request = { project: f.project, citations: [
+    { source: reference(f.file), selector: { kind: 'json-pointer' as const, pointer: '/__proto__/literal' } },
+    { source: reference(document), selector: { kind: 'text-range' as const, start: 0, end: document.value.content.length } },
+  ] }, before = f.store.list().map(reference), raw = canonical(request);
+  const read = ok(readAnswerCitations(f.store, request));
+  assert.equal(read.grounds.find(item => item.observation.source.id === f.file.id)!.observation.value, 'kept');
+  assert.equal(read.grounds.find(item => item.observation.source.id === f.file.id)!.proofLimit, 'repository-observation');
+  assert.equal(read.grounds.find(item => item.observation.source.id === document.id)!.proofLimit, 'reported-not-runtime-proof');
+  assert.equal(read.grounds.find(item => item.observation.source.id === document.id)!.observation.value, document.value.content);
+  assert.equal(Object.hasOwn(read, 'guards'), false);
+  assert.equal(Object.isFrozen(read.grounds[0]!.observation), true);
+  assert.equal(canonical(request), raw); assert.deepEqual(f.store.list().map(reference), before);
+  assert.deepEqual(ok(prepareAnswerCitations(f.store, request)).guards, read.references);
+});
+
+test('D5 shared citation reader preserves exact saved selectors through filesystem changes, source heads and restart', t => {
+  const f = citationFixture(t), request = { project: f.project,
+    citations: [{ source: reference(f.file), selector: { kind: 'json-pointer' as const, pointer: '/answer' } }] };
+  const historical = ok(readAnswerCitations(f.store, request));
+  withHistoricalReads(() => {
+    ok(prepareAnswerCitations(f.store, request));
+    writeFileSync(join(f.root, 'fact.json'), '{"answer":"XML"}');
+    rejected(prepareAnswerCitations(f.store, request), 'answer_inapplicable');
+    assert.deepEqual(ok(readAnswerCitations(f.store, request)), historical);
+  });
+  new Evidence(f.store).file(f.project, 'file', f.root, 'fact.json', 'application/json', f.file.revision);
+  rejected(prepareAnswerCitations(f.store, request), 'input_stale');
+  rmSync(join(f.root, 'fact.json'));
+  f.restart();
+  assert.deepEqual(ok(readAnswerCitations(f.store, request)), historical);
+  assert.equal(historical.grounds[0]!.observation.value, 'JSON');
+});
+
+test('D5 shared citation preparation provides guards for atomic source races and isolates Store views', t => {
+  const f = citationFixture(t), request = { project: f.project,
+    citations: [{ source: reference(f.document), selector: { kind: 'text-range' as const, start: 0, end: 3 } }] };
+  const prepared = ok(prepareAnswerCitations(f.store, request));
+  assert.deepEqual(prepared.guards, [reference(f.document)]);
+  new Evidence(f.store).document(f.project, 'document', 'New', 'text/plain', f.document.revision);
+  rejected(writeGuarded(f.store, { unit: 'E3-test', target: f.document.id, guards: prepared.guards,
+    writes: [{ id: 'candidate:citation-race', kind: 'candidate', expected: 0, value: prepared }] }), 'input_stale');
+  assert.equal(f.store.get('candidate:citation-race'), null);
+  const error = new TypeError('citation store failed');
+  const broken = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return () => { throw error; };
+    const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    ok(readAnswerCitations(f.store, request));
+    assert.throws(() => readAnswerCitations(broken, request), e => e === error);
+    assert.throws(() => prepareAnswerCitations(broken, request), e => e === error);
+    ok(readAnswerCitations(f.store, request));
+  });
+});
+
+test('D5 shared citation reader refuses malformed, absent, foreign and forged evidence instead of returning empty grounds', t => {
+  const f = citationFixture(t), citation = { source: reference(f.file), selector: { kind: 'json-pointer' as const, pointer: '/answer' } };
+  for (const read of [readAnswerCitations, prepareAnswerCitations]) {
+    for (const selector of [{ kind: 'json-pointer', pointer: '/absent' }, { kind: 'json-pointer', pointer: '/~2' },
+      { kind: 'text-range', start: 1, end: 1 }, { kind: 'all' }, { kind: 'json-pointer', pointer: '/answer', proofLimit: 'runtime' }])
+      rejected(read(f.store, { project: f.project, citations: [{ ...citation, selector: selector as Selector }] }), 'answer_unconfirmed');
+    rejected(read(f.store, { project: f.project, citations: [{ ...citation, source: { ...citation.source, hash: '0'.repeat(64) } }] }), 'record_forged');
+    rejected(read(f.store, { project: 'other', citations: [citation] }), 'record_foreign');
+    rejected(read(f.store, { project: f.project, citations: [{ ...citation, source: { ...citation.source, id: 'source:citations:missing' } }] }), 'record_missing');
+    const guarded = new Proxy(f.store, { get(target, key) {
+      if (key === 'get') return () => assert.fail('Malformed citation must fail before I/O');
+      const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    for (const request of [undefined, {}, { project: f.project }, { project: f.project, citations: [] },
+      { project: f.project, citations: [{}] }, { project: f.project, citations: [{ ...citation, value: 'invented' }] }])
+      assert.throws(() => read(guarded, request as Parameters<typeof read>[1]), (e: unknown) => e instanceof EngineError && e.code === 'answer_request_invalid');
+  }
+  const corrupt = f.store.write({ id: 'source:citations:corrupt', kind: 'source', expected: 0,
+    value: { ...f.file.value, sha256: '0'.repeat(64) } });
+  rejected(readAnswerCitations(f.store, { project: f.project, citations: [{ ...citation, source: reference(corrupt) }] }), 'answer_unconfirmed');
+});
+
+test('D5 grounds era preserves legacy document hashes while new acceptances use reported limits and a distinct address', async t => {
+  const f = factFixture(t), source = new Evidence(f.store).document(f.project, 'reported-format', '{"answer":"JSON"}', 'application/json', 0);
+  const native = await f.answer(f.issue(), null, 'JSON', { source: reference(source), selector: { kind: 'json-pointer', pointer: '/answer' } });
+  const prepared = ok(prepareAcceptedAnswer(f.store, native.request));
+  assert.equal(prepared.record.value.groundsEra, ANSWER_GROUNDS_ERA);
+  assert.equal(prepared.record.value.grounds[0]!.proofLimit, 'reported-not-runtime-proof');
+  // The old producer's contract used request identity and no era field. Its bytes stay independently readable.
+  const { groundsEra: _era, ...body } = clone(prepared.record.value);
+  body.grounds = body.grounds.map(ground => ({ ...ground, proofLimit: 'quoted-intent-requires-attribution' as const }));
+  const legacy = f.store.write<typeof body>({ id: `om-answer:${f.project}:${hashJson(native.request)}`, kind: 'accepted-answer', expected: 0, value: body });
+  const legacyRead = ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(legacy) }));
+  assert.deepEqual(legacyRead.record, legacy);
+  const modern = ok(writeAcceptedAnswer(f.store, native.request));
+  assert.notEqual(modern.id, legacy.id); assert.notEqual(modern.hash, legacy.hash);
+  assert.equal(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(modern) })).key, legacyRead.key);
+  assert.deepEqual(ok(prepareAcceptedAnswer(f.store, native.request)).writes, []);
+  assert.deepEqual(f.store.get(legacy.id), legacy);
+  const unknown = f.store.write({ id: 'om-answer:garden:unknown-era', kind: 'accepted-answer', expected: 0,
+    value: { ...modern.value, groundsEra: 'future' } });
+  rejected(readAcceptedAnswer(f.store, { project: f.project, record: reference(unknown) }), 'answer_record_invalid');
+  const switched = f.store.write({ id: legacy.id, kind: 'accepted-answer', expected: legacy.revision,
+    value: { ...legacy.value, grounds: modern.value.grounds } });
+  rejected(readAcceptedAnswer(f.store, { project: f.project, record: reference(switched) }), 'answer_record_invalid');
+  new Evidence(f.store).document(f.project, 'reported-format', '{"answer":"XML"}', 'application/json', source.revision);
+  f.restart();
+  assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(legacy) })), legacyRead);
+  assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(modern) })).record, modern);
 });

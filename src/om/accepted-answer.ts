@@ -5,7 +5,7 @@ import { Ajv, MissingRefError } from 'ajv';
 import { basename, dirname } from 'node:path';
 import type { DiscoveryDraft, FieldSpec, Question } from '../discovery/discovery.js';
 import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-model.js';
-import { Evidence, sourceIsCurrent, type Observation, type Source } from '../evidence/evidence.js';
+import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
@@ -80,10 +80,14 @@ export interface Mc1QuestionRecord { project: string; request: Mc1QuestionReques
 export interface AnswerRequest {
   project: string; question: Ref; answer: Ref; answeredQuestion: Ref; draft: Ref; attempt: GapLineAttempt | null;
 }
-export interface AnswerGround { observation: Observation; state: string; proofLimit: 'repository-observation' | 'quoted-intent-requires-attribution' }
+export const ANSWER_GROUNDS_ERA = 'citation-v2';
+type GroundsEra = typeof ANSWER_GROUNDS_ERA | 'legacy';
+export interface AnswerCitation { source: Ref; selector: Selector }
+export interface AnswerCitationsRequest { project: string; citations: AnswerCitation[] }
+export interface AnswerGround { observation: Observation; state: string; proofLimit: 'repository-observation' | 'reported-not-runtime-proof' | 'quoted-intent-requires-attribution' }
 export interface AcceptedAnswerRecord {
   project: string; request: AnswerRequest; target: string; field: string; contract: AnswerQuestionContract;
-  fingerprint: string; value: Json; grounds: AnswerGround[];
+  fingerprint: string; value: Json; grounds: AnswerGround[]; groundsEra?: typeof ANSWER_GROUNDS_ERA;
 }
 export type AnswerBasis = { record: Ref } | { pending: Write };
 export interface AnswerReadRequest { project: string; record: Ref }
@@ -425,30 +429,72 @@ function attemptOf(store: Store, project: string, gap: Gap, link: GapLineAttempt
   if (current) head(store, link.series);
   return { series: link.series, ordinal: link.attempt, block: series.value.block, goal: attempt.goal as AttemptGoal };
 }
-function checkedGround(store: Store, project: string, raw: Observation, current: boolean): AnswerGround {
+function citationGround(store: Store, project: string, citation: AnswerCitation, era: GroundsEra) {
+  if (era !== 'legacy') {
+    const selector = citation.selector;
+    check(selector.kind === 'json-pointer' && Object.keys(selector).every(key => ['kind', 'pointer'].includes(key))
+      || selector.kind === 'text-range' && Object.keys(selector).every(key => ['kind', 'start', 'end'].includes(key)),
+    'answer_unconfirmed', citation.source.id, 'selector', 'A citation must contain only its standard selector fields');
+  }
+  return historicalRead(store, { reader: 'D5.citation', project, ref: citation.source,
+    parameters: { selector: citation.selector, era } as unknown as Json }, () => {
+    const source = checkedSource(store, project, citation.source), value = source.value;
+    // Only saved bytes are projected into Evidence's standard selector. This is not current admission.
+    const historicalSource = { ...source, value: { ...value, origin: { kind: 'owner-document' as const, location: value.origin.location } } };
+    const view = new Proxy(store, { get(target, prop) {
+      if (prop === 'get') return (id: string, revision?: number) => id === source.id ? historicalSource : target.get(id, revision);
+      const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    let observation: Observation;
+    try { observation = new Evidence(view).observe(project, citation.source, citation.selector); }
+    catch (error) {
+      if (error instanceof EngineError && ['selector_invalid', 'evidence_missing', 'evidence_input_invalid'].includes(error.code))
+        fail('answer_unconfirmed', source.id, 'selector', 'The citation does not resolve against its saved source');
+      throw error;
+    }
+    const ground: AnswerGround = { observation, state: value.sha256,
+      proofLimit: value.origin.kind === 'file' ? 'repository-observation'
+        : era === 'legacy' ? 'quoted-intent-requires-attribution' : 'reported-not-runtime-proof' };
+    return copy({ source, ground });
+  }, () => fail('answer_unconfirmed', citation.source.id, 'history', 'A citation has cyclic historical sources'));
+}
+function currentCitation(store: Store, source: Revision<Source>): void {
+  head(store, reference(source));
+  check(sourceIsCurrent(source.value), 'answer_inapplicable', source.id, 'source', 'The captured source no longer describes the current file');
+}
+function requireCitations(store: Store, value: unknown): asserts value is AnswerCitationsRequest {
+  requireStore(store);
+  if (!object(value) || !text(value.project) || !Array.isArray(value.citations) || value.citations.length === 0
+    || Object.keys(value).some(key => !['project', 'citations'].includes(key))
+    || !value.citations.every(item => object(item) && isRef(item.source) && object(item.selector)
+      && Object.keys(item).every(key => ['source', 'selector'].includes(key)))) requestInvalid('citations');
+}
+function answerCitations(store: Store, request: AnswerCitationsRequest, current: boolean) {
+  const selected = request.citations.map(citation => citationGround(store, request.project, citation, ANSWER_GROUNDS_ERA));
+  if (current) for (const item of selected) currentCitation(store, item.source);
+  const references = unique(selected.map(item => reference(item.source)));
+  return { grounds: sorted(selected.map(item => item.ground)), references, ...(current ? { guards: references } : {}) };
+}
+/** E3 uses the same exact historical evidence as D5, without implying assessment or acceptance. */
+export function readAnswerCitations(store: Store, request: AnswerCitationsRequest): OmResult<Sealed<{ grounds: AnswerGround[]; references: Ref[] }>> {
+  requireCitations(store, request); request = copy(request);
+  return result(() => answerCitations(store, request, false));
+}
+/** Fresh heads and files are checked separately on every preparation; the guards join the caller's transaction. */
+export function prepareAnswerCitations(store: Store, request: AnswerCitationsRequest): OmResult<Sealed<{ grounds: AnswerGround[]; references: Ref[]; guards: Ref[] }>> {
+  requireCitations(store, request); request = copy(request);
+  return result(() => {
+    const checked = answerCitations(store, request, true);
+    return { ...checked, guards: checked.guards! };
+  });
+}
+function checkedGround(store: Store, project: string, raw: Observation, current: boolean, era: GroundsEra): AnswerGround {
   check(object(raw) && raw.projectId === project && isRef(raw.source) && object(raw.selector) && Object.hasOwn(raw, 'value'),
     'answer_unconfirmed', project, 'observations', 'Each citation needs its exact source, selector and computed value');
-  const source = checkedSource(store, project, raw.source);
-  const value = source.value;
-  // Historical reads use the same Evidence selector against saved bytes, without consulting today's filesystem.
-  const historicalSource = { ...source, value: { ...value, origin: { kind: 'owner-document' as const, location: value.origin.location } } };
-  const view = new Proxy(store, { get(target, prop) {
-    if (prop === 'get') return (id: string, revision?: number) => id === source.id ? historicalSource : target.get(id, revision);
-    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
-  let observation: Observation;
-  try { observation = new Evidence(view).observe(project, raw.source, raw.selector); }
-  catch (error) {
-    if (error instanceof EngineError && ['selector_invalid', 'evidence_missing', 'evidence_input_invalid'].includes(error.code))
-      fail('answer_unconfirmed', source.id, 'selector', 'The citation does not resolve against its saved source');
-    throw error;
-  }
-  check(same(observation, raw), 'answer_unconfirmed', source.id, 'observation.value', 'Evidence value must be derived from the exact citation');
-  if (current) {
-    head(store, raw.source);
-    check(sourceIsCurrent(value), 'answer_inapplicable', source.id, 'source', 'The captured source no longer describes the current file');
-  }
-  return { observation, state: value.sha256, proofLimit: value.origin.kind === 'file' ? 'repository-observation' : 'quoted-intent-requires-attribution' };
+  const checked = citationGround(store, project, raw, era);
+  check(same(checked.ground.observation, raw), 'answer_unconfirmed', raw.source.id, 'observation.value', 'Evidence value must be derived from the exact citation');
+  if (current) currentCitation(store, checked.source);
+  return checked.ground;
 }
 function checkedSource(store: Store, project: string, ref: Ref): Revision<Source> {
   const source = exact<Source>(store, project, ref, 'source'), value = source.value;
@@ -462,7 +508,7 @@ function checkedSource(store: Store, project: string, ref: Ref): Revision<Source
   }
   return source;
 }
-function deriveAnswerHistory(store: Store, request: AnswerRequest) {
+function deriveAnswerHistory(store: Store, request: AnswerRequest, era: GroundsEra) {
   const q = loadMc1Question(store, { project: request.project, record: request.question });
   const context = q.context;
   const answer = exact<ResearchAnswer>(store, request.project, request.answer, 'research-answer');
@@ -490,29 +536,29 @@ function deriveAnswerHistory(store: Store, request: AnswerRequest) {
   check(validator.validateSchema(schema as object), 'answer_question_invalid', q.record.id, 'resultForm', 'The question must contain a valid result schema');
   const valid = validator.compile(schema as object)(answer.value.value);
   check(valid, 'answer_unconfirmed', answer.id, 'value', 'The fact value must match the saved result form');
-  const grounds = sorted(assessment.value.observations.map(raw => checkedGround(store, request.project, raw, false)));
+  const grounds = sorted(assessment.value.observations.map(raw => checkedGround(store, request.project, raw, false, era)));
   const attempt = attemptOf(store, request.project, context.gap, request.attempt, false);
   const value: AcceptedAnswerRecord = { project: request.project, request, target: context.gap.target, field: context.gap.field,
-    contract: q.record.value.request.contract as AnswerQuestionContract, fingerprint: q.record.value.fingerprint, value: answer.value.value, grounds };
+    contract: q.record.value.request.contract as AnswerQuestionContract, fingerprint: q.record.value.fingerprint, value: answer.value.value, grounds, ...(era === 'legacy' ? {} : { groundsEra: era }) };
   const references = unique([...q.references, request.answer, request.answeredQuestion, request.draft, answer.value.assessment,
     assessment.value.environment, ...grounds.map(item => item.observation.source), ...(attempt ? [attempt.series] : [])]);
   const guards = unique([...context.guards, request.question, request.answer, request.answeredQuestion, request.draft, answer.value.assessment,
     assessment.value.environment, ...grounds.map(item => item.observation.source), ...(attempt ? [attempt.series] : [])]);
   return { value, references, guards, question: q.record as Revision<Mc1QuestionRecord>, gap: context.gap, attempt };
 }
-function deriveAnswer(store: Store, request: AnswerRequest, current: boolean) {
+function deriveAnswer(store: Store, request: AnswerRequest, current: boolean, era: GroundsEra = ANSWER_GROUNDS_ERA) {
   const historical = historicalRead(store, { reader: 'D5.answer-sources', project: request.project, ref: request.answer,
-    parameters: request as unknown as Json }, () => copy(deriveAnswerHistory(store, request)),
+    parameters: { request, era } as unknown as Json }, () => copy(deriveAnswerHistory(store, request, era)),
   () => fail('answer_unconfirmed', request.answer.id, 'history', 'The accepted answer has cyclic historical sources'));
   if (!current) return historical;
   const question = loadMc1Question(store, { project: request.project, record: request.question });
   const context = currentQuestionContext(store, question.record.value.request, question.context);
   for (const guard of historical.guards) head(store, guard);
-  for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true);
+  for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, era);
   return { ...historical, guards: unique([...historical.guards, ...context.guards]) };
 }
 function predicted(value: AcceptedAnswerRecord): Revision<AcceptedAnswerRecord> {
-  return { id: `${acceptedAnswerNamespace(value.project)}${hashJson(value.request)}`, kind: ACCEPTED_ANSWER_KIND,
+  return { id: `${acceptedAnswerNamespace(value.project)}${hashJson(value.groundsEra === undefined ? value.request : { request: value.request, groundsEra: value.groundsEra })}`, kind: ACCEPTED_ANSWER_KIND,
     revision: 1, hash: hashJson(value), value };
 }
 function checkAcceptedRecord(store: Store, project: string, record: Revision<AcceptedAnswerRecord>): CheckedAnswer {
@@ -522,7 +568,9 @@ function checkAcceptedRecord(store: Store, project: string, record: Revision<Acc
   try { requireAnswer(record.value.request); }
   catch (error) { if (error instanceof EngineError && error.code === 'answer_request_invalid') fail('answer_record_invalid', record.id, 'request', 'The saved answer request is malformed'); throw error; }
   check(record.value.request.project === project, 'answer_record_invalid', record.id, 'project', 'The source request belongs to this project');
-  const derived = deriveAnswer(store, record.value.request, false);
+  check(!Object.hasOwn(record.value, 'groundsEra') || record.value.groundsEra === ANSWER_GROUNDS_ERA,
+    'answer_record_invalid', record.id, 'groundsEra', 'The saved evidence contract must name a supported era');
+  const derived = deriveAnswer(store, record.value.request, false, record.value.groundsEra ?? 'legacy');
   check(same(record, predicted(derived.value)), 'answer_record_invalid', record.id, 'content', 'Acceptance must be rederived from its exact saved sources');
   return copy({ record, question: derived.question, gap: derived.gap, attempt: derived.attempt,
     key: factResultKey({ project, target: record.value.target, field: record.value.field, contract: record.value.contract, value: record.value.value }),
@@ -981,7 +1029,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       if (checked.attempt) { head(store, checked.attempt.series); guards.push(checked.attempt.series); }
       if (!view.writes.length) guards.push(view.ref);
       else {
-        const acceptance = deriveAnswer(view.store, checked.record.value.request, false);
+        const acceptance = deriveAnswer(view.store, checked.record.value.request, false, checked.record.value.groundsEra ?? 'legacy');
         for (const guard of acceptance.guards) { head(store, guard); guards.push(guard); }
       }
     }

@@ -24,7 +24,7 @@ import type { OmResult, Refusal } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   preparePartResult, readPartResult, partResponseId, type PartResponseRecord,
-  normalizePartAnswer, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
+  normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, completeAttempt, type AttemptGoal } from '../src/om/series.js';
 import { recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
@@ -287,8 +287,11 @@ test('E2 does not disguise storage execution faults as a producer refusal', t =>
   assert.deepEqual(snapshot(f.store), before);
 });
 
-function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false) {
-  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer), tasks = ok(prepareQuestionTasks(f.store, f.request));
+function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
+  resultForm: Json = { type: 'string' }) {
+  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer);
+  for (const question of f.request.questions) question.resultForm = resultForm;
+  const tasks = ok(prepareQuestionTasks(f.store, f.request));
   const routes = ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps,
     tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: ['src/format.ts'], records: [] }, previous: null }));
   const batch = routes.value.batches.find(batch => batch.model === 'MC1'
@@ -591,12 +594,13 @@ function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<t
   const requestId = (record.value.packet as Record<string, Json>).requestId as string;
   assert.equal(typeof requestId, 'string');
   const responseForm = (record.value.packet as Record<string, any>).responseForm;
-  assert.equal(responseForm.protocol, 'omg-part/v1'); assert.equal(responseForm.requestId, requestId);
-  assert.deepEqual([...responseForm.proposal.required].sort(), Object.keys(body).sort());
-  assert.equal(responseForm.proposal.additionalProperties, false);
+  assert.equal(responseForm.protocol, PACKET_ANSWER_PROTOCOL); assert.equal(responseForm.requestId, requestId);
+  const shape = responseForm.schema.oneOf[0].properties.proposal;
+  assert.deepEqual([...shape.required].sort(), Object.keys(body).sort());
+  assert.equal(shape.additionalProperties, false);
   const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(record), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: 'omg-part/v1', requestId, proposal: body }) } });
+      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body }) } });
   const request = { project: f.project, packet: reference(record), call: reference(call), response: reference(response) };
   const before = snapshot(f.store), prepared = ok(preparePartResult(f.store, request));
   assert.deepEqual(snapshot(f.store), before);
@@ -870,7 +874,7 @@ test('E2 part-result admission rejects a foreign purpose, another declared attem
   const requestId = nextPayload.requestId as string;
   const mismatched = f.store.write<PartResponseRecord>({ id: request.response.id, kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(nextPacket.record), call: reference(unanswered), requestId,
-      raw: JSON.stringify({ protocol: 'omg-part/v1', requestId: 'not-the-sent-request', proposal: result.body }) } });
+      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: 'not-the-sent-request', action: 'answer', proposal: result.body }) } });
   rejected(preparePartResult(f.store, { ...request, response: reference(mismatched) }), 'part_result_invalid');
   for (const section of Object.keys(result.body)) {
     const missing = clone(result.body) as unknown as Record<string, unknown>; delete missing[section];
@@ -1032,11 +1036,12 @@ for (const model of ['MC1', 'MC2'] as const) {
     const value = clone(saved.record.value) as QuestionPacketRecord;
     value.request = request;
     const payload = value.packet as Record<string, Json>;
-    payload.requestId = hashJson(request);
-    if (model === 'MC2') (payload.responseForm as Record<string, Json>).requestId = hashJson(request);
+    const requestId = hashJson({ protocol: PACKET_ANSWER_PROTOCOL, request });
+    payload.requestId = requestId;
+    (payload.responseForm as Record<string, Json>).requestId = requestId;
     value.fingerprint = { hash: hashJson(payload), chars: canonical(payload).length, utf8Bytes: Buffer.byteLength(canonical(payload)) };
     value.fullChars = canonical(payload).length;
-    const forged = f.store.write({ id: `om-question-packet:${f.project}:${hashJson(request)}`,
+    const forged = f.store.write({ id: `om-question-packet:${f.project}:${requestId}`,
       kind: 'question-packet', expected: 0, value: value as unknown as Json });
     const partRequest = part ? { ...part.request, packet: reference(forged) } : null;
     const forgedPart = part && partRequest ? f.store.write({ id: `om-part-result:${f.project}:${hashJson(partRequest)}`,
@@ -1210,4 +1215,171 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
   store.close(); store = new Store(database);
   assert.ok(acceptedPacket);
   assert.equal(ok(readQuestionPacket(store, { project, record: acceptedPacket })).value.state, 'ready');
+});
+
+test('E2 declares every new content and control branch before dispatch and shares its exact reply parser', t => {
+  const p = expansionFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
+  const payload = packet.value.packet as Record<string, any>, before = snapshot(f.store);
+  assert.equal(packet.value.answerProtocol, PACKET_ANSWER_PROTOCOL);
+  assert.equal(payload.version, 'om-question-packet/v2');
+  const form = payload.responseForm;
+  assert.deepEqual(form.schema.oneOf.map((branch: any) => branch.properties.action.const),
+    ['answer', 'need_source', 'need_owner', 'cannot_answer', 'pause']);
+  assert.equal(packet.id, `om-question-packet:${f.project}:${hashJson({ protocol: PACKET_ANSWER_PROTOCOL, request: p.request })}`);
+  assert.equal(payload.requestId, hashJson({ protocol: PACKET_ANSWER_PROTOCOL, request: p.request }));
+  const questionIds = [payload.questions[0].id];
+  const controls = [
+    { action: 'need_source', questionIds, missing: 'Read the addressed source', reads: [
+      { action: 'read', path: 'src/format.ts', media: 'text/plain' },
+      { action: 'read_source', source: reference(f.store.get(`source:${f.project}:brief`)!), selector: { kind: 'text-range', start: 0, end: 1 } },
+      { action: 'read_context', record: reference(f.input), pointer: '/input/contracts/0' },
+      { action: 'search', within: 'src', query: 'format' },
+    ] },
+    { action: 'need_owner', questionIds, reason: 'The choice is not set', decision: 'Which encoding is required?' },
+    { action: 'cannot_answer', questionIds, reason: 'No evidence' },
+    { action: 'pause', questionIds, reason: 'Stop this attempt' },
+  ];
+  for (const answer of controls) {
+    const raw: string = JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...answer });
+    const actual = ok(readPacketAnswer(f.store, { project: f.project, packet: reference(packet), raw })).answer;
+    assert.deepEqual(actual, { ...answer, ...('reads' in answer
+      ? { reads: [...answer.reads!].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0) } : {}) });
+    rejected(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw }), 'part_answer_invalid');
+  }
+  for (const bad of [
+    { ...controls[0], questionIds: ['foreign-question'] },
+    { ...controls[0], questionIds: [] },
+    { ...controls[0], questionIds: [...questionIds, ...questionIds] },
+    { ...controls[0], missing: ' ' },
+    { ...controls[0], reads: [{ action: 'search', query: 'everything' }] },
+    { ...controls[0], reads: [{ action: 'shell', command: 'cat **/*' }] },
+    { ...controls[1], proposal: {} },
+    { ...controls[2], status: 'accepted' },
+    { ...controls[3], action: 'read_plan' },
+  ]) rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
+    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...bad }) }), 'part_answer_invalid');
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
+    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: 'foreign-request', ...controls[2] }) }), 'part_result_invalid');
+  assert.deepEqual(snapshot(f.store), before, 'Parsing and content derivation create no calls, records or series outcomes');
+});
+
+test('E2 counts the added response branches in capacity and never silently emits the former smaller form', t => {
+  const p = packetFixture(t), { f } = p, prepared = ok(prepareQuestionPacket(f.store, p.request));
+  const payload = clone(prepared.record.value.packet) as Record<string, any>;
+  const currentChars = canonical(payload).length;
+  const legacy = { ...payload, responseForm: { results: 'One result per question id', value: 'The question contract resultForm',
+    citations: 'Exact source reference and text-range or JSON-pointer selector' } };
+  assert.ok(canonical(legacy).length < currentChars - 1);
+  const environment = p.environment(currentChars - 1), before = snapshot(f.store);
+  const blocked = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(environment) }));
+  assert.equal(blocked.record.value.state, 'blocked');
+  assert.equal(blocked.record.value.refusal?.code, 'packet_too_large');
+  assert.ok(blocked.record.value.fullChars! > environment.value.requestCapacityChars!);
+  assert.deepEqual(blocked.record.value.native, []);
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('E2 common proposal derivation checks assignment without inventing response provenance', t => {
+  const p = expansionFixture(t), { f } = p, saved = ok(writeQuestionPacket(f.store, p.request));
+  const actual = partResult(p, saved), before = snapshot(f.store);
+  const request = { project: f.project, packet: reference(saved.record), raw: actual.response.value.raw };
+  const derived = ok(derivePartProposal(f.store, request));
+  assert.deepEqual(derived.proposal, actual.proposal.value);
+  assert.ok(!Object.hasOwn(derived, 'call') && !Object.hasOwn(derived, 'record'));
+  const parsed = JSON.parse(request.raw);
+  parsed.proposal.fills[0].obligation = 'foreign-obligation';
+  rejected(derivePartProposal(f.store, { ...request, raw: JSON.stringify(parsed) }), 'part_result_invalid');
+  const noCall = { id: 'call-record:garden:unissued', revision: 1, hash: '0'.repeat(64) };
+  const attempted = preparePartResult(f.store, { ...actual.request, call: noCall });
+  assert.equal(attempted.ok, false, 'Well-shaped content cannot substitute for the full admitted-call chain');
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('E2 preserves original packet and part-result history strictly in its old answer era after restart', t => {
+  const p = expansionFixture(t), { f } = p;
+  const modern = ok(writeQuestionPacket(f.store, p.request)).record;
+  const value = clone(modern.value) as QuestionPacketRecord;
+  delete value.answerProtocol;
+  const payload = value.packet as Record<string, Json>, requestId = hashJson(p.request);
+  payload.version = 'om-question-packet/v1'; payload.requestId = requestId;
+  payload.responseForm = { protocol: 'omg-part/v1', requestId, proposal: clone(PART_PROPOSAL_SCHEMA) as unknown as Json };
+  value.fullChars = canonical(payload).length;
+  value.fingerprint = { hash: hashJson(payload), chars: canonical(payload).length, utf8Bytes: Buffer.byteLength(canonical(payload)) };
+  const packet = f.store.write<QuestionPacketRecord>({ id: `om-question-packet:${f.project}:${requestId}`, kind: 'question-packet', expected: 0, value });
+  assert.notEqual(modern.id, packet.id);
+  assert.notEqual((modern.value.packet as Record<string, Json>).requestId, requestId);
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  const modernPart = partResult(p, ok(writeQuestionPacket(f.store, p.request)));
+  const raw = JSON.stringify({ protocol: 'omg-part/v1', requestId, proposal: modernPart.body });
+  const proposalValue = ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw })).proposal;
+  const prior = modernPart.call.value;
+  const admission = ok(recordCall(f.store, f.project, { call: requestId, purpose: prior.purpose, basis: prior.basis,
+    block: prior.block, gaps: clone(prior.gaps), series: prior.series, attempt: prior.attempt, goal: clone(prior.goal),
+    dispatch: clone(prior.dispatch), packet: payload })).call;
+  const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(admission)), kind: 'part-response', expected: 0,
+    value: { project: f.project, packet: reference(packet), call: reference(admission), requestId, raw } });
+  const request = { project: f.project, packet: reference(packet), call: reference(admission), response: reference(response) }, key = hashJson(request);
+  const proposal = f.store.write<LayerProposal>({ id: `om-proposal:${f.project}:part:${key}`, kind: 'layer-proposal', expected: 0,
+    value: proposalValue as LayerProposal });
+  const result = f.store.write({ id: `om-part-result:${f.project}:${key}`, kind: 'part-result', expected: 0,
+    value: { project: f.project, request, proposal: reference(proposal) } });
+  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(result) })).proposal, proposal);
+  f.restart();
+  const before = snapshot(f.store);
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(result) })).proposal, proposal);
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
+    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'pause',
+      questionIds: [(payload.questions as Record<string, Json>[])[0]!.id], reason: 'New control' }) }), 'part_result_invalid');
+  const changed = clone(value); changed.answerProtocol = PACKET_ANSWER_PROTOCOL;
+  const wrong = f.store.write({ id: `${packet.id}:changed-era`, kind: 'question-packet', expected: 0, value: changed as unknown as Json });
+  rejected(readQuestionPacket(f.store, { project: f.project, record: reference(wrong) }), 'packet_record_invalid');
+  assert.equal(snapshot(f.store).length, before.length + 1);
+});
+
+test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', t => {
+  const p = packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'array', items: { type: 'string' } }), { f } = p;
+  const packet = ok(writeQuestionPacket(f.store, p.request)).record, payload = packet.value.packet as Record<string, any>;
+  const source = reference(f.store.get(`source:${f.project}:brief`)!);
+  const a = { source, selector: { kind: 'text-range', start: 0, end: 1 } };
+  const b = { source, selector: { kind: 'text-range', start: 1, end: 2 } };
+  const rows = payload.questions.map((question: { id: string }) => ({ questionId: question.id,
+    value: ['second', 'first', 'second'], citations: [b, a, b] }));
+  const parse = (body: unknown) => ok(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
+    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...body as object }) })).answer;
+  const initial = parse({ action: 'answer', results: [rows[0], rows[1], rows[0]] });
+  const permuted = parse({ action: 'answer', results: [rows[1], rows[0], rows[0]].map(row => ({ ...row, citations: [...row.citations].reverse() })) });
+  assert.deepEqual(permuted, initial);
+  assert.ok(initial.action === 'answer' && 'results' in initial);
+  assert.equal(initial.results.length, 3, 'Repeated results are left for E3 coverage rejection');
+  for (const row of initial.results) {
+    assert.deepEqual(row.value, ['second', 'first', 'second']);
+    assert.ok('citations' in row);
+    assert.equal(row.citations.length, 3);
+    assert.equal(row.citations.filter(citation => canonical(citation) === canonical(b)).length, 2);
+  }
+  const questionIds = payload.questions.map((question: { id: string }) => question.id);
+  const read = { action: 'read', path: 'src/Second/First.ts', media: 'text/plain' };
+  const search = { action: 'search', within: 'src/Two', query: 'b a b' };
+  const request = { action: 'need_source', questionIds, missing: 'Need these addressed facts', reads: [search, read, search] };
+  const control = parse(request);
+  assert.deepEqual(parse({ ...request, questionIds: [...questionIds].reverse(), reads: [...request.reads].reverse() }), control);
+  assert.ok(control.action === 'need_source');
+  assert.equal(control.reads.length, 3);
+  assert.equal(control.reads.filter(item => canonical(item) === canonical(search)).length, 2);
+  assert.ok(control.reads.some(item => item.action === 'read' && item.path === read.path));
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify({
+    protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...request, questionIds: [questionIds[0], questionIds[0]] }) }), 'part_answer_invalid');
+});
+
+
+test('E2 answer schema selection refuses missing null and unknown runtime kinds', () => {
+  for (const kind of [undefined, null, 'unknown', 'toString']) {
+    assert.throws(() => packetAnswerSchema(kind as never), error => {
+      assert.ok(malformed(error));
+      assert.equal(((error as EngineError).details as { field: string }).field, 'answer.schema');
+      return true;
+    });
+  }
+  for (const kind of ['node', 'fact', 'field'] as const) assert.ok(packetAnswerSchema(kind));
 });
