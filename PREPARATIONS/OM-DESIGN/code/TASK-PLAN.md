@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 54. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → A6 → D7 → F1 → F2 → F3 → F4 → E2.1 → V2 → F5 → S1 → D8.0 → D8 → B1.1 → B3 → P1 → P2 → P3 → C1 → C5.1 → D6 → E5 → E6 → G1 → G2 → G3 → H1 → H2.
+Задач: 56. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → A6 → D7 → F1 → F2 → F3 → F4 → E2.1 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.2 → B1.1 → B3 → P1 → P2 → P3 → C1 → C5.1 → D6 → E5 → E6 → G1 → G2 → G3 → H1 → H2.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -281,7 +281,7 @@
 - Пишет записи: om-input новой эры (срок вопроса); gap со сроком из входа
 - Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/om/input.ts`, `src/om/gaps.ts`, `test/preparation.test.ts`, `test/om-input.test.ts`, `test/om-gaps.test.ts`, `test/om-addressing.test.ts`, `test/om-runtime-confirmation.test.ts`
 - Из движка как есть: collectGaps — уже передаёт явно заданный moment; applyInputDecisions D3 — клонирует вопрос целиком; D7 obligations, D8 подтверждение среды
-- После: D8, S1
+- После: D8, S1, D8.2
 - **Изменение движка:** объявленное изменение (№786): новый договор производителя стадии с явным сроком вопроса (preparation-contracts.ts, requirements.ts, product/engine.ts) с сохранением прежних схем и версии 3
 - Тесты сверх обязательных:
   - договор №786 (полный текст — ~/REPORTS/review/omg-code-d8_contract-786.md): источник срока — явное поле вопроса проверенного производителя стадии; новый договор производителя (preparation-contracts.ts: unknowns и remainingQuestions сейчас additionalProperties:false без moment) разрешает явный срок из согласованного набора моментов OM, прежние схемы сохраняются; loadInputStages проверяет ответ по точной схеме сохранённой эры; глобально менять срок environment-confirmation (GAP_DEFAULT_MOMENTS) нельзя; D7 и наблюдение среды срок не назначают; из текста вопроса или blocksCurrentStage срок не выводится
@@ -574,7 +574,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 13.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 15.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -812,11 +812,13 @@
 - Отдаёт: M9 · Передать компилятору; Журнал отказов ворот
 - Читает записи: запись обязательств OM; runtime-observation
 - Пишет записи: runtime-observation и source (действующие записи)
-- Разрешённые пути: `src/runtime/runtime-observation.ts`, `src/graph/runtime-evidence.ts`, `src/graph/obligation-readiness.ts`, `test/om-runtime-confirmation.test.ts`, `src/runtime/environment.ts`
+- Разрешённые пути: `src/runtime/runtime-observation.ts`, `src/graph/runtime-evidence.ts`, `src/graph/obligation-readiness.ts`, `test/om-runtime-confirmation.test.ts`, `src/runtime/environment.ts`, `src/execution/task-obligations.ts`, `src/execution/commit.ts`
 - Из движка как есть: observeRuntime, recoverRuntimeObservation — src/runtime/runtime-observation.ts; runtimeSupport — src/graph/runtime-evidence.ts:30 (вложенная проверка подлинности наблюдения; расширяется, а не обходится); D7
 - После: D7, D8.0
 - **Изменение движка:** объявленное изменение: запись обязательств OM признаётся объявляющей записью наблюдения среды — и при создании наблюдения, и во вложенной проверке его подлинности (runtimeSupport, вердикт №152-1)
 - Тесты сверх обязательных:
+  - договор №808 (разбиение; ~/REPORTS/review/omg-code-d8_contract-808.md): D8 круга 3 замыкает ВЕСЬ путь наблюдения и исполнения — захват reader-pilot/execution-root, admission/completion observeRuntime, runtimeSupport, confirmation, предикаты, taskStartProofs/taskResultProofs, commitIntent и восстановление; runner/recovery без правки, если только передают набор, но их передача обязана сохранять отрицательные охраны (регрессия); потеря внутри этого пути под обещание D8.1 запрещена; R3/pipeline/компилятор — D8.1, прежние research-потребители — D8.2; переходное ограничение: не переведённые потребители сохраняют прежнее поведение, новый канал не подмешивается в Ref и не стирается в переведённом пути
+  - тест базы ee3fd4c (№808-5): сохранённые записи, proofs, RuntimeObservation.context, MachinePlan.guards и хэши — буквально прежние; в текущих support/confirmation весь прежний DTO, включая положительные guards, — без изменений; отдельно — ровно названное новое поле с точным набором отрицательных охран (для фикстуры: reader-pilot и execution-root, без пропусков, дублей и посторонних адресов); не фильтровать isRef и не исключать guards целиком; после появления зависимости текущий допуск меняется, frozen и точный повтор сохраняются
   - договор №803 (после второго возврата №799; ~/REPORTS/review/omg-code-d8_contract-803.md): отсутствие reader-pilot и execution-root — отрицательные охраны D8.0 {id, absent: true}; сохраняемые inputs/proofs/references и RuntimeObservation.context остаются Ref[], полный набор TransactionGuard доходит до транзакции (канал guards/admissionGuards); isRef-фильтр в промежуточном потребителе запрещён; объединение охран не схлопывает противоречие отсутствие/ревизия; предикатный потребитель проверяет наличие и отсутствие общим механизмом; потребители передачи охран — по описи воркера (№801); тесты: штатное создание обеих зависимостей внутри проверки и после подготовки, отказ без частичных записей, frozen после их появления; покрытие №793 и трёх окон №799 сохранить
   - граница D8 (№786-5): D8 сдаётся с настоящим OM-путём task-start и общим договором подтверждения; доступность R3 (feasibility) и environment-confirmation на task-result в D8 проверенной НЕ объявляется — положительные регрессии этих моментов перенесены в B1.1 (до G1); в D8 для них — только отрицательные и формальные проверки без поддельного источника
   - договор №780 (полный текст — ~/REPORTS/review/omg-code-d8_contract-780.md): в эре OM request.obligation, RuntimeObservation.requestedFor и ObligationConfirmation.obligation — один и тот же taskBindingId(CarriedObligation) существующей функцией; выбор ровно одного назначения из полной ведомости readOmObligationLedger по точной scope; нет совпадения или неоднозначно — адресный отказ, без выбора первого и без поиска по gap.id (даже при одном назначении); эру устанавливает проверенный производитель D7, не префикс строки; research-scope — прежний адрес и байты; проверка связывает observation/source, точную scope, выбранное назначение и его runtimeCheck с условием возврата (равенства gap.id или текста проверки мало; подтверждение другого потребителя или другой ведомости не подходит даже при совпадении программ и условий); общий selector во всех путях — запуск, runtimeSupport, поиск и полнота confirmations, более позднее наблюдение, frozenObligationConfirmation; дубликаты и полнота OM — по адресам назначений; gap.id в RuntimeObservation не дублировать (выводится из scope + taskBindingId); текущий допуск сохраняет проверки среды, источников и охраны; история по сохранённым основаниям; поздний неуспех того же назначения не воскрешает старый успех, вызов другого назначения не гасит чужое подтверждение. Регрессия: один D7-пробел с двумя потребителями — разные taskBindingId, отдельные наблюдения и подтверждения, разные и одинаковые runtimeCheck; успех первого не закрывает второго; потеря/дублирование/подмена строки — отказ; поздний неуспех первого не подменяет второго; OM-запрос по голому gap.id — отказ; чужой scope/назначение; точный повтор; история после перезапуска; прежний research-путь — результаты и байты
@@ -826,6 +828,45 @@
   - наблюдение без объявления или объявленное чужой записью — отказ runtime_check_not_declared
   - условие возврата наблюдения не совпало с условием обязательства — это не подтверждение
   - прежняя эра research-scope — без изменений
+
+### D8.1 · Охраны отсутствия до R3, pipeline и компилятора
+
+**Цель.** Довести транзакционный канал отрицательных охран (D8.0, D8) от runtimeSupport до записей R3-готовности, стадий pipeline и компилятора с их мостами OM, чтобы допуск R3 и компиляции срывался при появлении зависимости контекста исполнения (договор №808-3).
+
+- Правила: `rules-general`, `rules-m8`
+- Единицы карты: G6 · Ворота реализуемости
+- Получает от: M8 · Проверить реализуемость горизонта
+- Отдаёт: M9 · Передать компилятору; Журнал отказов ворот
+- Читает записи: runtimeSupport/confirmation (канал отрицательных охран)
+- Пишет записи: refinement assess/milestone, стадии pipeline, compile/publish — транзакции с полным набором охран
+- Разрешённые пути: `src/graph/refinement.ts`, `src/pipeline/pipeline.ts`, `src/pipeline/contracts.ts`, `src/compiler/compiler.ts`, `src/om/input.ts`, `src/om/horizon.ts`, `src/om/frame-obligations.ts`, `test/runtime-absence-r3.test.ts`
+- Из движка как есть: TransactionGuard/AbsentGuard — src/storage/store.ts (D8.0); канал отрицательных охран runtimeSupport/confirmation (D8); GateResult.admissionGuards — src/pipeline/contracts.ts:23, Pipeline.draft/inspect/accept — src/pipeline/pipeline.ts; опись №804 — ~/REPORTS/review/omg-code-d8_absence-inventory-804.md
+- После: D8
+- **Изменение движка:** объявленное изменение: транзакционный канал отрицательных охран в R3, pipeline и компиляторе (договор №808-3)
+- Тесты сверх обязательных:
+  - договор №808 (~/REPORTS/review/omg-code-d8_contract-808.md): отрицательные охраны доходят до транзакции R3 (refinement.assess/#milestone), pipeline (канал admissionGuards) и компилятора (compile/publish), включая мосты OM input/horizon/frame-obligations; isRef-фильтр в промежуточном потребителе запрещён; объединение охран не схлопывает противоречие отсутствие/ревизия
+  - сохраняемые поля не получают отсутствия: pipeline proofs (checked.guards), Milestone/Feasibility.inputs, MachinePlan.guards/hash — буквально прежние; ОСМОТР СТЫКА оркестратором: одноимённое поле admissionGuards в src/om/model-call.ts — СОХРАНЯЕМЫЙ Ref[] записи обмена E4 (проверяется isRef) — это другой канал, отрицательные охраны туда не попадают
+  - регрессии: штатное создание reader-pilot и execution-root внутри проверки и после подготовки допуска R3 и компиляции — атомарный отказ без частичных записей; прежние наборы pipeline/compiler/refinement/obligation-readiness — без правки ожиданий
+  - положительный OM R3 по №786 по-прежнему в B1.1; здесь — общий путь и research-scope эры
+
+### D8.2 · Охраны отсутствия у прежних research-потребителей
+
+**Цель.** Довести канал отрицательных охран до прежних research-потребителей runtimeSupport — technicalResearchFindings → refinement.finishResearch/#milestone, research-assessment, assessment-session, discovery, — чтобы и их транзакции срывались при появлении зависимости контекста (договор №808-3; не выносить в будущий аудит).
+
+- Правила: `rules-general`, `rules-m8`
+- Единицы карты: G6 · Ворота реализуемости
+- Получает от: M8 · Проверить реализуемость горизонта
+- Отдаёт: M9 · Передать компилятору; Журнал отказов ворот
+- Читает записи: runtimeSupport/collectRuntimeEvidence (канал отрицательных охран)
+- Пишет записи: research-assessment, assessment-session, discovery researched/answer, refinement finishResearch/milestone — транзакции с полным набором охран
+- Разрешённые пути: `src/graph/research-evidence.ts`, `src/discovery/research-assessment.ts`, `src/discovery/assessment-session.ts`, `src/discovery/discovery.ts`, `src/graph/refinement.ts`, `test/runtime-absence-research.test.ts`
+- Из движка как есть: TransactionGuard/AbsentGuard — src/storage/store.ts (D8.0); канал отрицательных охран (D8, D8.1); опись №804 — ~/REPORTS/review/omg-code-d8_absence-inventory-804.md
+- После: D8.1
+- **Изменение движка:** объявленное изменение: транзакционный канал отрицательных охран у прежних research-потребителей (договор №808-3)
+- Тесты сверх обязательных:
+  - договор №808-3: путь technicalResearchFindings → refinement.finishResearch/#milestone завершается транзакцией с полными охранами (refinement разрешён повторно после D8.1); research-assessment, assessment-session, discovery.researched/#answer — тоже
+  - сохраняемые assessment/session proofs и frozen — прежние точные ссылки; отсутствие не сохраняется как Ref
+  - регрессии: штатное создание reader-pilot и execution-root внутри проверки и после подготовки каждого research-писателя — атомарный отказ без частичных записей; прежние research-наборы — без правки ожиданий
 
 ### V1 · Единый источник технической вместимости запроса
 
