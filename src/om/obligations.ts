@@ -9,8 +9,8 @@ import type { Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readGapLines, type GapLinesRecord } from './gap-lines.js';
-import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
-import { withHistoricalReads } from './input.js';
+import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords, type GapRecord } from './gaps.js';
+import { historicalRead, withHistoricalReads } from './input.js';
 import { readFrameBasis } from './frame-obligations.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
@@ -18,6 +18,8 @@ import { readRecord, writeGuarded } from './refs.js';
 export const OM_OBLIGATION_CONTRACT = 'om-obligations/v1';
 export const OM_OWNER_ASSIGNMENT_CONTRACT = 'om-owner-gap-assignment/v1';
 export const OM_OWNER_ASSIGNMENT_KIND = 'om-owner-gap-assignment';
+export const OM_OBLIGATION_TRANSFER_CONTRACT = 'om-obligation-transfer/v1';
+export const OM_OBLIGATION_TRANSFER_KIND = 'om-obligation-transfer';
 export const OM_OBLIGATION_CODES = Object.freeze([
   'obligation_request_invalid', 'obligation_record_invalid', 'obligation_basis_missing',
   'obligation_ledger_missing', 'obligation_era_conflict', 'obligation_context_mismatch',
@@ -32,6 +34,18 @@ export interface OwnerGapAssignment {
   assignments: { responsibleNode: string; responsibleConsumer: string; reason: string; returnCondition: string;
     wake: CarriedObligation['wake']; runtimeCheck?: RuntimeCheck }[];
 }
+export interface ObligationTransferRequest {
+  project: string; from: { producer: Ref; ledger: Ref; assignment: Ref };
+  context: { gaps: GapReadRequest; lines: Ref }; gap: Ref;
+}
+export interface ObligationTransferRecord extends ObligationTransferRequest {
+  contract: typeof OM_OBLIGATION_TRANSFER_CONTRACT; owner: Ref; assignments: OwnerGapAssignment['assignments'];
+}
+export interface ObligationTransfer {
+  record: Revision<ObligationTransferRecord>; owner: Ref; assignments: OwnerGapAssignment['assignments']; inputs: Ref[];
+}
+export interface PreparedObligationTransfer extends ObligationTransfer { writes: Write[]; guards: Ref[] }
+type AssignmentRecord = Revision<OwnerGapAssignment> | Revision<ObligationTransferRecord>;
 export interface OmObligationRecord {
   contract: typeof OM_OBLIGATION_CONTRACT; project: string; request: ObligationRequest;
   assignments: Omit<CarriedObligation, 'scope'>[];
@@ -179,7 +193,7 @@ function ownerRecord(store: Store, project: string, ref: Ref): Revision<OwnerGap
     ownerInvalid(ref.id, 'record', 'The immutable H2 command must retain its exact canonical contents and project');
   return record as Revision<OwnerGapAssignment>;
 }
-function projectAssignment(store: Store, basis: Context, record: Revision<OwnerGapAssignment>) {
+function projectAssignment(store: Store, basis: Context, record: AssignmentRecord) {
   const value = record.value, expectedContext = { gaps: basis.request.gaps, lines: basis.request.lines };
   if (!same(value.context, expectedContext)) ownerInvalid(record.id, 'context', 'An assignment belongs to the exact full D1 and line context');
   const source = basis.gaps.records.find(row => same(reference(row), value.gap));
@@ -231,12 +245,129 @@ export function readOwnerGapAssignment(store: Store, request: { project: string;
     return { record, ...verified, inputs: unique([...basis.inputs, ...verified.inputs]) };
   });
 }
+function transferNamespace(project: string): string { return `${OM_OBLIGATION_TRANSFER_KIND}:${project}:`; }
+function transferRow(value: ObligationTransferRecord): Revision<ObligationTransferRecord> {
+  const hash = hashJson(value);
+  return { id: `${transferNamespace(value.project)}${hash}`, kind: OM_OBLIGATION_TRANSFER_KIND, revision: 1, hash, value };
+}
+function requireTransfer(request: ObligationTransferRequest): void {
+  if (!object(request) || !keys(request, ['project', 'from', 'context', 'gap']) || !text(request.project)
+    || !object(request.from) || !keys(request.from, ['producer', 'ledger', 'assignment'])
+    || ![request.from.producer, request.from.ledger, request.from.assignment, request.gap].every(isRef)
+    || !object(request.context) || !keys(request.context, ['gaps', 'lines'])) invalid('transfer');
+  requireContext({ project: request.project, ...request.context });
+  const sources = request.context.gaps.sources;
+  if (!text(sources.project) || ![sources.input, sources.graph, sources.horizon].every(isRef)) invalid('transfer.sources');
+  for (const [name, level] of [['operations', 2], ['works', 3]] as const) {
+    const source = sources[name];
+    if (name === 'works' && object(source) && Object.hasOwn(source, 'state')) {
+      if (source.state !== 'upper-not-accepted' || !isRef(source.layer)) invalid('transfer.sources.works');
+      continue;
+    }
+    if (!object(source) || !Array.isArray(source.proposals) || !source.proposals.every(isRef) || !object(source.frame)) invalid('transfer.sources.frame');
+    const frame = source.frame;
+    if (!text(frame.project) || frame.level !== level || ![frame.graph, frame.horizon].every(isRef)
+      || (frame.frame !== null && !isRef(frame.frame)) || (frame.layer !== null && !isRef(frame.layer))
+      || (level === 2 ? frame.upper !== null : !object(frame.upper) || !isRef(frame.upper.horizon)
+        || (frame.upper.frame !== null && !isRef(frame.upper.frame)))) invalid('transfer.sources.frame');
+  }
+}
+function assignmentRecord(store: Store, project: string, ref: Ref): { record: AssignmentRecord; inputs: Ref[]; owner: Ref } {
+  if (ref.id.startsWith(transferNamespace(project))) {
+    const transfer = loadTransfer(store, project, ref);
+    return { record: transfer.record, inputs: transfer.inputs, owner: transfer.owner };
+  }
+  const record = ownerRecord(store, project, ref);
+  return { record, inputs: [reference(record)], owner: reference(record) };
+}
+function deriveTransfer(store: Store, request: ObligationTransferRequest): ObligationTransfer {
+  const previous = load(store, request.project, request.from.producer);
+  if (!same(reference(previous.record), request.from.ledger)
+    || !previous.producer.value.request.assignments.some(item => 'record' in item && same(item.record, request.from.assignment)))
+    ownerInvalid(request.from.assignment.id, 'from', 'The source assignment must belong to the exact complete prior OM ledger');
+  const original = assignmentRecord(store, request.project, request.from.assignment);
+  const basis = context(store, { project: request.project, ...request.context, assignments: [] });
+  const oldSources = previous.producer.value.request.gaps.sources, nextSources = basis.request.gaps.sources;
+  if ('state' in oldSources.works || 'state' in nextSources.works
+    || !same({ ...oldSources, works: { ...oldSources.works, proposals: [] } },
+      { ...nextSources, works: { ...nextSources.works, proposals: [] } }))
+    ownerInvalid(request.from.assignment.id, 'context', 'F5 transfer changes only the checked work proposals of the same exact input, graph, horizon and frames');
+  const oldGap = take(readRecord<GapRecord>(store, original.record.value.gap,
+    { unit: 'D7', target: request.from.assignment.id, idPrefix: `om-gap:${request.project}:`, kind: 'gap' }));
+  const nextGap = basis.gaps.records.find(record => same(reference(record), request.gap));
+  if (!nextGap || nextGap.value.gap.moment === 'om-pass' || !same(oldGap.value.gap, nextGap.value.gap))
+    ownerInvalid(request.gap.id, 'gap', 'A transfer preserves the entire proved late gap, including its evidence, consumers and deferral');
+  const value: ObligationTransferRecord = { contract: OM_OBLIGATION_TRANSFER_CONTRACT, project: request.project,
+    from: request.from, context: { gaps: basis.request.gaps, lines: basis.request.lines }, gap: reference(nextGap),
+    owner: original.owner, assignments: original.record.value.assignments };
+  const record = transferRow(value), projected = projectAssignment(store, basis, record);
+  return { record, owner: original.owner, assignments: value.assignments,
+    inputs: unique([...previous.inputs, ...original.inputs, ...basis.inputs, ...projected.inputs,
+      request.from.producer, request.from.ledger, request.from.assignment, original.owner]) };
+}
+function loadTransfer(store: Store, project: string, ref: Ref): ObligationTransfer {
+  return historicalRead(store, { reader: 'D7.obligation-transfer', project, ref }, () => {
+    const record = take(readRecord<ObligationTransferRecord>(store, ref,
+      { unit: 'D7', target: ref.id, idPrefix: transferNamespace(project), kind: OM_OBLIGATION_TRANSFER_KIND }));
+    const value = record.value;
+    if (!object(value) || !keys(value, ['contract', 'project', 'from', 'context', 'gap', 'owner', 'assignments'])
+      || value.contract !== OM_OBLIGATION_TRANSFER_CONTRACT || value.project !== project || !isRef(value.owner)
+      || !Array.isArray(value.assignments) || !value.assignments.every(object))
+      ownerInvalid(ref.id, 'transfer', 'A saved transfer needs its explicit contract and complete derived owner assignment');
+    const request = { project: value.project, from: value.from, context: value.context, gap: value.gap } as ObligationTransferRequest;
+    try { requireTransfer(request); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'obligation_request_invalid')
+        ownerInvalid(ref.id, 'transfer', 'The saved transfer must retain every exact source and target reference');
+      throw error;
+    }
+    const derived = deriveTransfer(store, request);
+    if (!same(record, derived.record)) ownerInvalid(ref.id, 'transfer', 'The transfer is derived from original H2 authority, not from caller-supplied replacement fields');
+    return sealed(derived) as ObligationTransfer;
+  }, () => ownerInvalid(ref.id, 'transfer', 'Obligation transfer history contains a cycle'));
+}
+/** F5 records a derived transfer; only the original H2 command grants the assignment. */
+export function readObligationTransfer(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ObligationTransfer>> {
+  requireStore(store);
+  if (!object(request) || !keys(request, ['project', 'record']) || !text(request.project) || !isRef(request.record)) invalid('transfer-read');
+  return result(() => loadTransfer(store, request.project, request.record));
+}
+const authorityRef = (project: string, ref: Ref): boolean => [ownerNamespace(project), transferNamespace(project),
+  namespace(project, true), namespace(project, false), `source:${project}:`].some(prefix => ref.id.startsWith(prefix));
+function currentAuthority(store: Store, inputs: Ref[], writes: Write[]): Ref[] {
+  const guards: Ref[] = [];
+  for (const ref of inputs) {
+    if (writes.some(write => write.id === ref.id)) continue;
+    const current = store.get(ref.id);
+    if (!current || !same(reference(current), ref)) fail('input_stale', ref.id, 'assignment', 'New handoff admission uses current assignment authorities and source snapshots');
+    guards.push(ref);
+  }
+  return guards;
+}
+export function prepareObligationTransfer(store: Store, request: ObligationTransferRequest): OmResult<Sealed<PreparedObligationTransfer>> {
+  requireStore(store); requireTransfer(request); request = sealed(request) as ObligationTransferRequest;
+  return result(() => {
+    const derived = deriveTransfer(store, request), fresh = take(prepareCurrentGaps(store, derived.record.value.context.gaps));
+    const lines = store.get(request.context.lines.id);
+    if (!lines || !same(reference(lines), request.context.lines))
+      fail('input_stale', request.context.lines.id, 'lines', 'A new assignment transfer uses the current target line history');
+    const existing = store.get(derived.record.id), writes: Write[] = [];
+    if (existing) {
+      if (!same(existing, derived.record)) ownerInvalid(existing.id, 'transfer', 'The exact transfer address is already occupied');
+    } else writes.push({ id: derived.record.id, kind: derived.record.kind, expected: 0, value: derived.record.value });
+    const guards = unique([...fresh.guards, request.context.lines,
+      ...currentAuthority(store, derived.inputs.filter(ref => authorityRef(request.project, ref)), writes)]);
+    return { ...derived, writes, guards };
+  });
+}
 /** The same projection checks H2 authority during preparation and historical consumption. */
 function assignments(store: Store, basis: Context): OmObligationRecord['assignments'] {
   const late = basis.gaps.collection.gaps.filter(gap => gap.moment !== 'om-pass');
   const records = basis.request.assignments.map(item => {
     if (!('record' in item)) invalid('saved.assignments');
-    return ownerRecord(store, basis.request.project, item.record);
+    const checked = assignmentRecord(store, basis.request.project, item.record);
+    basis.inputs.push(...checked.inputs);
+    return checked.record;
   });
   if (!distinct(records.map(record => record.value.gap))) ownerInvalid(basis.request.project, 'assignments', 'A gap has exactly one complete owner assignment');
   const projected = records.flatMap(record => {
@@ -254,13 +385,25 @@ function derive(store: Store, basis: Context): OmObligations {
     request: basis.request, ledger: reference(record) }, true);
   return { record, producer, handoff: { era: OM_OBLIGATION_CONTRACT, producer: reference(producer), scope: reference(record),
     obligations: record.value.assignments.map(assignment => ({ ...assignment, scope: reference(record) })) },
-  inputs: unique([...basis.inputs, reference(record), reference(producer)]) };
+  inputs: handoffInputs(basis.request.project, basis.inputs, record, producer) };
+}
+function handoffInputs(project: string, inputs: readonly Ref[], record: Revision<OmObligationRecord>, producer: Revision<OmObligationProducer>): Ref[] {
+  // Prior producer/ledger pairs prove transfer authority; they are not additional
+  // handoffs for the new consumer. The transfer retains them, and preparation
+  // guards the complete internal basis, while public inputs select this one era.
+  return unique([...inputs.filter(ref => !ref.id.startsWith(namespace(project, true))
+    && !ref.id.startsWith(namespace(project, false))), reference(record), reference(producer)]);
 }
 function checked(found: Revision<unknown> | Sealed<Revision<unknown>>, expected: Revision<unknown>): void {
   if (!same(found, expected)) fail('obligation_record_invalid', found.id, 'record',
     'The immutable obligation record must be derived from its complete exact sources');
 }
 function load(store: Store, project: string, ref: Ref): OmObligations {
+  return historicalRead(store, { reader: 'D7.obligations', project, ref },
+    () => sealed(loadRecord(store, project, ref)) as OmObligations,
+    () => ownerInvalid(ref.id, 'history', 'The obligation producer history contains a cycle'));
+}
+function loadRecord(store: Store, project: string, ref: Ref): OmObligations {
   const producer = take(readRecord<OmObligationProducer>(store, ref,
     { unit: 'D7', target: ref.id, idPrefix: namespace(project, true), kind: 'om-obligation-basis' }));
   const value = producer.value;
@@ -311,12 +454,12 @@ export function prepareOmObligations(store: Store, request: ObligationRequest): 
   requireStore(store); requireRequest(request);
   request = sealed(request) as ObligationRequest;
   return result(() => {
-    const pending = new Map<string, Revision<OwnerGapAssignment>>(), writes: Write[] = [];
+    const pending = new Map<string, AssignmentRecord>(), writes: Write[] = [];
     const normalized = { ...request, assignments: request.assignments.map(item => {
       if ('record' in item) return item;
       const write = item.pending;
-      // Pending writes are H2 commands too, not an alternate authority or parser.
-      const record = { id: write.id, kind: write.kind, revision: 1, hash: hashJson(write.value), value: write.value } as Revision<OwnerGapAssignment>;
+      // A pending authority follows the same exact H2 or derived-transfer reader.
+      const record = { id: write.id, kind: write.kind, revision: 1, hash: hashJson(write.value), value: write.value } as AssignmentRecord;
       if (pending.has(write.id)) ownerInvalid(write.id, 'pending', 'The transaction cannot contain ambiguous owner commands');
       pending.set(write.id, record);
       const existing = store.get(write.id);
@@ -340,18 +483,14 @@ export function prepareOmObligations(store: Store, request: ObligationRequest): 
     if (!currentLines || !same(reference(currentLines), request.lines))
       fail('input_stale', request.lines.id, 'lines', 'New handoff admission uses current line history');
     const guards = [...fresh.guards, request.lines];
-    for (const ref of basis.inputs.filter(ref => ref.id.startsWith(ownerNamespace(request.project)) || ref.id.startsWith(`source:${request.project}:`))) {
-      if (writes.some(write => write.id === ref.id)) continue;
-      const current = store.get(ref.id);
-      if (!current || !same(reference(current), ref)) fail('input_stale', ref.id, 'assignment', 'New handoff admission uses the current owner assignment and source snapshots');
-      guards.push(ref);
-    }
+    guards.push(...currentAuthority(store, basis.inputs.filter(ref => authorityRef(request.project, ref)), writes));
     for (const expected of [derived.record, derived.producer]) {
       const existing = store.get(expected.id);
       if (existing) { checked(existing, expected); guards.push(reference(existing)); }
       else writes.push({ id: expected.id, kind: expected.kind, expected: 0, value: expected.value });
     }
-    return { ...derived, writes, guards: unique(guards), inputs: unique([...derived.inputs, ...fresh.references, ...fresh.guards]) };
+    return { ...derived, writes, guards: unique(guards), inputs: handoffInputs(request.project,
+      [...derived.inputs, ...fresh.references, ...fresh.guards], derived.record, derived.producer) };
   });
 }
 export function writeOmObligations(store: Store, request: ObligationRequest): OmResult<Sealed<PreparedOmObligations>> {

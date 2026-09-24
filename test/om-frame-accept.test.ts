@@ -1,32 +1,71 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { reference, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { Store } from '../src/storage/store.js';
+import { Store, type Revision } from '../src/storage/store.js';
+import { git } from '../src/runtime/environment.js';
 import { writeOmInput } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { fillObligations, prepareFrame, readFrame, type ConnectionFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { WORKS_FRAME_CONTRACT, flowKey, workAnchorId, fillObligations, prepareFrame, readFrame, type ConnectionFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import { prepareFrameProposals, readFrameProposals, type LayerProposal, type ProposalRequest } from '../src/om/frame-proposals.js';
 import { prepareCandidate, writeCandidate } from '../src/om/frame-candidate.js';
-import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal } from '../src/om/frame-accept.js';
+import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, readRejectedCandidate, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal } from '../src/om/frame-accept.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { gardenGraph, createOmFixture } from './om-fixture.js';
 import { prepareRebaseFrame, rebaseFrame } from '../src/om/frame-accept.js';
 import { buildRebasedLayer, readRebaseBasis, readLayerAcceptance, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
-import { preparedFeatures } from './product-fixture.js';
+import { preparedFeatures, refinedLayers } from './product-fixture.js';
+import { writeAddressing, inputDecisionWrite, type InputDecisionProposal } from '../src/om/addressing.js';
+import { writeGapLines } from '../src/om/gap-lines.js';
+import { writeOmObligations } from '../src/om/obligations.js';
+import { writeNeighbors } from '../src/om/neighbors.js';
+import { writeAtomicGate } from '../src/om/atomic-gate.js';
+import { readResultIdentity } from '../src/om/result-identity.js';
 
-async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port') {
-  const f = await createOmFixture(t), store = f.store;
+function markedNativeFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-marked-rebase-')), database = join(root, 'state.sqlite'), workspace = join(root, 'workspace');
+  let store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  mkdirSync(workspace);
+  writeFileSync(join(workspace, 'README.md'), 'A deterministic garden product fixture.\n');
+  git(workspace, ['init', '-b', 'main']);
+  git(workspace, ['add', 'README.md']);
+  git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture baseline']);
+  const graph = gardenGraph(), flow = graph.connectors.find(item => item.id === 'garden-flow')!;
+  const sleeping = flow.bindings.find(item => item.level === 3 && item.anchor !== null)!;
+  const anchor = graph.anchors.find(item => item.id === sleeping.anchor)!;
+  anchor.id = workAnchorId(flow.id, flowKey(flow.bindings.find(item => item.level === 2)!), sleeping.producer);
+  sleeping.anchor = anchor.id;
+  const engine = new ProductEngine(store);
+  preparedFeatures(engine, 'garden', graph);
+  const command = { executable: process.execPath, args: ['--version'] };
+  engine.environments.configure('garden', { workspace,
+    implementer: { actor: 'fixture-implementer', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'fixture-reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 10_000 }, 0);
+  refinedLayers(engine, 'garden');
+  const graphRevision = store.get<Graph>('graph:garden')!;
+  return { root, graph: graphRevision.value, graphRevision,
+    layers: { 2: store.get<LayerBasis>('graph-layer:garden:2')!, 3: store.get<LayerBasis>('graph-layer:garden:3')! },
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, store.get<StageArtifact>(`stage:garden:${stage}`)!])) as Record<UpstreamStage, Revision<StageArtifact>>,
+    get store() { return store; }, reopen() { store.close(); store = new Store(database); } };
+}
+
+async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port', marked = false) {
+  const f = marked ? markedNativeFixture(t) : await createOmFixture(t), store = f.store;
   const input = ok(writeOmInput(store, { project: 'garden', expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
   const choice = { choiceVersion: 'rebase-test', features: [{ outcome: 'garden-result' }], excluded: [] };
@@ -39,6 +78,21 @@ async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port'
   const original = ok(readFrame(store, from));
   const oldFrame: ConnectionFrame = { project: 'garden', level: 3, candidateHash: hashJson(f.graph),
     layerHash: hashJson(projectGraph(f.graph, 3)), fills: structuredClone(original.result.fills) as ConnectionFrame['fills'] };
+  if (marked) {
+    oldFrame.worksContract = WORKS_FRAME_CONTRACT;
+    for (const fill of oldFrame.fills) {
+      const node = f.graph.nodes.find(item => item.id === fill.node)!;
+      if (node.id === 'w-garden-later-operation' || node.id === 'w-garden-refusal-operation') {
+        assert.equal(node.code.length, 0); assert.ok(!f.graph.horizon.includes(node.id));
+        fill.source = 'identity'; fill.basis = original.upperRef;
+      } else if (fill.port !== undefined) {
+        const endpoint = f.graph.connectors.flatMap(item => item.bindings.filter(binding => binding.level === 3))
+          .flatMap(binding => [binding.producer, ...binding.consumers]).find(end => end.node === fill.node && end.port === fill.port)!;
+        assert.ok(endpoint.codeRef); fill.codeRef = structuredClone(endpoint.codeRef);
+      }
+    }
+    oldFrame.fills.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  }
   from.frame = reference(store.write({ id: 'om-frame:garden:3', kind: 'connection-frame', expected: 0, value: oldFrame }));
   const before = ok(readFrame(store, operations)), connector = structuredClone(f.graph.connectors.find(item => item.id === 'garden-prep-flow')!);
   const binding = connector.bindings.find(item => item.level === 2)!, node = structuredClone(f.graph.nodes.find(item => item.id === binding.producer.node)!);
@@ -133,6 +187,33 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
   const after = snapshot(f.f.store), repeated = ok(rebaseFrame(f.f.store, f.request));
   assert.equal(repeated.state, 'unchanged'); assert.deepEqual(repeated.frame, moved.frame);
   assert.deepEqual(snapshot(f.f.store), after);
+});
+
+test('C5 rebase preserves the explicit works contract and every carried or retired code address after restart', async t => {
+  const f = await rebaseFixture(t, 'port', true), before = snapshot(f.store);
+  const prepared = ok(prepareRebaseFrame(f.store, f.request));
+  assert.deepEqual(snapshot(f.store), before);
+  const moved = ok(rebaseFrame(f.store, f.request));
+  assert.equal(moved.frame.value.worksContract, WORKS_FRAME_CONTRACT);
+  assert.ok(moved.carried > 0 && moved.retired > 0);
+  const key = (fill: ConnectionFrame['fills'][number]) => canonical([fill.obligation, fill.node, fill.port ?? null]);
+  const prior = new Map(f.oldFrame.fills.map(fill => [key(fill), fill]));
+  for (const fill of [...moved.frame.value.fills, ...moved.frame.value.retired]) {
+    assert.deepEqual(fill.codeRef, prior.get(key(fill))!.codeRef);
+    if (fill.port !== undefined && fill.source === 'accepted') assert.ok(fill.codeRef);
+    if (fill.source === 'identity') assert.ok(!Object.hasOwn(fill, 'codeRef'));
+  }
+  assert.equal(moved.carried + moved.retired, f.oldFrame.fills.length);
+  assert.deepEqual(prepared.result.frame, moved.frame);
+  const request = { project: 'garden', level: 3 as const, graph: f.to.graph, layer: reference(moved.layer) };
+  const historical = ok(readLayerAcceptance(f.store, request)), bytes = canonical(moved.frame);
+  for (const ref of [f.to.graph, f.to.horizon]) {
+    const head = f.store.get(ref.id)!; f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+  }
+  f.f.reopen();
+  assert.deepEqual(ok(readLayerAcceptance(f.f.store, request)), historical);
+  const replay = ok(rebaseFrame(f.f.store, f.request));
+  assert.equal(replay.state, 'unchanged'); assert.equal(canonical(replay.frame), bytes);
 });
 
 test('C5 rebase refuses graph edits outside acceptance and guards its entire transaction', async t => {
@@ -357,6 +438,49 @@ test('C5 does not trust foreign gate identities, future levels, claimed failure 
   assert.deepEqual(snapshot(f.store), before);
 });
 
+test('C5 requires a well-formed G5 basis without widening G3 or trusting a level label', t => {
+  const f = fixture(t), before = snapshot(f.store), basis = { id: 'om-atomic-gate:garden:unproven', revision: 1, hash: 'a'.repeat(64) };
+  for (const action of [prepareSettleCandidate, settleCandidate]) {
+    refusal(action(f.store, { ...f.request, outcome: { ...f.request.outcome, basis } }), 'gate_outcome_mismatch');
+    refusal(action(f.store, { ...f.request, level: 3, outcome: { ...f.request.outcome, gate: 'G5', basis } }), 'gate_outcome_mismatch');
+    for (const bad of [null, {}, { ...basis, revision: 0 }, { ...basis, hash: 'wrong' }])
+      assert.throws(() => action(f.store, { ...f.request, outcome: { ...f.request.outcome, basis: bad } } as SettleCandidateRequest),
+        (error: unknown) => error instanceof EngineError && error.code === 'frame_accept_request_invalid');
+  }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('the historical G5 rejection reader requires its complete failed outcome before reading sources', t => {
+  const f = fixture(t), before = snapshot(f.store), basis = { id: 'om-atomic-gate:garden:unproven', revision: 1, hash: 'a'.repeat(64) };
+  const request: SettleCandidateRequest = { ...f.request, level: 3,
+    outcome: { ...f.request.outcome, gate: 'G5', passed: false, codes: ['work_packet_over_capacity'], basis } };
+  const malformed = (error: unknown) => error instanceof EngineError && error.code === 'frame_accept_request_invalid';
+  for (const bad of [undefined, null, [], 0, 'request']) {
+    assert.throws(() => readRejectedCandidate(f.store, bad as unknown as SettleCandidateRequest), malformed);
+    assert.throws(() => readRejectedCandidate(bad as unknown as Store, request), malformed);
+  }
+  for (const field of ['project', 'level', 'candidate', 'outcome'] as const) {
+    const missing = structuredClone(request) as Partial<SettleCandidateRequest>; delete missing[field];
+    assert.throws(() => readRejectedCandidate(f.store, missing as SettleCandidateRequest), malformed);
+  }
+  for (const field of ['gate', 'candidate', 'graphHash', 'passed', 'codes'] as const) {
+    const missing = structuredClone(request);
+    delete (missing.outcome as Partial<SettleCandidateRequest['outcome']>)[field];
+    assert.throws(() => readRejectedCandidate(f.store, missing as SettleCandidateRequest), malformed);
+  }
+  const get = f.store.get.bind(f.store);
+  try {
+    f.store.get = (() => { throw new Error('Invalid outcome reached storage'); }) as Store['get'];
+    for (const altered of [f.request, { ...request, level: 2 as const },
+      { ...request, outcome: { ...request.outcome, gate: 'G3' as const } },
+      { ...request, outcome: { ...request.outcome, passed: true, codes: [] } },
+      { ...request, outcome: { gate: 'G5' as const, candidate: request.candidate, graphHash: request.outcome.graphHash,
+        passed: false, codes: request.outcome.codes } }])
+      refusal(readRejectedCandidate(f.store, altered), 'gate_outcome_mismatch');
+  } finally { f.store.get = get; }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
 test('C5 preserves addressed source failures and execution exceptions on both acceptance paths', t => {
   const f = fixture(t), before = snapshot(f.store);
   for (const candidate of [{ ...f.request.candidate, revision: f.request.candidate.revision + 100 },
@@ -576,4 +700,218 @@ test('C5 preserves unmarked rebase history and late replay in its saved era', as
     assert.equal(ok(readLayerAcceptance(store, accepted)).producer, 'om');
     assert.deepEqual(snapshot(store), before);
   }
+});
+
+async function producePreF5AcceptanceHistory() {
+  const { createOmFixture } = await import('./om-fixture.js');
+  const { canonical, hashJson } = await import('../src/canonical.js');
+  const { projectGraph } = await import('../src/graph/project.js');
+  const { reference } = await import('../src/pipeline/contracts.js');
+  const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
+  const { writeOmInput } = await import('../src/om/input.js');
+  const { writeHorizon } = await import('../src/om/horizon.js');
+  const { readFrame } = await import('../src/om/frame-obligations.js');
+  const { writeCandidate } = await import('../src/om/frame-candidate.js');
+  const { settleCandidate, readAcceptedFrame, rebaseFrame } = await import('../src/om/frame-accept.js');
+  const { readLayerAcceptance, readRebaseBasis } = await import('../src/om/layer-basis.js');
+  const { rmSync } = await import('node:fs');
+  const take = <T>(result: OmResult<T>): T => {
+    if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.message}`);
+    return result.value;
+  };
+  const f = await createOmFixture({ after() {} } as unknown as TestContext);
+  let complete = false;
+  try {
+    const store = f.store, project = f.project;
+    const input = take(writeOmInput(store, { project, expected: 0,
+      stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+    const choice = { choiceVersion: 'pre-f5-native', features: [{ outcome: 'garden-result' }], excluded: [] };
+    const horizon = take(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
+      refinement: reference(store.get('phase:garden:L2')!), choice, available: {} }));
+    const operations: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), layer: reference(f.layers[2]),
+      horizon: reference(horizon.gate), frame: null, upper: null };
+    const researchFrame: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]),
+      upper: { horizon: reference(horizon.gate), frame: null } };
+    const research = { project, level: 3 as const, graph: reference(f.graphRevision), layer: reference(f.layers[3]) };
+    const researchBytes = canonical(take(readLayerAcceptance(store, research))), mapped = take(readFrame(store, researchFrame));
+    const researchFrameBytes = canonical(mapped);
+    const oldFrame = store.write({ id: `om-frame:${project}:3`, kind: 'connection-frame', expected: 0, value: {
+      project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(projectGraph(f.graph, 3)), fills: mapped.result.fills,
+    } });
+    const from = { ...researchFrame, frame: reference(oldFrame) };
+    const written = take(writeCandidate(store, { frame: operations, proposals: [] }));
+    if (written.state !== 'candidate') throw new Error('The old native frame did not yield its operation candidate');
+    const candidate = reference(written.record);
+    const settled = take(settleCandidate(store, { project, level: 2, candidate,
+      outcome: { gate: 'G3', candidate, graphHash: written.record.value.graphHash, passed: true, codes: [] } }));
+    if (!settled.graph || !settled.layer || !settled.frame) throw new Error('The old G3 did not accept its candidate');
+    const accepted = { project, level: 2 as const, graph: reference(settled.graph), layer: reference(settled.layer), frame: reference(settled.frame) };
+    const acceptedBytes = canonical(take(readAcceptedFrame(store, accepted)));
+    const next = take(writeHorizon(store, { project, input: reference(input), graph: accepted.graph, refinement: accepted.layer,
+      choice: { ...choice, choiceVersion: 'pre-f5-rebase' }, available: {} }));
+    const to: FrameRequest = { project, level: 3, graph: accepted.graph, horizon: reference(next.gate), layer: null,
+      frame: null, upper: { horizon: reference(next.gate), frame: accepted.frame } };
+    const request = { from, to }, moved = take(rebaseFrame(store, request));
+    const rebased = { project, level: 3 as const, graph: to.graph, layer: reference(moved.layer) };
+    const rebasedBytes = canonical(take(readLayerAcceptance(store, rebased)));
+    const rebaseBasisBytes = canonical(take(readRebaseBasis(store, moved.frame.value.rebase as { from: FrameRequest; to: FrameRequest })));
+    const rows = [f.graphRevision, f.layers[3], oldFrame, settled.graph, settled.layer, settled.frame, moved.frame, moved.layer]
+      .map(row => ({ reference: reference(row), bytes: canonical(row) }));
+    for (const id of [`graph:${project}`, `source:${project}:brief`, `environment:${project}`]) {
+      const head = store.get(id)!; store.write({ id, kind: head.kind, expected: head.revision, value: head.value });
+    }
+    complete = true;
+    return { root: f.root, database: f.database, research, researchBytes, researchFrame, researchFrameBytes,
+      accepted, acceptedBytes, request, rebased, rebasedBytes, rebaseBasisBytes, frame: moved.frame, layer: moved.layer, rows };
+  } finally {
+    f.store.close();
+    if (!complete) rmSync(f.root, { recursive: true, force: true });
+  }
+}
+
+test('C5 and layer-basis preserve real 41fcb54 research L3 and rebase producer bytes after restart', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-c5-era-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(root, 'pre-f5-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', '41fcb54739d861d10b7d7324f77f5978db8d30d8:' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}
+`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const producer = producePreF5AcceptanceHistory.toString()
+    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
+    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
+  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})()));`],
+  { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
+  const history = JSON.parse(output) as Awaited<ReturnType<typeof producePreF5AcceptanceHistory>>;
+  t.after(() => rmSync(history.root, { recursive: true, force: true }));
+  assert.ok(!Object.hasOwn(history.frame.value, 'worksContract'));
+  for (let restart = 0; restart < 2; restart++) {
+    const store = new Store(history.database);
+    try {
+      const before = snapshot(store);
+      assert.equal(canonical(ok(readLayerAcceptance(store, history.research))), history.researchBytes);
+      assert.equal(canonical(ok(readFrame(store, history.researchFrame))), history.researchFrameBytes);
+      assert.equal(canonical(ok(readAcceptedFrame(store, history.accepted))), history.acceptedBytes);
+      assert.equal(canonical(ok(readLayerAcceptance(store, history.rebased))), history.rebasedBytes);
+      assert.equal(canonical(ok(readRebaseBasis(store, history.frame.value.rebase as { from: FrameRequest; to: FrameRequest }))), history.rebaseBasisBytes);
+      const replay = ok(rebaseFrame(store, history.request));
+      assert.equal(replay.state, 'unchanged');
+      assert.equal(canonical(replay.frame), canonical(history.frame));
+      assert.equal(canonical(replay.layer), canonical(history.layer));
+      for (const row of history.rows)
+        assert.equal(canonical(store.get(row.reference.id, row.reference.revision)), row.bytes);
+      assert.deepEqual(snapshot(store), before);
+    } finally { store.close(); }
+  }
+});
+
+test('G5 result identity traverses a proved rebase to native L3 fills without treating rebase as acceptance', t => {
+  const f = markedNativeFixture(t), project = 'garden', store = f.store, engine = new ProductEngine(store);
+  const initial = ok(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const decisions: InputDecisionProposal['decision'][] = [
+    { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] },
+    { target: 'garden-B1', field: 'state', value: { writer: 'garden-produce-block', authority: 'garden-consume-block', rollback: 'garden-consume-block' } },
+    { target: 'garden-R1#1', field: 'checkKind', value: 'test' },
+  ];
+  const input = ok(writeAddressing(store, { project, input: reference(initial), graph: reference(f.graphRevision),
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(initial),
+      graph: reference(f.graphRevision), layers: [], decision }) })) }));
+  const choice = { choiceVersion: 'identity-native', features: [{ outcome: 'garden-result' }], excluded: [] };
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
+    refinement: reference(store.get('phase:garden:L2')!), choice, available: {} }));
+  const operations: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
+    layer: reference(f.layers[2]), frame: null, upper: null };
+  const nativeRequest: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]),
+    upper: { horizon: reference(horizon.gate), frame: null } };
+  const native = ok(readFrame(store, nativeRequest));
+  const nativeFills = structuredClone(native.result.fills) as ConnectionFrame['fills'];
+  for (const fill of nativeFills) if (['w-garden-later-operation', 'w-garden-refusal-operation'].includes(fill.node)) {
+    assert.ok(!f.graph.horizon.includes(fill.node));
+    fill.source = 'identity'; fill.basis = native.upperRef;
+  }
+  nativeFills.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  assert.ok(nativeFills.some(fill => fill.source === 'accepted' && fill.port !== undefined));
+  assert.ok(nativeFills.every(fill => !Object.hasOwn(fill, 'codeRef')));
+  const nativeFrame = store.write<ConnectionFrame>({ id: 'om-frame:garden:3', kind: 'connection-frame', expected: 0,
+    value: { project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(projectGraph(f.graph, 3)), fills: nativeFills } });
+  const from = { ...nativeRequest, frame: reference(nativeFrame) };
+  ok(readFrame(store, from));
+  const upperCandidate = ok(writeCandidate(store, { frame: operations, proposals: [] }));
+  assert.equal(upperCandidate.state, 'candidate'); if (upperCandidate.state !== 'candidate') throw new Error('Missing native upper candidate');
+  const upperRef = reference(upperCandidate.record), upper = ok(settleCandidate(store, { project, level: 2, candidate: upperRef,
+    outcome: { gate: 'G3', candidate: upperRef, graphHash: upperCandidate.record.value.graphHash, passed: true, codes: [] } }));
+  const next = ok(writeHorizon(store, { project, input: reference(input), graph: reference(upper.graph!), refinement: reference(upper.layer!),
+    choice: { ...choice, choiceVersion: 'identity-rebased' }, available: {} }));
+  const to: FrameRequest = { project, level: 3, graph: reference(upper.graph!), horizon: reference(next.gate), layer: null,
+    frame: null, upper: { horizon: reference(next.gate), frame: reference(upper.frame!) } };
+  const rebased = ok(rebaseFrame(store, { from, to }));
+  assert.ok(rebased.carried > 0); assert.equal(rebased.retired, 0);
+  assert.ok(!Object.hasOwn(rebased.frame.value, 'worksContract'));
+  const prepared = ok(prepareFrame(store, { ...to, layer: reference(rebased.layer), frame: reference(rebased.frame) }));
+  const works: ProposalRequest = { frame: structuredClone(prepared.request) as FrameRequest, proposals: [] };
+  const obligation = prepared.result.obligations.find(item => item.kind === 'connection-end' && item.role === 'producer'
+    && item.connector === 'garden-flow' && prepared.result.fills.some(fill => fill.obligation === item.id && fill.source === 'accepted'))!;
+  assert.ok(obligation);
+  const rebaseAcceptance = { project, level: 3 as const, graph: to.graph, layer: reference(rebased.layer), frame: reference(rebased.frame) };
+  const beforeRebaseRead = snapshot(store);
+  const rebaseResult = readResultIdentity(store, { acceptance: rebaseAcceptance, obligation: obligation.id });
+  assert.equal(rebaseResult.ok, false, 'A rebase preserves history but accepts no new result');
+  assert.deepEqual(snapshot(store), beforeRebaseRead);
+  const gaps = ok(writeGaps(store, { project, input: reference(input), graph: to.graph, horizon: to.horizon,
+    operations: { frame: { ...operations, graph: to.graph, horizon: to.horizon, layer: reference(upper.layer!), frame: reference(upper.frame!) }, proposals: [] }, works }));
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const handoff = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+  assert.deepEqual(handoff.handoff.obligations, []);
+  if ('state' in gapRead.sources.works) throw new Error('The rebased native layer must supply the works frame');
+  const candidate = ok(writeCandidate(store, { ...gapRead.sources.works, works: { contract: WORKS_FRAME_CONTRACT,
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } }));
+  assert.equal(candidate.state, 'candidate'); if (candidate.state !== 'candidate') throw new Error('Missing works candidate');
+  const candidateRef = reference(candidate.record), neighbors = ok(writeNeighbors(store, { project, candidate: candidateRef }));
+  const environment = engine.environments.get(project), { projectId: _projectId, ...configuration } = environment.value;
+  const capacity = engine.environments.configure(project, { ...configuration, requestCapacityChars: 200_000 }, environment.revision);
+  const gate = ok(writeAtomicGate(store, { project, candidate: candidateRef, neighbors: reference(neighbors),
+    environment: reference(capacity), gaps: gapRead, results: [], sources: [] }));
+  assert.equal(gate.value.result.passed, true, canonical(gate.value.result.findings));
+  const accepted = ok(settleCandidate(store, { project, level: 3, candidate: candidateRef,
+    outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: reference(gate) } }));
+  assert.equal(accepted.state, 'accepted'); assert.ok(accepted.graph && accepted.layer && accepted.frame);
+  const acceptance = { project, level: 3 as const, graph: reference(accepted.graph),
+    layer: reference(accepted.layer), frame: reference(accepted.frame) };
+  const request = { acceptance, obligation: obligation.id }, identity = ok(readResultIdentity(store, request));
+  assert.match(identity.key, /^om-result:[a-f0-9]{64}$/);
+  assert.ok(identity.fills.length > 0 && identity.fills.every(fill => fill.codeRef !== undefined));
+  const previousRefs = [from.graph, from.layer!, from.frame, reference(rebased.layer), reference(rebased.frame)];
+  for (const ref of previousRefs) assert.ok(identity.references.some(found => canonical(found) === canonical(ref)), ref.id);
+  const identityBytes = canonical(identity), frameBytes = canonical(nativeFrame), rebaseBytes = canonical(rebased.frame);
+  for (const ref of [acceptance.graph, acceptance.layer, acceptance.frame, reference(capacity)]) {
+    const head = store.get(ref.id)!;
+    store.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+  }
+  f.reopen();
+  const beforeHistory = snapshot(f.store);
+  assert.equal(canonical(ok(readResultIdentity(f.store, request))), identityBytes);
+  assert.equal(canonical(f.store.get(nativeFrame.id, nativeFrame.revision)), frameBytes);
+  assert.equal(canonical(f.store.get(rebased.frame.id, rebased.frame.revision)), rebaseBytes);
+  assert.equal(readResultIdentity(f.store, { acceptance: rebaseAcceptance, obligation: obligation.id }).ok, false);
+  assert.deepEqual(snapshot(f.store), beforeHistory);
 });

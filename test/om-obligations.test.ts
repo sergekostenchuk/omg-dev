@@ -20,9 +20,13 @@ import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeGapLines } from "../src/om/gap-lines.js";
+import { writeGapLines, type GapLinesRecord } from "../src/om/gap-lines.js";
+import { WORKS_FRAME_CONTRACT } from "../src/om/frame-obligations.js";
+import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { OM_OBLIGATION_CONTRACT, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment, readOwnerGapAssignment, type OwnerGapAssignment, prepareOmObligations, writeOmObligations, readOmObligations,
-  readOmObligationHandoff, readOmObligationLedger, type ObligationRequest, type OmObligationProducer, type OmObligationRecord } from "../src/om/obligations.js";
+  readOmObligationHandoff, readOmObligationLedger, type ObligationRequest, type OmObligationProducer, type OmObligationRecord,
+  OM_OBLIGATION_TRANSFER_CONTRACT, OM_OBLIGATION_TRANSFER_KIND, prepareObligationTransfer, readObligationTransfer,
+  type ObligationTransferRequest, type ObligationTransferRecord, type OmObligations } from "../src/om/obligations.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { gardenGraph } from "./om-fixture.js";
@@ -645,4 +649,159 @@ test("D7 responsibility paths cannot borrow unaccepted lower intermediates betwe
     denied(readOwnerGapAssignment(reopened, { project: f.project, record: reference(record) }), "obligation_assignment_invalid");
     assert.deepEqual(ok(readOmObligationLedger(reopened, { project: f.project, ledger: reference(legitimate.record) })).handoff, legitimate.handoff);
   } finally { reopened.close(); }
+});
+
+/** A valid C3 proposal-set change, without pretending to accept work or to grant H2 authority. */
+function nextTransferContext(f: ReturnType<typeof fixture>, source: OmObligations, ordinal: number) {
+  const sources = clone(source.producer.value.request.gaps.sources) as GapRequest;
+  if ('state' in sources.works) assert.fail('A work-assignment transfer starts from a genuine L3 frame request');
+  const frame = sources.works.frame;
+  const value: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 3, worksContract: WORKS_FRAME_CONTRACT,
+    source: 'input', status: 'proposed', nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [], tests: [],
+    edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+  const proposal = f.store.write({ id: `om-proposal:${f.project}:transfer-context-${ordinal}`, kind: 'layer-proposal', expected: 0, value });
+  sources.works.proposals.push(reference(proposal));
+  const gaps = ok(writeGaps(f.store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const previous = f.store.get<GapLinesRecord>(source.producer.value.request.lines.id)!;
+  const lines = ok(writeGapLines(f.store, { project: f.project, gaps: gapRead, previous: reference(previous),
+    pass: previous.value.request.pass + 1, closures: [] }));
+  const gap = gaps.records.find(row => row.value.gap.target === 'discovery:late-0')!;
+  return { gaps: gapRead, lines: reference(lines), gap: reference(gap) };
+}
+function transferRequest(f: ReturnType<typeof fixture>, source: OmObligations, next: ReturnType<typeof nextTransferContext>): ObligationTransferRequest {
+  const assignment = source.producer.value.request.assignments[0]!;
+  if (!('record' in assignment)) assert.fail('The source authority must be saved');
+  return { project: f.project, from: { producer: reference(source.producer), ledger: reference(source.record), assignment: assignment.record },
+    context: { gaps: next.gaps, lines: next.lines }, gap: next.gap };
+}
+function transferWrite(value: ObligationTransferRecord): Write {
+  return { id: `${OM_OBLIGATION_TRANSFER_KIND}:${value.project}:${hashJson(value)}`, kind: OM_OBLIGATION_TRANSFER_KIND, expected: 0, value };
+}
+
+test('D7 F5 transfer preserves all H2 consumers through repeated proposal changes and exact historical restart', t => {
+  const f = fixture(t, ['post-implementation-proof'], true), original = ok(writeOmObligations(f.store, pendingOwners(f))) as unknown as OmObligations;
+  const oldBytes = { producer: clone(original.producer), record: clone(original.record), handoff: clone(original.handoff) };
+  const next = nextTransferContext(f, original, 1), request = transferRequest(f, original, next), before = revisions(f.store);
+  const transfer = ok(prepareObligationTransfer(f.store, request));
+  assert.deepEqual(revisions(f.store), before); assert.equal(transfer.record.kind, OM_OBLIGATION_TRANSFER_KIND);
+  assert.equal(transfer.record.value.contract, OM_OBLIGATION_TRANSFER_CONTRACT);
+  assert.deepEqual(transfer.owner, request.from.assignment);
+  assert.equal(transfer.assignments.length, 2);
+  assert.deepEqual(transfer.assignments.map(row => row.responsibleConsumer).sort(), ['garden-later-block', 'garden-produce-block']);
+  assert.ok(!transfer.guards.some(ref => sameRef(ref, original.producer.value.request.lines)), 'Old D2 is historical, not required to be current');
+  assert.ok(transfer.guards.some(ref => sameRef(ref, next.lines)));
+  for (const ref of [request.from.assignment, request.from.producer, request.from.ledger])
+    assert.ok(transfer.guards.some(guard => sameRef(guard, ref)));
+  const newRequest: ObligationRequest = { project: f.project, gaps: next.gaps, lines: next.lines,
+    assignments: [{ pending: clone(transfer.writes[0]!) as Write }] };
+  const prepared = ok(prepareOmObligations(f.store, newRequest));
+  assert.deepEqual(revisions(f.store), before, 'Preparing the transferred ledger publishes neither record');
+  assert.equal(prepared.writes.filter(write => write.kind === OM_OWNER_ASSIGNMENT_KIND).length, 0);
+  assert.equal(prepared.writes.filter(write => write.kind === OM_OBLIGATION_TRANSFER_KIND).length, 1);
+  for (const ref of [request.from.assignment, request.from.producer, request.from.ledger])
+    assert.ok(prepared.guards.some(guard => sameRef(guard, ref)), 'The outward handoff still guards its original authority');
+  const saved = ok(writeOmObligations(f.store, newRequest)) as unknown as OmObligations;
+  assert.equal(saved.handoff.obligations.length, 2);
+  assert.deepEqual(ok(readOmObligationHandoff(f.store, f.project, saved.inputs)), saved.handoff);
+  assert.deepEqual(obligationHandoff(f.store, f.project, saved.inputs), saved.handoff);
+  assert.deepEqual(taskObligationHandoff(f.store, f.project, saved.inputs), saved.handoff);
+  assert.deepEqual(readinessObligations(f.store, f.project, saved.inputs).value?.handoff, saved.handoff);
+  for (let index = 0; index < original.handoff.obligations.length; index++) {
+    const old = original.handoff.obligations[index]!, current = saved.handoff.obligations.find(row => row.responsibleConsumer === old.responsibleConsumer)!;
+    const { scope: _oldScope, original: _oldGap, ...oldAssignment } = old;
+    const { scope: _newScope, original: _newGap, ...newAssignment } = current;
+    assert.deepEqual(newAssignment, oldAssignment); assert.notEqual(taskBindingId(old), taskBindingId(current));
+    assert.deepEqual(current.original.record, next.gap); assert.deepEqual(current.scope, reference(saved.record));
+  }
+  assert.deepEqual(ok(readObligationTransfer(f.store, { project: f.project, record: reference(transfer.record) })).assignments, transfer.assignments);
+  assert.deepEqual(ok(prepareObligationTransfer(f.store, request)).writes, []);
+  assert.deepEqual(ok(prepareOmObligations(f.store, newRequest)).writes, []);
+  const another = nextTransferContext(f, saved, 2), againRequest = transferRequest(f, saved, another);
+  const again = ok(prepareObligationTransfer(f.store, againRequest));
+  assert.deepEqual(again.owner, transfer.owner, 'A second transfer retains original H2 authority');
+  assert.deepEqual(again.record.value.from.assignment, reference(transfer.record));
+  const newest = ok(writeOmObligations(f.store, { project: f.project, gaps: another.gaps, lines: another.lines,
+    assignments: [{ pending: clone(again.writes[0]!) as Write }] }));
+  assert.equal(newest.handoff.obligations.length, 2);
+  assert.equal(newest.inputs.filter(ref => ref.id.startsWith('om-obligation-basis:')).length, 1);
+  assert.equal(newest.inputs.filter(ref => ref.id.startsWith('om-obligations:')).length, 1);
+  assert.deepEqual(ok(readOmObligationHandoff(f.store, f.project, clone(newest.inputs) as Ref[])), newest.handoff);
+  assert.deepEqual(f.store.get(original.producer.id, original.producer.revision), oldBytes.producer);
+  assert.deepEqual(f.store.get(original.record.id, original.record.revision), oldBytes.record);
+  const ownerHead = f.store.get(transfer.owner.id)!;
+  f.store.write({ id: ownerHead.id, kind: ownerHead.kind, expected: ownerHead.revision, value: ownerHead.value });
+  f.store.close(); const reopened = new Store(f.database);
+  try {
+    assert.deepEqual(ok(readOmObligations(reopened, { project: f.project, producer: reference(original.producer) })).handoff, oldBytes.handoff);
+    assert.deepEqual(ok(readOmObligations(reopened, { project: f.project, producer: reference(saved.producer) })).handoff, saved.handoff);
+    assert.deepEqual(ok(readOmObligations(reopened, { project: f.project, producer: reference(newest.producer) })).handoff, newest.handoff);
+    assert.deepEqual(obligationHandoff(reopened, f.project, clone(newest.inputs) as Ref[]), newest.handoff);
+    assert.deepEqual(taskObligationHandoff(reopened, f.project, clone(newest.inputs) as Ref[]), newest.handoff);
+    assert.deepEqual(ok(readObligationTransfer(reopened, { project: f.project, record: reference(again.record) })).owner, transfer.owner);
+    assert.deepEqual(ok(readOwnerGapAssignment(reopened, { project: f.project, record: transfer.owner })).record,
+      reopened.get(transfer.owner.id, transfer.owner.revision), 'The old owner era is still read as an H2 command');
+    denied(prepareObligationTransfer(reopened, request), 'input_stale');
+    denied(prepareObligationTransfer(reopened, againRequest), 'input_stale');
+  } finally { reopened.close(); }
+});
+
+test('D7 transfer rederives owner contents and rejects lost consumers forged provenance and source races atomically', t => {
+  const f = fixture(t, ['post-implementation-proof'], true), original = ok(writeOmObligations(f.store, pendingOwners(f))) as unknown as OmObligations;
+  const next = nextTransferContext(f, original, 1), request = transferRequest(f, original, next), legitimate = ok(prepareObligationTransfer(f.store, request));
+  const variants: ObligationTransferRecord[] = [];
+  const changed = clone(legitimate.record.value) as ObligationTransferRecord; changed.assignments[0]!.returnCondition = 'Different authorization'; variants.push(changed);
+  const shortened = clone(legitimate.record.value) as ObligationTransferRecord; shortened.assignments.pop(); variants.push(shortened);
+  const owner = clone(legitimate.record.value) as ObligationTransferRecord; owner.owner = reference(original.producer); variants.push(owner);
+  const epoch = clone(legitimate.record.value) as unknown as Record<string, Json>; epoch.contract = 'om-obligation-transfer/v99'; variants.push(epoch as unknown as ObligationTransferRecord);
+  for (const value of variants) {
+    const pending = transferWrite(value), before = revisions(f.store);
+    denied(prepareOmObligations(f.store, { project: f.project, gaps: next.gaps, lines: next.lines, assignments: [{ pending }] }), 'obligation_assignment_invalid');
+    assert.deepEqual(revisions(f.store), before);
+    const forged = f.store.write(pending);
+    denied(readObligationTransfer(f.store, { project: f.project, record: reference(forged) }), 'obligation_assignment_invalid');
+  }
+  const foreign = { ...request, from: { ...request.from, ledger: reference(original.producer) } };
+  denied(prepareObligationTransfer(f.store, foreign), 'obligation_assignment_invalid');
+  const originalAssignment = original.producer.value.request.assignments[0]!;
+  if (!('record' in originalAssignment)) assert.fail('Expected saved H2 source');
+  denied(prepareOmObligations(f.store, { project: f.project, gaps: next.gaps, lines: next.lines, assignments: [originalAssignment] }),
+    'obligation_assignment_invalid');
+  const prepared = ok(prepareOmObligations(f.store, { project: f.project, gaps: next.gaps, lines: next.lines,
+    assignments: [{ pending: clone(legitimate.writes[0]!) as Write }] }));
+  const other = new Store(f.database);
+  try {
+    const source = other.get(originalAssignment.record.id)!;
+    other.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+    const before = revisions(f.store);
+    denied(writeGuarded(f.store, { unit: 'F5-transfer-test', target: legitimate.record.id,
+      writes: [...prepared.writes, { id: 'transfer-neighbor', kind: 'transfer-neighbor', expected: 0, value: {} }], guards: prepared.guards }), 'input_stale');
+    assert.equal(f.store.get(legitimate.record.id), null); assert.equal(f.store.get(prepared.record.id), null);
+    assert.equal(f.store.get(prepared.producer.id), null); assert.equal(f.store.get('transfer-neighbor'), null);
+    assert.deepEqual(revisions(f.store), before);
+    denied(prepareObligationTransfer(f.store, request), 'input_stale');
+  } finally { other.close(); }
+});
+
+test('D7 transfer entry points reject missing malformed and foreign arguments before storage', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-transfer-arguments-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const view = new Proxy(store, { get(target, property) {
+    if (['get', 'list', 'history'].includes(String(property))) return () => assert.fail('Malformed transfer request reached storage');
+    const member: unknown = Reflect.get(target, property, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const ref: Ref = { id: 'om-obligation-basis:garden:argument', revision: 1, hash: hashJson('argument') };
+  const input = { project: 'garden', from: { producer: ref, ledger: ref, assignment: ref }, context: { gaps: { sources: {}, records: [] }, lines: ref }, gap: ref };
+  const read = { project: 'garden', record: ref };
+  for (const [action, request] of [[prepareObligationTransfer, input], [readObligationTransfer, read]] as const) {
+    const invoke = action as (store: Store, request: unknown) => unknown;
+    for (const value of [undefined, null, [], '', false, { ...request, project: '' }, { ...request, status: 'accepted' }])
+      assert.throws(() => invoke(view, value), malformed);
+    for (const key of Object.keys(request)) {
+      const absent = clone(request) as Record<string, unknown>; delete absent[key];
+      assert.throws(() => invoke(view, absent), malformed);
+    }
+    assert.throws(() => invoke(undefined as unknown as Store, request), malformed);
+  }
+  for (const from of [null, [], {}, { producer: ref, ledger: ref }, { ...input.from, assignment: null }, { ...input.from, producer: { ...ref, revision: 0 } }])
+    assert.throws(() => prepareObligationTransfer(view, { ...input, from } as unknown as ObligationTransferRequest), malformed);
 });

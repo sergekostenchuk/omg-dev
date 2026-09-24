@@ -1,5 +1,7 @@
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
+import { RefinementRelations } from '../graph/relations.js';
+import type { Graph } from '../graph/model.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { gapId, prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, type GapRecords } from './gaps.js';
@@ -12,6 +14,7 @@ import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } 
 import type { AcceptanceContext, Confirmation } from './achievements.js';
 import { readResultIdentity } from './result-identity.js';
 import { confirmAnswerGapClosure, type AnswerBasis } from './accepted-answer.js';
+import { withHistoricalReads } from './input.js';
 
 export const GAP_LINE_KIND = 'gap-line';
 export const GAP_LINE_CODES = Object.freeze([
@@ -66,8 +69,10 @@ function fail(code: string, target: string, field: string, message: string): nev
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new LineFailure(result.refusal); return result.value; }
 function run<T>(action: () => T): OmResult<Sealed<T>> {
-  try { return delivered(action()); }
-  catch (error) { if (error instanceof LineFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  return withHistoricalReads(() => {
+    try { return delivered(action()); }
+    catch (error) { if (error instanceof LineFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  });
 }
 function lineShape(value: unknown): value is GapLine {
   if (!object(value) || ![value['id'], value['target'], value['field']].every(text)
@@ -277,6 +282,11 @@ function seriesGoal(store: Store, project: string, line: GapLine, link: GapLineA
 function substantive(obligation: FrameObligation): Omit<FrameObligation, 'zone'> {
   const { zone: _zone, ...value } = obligation; return value;
 }
+function closureFrame(gaps: GapReadRequest, level: 2 | 3, line: string): FrameRequest {
+  const source = level === 2 ? gaps.sources.operations : gaps.sources.works;
+  if ('state' in source) fail('closure_unconfirmed', line, 'acceptance', 'A work filling needs its exact saved work-frame context');
+  return source.frame;
+}
 /** One content verifier serves preparation, historical re-derivation, and the acceptance provider. */
 function confirmClosure(store: Store, project: string, line: GapLine, closure: GapClosureRequest,
   previous: History | null, gaps: GapReadRequest, current: boolean): ConfirmedGapClosure {
@@ -294,17 +304,21 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
     return { kind: 'answer', key: answer.key, attempt: answer.attempt,
       references: [...answer.references], guards: [...answer.guards], writes: [...answer.writes] };
   }
-  const context = gaps.sources.operations.frame;
   if (closure.acceptance === null || closure.acceptance.project !== project || !same(closure.basis, closure.acceptance.frame))
     fail('closure_unconfirmed', line.id, 'acceptance', 'A filled line names its exact accepted connection frame and its source context');
+  // The exact accepting producer chooses the source contract; there is no fallback between levels.
+  const level = closure.acceptance.level, origin = level === 2 ? 'operations' : 'works';
+  const context = closureFrame(gaps, level, line.id);
   // Historical delivery still belongs to its saved D1 context; only head freshness is conditional.
   if (context.project !== closure.acceptance.project || context.level !== closure.acceptance.level
     || !same(context.graph, closure.acceptance.graph) || !same(context.layer, closure.acceptance.layer)
     || !same(context.frame, closure.acceptance.frame))
     fail('closure_unconfirmed', line.id, 'acceptance', 'The saved D1 context must use this exact accepted filling');
   const source = oldGap(previous, line.id);
-  if (!source || source.gap.field !== 'fill' || !source.gap.evidence.some(item => item.origin === 'operations'))
-    fail('closure_unsupported', line.id, 'basis', 'This producer confirms operation-frame fillings; other kinds need their own accepting producer');
+  if (!source || source.gap.field !== 'fill' || !source.gap.evidence.some(item => item.origin === origin))
+    fail('closure_unsupported', line.id, 'basis', level === 2
+      ? 'This producer confirms operation-frame fillings; other kinds need their own accepting producer'
+      : 'This producer confirms work-frame fillings from the exact preceding D1 context');
   const accepted = take(readAcceptedFrame(store, closure.acceptance));
   if (!accepted.graph || !accepted.frame || !accepted.layer) fail('closure_unconfirmed', line.id, 'basis', 'A filled line needs an accepted graph, layer and frame');
   const candidate = take(readCandidate(store, { project, candidate: accepted.frame.value.acceptance.candidate }));
@@ -316,7 +330,7 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
     // The accepting candidate horizon is historical; current admission uses D1's current frame context.
     fresh = take(prepareFrame(store, context));
   }
-  const previousFrame = take(readFrame(store, source.history.row.value.request.gaps.sources.operations.frame));
+  const previousFrame = take(readFrame(store, closureFrame(source.history.row.value.request.gaps, level, line.id)));
   const before = previousFrame.result.obligations.find(item => item.id === line.target);
   const obligation = frame.result.obligations.find(item => item.id === line.target);
   const fills = frame.result.fills.filter(item => item.obligation === line.target);
@@ -325,7 +339,11 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
     || !fills.length || fills.some(fill => fill.source !== 'accepted'))
     fail('closure_unconfirmed', line.id, 'fill', 'The same obligation must be fully filled by accepted real definitions, not identities or a changed requirement');
   const attempt = seriesGoal(store, project, line, closure.attempt, current);
-  if (attempt && attempt.block !== obligation.upper.node)
+  const belongs = !attempt || (level === 2 ? attempt.block === obligation.upper.node
+    : source.gap.consumers.includes(attempt.block)
+      && frame.upper.nodes.some(node => node.id === attempt.block && node.kind === 'block')
+      && new RefinementRelations(frame.upper as Graph).refines(obligation.upper.node, attempt.block));
+  if (!belongs)
     fail('closure_unconfirmed', line.id, 'attempt.block', 'The recorded goal belongs to the block whose gap was filled');
   return { kind: 'frame', obligation: obligation as FrameObligation, acceptance: closure.acceptance, attempt, writes: [], references: unique([...frame.references, ...previousFrame.references, closure.basis,
       closure.acceptance.graph, closure.acceptance.layer, ...(attempt ? [attempt.series] : [])]),

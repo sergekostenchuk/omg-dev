@@ -1,8 +1,11 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonical, hashJson } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
@@ -22,7 +25,7 @@ import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { openSeries, beginAttempt, completeAttempt, readSeries, type AttemptGoal, type SeriesRequest } from "../src/om/series.js";
+import { openSeries, beginAttempt, completeAttempt, readSeries, readSeriesAt, type AttemptGoal, type SeriesRequest } from "../src/om/series.js";
 import { confirmResults } from "../src/om/achievements.js";
 import { closeAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
@@ -792,4 +795,131 @@ test("D2 historical closure stays bound to its saved D1 context on replay, confi
   }
   const restarted = new Store(f.database);
   try { check(restarted); } finally { restarted.close(); }
+});
+
+async function producePreF5ResultHistory() {
+  // Only the child loader exports these helpers, from the immutable old test source.
+  const fixture = await import('./om-gap-lines.test.js') as unknown as {
+    firstPassFixture: typeof firstPassFixture; acceptOperations: typeof acceptOperations;
+    goalFor: typeof goalFor; openAttempt: typeof openAttempt;
+  };
+  const { canonical } = await import('../src/canonical.js');
+  const { reference } = await import('../src/pipeline/contracts.js');
+  const { prepareFrame } = await import('../src/om/frame-obligations.js');
+  const { writeGapLines, readGapLines } = await import('../src/om/gap-lines.js');
+  const { readResultIdentity } = await import('../src/om/result-identity.js');
+  const { confirmResults } = await import('../src/om/achievements.js');
+  const { beginAttempt, readSeries } = await import('../src/om/series.js');
+  const { closeAttempt } = await import('../src/om/repeat-gate.js');
+  const { rmSync } = await import('node:fs');
+  const take = <T>(result: OmResult<T>): T => {
+    if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.message}`);
+    return result.value;
+  };
+  const f = fixture.firstPassFixture({ after() {} } as unknown as TestContext);
+  let complete = false;
+  try {
+    const first = take(writeGapLines(f.store, f.request));
+    const line = f.gaps.collection.gaps.find(item => item.field === 'fill'
+      && item.evidence.some(evidence => evidence.origin === 'operations'))!;
+    const obligation = take(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === line.target)!;
+    const address = { project: 'garden', block: obligation.upper.node, line: 1 };
+    const goal = fixture.goalFor(line), attempt = fixture.openAttempt(f.store, address, goal);
+    const accepted = fixture.acceptOperations(f);
+    const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: accepted.gaps,
+      closures: [{ ...accepted.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
+    const closed = take(writeGapLines(f.store, request));
+    const identityRequest = { acceptance: accepted.acceptance, obligation: line.target };
+    const identityBytes = canonical(take(readResultIdentity(f.store, identityRequest)));
+    const confirmationRequest = { project: 'garden', block: address.block, target: attempt.id,
+      goal, accepting: [reference(closed)], cancelling: [] };
+    const confirmationBytes = canonical(take(confirmResults(f.store, confirmationRequest)));
+    const closeRequest = { ...address, attempt: 1,
+      outcome: { reason: 'result' as const, accepting: [reference(closed)], cancelling: [], refusals: [] } };
+    const firstOutcome = take(closeAttempt(f.store, closeRequest));
+    if (firstOutcome.verdict !== 'progress') throw new Error('The old accepted filling did not establish progress');
+    const progressed = take(readSeries(f.store, address));
+    take(beginAttempt(f.store, { ...address, attempt: 2, goal }));
+    const secondRequest = { ...closeRequest, attempt: 2 }, secondOutcome = take(closeAttempt(f.store, secondRequest));
+    if (secondOutcome.verdict !== 'none' || secondOutcome.withoutProgress !== 1)
+      throw new Error('The old repeated result did not retain its lasting identity');
+    const series = take(readSeries(f.store, address));
+    const rows = [first, closed, attempt, progressed, series, accepted.accepted.graph!, accepted.accepted.layer!, accepted.accepted.frame!]
+      .map(row => ({ reference: reference(row), bytes: canonical(row) }));
+    for (const ref of [accepted.acceptance.graph, accepted.acceptance.layer, accepted.acceptance.frame,
+      reference(f.store.get('source:garden:brief')!)]) {
+      const row = f.store.get(ref.id)!;
+      f.store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+    }
+    const replayBytes = canonical(take(closeAttempt(f.store, closeRequest)));
+    complete = true;
+    return { root: f.root, database: f.database, address, firstRequest: f.request, first: reference(first),
+      firstBytes: canonical(take(readGapLines(f.store, { project: 'garden', record: reference(first) }))), request,
+      closed: reference(closed), closedBytes: canonical(take(readGapLines(f.store, { project: 'garden', record: reference(closed) }))),
+      identityRequest, identityBytes, confirmationRequest, confirmationBytes, closeRequest, replayBytes,
+      secondRequest, secondOutcomeBytes: canonical(secondOutcome), series: reference(series), seriesBytes: canonical(series),
+      progressed: reference(progressed), progressedBytes: canonical(progressed), rows };
+  } finally {
+    f.store.close();
+    if (!complete) rmSync(f.root, { recursive: true, force: true });
+  }
+}
+
+test('D2, structural identity and G7 preserve real 41fcb54 L2 producer history after restart', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-d2-era-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(root, 'pre-f5-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  if (url === 'node:test') return { format: 'module', shortCircuit: true,
+    source: 'export const test = () => {}; export default test;' };
+  const prefix = new URL('dist/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    let source = execFileSync('git', ['show', '41fcb54739d861d10b7d7324f77f5978db8d30d8:' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    if (relative === 'test/om-gap-lines.test.ts')
+      source += '\\nexport { firstPassFixture, acceptOperations, goalFor, openAttempt };\\n';
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}
+`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const producer = producePreF5ResultHistory.toString()
+    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
+    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
+      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
+  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})()));`],
+  { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
+  const history = JSON.parse(output) as Awaited<ReturnType<typeof producePreF5ResultHistory>>;
+  t.after(() => rmSync(history.root, { recursive: true, force: true }));
+  for (let restart = 0; restart < 2; restart++) {
+    const store = new Store(history.database);
+    try {
+      const before = historySnapshot(store);
+      assert.equal(canonical(ok(readGapLines(store, { project: 'garden', record: history.first }))), history.firstBytes);
+      assert.equal(canonical(ok(readGapLines(store, { project: 'garden', record: history.closed }))), history.closedBytes);
+      assert.equal(canonical(ok(readResultIdentity(store, history.identityRequest))), history.identityBytes);
+      assert.equal(canonical(ok(confirmResults(store, history.confirmationRequest))), history.confirmationBytes);
+      assert.equal(canonical(ok(readSeriesAt(store, 'garden', history.progressed))), history.progressedBytes);
+      assert.equal(canonical(ok(readSeriesAt(store, 'garden', history.series))), history.seriesBytes);
+      assert.equal(canonical(ok(readSeries(store, history.address))), history.seriesBytes);
+      assert.equal(canonical(ok(writeGapLines(store, history.firstRequest))), history.firstBytes);
+      assert.equal(canonical(ok(writeGapLines(store, history.request))), history.closedBytes);
+      assert.equal(canonical(ok(closeAttempt(store, history.closeRequest))), history.replayBytes);
+      assert.equal(canonical(ok(closeAttempt(store, history.secondRequest))), history.secondOutcomeBytes);
+      for (const row of history.rows)
+        assert.equal(canonical(store.get(row.reference.id, row.reference.revision)), row.bytes);
+      assert.deepEqual(historySnapshot(store), before);
+    } finally { store.close(); }
+  }
 });

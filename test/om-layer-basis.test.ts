@@ -14,7 +14,7 @@ import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { writeOmInput } from "../src/om/input.js";
-import { readLayerBasis, readLayerEnvelope, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame,
+import { readLayerBasis, readLayerEnvelope, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame, acceptedLayerProof,
   type LayerBasis, type OmAcceptedFrame, type OmRebasedFrame, type RebasedLayerRequest, type LayerEnvelopeRequest } from "../src/om/layer-basis.js";
 import { prepareHorizon, readHorizon, writeHorizon, type HorizonRecord, type HorizonRequest } from "../src/om/horizon.js";
 import { prepareFrame, readFrame, type FrameRequest } from "../src/om/frame-obligations.js";
@@ -302,6 +302,11 @@ test("OM acceptance builders preserve exact fill sources, distinguish the own lo
   const graph = { id: candidate.value.base.graph.id, revision: candidate.value.base.graph.revision + 1, hash: candidate.value.graphHash };
   const upper = basisRequest(f, 2).upper, before = revisions(f.store);
   const saved = omAcceptedFrame(candidate, gate, graph, upper);
+  const frameRef = { id: `om-frame:${f.project}:2`, revision: 1, hash: hashJson(saved) };
+  const proof = acceptedLayerProof(candidate, upper, frameRef);
+  assert.deepEqual(proof, { level: 2, hash: candidate.value.layerHash,
+    inputs: [upper, reference(candidate), frameRef].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0) });
+  assert.ok(Object.isFrozen(proof) && Object.isFrozen(proof.inputs));
   assert.equal(saved.candidateHash, candidate.value.graphHash);
   assert.deepEqual(saved.acceptance, { producer: "om", candidate: reference(candidate), gate: { name: "G3", ...gate }, graph, upper });
   assert.deepEqual(saved.fills, acceptedCandidateFills(candidate.value.fills));
@@ -318,12 +323,22 @@ test("OM acceptance builders preserve exact fill sources, distinguish the own lo
     assert.throws(() => omAcceptedFrame(candidate, value as unknown as CandidateGate, graph, upper), malformed);
     assert.throws(() => omAcceptedFrame(candidate, gate, value as unknown as Ref, upper), malformed);
     assert.throws(() => omAcceptedFrame(candidate, gate, graph, value as unknown as Ref), malformed);
+    assert.throws(() => acceptedLayerProof(value as unknown as Revision<FrameCandidateRecord>, upper, frameRef), malformed);
+    assert.throws(() => acceptedLayerProof(candidate, value as unknown as Ref, frameRef), malformed);
+    assert.throws(() => acceptedLayerProof(candidate, upper, value as unknown as Ref), malformed);
     assert.throws(() => lowerLayerHash(value as unknown as Graph, 2), malformed);
     if (!Array.isArray(value)) assert.throws(() => acceptedCandidateFills(value as unknown as FrameCandidateRecord['fills']), malformed);
   }
   assert.throws(() => omAcceptedFrame(candidate, { ...gate, graphHash: "0".repeat(64) }, graph, upper), malformed);
+  for (const addition of [{ basis: reference(candidate) }, { gate: "G5" }, { worksContract: "works-frame/v1", gate: "G5", basis: reference(candidate), codes: [] }])
+    assert.throws(() => omAcceptedFrame(candidate, { ...gate, ...addition }, graph, upper), malformed);
   assert.throws(() => omAcceptedFrame(candidate, gate, { ...graph, revision: graph.revision + 1 }, upper), malformed);
   assert.throws(() => omAcceptedFrame(candidate, gate, graph, { ...upper, id: "graph-layer:foreign:1" }), malformed);
+  assert.throws(() => acceptedLayerProof(candidate, { ...upper, id: "graph-layer:foreign:1" }, frameRef), malformed);
+  assert.throws(() => acceptedLayerProof(candidate, upper, { ...frameRef, id: "om-frame:foreign:2" }), malformed);
+  const withoutWorks = { ...candidate.value, level: 3 as const };
+  assert.throws(() => acceptedLayerProof({ ...candidate, value: withoutWorks, hash: hashJson(withoutWorks) },
+    { ...upper, id: `graph-layer:${f.project}:2` }, { ...frameRef, id: `om-frame:${f.project}:3` }), malformed);
   for (const field of ["obligation", "node", "source", "basis"] as const) {
     const fills = clone(candidate.value.fills); delete (fills[0] as unknown as Record<string, unknown>)[field];
     assert.throws(() => acceptedCandidateFills(fills), malformed);
@@ -479,6 +494,8 @@ test("the rebase layer builder rejects forged graph hashes and malformed or nonc
   const rejects = (changed: unknown) => assert.throws(() => buildRebasedLayer({ ...request,
     frame: changed as OmRebasedFrame, reference: { ...request.reference, hash: hashJson(changed) } }), malformed);
   for (const field of ["layerHash", "upperHash", "lowerHash"] as const) rejects({ ...frame, [field]: "0".repeat(64) });
+  for (const worksContract of [null, "", "works-frame/v2", "research"])
+    rejects({ ...frame, worksContract });
   assert.ok(frame.fills.length > 1);
   for (const field of ["fills", "retired"] as const) {
     for (const value of [null, {}, [null], [{ ...frame.fills[0], source: "proposed" }],
@@ -492,4 +509,32 @@ test("the rebase layer builder rejects forged graph hashes and malformed or nonc
       reference: { ...request.reference, hash: hashJson(changed) } }).projection, layer.projection);
   }
   assert.deepEqual(revisions(f.store), before);
+});
+
+test("a claimed G5 work acceptance never falls back to the native or rebase producer", async t => {
+  const { f, from, to, accepted } = await nativeRebaseFixture(t);
+  const basis = delivered(readRebaseBasis(f.store, { from, to }));
+  for (const worksContract of [undefined, "works-frame/v2", "works-frame/v1"]) {
+    const frame = { ...clone(basis.frame), ...(worksContract === undefined ? {} : { worksContract }), acceptance: {
+      producer: "om", candidate: accepted.frame!.value.acceptance.candidate,
+      gate: { name: "G5", passed: true, candidate: accepted.frame!.value.acceptance.candidate,
+        graphHash: to.graph.hash, findings: [], codes: [] }, graph: to.graph, upper: basis.upper,
+    } };
+    const frameRow = f.store.write({ id: from.frame!.id, kind: "connection-frame", expected: f.store.get(from.frame!.id)!.revision, value: frame });
+    const layer = buildRebasedLayer({ frame: basis.frame as OmRebasedFrame,
+      reference: { id: from.frame!.id, revision: from.frame!.revision + 1, hash: hashJson(basis.frame) },
+      graph: accepted.graph!.value as Graph, upper: accepted.layer as Revision<LayerBasis>,
+      previous: f.store.get<LayerBasis>(from.layer!.id, from.layer!.revision)! });
+    const frameRef = reference(frameRow);
+    const refs = (items: readonly Ref[]) => items.map(ref => ref.id === frameRef.id ? frameRef : ref)
+      .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+    const layerRow = f.store.write({ id: from.layer!.id, kind: "graph-layer", expected: f.store.get(from.layer!.id)!.revision,
+      value: { ...layer, acceptance: { producer: "om", frame: frameRef },
+        layerProofs: layer.layerProofs!.map(proof => proof.level === 3
+          ? { ...proof, inputs: refs(proof.inputs) } : proof), inputs: refs(layer.inputs) } });
+    const before = revisions(f.store);
+    const refusal = refusedAs(readLayerAcceptance(f.store, { project: f.project, level: 3, graph: to.graph, layer: reference(layerRow) }), "layer_basis_unproven");
+    assert.equal(refusal.at.field, "acceptance.contract");
+    assert.deepEqual(revisions(f.store), before);
+  }
 });

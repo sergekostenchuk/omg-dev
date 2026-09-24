@@ -6,9 +6,12 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, type FrameCandidateRecord } from './frame-candidate.js';
 import type { LayerProposal, ProposalObservation, ProposalRequest } from './frame-proposals.js';
-import { currentFrameRequest, prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
+import { WORKS_FRAME_CONTRACT, currentFrameRequest, prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
 import type { Finding } from '../pipeline/contracts.js';
-import { omAcceptedFrame, readLayerAcceptance, type LayerBasis, type OmAcceptedFrame } from './layer-basis.js';
+import { omAcceptedFrame, acceptedLayerProof, readLayerAcceptance, type AcceptedFrameGate, type LayerBasis, type OmAcceptedFrame } from './layer-basis.js';
+import { prepareAtomicGate, readAtomicGate, type AtomicGateRequest, type AtomicGateRecord } from './atomic-gate.js';
+import { journalId, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, REFUSAL_JOURNAL_KIND,
+  type RefusalJournal, type UnitRefusalRecord, type OriginSource } from './refusal-journal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRebaseBasis, buildRebasedLayer, type OmRebasedFrame } from './layer-basis.js';
@@ -17,7 +20,7 @@ export const FRAME_ACCEPT_CODES = Object.freeze([
   'candidate_level_unsupported', 'candidate_missing', 'candidate_graph_mismatch', 'gate_outcome_mismatch',
   'input_stale', 'frame_acceptance_invalid',
 ] as const);
-export interface FrameGateOutcome { gate: 'G3' | 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[] }
+export interface FrameGateOutcome { gate: 'G3' | 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[]; basis?: Ref }
 export interface SettleCandidateRequest { project: string; level: 2 | 3; candidate: Ref; outcome: FrameGateOutcome }
 export interface Settlement {
   state: 'accepted' | 'rejected' | 'unchanged' | 'obsolete';
@@ -26,6 +29,10 @@ export interface Settlement {
 }
 export interface PreparedSettlement { result: Settlement; writes: Write[]; guards: Ref[]; expected: { graph: number; layer: number; frame: number } | null }
 export interface AcceptedFrameRequest { project: string; level: 2 | 3; graph: Ref; layer: Ref; frame: Ref }
+interface WorkRejectionRecord {
+  contract: 'om-work-rejection/v1'; project: string; candidate: Ref; gate: Ref;
+  diagnostic: Ref; previousJournal: Ref | null; journal: Ref; proposals: Ref[];
+}
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const hash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -52,7 +59,7 @@ function requireRequest(store: Store, value: unknown): asserts value is SettleCa
   const outcome = value['outcome'];
   if (!object(outcome) || !['G3', 'G5'].includes(outcome['gate'] as string) || !isRef(outcome['candidate'])
     || !hash(outcome['graphHash']) || typeof outcome['passed'] !== 'boolean' || !Array.isArray(outcome['codes'])
-    || !outcome['codes'].every(text)) invalid('outcome');
+    || !outcome['codes'].every(text) || Object.hasOwn(outcome, 'basis') && !isRef(outcome['basis'])) invalid('outcome');
 }
 function proposedRevision<T>(write: Write): Revision<T> {
   return { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(write.value), value: sealed(write.value) as T };
@@ -72,11 +79,12 @@ export function readAcceptedFrame(store: Store, request: AcceptedFrameRequest): 
   if (!(store instanceof Store) || !object(request) || !text(request.project) || ![2, 3].includes(request.level)
     || ![request.graph, request.layer, request.frame].every(isRef)) invalid('acceptedFrame');
   return run(() => {
-    supported(request.level);
     const basis = take(readLayerAcceptance(store, request));
     if (basis.producer !== 'om' || !same(basis.frame, request.frame))
       fail('frame_acceptance_invalid', request.frame.id, 'acceptance', 'The layer must name this exact OM accepting frame');
     const frame = exact<OmAcceptedFrame>(store, request.frame, `om-frame:${request.project}:${request.level}`, 'connection-frame');
+    if (!object(frame.value.acceptance) || !isRef(frame.value.acceptance.candidate))
+      fail('frame_acceptance_invalid', request.frame.id, 'acceptance', 'A rebase cannot substitute for an actual candidate acceptance');
     const graph = exact<Graph>(store, request.graph, `graph:${request.project}`, 'graph');
     const layer = exact<LayerBasis>(store, request.layer, `graph-layer:${request.project}:${request.level}`, 'graph-layer');
     const candidate = take(readCandidate(store, { project: request.project, candidate: frame.value.acceptance.candidate }));
@@ -105,12 +113,126 @@ function priorAcceptance(store: Store, request: SettleCandidateRequest): Settlem
 function normalizeOutcome(request: SettleCandidateRequest): SettleCandidateRequest {
   return sealed({ ...request, outcome: { ...request.outcome, codes: sorted(request.outcome.codes) } }) as SettleCandidateRequest;
 }
+function workRejectionId(request: SettleCandidateRequest): string {
+  return `om-work-rejection:${request.project}:${hashJson([request.candidate, request.outcome.basis])}`;
+}
+function workRejectionSources(store: Store, request: SettleCandidateRequest,
+  candidate: Revision<FrameCandidateRecord>, gate: Revision<AtomicGateRecord>) {
+  if (candidate.value.level !== 3 || candidate.value.works?.contract !== WORKS_FRAME_CONTRACT
+    || gate.value.result.passed || !gate.value.result.codes.length || !gate.value.result.findings.length)
+    fail('gate_outcome_mismatch', candidate.id, 'passed', 'Work rejection requires the complete failed G5 result');
+  const proposalRequest = { frame: candidate.value.request.frame, proposals: candidate.value.request.proposals };
+  const origins: OriginSource[] = [{ role: 'derived', ref: reference(candidate) },
+    { role: 'base', ref: candidate.value.base.graph, context: { kind: 'frame', request: sealed(candidate.value.request.frame) } },
+    { role: 'environment', ref: gate.value.request.environment },
+    ...candidate.value.proposals.map(ref => ({ role: 'proposal', ref,
+      context: { kind: 'proposal' as const, request: sealed(proposalRequest) } }))];
+  const diagnosticValue: UnitRefusalRecord = { gate: 'G5', refusals: sorted(gate.value.result.findings).map(finding => ({
+    code: finding.code, goal: finding.target, remedy: finding.message,
+    origin: { name: finding.code, stage: 'atomicity', subject: finding.target, sources: sorted(origins) },
+  })) };
+  const diagnosticWrite: Write = { id: `${unitRefusalNamespace(request.project)}g5:${hashJson(reference(gate))}`,
+    kind: UNIT_REFUSAL_KIND, expected: 0, value: diagnosticValue };
+  const verdict = { contract: 'om-work-rejection/v1' as const, candidateHash: candidate.value.graphHash,
+    candidate: request.candidate, gate: reference(gate), codes: sorted(gate.value.result.codes) };
+  const proposalWrites = candidate.value.proposals.map(ref => {
+    const original = exact<LayerProposal>(store, ref, ref.id, 'layer-proposal');
+    return { id: ref.id, kind: 'layer-proposal', expected: ref.revision,
+      value: { ...original.value, status: 'rejected' as const, verdict } };
+  });
+  return { diagnosticWrite, diagnostic: proposedRevision<UnitRefusalRecord>(diagnosticWrite), proposalWrites };
+}
+function withRecords(store: Store, rows: readonly Revision<unknown>[], absentHead?: string): Store {
+  return new Proxy(store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) => {
+      if (id === absentHead && revision === undefined) return null;
+      return rows.find(row => row.id === id && (revision === undefined || revision === row.revision)) ?? target.get(id, revision);
+    };
+    const value: unknown = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+function rejectionBody(request: SettleCandidateRequest, diagnostic: Ref, previousJournal: Ref | null, journal: Ref, proposals: Ref[]): WorkRejectionRecord {
+  return { contract: 'om-work-rejection/v1', project: request.project, candidate: request.candidate,
+    gate: request.outcome.basis!, diagnostic, previousJournal, journal, proposals };
+}
+/** Exact failed G5 settlement, including its journal snapshot; subsequent heads do not rewrite the event. */
+export function readRejectedCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<Settlement>> {
+  requireRequest(store, request); request = normalizeOutcome(request);
+  return run(() => {
+    if (request.level !== 3 || request.outcome.gate !== 'G5' || !request.outcome.basis || request.outcome.passed
+      || !request.outcome.codes.length || !same(request.candidate, request.outcome.candidate))
+      fail('gate_outcome_mismatch', request.candidate.id, 'outcome', 'A rejected work candidate names its failed G5 basis');
+    const candidate = take(readCandidate(store, { project: request.project, candidate: request.candidate })) as Revision<FrameCandidateRecord>;
+    const gate = take(readAtomicGate(store, { project: request.project, record: request.outcome.basis })) as Revision<AtomicGateRecord>;
+    requireAtomicOutcome(request, candidate, gate);
+    const derived = workRejectionSources(store, request, candidate, gate), id = workRejectionId(request);
+    const row = store.get<WorkRejectionRecord>(id, 1);
+    if (!row || row.kind !== 'om-work-rejection' || !object(row.value) || row.hash !== hashJson(row.value)
+      || !isRef(row.value.journal) || row.value.journal.id !== journalId(request.project)
+      || row.value.previousJournal !== null && (!isRef(row.value.previousJournal) || row.value.previousJournal.id !== journalId(request.project)))
+      fail('frame_acceptance_invalid', id, 'rejection', 'The failed gate needs its exact complete rejection event');
+    const diagnostic = exact<UnitRefusalRecord>(store, reference(derived.diagnostic), derived.diagnostic.id, UNIT_REFUSAL_KIND);
+    if (!same(diagnostic, derived.diagnostic)) fail('frame_acceptance_invalid', diagnostic.id, 'refusals', 'Diagnostics must retain every original G5 finding');
+    const proposals = derived.proposalWrites.map(write => {
+      const expected = proposedRevision<LayerProposal>(write);
+      return exact<LayerProposal>(store, reference(expected), expected.id, 'layer-proposal');
+    });
+    const journal = exact<RefusalJournal>(store, row.value.journal, journalId(request.project), REFUSAL_JOURNAL_KIND);
+    const previous = row.value.previousJournal === null ? null
+      : exact<RefusalJournal>(store, row.value.previousJournal, journalId(request.project), REFUSAL_JOURNAL_KIND);
+    const verified = take(prepareRecordRefusal(withRecords(store, previous ? [previous] : [], previous ? undefined : journal.id),
+      { project: request.project, source: reference(diagnostic) }));
+    const journalWrite = verified.writes.find(write => write.id === journal.id);
+    const expectedJournal = journalWrite ? proposedRevision<RefusalJournal>(journalWrite) : previous;
+    if (!same(journal, expectedJournal) || !same(row.value, rejectionBody(request, reference(diagnostic),
+      previous ? reference(previous) : null, reference(journal), proposals.map(reference))))
+      fail('frame_acceptance_invalid', row.id, 'journal', 'The rejection must retain its complete journalled finding set and proposal transitions');
+    return { state: 'rejected', graph: null, layer: null, frame: null, proposals };
+  });
+}
+function requireAtomicOutcome(request: SettleCandidateRequest, candidate: Revision<FrameCandidateRecord>, atomic: Revision<AtomicGateRecord>): void {
+  if (candidate.value.works?.contract !== WORKS_FRAME_CONTRACT || candidate.value.level !== 3
+    || !same({ gate: atomic.value.result.gate, candidate: atomic.value.result.candidate,
+      graphHash: atomic.value.result.graphHash, passed: atomic.value.result.passed, codes: sorted(atomic.value.result.codes) },
+    { gate: request.outcome.gate, candidate: request.candidate, graphHash: request.outcome.graphHash,
+      passed: request.outcome.passed, codes: request.outcome.codes }) || !same(request.candidate, request.outcome.candidate)
+    || candidate.value.graphHash !== atomic.value.result.graphHash)
+    fail('gate_outcome_mismatch', candidate.id, 'outcome', 'The claimed outcome must equal the complete saved G5 result for this works candidate');
+}
+function prepareWorkRejection(store: Store, request: SettleCandidateRequest, candidate: Revision<FrameCandidateRecord>,
+  gate: Revision<AtomicGateRecord>, guards: Ref[], expected: PreparedSettlement['expected']): PreparedSettlement {
+  const derived = workRejectionSources(store, request, candidate, gate), writes: Write[] = [...derived.proposalWrites];
+  const old = store.get(derived.diagnostic.id);
+  if (old && !same(old, derived.diagnostic))
+    fail('frame_acceptance_invalid', old.id, 'refusals', 'An immutable G5 diagnostic cannot be replaced');
+  if (!old) writes.push(derived.diagnosticWrite);
+  const journal = take(prepareRecordRefusal(withRecords(store, [derived.diagnostic]), { project: request.project, source: reference(derived.diagnostic) }));
+  writes.push(...journal.writes);
+  const journalWrite = journal.writes.find(write => write.id === journalId(request.project));
+  let previousJournal = journal.guards.find(ref => ref.id === journalId(request.project)) ?? null;
+  let journalRef: Ref;
+  if (journalWrite) journalRef = reference(proposedRevision<RefusalJournal>(journalWrite));
+  else {
+    const saved = store.get<RefusalJournal>(journalId(request.project));
+    if (!saved || !same(saved.value, journal.value))
+      fail('input_stale', journalId(request.project), 'journal', 'The journal changed after preparation of the rejection');
+    journalRef = reference(saved); previousJournal = journalRef; guards.push(journalRef);
+  }
+  const proposals = derived.proposalWrites.map(write => proposedRevision<LayerProposal>(write));
+  writes.push({ id: workRejectionId(request), kind: 'om-work-rejection', expected: 0,
+    value: rejectionBody(request, reference(derived.diagnostic), previousJournal, journalRef, proposals.map(reference)) });
+  return { result: { state: 'rejected', graph: null, layer: null, frame: null, proposals }, writes,
+    guards: unique([...guards, ...journal.guards, ...(old ? [reference(old)] : [])]
+      .filter(ref => !writes.some(write => same(reference(proposedRevision(write)), ref)))), expected };
+}
 /** Prepare every write and its guard before any member of the acceptance transaction is visible. */
 export function prepareSettleCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<PreparedSettlement>> {
   requireRequest(store, request); request = normalizeOutcome(request);
   return run(() => {
-    supported(request.level);
-    if (request.outcome.gate !== 'G3' || !same(request.candidate, request.outcome.candidate)
+    if (request.level === 3 && !request.outcome.basis) supported(request.level);
+    if (request.outcome.gate !== (request.level === 3 ? 'G5' : 'G3') || request.level === 2 && request.outcome.basis !== undefined
+      || !same(request.candidate, request.outcome.candidate)
       || (request.outcome.passed ? request.outcome.codes.length !== 0 : request.outcome.codes.length === 0))
       fail('gate_outcome_mismatch', request.candidate.id, 'outcome', 'The gate must name this exact candidate and its own level');
     const loaded = readCandidate(store, { project: request.project, candidate: request.candidate });
@@ -119,37 +241,56 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     const candidate = take(loaded) as Revision<FrameCandidateRecord>;
     if (candidate.value.level !== request.level || request.outcome.graphHash !== candidate.value.graphHash)
       fail('gate_outcome_mismatch', candidate.id, 'graphHash', 'The gate outcome belongs to a different candidate graph');
+    const atomic = request.level === 3 ? take(readAtomicGate(store, { project: request.project, record: request.outcome.basis! })) : null;
+    if (atomic) requireAtomicOutcome(request, candidate, atomic as Revision<AtomicGateRecord>);
     const previous = priorAcceptance(store, request);
     if (previous) return { result: { ...previous, state: request.outcome.passed ? 'unchanged' : 'obsolete' }, writes: [], guards: [], expected: null };
-    const checked = gateCandidate(store, { project: request.project, candidate: request.candidate });
-    if (!checked.ok) throw new AcceptFailure(checked.refusal);
-    if (!request.outcome.passed)
-      fail('gate_outcome_mismatch', candidate.id, 'passed', 'A failed outcome cannot replace the successful G3 result rederived by code');
+    if (atomic && !atomic.value.result.passed && store.get(workRejectionId(request), 1)) {
+      const rejected = take(readRejectedCandidate(store, request));
+      return { result: { ...rejected, state: 'unchanged' }, writes: [], guards: [], expected: null };
+    }
+    let checked: AcceptedFrameGate;
+    const gateGuards: Ref[] = [];
+    if (atomic) {
+      const admission = take(prepareAtomicGate(store, atomic.value.request as AtomicGateRequest));
+      if (!same(admission.record, atomic))
+        fail('gate_outcome_mismatch', atomic.id, 'basis', 'Current G5 preparation must reproduce the exact saved gate record');
+      gateGuards.push(...admission.guards, reference(atomic));
+      checked = { ...atomic.value.result, basis: reference(atomic) } as AcceptedFrameGate;
+      if (checked.passed && (checked.findings.length || atomic.value.result.codes.length))
+        fail('gate_outcome_mismatch', atomic.id, 'passed', 'Only the complete successful G5 result may accept a work candidate');
+    } else {
+      checked = take(gateCandidate(store, { project: request.project, candidate: request.candidate })) as AcceptedFrameGate;
+      if (!request.outcome.passed)
+        fail('gate_outcome_mismatch', candidate.id, 'passed', 'A failed outcome cannot replace the successful G3 result rederived by code');
+    }
     // These are the exact source heads frozen by C4, not a fresh snapshot of changed proposals.
     current(store, candidate.value.base.graph);
     for (const ref of candidate.value.proposals) current(store, ref);
-    const frameHead = store.get(`om-frame:${request.project}:2`);
+    const frameHead = store.get(`om-frame:${request.project}:${request.level}`);
     if (!same(frameHead ? reference(frameHead) : null, candidate.value.base.frame))
       fail('input_stale', candidate.id, 'base.frame', 'The accepted frame changed after candidate assembly');
     const prepared = take(prepareCandidate(store, candidate.value.request));
     if (prepared.state !== 'candidate' || !prepared.existing || !same(reference(prepared.existing), request.candidate))
       fail('candidate_graph_mismatch', candidate.id, 'candidate', 'Current preparation did not reproduce this exact saved candidate');
-    const upperId = `graph-layer:${request.project}:1`;
+    if (atomic && !atomic.value.result.passed) return prepareWorkRejection(store, request, candidate,
+      atomic as Revision<AtomicGateRecord>, unique([...prepared.guards, ...gateGuards, request.candidate]), prepared.expected);
+    const upperId = `graph-layer:${request.project}:${request.level - 1}`;
     const upperCandidates = prepared.guards.filter(ref => ref.id === upperId);
     if (upperCandidates.length !== 1) fail('frame_acceptance_invalid', upperId, 'upper', 'The acceptance must retain exactly one admitted upper basis');
     const upperRef = upperCandidates[0]!;
     const upper = exact<LayerBasis>(store, upperRef, upperId, 'graph-layer');
     const graphWrite: Write = { id: `graph:${request.project}`, kind: 'graph', expected: prepared.expected.graph, value: candidate.value.graph };
     const graph = proposedRevision<Graph>(graphWrite);
-    const frameValue = omAcceptedFrame(candidate, checked.value, reference(graph), upperRef);
-    const frameWrite: Write = { id: `om-frame:${request.project}:2`, kind: 'connection-frame', expected: prepared.expected.frame, value: frameValue };
+    const frameValue = omAcceptedFrame(candidate, checked, reference(graph), upperRef);
+    const frameWrite: Write = { id: `om-frame:${request.project}:${request.level}`, kind: 'connection-frame', expected: prepared.expected.frame, value: frameValue };
     const frame = proposedRevision<OmAcceptedFrame>(frameWrite);
-    const own = { level: 2 as const, hash: candidate.value.layerHash, inputs: unique([upperRef, request.candidate, reference(frame)]) };
-    const proofs = [...(upper.value.layerProofs ?? []), own];
-    const layerValue: LayerBasis = { projection: projectGraph(candidate.value.graph, 2), obligations: upper.value.obligations,
+    const own = acceptedLayerProof(candidate, upperRef, reference(frame));
+    const proofs = [...(upper.value.layerProofs ?? []), { ...own, inputs: [...own.inputs] }];
+    const layerValue: LayerBasis = { projection: projectGraph(candidate.value.graph, request.level), obligations: upper.value.obligations,
       layerProofs: proofs, inputs: unique([...upper.value.obligations.flatMap(item => item.inputs), ...proofs.flatMap(proof => proof.inputs)]),
       acceptance: { producer: 'om', frame: reference(frame) } };
-    const layerWrite: Write = { id: `graph-layer:${request.project}:2`, kind: 'graph-layer', expected: prepared.expected.layer, value: layerValue };
+    const layerWrite: Write = { id: `graph-layer:${request.project}:${request.level}`, kind: 'graph-layer', expected: prepared.expected.layer, value: layerValue };
     const layer = proposedRevision<LayerBasis>(layerWrite);
     const proposalWrites = candidate.value.proposals.map(ref => {
       const original = exact<LayerProposal>(store, ref, ref.id, 'layer-proposal');
@@ -158,7 +299,7 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     });
     const proposals = proposalWrites.map(write => proposedRevision<LayerProposal>(write));
     return { result: { state: 'accepted', graph, layer, frame, proposals },
-      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: unique([...prepared.guards, request.candidate, upperRef]), expected: prepared.expected };
+      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: unique([...prepared.guards, ...gateGuards, request.candidate, upperRef]), expected: prepared.expected };
   });
 }
 export function settleCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<Settlement>> {

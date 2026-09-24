@@ -14,7 +14,7 @@ import { ProductEngine } from "../src/product/engine.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { projectGraph } from "../src/graph/project.js";
-import { writeOmInput } from "../src/om/input.js";
+import { withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
@@ -173,6 +173,63 @@ function source(): { graph: Graph; obligation: FrameObligation; fills: FrameFill
 const extract = (input: ReturnType<typeof source>) => extractResultSlice(input.graph, input.obligation, input.fills);
 const mutable = (input: ReturnType<typeof source>): ResultDependencySlice => clone(delivered(extract(input))) as ResultDependencySlice;
 
+function workSource(): ReturnType<typeof source> {
+  const input = source(), operation = input.graph.nodes.find(node => node.id === "operation")!, peer = input.graph.nodes.find(node => node.id === "peer")!;
+  const work: Node = { ...clone(operation), id: "work", kind: "work", parent: operation.id,
+    code: [{ path: "src/work.ts", symbol: "produce", access: "write", status: "planned" },
+      { path: "src/work.ts", symbol: "produceAgain", access: "write", status: "planned" }], tests: [] };
+  const consumer: Node = { ...clone(peer), id: "consumer-work", kind: "work", parent: peer.id,
+    code: [{ path: "src/consumer.ts", symbol: "consume", access: "read", status: "existing" }], tests: [] };
+  input.graph.nodes.push(work, consumer);
+  input.graph.connectors[0]!.bindings.push({ level: 3,
+    producer: { node: work.id, port: "out", codeRef: clone(work.code[0]!) },
+    consumers: [{ node: consumer.id, port: "in", codeRef: clone(consumer.code[0]!) }], anchor: null });
+  input.obligation = { ...input.obligation, level: 3, upper: { node: operation.id, port: "out" } };
+  input.fills = [{ ...input.fills[0]!, node: work.id, codeRef: clone(work.code[0]!),
+    basis: { id: "graph:product", revision: 1, hash: hashJson(input.graph) } }];
+  return input;
+}
+
+test("N=3 result material retains full work code addresses and distinguishes their selected endpoint without changing N=2 form", () => {
+  const input = workSource(), before = canonical(input), slice = delivered(extract(input));
+  assert.equal(slice.level, 3); assert.deepEqual(slice.obligation, input.obligation); assert.deepEqual(slice.fills, input.fills);
+  const content = delivered(normalizeResultContent(input.graph, input.obligation, input.fills));
+  assert.deepEqual(content.fills, [{ node: "work", port: "out", codeRef: input.fills[0]!.codeRef }]);
+  assert.ok(content.graph.nodes.some(node => node.kind === "work" && node.id === "work"));
+  const alternate = clone(input);
+  alternate.fills[0]!.codeRef = clone(input.graph.nodes.find(node => node.id === "work")!.code[1]!);
+  assert.notDeepEqual(delivered(normalizeResultContent(alternate.graph, alternate.obligation, alternate.fills)), content,
+    "The selected code endpoint is retained even when both CodeRefs already occur in the same work definition");
+  const legacy = source(), legacyContent = delivered(normalizeResultContent(legacy.graph, legacy.obligation, legacy.fills));
+  assert.deepEqual(legacyContent.fills, [{ node: "operation", port: "out" }]);
+  assert.ok(!Object.hasOwn(legacyContent.fills[0]!, "codeRef"));
+  assert.equal(canonical(input), before);
+});
+
+test("N=3 operation outcomes use real work fills without inventing a connection endpoint", () => {
+  const input = workSource();
+  input.obligation = { id: "work-outcome", level: 3, kind: "operation-outcome", upper: { node: "operation" },
+    artifact: "artifact", zone: "horizon" };
+  input.fills = [{ obligation: input.obligation.id, node: "work", source: "accepted", basis: input.fills[0]!.basis }];
+  assert.deepEqual(delivered(normalizeResultContent(input.graph, input.obligation, input.fills)).fills, [{ node: "work" }]);
+  input.fills[0]!.codeRef = clone(input.graph.nodes.find(node => node.id === "work")!.code[0]!);
+  refusedAs(extract(input), "result_slice_invalid");
+});
+
+test("N=3 material refuses missing, incomplete, foreign and service code fields or operation masquerading as work", () => {
+  const corruptions: ((input: ReturnType<typeof workSource>) => void)[] = [
+    input => { delete input.fills[0]!.codeRef; },
+    input => { delete (input.fills[0]!.codeRef as Partial<Node["code"][number]>).path; },
+    input => { input.fills[0]!.codeRef!.path = "src/foreign.ts"; },
+    input => { (input.fills[0]!.codeRef as unknown as Record<string, unknown>)["accepted"] = true; },
+    input => { input.fills[0]!.node = "operation"; input.fills[0]!.codeRef = clone(input.graph.nodes.find(node => node.id === "operation")!.code[0]!); },
+    input => { input.obligation.kind = "block-outcome"; },
+  ];
+  for (const corrupt of corruptions) { const input = workSource(); corrupt(input); refusedAs(extract(input), "result_slice_invalid"); }
+  const legacy = source(); legacy.fills[0]!.codeRef = clone(legacy.graph.nodes.find(node => node.id === "operation")!.code[0]!);
+  refusedAs(extract(legacy), "result_slice_invalid");
+});
+
 test("N=2 dependencies retain complete definitions and typed identities without unrelated graph bulk", () => {
   const input = source(), before = canonical(input), result = delivered(extract(input));
   assert.deepEqual(result.obligation, input.obligation); assert.deepEqual(result.fills, input.fills);
@@ -298,7 +355,8 @@ test("missing inputs, unknown fields and non-JSON values produce addressed typed
 });
 
 test("unsupported levels and absent or identity fills cannot masquerade as accepted result material", () => {
-  const input = source(); input.obligation.level = 3; refusedAs(extract(input), "result_slice_level_unsupported");
+  const input = source(); input.obligation.level = 3; refusedAs(extract(input), "result_slice_invalid");
+  (input.obligation as unknown as { level: number }).level = 4; refusedAs(extract(input), "result_slice_level_unsupported");
   input.obligation.level = 2; input.fills = []; refusedAs(extract(input), "result_slice_unfilled");
   input.fills = source().fills; input.fills[0]!.source = "identity"; refusedAs(extract(input), "result_slice_unfilled");
   input.fills[0]!.source = "accepted"; input.fills[0]!.obligation = "foreign"; refusedAs(extract(input), "result_slice_unfilled");
@@ -527,6 +585,35 @@ function identityFixture(t: TestContext, research = false, options: { thirdPort?
     reopen() { store.close(); store = new Store(database); } };
 }
 
+test("different result obligations share one exact C5 history per operation and read it again after the operation", t => {
+  const fixture = identityFixture(t), acceptance = fixture.acceptance;
+  const fills = fixture.store.get<{ fills: FrameFill[] }>(acceptance.frame.id, acceptance.frame.revision)!.value.fills;
+  const other = fills.find(fill => fill.source === "accepted" && fill.obligation !== fixture.obligation)?.obligation;
+  assert.ok(other, "The real accepted frame supplies a second complete obligation");
+  let reads = 0;
+  const store = new Proxy(fixture.store, { get(target, property) {
+    if (property === "get") return (id: string, revision?: number) => { reads++; return target.get(id, revision); };
+    const member: unknown = Reflect.get(target, property, target); return typeof member === "function" ? member.bind(target) : member;
+  } });
+  const read = (obligation: string) => delivered(readResultIdentity(store, { acceptance, obligation }));
+  const results = withHistoricalReads(() => {
+    const first = read(fixture.obligation), afterFirst = reads;
+    assert.ok(afterFirst > 0);
+    const second = read(other);
+    assert.equal(reads, afterFirst, "A different obligation must reuse the exact acceptance history, not unfold C5 again");
+    assert.deepEqual(read(fixture.obligation), first);
+    assert.equal(reads, afterFirst);
+    assert.notEqual(second.key, first.key, "Only shared sources are cached; each obligation still gets its own content identity");
+    return { first, second };
+  });
+  const beforeNext = reads;
+  assert.deepEqual(read(other), results.second);
+  assert.ok(reads > beforeNext, "A completed external operation must not retain its proof cache");
+  fixture.reopen();
+  assert.deepEqual(delivered(readResultIdentity(fixture.store, { acceptance, obligation: fixture.obligation })), results.first);
+  assert.deepEqual(delivered(readResultIdentity(fixture.store, { acceptance, obligation: other })), results.second);
+});
+
 test("shared C5/C2 identity survives technical acceptance, editorial changes, typed rename chains and A→B→A after restart", t => {
   const fixture = identityFixture(t), read = (acceptance: AcceptedFrameRequest) => delivered(readResultIdentity(fixture.store, { acceptance, obligation: fixture.obligation }));
   const original = read(fixture.acceptance);
@@ -650,6 +737,7 @@ test("identity accepts no caller content, mappings, keys, forged sources, unsupp
   for (const field of ["key", "graph", "mapping", "names"])
     refusedAs(invoke(fixture.store, { ...request, [field]: {} }), "result_identity_invalid");
   refusedAs(invoke(fixture.store, { ...request, acceptance: { ...fixture.acceptance, level: 3 } }), "result_identity_invalid");
+  refusedAs(invoke(fixture.store, { ...request, acceptance: { ...fixture.acceptance, level: 4 } }), "result_identity_invalid");
   refusedAs(readResultIdentity(fixture.store, { ...request, obligation: "unknown" }), "result_identity_unfilled");
   const forged = readResultIdentity(fixture.store, { ...request, acceptance: { ...fixture.acceptance,
     graph: { ...fixture.acceptance.graph, hash: hashJson("forged") } } });

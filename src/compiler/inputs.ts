@@ -43,6 +43,57 @@ export function requireCompatibleReceipt(receipt: Revision<ArtifactReceipt> | nu
   return receipt;
 }
 
+/** An external input is saved evidence, not an execution receipt. Historical reads use only its exact stored bytes. */
+export function resolveExternalSource(store: Store, project: string, graph: Graph, artifactId: string,
+  source: Ref, current: boolean): Pick<TaskInput, "receipt" | "source"> {
+  const address = (field: string) => ({ unit: "compiler/inputs", target: text(artifactId) ? artifactId : "external-source", field });
+  const invalid = (field: string): never => { throw new EngineError("external_source_request_invalid",
+    "External source resolution needs well-formed arguments and a declared external artifact contract", address(field)); };
+  const missing = (field: string): never => { throw new EngineError("external_input_missing",
+    "External artifact needs a verified source with the same ID", address(field)); };
+  if (!(store instanceof Store)) invalid("store");
+  if (!text(project)) invalid("project");
+  if (!text(artifactId)) invalid("artifactId");
+  if (!isRef(source)) invalid("source");
+  if (typeof current !== "boolean") invalid("current");
+  if (!object(graph) || !receiptGraphShapes[graph.version === 2 ? 1 : 0]!(graph)) invalid("graph");
+  const artifact = graph.artifacts.find(item => item.id === artifactId);
+  if (!artifact) return invalid("artifactId");
+  if (!artifact.external) invalid(`graph.artifacts.${artifact.id}.external`);
+  const contract = graph.contracts.find(item => item.id === artifact.contract);
+  if (!contract) return invalid(`graph.artifacts.${artifact.id}.contract`);
+  const matches = (() => {
+    try { return new Ajv({ strict: true }).compile(contract.schema as object); }
+    catch { return invalid(`graph.contracts.${contract.id}.schema`); }
+  })();
+  if (source.id !== `source:${project}:${artifact.id}`) missing("source.id");
+  const record = store.get<Source>(source.id, source.revision);
+  if (!record || !isRef(record) || record.id !== source.id || record.revision !== source.revision
+    || record.hash !== source.hash || record.kind !== "source" || !object(record.value)) return missing("source");
+  const value = record.value;
+  if (value.projectId !== project || typeof value.content !== "string" || typeof value.sha256 !== "string"
+    || !["text/plain", "application/json"].includes(value.mediaType) || !object(value.origin)
+    || !["file", "owner-document"].includes(value.origin.kind) || typeof value.origin.location !== "string")
+    missing("source.value");
+  let canonicalHash: string;
+  try { canonicalHash = hashJson(value); }
+  catch { return missing("source.value"); }
+  if (canonicalHash !== record.hash || digest(value.content) !== value.sha256) missing("source.hash");
+  if (current) {
+    const head = store.get(source.id);
+    if (!head || head.kind !== "source" || head.revision !== source.revision || head.hash !== source.hash)
+      missing("source.current");
+    if (!sourceIsCurrent(value)) missing("source.current");
+  }
+  let content: unknown = value.content;
+  if (value.mediaType === "application/json") {
+    try { content = JSON.parse(value.content); }
+    catch { throw new EngineError("artifact_contract_mismatch", "External source does not match its contract", address("source.content")); }
+  }
+  if (!matches(content)) throw new EngineError("artifact_contract_mismatch", "External source does not match its contract", address("source.content"));
+  return { receipt: null, source: reference(record) };
+}
+
 export function resolveArtifact(store: Store, project: string, graph: Graph, repository: RepositoryState,
   producerId: string, artifactId: string, sealed?: Ref[]): Pick<TaskInput, "receipt" | "source"> {
           const read = <T>(id: string): Revision<T> | null => {
@@ -54,14 +105,10 @@ export function resolveArtifact(store: Store, project: string, graph: Graph, rep
             return record;
           };
           const artifact = graph.artifacts.find(artifact => artifact.id === artifactId)!;
-          const contract = graph.contracts.find(contract => contract.id === artifact.contract)!;
           if (artifact.external) {
             const source = read<Source>(`source:${project}:${artifact.id}`);
-            requireCondition(source && source.kind === "source" && source.value.projectId === project
-              && (sealed ? digest(source.value.content) === source.value.sha256 : sourceIsCurrent(source.value)), "external_input_missing", "External artifact needs a verified source with the same ID");
-            const value = source.value.mediaType === "application/json" ? JSON.parse(source.value.content) : source.value.content;
-            requireCondition(new Ajv({ strict: true }).compile(contract.schema as object)(value), "artifact_contract_mismatch", "External source does not match its contract");
-            return { receipt: null, source: reference(source) };
+            requireCondition(source, "external_input_missing", "External artifact needs a verified source with the same ID");
+            return resolveExternalSource(store, project, graph, artifactId, reference(source), sealed === undefined);
           } else {
             const receipt = requireCompatibleReceipt(read<ArtifactReceipt>(receiptId(project, artifact.id)), project, graph, producerId, artifactId);
             const producer = graph.nodes.find(item => item.id === producerId)!;

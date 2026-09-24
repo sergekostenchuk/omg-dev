@@ -8,8 +8,10 @@ import { Store } from "../storage/store.js";
 import { normalizeAnswerContract, type AnswerQuestionContract } from "./accepted-answer.js";
 import { readAcceptedFrame, type AcceptedFrameRequest } from "./frame-accept.js";
 import { readCandidate } from "./frame-candidate.js";
-import { readFrame, type FrameFill, type FrameObligation, type FrameRead } from "./frame-obligations.js";
+import { readFrame, workFillCode, type FrameFill, type FrameObligation, type FrameRead } from "./frame-obligations.js";
 import type { ProposalReplacement } from "./frame-proposals.js";
+import type { OmRebasedFrame } from "./layer-basis.js";
+import { historicalRead, withHistoricalReads } from "./input.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 
 export const RESULT_SLICE_REFUSAL_CODES = Object.freeze([
@@ -65,7 +67,7 @@ type Part = typeof parts[number];
 export type ResultDependencyGraph = Pick<Graph, "version" | Part>;
 export interface ResultDependencySlice {
   version: 1;
-  level: 2;
+  level: 2 | 3;
   obligation: FrameObligation;
   fills: FrameFill[];
   graph: ResultDependencyGraph;
@@ -96,18 +98,26 @@ function requireInputs(graph: unknown, obligation: unknown, fills: unknown): ass
     || !text(obligation["upper"]["node"]) || !keys(obligation["upper"], ["node", "port"])
     || !text(obligation["artifact"]) || !["horizon", "outside"].includes(obligation["zone"] as string)
     || !keys(obligation, ["id", "level", "kind", "upper", "artifact", "zone", "connector", "role", "flow"])) invalid("obligation");
-  if (obligation["level"] !== 2) reject("result_slice_level_unsupported", obligation["id"], "level", "Result dependency extraction is defined for N=2");
+  if (obligation["level"] !== 2 && obligation["level"] !== 3)
+    reject("result_slice_level_unsupported", obligation["id"], "level", "Result dependency extraction is defined for N=2 and N=3");
   if (obligation["kind"] === "connection-end") {
     if (!text(obligation["upper"]["port"]) || !text(obligation["connector"]) || !text(obligation["flow"])
       || !["producer", "consumer"].includes(obligation["role"] as string)) invalid("obligation.connection");
-  } else if (obligation["kind"] !== "block-outcome" || ["connector", "role", "flow"].some(key => Object.hasOwn(obligation, key))
+  } else if (obligation["kind"] !== (obligation["level"] === 2 ? "block-outcome" : "operation-outcome")
+    || ["connector", "role", "flow"].some(key => Object.hasOwn(obligation, key))
     || Object.hasOwn(obligation["upper"], "port")) invalid("obligation.outcome");
   if (!Array.isArray(fills) || !fills.every(fill => object(fill) && text(fill["obligation"]) && text(fill["node"])
     && (!Object.hasOwn(fill, "port") || text(fill["port"])) && ["accepted", "identity"].includes(fill["source"] as string)
-    && isRef(fill["basis"]) && keys(fill, ["obligation", "node", "port", "source", "basis"]))) invalid("fills");
+    && isRef(fill["basis"]) && keys(fill, ["obligation", "node", "port", "source", "basis", ...(obligation["level"] === 3 ? ["codeRef"] : [])]))) invalid("fills");
   if (!fills.length || fills.some(fill => fill.obligation !== obligation["id"] || fill.source !== "accepted"))
     reject("result_slice_unfilled", obligation["id"], "fills", "Only the complete real fills of this obligation supply result dependencies");
   if (fills.some(fill => obligation["kind"] === "connection-end" ? !text(fill.port) : Object.hasOwn(fill, "port"))) invalid("fills.port");
+  if (obligation["level"] === 3) for (const fill of fills) {
+    if (obligation["kind"] !== "connection-end") {
+      if (Object.hasOwn(fill, "codeRef")) invalid("fills.codeRef");
+    } else if (!object(fill.codeRef) || !(graph as unknown as Graph).nodes.find(node => node.id === fill.node)?.code
+      .some(code => canonical(code) === canonical(fill.codeRef))) invalid("fills.codeRef");
+  }
 }
 
 // Only explicitly unordered collections are sorted. Schema arrays, command arguments,
@@ -167,7 +177,7 @@ function dependencies(graph: Graph, obligation: FrameObligation, fills: readonly
   if (obligation.connector !== undefined) add("connectors", obligation.connector, obligation.id, "connector");
   for (const fill of fills) {
     const node = add("nodes", fill.node, obligation.id, "fills.node") as Graph["nodes"][number];
-    if (node.kind !== "operation") invalid("fills.node");
+    if (node.kind !== (obligation.level === 2 ? "operation" : "work")) invalid("fills.node");
     if (fill.port !== undefined) endpoint(fill.node, fill.port, obligation.id, "fills");
   }
   // Reverse associations are rooted in this fill and its upper obligation, not every
@@ -255,7 +265,7 @@ function dependencies(graph: Graph, obligation: FrameObligation, fills: readonly
 }
 
 /** Dependency material only, not acceptance or a result key. The caller supplies the
- * complete C2-verified fills for one accepted N=2 obligation. IDs, provenance, optional
+ * complete C2-verified fills for one accepted N=2 or N=3 obligation. IDs, provenance, optional
  * field presence and all selected definitions are retained; no text field is excluded.
  * This deliberately neither projects the input graph nor interprets replacement prose. */
 export function extractResultSlice(graph: Graph, obligation: FrameObligation, fills: readonly FrameFill[]): OmResult<Sealed<ResultDependencySlice>> {
@@ -263,7 +273,7 @@ export function extractResultSlice(graph: Graph, obligation: FrameObligation, fi
     const input = sealed({ graph, obligation, fills });
     requireInputs(input.graph, input.obligation, input.fills);
     const source = input as unknown as { graph: Graph; obligation: FrameObligation; fills: FrameFill[] };
-    return delivered<ResultDependencySlice>({ version: 1, level: 2, obligation: source.obligation, fills: sorted(source.fills),
+    return delivered<ResultDependencySlice>({ version: 1, level: source.obligation.level, obligation: source.obligation, fills: sorted(source.fills),
       graph: dependencies(source.graph, source.obligation, source.fills) });
   } catch (error) {
     if (error instanceof SliceFailure) return { ok: false, refusal: error.refusal };
@@ -277,14 +287,15 @@ export function extractResultSlice(graph: Graph, obligation: FrameObligation, fi
 type StructuralNode = Omit<Graph["nodes"][number], "title" | "purpose" | "benefit" | "beneficiary">;
 export interface ResultContent {
   obligation: Omit<FrameObligation, "id" | "zone">;
-  fills: Pick<FrameFill, "node" | "port">[];
+  fills: Pick<FrameFill, "node" | "port" | "codeRef">[];
   graph: Omit<ResultDependencyGraph, "nodes"> & { nodes: StructuralNode[] };
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new SliceFailure(result.refusal); return result.value; }
 function contentOf(graph: Graph, obligation: FrameObligation, fills: readonly FrameFill[]): ResultContent {
   const slice = dependencies(graph, obligation, fills, false);
   const { id: _id, zone: _zone, ...upper } = obligation;
-  return { obligation: upper, fills: sorted(fills.map(fill => ({ node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) }))),
+  return { obligation: upper, fills: sorted(fills.map(fill => ({ node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }),
+    ...(obligation.level === 3 && fill.codeRef !== undefined ? { codeRef: fill.codeRef } : {}) }))),
     graph: { ...slice, nodes: sorted(slice.nodes.map(node => {
       const { title: _title, purpose: _purpose, benefit: _benefit, beneficiary: _beneficiary, ...structure } = node;
       return structure;
@@ -492,7 +503,7 @@ function renamed(content: ResultContent, map: Renames): ResultContent {
     ...(graph.transfers === undefined ? {} : { transfers: graph.transfers.map(value => ({ ...value, from: node(value.from), to: node(value.to) })) }),
     ...(graph.packets === undefined ? {} : { packets: graph.packets.map(value => ({ ...value, unit: node(value.unit) })) }),
   };
-  // The upper obligation is immutable in the accepted N=2 transition. Lower
+  // The upper obligation is immutable in an accepted same-level transition. Lower
   // mappings must never silently rewrite its upper address, connector or flow.
   return { obligation: content.obligation,
     fills: sorted(content.fills.map(fill => fill.port === undefined ? { node: node(fill.node) } : endpoint(fill as Address))),
@@ -500,23 +511,42 @@ function renamed(content: ResultContent, map: Renames): ResultContent {
 }
 function snapshot(frame: FrameRead, obligationId: string): { obligation: FrameObligation; fills: FrameFill[]; content: ResultContent } | null {
   const obligation = frame.result.obligations.find(value => value.id === obligationId);
-  const fills = frame.result.fills.filter(fill => fill.obligation === obligationId);
+  let fills = frame.result.fills.filter(fill => fill.obligation === obligationId);
   if (!frame.accepted || !obligation || frame.result.open.some(value => value.id === obligationId)
     || !fills.length || fills.some(fill => fill.source !== "accepted")) return null;
+  if (obligation.level === 3 && obligation.kind === "connection-end") fills = fills.map(fill => {
+    const codeRef = take(workFillCode(frame.upper, frame.accepted!, obligation, fill));
+    if (fill.codeRef !== undefined && canonical(codeRef) !== canonical(fill.codeRef))
+      reject("result_identity_unfilled", obligation.id, "fills.codeRef", "An accepted work result retains its exact proved code endpoint");
+    // Native predecessors keep their own frame format. Their endpoint is inferred
+    // by the same checked C2 flow reader, never selected from Node.code by position.
+    return { ...fill, codeRef };
+  });
   return { obligation, fills, content: take(normalizeResultContent(frame.accepted.graph, obligation, fills)) as ResultContent };
 }
 function identityInputs(store: unknown, request: unknown): asserts request is ResultIdentityRequest {
   if (!(store instanceof Store) || !object(request) || !text(request["obligation"]) || !keys(request, ["acceptance", "obligation"]))
     reject("result_identity_invalid", "result", "request", "Identity reads require a store and one exact accepted obligation");
   const acceptance = request["acceptance"];
-  if (!object(acceptance) || !text(acceptance["project"]) || acceptance["level"] !== 2
+  if (!object(acceptance) || !text(acceptance["project"]) || ![2, 3].includes(acceptance["level"] as number)
     || !["graph", "layer", "frame"].every(field => isRef(acceptance[field]))
     || !keys(acceptance, ["project", "level", "graph", "layer", "frame"]))
-    reject("result_identity_invalid", "result", "acceptance", "Identity reads require an exact N=2 acceptance request");
+    reject("result_identity_invalid", "result", "acceptance", "Identity reads require an exact N=2 or N=3 acceptance request");
+  const value = acceptance as unknown as AcceptedFrameRequest;
+  if (value.graph.id !== `graph:${value.project}` || value.layer.id !== `graph-layer:${value.project}:${value.level}`
+    || value.frame.id !== `om-frame:${value.project}:${value.level}`)
+    reject("result_identity_invalid", "result", "acceptance", "The acceptance addresses must name this exact project and level");
 }
 function identityHistory(store: Store, request: ResultIdentityRequest): { steps: IdentityStep[]; references: Ref[] } {
+  const acceptance = request.acceptance;
+  return historicalRead(store, { reader: "D2.resultIdentityHistory", project: acceptance.project, ref: acceptance.frame,
+    parameters: { project: acceptance.project, level: acceptance.level, graph: { ...acceptance.graph },
+      layer: { ...acceptance.layer }, frame: { ...acceptance.frame } } },
+  () => deriveIdentityHistory(store, acceptance), () => ambiguous(acceptance.frame.id, "history"));
+}
+function deriveIdentityHistory(store: Store, initial: AcceptedFrameRequest): { steps: IdentityStep[]; references: Ref[] } {
   const reverse: IdentityStep[] = [], references: Ref[] = [], seen = new Set<string>();
-  let acceptance = request.acceptance;
+  let acceptance = initial;
   for (;;) {
     const key = canonical(acceptance);
     if (seen.has(key)) ambiguous(acceptance.frame.id, "history");
@@ -525,12 +555,35 @@ function identityHistory(store: Store, request: ResultIdentityRequest): { steps:
     if (!accepted.graph || !accepted.layer || !accepted.frame)
       reject("result_identity_unfilled", acceptance.frame.id, "acceptance", "The event must retain its accepted graph, layer and frame");
     const candidate = take(readCandidate(store, { project: acceptance.project, candidate: accepted.frame.value.acceptance.candidate }));
-    const previous = candidate.value.request.frame;
-    const before = take(readFrame(store, previous as FrameRead["request"])) as FrameRead;
+    let previous = candidate.value.request.frame as FrameRead["request"];
+    let before = take(readFrame(store, previous)) as FrameRead;
     const frame = take(readFrame(store, { ...previous, graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame } as FrameRead["request"])) as FrameRead;
     references.push(...frame.references, ...before.references, reference(candidate), ...accepted.proposals.map(reference),
       ...candidate.value.proposals, acceptance.graph, acceptance.layer, acceptance.frame);
     reverse.push({ frame, before, replacements: accepted.proposals.flatMap(value => value.value.replaces) as ProposalReplacement[] });
+    if (previous.level === 3) {
+      // A rebase is a proved transport of the old mapping, not a new C5 event.
+      // readFrame has already checked its complete saved request and derivation.
+      // Follow that exact predecessor rather than asking readAcceptedFrame to
+      // interpret the rebase as a candidate acceptance.
+      while (before.accepted?.frame && Object.hasOwn(before.accepted.frame.value, "rebase")) {
+        const carried = before.accepted.frame.value as OmRebasedFrame;
+        const key = canonical({ project: previous.project, level: previous.level,
+          graph: previous.graph, layer: previous.layer, frame: previous.frame });
+        if (seen.has(key)) ambiguous(before.accepted.frame.reference.id, "history");
+        seen.add(key);
+        previous = carried.rebase.from;
+        const older = take(readFrame(store, previous)) as FrameRead;
+        references.push(...older.references);
+        reverse.push({ frame: before, before: older, replacements: [] });
+        before = older;
+      }
+      // A checked native layer, with or without its optional mapped C2 frame,
+      // is the root; it does not need an invented OM candidate acceptance.
+      if (!before.accepted?.frame || !Object.hasOwn(before.accepted.frame.value, "acceptance")) {
+        reverse.push({ frame: before, before: null, replacements: [] }); break;
+      }
+    }
     if (previous.frame === null) {
       reverse.push({ frame: before, before: null, replacements: [] }); break;
     }
@@ -541,6 +594,9 @@ function identityHistory(store: Store, request: ResultIdentityRequest): { steps:
 }
 /** Shared supplier-independent identity, derived only from exact C5/C2 history. */
 export function readResultIdentity(store: Store, request: ResultIdentityRequest): OmResult<Sealed<ResultIdentity>> {
+  return withHistoricalReads(() => readResultIdentityInScope(store, request));
+}
+function readResultIdentityInScope(store: Store, request: ResultIdentityRequest): OmResult<Sealed<ResultIdentity>> {
   try {
     identityInputs(store, request);
     request = sealed(request) as ResultIdentityRequest;
