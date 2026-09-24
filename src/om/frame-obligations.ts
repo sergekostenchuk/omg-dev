@@ -162,7 +162,8 @@ function acceptsFlowAnchor(upper: Graph, graph: Graph, flow: FrameFlow, binding:
     && graph.tests.some(test => test.id === anchor.test) && !!connector?.wakeTest && graph.tests.some(test => test.id === connector.wakeTest);
 }
 interface FlowFault { connector: string; message: string; obligations: string[] }
-function flowFaults(upper: Graph, graph: Graph, obligations: FrameObligation[], rows: Map<string, FrameFill[]>, level: FrameLevel,
+type FlowFill = Omit<FrameFill, "basis">;
+function flowFaults(upper: Graph, graph: Graph, obligations: FrameObligation[], rows: Map<string, FlowFill[]>, level: FrameLevel,
   partial: boolean, works = false, assignedFlow?: (flow: FrameFlow, delivery: Binding) => void): FlowFault[] {
   const faults: FlowFault[] = [];
   const flows = upperFlows(upper, level).map(flow => {
@@ -231,7 +232,7 @@ function checkFlowCorrespondence(upper: Graph, graph: Graph, obligations: FrameO
   const first = flowFaults(upper, graph, obligations, rows, level, partial, works)[0];
   if (first) frameReject(code, target, first.connector, first.message);
 }
-function fillMismatch(upper: Graph, graph: Graph, obligation: FrameObligation | undefined, row: FrameFill, level: FrameLevel,
+function fillMismatch(upper: Graph, graph: Graph, obligation: FrameObligation | undefined, row: FlowFill, level: FrameLevel,
   relations: RefinementRelations, works = false): string | null {
   const node = graph.nodes.find(item => item.id === row.node);
   if (!obligation || !node || LEVEL[node.kind] !== level || !relations.refines(node.id, obligation.upper.node))
@@ -336,6 +337,80 @@ function historicalFills(upper: Graph, graph: Graph, obligation: FrameObligation
   }
   return preserveCode ? result : [...new Map(result.map(endpoint => [canonical([endpoint.node, endpoint.port]), endpoint])).values()];
 }
+/** Pure correspondence projection; it neither admits a layer nor supplies acceptance provenance. */
+export interface FrameFlowSource {
+  obligations: FrameObligation[]; fills: FlowFill[] | null; worksContract?: typeof WORKS_FRAME_CONTRACT;
+}
+export interface FrameFlowRead {
+  upper: Binding;
+  ends: { role: "producer" | "consumer"; upper: Endpoint; lower: Endpoint }[];
+}
+export function readFrameFlow(upper: Graph, graph: Graph, source: FrameFlowSource, connector: string,
+  binding: Binding): OmResult<Sealed<FrameFlowRead>> {
+  requireFrameGraph(upper, "upper"); requireFrameGraph(graph, "graph"); requireFlow(binding);
+  const level = binding.level; requireFrameLevel(level);
+  if (!frameText(connector) || !frameObject(source) || !Array.isArray(source.obligations)
+    || !source.obligations.every(item => isFrameObligation(item, level))
+    || (Object.hasOwn(source, "worksContract") && (level !== 3 || source.worksContract !== WORKS_FRAME_CONTRACT))
+    || (source.fills !== null && (!Array.isArray(source.fills) || !source.fills.every(row => frameObject(row)
+      && frameText(row.obligation) && frameText(row.node) && ["accepted", "identity"].includes(row.source)
+      && (!Object.hasOwn(row, "port") || frameText(row.port))
+      && (!Object.hasOwn(row, "codeRef") || frameCodeShape(row.codeRef)))))) frameInvalid("flow.source", connector);
+  return frameResult(() => {
+    upper = frameCopy(upper); graph = frameCopy(graph); source = frameCopy(source); binding = frameCopy(binding);
+    const upperConnector = upper.connectors.find(item => item.id === connector), lowerConnector = graph.connectors.find(item => item.id === connector);
+    if (!upperConnector || !lowerConnector || upperConnector.artifact !== lowerConnector.artifact
+      || !upperConnector.bindings.some(item => item.level === level - 1))
+      frameReject("frame_record_invalid", connector, "connector", "The whole flow needs the same connection at both levels");
+    // Other connections may still be open in a partial accepted frame. This query proves this connection only.
+    upper = { ...upper, connectors: [upperConnector] }; graph = { ...graph, connectors: [lowerConnector] };
+    const obligations = obligationsOf(upper, { nodes: [], excluded: [], hash: hashJson([]) }, level)
+      .filter(item => item.kind === "connection-end");
+    const supplied = source.obligations.filter(item => item.connector === connector);
+    if (canonical(frameSorted(supplied.map(obligationContent))) !== canonical(frameSorted(obligations.map(obligationContent))))
+      frameReject("frame_record_invalid", connector, "obligations", "The flow must retain every exact upper-end obligation");
+    const rows = new Map<string, FlowFill[]>(), relations = new RefinementRelations(graph);
+    if (source.fills?.some(row => !source.obligations.some(item => item.id === row.obligation)))
+      frameReject("frame_record_invalid", connector, "fills", "A flow fill must name its declared obligation");
+    for (const obligation of obligations) {
+      const entries: FlowFill[] = source.fills === null
+        ? historicalFills(upper, graph, obligation, level, relations, true).map(endpoint => ({
+          obligation: obligation.id, node: endpoint.node, port: endpoint.port, source: "accepted",
+          ...(source.worksContract && endpoint.codeRef ? { codeRef: endpoint.codeRef } : {}),
+        }))
+        : source.fills.filter(row => row.obligation === obligation.id);
+      for (const row of entries) {
+        const mismatch = fillMismatch(upper, graph, obligation, row, level, relations, source.worksContract === WORKS_FRAME_CONTRACT);
+        if (mismatch) frameReject("frame_record_invalid", connector, obligation.id, mismatch);
+      }
+      if (source.fills !== null && new Set(entries.map(frameEndpointKey)).size !== entries.length)
+        frameReject("frame_record_invalid", connector, obligation.id, "The same recorded flow endpoint is duplicated");
+      // Historical inference can encounter the same end in several physical deliveries of one flow.
+      rows.set(obligation.id, source.fills === null
+        ? [...new Map(entries.map(row => [canonical(row), row])).values()] : entries);
+    }
+    const group = lowerConnector.bindings.filter(item => item.level === level && flowKey(item) === flowKey(binding));
+    const grouped = group.length ? { ...group[0]!, consumers: frameSorted(group.flatMap(item => item.consumers)) } : null;
+    const normalized = (item: Binding) => ({ ...item, consumers: frameSorted(item.consumers) });
+    if (!group.some(item => canonical(normalized(item)) === canonical(normalized(binding)))
+      && canonical(grouped) !== canonical(normalized(binding)))
+      frameReject("frame_record_invalid", connector, "binding", "The query must name an exact lower binding or its complete grouped flow");
+    const assigned = new Map<string, FrameFlow>();
+    const faults = flowFaults(upper, graph, obligations, rows, level, true, source.worksContract === WORKS_FRAME_CONTRACT,
+      (flow, delivery) => { if (flowKey(delivery) === flowKey(binding)) assigned.set(flow.key, flow); });
+    if (faults.length) frameReject("frame_record_invalid", connector, "flow", faults[0]!.message);
+    if (assigned.size !== 1) frameReject("accepted_binding_ambiguous", connector, "flow",
+      "The requested lower flow requires exactly one upper flow");
+    const flow = [...assigned.values()][0]!;
+    const ends: FrameFlowRead["ends"] = obligations.filter(item => item.flow === flow.key).flatMap(obligation =>
+      (rows.get(obligation.id) ?? []).map(row => ({ role: obligation.role!,
+        upper: { node: obligation.upper.node, port: obligation.upper.port! },
+        lower: { node: row.node, port: row.port!, ...(row.codeRef ? { codeRef: row.codeRef } : {}) },
+      })));
+    return { upper: { level: level - 1 as 1 | 2, producer: flow.producer, consumers: flow.consumers, anchor: flow.anchor }, ends };
+  });
+}
+
 /** Extract code only at a new-candidate boundary; this does not admit an accepted layer or change historical fills. */
 export function workFillCode(upper: Graph, accepted: AcceptedFrame, obligation: FrameObligation, fill: FrameFill): OmResult<Sealed<CodeRef>> {
   requireFrameGraph(upper, "upper");
