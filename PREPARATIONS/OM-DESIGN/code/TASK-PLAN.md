@@ -972,11 +972,12 @@
 - Отдаёт: G5 · Ворота атомарности; Записи OM в SQLite; F7.2 · каркас работ
 - Читает записи: принятый граф уровня операций; om-horizon; connection-frame уровня 2
 - Пишет записи: —
-- Разрешённые пути: `src/om/work-zone.ts`, `test/om-work-zone.test.ts`
+- Разрешённые пути: `src/om/work-zone.ts`, `test/om-work-zone.test.ts`, `src/om/frame-obligations.ts`, `test/om-frame-obligations.test.ts`
 - Из движка как есть: RefinementRelations — src/graph/relations.ts; C2
 - Пробный код (сценарии, не код к переносу): proto/works.mjs — workZone
-- После: C5
+- После: C5, D3
 - Тесты сверх обязательных:
+  - один вывод зоны (вопрос воркера №606, урок 25, решение оркестратора): чистый workZone в work-zone.ts; C2 (frameSources, frame-obligations.ts:551–558) вызывает его вместо своей формулы; в C2 передаётся проекция ПРИНЯТОГО L2, чтобы непринятые нижние узлы не создавали ложный путь refines (класс, закрытый в D7); сохраняемые источники F1 читает через readFrame(level=2), текущий допуск — prepareFrame(level=2) с полными guards; L3 и отдельный алгоритм принятия не требуются; исторический слой без frame — по своему договору; horizon_execution_missing — явно. Регрессия: первый C5 с прежним горизонтом (refinement:null) → F1; F1 и C2 дают одну зону, включая realizes и исключение identity/available; непринятый нижний узел не расширяет зону ни в F1, ни в C2
   - блок с execution available в зону не входит: повторное исполнение не выводится
   - операция, реализующая роль другой операции (realizes), попадает в зону блока, который уточняет
 
