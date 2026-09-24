@@ -1,13 +1,47 @@
 import { Ajv } from "ajv";
 import { Store, type Revision } from "../storage/store.js";
 import type { Graph } from "../graph/model.js";
+import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { git, type RepositoryState } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
-import { requireCondition } from "../errors.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { hashJson, digest } from "../canonical.js";
 import { receiptId, nodeSignature, type ArtifactReceipt, type TaskInput, type MachinePlan } from "./model.js";
+
+const graphShapes = new Ajv({ strict: true, allowUnionTypes: true });
+const receiptGraphShapes = [graphShapes.compile<Graph>(graphSchema), graphShapes.compile<Graph>(graphV2Schema)];
+const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+
+/** Compatibility with a graph only; the caller reads the exact record and establishes its execution proof. */
+export function requireCompatibleReceipt(receipt: Revision<ArtifactReceipt> | null, project: string, graph: Graph,
+  producerId: string, artifactId: string): Revision<ArtifactReceipt> {
+  const invalid = (field: string): never => { throw new EngineError("receipt_compatibility_invalid",
+    "Receipt compatibility needs well-formed arguments and resolvable graph addresses",
+    { unit: "compiler/inputs", target: text(artifactId) ? artifactId : "artifact-receipt", field }); };
+  if (!text(project)) invalid("project");
+  if (!text(producerId)) invalid("producerId");
+  if (!text(artifactId)) invalid("artifactId");
+  if (!object(graph) || !receiptGraphShapes[graph.version === 2 ? 1 : 0]!(graph)) invalid("graph");
+  if (receipt !== null && (!object(receipt) || !isRef(receipt) || !text(receipt.kind) || !object(receipt.value))) invalid("receipt");
+  const artifact = graph.artifacts.find(artifact => artifact.id === artifactId);
+  if (!artifact) return invalid("artifactId");
+  const contract = graph.contracts.find(contract => contract.id === artifact.contract);
+  if (!contract) return invalid(`graph.artifacts.${artifact.id}.contract`);
+  const producer = graph.nodes.find(item => item.id === producerId);
+  if (!producer) return invalid("producerId");
+  if (!graph.artifacts.some(item => item.id === producer.outcome)) invalid(`graph.nodes.${producer.id}.outcome`);
+  // nodeContext also reads contracts of the producer's other outputs; shape validation cannot prove these references.
+  const contracts = new Set(graph.contracts.map(item => item.id));
+  for (const output of graph.artifacts) if (!contracts.has(output.contract))
+    invalid(`graph.artifacts.${output.id}.contract`);
+  requireCondition(receipt && receipt.kind === "artifact" && receipt.value.projectId === project && receipt.value.artifact === artifact.id && receipt.value.node === producer.id
+    && receipt.value.signature === nodeSignature(graph, producer) && receipt.value.contractHash === hashJson(contract.schema),
+  "producer_not_ready", "A producer outside this horizon needs a compatible committed artifact");
+  return receipt;
+}
 
 export function resolveArtifact(store: Store, project: string, graph: Graph, repository: RepositoryState,
   producerId: string, artifactId: string, sealed?: Ref[]): Pick<TaskInput, "receipt" | "source"> {
@@ -29,11 +63,8 @@ export function resolveArtifact(store: Store, project: string, graph: Graph, rep
             requireCondition(new Ajv({ strict: true }).compile(contract.schema as object)(value), "artifact_contract_mismatch", "External source does not match its contract");
             return { receipt: null, source: reference(source) };
           } else {
-            const receipt = read<ArtifactReceipt>(receiptId(project, artifact.id));
+            const receipt = requireCompatibleReceipt(read<ArtifactReceipt>(receiptId(project, artifact.id)), project, graph, producerId, artifactId);
             const producer = graph.nodes.find(item => item.id === producerId)!;
-            requireCondition(receipt && receipt.kind === "artifact" && receipt.value.projectId === project && receipt.value.artifact === artifact.id && receipt.value.node === producer.id
-              && receipt.value.signature === nodeSignature(graph, producer) && receipt.value.contractHash === hashJson(contract.schema),
-            "producer_not_ready", "A producer outside this horizon needs a compatible committed artifact");
             git(repository.root, ["merge-base", "--is-ancestor", receipt.value.commit, repository.head]);
             requireCondition(git(repository.root, ["rev-parse", `${receipt.value.commit}^{tree}`]) === receipt.value.tree,
               "artifact_foreign", "Artifact commit and tree disagree");

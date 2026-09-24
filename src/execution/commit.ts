@@ -1,6 +1,7 @@
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { git, type Environment, type ExecutionRoot } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
+import { prepareWriterIndex } from "../ownership/writer-index.js";
 import { digest, hashJson } from "../canonical.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -66,9 +67,11 @@ export function finishCommit(store: Store, root: Revision<ExecutionRoot>, run: R
   requireWorktree(root.value, run.value.commit);
   const accepted: TaskRun = { ...run.value, state: "committed", child: null, updatedAt: Date.now() };
   const acceptedRef = { id: run.id, revision: run.revision + 1, hash: hashJson(accepted) };
+  const rootWrite: Write = { id: root.id, kind: root.kind, expected: root.revision, value: { ...root.value, head: run.value.commit } };
+  const acceptedRoot: Revision<ExecutionRoot> = { id: rootWrite.id, kind: rootWrite.kind, revision: rootWrite.expected + 1,
+    hash: hashJson(rootWrite.value), value: rootWrite.value as ExecutionRoot };
   const writes: Write[] = [
-    { id: run.id, kind: run.kind, expected: run.revision, value: accepted },
-    { id: root.id, kind: root.kind, expected: root.revision, value: { ...root.value, head: run.value.commit } },
+    { id: run.id, kind: run.kind, expected: run.revision, value: accepted }, rootWrite,
   ];
   const files = task.writePaths.map(path => { const bytes = treeFile(root.value.path, run.value.commit!, path); return { path, hash: bytes === null ? null : digest(bytes) }; });
   for (const output of run.value.artifacts) {
@@ -80,5 +83,10 @@ export function finishCommit(store: Store, root: Revision<ExecutionRoot>, run: R
       value: { files }, plan: run.value.plan, run: acceptedRef };
     writes.push({ id, kind: "artifact", expected: old?.revision ?? 0, value });
   }
-  return store.writeMany<TaskRun>(writes)[0]!;
+  const writerGuards: Ref[] = [];
+  for (const path of new Set(task.writePaths)) {
+    const index = prepareWriterIndex(store, plan.projectId, path, reference(root), { ref: acceptedRef, run: accepted, task, root: acceptedRoot });
+    writes.push(...index.writes); writerGuards.push(...index.guards);
+  }
+  return store.writeMany<TaskRun>(writes, writerGuards)[0]!;
 }
