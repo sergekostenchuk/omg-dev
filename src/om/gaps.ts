@@ -323,7 +323,7 @@ function normalizedRequest(request: GapRequest): GapRequest {
   return copy({ ...request, operations: { ...request.operations, proposals: sorted(request.operations.proposals) },
     works: unavailableWorks(request.works) ? request.works : { ...request.works, proposals: sorted(request.works.proposals) } });
 }
-interface Materialized { sources: GapSources; collection: GapCollection; gate: GapGate; references: Ref[]; guards: Ref[] }
+interface Materialized { request: GapRequest; sources: GapSources; collection: GapCollection; gate: GapGate; references: Ref[]; guards: Ref[] }
 function materialize(store: Store, request: GapRequest, current: boolean): Materialized {
   for (const [name, level] of [['operations', 2], ['works', 3]] as const) {
     const frame = name === 'operations' ? request.operations.frame : unavailableWorks(request.works) ? null : request.works.frame;
@@ -339,6 +339,7 @@ function materialize(store: Store, request: GapRequest, current: boolean): Mater
   const read = current ? prepareFrameProposals : readFrameProposals;
   const operations = take(read(store, request.operations));
   let works: Sealed<{ gaps: FrameGap[]; references: Ref[]; guards?: Ref[] }>;
+  let worksRequest = request.works;
   if (unavailableWorks(request.works)) {
     if (operations.frame.accepted !== null || horizon.horizon.value.request.refinement !== null)
       reject('gap_record_forged', request.project, 'works', 'The unavailable works source contradicts its saved upper-layer basis');
@@ -350,7 +351,11 @@ function materialize(store: Store, request: GapRequest, current: boolean): Mater
         reject('input_stale', request.works.layer.id, 'works.layer', 'The unavailable works source is no longer current');
     }
     works = { gaps: [], references: envelope.references, guards: current ? envelope.currentReferences : [] };
-  } else works = take(read(store, request.works)) as Sealed<PreparedFrameProposals>;
+  } else {
+    const prepared = take(read(store, request.works));
+    works = prepared;
+    worksRequest = { ...request.works, frame: prepared.frame.request };
+  }
   const sources: GapSources = { inputResult: { input: input.value.input as OmInput, hash: input.value.hash, gaps: input.value.gaps as InputGap[], refusals: [] },
     graph: graph.value as Graph, horizon: { nodes: [...horizon.horizon.value.result.horizon.nodes] },
     frameGaps: { operations: operations.gaps as FrameGap[], works: works.gaps as FrameGap[] } };
@@ -362,7 +367,8 @@ function materialize(store: Store, request: GapRequest, current: boolean): Mater
     if (previous && !same(previous, ref)) reject('gap_record_forged', ref.id, 'head', 'Sources were prepared from different heads');
     guards.set(ref.id, ref);
   }
-  return { sources, collection, gate, guards: sorted([...guards.values()]),
+  return { request: { ...request, operations: { ...request.operations, frame: operations.frame.request }, works: worksRequest },
+    sources, collection, gate, guards: sorted([...guards.values()]),
     references: unique([request.input, request.graph, request.horizon, reference(horizon.horizon), ...operations.references, ...works.references]) };
 }
 function recordId(project: string, gap: Gap): string { return `om-gap:${project}:${gap.id}`; }
@@ -388,6 +394,7 @@ export function prepareGaps(store: Store, request: GapRequest): OmResult<Sealed<
   requireStore(store); requireRequest(request); request = normalizedRequest(request);
   return outcome(() => {
     const basis = materialize(store, request, true), writes: Write[] = [], existing: Revision<GapRecord>[] = [];
+    request = normalizedRequest(basis.request);
     const guards = new Map(basis.guards.map(ref => [ref.id, ref])), cache = new Map([[canonical(request), basis]]);
     for (const gap of basis.collection.gaps) {
       const id = recordId(request.project, gap), value: GapRecord = { project: request.project, sources: request, gap };
@@ -431,5 +438,17 @@ export function readGaps(store: Store, request: GapReadRequest): OmResult<Sealed
     }
     for (const id of expected) if (!seen.has(id)) reject('gap_missing', id, 'records', 'A source gap is absent from the historical set');
     return { sources, records: records.sort((a, b) => order(a.id, b.id)), collection: basis.collection, gate: basis.gate };
+  });
+}
+
+/** New work requires the exact saved current derivation, even when two eras yield the same empty set. */
+export function prepareCurrentGaps(store: Store, request: GapReadRequest): OmResult<Sealed<PreparedGaps>> {
+  return outcome(() => {
+    const historical = take(readGaps(store, request));
+    const prepared = take(prepareGaps(store, historical.sources as GapRequest));
+    if (!same(prepared.sources, historical.sources) || prepared.writes.length
+      || !same(sorted(prepared.existing.map(reference)), sorted(historical.records.map(reference))))
+      reject('input_stale', historical.sources.project, 'gaps.sources', 'New work requires the complete saved current D1 contract and record set');
+    return prepared;
   });
 }

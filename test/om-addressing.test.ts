@@ -87,7 +87,7 @@ function factFixture(t: TestContext) {
     const current = ok(readOmInput(f.store, f.project, inputRef));
     const sources = gapRequest(f, current, `fact-application-${inputRef.revision}`);
     const gaps = ok(writeGaps(f.store, sources));
-    return { sources, records: gaps.records.map(reference), gap: gaps.records.find(row => row.value.gap.target === question) };
+    return { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference), gap: gaps.records.find(row => row.value.gap.target === question) };
   }
   const gaps = gapsFor(reference(input));
   assert.equal(gaps.gap!.value.gap.code, 'predecessor_question');
@@ -184,7 +184,7 @@ test('D3 native first pass addresses a question through B1, horizon, frame and D
   assert.deepEqual(gap.routes, ['code', 'research']);
   const saved = f.store.list().map(reference); f.restart();
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(addressed))), addressed);
-  ok(readGaps(f.store, { sources, records: gaps.records.map(reference) }));
+  ok(readGaps(f.store, { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }));
   assert.deepEqual(ok(writeAddressing(f.store, request)), addressed); assert.deepEqual(f.store.list().map(reference), saved);
   // Historic input remains legal after an upstream proof moves; new preparation may no longer reuse it.
   const source = f.store.get('source:garden:brief')!;
@@ -802,7 +802,7 @@ async function dependentFacts(t: TestContext) {
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
   function gaps() {
     const sources = gapRequest(f, input, `dependent-facts-${input.revision}`), saved = ok(writeGaps(f.store, sources));
-    return { sources, records: saved.records.map(reference), rows: saved.records };
+    return { sources: structuredClone(saved.sources) as GapRequest, records: saved.records.map(reference), rows: saved.records };
   }
   function source(role: Role, value: string) {
     const file = `${role}.json`, id = `source:garden:dependency-${role}`, old = f.store.get(id);
@@ -951,7 +951,7 @@ async function independentFactPrefixes(t: TestContext) {
       [mc1FieldSpec({ input: reference(input), gap: reference(gap), contract })], [reference(input), reference(gap)]);
     const issued = f.store.get<Question>(draft.value.questions[0]!)!;
     const question = ok(writeMc1Question(f.store, { project: f.project, input: reference(input),
-      gaps: { sources, records: gaps.records.map(reference) }, gap: reference(gap), contract,
+      gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, gap: reference(gap), contract,
       requirements: [{ pointer: '/contracts/0' }], engineQuestion: reference(issued), draft: reference(draft) }));
     const assessment = await assessAnswer(f.store, issued, { action: 'answer', question: issued.id, value,
       citations: [{ source: reference(source), selector: { kind: 'json-pointer', pointer: '/answer' } }] }, environment, f.root);

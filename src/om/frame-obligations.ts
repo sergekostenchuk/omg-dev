@@ -4,6 +4,7 @@ import { EngineError } from "../errors.js";
 import { LEVEL, type Binding, type Endpoint, type Graph, type Node } from "../graph/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
+import { workZone } from "./work-zone.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type GateResult, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from "./refusal.js";
@@ -435,6 +436,7 @@ export function carryFrameFills(upper: Graph, scope: FrameScope, accepted: Pick<
 export interface FrameRequest {
   project: string; level: FrameLevel; horizon: Ref; graph: Ref; layer: Ref | null; frame: Ref | null;
   upper: { horizon: Ref; frame: Ref | null } | null;
+  workZoneContract?: "accepted-l2-v1";
 }
 export interface FrameRead {
   request: FrameRequest; upper: Graph; upperRef: Ref; scope: FrameScope;
@@ -452,9 +454,11 @@ function frameTake<T>(result: OmResult<T>): T {
   if (!result.ok) throw new FrameFailure(result.refusal);
   return result.value;
 }
-function requireFrameRequest(store: Store, request: unknown): asserts request is FrameRequest {
-  if (!(store instanceof Store) || !frameObject(request) || !frameText(request['project'])) frameInvalid("request");
+function requireFrameRequest(request: unknown): asserts request is FrameRequest {
+  if (!frameObject(request) || !frameText(request['project'])) frameInvalid("request");
   requireFrameLevel(request['level']);
+  if (Object.hasOwn(request, 'workZoneContract')
+    && (request['level'] !== 3 || request['workZoneContract'] !== 'accepted-l2-v1')) frameInvalid("workZoneContract");
   for (const key of ['horizon', 'graph']) if (!isRef(request[key])) frameInvalid(key);
   for (const key of ['layer', 'frame']) if (request[key] !== null && !isRef(request[key])) frameInvalid(key);
   const upper = request['upper'];
@@ -545,10 +549,13 @@ function frameSources(store: Store, request: FrameRequest): FrameBasis {
     // Entering the new block horizon reopens identity obligations; it does not turn the saved identity into
     // a real operation. Read that classification from the validated accepted frame before zone filtering.
     const identities = new Set((upperFrame?.value.fills ?? []).filter(fill => fill.source === "identity").map(fill => fill.node));
-    const relations = new RefinementRelations(graph);
-    const nodes = graph.nodes.filter(node => node.kind === "operation" && !identities.has(node.id)
-      && ownerScope.nodes.some(block => ownerScope.execution[block]?.state === "needed" && relations.refines(node.id, block)))
-      .map(node => node.id).sort(frameOrder);
+    // Unmarked saved requests retain the full-graph derivation of their producer's era.
+    const relations = request.workZoneContract === undefined ? new RefinementRelations(graph) : null;
+    const nodes = relations
+      ? graph.nodes.filter(node => node.kind === "operation" && !identities.has(node.id)
+        && ownerScope.nodes.some(block => ownerScope.execution[block]?.state === "needed" && relations.refines(node.id, block)))
+        .map(node => node.id).sort(frameOrder)
+      : [...frameTake(workZone(frameProjection(graph, 2), ownerScope, [...identities]))];
     scope = { nodes, excluded: ownerScope.excluded, hash: hashJson([ownerScope.hash, 3, nodes]) };
   }
   let accepted: AcceptedFrame | null = null;
@@ -595,7 +602,8 @@ function frameSources(store: Store, request: FrameRequest): FrameBasis {
 }
 /** Resolve the common exact upper sources without prematurely inventing lower fills. */
 export function readFrameBasis(store: Store, request: FrameRequest): OmResult<Sealed<FrameBasis>> {
-  requireFrameRequest(store, request);
+  if (!(store instanceof Store)) frameInvalid("store");
+  requireFrameRequest(request);
   return frameResult(() => frameSources(store, frameCopy(request)));
 }
 function frameDerive(store: Store, request: FrameRequest): FrameRead {
@@ -605,7 +613,8 @@ function frameDerive(store: Store, request: FrameRequest): FrameRead {
 }
 /** History is checked exclusively through immutable exact references, even after heads move. */
 export function readFrame(store: Store, request: FrameRequest): OmResult<Sealed<FrameRead>> {
-  requireFrameRequest(store, request);
+  if (!(store instanceof Store)) frameInvalid("store");
+  requireFrameRequest(request);
   return frameResult(() => frameDerive(store, frameCopy(request)));
 }
 function frameCurrentSources(store: Store) {
@@ -653,10 +662,17 @@ export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceReq
     return { ...basis, guards: frameSorted([...guards.values()]) };
   });
 }
+/** New producers save this exact request; historical readers never add its contract. */
+export function currentFrameRequest(request: FrameRequest): Sealed<FrameRequest> {
+  requireFrameRequest(request);
+  const copied = frameCopy(request);
+  return copied.level === 3 ? frameCopy({ ...copied, workZoneContract: "accepted-l2-v1" }) : copied;
+}
 /** Prepare current acceptance without writing; hand the guards and CAS revisions to C5. */
 export function prepareFrame(store: Store, request: FrameRequest): OmResult<Sealed<PreparedFrame>> {
-  requireFrameRequest(store, request);
-  request = frameCopy(request);
+  if (!(store instanceof Store)) frameInvalid("store");
+  requireFrameRequest(request);
+  request = currentFrameRequest(request);
   return frameResult(() => {
     const read = frameDerive(store, request);
     const { traced, guards, remember, current, acceptGate } = frameCurrentSources(store);

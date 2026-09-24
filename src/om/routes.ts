@@ -4,7 +4,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { historicalRead, readOmInput, withHistoricalReads } from './input.js';
-import { collectGaps, gateGaps, readGaps, prepareGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
+import { collectGaps, gateGaps, readGaps, prepareCurrentGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
   type GapMoment, type GapSources } from './gaps.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { applicableAnswerTask, prepareAnswerSearch, readAnswerSearch, readAnswerTaskBasis,
@@ -99,8 +99,7 @@ function routeSources(store: Store, request: RoutesRequest, current: boolean) {
   const input = take(readOmInput(store, request.project, gaps.sources.input));
   const guards: Ref[] = [], references: Ref[] = [gaps.sources.input, ...request.gaps.records];
   if (current) {
-    const prepared = take(prepareGaps(store, gaps.sources as GapReadRequest['sources']));
-    if (!same(prepared.collection, gaps.collection)) fail('route_source_invalid', request.project, 'gaps', 'D1 sources changed their full gap set');
+    const prepared = take(prepareCurrentGaps(store, request.gaps));
     guards.push(...prepared.guards, gaps.sources.input, ...request.gaps.records);
     references.push(...prepared.references);
   }

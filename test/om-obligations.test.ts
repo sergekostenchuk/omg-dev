@@ -115,7 +115,7 @@ function fixture(t: TestContext, kinds: Array<"environment-confirmation" | "post
     works: multipleConsumers ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
       layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } : { state: "upper-not-accepted", layer: reference(upper) } };
   const gaps = ok(writeGaps(store, source));
-  const gapRead = { sources: source, records: gaps.records.map(reference) };
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
   const request: ObligationRequest = { project, gaps: gapRead, lines: reference(lines), assignments: [] };
   return { root, database, store, engine, project, graph, upper, input, horizon, gaps, lines, request };
@@ -214,7 +214,7 @@ test("D7 D1 and D2 must name the same native horizon even when their open gap id
     operations: { ...f.request.gaps.sources.operations, frame: { ...f.request.gaps.sources.operations.frame, horizon: reference(nextHorizon.gate) } } };
   const nextGaps = ok(writeGaps(f.store, sources));
   assert.deepEqual(nextGaps.collection.gaps.map(gap => gap.id), f.gaps.collection.gaps.map(gap => gap.id));
-  const mismatched: ObligationRequest = { ...f.request, gaps: { sources, records: nextGaps.records.map(reference) } };
+  const mismatched: ObligationRequest = { ...f.request, gaps: { sources: structuredClone(nextGaps.sources) as GapRequest, records: nextGaps.records.map(reference) } };
   const before = revisions(f.store);
   denied(prepareOmObligations(f.store, mismatched), "obligation_context_mismatch");
   denied(writeOmObligations(f.store, mismatched), "obligation_context_mismatch");

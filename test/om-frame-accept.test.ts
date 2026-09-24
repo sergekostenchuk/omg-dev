@@ -21,7 +21,7 @@ import type { OmResult } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { gardenGraph, createOmFixture } from './om-fixture.js';
 import { prepareRebaseFrame, rebaseFrame } from '../src/om/frame-accept.js';
-import { buildRebasedLayer, readLayerAcceptance, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
+import { buildRebasedLayer, readRebaseBasis, readLayerAcceptance, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
 import { preparedFeatures } from './product-fixture.js';
 
@@ -76,7 +76,9 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
   assert.equal(moved.state, 'rebased'); assert.ok(moved.carried > 0); assert.ok(moved.retired > 0);
   assert.equal(moved.carried + moved.retired, f.oldFrame.fills.length);
   assert.deepEqual(moved.frame.value.rebasedFrom, f.from.frame);
-  assert.deepEqual(moved.frame.value.rebase, f.request);
+  assert.deepEqual(moved.frame.value.rebase, { from: f.from, to: { ...f.to, workZoneContract: 'accepted-l2-v1' } });
+  assert.ok(!Object.hasOwn(moved.frame.value.rebase.from, 'workZoneContract'));
+  assert.ok(!Object.hasOwn(f.to, 'workZoneContract'));
   assert.deepEqual(reference(f.store.get('graph:garden')!), f.to.graph);
   const current = { ...f.to, layer: reference(moved.layer), frame: reference(moved.frame) };
   for (const read of [readFrame, prepareFrame]) {
@@ -97,7 +99,7 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
   assert.ok(preparedGaps.guards.some(ref => canonical(ref) === canonical(reference(moved.frame))));
   for (const gap of proposals.gaps) assert.ok(gaps.collection.gaps.some(item => item.target === gap.target && item.field === 'fill'));
   assert.equal(gaps.gate.passed, true);
-  assert.deepEqual(ok(readGaps(f.store, { sources: gapRequest, records: gaps.records.map(reference) })), gaps);
+  assert.deepEqual(ok(readGaps(f.store, { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) })), gaps);
 
   const forgedPath = join(f.f.root, 'forged-rebase.sqlite'); copyFileSync(branch.path, forgedPath);
   const forgedStore = new Store(forgedPath);
@@ -125,6 +127,8 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
     for (const action of [prepareRebaseFrame, rebaseFrame]) refusal(action(markerStore, f.request), 'frame_acceptance_invalid');
     assert.deepEqual(snapshot(markerStore), before);
   } finally { markerStore.close(); }
+  const graphHead = f.store.get<Graph>('graph:garden')!;
+  f.store.write({ id: graphHead.id, kind: graphHead.kind, expected: graphHead.revision, value: graphHead.value });
   f.f.reopen();
   const after = snapshot(f.f.store), repeated = ok(rebaseFrame(f.f.store, f.request));
   assert.equal(repeated.state, 'unchanged'); assert.deepEqual(repeated.frame, moved.frame);
@@ -197,7 +201,7 @@ test('C5 retires a work fill when an accepted operation outcome changes under th
   assert.deepEqual(gaps.collection, gapPreparation.collection);
   assert.ok(gaps.collection.gaps.some(gap => gap.target === oldObligation.id && gap.field === 'fill'));
   assert.equal(gaps.gate.passed, true);
-  const gapRead = { sources: gapRequest, records: gaps.records.map(reference) };
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   assert.deepEqual(ok(readGaps(f.store, gapRead)), gaps);
   const after = snapshot(f.store), repeated = ok(rebaseFrame(f.store, f.request));
   assert.equal(repeated.state, 'unchanged');
@@ -546,4 +550,30 @@ test('C5 rejection retains G3 nested findings and distinguishes forbidden N2 pay
   const forbidden = ok(rejectProposals(f.store, { frame: f.frame, proposals: [next] }));
   assert.deepEqual(forbidden.verdict!.codes, ['candidate_level_unsupported']);
   assert.equal(forbidden.state, 'rejected');
+});
+
+
+test('C5 preserves unmarked rebase history and late replay in its saved era', async t => {
+  const f = await rebaseFixture(t), basis = ok(readRebaseBasis(f.store, f.request));
+  assert.ok(!Object.hasOwn(basis.frame.rebase.to, 'workZoneContract'));
+  const frameRef = { id: f.from.frame!.id, revision: f.from.frame!.revision + 1, hash: hashJson(basis.frame) };
+  const layer = buildRebasedLayer({ frame: basis.frame as OmRebasedFrame, reference: frameRef,
+    graph: f.accepted.graph!.value as Graph, upper: f.accepted.layer! as Parameters<typeof buildRebasedLayer>[0]['upper'],
+    previous: f.store.get<LayerBasis>(f.from.layer!.id)! });
+  const written = f.store.writeMany([
+    { id: frameRef.id, kind: 'connection-frame', expected: f.from.frame!.revision, value: basis.frame },
+    { id: f.from.layer!.id, kind: 'graph-layer', expected: f.from.layer!.revision, value: layer },
+  ]);
+  const accepted = { project: 'garden', level: 3 as const, graph: f.to.graph, layer: reference(written[1]!) };
+  assert.equal(ok(readLayerAcceptance(f.store, accepted)).producer, 'om');
+  const graphHead = f.store.get<Graph>('graph:garden')!;
+  f.store.write({ id: graphHead.id, kind: graphHead.kind, expected: graphHead.revision, value: graphHead.value });
+  for (let restart = 0; restart < 2; restart++) {
+    if (restart) f.f.reopen();
+    const store = f.f.store, before = snapshot(store), repeated = ok(rebaseFrame(store, f.request));
+    assert.equal(repeated.state, 'unchanged');
+    assert.deepEqual(repeated.frame.value.rebase, f.request);
+    assert.equal(ok(readLayerAcceptance(store, accepted)).producer, 'om');
+    assert.deepEqual(snapshot(store), before);
+  }
 });

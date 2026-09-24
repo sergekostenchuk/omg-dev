@@ -140,8 +140,10 @@ const INCOMING: Codes = { entry: "refusal_entry_invalid", origin: "origin_invali
 const STORED: Codes = { entry: "journal_invalid", origin: "journal_invalid", source: "journal_invalid" };
 
 function frameContextShape(value: unknown): value is FrameRequest {
-  if (!isPlainObject(value) || !exactKeys(value, ["project", "level", "horizon", "graph", "layer", "frame", "upper"])) return false;
+  if (!isPlainObject(value) || !exactKeys(value, ["project", "level", "horizon", "graph", "layer", "frame", "upper",
+    ...(Object.hasOwn(value as object, "workZoneContract") ? ["workZoneContract"] : [])])) return false;
   const frame = value as FrameRequest;
+  if (Object.hasOwn(frame, "workZoneContract") && (frame.level !== 3 || frame.workZoneContract !== "accepted-l2-v1")) return false;
   if (!isText(frame.project) || ![2, 3].includes(frame.level) || !isRef(frame.horizon) || !isRef(frame.graph)
     || frame.layer !== null && !isRef(frame.layer) || frame.frame !== null && !isRef(frame.frame)) return false;
   return frame.level === 2 ? frame.upper === null : isPlainObject(frame.upper) && exactKeys(frame.upper, ["horizon", "frame"])
@@ -164,7 +166,8 @@ const sourceRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash
 function normalizedFrameContext(frame: FrameRequest): FrameRequest {
   return { project: frame.project, level: frame.level, horizon: sourceRef(frame.horizon), graph: sourceRef(frame.graph),
     layer: frame.layer === null ? null : sourceRef(frame.layer), frame: frame.frame === null ? null : sourceRef(frame.frame),
-    upper: frame.upper === null ? null : { horizon: sourceRef(frame.upper.horizon), frame: frame.upper.frame === null ? null : sourceRef(frame.upper.frame) } };
+    upper: frame.upper === null ? null : { horizon: sourceRef(frame.upper.horizon), frame: frame.upper.frame === null ? null : sourceRef(frame.upper.frame) },
+    ...(Object.hasOwn(frame, "workZoneContract") ? { workZoneContract: frame.workZoneContract! } : {}) };
 }
 /** Syntax and identity only: each producer still proves the source and its exact assembly context. */
 export function normalizeOriginSource(value: unknown): Sealed<OriginSource> {

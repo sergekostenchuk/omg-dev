@@ -132,7 +132,7 @@ function routesFixture(t: TestContext, withEncoding = false) {
     const gaps = ok(writeGaps(store, sources)), gap = gaps.records.find(row => row.value.gap.target === target)!;
     assert.equal(gap.value.gap.code, "predecessor_question"); assert.equal(gap.value.gap.kind, "repository-fact");
     assert.deepEqual(gap.value.gap.routes, ["code", "research"]);
-    return { sources, records: gaps.records.map(reference), gap };
+    return { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference), gap };
   }
   const gaps = gapsFor(reference(input));
   const command = { executable: process.execPath, args: ["-e",
@@ -696,7 +696,7 @@ test('D4 native batched D5 answers flow through routing, application and D2 clos
       const complete = ok(writeGaps(f.store, sources));
       assert.ok(complete.records.length > 0, 'D1 still includes all other gaps');
       assert.equal(complete.records.some(row => row.value.gap.target === f.target), false);
-      const current = { sources, records: complete.records.map(reference) };
+      const current = { sources: structuredClone(complete.sources) as GapRequest, records: complete.records.map(reference) };
       const close: GapLinesRequest = { project: f.project, previous: reference(opened), pass: 2, gaps: current,
         closures: [{ id: f.gaps.gap.value.gap.id, reason: 'filled', basis: reference(chosen), acceptance: null,
           attempt: null, answer: { record: reference(chosen) } }] };

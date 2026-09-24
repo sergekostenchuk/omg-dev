@@ -82,7 +82,7 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false) {
     works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
   const gaps = ok(writeGaps(store, sources)), gap = gaps.records.find(row => row.value.gap.target === 'discovery:output-format')!;
   assert.equal(gap.value.gap.kind, 'repository-fact');
-  const gapSet = { sources, records: gaps.records.map(reference) };
+  const gapSet = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const tasks = ok(prepareQuestionTasks(store, { project, gaps: gapSet,
     questions: gaps.records.filter(row => row.value.gap.code === 'predecessor_question' && row.value.gap.kind === 'repository-fact')
       .map(row => ({ gap: reference(row), requirements: [{ pointer: '/contracts/0' }], resultForm: schema })) }));

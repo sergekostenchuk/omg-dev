@@ -97,7 +97,7 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
   const active = gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral);
   assert.deepEqual(active.map(row => row.value.gap.target).sort(), ['discovery:encoding', 'discovery:output-format']);
   assert.ok(gaps.records.find(row => row.value.gap.target === 'discovery:later-format')!.value.gap.deferral);
-  const request: QuestionTaskRequest = { project, gaps: { sources, records: gaps.records.map(reference) },
+  const request: QuestionTaskRequest = { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
     questions: active.map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) };
   return { root, database, project, stages, input, graph, horizon, gaps, active, request,
     get store() { return store; }, get engine() { return engine; },
@@ -964,9 +964,9 @@ test('E2 does not reassign accepted refinements and writes an empty packet when 
   const operations = ok(prepareFrameProposals(store, sources.operations)), works = ok(prepareFrameProposals(store, frame(3)));
   assert.deepEqual(operations.gaps, []); assert.deepEqual(works.gaps, []);
   const gaps = ok(writeGaps(store, sources));
-  const tasks = ok(prepareQuestionTasks(store, { project, gaps: { sources, records: gaps.records.map(reference) }, questions: [] }));
+  const tasks = ok(prepareQuestionTasks(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, questions: [] }));
   assert.deepEqual(tasks.tasks, []);
-  const routes = ok(writeRoutes(store, { project, gaps: { sources, records: gaps.records.map(reference) }, tasks: [],
+  const routes = ok(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, tasks: [],
     catalog: { paths: [], records: [] }, previous: null }));
   assert.deepEqual(routes.value.batches, []);
   const request: QuestionPacketRequest = { project, routes: reference(routes), batch: null, environment: reference(environment), attempt: null, previous: [] };
@@ -988,7 +988,7 @@ test('E2 assigns a genuinely open outcome alone after C3 fills every connection 
   const applied = ok(prepareFrameProposals(f.store, sources.operations));
   assert.deepEqual(applied.gaps.filter(gap => gap.consumer === p.batch.node).map(gap => gap.target), [outcome.id]);
   const gaps = ok(writeGaps(f.store, sources));
-  const taskRequest: QuestionTaskRequest = { ...f.request, gaps: { sources, records: gaps.records.map(reference) },
+  const taskRequest: QuestionTaskRequest = { ...f.request, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
     questions: f.request.questions.map(item => ({ ...item, gap: reference(gaps.records.find(record => record.id === item.gap.id)!) })) };
   const tasks = ok(prepareQuestionTasks(f.store, taskRequest));
   const routes = ok(writeRoutes(f.store, { project: f.project, gaps: taskRequest.gaps,
@@ -1201,7 +1201,7 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
     works: { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
       layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } };
   const gaps = ok(writeGaps(store, sources));
-  const routes = ok(writeRoutes(store, { project, gaps: { sources, records: gaps.records.map(reference) }, tasks: [],
+  const routes = ok(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) }, tasks: [],
     catalog: { paths: [], records: [] }, previous: null }));
   const batch = routes.value.batches.find(batch => batch.level === 3 && batch.node === 'garden-produce-operation')!;
   assert.ok(batch);

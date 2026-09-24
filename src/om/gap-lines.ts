@@ -2,7 +2,7 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { gapId, prepareGaps, readGaps, type Gap, type GapReadRequest, type GapRecords } from './gaps.js';
+import { gapId, prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, type GapRecords } from './gaps.js';
 import { readAcceptedFrame, type AcceptedFrameRequest } from './frame-accept.js';
 import { readCandidate } from './frame-candidate.js';
 import { prepareFrame, readFrame, type FrameObligation, type PreparedFrame, type FrameRequest } from './frame-obligations.js';
@@ -382,9 +382,7 @@ export function prepareGapLines(store: Store, request: GapLinesRequest): OmResul
     if (previous && request.pass < previous.row.value.request.pass) fail('pass_out_of_order', latest!.id, 'pass', 'A delayed pass cannot replace later states');
     if (!same(request.previous, latest ? reference(latest) : null)) fail('input_stale', gapLinesId(request.project), 'previous', 'A pass names the state it advances');
     const gaps = take(readGaps(store, request.gaps));
-    const fresh = take(prepareGaps(store, request.gaps.sources));
-    if (fresh.writes.length || !same(sorted(fresh.existing.map(reference)), sorted(request.gaps.records)))
-      fail('input_stale', gapLinesId(request.project), 'gaps.records', 'D1 must have saved this complete current set before lines are advanced');
+    const fresh = take(prepareCurrentGaps(store, request.gaps));
     const merged = mergeLines(previous?.row.value.lines ?? [], gaps.collection.gaps as Gap[], request.pass, request.closures);
     if (merged.refusals.length) throw new LineFailure(merged.refusals[0]!);
     const closures = suppliedClosures.map(closure => confirmClosure(store, request.project,

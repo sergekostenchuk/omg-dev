@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonical, hashJson } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { LEVEL, type Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
@@ -21,15 +21,17 @@ import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
 import {
   frameObligations, fillObligations, carryFrameFills, flowKey, representativeId, FRAME_REFUSAL_CODES,
-  readFrame, prepareFrame, type FrameRequest,
+  readFrame, readFrameBasis, prepareFrame, type FrameRequest,
   type AcceptedFrame, type ConnectionFrame, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
 import { gardenGraph, createOmFixture, type OmFixture, type FixtureLayer } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
 import { writeCandidate, gateCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from "../src/om/gaps.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
+import { readWorkZone, prepareWorkZone, type WorkZoneRequest } from "../src/om/work-zone.js";
 
 const clone = structuredClone;
 const levels = [2, 3] as const;
@@ -926,5 +928,138 @@ test("OM acceptance from L1 is consumed by C2, B2 and D1 with historical sources
   store.close(); store = new Store(database);
   assert.deepEqual(delivered(readFrame(store, request)), historical);
   assert.deepEqual(delivered(readHorizon(store, "garden", reference(horizon.gate))), horizon);
-  assert.deepEqual(delivered(readGaps(store, { sources: gapsRequest, records: gaps.records.map(reference) })), gaps);
+  assert.deepEqual(delivered(readGaps(store, { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) })), gaps);
+});
+
+test("C2 and F1 share the accepted operation zone across realizes roles, newly selected identities and unaccepted lower bridges", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-work-zone-c2-")), store = new Store(join(root, "state.sqlite"));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = gardenGraph(), producer = "garden-produce-block", consumer = "garden-consume-block", later = "garden-later-block";
+  const outside = "garden-refusal-operation";
+  graph.edges!.push({ id: "refusal-realizes-consumer", relation: "realizes", source: outside, target: consumer,
+    condition: "The refusal operation also refines the consumer role" });
+  const remap = (value: Json, suffix: string): Json => {
+    const names: Record<string, string> = { "garden-result": `garden-${suffix}`, "garden-R1": `garden-R-${suffix}`,
+      "garden-B1": `garden-B-${suffix}`, "garden-concept": `garden-concept-${suffix}`, "Deliver result": `Deliver ${suffix}` };
+    if (typeof value === "string") return names[value] ?? value;
+    if (Array.isArray(value)) return value.map(item => remap(item, suffix));
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, remap(item, suffix)]));
+    return value;
+  };
+  const fields = (field: string): Json => {
+    const basic = preparedField("garden", field), variants = [basic, ...["later", "data"].map(suffix => remap(basic, suffix))];
+    if (["conceptSections", "behaviorContracts", "featurePreparation", "features"].includes(field))
+      return variants.flatMap(value => value as Json[]);
+    if (field === "preparation" || field === "operationRequirements") {
+      const value = clone(basic) as Record<string, Json>;
+      for (const key of field === "preparation" ? ["outcomes"] : ["outcomes", "conceptCoverage"])
+        value[key] = variants.flatMap(item => (item as Record<string, Json>)[key] as Json[]);
+      return value;
+    }
+    return basic;
+  };
+  const requirement = graph.requirements![0]!;
+  graph.requirements!.push(...["later", "data"].map(suffix => remap(requirement as unknown as Json, suffix) as unknown as typeof requirement));
+  for (const node of graph.nodes) node.implements!.push("garden-R-later", "garden-R-data");
+  graph.journeys!.push({ id: "garden-data-feature", actor: "garden-user", variant: "success", entry: producer,
+    path: [producer], outcome: "garden-data", terminal: "success" });
+  const { level: _level, ...projection } = projectGraph(graph, 1);
+  try { preparedFeatures(new ProductEngine(store), "garden", projection as Graph, fields); }
+  catch (error) { if (error instanceof EngineError) assert.fail(JSON.stringify(error.details)); throw error; }
+  const initial = acceptedHorizon(store, null), input = initial.horizon.value.request.input;
+  const original: FrameRequest = { project: "garden", level: 2, horizon: reference(initial.gate),
+    graph: reference(store.get("graph:garden")!), layer: null, frame: null, upper: null };
+  const prepared = delivered(prepareFrame(store, original)), design = projectGraph(graph, 2);
+  const realNodes = design.nodes.filter(node => node.kind === "operation" && node.parent !== later);
+  const included = new Set(realNodes.map(node => node.id));
+  const fills = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
+    { graph, reference: actualGraphRef(graph), frame: null }, prepared.upperRef, 2)).fills;
+  const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+    nodes: clone(realNodes), fills: fills.filter(fill => included.has(fill.node)).map(fill => ({ obligation: fill.obligation,
+      node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),
+    localConnectors: clone(design.connectors.filter(connector => !prepared.upper.connectors.some(upper => upper.id === connector.id))
+      .map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))),
+    artifacts: clone(design.artifacts), contracts: clone(design.contracts), joins: clone(design.joins), tests: clone(design.tests),
+    edges: clone(design.edges ?? []), journeys: clone(design.journeys ?? []), packets: clone(design.packets ?? []),
+    transfers: clone(design.transfers ?? []), anchors: clone(design.anchors), removes: [], replaces: [], redefines: [] };
+  const offered = store.write({ id: "om-proposal:garden:work-zone-c2", kind: "layer-proposal", expected: 0, value: proposal });
+  const written = delivered(writeCandidate(store, { frame: original, proposals: [reference(offered)] }));
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
+  const candidate = reference(written.record), gate = delivered(gateCandidate(store, { project: "garden", candidate }));
+  assert.equal(gate.passed, true, JSON.stringify(gate));
+  const settled = delivered(settleCandidate(store, { project: "garden", level: 2, candidate,
+    outcome: { gate: "G3", candidate, graphHash: gate.graphHash, passed: gate.passed, codes: [] } }));
+  assert.equal(settled.state, "accepted"); assert.ok(settled.graph && settled.layer && settled.frame);
+  const acceptedGraph = reference(settled.graph), acceptedLayer = reference(settled.layer), acceptedFrame = reference(settled.frame);
+  const identity = representativeId(later, 2);
+  assert.ok(settled.frame.value.fills.some(fill => fill.source === "identity" && fill.node === identity));
+  const choice = (version: string, outcomes: string[], graphRef: Ref = acceptedGraph) => {
+    const result = delivered(writeHorizon(store, { project: "garden", input, graph: graphRef, refinement: acceptedLayer,
+      choice: { choiceVersion: version, features: outcomes.map(outcome => ({ outcome })), excluded: [] }, available: {} }));
+    assert.equal(result.gate.value.state, "accepted");
+    return result;
+  };
+  const compare = (horizon: Ref, graphRef: Ref, expected: string[]) => {
+    const request: WorkZoneRequest = { project: "garden", graph: graphRef, layer: acceptedLayer, frame: acceptedFrame, horizon };
+    const workFrame: FrameRequest = { project: "garden", level: 3, graph: graphRef, layer: null, frame: null, horizon,
+      upper: { horizon, frame: acceptedFrame } };
+    const before = revisions(store);
+    assert.deepEqual(delivered(readWorkZone(store, request)).operations, expected);
+    assert.deepEqual(delivered(prepareWorkZone(store, request)).operations, expected);
+    const prepared = delivered(prepareFrame(store, workFrame));
+    assert.equal(prepared.request.workZoneContract, "accepted-l2-v1");
+    assert.ok(!Object.hasOwn(workFrame, "workZoneContract"));
+    assert.deepEqual(delivered(readFrame(store, prepared.request)).scope.nodes, expected);
+    assert.deepEqual(prepared.scope.nodes, expected);
+    assert.deepEqual(revisions(store), before);
+  };
+  const expected = ["garden-consume-operation", "garden-prep-operation", "garden-produce-operation", outside];
+  const same = choice("work-zone-realizes", ["garden-result"]);
+  compare(reference(same.gate), acceptedGraph, expected);
+  const expanded = choice("work-zone-identity-entry", ["garden-result", "garden-later"]);
+  assert.ok(expanded.horizon.value.result.horizon.nodes.includes(later));
+  assert.deepEqual(expanded.horizon.value.result.horizon.execution[later], { state: "needed" });
+  compare(reference(expanded.gate), acceptedGraph, expected);
+  const reopened = delivered(readFrame(store, { ...original, graph: acceptedGraph, layer: acceptedLayer, frame: acceptedFrame,
+    horizon: reference(expanded.gate) }));
+  assert.ok(reopened.result.open.some(obligation => obligation.upper.node === later),
+    "Entering the horizon leaves the saved representative unrefined rather than changing its identity classification");
+
+  const producerOnly = choice("work-zone-lower-bridge", ["garden-data"]);
+  assert.deepEqual(producerOnly.horizon.value.result.horizon.nodes, [producer]);
+  const lower = clone(settled.graph.value) as Graph;
+  lower.nodes.push(clone(graph.nodes.find(node => node.id === "garden-produce-work")!));
+  lower.edges!.push({ id: "outside-via-unaccepted-work", relation: "realizes", source: outside, target: "garden-produce-work",
+    condition: "An unaccepted lower layer must not widen the operation zone" });
+  assert.deepEqual(projectGraph(lower, 2), projectGraph(settled.graph.value as Graph, 2));
+  const changed = store.write({ id: settled.graph.id, kind: settled.graph.kind, expected: settled.graph.revision, value: lower });
+  compare(reference(producerOnly.gate), reference(changed), ["garden-prep-operation", "garden-produce-operation"]);
+});
+
+
+test("C2 work-zone contracts are explicit in history and unknown contracts never become current work", async t => {
+  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const legacy = requestFor(f, reference(horizon.gate), 3), original = clone(legacy);
+  const historical = delivered(readFrame(f.store, legacy));
+  assert.ok(!Object.hasOwn(historical.request, "workZoneContract"));
+  const prepared = delivered(prepareFrame(f.store, legacy));
+  assert.deepEqual(legacy, original);
+  assert.equal(prepared.request.workZoneContract, "accepted-l2-v1");
+  assert.deepEqual(delivered(readFrame(f.store, prepared.request)).result, prepared.result);
+  const before = revisions(f.store);
+  for (const contract of [undefined, null, "unknown", 1]) {
+    for (const action of [readFrame, readFrameBasis, prepareFrame]) {
+      assert.throws(() => action(f.store, { ...legacy, workZoneContract: contract } as unknown as FrameRequest),
+        (error: unknown) => error instanceof EngineError && error.code === "frame_request_invalid"
+          && (error.details as { field?: string }).field === "workZoneContract");
+    }
+  }
+  for (const action of [readFrame, readFrameBasis, prepareFrame]) {
+    assert.throws(() => action(f.store, { ...requestFor(f, reference(horizon.gate), 2), workZoneContract: "accepted-l2-v1" }),
+      (error: unknown) => error instanceof EngineError && error.code === "frame_request_invalid");
+  }
+  assert.deepEqual(revisions(f.store), before);
+  f.reopen();
+  assert.deepEqual(delivered(readFrame(f.store, legacy)), historical);
+  assert.deepEqual(delivered(readFrame(f.store, prepared.request)).result, prepared.result);
 });

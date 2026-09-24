@@ -6,7 +6,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, type FrameCandidateRecord } from './frame-candidate.js';
 import type { LayerProposal, ProposalObservation, ProposalRequest } from './frame-proposals.js';
-import { prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
+import { currentFrameRequest, prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
 import type { Finding } from '../pipeline/contracts.js';
 import { omAcceptedFrame, readLayerAcceptance, type LayerBasis, type OmAcceptedFrame } from './layer-basis.js';
 import { readRecord, writeGuarded } from './refs.js';
@@ -326,15 +326,22 @@ function rebaseResult(frame: Revision<OmRebasedFrame>, layer: Revision<LayerBasi
 }
 /** Rebase carries an already accepted work frame; it never accepts a new work candidate or G5 claim. */
 export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): OmResult<Sealed<PreparedFrameRebase>> {
-  requireRebaseRequest(store, request); request = sealed(request) as RebaseFrameRequest;
+  requireRebaseRequest(store, request);
+  currentFrameRequest(request.from); currentFrameRequest(request.to);
+  request = sealed(request) as RebaseFrameRequest;
   return run(() => {
-    const { from, to } = request;
+    const { from } = request;
+    let { to } = request;
     if (from.level !== 3 || to.level !== 3)
       fail('candidate_level_unsupported', from.project, 'level', 'The current rebase carries accepted works after an OM operation transition');
     if (from.project !== to.project || !from.frame || !from.layer || to.frame !== null || to.layer !== null)
       fail('frame_acceptance_invalid', from.project, 'rebase', 'Rebase needs one exact old work frame and a fresh upper-basis request');
     const saved = store.get<OmRebasedFrame>(from.frame.id, from.frame.revision + 1);
-    if (saved && object(saved.value) && same(saved.value.rebase ?? null, request)) {
+    // A completed transition is compared in its recorded era before normalizing any new work.
+    const replay = saved && object(saved.value) && object(saved.value.rebase)
+      && object(saved.value.rebase.to) && Object.hasOwn(saved.value.rebase.to, 'workZoneContract')
+      ? { from, to: currentFrameRequest(to) } : request;
+    if (saved && object(saved.value) && same(saved.value.rebase ?? null, replay)) {
       const layer = store.get<LayerBasis>(from.layer.id, from.layer.revision + 1);
       if (!layer || !object(layer.value) || !object(layer.value.acceptance) || !isRef(layer.value.acceptance.frame)
         || !same(layer.value.acceptance.frame, reference(saved)))
@@ -342,6 +349,8 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
       take(readLayerAcceptance(store, { project: from.project, level: 3, graph: to.graph, layer: reference(layer) }));
       return { result: rebaseResult(saved, layer, 'unchanged'), writes: [], guards: [] };
     }
+    to = currentFrameRequest(to);
+    request = { from, to };
     const basis = take(readRebaseBasis(store, request));
     for (const ref of [to.graph, to.horizon, from.layer, from.frame, ...basis.currentReferences]) current(store, ref);
     const guards: Ref[] = [...basis.currentReferences, to.graph, to.horizon, from.layer, from.frame];

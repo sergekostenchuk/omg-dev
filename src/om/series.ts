@@ -5,7 +5,7 @@ import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type RefusalRoute, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
-import { readGaps, prepareGaps, type GapReadRequest } from "./gaps.js";
+import { readGaps, prepareCurrentGaps, type GapReadRequest } from "./gaps.js";
 import { readOmInput, withHistoricalReads, historicalRead } from "./input.js";
 import { readFrameBasis } from "./frame-obligations.js";
 import { readRoutes, prepareRoutes } from "./routes.js";
@@ -1931,8 +1931,7 @@ function mechanismProjection(store: Store, project: string, scope: Sealed<GapRea
     });
   if (!current) return historical;
   const full = mechanismGaps(store, project, scope);
-  const prepared = mechanismTake(prepareGaps(store, full.sources as GapReadRequest['sources']));
-  mechanismCheck(canonical(prepared.collection) === canonical(full.collection), project, 'scope', 'Admission must stand on the current complete D1 derivation');
+  const prepared = mechanismTake(prepareCurrentGaps(store, { sources: full.sources as GapReadRequest['sources'], records: [...scope.records] }));
   const guards = refsUnique([...prepared.guards, scope.sources.input, ...scope.records]);
   for (const ref of guards) {
     const head = store.get(ref.id);

@@ -9,7 +9,7 @@ import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { prepareGaps, readGaps, type Gap, type GapReadRequest, type GapRequest } from './gaps.js';
+import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
 import { readSeries, type RepairSeries, type AttemptGoal } from './series.js';
@@ -262,15 +262,14 @@ function questionContext(store: Store, request: Mc1QuestionRequest) {
   const references = unique([...context.references, request.engineQuestion, request.draft, ...(request.task ? [request.task] : [])]);
   return { ...context, engine, draft, references };
 }
-function currentTaskGuards(store: Store, request: AnswerTaskRequest, context: ReturnType<typeof taskContext>): Ref[] {
-  const prepared = take(prepareGaps(store, request.gaps.sources));
-  check(same(prepared.collection, context.collection), 'answer_question_invalid', context.gap.target, 'gaps', 'Current D1 must preserve the issued source set');
+function currentTaskGuards(store: Store, request: AnswerTaskRequest): Ref[] {
+  const prepared = take(prepareCurrentGaps(store, request.gaps));
   const guards = unique([...prepared.guards, request.input, ...request.gaps.records]);
   for (const guard of guards) head(store, guard);
   return guards;
 }
 function currentQuestionContext(store: Store, request: Mc1QuestionRequest, context: ReturnType<typeof questionContext>) {
-  const guards = currentTaskGuards(store, taskRequestForQuestion(request), context);
+  const guards = currentTaskGuards(store, taskRequestForQuestion(request));
   if (request.task) { head(store, request.task); guards.push(request.task); }
   return { ...context, guards: unique(guards) };
 }
@@ -306,7 +305,7 @@ function loadAnswerTask(store: Store, request: AnswerReadRequest) {
 export function prepareAnswerTask(store: Store, request: AnswerTaskRequest): OmResult<Sealed<CheckedAnswerTask>> {
   requireStore(store); requireTask(request); request = normalizedTask(request);
   return result(() => {
-    const context = taskContext(store, request), guards = currentTaskGuards(store, request, context);
+    const context = taskContext(store, request), guards = currentTaskGuards(store, request);
     const record = predictedTask(request, context.contract), old = store.get(record.id);
     check(!old || same(old, record), 'answer_question_invalid', record.id, 'task', 'The producer task cannot be overwritten under the same source request');
     return { request, record, contract: context.contract, gap: context.gap,
@@ -358,7 +357,7 @@ export function readAnswerTaskBasis(store: Store, request: { project: string; ta
   request = copy(request);
   return result(() => {
     const basis = answerTaskBasis(store, request.project, request.task), checked = basis.checked;
-    const guards = request.current ? currentTaskGuards(store, checked.request, checked.context) : [];
+    const guards = request.current ? currentTaskGuards(store, checked.request) : [];
     if (request.current && !basis.writes.length) { head(store, reference(checked.record)); guards.push(reference(checked.record)); }
     const { context: _context, ...answerTask } = checked;
     return { ...answerTask, guards: unique(guards), writes: basis.writes };
@@ -1020,8 +1019,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       'A line may not reattribute a fact to a different attempt');
     const guards: Ref[] = [];
     if (request.currentOnly) {
-      const prepared = take(prepareGaps(view.store, now.sources as GapRequest));
-      check(same(prepared.collection, now.collection), 'answer_inapplicable', request.target, 'closure.current', 'The closing D1 source must be current');
+      const prepared = take(prepareCurrentGaps(view.store, request.current));
       guards.push(...prepared.guards, now.sources.input, ...request.current.records);
       const sources = currentAnswerSources(view.store, request.project, checked);
       check(sources.applicable, 'answer_inapplicable', request.target, 'closure.sources', 'The applied fact no longer describes its current evidence');

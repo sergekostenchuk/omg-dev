@@ -9,7 +9,7 @@ import type { Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readGapLines, type GapLinesRecord } from './gap-lines.js';
-import { prepareGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
+import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { withHistoricalReads } from './input.js';
 import { readFrameBasis } from './frame-obligations.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -335,9 +335,7 @@ export function prepareOmObligations(store: Store, request: ObligationRequest): 
       const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
     } });
     const basis = context(view, normalized), derived = derive(view, basis);
-    const fresh = take(prepareGaps(store, basis.request.gaps.sources));
-    if (fresh.writes.length || !same(sorted(fresh.existing.map(reference)), basis.request.gaps.records))
-      fail('input_stale', request.project, 'gaps', 'The complete current gap set must be saved before it is handed off');
+    const fresh = take(prepareCurrentGaps(store, basis.request.gaps));
     const currentLines = store.get(request.lines.id);
     if (!currentLines || !same(reference(currentLines), request.lines))
       fail('input_stale', request.lines.id, 'lines', 'New handoff admission uses current line history');

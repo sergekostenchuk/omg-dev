@@ -19,7 +19,7 @@ import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerP
 import { flowKey, type FrameObligation } from './frame-obligations.js';
 import { readSeries, readAnySeriesAt, readMechanismAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
-import { prepareGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
+import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
 import { historicalRead, withHistoricalReads } from './input.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -88,9 +88,7 @@ export function prepareQuestionTasks(store: Store, request: QuestionTaskRequest)
     const gaps = take(readGaps(store, request.gaps));
     if (gaps.sources.project !== request.project)
       fail('packet_task_set_invalid', request.project, 'gaps', 'The complete D1 source must belong to this project');
-    const current = take(prepareGaps(store, gaps.sources as GapReadRequest['sources']));
-    if (!same(current.collection, gaps.collection))
-      fail('packet_task_set_invalid', request.project, 'gaps', 'The task set must describe the current complete D1 source');
+    const current = take(prepareCurrentGaps(store, request.gaps));
     for (const ref of request.gaps.records) {
       const head = store.get(ref.id);
       if (!head || !same(reference(head), ref))

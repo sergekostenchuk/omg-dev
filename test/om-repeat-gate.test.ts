@@ -2272,8 +2272,8 @@ function mechanismFixture(t: test.TestContext, names = ["format-a", "format-b"])
     const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
       operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
       works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
-    const records = deliveredOf(writeGaps(store, sources)).records;
-    const scope: GapReadRequest = { sources, records: records.map(reference) };
+    const gaps = deliveredOf(writeGaps(store, sources));
+    const scope: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
     const routes = deliveredOf(writeRoutes(store, { project, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
     const batch = routes.value.batches.find(item => item.model === "MC2" && item.task === "input-field"
       && item.items.every(gap => gap.field === "address"));

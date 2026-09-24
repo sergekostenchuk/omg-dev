@@ -3,23 +3,24 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonical, hashJson } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { LEVEL, type Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { KNOWLEDGE_KINDS, RESOLUTION_MOMENTS } from "../src/graph/obligation-policy.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { Store } from "../src/storage/store.js";
+import { Store, type Write } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { writeOmInput, type OmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
+import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { fillObligations, type FrameLevel, type FrameRead, type FrameScope } from "../src/om/frame-obligations.js";
 import { applyProposals, openObligationsToGaps, prepareFrameProposals, type FrameGap, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { collectGaps, gateGaps, gapId, prepareGaps, writeGaps, readGaps, GAP_REFUSAL_CODES,
-  type GapSources, type GapCollection, type GapRequest, type GapRecord } from "../src/om/gaps.js";
+import { collectGaps, gateGaps, gapId, prepareGaps, prepareCurrentGaps, writeGaps, readGaps, GAP_REFUSAL_CODES,
+  type GapSources, type GapCollection, type GapRequest, type GapReadRequest, type GapRecord } from "../src/om/gaps.js";
 import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
@@ -443,19 +444,24 @@ test("native D1 prepares without writes, persists exact B1 and C3 sources and re
   assert.ok(prepared.collection.gaps.some(gap => gap.code === "inventory_missing"));
   assert.equal(prepared.existing.length, 0);
   assert.equal(prepared.writes.length, prepared.collection.gaps.length);
-  assert.deepEqual(prepared.sources, request);
+  assert.ok('frame' in prepared.sources.works);
+  assert.equal(prepared.sources.works.frame.workZoneContract, 'accepted-l2-v1');
+  assert.deepEqual(prepared.sources, { ...request, works: { ...request.works,
+    frame: { ...request.works.frame, workZoneContract: 'accepted-l2-v1' } } });
+  assert.equal(Object.hasOwn(request.works.frame, 'workZoneContract'), false);
   assert.deepEqual(revisions(f.store), before);
   const saved = delivered(writeGaps(f.store, request));
   assert.equal(saved.records.length, prepared.collection.gaps.length);
+  assert.deepEqual(saved.sources, prepared.sources);
   assert.equal(f.store.list("gap").length, saved.records.length);
   assert.deepEqual(saved.collection, prepared.collection);
   for (const row of saved.records) {
     assert.equal(row.kind, "gap"); assert.equal(row.id, `om-gap:garden:${row.value.gap.id}`);
     assert.equal(row.revision, 1); assert.equal(row.value.project, "garden");
-    assert.deepEqual(row.value.sources, request);
+    assert.deepEqual(row.value.sources, prepared.sources);
     assert.equal(row.hash, hashJson(row.value));
   }
-  const read = delivered(readGaps(f.store, { sources: request, records: saved.records.map(reference) }));
+  const read = delivered(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) }));
   assert.deepEqual(read.collection, saved.collection); assert.deepEqual(read.records, saved.records);
   const after = revisions(f.store), repeated = delivered(writeGaps(f.store, request));
   assert.deepEqual(repeated, saved); assert.deepEqual(revisions(f.store), after);
@@ -470,9 +476,9 @@ test("stored gap history survives source and graph heads plus reopen while G4 re
   const f = await createOmFixture(t), request = nativeRequest(f), saved = delivered(writeGaps(f.store, request));
   const refs = saved.records.map(reference), before = revisions(f.store);
   assert.ok(refs.length > 1, "the native input supplies several independent gaps");
-  refusedAs(readGaps(f.store, { sources: request, records: [] }), "gap_missing");
-  refusedAs(readGaps(f.store, { sources: request, records: refs.slice(1) }), "gap_missing");
-  refusedAs(readGaps(f.store, { sources: request, records: [...refs, refs[0]!] }), "gap_duplicate");
+  refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: [] }), "gap_missing");
+  refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: refs.slice(1) }), "gap_missing");
+  refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: [...refs, refs[0]!] }), "gap_duplicate");
   assert.deepEqual(revisions(f.store), before);
   const victim = saved.records.find(row => row.value.gap.code === "inventory_missing")!;
   const counterfeit = clone(victim.value) as GapRecord;
@@ -480,8 +486,8 @@ test("stored gap history survives source and graph heads plus reopen while G4 re
   const forged = f.store.write<GapRecord>({ id: victim.id, kind: "gap", expected: victim.revision, value: counterfeit });
   assert.equal(forged.hash, hashJson(counterfeit));
   const forgedRefs = refs.map(ref => ref.id === forged.id ? reference(forged) : ref), afterForgery = revisions(f.store);
-  refusedAs(readGaps(f.store, { sources: request, records: forgedRefs }), "gap_record_forged");
-  assert.deepEqual(delivered(readGaps(f.store, { sources: request, records: refs })).collection, saved.collection);
+  refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: forgedRefs }), "gap_record_forged");
+  assert.deepEqual(delivered(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: refs })).collection, saved.collection);
   assert.deepEqual(revisions(f.store), afterForgery);
   const graph = f.store.get("graph:garden")!, source = f.store.get("source:garden:brief")!;
   f.store.write({ id: graph.id, kind: graph.kind, expected: graph.revision, value: graph.value });
@@ -489,11 +495,11 @@ test("stored gap history survives source and graph heads plus reopen while G4 re
   const afterDrift = revisions(f.store);
   refusedAs(prepareGaps(f.store, request), "input_stale");
   refusedAs(writeGaps(f.store, request), "input_stale");
-  const historic = delivered(readGaps(f.store, { sources: request, records: refs }));
+  const historic = delivered(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: refs }));
   assert.deepEqual(historic.collection, saved.collection);
   assert.deepEqual(revisions(f.store), afterDrift);
   f.reopen();
-  assert.deepEqual(delivered(readGaps(f.store, { sources: request, records: refs })), historic);
+  assert.deepEqual(delivered(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: refs })), historic);
   assert.deepEqual(revisions(f.store), afterDrift);
 });
 
@@ -569,13 +575,13 @@ test("storage boundaries reject foreign exact references and status imitations w
       try {
         f.store.get = ((id: string, revision?: number) => { if (id === request.input.id) throw fault; return get(id, revision); }) as Store["get"];
         assert.throws(() => action(f.store, request), error => error === fault);
-        assert.throws(() => readGaps(f.store, { sources: request, records }), error => error === fault);
+        assert.throws(() => readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records }), error => error === fault);
       } finally { f.store.get = get; }
     }
   }
-  assert.throws(() => readGaps(undefined as unknown as Store, { sources: request, records }), malformed);
-  assert.throws(() => readGaps(f.store, { sources: request } as Parameters<typeof readGaps>[1]), malformed);
-  refusedAs(readGaps(f.store, { sources: request, records: [{ ...records[0]!, hash: "0".repeat(64) }, ...records.slice(1)] }), "record_forged");
+  assert.throws(() => readGaps(undefined as unknown as Store, { sources: clone(saved.sources) as GapRequest, records }), malformed);
+  assert.throws(() => readGaps(f.store, { sources: clone(saved.sources) as GapRequest } as Parameters<typeof readGaps>[1]), malformed);
+  refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: [{ ...records[0]!, hash: "0".repeat(64) }, ...records.slice(1)] }), "record_forged");
   assert.deepEqual(revisions(f.store), before);
   assert.deepEqual([...GAP_REFUSAL_CODES].sort(), ["gap_request_invalid", "gap_source_missing", "gap_set_missing", "gap_record_forged", "gap_missing",
     "gap_foreign", "gap_duplicate", "gap_class_unknown", "gap_kind_unknown", "gap_class_conflict", "gap_consumer_missing", "gap_moment_unknown", "gap_outside_horizon"].sort());
@@ -633,7 +639,8 @@ test("native first-pass gaps accept an explicit unaccepted work upper, then expo
   assert.deepEqual(revisions(store), beforePreparation);
   const firstSnapshot = await store.snapshot(join(root, "initial-source-snapshot"));
   const first = delivered(writeGaps(store, request)), firstRefs = first.records.map(reference);
-  const firstHistory = delivered(readGaps(store, { sources: request, records: firstRefs }));
+  assert.deepEqual(first.sources, request);
+  const firstHistory = delivered(readGaps(store, { sources: clone(first.sources) as GapRequest, records: firstRefs }));
   assert.deepEqual(firstHistory.collection, first.collection);
   const reused = delivered(prepareGaps(store, request));
   assert.deepEqual(reused.writes, []);
@@ -682,7 +689,7 @@ test("native first-pass gaps accept an explicit unaccepted work upper, then expo
   const beforeStale = revisions(store);
   refusedAs(prepareGaps(store, request), "input_stale");
   refusedAs(writeGaps(store, request), "input_stale");
-  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
+  assert.deepEqual(delivered(readGaps(store, { sources: clone(first.sources) as GapRequest, records: firstRefs })), firstHistory);
   assert.deepEqual(revisions(store), beforeStale);
 
   const workHorizon = delivered(writeHorizon(store, { project: "garden", input: reference(input), graph: reference(nextGraph),
@@ -704,15 +711,74 @@ test("native first-pass gaps accept an explicit unaccepted work upper, then expo
   }
   assert.deepEqual(revisions(store), beforeMask);
   const next = delivered(writeGaps(store, current));
+  assert.ok('frame' in next.sources.works);
+  assert.equal(next.sources.works.frame.workZoneContract, 'accepted-l2-v1');
   for (const gap of workSource.gaps) {
     const saved = next.collection.gaps.find(item => item.target === gap.target && item.field === gap.field);
     assert.ok(saved, gap.target);
     assert.ok(saved.evidence.some(evidence => evidence.origin === "works"));
   }
   assert.ok(firstRefs.some(ref => next.records.some(record => record.id === ref.id && record.revision > ref.revision)));
-  const nextRefs = next.records.map(reference), nextHistory = delivered(readGaps(store, { sources: current, records: nextRefs }));
-  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
+  const nextRefs = next.records.map(reference), nextHistory = delivered(readGaps(store, { sources: clone(next.sources) as GapRequest, records: nextRefs }));
+  assert.deepEqual(delivered(readGaps(store, { sources: clone(first.sources) as GapRequest, records: firstRefs })), firstHistory);
   store.close(); store = new Store(database);
-  assert.deepEqual(delivered(readGaps(store, { sources: request, records: firstRefs })), firstHistory);
-  assert.deepEqual(delivered(readGaps(store, { sources: current, records: nextRefs })), nextHistory);
+  assert.deepEqual(delivered(readGaps(store, { sources: clone(first.sources) as GapRequest, records: firstRefs })), firstHistory);
+  assert.deepEqual(delivered(readGaps(store, { sources: clone(next.sources) as GapRequest, records: nextRefs })), nextHistory);
+});
+
+test("current D1 admission distinguishes eras even when both legitimate derivations contain no gap records", async t => {
+  const f = await createOmFixture(t), graph = reference(f.graphRevision);
+  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0,
+    value: { projectId: f.project, paths: [...new Set(f.graph.nodes.flatMap(node => node.code.map(ref => ref.path)))].sort() } });
+  const base = delivered(writeOmInput(f.store, { project: f.project, expected: 0, inventory: reference(inventory),
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  assert.deepEqual(base.value.input.questions, []);
+  const decisions = base.value.gaps.map(gap => {
+    assert.ok(["contract_node_unbound", "acceptance_kind_missing", "contract_boundary_prose"].includes(gap.code), gap.code);
+    const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
+    const value: Json = field === "nodes" ? ["garden-produce-block", "garden-consume-block"] : field === "checkKind" ? "test"
+      : { writer: "garden-produce-block", authority: "garden-user", rollback: "garden-produce-block" };
+    return { pending: clone(inputDecisionWrite({ project: f.project, input: reference(base), graph, layers: [],
+      decision: { target: gap.target, field, value } })) as Write };
+  });
+  const input = delivered(writeAddressing(f.store, { project: f.project, input: reference(base), graph, decisions }));
+  assert.deepEqual(input.value.gaps, []);
+  const horizon = delivered(writeHorizon(f.store, { project: f.project, input: reference(input), graph,
+    refinement: reference(f.store.get("phase:garden:L2")!), available: {},
+    choice: { choiceVersion: "empty-d1-era", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const frame = (level: FrameLevel): ProposalRequest => ({ proposals: [], frame: { project: f.project, level, graph,
+    horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: null,
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
+  const sources: GapRequest = { project: f.project, input: reference(input), graph, horizon: reference(horizon.gate),
+    operations: frame(2), works: frame(3) };
+  const saved = delivered(writeGaps(f.store, sources));
+  assert.deepEqual(saved.collection, { gaps: [], refusals: [] });
+  assert.deepEqual(saved.records, []);
+  assert.ok("frame" in saved.sources.works);
+  assert.equal(saved.sources.works.frame.workZoneContract, "accepted-l2-v1");
+  const current: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: [] };
+  const legacy = clone(current);
+  assert.ok("frame" in legacy.sources.works);
+  delete legacy.sources.works.frame.workZoneContract;
+  const before = revisions(f.store);
+  assert.deepEqual(delivered(readGaps(f.store, legacy)).collection, saved.collection);
+  const refusal = refusedAs(prepareCurrentGaps(f.store, legacy), "input_stale");
+  assert.equal(refusal.at.field, "gaps.sources");
+  const admitted = delivered(prepareCurrentGaps(f.store, current));
+  assert.deepEqual(admitted.sources, saved.sources);
+  assert.deepEqual(admitted.collection, saved.collection);
+  assert.deepEqual(admitted.writes, []);
+  assert.deepEqual(admitted.existing, []);
+  for (const ref of [graph, reference(input), reference(horizon.gate), reference(inventory), reference(f.layers[2]), reference(f.layers[3])])
+    assert.ok(admitted.guards.some(guard => canonical(guard) === canonical(ref)), ref.id);
+  assert.deepEqual(revisions(f.store), before);
+
+  const unread = new Proxy(f.store, { get(target, key) {
+    if (key === "get") return () => { throw new Error("Malformed admission must fail before any Store read"); };
+    const member: unknown = Reflect.get(target, key, target); return typeof member === "function" ? member.bind(target) : member;
+  } });
+  for (const bad of [undefined, null, [], {}, { records: [] }, { sources: current.sources },
+    { sources: null, records: [] }, { sources: current.sources, records: [{}] }])
+    assert.throws(() => prepareCurrentGaps(unread, bad as unknown as GapReadRequest), malformed);
+  assert.throws(() => prepareCurrentGaps(undefined as unknown as Store, current), malformed);
 });

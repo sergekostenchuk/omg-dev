@@ -918,7 +918,7 @@ function mechanismFixture(t: test.TestContext, label: string, StoreType: typeof 
     const sources: GapRequest = { project: PROJECT, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
       operations: { proposals: [], frame: { project: PROJECT, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
       works: { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${PROJECT}:2`)!) } };
-    const gaps = deliveredOf(writeGaps(f.store, sources)), gapSet = { sources, records: gaps.records.map(reference) };
+    const gaps = deliveredOf(writeGaps(f.store, sources)), gapSet = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
     const routes = deliveredOf(writeRoutes(f.store, { project: PROJECT, gaps: gapSet, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
     const batch = routes.value.batches.find(batch => batch.task === "input-field" && batch.items.every(item => item.target.startsWith("discovery:") && item.consumers.length === 0))!;
     assert.ok(batch); assert.equal(batch.items.length, questionCount);

@@ -156,7 +156,7 @@ function factFixture(t: TestContext) {
     const gaps = ok(writeGaps(store, sources)), gap = gaps.records.find(row => row.value.gap.target === target)!;
     assert.equal(gap.value.gap.code, 'predecessor_question'); assert.equal(gap.value.gap.kind, 'repository-fact');
     assert.deepEqual(gap.value.gap.routes, ['code', 'research']);
-    return { sources, records: gaps.records.map(reference), gap };
+    return { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference), gap };
   }
   const gaps = gapsFor(reference(input));
   const command = { executable: process.execPath, args: ['-e',
@@ -395,7 +395,7 @@ test('D5 pending closure preparation carries the answer and its complete index w
   } });
   const request = { project: f.project, basis: { pending: { id: accepted.id, kind: accepted.kind, expected: 0, value: accepted.value } },
     target: f.target, field: 'answer', prior: { sources: f.gaps.sources, records: f.gaps.records },
-    current: { sources, records: current.records.map(reference) }, attempt: null, currentOnly: true };
+    current: { sources: structuredClone(current.sources) as GapRequest, records: current.records.map(reference) }, attempt: null, currentOnly: true };
   const prepared = ok(confirmAnswerGapClosure(view, request));
   assert.deepEqual(prepared.writes.map(write => write.kind), ['accepted-answer', ANSWER_INDEX_KIND]);
   assert.deepEqual((prepared.writes[1]!.value as unknown as AnswerIndex).answers, [reference(accepted)]);
@@ -1026,7 +1026,7 @@ test('D5 does not turn an unclassified native predecessor question into an MC1 f
   const draft = engine.discovery.create(project, 'om-g2', 'R1', 'garden-produce-block',
     [mc1FieldSpec({ input: reference(input), gap: reference(gap), contract: requestContract })], [reference(input), reference(gap)]);
   const issued = store.get<Question>(draft.value.questions[0]!)!;
-  const request: Mc1QuestionRequest = { project, input: reference(input), gaps: { sources, records: gaps.records.map(reference) },
+  const request: Mc1QuestionRequest = { project, input: reference(input), gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
     gap: reference(gap), contract: requestContract, requirements: [], engineQuestion: reference(issued), draft: reference(draft) };
   const before = store.list().map(reference), prepared = prepareMc1Question(store, request);
   assert.equal(prepared.ok, false);

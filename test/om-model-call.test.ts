@@ -282,7 +282,7 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
     works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
   const gaps = valueOf(writeGaps(store, sources));
-  const gapRequest = { sources, records: gaps.records.map(reference) };
+  const gapRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const tasks = valueOf(prepareQuestionTasks(store, { project, gaps: gapRequest,
     questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
       .map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));

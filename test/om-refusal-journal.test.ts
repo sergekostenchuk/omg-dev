@@ -914,3 +914,31 @@ test("origin normalization rejects incomplete modern contexts and the journal re
   }
   for (const value of [undefined, null, [], "source"]) assert.throws(() => normalizeOriginSource(value), code("journal_request_invalid"));
 });
+
+
+test("origin history preserves each work-zone era and refuses a forged contract context", t => {
+  const { store, path } = fixture(t);
+  const legacy: FrameRequest = { project: PROJECT, level: 3, graph: BASE, horizon: refTo("om-horizon-gate:alpha:work-zone"),
+    layer: null, frame: null, upper: { horizon: refTo("om-horizon-gate:alpha:work-zone"), frame: null } };
+  const source = (frame: FrameRequest): OriginSource => ({ role: "base", ref: BASE, context: { kind: "frame", request: frame } });
+  const sources = [source(legacy), source({ ...legacy, workZoneContract: "accepted-l2-v1" })];
+  assert.notEqual(originSourceKey(sources[0]!), originSourceKey(sources[1]!));
+  for (const item of sources) assert.deepEqual(normalizeOriginSource(item), item);
+  const record = gateRecord(store, "zone-era", gateFailure({ refusals: [entry({ origin: origin({ sources }) })] }));
+  const recorded = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(record) }));
+  const classified = deliveredOf(classifyRefusal(store, { project: PROJECT, row: recorded.value.rows[0]!.id,
+    class: "unknown", addressee: "reviewer", basis: sources }));
+  for (const contract of [undefined, null, "unknown"]) assert.throws(() =>
+    normalizeOriginSource(source({ ...legacy, workZoneContract: contract } as unknown as FrameRequest)), code("journal_request_invalid"));
+  assert.throws(() => normalizeOriginSource(source({ ...legacy, level: 2, upper: null, workZoneContract: "accepted-l2-v1" })), code("journal_request_invalid"));
+  store.close(); const reopened = new Store(path); t.after(() => reopened.close());
+  assert.deepEqual(deliveredOf(readJournal(reopened, { project: PROJECT })).value, classified.value);
+  assert.deepEqual(deliveredOf(classifyRefusal(reopened, { project: PROJECT, row: recorded.value.rows[0]!.id,
+    class: "unknown", addressee: "reviewer", basis: [...sources].reverse() })), classified);
+  const forged = structuredClone(classified.value) as RefusalJournal;
+  const marked = forged.rows[0]!.origin.sources.find(item => item.context?.kind === "frame" && item.context.request.workZoneContract);
+  assert.ok(marked?.context?.kind === "frame");
+  delete (marked.context.request as FrameRequest).workZoneContract;
+  reopened.write({ id: classified.id, kind: classified.kind, expected: classified.revision, value: forged });
+  addressed(refusalOf(readJournal(reopened, { project: PROJECT })), "journal_invalid");
+});

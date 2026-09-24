@@ -280,7 +280,7 @@ function firstPassFixture(t: TestContext) {
   const sources: GapRequest = { project: "garden", input: reference(input), graph: frame.graph, horizon: frame.horizon,
     operations: { frame, proposals: [] }, works: { state: "upper-not-accepted", layer: reference(store.get("graph-layer:garden:2")!) } };
   const gaps = ok(writeGaps(store, sources));
-  const initial: GapReadRequest = { sources, records: gaps.records.map(reference) };
+  const initial: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   return { root, database, store, graph, frame, input: reference(input), gaps, initial,
     request: { project: "garden", previous: null, pass: 1, gaps: initial, closures: [] } as GapLinesRequest };
 }
@@ -312,7 +312,7 @@ function acceptOperations(f: ReturnType<typeof firstPassFixture>) {
     operations: { frame: operations, proposals: [] }, works: { proposals: [], frame: { ...operations, level: 3, layer: null, frame: null,
       upper: { horizon: reference(next.gate), frame: acceptance.frame } } } };
   const saved = ok(writeGaps(store, sources));
-  const gaps: GapReadRequest = { sources, records: saved.records.map(reference) };
+  const gaps: GapReadRequest = { sources: structuredClone(saved.sources) as GapRequest, records: saved.records.map(reference) };
   const line = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
   assert.ok(line); assert.ok(!saved.collection.gaps.some(item => item.id === line.id));
   const closure: GapClosureRequest = { id: line.id, reason: "filled", basis: acceptance.frame, acceptance, attempt: null };
@@ -535,9 +535,10 @@ test("D2 saved replay normalizes the complete source proposal sets and gap refer
     kind: "layer-proposal", expected: 0, value: proposal })));
   const sources: GapRequest = { ...f.initial.sources, operations: { frame: f.frame, proposals } };
   const gaps = ok(writeGaps(f.store, sources));
-  const request: GapLinesRequest = { ...f.request, gaps: { sources, records: gaps.records.map(reference) } };
+  const request: GapLinesRequest = { ...f.request, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) } };
   const saved = ok(writeGapLines(f.store, request)), before = historySnapshot(f.store);
-  const reordered: GapLinesRequest = { ...request, gaps: { sources: { ...sources, operations: { frame: f.frame, proposals: [...proposals].reverse() } },
+  const reordered: GapLinesRequest = { ...request, gaps: { sources: { ...request.gaps.sources,
+    operations: { ...request.gaps.sources.operations, proposals: [...proposals].reverse() } },
     records: [...request.gaps.records].reverse() } };
   const prepared = ok(prepareGapLines(f.store, reordered));
   assert.deepEqual(prepared.existing, saved); assert.deepEqual(prepared.writes, []);
@@ -663,7 +664,7 @@ function replaceOperationResult(f: ReturnType<typeof firstPassFixture>, frame: F
       upper: { horizon: operations.horizon, frame: acceptance.frame } } } };
   const saved = ok(writeGaps(f.store, sources));
   assert.ok(!saved.collection.gaps.some(gap => gap.target === obligation && gap.field === "fill"));
-  return { acceptance, gaps: { sources, records: saved.records.map(reference) } as GapReadRequest };
+  return { acceptance, gaps: { sources: structuredClone(saved.sources) as GapRequest, records: saved.records.map(reference) } as GapReadRequest };
 }
 
 test("D2 real C5→D1→D2→G7 A→B→A keeps a closed line and counts only new semantic results after restart", t => {
