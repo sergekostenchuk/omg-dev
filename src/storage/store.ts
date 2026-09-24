@@ -9,6 +9,30 @@ import { createSnapshot, type Snapshot, type SnapshotOptions } from "./snapshots
 export interface Revision<T = Json> { id: string; kind: string; revision: number; hash: string; value: T }
 export interface Write { id: string; kind: string; expected: number; value: unknown }
 export interface ReadGuard { id: string; revision: number; hash: string }
+export interface AbsentGuard { id: string; absent: true }
+export type TransactionGuard = ReadGuard | AbsentGuard;
+
+function transactionGuards(value: unknown): TransactionGuard[] {
+  requireCondition(Array.isArray(value), "invalid_guard", "Transaction guards must be an array");
+  return Array.from(value, (guard: unknown, index): TransactionGuard => {
+    requireCondition(guard !== null && typeof guard === "object" && !Array.isArray(guard),
+      "invalid_guard", `Guard ${index} must be a record`);
+    const fields = guard as Record<string, unknown>;
+    const id = fields['id'];
+    requireCondition(typeof id === "string" && id.length > 0,
+      "invalid_guard", `Guard ${index} needs a nonempty ID`);
+    if ('absent' in fields) {
+      requireCondition(fields['absent'] === true && !('revision' in fields) && !('hash' in fields),
+        "invalid_guard", `Guard ${index} for ${id} must declare only absence`);
+      return { id, absent: true };
+    }
+    const revision = fields['revision'], hash = fields['hash'];
+    requireCondition(typeof revision === "number" && Number.isSafeInteger(revision) && revision > 0
+      && typeof hash === "string" && /^[a-f0-9]{64}$/i.test(hash),
+    "invalid_guard", `Guard ${index} for ${id} needs an exact revision and SHA-256 hash`);
+    return { id, revision, hash };
+  });
+}
 
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
@@ -33,6 +57,9 @@ export class Store {
   }
   get databaseId(): string { return String(this.#db.prepare("SELECT database_id FROM identity WHERE id=1").get()!['database_id']); }
   get<T = Json>(id: string, revision?: number): Revision<T> | null {
+    return this.#get<T>(id, revision);
+  }
+  #get<T = Json>(id: string, revision?: number): Revision<T> | null {
     const row = revision === undefined
       ? this.#db.prepare("SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id=?").get(id)
       : this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? AND revision=?").get(id, revision);
@@ -48,8 +75,9 @@ export class Store {
     return this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
   }
   write<T = Json>(input: Write): Revision<T> { return this.writeMany<T>([input])[0]!; }
-  writeMany<T = Json>(inputs: Write[], guards: ReadGuard[] = []): Revision<T>[] {
+  writeMany<T = Json>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const checkedGuards = transactionGuards(guards);
     const ids = new Set<string>();
     const prepared = inputs.map(input => {
       requireCondition(typeof input.id === "string" && input.id.length > 0 && input.id.length <= 200
@@ -62,10 +90,15 @@ export class Store {
     });
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      for (const guard of guards) {
-        const current = this.get(guard.id);
-        requireCondition(current && current.revision === guard.revision && current.hash === guard.hash,
-          "input_stale", "An input changed before the transaction could commit");
+      for (const guard of checkedGuards) {
+        if ('absent' in guard) {
+          const head = this.#db.prepare("SELECT revision FROM heads WHERE entity_id=?").get(guard.id);
+          requireCondition(!head, "input_stale", `Input ${guard.id} appeared before the transaction could commit`);
+        } else {
+          const current = this.#get(guard.id);
+          requireCondition(current && current.revision === guard.revision && current.hash === guard.hash,
+            "input_stale", "An input changed before the transaction could commit");
+        }
       }
       const results: Revision<T>[] = [];
       for (const input of prepared) {

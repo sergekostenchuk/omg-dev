@@ -4,8 +4,11 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync, mkdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { spawnSync } from "node:child_process";
-import { Store } from "../src/storage/store.js";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Store, type AbsentGuard, type ReadGuard, type TransactionGuard } from "../src/storage/store.js";
+import { isRef } from "../src/pipeline/contracts.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
 import { EngineError } from "../src/errors.js";
 
@@ -114,4 +117,173 @@ test("snapshot publication cannot replace the live database through an ancestor 
   const store = new Store(join(root, "real", "slots", "snapshot-A.sqlite"));
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   await assert.rejects(store.snapshot(join(root, "alias", "slots")), code("unsafe_snapshot_path"));
+});
+
+test("absence guards preserve absence and permit the same transaction to create its guarded ID", t => {
+  const { store, path } = fixture(t);
+  const guard: AbsentGuard = { id: "pilot", absent: true };
+  assert.equal(isRef(guard), false);
+  assert.deepEqual(store.writeMany([], [guard]), []);
+  store.writeMany([{ id: "neighbor", kind: "proof", expected: 0, value: {} }], [guard]);
+  assert.equal(store.get(guard.id), null);
+  assert.deepEqual(store.history(guard.id), []);
+  assert.deepEqual(store.list().map(record => record.id), ["neighbor"]);
+  const writes = [
+    { id: guard.id, kind: "pilot", expected: 0, value: { active: true } },
+    { id: "accepted", kind: "proof", expected: 0, value: {} },
+  ];
+  const saved = store.writeMany(writes, [guard]);
+  assert.equal(saved.length, 2);
+  assert.throws(() => store.writeMany(writes, [guard]), code("input_stale"));
+  store.close();
+  const reopened = new Store(path);
+  try {
+    assert.deepEqual(reopened.get(guard.id), saved[0]);
+    assert.throws(() => reopened.writeMany([], [guard]), code("input_stale"));
+    assert.equal(reopened.history(guard.id).length, 1);
+  } finally { reopened.close(); }
+});
+
+test("a second Store invalidates every guarded dependency without partial neighboring records", t => {
+  const { store, path } = fixture(t);
+  const second = new Store(path);
+  t.after(() => second.close());
+  for (const changed of ["present-a", "present-b", "absent-a", "absent-b"]) {
+    const prefix = `${changed}:`;
+    const present = ["present-a", "present-b"].map(id => store.write({
+      id: prefix + id, kind: "source", expected: 0, value: { original: true },
+    }));
+    const guards: TransactionGuard[] = [...present,
+      { id: prefix + "absent-a", absent: true }, { id: prefix + "absent-b", absent: true }];
+    second.write({ id: prefix + changed, kind: "source", expected: changed.startsWith("present") ? 1 : 0, value: {} });
+    const writes = ["left", "right"].map(id => ({ id: prefix + id, kind: "proof", expected: 0, value: {} }));
+    assert.throws(() => store.writeMany(writes, guards), code("input_stale"));
+    for (const write of writes) {
+      assert.equal(second.get(write.id), null);
+      assert.deepEqual(second.history(write.id), []);
+    }
+    for (const record of present) assert.deepEqual(second.get(record.id, record.revision), record);
+    const current = second.get(prefix + changed)!;
+    const refreshed = guards.map(guard => guard.id === current.id ? current : guard);
+    assert.equal(store.writeMany(writes, refreshed).length, 2);
+  }
+});
+
+test("mixed positive and absence guards retain duplicates and never erase contradictory dependencies", t => {
+  const { store } = fixture(t);
+  const source = store.write({ id: "source", kind: "source", expected: 0, value: {} });
+  const positive: ReadGuard = source;
+  const absent: AbsentGuard = { id: "new", absent: true };
+  assert.deepEqual(store.writeMany([], [positive, absent, positive, absent]), []);
+  for (const guards of [[positive, { id: source.id, absent: true } as const],
+    [{ id: source.id, absent: true } as const, positive]]) {
+    assert.throws(() => store.writeMany([{ id: "forbidden", kind: "proof", expected: 0, value: {} }], guards), code("input_stale"));
+    assert.equal(store.get("forbidden"), null);
+  }
+  for (const guard of [{ ...positive, hash: "0".repeat(64) }, { ...positive, revision: 2 },
+    { ...positive, id: "foreign-source" }, { ...positive, hash: positive.hash.toUpperCase() }]) {
+    assert.throws(() => store.writeMany([], [guard]), code("input_stale"));
+  }
+  const results = store.writeMany([
+    { id: absent.id, kind: "source", expected: 0, value: {} },
+    { id: source.id, kind: source.kind, expected: source.revision, value: { updated: true } },
+  ], [positive, absent, absent, positive]);
+  assert.equal(results[1]!.revision, 2);
+  assert.deepEqual(store.get(source.id, 1), source);
+});
+
+test("all guard forms are validated before database checks and writes", t => {
+  const { store } = fixture(t);
+  const valid = { id: "guarded", revision: 1, hash: "a".repeat(64) };
+  const malformed: unknown[] = [undefined, null, true, 1, "guarded", [], {},
+    { absent: true }, { id: "", absent: true }, { id: 1, absent: true },
+    { id: "guarded" }, { ...valid, revision: undefined }, { ...valid, hash: undefined },
+    ...[false, undefined, null, 1, "true"].map(absent => ({ id: "guarded", absent })),
+    ...[false, undefined, null, 1, "true"].map(absent => ({ ...valid, absent })),
+    { ...valid, absent: true }, { id: "guarded", absent: true, revision: undefined },
+    { id: "guarded", absent: true, hash: undefined },
+    ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1", null].map(revision => ({ ...valid, revision })),
+    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), 1, null].map(hash => ({ ...valid, hash })),
+  ];
+  const writes = ["left", "right"].map(id => ({ id, kind: "proof", expected: 0, value: {} }));
+  for (const guard of malformed) {
+    assert.throws(() => store.writeMany(writes, [valid, guard] as never), code("invalid_guard"));
+  }
+  for (const guards of [null, {}, "guards", 1, new Array(1)]) {
+    assert.throws(() => store.writeMany(writes, guards as never), code("invalid_guard"));
+  }
+  assert.deepEqual(store.list(), []);
+  assert.equal(store.writeMany(writes).length, 2);
+});
+
+test("transaction guards read database heads directly and positive guards retain checksum validation", t => {
+  const { store, path } = fixture(t);
+  const source = store.write({ id: "source", kind: "source", expected: 0, value: {} });
+  store.get = () => { throw new Error("A transaction must not use a public read wrapper"); };
+  assert.deepEqual(store.writeMany([], [source, { id: "missing", absent: true }]), []);
+  assert.throws(() => store.writeMany([], [{ id: source.id, absent: true }]), code("input_stale"));
+  const raw = new DatabaseSync(path);
+  try {
+    raw.exec("DROP TRIGGER revisions_no_update; UPDATE revisions SET body='null' WHERE entity_id='source'");
+    assert.throws(() => store.writeMany([], [source]), code("record_corrupt"));
+    assert.throws(() => store.writeMany([], [{ id: source.id, absent: true }]), code("input_stale"));
+  } finally { raw.close(); }
+});
+
+test("guarded writes roll back their own creations on a later write conflict", t => {
+  const { store } = fixture(t);
+  store.write({ id: "occupied", kind: "source", expected: 0, value: {} });
+  assert.throws(() => store.writeMany([
+    { id: "new", kind: "source", expected: 0, value: {} },
+    { id: "neighbor", kind: "proof", expected: 0, value: {} },
+    { id: "occupied", kind: "source", expected: 0, value: {} },
+  ], [{ id: "new", absent: true }]), code("revision_conflict"));
+  assert.equal(store.get("new"), null);
+  assert.equal(store.get("neighbor"), null);
+  assert.deepEqual(store.history("new"), []);
+  assert.deepEqual(store.history("neighbor"), []);
+});
+
+test("the complete ee3fd4c Store producer retains records, hashes and history after restart", t => {
+  const { store, path, root } = fixture(t);
+  store.close();
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(root, "legacy-store-loader.mjs");
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/src/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', 'ee3fd4cb0941cc47e1b783e06015bd3a8d59fd8b:' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const output = execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, "--input-type=module", "--eval",
+    `import { Store } from ${JSON.stringify(new URL('dist/src/storage/store.js', repositoryUrl).href)};
+const store = new Store(${JSON.stringify(path)});
+const source = store.write({id:'source', kind:'source', expected:0, value: {text:'legacy'}});
+store.writeMany([{id:'proof', kind:'proof', expected:0, value:{source}}], [source]);
+store.write({id:source.id, kind:source.kind, expected:1, value:{text:'changed'}});
+process.stdout.write(JSON.stringify({list:store.list(), history:store.history(source.id)})); store.close();`],
+    { cwd: repository, encoding: "utf8", timeout: 30_000 });
+  const legacy = JSON.parse(output) as { list: unknown[]; history: ReadGuard[] };
+  const reopened = new Store(path);
+  try {
+    assert.deepEqual(reopened.list(), legacy.list);
+    assert.deepEqual(reopened.history("source"), legacy.history);
+    assert.deepEqual(reopened.get("source", 1), legacy.history[0]);
+    assert.throws(() => reopened.writeMany([], [legacy.history[0]!]), code("input_stale"));
+    assert.deepEqual(reopened.writeMany([], [legacy.history[1]!, { id: "missing", absent: true }]), []);
+    assert.deepEqual(reopened.list(), legacy.list);
+  } finally { reopened.close(); }
 });
