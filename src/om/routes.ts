@@ -4,13 +4,13 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { historicalRead, readOmInput, withHistoricalReads } from './input.js';
-import { collectGaps, gateGaps, readGaps, prepareGaps, GAP_ROUTES, type GapReadRequest, type Gap, type GapCollection, type GapKind,
+import { collectGaps, gateGaps, readGaps, prepareGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
   type GapMoment, type GapSources } from './gaps.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { applicableAnswerTask, prepareAnswerSearch, readAnswerSearch, readAnswerTaskBasis,
   type AnswerInvalidation, type AnswerTaskBasis } from './accepted-answer.js';
 
-export const ROUTE_POLICY = sealed(GAP_ROUTES);
+export { ROUTE_POLICY };
 export const ROUTE_CODES = sealed(['route_request_invalid', 'answer_route_foreign', 'route_source_invalid', 'route_task_invalid',
   'route_task_missing', 'route_answer_ambiguous', 'route_record_invalid', 'route_stale', 'inventory_format_unsupported'] as const);
 export type GapRoute = 'code' | 'research' | 'design' | 'owner' | 'environment' | 'task-result';

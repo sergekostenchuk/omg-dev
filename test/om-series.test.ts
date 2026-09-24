@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,7 @@ import {
   classifyRefusal, readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
 } from "../src/om/refusal-journal.js";
 import {
-  beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, readStopHistory, resumeSeries, seriesId,
+  beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, readSeriesAt, readStopHistory, resumeSeries, seriesId,
   prepareBeginAttempt, prepareCompleteAttempt, prepareEscalateSeries, prepareOpenSeries, prepareResumeSeries,
   inputFixNamespace, ownerDecisionNamespace, stopReviewNamespace,
   ATTEMPT_VERDICTS, COMPLETION_REASONS, CONTINUATION_GROUNDS, INPUT_FIX_KIND, OWNER_DECISION_KIND,
@@ -2675,4 +2676,447 @@ test("a stored history holds no attempt past a standing stop, and no transition 
   const heir = addressed(refusalOf(readSeries(store, address("heir", 2))), "series_invalid", "heir", 2);
   assert.equal(heir.at.field, "attempts.4");
   assert.equal(addressed(refusalOf(readStopHistory(store, address("heir", 2))), "series_invalid", "heir", 2).at.field, "attempts.4");
+});
+
+
+test("readSeriesAt preserves exact history and inherited stops after later transitions and restart", t => {
+  const { path, store } = fixture(t);
+  const first = opened(store);
+  const initial = cycle(store, PROJECT, goal(), fruitless());
+  cycle(store, PROJECT, goal(), fruitless());
+  const stopped = cycle(store, PROJECT, goal(), fruitless());
+  const successor = deliveredOf(openSeries(store, { ...address(PROJECT, 2), slice: "slice:cart@2",
+    predecessor: reference(stopped), basis: { ground: "inputs-changed", text: "dependency changed" } }));
+  deliveredOf(resumeSeries(store, { ...address(PROJECT, 2), stop: 3, ...byReview(store, PROJECT, 3) }));
+  cycle(store, PROJECT, goal(), fruitless(), 2);
+  const snapshots = [first, initial, stopped, successor];
+  const historicalOnly = (source: Store) => new Proxy(source, { get(target, property) {
+    if (property === "get") return (id: string, revision?: number) => {
+      assert.notEqual(revision, undefined, "Historical reading must not consult current heads");
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  for (const record of snapshots) {
+    const checked = deliveredOf(readSeriesAt(historicalOnly(store), PROJECT, reference(record)));
+    assert.deepEqual(checked, record);
+    assert.ok(deeplyFrozen(checked));
+    assert.equal(hashJson(checked.value), checked.hash);
+  }
+  const before = store.list().map(reference);
+  store.close();
+  const back = new Store(path);
+  t.after(() => back.close());
+  for (const record of snapshots)
+    assert.deepEqual(deliveredOf(readSeriesAt(historicalOnly(back), PROJECT, reference(record))), record);
+  assert.deepEqual(back.list().map(reference), before);
+});
+
+test("readSeriesAt rejects substituted addresses hashes and stored history through the common check", t => {
+  const { store, path } = fixture(t), initial = opened(store);
+  assert.equal(refusalOf(readSeriesAt(store, "another", reference(initial))).code, "record_foreign");
+  assert.equal(refusalOf(readSeriesAt(store, PROJECT, { ...reference(initial), hash: hex("f") })).code, "record_forged");
+  assert.equal(refusalOf(readSeriesAt(store, PROJECT, { ...reference(initial), revision: 999 })).code, "record_missing");
+  const invalidAddress = store.write({ id: `repair-series:${PROJECT}:01:${BLOCK}`, kind: REPAIR_SERIES_KIND,
+    expected: 0, value: initial.value });
+  assert.equal(refusalOf(readSeriesAt(store, PROJECT, reference(invalidAddress))).code, "series_invalid");
+  const wrongOwner = store.write({ id: seriesId(PROJECT, "other:block", 1), kind: REPAIR_SERIES_KIND,
+    expected: 0, value: initial.value });
+  assert.equal(refusalOf(readSeriesAt(store, PROJECT, reference(wrongOwner))).code, "series_foreign");
+  cycle(store, PROJECT, goal(), fruitless());
+  forge(store, PROJECT, value => ({ ...value, withoutProgress: 0 }));
+  const forged = store.get<RepairSeries>(initial.id)!;
+  assert.equal(refusalOf(readSeriesAt(store, PROJECT, reference(forged))).code, "series_invalid");
+  assert.deepEqual(deliveredOf(readSeriesAt(store, PROJECT, reference(initial))), initial);
+  store.close();
+  const back = new Store(path);
+  t.after(() => back.close());
+  assert.equal(refusalOf(readSeriesAt(back, PROJECT, reference(wrongOwner))).code, "series_foreign");
+  assert.equal(refusalOf(readSeriesAt(back, PROJECT, reference(forged))).code, "series_invalid");
+  assert.deepEqual(deliveredOf(readSeriesAt(back, PROJECT, reference(initial))), initial);
+});
+
+test("readSeriesAt validates every argument before storage and preserves execution faults", t => {
+  const { store } = fixture(t), initial = opened(store), ref = reference(initial);
+  let reads = 0;
+  const fault = new TypeError("historical series storage fault");
+  const broken = new Proxy(store, { get(target, property) {
+    if (property === "get") return () => { reads += 1; throw fault; };
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  for (const invalid of [undefined, null, 1, {}, []]) {
+    assert.throws(() => readSeriesAt(invalid as unknown as Store, PROJECT, ref), code("series_request_invalid"));
+    assert.throws(() => readSeriesAt(broken, invalid as unknown as string, ref), code("series_request_invalid"));
+    assert.throws(() => readSeriesAt(broken, PROJECT, invalid as unknown as Ref), code("series_request_invalid"));
+  }
+  assert.throws(() => readSeriesAt(broken, "foreign:project", ref), code("series_request_invalid"));
+  assert.equal(reads, 0);
+  assert.equal(refusalOf(readSeriesAt(broken, "other", ref)).code, "record_foreign");
+  assert.equal(reads, 0);
+  assert.throws(() => readSeriesAt(broken, PROJECT, ref), error => error === fault);
+  assert.equal(reads, 1);
+});
+
+// A3.3 uses actual accepted preparation, B1, G2 and complete D1, never a claimed slice hash.
+import { ProductEngine } from '../src/product/engine.js';
+import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
+import type { Graph } from '../src/graph/model.js';
+import type { Question } from '../src/discovery/discovery.js';
+import { designOf } from '../src/graph/builder.js';
+import { projectGraph } from '../src/graph/project.js';
+import { writeOmInput, withHistoricalReads } from '../src/om/input.js';
+import { writeHorizon } from '../src/om/horizon.js';
+import { writeGaps, type GapReadRequest, type GapRequest } from '../src/om/gaps.js';
+import { writeRoutes } from '../src/om/routes.js';
+import { writeAddressing, inputDecisionWrite } from '../src/om/addressing.js';
+import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { preparedFeatures } from './product-fixture.js';
+import { preparedField } from './preparation-fixture.js';
+import { gardenGraph } from './om-fixture.js';
+import { seriesAddress, seriesOwner, seriesRequestOf, readAnySeries, readAnySeriesAt, projectMechanismSlice, prepareSeriesAdmission, readMechanismAdmission,
+  type MechanismSeriesRequest, type MechanismAdmission } from '../src/om/series.js';
+
+function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = '', extraConsumer = false) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-mechanism-series-')), path = join(root, 'state.sqlite');
+  let store = new Store(path), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden';
+  const { level: _level, ...graph } = projectGraph(gardenGraph(), 1);
+  if (extraConsumer) graph.nodes.push({ ...structuredClone(graph.nodes.find(node => node.id === 'garden-later-block')!), id: 'garden-extra-block' });
+  preparedFeatures(engine, project, graph as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = questions.map(id => ({ id,
+      question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', blocksCurrentStage: false,
+      resolution: 'Resolve the question during OM' }));
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  let input = deliveredOf(writeOmInput(store, { project, stages, expected: 0 }));
+  const request: MechanismSeriesRequest = { project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: 1 };
+  function publish() {
+    const graph = reference(store.get(`graph:${project}`)!);
+    const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph, refinement: null, available: {},
+      choice: { choiceVersion: `mechanism-fixture-${input.revision}`, features: [{ outcome: 'garden-result' }], excluded: [] } }));
+    const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
+      operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+      works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+    const records = deliveredOf(writeGaps(store, sources));
+    const gaps: GapReadRequest = { sources, records: records.records.map(reference) };
+    const routes = deliveredOf(writeRoutes(store, { project, gaps, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+    const batch = routes.value.batches.find(batch => batch.model === 'MC2' && batch.task === 'input-field' && batch.items.every(item => item.field === 'address'));
+    const admission: MechanismAdmission | null = batch ? { gaps, routes: reference(routes), batch: batch.id } : null;
+    const goal: AttemptGoal | null = batch ? { key: 'addressing', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, 'address') } : null;
+    return { gaps, routes, admission, goal };
+  }
+  return { request, stages, publish, get store() { return store; }, get input() { return input; },
+    replaceProducerQuestions(ids: string[]) {
+      // A fresh accepted research contract for each stage preserves real producer provenance while its
+      // unknown-question set changes. Neither the B1 record nor any D1 classification is patched by the fixture.
+      const source = store.get<{ content: string }>(`source:${project}:brief`)!;
+      for (const stage of UPSTREAM_STAGES) {
+        const draft = engine.prepare(project, stage);
+        for (const id of draft.value.questions) {
+          const question = store.get<Question>(id)!;
+          if (question.value.spec.kind === 'fact') engine.discovery.fact(id, question.revision, reference(source),
+            { kind: 'text-range', start: 0, end: source.value.content.length });
+          else {
+            const field = question.value.spec.field;
+            const value = field === 'mapDesign' ? designOf(store.get<Graph>(`graph:${project}`)!.value) as unknown as Json
+              : preparedField(project, field);
+            if (field === 'preparation') (value as Record<string, Json>).unknowns = ids.map(id => ({ id,
+              question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', blocksCurrentStage: false,
+              resolution: 'Resolve the question during OM' }));
+            engine.discovery.decision(id, question.revision, 'owner', value);
+          }
+        }
+        const old = store.get(`stage:${project}:${stage}`)!;
+        const produced = engine.draft(project, stage, draft.id, old.revision);
+        stages[stage] = reference(engine.pipeline.accept(project, stage, produced.revision));
+      }
+      assert.equal(engine.pipeline.inspect(project, 'features').state, 'accepted');
+      input = deliveredOf(writeOmInput(store, { project, stages, expected: input.revision }));
+    },
+    inventory() {
+      const old = store.get(`repo-inventory:${project}`);
+      const inventory = store.write({ id: `repo-inventory:${project}`, kind: 'repo-inventory', expected: old?.revision ?? 0,
+        value: { project, version: (old?.revision ?? 0) + 1 } });
+      input = deliveredOf(writeOmInput(store, { project, stages, inventory: reference(inventory), expected: input.revision }));
+    },
+    address(ids: string[]) {
+      const graph = reference(store.get(`graph:${project}`)!);
+      input = deliveredOf(writeAddressing(store, { project, input: reference(input), graph,
+        decisions: ids.map(id => ({ pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph, layers: [],
+          decision: { target: `discovery:${id}`, field: 'address', value: { consumer: 'garden-produce-block', kind: 'owner-decision' } } })) as Write })) }));
+    },
+    restart() { store.close(); store = new Store(path); engine = new ProductEngine(store); },
+  };
+}
+
+test('mechanism slice derives full D1 and accepted consumer conditions while independent inventory keeps identity', t => {
+  const f = mechanismFixture(t), a = f.publish();
+  const before = deliveredOf(projectMechanismSlice(f.store, 'garden', a.gaps, true));
+  assert.deepEqual(before.value.questions.map(row => row.target), ['discovery:A', 'discovery:B']);
+  assert.ok(before.value.consumers.length > 1);
+  assert.ok(before.value.consumers.every(node => ['product', 'block'].includes(node.kind)));
+  const omitted = { ...a.gaps, records: a.gaps.records.slice(1) };
+  assert.equal(projectMechanismSlice(f.store, 'garden', omitted).ok, false);
+  const opened = deliveredOf(openSeries(f.store, { ...f.request, scope: a.gaps, predecessor: null, basis: null }));
+  assert.equal(Object.hasOwn(opened.value, 'block'), false);
+  assert.equal(opened.id, 'repair-series:garden:mechanism:1:M5:addressing');
+  assert.notEqual(seriesId('garden', 'mechanism:1:M5:addressing', 1), opened.id);
+  deliveredOf(beginAttempt(f.store, { ...f.request, attempt: 1, goal: a.goal!, admission: a.admission! }));
+  deliveredOf(completeAttempt(f.store, { ...f.request, attempt: 1, outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  f.inventory(); const b = f.publish();
+  const refreshed = deliveredOf(projectMechanismSlice(f.store, 'garden', b.gaps, true));
+  assert.equal(refreshed.slice, before.slice);
+  assert.notDeepEqual(b.gaps.sources.input, a.gaps.sources.input);
+  const freshOpen = deliveredOf(prepareOpenSeries(f.store, { ...f.request, scope: b.gaps, predecessor: null, basis: null }));
+  assert.equal(freshOpen.writes.length, 0);
+  assert.ok(freshOpen.guards.some(ref => ref.id === 'repo-inventory:garden'));
+  assert.equal(deliveredOf(openSeries(f.store, { ...f.request, scope: b.gaps, predecessor: null, basis: null })).revision, 3);
+  const next = deliveredOf(beginAttempt(f.store, { ...f.request, attempt: 2, goal: b.goal!, admission: b.admission! }));
+  assert.equal(next.value.withoutProgress, 1);
+  const proof = deliveredOf(readMechanismAdmission(f.store, { project: 'garden', series: reference(next), attempt: 2, admission: b.admission!, current: true }));
+  assert.deepEqual(proof.goal, b.goal);
+  assert.ok(proof.guards.some(ref => ref.id === `repo-inventory:garden`));
+  f.inventory();
+  assert.equal(readMechanismAdmission(f.store, { project: 'garden', series: reference(next), attempt: 2, admission: b.admission!, current: true }).ok, false);
+  assert.equal(readMechanismAdmission(f.store, { project: 'garden', series: reference(next), attempt: 2, admission: b.admission!, current: false }).ok, true);
+  assert.equal(prepareOpenSeries(f.store, { ...f.request, scope: b.gaps, predecessor: null, basis: null }).ok, false);
+  f.restart(); assert.equal(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(opened))).value.slice, before.slice);
+});
+
+test('mechanism completion and exact late repeats survive D3 addressing and restart while new work needs successor', t => {
+  const f = mechanismFixture(t), first = f.publish();
+  const opening = { ...f.request, scope: first.gaps, predecessor: null, basis: null };
+  const opened = deliveredOf(openSeries(f.store, opening));
+  const begin = { ...f.request, attempt: 1, goal: first.goal!, admission: first.admission! };
+  const running = deliveredOf(beginAttempt(f.store, begin));
+  const permuted = { ...begin, admission: { ...begin.admission, gaps: { ...begin.admission.gaps, records: [...begin.admission.gaps.records].reverse() } } };
+  assert.equal(deliveredOf(beginAttempt(f.store, permuted)).revision, running.revision);
+  const beforeMalformed = f.store.list().map(reference), { admission: _admission, ...missingAdmission } = begin;
+  for (const request of [missingAdmission, { ...begin, admission: null }, { ...begin, admission: {} },
+    { ...begin, admission: { ...begin.admission, gaps: null } }])
+    assert.throws(() => beginAttempt(f.store, request as never), code('series_request_invalid'));
+  assert.deepEqual(f.store.list().map(reference), beforeMalformed);
+  f.address(['A']); const second = f.publish();
+  assert.notEqual(deliveredOf(projectMechanismSlice(f.store, 'garden', second.gaps)).slice, opened.value.slice);
+  assert.equal(deliveredOf(beginAttempt(f.store, begin)).revision, running.revision);
+  assert.equal(deliveredOf(openSeries(f.store, opening)).revision, running.revision);
+  const doneRequest = { ...f.request, attempt: 1, outcome: { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] } };
+  const done = deliveredOf(completeAttempt(f.store, doneRequest));
+  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, attempt: 2, goal: second.goal!, admission: second.admission! })).code, 'series_conflict');
+  const successor = deliveredOf(openSeries(f.store, { ...f.request, line: 2, scope: second.gaps, predecessor: reference(done), basis: { ground: 'inputs-changed', text: 'A was addressed by F5.3' } }));
+  assert.equal(successor.value.inherited.length, 1); assert.equal(successor.value.withoutProgress, 1);
+  f.restart();
+  assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(successor))), successor);
+  const claimedRevision = f.store.get(done.id)!.revision;
+  assert.equal(deliveredOf(completeAttempt(f.store, doneRequest)).revision, claimedRevision);
+  assert.equal(deliveredOf(openSeries(f.store, opening)).revision, claimedRevision);
+  assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(running))), running);
+  f.address(['B']); const empty = f.publish();
+  assert.equal(deliveredOf(projectMechanismSlice(f.store, 'garden', empty.gaps)).value.questions.length, 0);
+  assert.equal(openSeries(f.store, { ...f.request, line: 3, scope: empty.gaps, predecessor: reference(successor), basis: { ground: 'inputs-changed', text: 'None remain' } }).ok, false);
+  assert.equal(deliveredOf(readAnySeries(f.store, { ...f.request, line: 2 })).value.withoutProgress, 1);
+});
+
+test('mechanism admission rejects forged goals, batches, owner aliases and historical scope tampering without writes', t => {
+  const f = mechanismFixture(t), native = f.publish();
+  const opened = deliveredOf(openSeries(f.store, { ...f.request, scope: native.gaps, predecessor: null, basis: null }));
+  const before = f.store.list().map(reference);
+  for (const goal of [{ ...native.goal!, questions: native.goal!.questions.slice(1) }, { ...native.goal!, result: 'unrelated' }]) {
+    assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, attempt: 1, admission: native.admission!, goal })).code, 'attempt_conflict');
+  }
+  assert.equal(prepareSeriesAdmission(f.store, f.request, { ...native.admission!, batch: 'foreign' }).ok, false);
+  for (const request of [{ ...f.request, owner: null }, { ...f.request, owner: { kind: 'mechanism', mechanism: 'other' } }, { ...f.request, block: 'M5:addressing' }]) {
+    assert.throws(() => seriesAddress(request as never), code('series_request_invalid'));
+  }
+  for (const value of [undefined, null, {}, { owner: null }, { owner: { kind: 'mechanism', mechanism: 'unknown' } }]) {
+    assert.throws(() => seriesOwner(value as never), code('series_request_invalid'));
+    assert.throws(() => seriesRequestOf(value as never), code('series_request_invalid'));
+  }
+  for (const value of [{ project: 'garden', block: 'M5:addressing', line: 1, scope: native.gaps },
+    { project: 'garden', block: 'random-future-node', line: 1, admission: native.admission }])
+    assert.throws(() => seriesAddress(value as never), code('series_request_invalid'));
+  assert.deepEqual(f.store.list().map(reference), before);
+  const forged = structuredClone(opened.value) as any;
+  forged.scope.records.pop();
+  const row = f.store.write({ id: opened.id, kind: REPAIR_SERIES_KIND, expected: opened.revision, value: forged });
+  assert.equal(readAnySeriesAt(f.store, 'garden', reference(row)).ok, false);
+  f.restart(); assert.equal(readAnySeries(f.store, f.request).ok, false);
+  assert.equal(readAnySeriesAt(f.store, 'garden', reference(opened)).ok, true);
+});
+
+
+test('mechanism semantic slice distinguishes changed task text, accepted consumers and the complete question set', t => {
+  const a = mechanismFixture(t, ['A']), ab = mechanismFixture(t, ['A', 'B']), b = mechanismFixture(t, ['B']);
+  const changed = mechanismFixture(t, ['A'], ' changed'), consumers = mechanismFixture(t, ['A'], '', true);
+  const cases = [a, ab, b, changed, consumers].map(f => {
+    const snapshot = f.publish(); return deliveredOf(projectMechanismSlice(f.store, 'garden', snapshot.gaps));
+  });
+  assert.equal(new Set(cases.map(value => value.slice)).size, 5);
+  assert.equal(cases[0]!.value.questions[0]!.target, cases[3]!.value.questions[0]!.target);
+  assert.equal(cases[4]!.value.consumers.length, cases[0]!.value.consumers.length + 1);
+});
+
+test('mechanism prepared admissions guard all fresh sources and successor atomically claims the earlier line', t => {
+  const f = mechanismFixture(t), first = f.publish();
+  const opening = deliveredOf(openSeries(f.store, { ...f.request, scope: first.gaps, predecessor: null, basis: null }));
+  const pending = deliveredOf(prepareBeginAttempt(f.store, { ...f.request, attempt: 1, goal: first.goal!, admission: first.admission! }));
+  assert.ok(pending.guards.some(ref => ref.id === 'om-input:garden'));
+  assert.ok(pending.guards.some(ref => ref.id === first.routes.id));
+  f.address(['A']); const next = f.publish();
+  const successor = deliveredOf(prepareOpenSeries(f.store, { ...f.request, line: 2, scope: next.gaps, predecessor: reference(opening),
+    basis: { ground: 'inputs-changed', text: 'A was addressed' } }));
+  assert.equal(successor.writes.length, 2);
+  assert.equal(successor.writes[1]!.id, opening.id);
+  assert.deepEqual(successor.writes[1]!.value, opening.value);
+  deliveredOf(writeGuarded(f.store, { unit: 'A3.3-test', target: successor.writes[0]!.id, writes: successor.writes, guards: successor.guards }));
+  const before = f.store.list().map(reference);
+  assert.equal(writeGuarded(f.store, { unit: 'A3.3-test', target: opening.id, writes: pending.writes, guards: pending.guards }).ok, false);
+  assert.deepEqual(f.store.list().map(reference), before);
+  const oldProof = deliveredOf(readAnySeriesAt(f.store, 'garden', reference(opening)));
+  assert.deepEqual(oldProof, opening);
+});
+
+test('mechanism historical proof cost follows unique bases rather than repeated attempt paths and expires per operation', t => {
+  const f = mechanismFixture(t, ['A']), native = f.publish();
+  deliveredOf(openSeries(f.store, { ...f.request, scope: native.gaps, predecessor: null, basis: null }));
+  const watched = native.gaps.records.find(ref => ref.id.includes('gap:')) ?? native.gaps.records[0]!;
+  let reads = 0;
+  const counted = new Proxy(f.store, { get(target, property) {
+    if (property === 'get') return (id: string, revision?: number) => {
+      if (id === watched.id && revision === watched.revision) reads++;
+      return target.get(id, revision);
+    };
+    const value: unknown = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const counts: number[] = [];
+  let latest: Ref | null = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    deliveredOf(beginAttempt(f.store, { ...f.request, attempt, goal: native.goal!, admission: native.admission! }));
+    const closed = deliveredOf(completeAttempt(f.store, { ...f.request, attempt,
+      outcome: { reason: 'awaiting-owner', achieved: [], cancelled: [], refusals: [] } }));
+    latest = reference(closed);
+    if ([1, 2, 4].includes(attempt)) {
+      reads = 0; deliveredOf(readAnySeriesAt(counted, 'garden', latest)); counts.push(reads);
+    }
+  }
+  assert.ok(counts[0]! > 0);
+  assert.deepEqual(counts, [counts[0], counts[0], counts[0]], 'Each whole historical proof must expand the same complete D1 once irrespective of repeated attempt paths');
+  reads = 0;
+  deliveredOf(readAnySeriesAt(counted, 'garden', latest!));
+  assert.equal(reads, counts[0]);
+  deliveredOf(readAnySeriesAt(counted, 'garden', latest!));
+  assert.equal(reads, counts[0]! * 2, 'A new external operation must read exact sources anew');
+  let otherReads = 0;
+  const other = new Proxy(f.store, { get(target, property) {
+    if (property === 'get') return (id: string, revision?: number) => {
+      if (id === watched.id && revision === watched.revision) otherReads++;
+      return target.get(id, revision);
+    };
+    const value: unknown = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  withHistoricalReads(() => {
+    deliveredOf(readAnySeriesAt(counted, 'garden', latest!));
+    deliveredOf(readAnySeriesAt(other, 'garden', latest!));
+  });
+  assert.ok(otherReads > 0, 'Different Store presentations retain independent proof scopes');
+});
+
+
+test('mechanism one real producer lineage A to A+B to B to empty to A inherits every attempt, stop and owner ladder', t => {
+  const f = mechanismFixture(t, ['A']), a = f.publish();
+  const first = deliveredOf(openSeries(f.store, { ...f.request, scope: a.gaps, predecessor: null, basis: null }));
+  const noResult = { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] };
+  const cycle = (snapshot: ReturnType<typeof f.publish>, line: number, attempt: number) => {
+    deliveredOf(beginAttempt(f.store, { ...f.request, line, attempt, goal: snapshot.goal!, admission: snapshot.admission! }));
+    return deliveredOf(completeAttempt(f.store, { ...f.request, line, attempt, outcome: noResult }));
+  };
+  cycle(a, 1, 1); const twice = cycle(a, 1, 2);
+  assert.equal(twice.value.withoutProgress, 2); assert.equal(twice.value.stop, null);
+
+  f.replaceProducerQuestions(['A', 'B']); const ab = f.publish();
+  const second = deliveredOf(openSeries(f.store, { ...f.request, line: 2, scope: ab.gaps, predecessor: reference(twice),
+    basis: { ground: 'inputs-changed', text: 'The accepted producer added B to A' } }));
+  assert.equal(second.value.inherited.length, 2); assert.equal(second.value.withoutProgress, 2);
+  const firstStop = cycle(ab, 2, 3);
+  assert.equal(firstStop.value.stop!.attempt, 3); assert.equal(firstStop.value.ladder.rung, 1);
+  const pendingReviewId = `${stopReviewNamespace('garden')}prepared-before-successor`;
+  const pendingReviewValue = { ...review('garden', 3, firstStop.value.stop!.goals), owner: f.request.owner } as Record<string, unknown>;
+  delete pendingReviewValue.block;
+  const lateResume = deliveredOf(prepareResumeSeries(f.store, { ...f.request, line: 2, stop: 3, ground: 'review-record',
+    text: 'A continuation prepared before the next slice', review: { pending: { id: pendingReviewId,
+      kind: STOP_REVIEW_KIND, value: pendingReviewValue as Json } } }));
+  assert.deepEqual(lateResume.guards.map(ref => ref.id), [firstStop.id], 'The competing resume has no D1 guard which could hide the lineage CAS defect');
+
+  f.replaceProducerQuestions(['B']); const b = f.publish();
+  const third = deliveredOf(openSeries(f.store, { ...f.request, line: 3, scope: b.gaps, predecessor: reference(firstStop),
+    basis: { ground: 'inputs-changed', text: 'The accepted producer now asks B only' } }));
+  assert.equal(third.value.inherited.length, 3); assert.equal(third.value.withoutProgress, 3);
+  assert.deepEqual(third.value.stop, firstStop.value.stop); assert.deepEqual(third.value.ladder, firstStop.value.ladder);
+  const claimed = f.store.list(REPAIR_SERIES_KIND).map(reference);
+  assert.equal(refusalOf(writeGuarded(f.store, { unit: 'A3.3-test', target: firstStop.id,
+    writes: lateResume.writes, guards: lateResume.guards })).code, 'input_stale');
+  assert.equal(f.store.get(pendingReviewId), null);
+  assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), claimed);
+  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, line: 3, attempt: 4, goal: b.goal!, admission: b.admission! })).code, 'series_stopped');
+  const reviewedValue = { ...review('garden', 3, third.value.stop!.goals), owner: f.request.owner } as Record<string, unknown>;
+  delete reviewedValue.block;
+  const reviewRef = reviewed(f.store, 'garden', reviewedValue);
+  deliveredOf(resumeSeries(f.store, { ...f.request, line: 3, stop: 3, ground: 'review-record',
+    text: 'The review supplies the first continuation', review: { ref: reviewRef } }));
+  cycle(b, 3, 4); cycle(b, 3, 5); const ownerStop = cycle(b, 3, 6);
+  assert.equal(ownerStop.value.stop!.attempt, 6); assert.equal(ownerStop.value.ladder.rung, 2);
+  assert.deepEqual(ownerStop.value.ladder.grounds, ['owner-decision']);
+
+  f.replaceProducerQuestions([]); const empty = f.publish();
+  assert.equal(deliveredOf(projectMechanismSlice(f.store, 'garden', empty.gaps)).value.questions.length, 0);
+  const untouched = f.store.list(REPAIR_SERIES_KIND).map(reference);
+  assert.equal(openSeries(f.store, { ...f.request, line: 4, scope: empty.gaps, predecessor: reference(ownerStop),
+    basis: { ground: 'inputs-changed', text: 'No addressing questions remain' } }).ok, false);
+  assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), untouched);
+  f.restart();
+  assert.deepEqual(deliveredOf(readAnySeries(f.store, { ...f.request, line: 3 })), ownerStop);
+
+  f.replaceProducerQuestions(['A']); const returned = f.publish();
+  assert.equal(deliveredOf(projectMechanismSlice(f.store, 'garden', returned.gaps)).slice, first.value.slice,
+    'Returning A is the same semantic task despite the accepted producer revisions');
+  assert.equal(refusalOf(openSeries(f.store, { ...f.request, scope: returned.gaps, predecessor: null, basis: null })).code, 'series_conflict');
+  assert.equal(prepareSeriesAdmission(f.store, f.request, returned.admission!).ok, false, 'The old line cannot acquire a new current admission when A returns');
+  const fourth = deliveredOf(openSeries(f.store, { ...f.request, line: 4, scope: returned.gaps, predecessor: reference(ownerStop),
+    basis: { ground: 'inputs-changed', text: 'A returned after the empty interval' } }));
+  assert.deepEqual(fourth.value.inherited.map(attempt => attempt.ordinal), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(fourth.value.inherited.map(attempt => attempt.goal.questions), [a.goal!.questions, a.goal!.questions,
+    ab.goal!.questions, b.goal!.questions, b.goal!.questions, b.goal!.questions]);
+  assert.equal(fourth.value.withoutProgress, ownerStop.value.withoutProgress);
+  assert.deepEqual(fourth.value.stop, ownerStop.value.stop); assert.deepEqual(fourth.value.ladder, ownerStop.value.ladder);
+  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, line: 4, attempt: 7, goal: returned.goal!, admission: returned.admission! })).code, 'series_stopped');
+  const repeated = { ...f.request, line: 1, attempt: 1, outcome: noResult }, stable = f.store.list(REPAIR_SERIES_KIND).map(reference);
+  deliveredOf(completeAttempt(f.store, repeated)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
+  f.restart();
+  assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(first))), first);
+  assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(firstStop))), firstStop);
+  assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(ownerStop))), ownerStop);
+  assert.deepEqual(deliveredOf(readAnySeries(f.store, { ...f.request, line: 4 })), fourth);
+  deliveredOf(completeAttempt(f.store, repeated)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
+});
+
+
+test('A3.3 public A4 and D2 readers load independently in fresh Node processes without import-order dependence', () => {
+  for (const [entry, exports] of [
+    ['achievements', ['confirmResults']],
+    ['gap-lines', ['readGapLines', 'prepareGapLines', 'confirmGapLineResult']],
+  ] as const) {
+    const url = new URL(`../src/om/${entry}.js`, import.meta.url).href;
+    const child = spawnSync(process.execPath, ['--input-type=module', '--eval',
+      'const entry = await import(process.argv[1]); process.stdout.write(JSON.stringify(Object.fromEntries(JSON.parse(process.argv[2]).map(name => [name, typeof entry[name]]))));',
+      url, JSON.stringify(exports)], { encoding: 'utf8' });
+    assert.equal(child.error, undefined, `${entry}: ${child.error?.message ?? ''}`);
+    assert.equal(child.status, 0, `${entry} must initialize as the first OM entrypoint in its own process: ${child.stderr}`);
+    assert.deepEqual(JSON.parse(child.stdout), Object.fromEntries(exports.map(name => [name, 'function'])));
+  }
 });

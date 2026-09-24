@@ -4,9 +4,13 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { tokenUsage, type TokenUsage } from "../runtime/model-usage.js";
 import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
-import { readStopContext } from "./repeat-gate.js";
+import { readStopContext, readOriginHoldAt } from "./repeat-gate.js";
 import { writeGuarded } from "./refs.js";
-import { readSeries, seriesId, REPAIR_SERIES_KIND, type AttemptGoal, type RepairSeries } from "./series.js";
+import { withHistoricalReads } from "./input.js";
+import {
+  readSeriesAt, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
+  type AttemptGoal, type MechanismAdmission, type SeriesOwner,
+} from "./series.js";
 
 /** G8's durable boundary: admission and accounting exist before a paid dispatch can start. */
 const UNIT = "gate-admit";
@@ -42,6 +46,12 @@ export interface AddressedGap {
 }
 
 /** The exact adapter and configuration a later dispatch must use. */
+export type MechanismCallOwner = Extract<SeriesOwner, { kind: "mechanism" }>;
+
+export interface MechanismAddressedGap extends Omit<AddressedGap, "consumer"> {
+  readonly consumer: MechanismCallOwner;
+}
+
 export interface DispatchContract {
   readonly adapter: Ref;
   readonly config: Ref;
@@ -80,6 +90,14 @@ export interface RecordCallRequest {
   readonly packet: Json;
 }
 
+export interface MechanismRecordCallRequest extends Omit<RecordCallRequest, "block" | "gaps"> {
+  readonly block?: never;
+  readonly owner: MechanismCallOwner;
+  readonly admission: Sealed<MechanismAdmission>;
+  readonly gaps: readonly MechanismAddressedGap[];
+}
+export type AnyRecordCallRequest = RecordCallRequest | MechanismRecordCallRequest;
+
 export interface CallRecord {
   readonly call: string;
   readonly purpose: CallPurpose;
@@ -98,6 +116,15 @@ export interface CallRecord {
   readonly settledAt: number | null;
 }
 
+export interface MechanismCallRecord extends Omit<CallRecord, "block" | "gaps"> {
+  readonly block?: never;
+  readonly owner: MechanismCallOwner;
+  readonly admission: Sealed<MechanismAdmission>;
+  readonly gaps: readonly MechanismAddressedGap[];
+}
+export type AnyCallRecord = CallRecord | MechanismCallRecord;
+type AnyAddressedGap = Omit<AddressedGap, "consumer"> & { readonly consumer: string | MechanismCallOwner };
+
 /** A report row copies the address and outcome needed by E6, while its exact call ref remains the single source. */
 export interface CallLedgerEntry {
   readonly call: Ref;
@@ -115,13 +142,21 @@ export interface CallLedgerEntry {
   readonly settledAt: number | null;
 }
 
+export interface MechanismCallLedgerEntry extends Omit<CallLedgerEntry, "block" | "gaps"> {
+  readonly block?: never;
+  readonly owner: MechanismCallOwner;
+  readonly admission: Sealed<MechanismAdmission>;
+  readonly gaps: readonly MechanismAddressedGap[];
+}
+export type AnyCallLedgerEntry = CallLedgerEntry | MechanismCallLedgerEntry;
+
 export interface CallLedger {
   readonly projectId: string;
-  readonly calls: readonly CallLedgerEntry[];
+  readonly calls: readonly AnyCallLedgerEntry[];
 }
 
-export interface RecordedCall {
-  readonly call: Revision<CallRecord>;
+export interface RecordedCall<T extends AnyCallRecord = AnyCallRecord> {
+  readonly call: Revision<T>;
   readonly ledger: Revision<CallLedger>;
   readonly repeated: boolean;
 }
@@ -131,6 +166,7 @@ export interface SettledCall extends RecordedCall {
 }
 
 const REQUEST_KEYS = Object.freeze(["attempt", "basis", "block", "call", "dispatch", "gaps", "goal", "packet", "purpose", "series"] as const);
+const MECHANISM_REQUEST_KEYS = [...REQUEST_KEYS.filter(key => key !== "block"), "owner", "admission"];
 const GAP_KEYS = Object.freeze(["consumer", "field", "goal", "id"] as const);
 const GOAL_KEYS = Object.freeze(["key", "questions", "result"] as const);
 const DISPATCH_KEYS = Object.freeze(["adapter", "config"] as const);
@@ -146,19 +182,13 @@ const LEDGER_KEYS = Object.freeze(["calls", "projectId"] as const);
 const LEDGER_ENTRY_KEYS = Object.freeze([
   "attempt", "basis", "block", "call", "gaps", "goal", "name", "openedAt", "purpose", "series", "settledAt", "status", "usage",
 ] as const);
+const mechanismKeys = (keys: readonly string[]): readonly string[] => [...keys.filter(key => key !== "block"), "owner", "admission"];
+const MECHANISM_CALL_KEYS = mechanismKeys(CALL_KEYS);
+const MECHANISM_LEDGER_ENTRY_KEYS = mechanismKeys(LEDGER_ENTRY_KEYS);
 
-interface CheckedRequest {
-  readonly call: string;
-  readonly purpose: CallPurpose;
-  readonly basis: CallBasis | null;
-  readonly block: string;
-  readonly gaps: readonly AddressedGap[];
-  readonly series: Ref;
-  readonly attempt: number;
-  readonly goal: AttemptGoal;
-  readonly dispatch: DispatchContract;
+type CheckedRequest = (Omit<RecordCallRequest, "packet"> | Omit<MechanismRecordCallRequest, "packet">) & {
   readonly packet: PacketFingerprint;
-}
+};
 
 interface CheckedLedger {
   readonly record: Revision<CallLedger>;
@@ -180,7 +210,10 @@ export function callLedgerId(project: string): string {
 }
 
 /** Reads one exact historical call revision without admitting a dispatch or consulting later source heads. */
-export function readCall(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CallRecord>>> {
+export function readCall(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyCallRecord>>> {
+  return withHistoricalReads(() => readCallInScope(store, project, ref));
+}
+function readCallInScope(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyCallRecord>>> {
   requireCondition(store instanceof Store, "call_request_invalid", "A call is read through a store");
   if (!validProject(project)) return problem("call_request_invalid", "A call belongs to one named project without a namespace separator", "call", "project");
   if (!exactReference(ref)) return problem("call_unresolved", "A call is read by an exact reference", targetOf(ref), "call");
@@ -188,7 +221,7 @@ export function readCall(store: Store, project: string, ref: Ref): OmResult<Seal
   if (!ref.id.startsWith(namespace) || !/^[a-f0-9]{64}$/.test(ref.id.slice(namespace.length))) {
     return problem("call_unresolved", "The call reference belongs to this project's call namespace", ref.id, "call", "producer", ref);
   }
-  const record = store.get<CallRecord>(ref.id, ref.revision);
+  const record = store.get<AnyCallRecord>(ref.id, ref.revision);
   if (!record || record.id !== ref.id || record.revision !== ref.revision || record.hash !== ref.hash || record.kind !== CALL_RECORD_KIND) {
     return problem("call_unresolved", "No call record stands at this exact reference", ref.id, "call", "producer", ref);
   }
@@ -200,14 +233,20 @@ export function readCall(store: Store, project: string, ref: Ref): OmResult<Seal
  * The running series, adapter and configuration are all guarded heads: a change in the read/write window admits
  * nothing. A late repeat finds the already admitted identity and never re-validates it against later heads (T5).
  */
-export function recordCall(store: Store, project: string, request: RecordCallRequest): OmResult<Sealed<RecordedCall>> {
+export function recordCall(store: Store, project: string, request: RecordCallRequest): OmResult<Sealed<RecordedCall<CallRecord>>>;
+export function recordCall(store: Store, project: string, request: MechanismRecordCallRequest): OmResult<Sealed<RecordedCall<MechanismCallRecord>>>;
+export function recordCall(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>>;
+export function recordCall(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>> {
+  return withHistoricalReads(() => recordCallInScope(store, project, request));
+}
+function recordCallInScope(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>> {
   requireCondition(store instanceof Store, "call_request_invalid", "A call is recorded through a store");
   if (!validProject(project)) return problem("call_request_invalid", "A call belongs to one named project without a namespace separator", String(project), "project");
   const checked = checkRequest(project, request);
   if (!checked.ok) return checked;
 
   const id = callRecordId(project, checked.value.call);
-  const standing = store.get<CallRecord>(id);
+  const standing = store.get<AnyCallRecord>(id);
   if (standing) {
     const valid = checkedCall(store, standing, project, id);
     if (!valid.ok) return valid;
@@ -231,13 +270,13 @@ export function recordCall(store: Store, project: string, request: RecordCallReq
   if (!ledger.ok) return ledger;
 
   const openedAt = Date.now();
-  const value: CallRecord = {
+  const value: AnyCallRecord = {
     call: checked.value.call, purpose: checked.value.purpose, basis: copyBasis(checked.value.basis),
-    projectId: project, block: checked.value.block,
+    projectId: project, ...ownerFields(checked.value),
     gaps: checked.value.gaps, series: exactRef(checked.value.series), attempt: checked.value.attempt,
     goal: copyGoal(checked.value.goal), dispatch: copyDispatch(checked.value.dispatch), packet: { ...checked.value.packet },
     openedAt, status: "open", usage: null, settledAt: null,
-  };
+  } as AnyCallRecord;
   const pending: Ref = { id, revision: 1, hash: hashJson(value) };
   const row = rowOf(pending, value);
   const ledgerValue: CallLedger = {
@@ -263,7 +302,7 @@ export function recordCall(store: Store, project: string, request: RecordCallReq
   const savedLedger = written.value.find(record => record.id === callLedgerId(project));
   requireCondition(call !== undefined && savedLedger !== undefined, "call_write_invalid", "The atomic call transaction returned both records it wrote");
   return delivered({
-    call: call as unknown as Revision<CallRecord>,
+    call: call as unknown as Revision<AnyCallRecord>,
     ledger: savedLedger as unknown as Revision<CallLedger>, repeated: false,
   });
 }
@@ -273,6 +312,11 @@ export function recordCall(store: Store, project: string, request: RecordCallReq
  * the call and its ledger row together. No total is compared with a budget or used to interrupt an answer.
  */
 export function settleCall(
+  store: Store, call: Ref, usageInput: TokenUsage | null, status: CallSettlementStatus,
+): OmResult<Sealed<SettledCall>> {
+  return withHistoricalReads(() => settleCallInScope(store, call, usageInput, status));
+}
+function settleCallInScope(
   store: Store, call: Ref, usageInput: TokenUsage | null, status: CallSettlementStatus,
 ): OmResult<Sealed<SettledCall>> {
   requireCondition(store instanceof Store, "settlement_request_invalid", "A call is settled through a store");
@@ -286,11 +330,11 @@ export function settleCall(
   const usage = checkedUsage(usageInput, call.id);
   if (!usage.ok) return usage;
 
-  const named = store.get<CallRecord>(call.id, call.revision);
+  const named = store.get<AnyCallRecord>(call.id, call.revision);
   if (!named || named.hash !== call.hash || named.kind !== CALL_RECORD_KIND) {
     return problem("call_unresolved", "No call record stands at the exact reference being settled", call.id, "call", "producer", call);
   }
-  const current = store.get<CallRecord>(call.id);
+  const current = store.get<AnyCallRecord>(call.id);
   if (!current || current.kind !== CALL_RECORD_KIND) {
     return problem("call_unresolved", "The admitted call has no current call-record head", call.id, "call", "producer", call);
   }
@@ -324,7 +368,7 @@ export function settleCall(
   }
 
   const settledAt = Math.max(Date.now(), valid.value.value.openedAt);
-  const value: CallRecord = { ...valid.value.value, status, usage: usage.value, settledAt };
+  const value: AnyCallRecord = { ...valid.value.value, status, usage: usage.value, settledAt };
   const nextRef: Ref = { id: valid.value.id, revision: valid.value.revision + 1, hash: hashJson(value) };
   const calls = ledger.value.record.value.calls.map((row, index) => index === position ? rowOf(nextRef, value) : row);
   const ledgerValue: CallLedger = { projectId: valid.value.value.projectId, calls: orderedRows(calls) };
@@ -341,13 +385,13 @@ export function settleCall(
   const savedLedger = written.value.find(record => record.id === ledger.value!.record.id);
   requireCondition(savedCall !== undefined && savedLedger !== undefined, "call_write_invalid", "The atomic settlement returned both records it wrote");
   return delivered({
-    call: savedCall as unknown as Revision<CallRecord>,
+    call: savedCall as unknown as Revision<AnyCallRecord>,
     ledger: savedLedger as unknown as Revision<CallLedger>, repeated: false, settled: true,
   });
 }
 
 function checkRequest(project: string, value: unknown): OmResult<Sealed<CheckedRequest>> {
-  if (!isPlainObject(value) || !exactKeys(value as object, REQUEST_KEYS)) {
+  if (!isPlainObject(value) || !exactKeys(value as object, "owner" in (value as object) ? MECHANISM_REQUEST_KEYS : REQUEST_KEYS)) {
     return problem("call_request_invalid", "A call request carries exactly its identity, question, series, dispatch and packet", project, "request");
   }
   const request = value as Record<string, unknown>;
@@ -359,8 +403,10 @@ function checkRequest(project: string, value: unknown): OmResult<Sealed<CheckedR
   const purpose = request['purpose'] as CallPurpose;
   const basis = checkBasis(request['basis'], purpose, target);
   if (!basis.ok) return basis;
-  if (!isText(request['block'])) return problem("call_request_invalid", "A call names the block whose question it serves", target, "block");
-  const gaps = checkGaps(request['gaps'], target);
+  const mechanism = "owner" in request;
+  if (mechanism ? !validMechanismFields(request) : !isText(request['block']))
+    return problem("call_request_invalid", "A call names its typed owner and exact admission basis", target, mechanism ? "owner" : "block");
+  const gaps = checkGaps(request['gaps'], target, mechanism);
   if (!gaps.ok) return gaps;
   const goal = checkGoal(request['goal'], target);
   if (!goal.ok) return goal;
@@ -380,10 +426,10 @@ function checkRequest(project: string, value: unknown): OmResult<Sealed<CheckedR
   const packet: PacketFingerprint = { hash: hashJson(request['packet']), chars: text.length, bytes: Buffer.byteLength(text, "utf8") };
   return delivered({
     call: request['call'] as string, purpose, basis: basis.value,
-    block: request['block'] as string, gaps: gaps.value,
+    ...ownerFields(request as unknown as CheckedRequest), gaps: gaps.value,
     series: exactRef(request['series'] as Ref), attempt: request['attempt'] as number,
     goal: goal.value, dispatch: dispatch.value, packet,
-  });
+  } as CheckedRequest);
 }
 
 function checkBasis(value: unknown, purpose: CallPurpose, target: string): OmResult<Sealed<CallBasis | null>> {
@@ -411,10 +457,10 @@ function checkBasis(value: unknown, purpose: CallPurpose, target: string): OmRes
   return problem("call_basis_invalid", "A call basis exactly names its saved stop or origin hold", target, "basis", "gap");
 }
 
-function checkGaps(value: unknown, target: string): OmResult<Sealed<readonly AddressedGap[]>> {
+function checkGaps(value: unknown, target: string, mechanism = false): OmResult<Sealed<readonly AnyAddressedGap[]>> {
   if (!Array.isArray(value)) return problem("call_question_missing", "A call explicitly names its addressed questions", target, "gaps", "gap");
   if (value.length === 0) return problem("call_question_missing", "A paid call has at least one addressed question", target, "gaps", "gap");
-  const gaps: AddressedGap[] = [];
+  const gaps: AnyAddressedGap[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const gap = value[index];
     if (!isPlainObject(gap) || !exactKeys(gap, GAP_KEYS)) {
@@ -422,9 +468,9 @@ function checkGaps(value: unknown, target: string): OmResult<Sealed<readonly Add
     }
     const row = gap as Record<string, unknown>;
     for (const field of GAP_KEYS) {
-      if (!isText(row[field])) return problem("call_question_invalid", "A question address has no empty part", target, `gaps.${index}.${field}`, "gap");
+      if (field === "consumer" && mechanism ? !validMechanismOwner(row[field]) : !isText(row[field])) return problem("call_question_invalid", "A question address has no empty part", target, `gaps.${index}.${field}`, "gap");
     }
-    gaps.push({ id: row['id'] as string, goal: row['goal'] as string, field: row['field'] as string, consumer: row['consumer'] as string });
+    gaps.push({ id: row['id'] as string, goal: row['goal'] as string, field: row['field'] as string, consumer: row['consumer'] as string | MechanismCallOwner });
   }
   return delivered(orderedGaps(gaps));
 }
@@ -474,32 +520,18 @@ function resolveDispatch(store: Store, dispatch: DispatchContract, target: strin
 }
 
 function resolveSeries(store: Store, project: string, request: CheckedRequest, target: string): OmResult<Sealed<readonly Ref[]>> {
-  const found = store.get<RepairSeries>(request.series.id, request.series.revision);
-  const body = found && isPlainObject(found.value)
-    ? found.value as unknown as Record<string, unknown>
-    : null;
-  if (!found || found.hash !== request.series.hash || found.kind !== REPAIR_SERIES_KIND
-    || body === null || body['projectId'] !== project || body['block'] !== request.block
-    || !Number.isSafeInteger(body['line']) || Number(body['line']) < 1) {
-    return problem("call_series_unresolved", "The call's exact series does not belong to this project and block",
+  if ("owner" in request) return resolveMechanismSeries(store, project, request, target, true);
+  const read = readSeriesAt(store, project, request.series);
+  if (!read.ok || read.value.value.block !== request.block) {
+    return problem("call_series_unresolved", "The call's exact valid series does not belong to this project and block",
       target, "series", "producer", request.series);
   }
-  const line = Number(body['line']);
-  let expectedId: string;
-  try { expectedId = seriesId(project, request.block, line); }
-  catch (error) {
-    if (!(error instanceof EngineError) || error.code !== "series_request_invalid") throw error;
-    return problem("call_series_unresolved", "The call's series address is outside the series namespace",
-      target, "series", "producer", request.series);
-  }
-  if (found.id !== expectedId) {
-    return problem("call_series_unresolved", "The call's exact series does not belong to this project and block",
-      target, "series", "producer", request.series);
-  }
-  const read = readSeries(store, { project, block: request.block, line });
-  if (!read.ok || !sameRef(reference(read.value), request.series)) {
+  // Historical ownership is common A3 work; admission separately requires its current guarded head.
+  const current = store.get(request.series.id);
+  if (!current || !sameRef(reference(current), request.series)) {
     return problem("call_series_unresolved", "The call names the current valid series head", target, "series", "producer", request.series);
   }
+  const line = read.value.value.line;
   const attempt = [...read.value.value.inherited, ...read.value.value.attempts].find(item => item.ordinal === request.attempt);
   if (request.purpose === "model-research" || request.purpose === "model-design") {
     if (!attempt || attempt.outcome !== null) {
@@ -540,11 +572,91 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
   return delivered(uniqueRefs([request.series, ...context.value.reads]));
 }
 
+/** The admission proof is common A3 work; E1 only binds its own dispatch address and purpose to it. */
+function resolveMechanismSeries(
+  store: Store, project: string, request: Omit<MechanismRecordCallRequest, "packet"> | MechanismCallRecord,
+  target: string, current: boolean,
+): OmResult<Sealed<readonly Ref[]>> {
+  if (current) {
+    const head = store.get(request.series.id);
+    if (!head || !sameRef(reference(head), request.series))
+      return problem("call_series_unresolved", "New dispatch requires the current owner series head", target, "series", "producer", request.series);
+  }
+  const ordinary = request.purpose === "model-research" || request.purpose === "model-design";
+  const readAdmission = ordinary ? readMechanismAdmission : readMechanismAnalysisAdmission;
+  let read: ReturnType<typeof readMechanismAdmission>;
+  try {
+    read = readAdmission(store, {
+      project, series: request.series, attempt: request.attempt, admission: JSON.parse(canonical(request.admission)) as MechanismAdmission, current,
+    });
+  } catch (error) {
+    if (error instanceof EngineError && error.code === "series_request_invalid")
+      return problem("call_series_unresolved", "The saved mechanism admission has malformed source addresses", target, "admission", "producer", request.series);
+    throw error;
+  }
+  if (!read.ok || hashJson(read.value.owner) !== hashJson(request.owner))
+    return problem("call_series_unresolved", "The call's mechanism owner and exact task must be proved by its series", target, "admission", "producer", request.series);
+  const series = read.value.series.value;
+  const attempt = [...series.inherited, ...series.attempts].find(item => item.ordinal === request.attempt);
+  const guards = current ? [request.series, ...read.value.guards] as unknown as readonly Ref[] : [];
+  if (ordinary) {
+    if (request.purpose !== "model-design")
+      return problem("call_purpose_invalid", "M5:addressing admits its MC2 design task", target, "purpose", "gap", request.series);
+    if (!attempt || attempt.outcome !== null || series.stop !== null)
+      return problem("call_series_unresolved", "A design call belongs to the running mechanism attempt", target, "attempt", "producer", request.series);
+    if (hashJson(copyGoal(attempt.goal)) !== hashJson(request.goal))
+      return problem("call_goal_conflict", "The call uses the full goal recorded for this mechanism attempt", target, "goal", "gap", request.series);
+    const gaps = orderedGaps(read.value.gaps.map(gap => ({ id: gap.id, goal: gap.target, field: gap.field, consumer: request.owner })));
+    if (hashJson(gaps) !== hashJson(request.gaps))
+      return problem("call_question_invalid", "The call addresses every member of the proved mechanism batch exactly once", target, "gaps", "gap", request.series);
+    return delivered(uniqueRefs(guards));
+  }
+  if (!attempt || attempt.outcome === null)
+    return problem("call_basis_unresolved", "An analysis call refers to a completed mechanism attempt", target, "attempt", "producer", request.series);
+  if (request.purpose === "stop-analysis") {
+    const basis = request.basis as SeriesStopBasis, stop = series.stop;
+    if (!sameRef(basis.series, request.series) || basis.attempt !== request.attempt || stop === null
+      || stop.attempt !== request.attempt || !stop.attempts.includes(request.attempt)
+      || !series.ladder.grounds.includes("review-record"))
+      return problem("call_basis_unresolved", "A mechanism stop analysis names the saved stop and its review rung", target, "basis", "producer", basis.series);
+    return delivered(uniqueRefs(guards));
+  }
+  const basis = request.basis as OriginHoldBasis;
+  const hold = readOriginHoldAt(store, project, basis.hold);
+  if (!hold.ok || !("owner" in hold.value.value) || hashJson(hold.value.value.owner) !== hashJson(request.owner)
+    || hold.value.value.attempt !== request.attempt || hold.value.value.lift !== null
+    || !attempt.outcome.refusals.some(refusal => refusal.row === hold.value.value.row))
+    return problem("call_basis_unresolved", "The exact saved hold must belong to this mechanism attempt", target, "basis", "producer", basis.hold);
+  // Lifting today's hold does not change the exact open revision which admitted this call.
+  if (!current) return delivered([]);
+  const context = readStopContext(store, seriesRequestOf(JSON.parse(canonical(series))));
+  if (!context.ok || !context.value.context.holds.some(item => sameRef(item.hold, basis.hold) && item.attempt === request.attempt))
+    return problem("call_basis_unresolved", "A mechanism origin analysis names its current owner hold", target, "basis", "producer", basis.hold);
+  return delivered(uniqueRefs([...guards, ...context.value.reads]));
+}
+
+function validMechanismOwner(value: unknown): value is MechanismCallOwner {
+  return isPlainObject(value) && exactKeys(value as object, ["kind", "mechanism"])
+    && (value as Record<string, unknown>).kind === "mechanism" && (value as Record<string, unknown>).mechanism === "M5:addressing";
+}
+function validMechanismFields(value: object): boolean {
+  const row = value as Record<string, unknown>, admission = row['admission'] as Record<string, unknown>;
+  return validMechanismOwner(row['owner']) && isPlainObject(admission)
+    && exactKeys(admission, ["gaps", "routes", "batch"]) && isPlainObject(admission.gaps)
+    && exactKeys(admission.gaps as object, ["sources", "records"]) && isPlainObject((admission.gaps as Record<string, unknown>).sources)
+    && Array.isArray((admission.gaps as Record<string, unknown>).records) && ((admission.gaps as Record<string, unknown>).records as unknown[]).every(exactReference)
+    && exactReference(admission.routes) && isText(admission.batch);
+}
+function ownerFields(value: CheckedRequest | AnyCallRecord): { block: string } | { owner: MechanismCallOwner; admission: MechanismAdmission } {
+  return "owner" in value ? { owner: { ...value.owner }, admission: JSON.parse(canonical(value.admission)) as MechanismAdmission }
+    : { block: value.block };
+}
+
 function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLedger | null>> {
   const id = callLedgerId(project);
-  const calls = store.list<CallRecord>(CALL_RECORD_KIND)
+  const calls = store.list<AnyCallRecord>(CALL_RECORD_KIND)
     .filter(call => call.id.startsWith(callRecordNamespace(project)));
-  const sources: Revision<CallRecord>[] = [];
+  const sources: Revision<AnyCallRecord>[] = [];
   for (const call of calls) {
     const valid = checkedCall(store, call, project, call.id);
     if (!valid.ok) return valid;
@@ -577,14 +689,18 @@ function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLe
 }
 
 function checkedCall(
-  store: Store, record: Revision<CallRecord>, project: string, target: string,
-): OmResult<Sealed<Revision<CallRecord>>> {
+  store: Store, record: Revision<AnyCallRecord>, project: string, target: string,
+): OmResult<Sealed<Revision<AnyCallRecord>>> {
   if (!validCallShape(record, project)) {
     return problem("call_record_invalid", "The stored call record is not one this unit writes", target, "record", "producer", reference(record));
   }
+  if ("owner" in record.value) {
+    const owner = resolveMechanismSeries(store, project, record.value, target, false);
+    if (!owner.ok) return problem("call_record_invalid", "The saved mechanism admission does not follow from its exact series and task", target, "admission", "producer", reference(record));
+  }
   if (record.revision === 1 && record.value.status === "open") return delivered(record);
   if (record.revision === 2 && record.value.status !== "open") {
-    const admitted = store.get<CallRecord>(record.id, 1);
+    const admitted = store.get<AnyCallRecord>(record.id, 1);
     if (admitted && validCallShape(admitted, project) && admitted.value.status === "open"
       && admitted.value.openedAt === record.value.openedAt
       && hashJson(identityOf(admitted.value)) === hashJson(identityOf(record.value))) {
@@ -595,12 +711,12 @@ function checkedCall(
     target, "revision", "producer", reference(record));
 }
 
-function validCallShape(record: Revision<CallRecord>, project: string): boolean {
+function validCallShape(record: Revision<AnyCallRecord>, project: string): boolean {
   const value = record.value;
-  if (record.kind !== CALL_RECORD_KIND || !isPlainObject(value) || !exactKeys(value, CALL_KEYS)
+  if (record.kind !== CALL_RECORD_KIND || !isPlainObject(value) || !exactKeys(value, "owner" in value ? MECHANISM_CALL_KEYS : CALL_KEYS)
     || !validProject(value.projectId) || value.projectId !== project || !isText(value.call)
-    || !CALL_PURPOSES.includes(value.purpose) || !validBasis(value.basis, value.purpose) || !isText(value.block)
-    || record.id !== callRecordId(project, value.call) || !validGaps(value.gaps)
+    || !CALL_PURPOSES.includes(value.purpose) || !validBasis(value.basis, value.purpose) || ("owner" in value ? !validMechanismFields(value) : !isText(value.block))
+    || record.id !== callRecordId(project, value.call) || !validGaps(value.gaps, "owner" in value)
     || !validGoal(value.goal) || hashJson(copyGoal(value.goal)) !== hashJson(value.goal)
     || !exactReference(value.series) || !Number.isSafeInteger(value.attempt) || value.attempt < 1
     || !validDispatch(value.dispatch) || !validFingerprint(value.packet)
@@ -626,31 +742,31 @@ function checkedUsage(value: unknown, target: string): OmResult<Sealed<TokenUsag
   }
 }
 
-function identityFrom(project: string, request: CheckedRequest): Omit<CallRecord, "openedAt" | "status" | "usage" | "settledAt"> {
+function identityFrom(project: string, request: CheckedRequest): Omit<AnyCallRecord, "openedAt" | "status" | "usage" | "settledAt" | "gaps"> & { gaps: readonly AnyAddressedGap[] } {
   return {
     call: request.call, purpose: request.purpose, basis: copyBasis(request.basis), projectId: project,
-    block: request.block, gaps: request.gaps,
+    ...ownerFields(request), gaps: request.gaps,
     series: exactRef(request.series), attempt: request.attempt, goal: copyGoal(request.goal),
     dispatch: copyDispatch(request.dispatch), packet: { ...request.packet },
   };
 }
 
-function identityOf(value: CallRecord): Omit<CallRecord, "openedAt" | "status" | "usage" | "settledAt"> {
+function identityOf(value: AnyCallRecord): Omit<AnyCallRecord, "openedAt" | "status" | "usage" | "settledAt" | "gaps"> & { gaps: readonly AnyAddressedGap[] } {
   return {
     call: value.call, purpose: value.purpose, basis: copyBasis(value.basis), projectId: value.projectId,
-    block: value.block, gaps: orderedGaps(value.gaps),
+    ...ownerFields(value), gaps: orderedGaps(value.gaps),
     series: exactRef(value.series), attempt: value.attempt, goal: copyGoal(value.goal),
     dispatch: copyDispatch(value.dispatch), packet: { ...value.packet },
   };
 }
 
-function rowOf(call: Ref, value: CallRecord): CallLedgerEntry {
+function rowOf(call: Ref, value: AnyCallRecord): AnyCallLedgerEntry {
   return {
-    call: exactRef(call), name: value.call, purpose: value.purpose, basis: copyBasis(value.basis), block: value.block,
+    call: exactRef(call), name: value.call, purpose: value.purpose, basis: copyBasis(value.basis), ...ownerFields(value),
     gaps: orderedGaps(value.gaps), series: exactRef(value.series), attempt: value.attempt, goal: copyGoal(value.goal),
     status: value.status, usage: value.usage === null ? null : copyUsage(value.usage),
     openedAt: value.openedAt, settledAt: value.settledAt,
-  };
+  } as AnyCallLedgerEntry;
 }
 
 const copyUsage = (usage: TokenUsage): TokenUsage => ({
@@ -673,16 +789,16 @@ const copyBasis = (basis: CallBasis | null): CallBasis | null => basis === null 
 
 const exactRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
 
-const orderedGaps = (gaps: readonly AddressedGap[]): AddressedGap[] => [...gaps]
-  .map(gap => ({ id: gap.id, goal: gap.goal, field: gap.field, consumer: gap.consumer }))
+const orderedGaps = (gaps: readonly AnyAddressedGap[]): AnyAddressedGap[] => [...gaps]
+  .map(gap => ({ id: gap.id, goal: gap.goal, field: gap.field, consumer: typeof gap.consumer === "string" ? gap.consumer : { ...gap.consumer } }))
   .sort((left, right) => compareText(canonical(left), canonical(right)));
 
-const orderedRows = (rows: readonly CallLedgerEntry[]): CallLedgerEntry[] => [...rows].sort((left, right) => compareText(left.call.id, right.call.id));
+const orderedRows = (rows: readonly AnyCallLedgerEntry[]): AnyCallLedgerEntry[] => [...rows].sort((left, right) => compareText(left.call.id, right.call.id));
 
-function validGaps(value: unknown): value is readonly AddressedGap[] {
+function validGaps(value: unknown, mechanism = false): value is readonly AnyAddressedGap[] {
   if (!Array.isArray(value) || value.length === 0) return false;
-  if (!value.every(gap => isPlainObject(gap) && exactKeys(gap, GAP_KEYS) && GAP_KEYS.every(key => isText(gap[key])))) return false;
-  return hashJson(orderedGaps(value as AddressedGap[])) === hashJson(value);
+  if (!value.every(gap => isPlainObject(gap) && exactKeys(gap, GAP_KEYS) && GAP_KEYS.every(key => key === "consumer" && mechanism ? validMechanismOwner(gap[key]) : isText(gap[key])))) return false;
+  return hashJson(orderedGaps(value as AnyAddressedGap[])) === hashJson(value);
 }
 
 function validGoal(value: unknown): value is AttemptGoal {
@@ -722,12 +838,12 @@ function validFingerprint(value: unknown): value is PacketFingerprint {
     && Number.isSafeInteger(packet['bytes']) && Number(packet['bytes']) >= Number(packet['chars']);
 }
 
-function validLedgerRow(value: unknown): value is CallLedgerEntry {
+function validLedgerRow(value: unknown): value is AnyCallLedgerEntry {
   if (!isPlainObject(value)) return false;
   const row = value as Record<string, unknown>;
-  if (!exactKeys(row, LEDGER_ENTRY_KEYS) || !exactReference(row['call'])
+  if (!exactKeys(row, "owner" in row ? MECHANISM_LEDGER_ENTRY_KEYS : LEDGER_ENTRY_KEYS) || !exactReference(row['call'])
     || !isText(row['name']) || !CALL_PURPOSES.includes(row['purpose'] as CallPurpose)
-    || !validBasis(row['basis'], row['purpose'] as CallPurpose) || !isText(row['block']) || !validGaps(row['gaps'])
+    || !validBasis(row['basis'], row['purpose'] as CallPurpose) || ("owner" in row ? !validMechanismFields(row) : !isText(row['block'])) || !validGaps(row['gaps'], "owner" in row)
     || !exactReference(row['series']) || !Number.isSafeInteger(row['attempt']) || Number(row['attempt']) < 1
     || !validGoal(row['goal']) || hashJson(copyGoal(row['goal'])) !== hashJson(row['goal'])
     || !["open", ...CALL_SETTLEMENT_STATUSES].includes(row['status'] as CallStatus)

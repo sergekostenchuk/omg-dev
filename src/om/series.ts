@@ -5,6 +5,12 @@ import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type RefusalRoute, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
+import { readGaps, prepareGaps, type GapReadRequest } from "./gaps.js";
+import { readOmInput, withHistoricalReads, historicalRead } from "./input.js";
+import { readFrameBasis } from "./frame-obligations.js";
+import { readRoutes, prepareRoutes } from "./routes.js";
+import { gapLineKey, gapLineExpectedResult } from "./gap-lines.js";
+import { inputDecisionNamespace } from "./addressing.js";
 
 /**
  * The history of attempts at one block and one slice of the horizon.
@@ -303,6 +309,27 @@ export interface CompleteAttemptRequest extends SeriesRequest {
   readonly attempt: number;
   readonly outcome: ClaimedOutcome;
 }
+export type MechanismOwner = { readonly kind: "mechanism"; readonly mechanism: "M5:addressing" };
+export type SeriesOwner = { readonly kind: "block"; readonly block: string } | MechanismOwner;
+export interface MechanismSeriesRequest { readonly project: string; readonly owner: MechanismOwner; readonly line: number }
+export type AnySeriesRequest = SeriesRequest | MechanismSeriesRequest;
+export interface MechanismAdmission { readonly gaps: Sealed<GapReadRequest>; readonly routes: Ref; readonly batch: string }
+export interface MechanismRepairSeries extends Omit<RepairSeries, "block"> {
+  readonly owner: MechanismOwner;
+  readonly scope: Sealed<GapReadRequest>;
+  readonly admissions: readonly { readonly attempt: number; readonly basis: MechanismAdmission }[];
+}
+export type AnyRepairSeries = RepairSeries | MechanismRepairSeries;
+export interface MechanismOpenSeriesRequest extends MechanismSeriesRequest {
+  readonly scope: Sealed<GapReadRequest>; readonly predecessor: Ref | null; readonly basis: SeriesBasis | null;
+}
+export interface MechanismBeginAttemptRequest extends MechanismSeriesRequest {
+  readonly attempt: number; readonly goal: AttemptGoal; readonly admission: MechanismAdmission;
+}
+export type MechanismCompleteAttemptRequest = MechanismSeriesRequest & Pick<CompleteAttemptRequest, "attempt" | "outcome">;
+export type AnyOpenSeriesRequest = OpenSeriesRequest | MechanismOpenSeriesRequest;
+export type AnyBeginAttemptRequest = BeginAttemptRequest | MechanismBeginAttemptRequest;
+export type AnyCompleteAttemptRequest = CompleteAttemptRequest | MechanismCompleteAttemptRequest;
 /**
  * The record a ground stands on, in one of the two ways a neighbour can hand it over — never both, never neither.
  * `ref` names a record ALREADY STORED, at its exact reference. `pending` is the record the neighbour writes IN THIS
@@ -369,6 +396,12 @@ export interface SeriesTransition {
   readonly value: RepairSeries;
 }
 
+export interface AnySeriesTransition extends Omit<SeriesTransition, "value"> { readonly value: AnyRepairSeries }
+export type MechanismResumeSeriesRequest = MechanismSeriesRequest & ContinuationRequest & { readonly stop: number };
+export type MechanismEscalateSeriesRequest = MechanismSeriesRequest & Pick<EscalateSeriesRequest, "stop" | "review">;
+export type AnyResumeSeriesRequest = ResumeSeriesRequest | MechanismResumeSeriesRequest;
+export type AnyEscalateSeriesRequest = EscalateSeriesRequest | MechanismEscalateSeriesRequest;
+
 const GOAL_KEYS = Object.freeze(["key", "questions", "result"] as const);
 const ACHIEVEMENT_KEYS = Object.freeze(["key", "basis"] as const);
 const STORED_REFUSAL_KEYS = Object.freeze(["row"] as const);
@@ -390,9 +423,10 @@ const REF_SOURCE_KEYS = Object.freeze(["ref"] as const);
 const PENDING_SOURCE_KEYS = Object.freeze(["pending"] as const);
 const PENDING_KEYS = Object.freeze(["id", "kind", "value"] as const);
 
-interface Address { readonly project: string; readonly block: string; readonly line: number; readonly id: string }
+export interface SeriesAddress { readonly project: string; readonly owner: SeriesOwner; readonly line: number; readonly id: string }
+type Address = SeriesAddress;
 interface Context { readonly target: string; readonly ref: Ref | undefined }
-interface Prepared { readonly transition: SeriesTransition; readonly current: Revision<RepairSeries> | null }
+interface Prepared { readonly transition: AnySeriesTransition; readonly current: Revision<AnyRepairSeries> | null }
 
 export function seriesId(project: string, block: string, line: number): string {
   // The line is decimal digits and a project carries no ':', so the address of a series decomposes in one way only,
@@ -427,8 +461,10 @@ export function ownerDecisionNamespace(project: string): string {
  * an unchanged slice is the same series, and re-issuing one would be a way round a saved stop.
  * Opening the same series again changes nothing and writes no revision, however much has happened since (T5).
  */
-export function openSeries(store: Store, request: OpenSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
-  return applied(store, prepareOpen(store, request));
+export function openSeries(store: Store, request: OpenSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function openSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function openSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareOpen(store, request)));
 }
 
 /**
@@ -437,8 +473,10 @@ export function openSeries(store: Store, request: OpenSeriesRequest): OmResult<S
  * notification lost to a restart re-reaches the cycle it was about instead of opening the next one; the same ordinal
  * under another goal is a conflict. Only the next ordinal opens an attempt, and none opens while a stop stands.
  */
-export function beginAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>> {
-  return applied(store, prepareBegin(store, request));
+export function beginAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareBegin(store, request)));
 }
 
 /**
@@ -447,8 +485,10 @@ export function beginAttempt(store: Store, request: BeginAttemptRequest): OmResu
  * closed is refused, so a late delivery does not undo a later one (T5). Whether the attempt moved the goal is decided
  * here, from the achievements it carries and the history of that goal — never from a word of the caller's.
  */
-export function completeAttempt(store: Store, request: CompleteAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>> {
-  return applied(store, prepareComplete(store, request));
+export function completeAttempt(store: Store, request: CompleteAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareComplete(store, request)));
 }
 
 /**
@@ -458,8 +498,10 @@ export function completeAttempt(store: Store, request: CompleteAttemptRequest): 
  * saved since then standing. A continuation opens a new window of up to three attempts without progress; it is not
  * itself progress, so it spends the rung it stood on instead of returning the ladder to the start.
  */
-export function resumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
-  return applied(store, prepareResume(store, request));
+export function resumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareResume(store, request)));
 }
 
 /**
@@ -470,8 +512,10 @@ export function resumeSeries(store: Store, request: ResumeSeriesRequest): OmResu
  * It applies to its own stop and once: the same request again changes nothing, another review for a stop already
  * escalated is refused, and a stop that no longer stands cannot be escalated at all (T5).
  */
-export function escalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
-  return applied(store, prepareEscalate(store, request));
+export function escalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareEscalate(store, request)));
 }
 
 /**
@@ -479,13 +523,49 @@ export function escalateSeries(store: Store, request: EscalateSeriesRequest): Om
  * An absent series is a typed refusal, not an empty one: a block that was never repaired and a series that was lost
  * are different facts, and no consumer may read them alike (T4).
  */
-export function readSeries(store: Store, request: SeriesRequest): OmResult<Sealed<Revision<RepairSeries>>> {
+export function readSeries(store: Store, request: SeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function readSeries(store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function readSeries(store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "A series is read through a request object");
   const address = requireAddress(request);
-  const current = currentSeries(store, address);
-  if (!current) return missing(address);
-  return current.ok ? delivered(current.value) : current;
+  return withHistoricalReads(() => {
+    const current = currentSeries(store, address);
+    if (!current) return missing(address);
+    return current.ok ? delivered(current.value) : current;
+  });
+}
+
+/** Exact history uses the same series check without requiring this revision to remain the head. */
+export function readAnySeriesAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  return withHistoricalReads(() => readSeriesHistory(store, project, ref));
+}
+function readSeriesHistory(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+  requireStore(store);
+  requireProject(project);
+  if (!isRef(ref)) throw new EngineError("series_request_invalid", "Historical series reading needs an exact reference",
+    { unit: UNIT, target: REPAIR_SERIES_KIND, field: "reference" });
+  const prefix = `${REPAIR_SERIES_KIND}:${project}:`;
+  const read = readRecord<AnyRepairSeries>(store, ref, { unit: UNIT, target: ref.id, kind: REPAIR_SERIES_KIND, idPrefix: prefix });
+  if (!read.ok) return read;
+  // Decode the address, never the body's claimed owner. Colons inside an existing block id retain their meaning.
+  const suffix = ref.id.slice(prefix.length);
+  if (suffix.startsWith("mechanism:")) {
+    const match = /^mechanism:([1-9][0-9]*):M5:addressing$/.exec(suffix);
+    if (!match || !Number.isSafeInteger(Number(match[1]))) return problem("series_invalid", "The mechanism series address is malformed", { target: ref.id, ref }, "id");
+    const address = seriesAddress({ project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, line: Number(match[1]) });
+    const broken = checkSeries(store, read.value.value, address, { target: ref.id, ref });
+    return broken ?? delivered(read.value as Revision<AnyRepairSeries>);
+  }
+  const separator = suffix.indexOf(":");
+  const line = Number(suffix.slice(0, separator)), block = suffix.slice(separator + 1);
+  const context: Context = { target: ref.id, ref };
+  if (separator < 1 || !Number.isSafeInteger(line) || line < 1 || !block.length
+    || suffix !== `${line}:${block}`)
+    return problem("series_invalid", "The historical record must stand at a canonical series address", context, "id");
+  const address: Address = { project, owner: { kind: "block", block }, line, id: ref.id };
+  const broken = checkSeries(store, read.value.value, address, context);
+  return broken ?? delivered(read.value as Revision<AnyRepairSeries>);
 }
 
 /**
@@ -501,58 +581,72 @@ export function readSeries(store: Store, request: SeriesRequest): OmResult<Seale
  * stop keeps its goals and its window exactly. Nothing here is stored beside them and nothing is believed: a record
  * whose stored ladder, count or stop does not follow from the same walk is refused by readSeries before this returns.
  */
-export function readStopHistory(store: Store, request: SeriesRequest): OmResult<Sealed<StopHistory>> {
+export function readStopHistory(store: Store, request: AnySeriesRequest): OmResult<Sealed<StopHistory>> {
   const read = readSeries(store, request);
   if (!read.ok) return read;
-  const derived = walk(plainSeries(read.value.value as unknown as RepairSeries));
+  const derived = walk(plainSeries(read.value.value as unknown as AnyRepairSeries));
   return delivered({ stops: derived.stops, standing: derived.stop === null ? null : derived.stop.attempt });
 }
 
 // Each change is prepared once and applied in one of two ways: written on its own here, or handed to a caller that
 // writes it together with other records in a single guarded transaction. One implementation, two entrances.
-export const prepareOpenSeries = (store: Store, request: OpenSeriesRequest): OmResult<Sealed<SeriesTransition>> =>
-  handed(prepareOpen(store, request));
-export const prepareBeginAttempt = (store: Store, request: BeginAttemptRequest): OmResult<Sealed<SeriesTransition>> =>
-  handed(prepareBegin(store, request));
-export const prepareCompleteAttempt = (store: Store, request: CompleteAttemptRequest): OmResult<Sealed<SeriesTransition>> =>
-  handed(prepareComplete(store, request));
-export const prepareResumeSeries = (store: Store, request: ResumeSeriesRequest): OmResult<Sealed<SeriesTransition>> =>
-  handed(prepareResume(store, request));
-export const prepareEscalateSeries = (store: Store, request: EscalateSeriesRequest): OmResult<Sealed<SeriesTransition>> =>
-  handed(prepareEscalate(store, request));
+export function prepareOpenSeries(store: Store, request: OpenSeriesRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareOpen(store, request))); }
+export function prepareBeginAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareBegin(store, request))); }
+export function prepareCompleteAttempt(store: Store, request: CompleteAttemptRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareComplete(store, request))); }
+export function prepareResumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareResume(store, request))); }
+export function prepareEscalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareEscalate(store, request))); }
 
-const handed = (prepared: OmResult<Prepared>): OmResult<Sealed<SeriesTransition>> =>
+const handed = (prepared: OmResult<Prepared>): OmResult<Sealed<AnySeriesTransition>> =>
   prepared.ok ? delivered(prepared.value.transition) : prepared;
 
-function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Revision<RepairSeries>>> {
+function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Revision<AnyRepairSeries>>> {
   if (!prepared.ok) return prepared;
   const { transition, current } = prepared.value;
   // Nothing to write is a fact, not a failure: the series already holds what was asked for.
   if (transition.writes.length === 0) return delivered(current!);
   // One transaction for the series and the ground it stands on: both commit, or neither does (T7).
-  const result = writeGuarded<RepairSeries>(store, {
+  const result = writeGuarded<AnyRepairSeries>(store, {
     unit: UNIT, target: transition.writes[0]!.id, guards: transition.guards, writes: [...transition.writes],
   });
   if (!result.ok) return result;
   return delivered(result.value[0]!);
 }
 
-const unchanged = (current: Revision<RepairSeries>): OmResult<Prepared> =>
-  ({ ok: true, value: { transition: { writes: [], guards: [], value: current.value }, current } });
+const unchanged = (current: Revision<AnyRepairSeries>, guards: readonly Ref[] = []): OmResult<Prepared> =>
+  ({ ok: true, value: { transition: { writes: [], guards, value: current.value }, current } });
 
 function change(
-  address: Address, value: RepairSeries, expected: number, guards: readonly Ref[], current: Revision<RepairSeries> | null,
+  address: Address, value: AnyRepairSeries, expected: number, guards: readonly Ref[], current: Revision<AnyRepairSeries> | null,
   grounds: readonly PreparedWrite[] = [],
 ): OmResult<Prepared> {
   const series: PreparedWrite = { id: address.id, kind: REPAIR_SERIES_KIND, expected, value };
   return { ok: true, value: { transition: { writes: [series, ...grounds], guards: [...guards], value }, current } };
 }
 
-function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepared> {
+function prepareOpen(store: Store, request: AnyOpenSeriesRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "A series is opened through a request object");
   const address = requireAddress(request);
-  requireCondition(isText(request.slice), "series_request_invalid", "A series names the slice of the horizon it belongs to");
+  const mechanism = "owner" in request;
+  if (mechanism) requireScope(request.scope);
+  else requireCondition(isText(request.slice), "series_request_invalid", "A series names the slice of the horizon it belongs to");
+  const projection = mechanism ? projectMechanismSlice(store, address.project, request.scope, false) : null;
+  if (projection && !projection.ok) return projection;
+  if (projection?.ok && projection.value.value.questions.length === 0)
+    return problem("series_invalid", "An empty addressing slice opens no work and does not erase its lineage", { target: address.id, ref: undefined }, "scope.questions");
+  const slice = projection?.ok ? projection.value.slice : (request as OpenSeriesRequest).slice;
+  let sourceGuards: readonly Ref[] = [];
+
   // The first line has no predecessor and no ground to stand on; any later line has both. Neither is a default.
   // Whether a predecessor that IS named is an exact reference is data, not shape: it comes back addressed.
   requireCondition("predecessor" in request && (address.line === 1) === (request.predecessor === null),
@@ -569,17 +663,17 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
   let carried: readonly Continuation[] = [];
   let escalated: readonly Escalation[] = [];
   let predecessor: Ref | null = null;
-  let earlier: Revision<RepairSeries> | null = null;
+  let earlier: Revision<AnyRepairSeries> | null = null;
   if (request.predecessor !== null) {
-    const at = seriesId(address.project, address.block, address.line - 1);
-    const read = readRecord<RepairSeries>(store, request.predecessor, {
+    const at = ownerSeriesId(address.project, address.owner, address.line - 1);
+    const read = readRecord<AnyRepairSeries>(store, request.predecessor, {
       unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: at,
     });
     if (!read.ok) return read;
     const broken = checkSeries(store, read.value.value, { ...address, line: address.line - 1, id: at },
       { target: address.id, ref: reference(read.value) });
     if (broken) return broken;
-    earlier = read.value as Revision<RepairSeries>;
+    earlier = read.value as Revision<AnyRepairSeries>;
     inherited = [...earlier.value.inherited, ...earlier.value.attempts].map(copyAttempt);
     // The continuations come across with the attempts: a stop already answered must not come back to life in the
     // successor, and the windows already opened are what the rung of the ladder is derived from.
@@ -593,15 +687,29 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
   if (standing) {
     if (!standing.ok) return standing;
     const held = standing.value.value;
-    const same = held.slice === request.slice
+    const same = held.slice === slice
       && hashJson(held.predecessor) === hashJson(predecessor) && hashJson(held.basis) === hashJson(basis);
-    if (same) return unchanged(standing.value);
+    if (same) {
+      if (mechanism && "owner" in held && canonical(normalizedScope(request.scope)) !== canonical(normalizedScope(held.scope))) {
+        if (store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
+          return problem("series_conflict", "Fresh work cannot return to an older line after its successor exists", { target: address.id, ref: reference(standing.value) }, "line");
+        const fresh = projectMechanismSlice(store, address.project, request.scope, true);
+        if (!fresh.ok) return fresh;
+        return unchanged(standing.value, fresh.value.guards);
+      }
+      return unchanged(standing.value);
+    }
     return refused("series_conflict", "A series already stands at this address on another slice, predecessor or ground",
       { unit: UNIT, target: address.id, field: "slice", ref: reference(standing.value) }, "producer");
   }
 
+  if (mechanism) {
+    const admitted = projectMechanismSlice(store, address.project, request.scope, true);
+    if (!admitted.ok) return admitted;
+    sourceGuards = admitted.value.guards;
+  }
   if (earlier) {
-    if (earlier.value.slice === request.slice) {
+    if (earlier.value.slice === slice) {
       return refused("slice_unchanged", "An unchanged slice keeps the same series and the same count, and opens no successor",
         { unit: UNIT, target: address.id, field: "slice", ref: predecessor ?? undefined }, "producer");
     }
@@ -614,16 +722,22 @@ function prepareOpen(store: Store, request: OpenSeriesRequest): OmResult<Prepare
   }
 
   const value = settled({
-    projectId: address.project, block: address.block, line: address.line, slice: request.slice,
+    projectId: address.project, ...ownerFields(address.owner), line: address.line, slice,
+    ...(mechanism ? { scope: normalizedScope(request.scope), admissions: earlier && "owner" in earlier.value ? earlier.value.admissions : [] } : {}),
     predecessor, basis, inherited, attempts: [], continuations: carried, escalations: escalated,
-  });
-  return change(address, value, 0, predecessor === null ? [] : [predecessor], null);
+  } as SeriesDraft);
+  // Claim the old line in the same CAS transaction. Its unchanged body remains historical, while its new revision
+  // invalidates a previously prepared attempt on that old line in either transaction ordering.
+  const claim: PreparedWrite[] = mechanism && earlier ? [{ id: earlier.id, kind: REPAIR_SERIES_KIND,
+    expected: earlier.revision, value: earlier.value }] : [];
+  return change(address, value, 0, [...sourceGuards, ...(predecessor === null ? [] : [predecessor])], null, claim);
 }
 
-function prepareBegin(store: Store, request: BeginAttemptRequest): OmResult<Prepared> {
+function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "An attempt is begun through a request object");
   const address = requireAddress(request);
+  if ("owner" in request) requireAdmission(request.admission);
   requireCondition(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
     "series_request_invalid", "An attempt names the ordinal it opens, so that a late delivery finds its own attempt");
   requireCondition(goalProblem(request.goal) === null,
@@ -636,14 +750,28 @@ function prepareBegin(store: Store, request: BeginAttemptRequest): OmResult<Prep
   const head = current.value;
   const context: Context = { target: address.id, ref: reference(head) };
   const held = head.value;
-
   const known = [...held.inherited, ...held.attempts].find(item => item.ordinal === request.attempt);
   if (known) {
     // T5: an ordinal this series already holds is that attempt, whether it is still running or long closed. A
     // notification that arrives twice, or late, re-reaches the cycle it was about and opens nothing.
-    if (hashJson(known.goal) === hashJson(goal)) return unchanged(head);
+    if (hashJson(known.goal) === hashJson(goal)) {
+      if ("owner" in held && "owner" in request && canonical(held.admissions.find(row => row.attempt === request.attempt)?.basis ?? null) !== canonical(normalizedAdmission(request.admission)))
+        return problem("attempt_conflict", "An existing attempt retains its exact admission evidence", context, "admission");
+      return unchanged(head);
+    }
     return problem("attempt_conflict", `Attempt ${request.attempt} was begun for another goal, and a later goal does not replace it`, context, "goal");
   }
+  let admission: SeriesAdmissionProof | null = null;
+  if ("owner" in request) {
+    const admitted = prepareSeriesAdmission(store, request, request.admission);
+    if (!admitted.ok) return admitted;
+    admission = admitted.value as SeriesAdmissionProof;
+    if (!("owner" in held) || held.slice !== admission.slice)
+      return problem("series_conflict", "A changed mechanism task or accepted consumer set requires the inherited successor", context, "scope");
+    if (canonical(goal.questions) !== canonical(admission.goal.questions) || goal.result !== admission.goal.result)
+      return problem("attempt_conflict", "The declared goal must equal the entire selected M6 batch and its result contract", context, "goal");
+  }
+
   if (request.attempt !== held.inherited.length + held.attempts.length + 1) {
     return problem("attempt_unknown", `Attempt ${request.attempt} is neither an attempt this series holds nor the next one to open`, context, "attempt");
   }
@@ -654,11 +782,12 @@ function prepareBegin(store: Store, request: BeginAttemptRequest): OmResult<Prep
     return problem("series_stopped", `A saved stop stands after attempt ${held.stop.attempt}: ${held.stop.resume}`, context, "stop");
   }
   const attempt: Attempt = { ordinal: request.attempt, goal, outcome: null, verdict: null };
-  const value = settled({ ...plainSeries(held), attempts: [...held.attempts.map(copyAttempt), attempt] });
-  return change(address, value, head.revision, [reference(head)], head);
+  const value = settled({ ...plainSeries(held),
+    ...("owner" in held && "owner" in request ? { admissions: [...held.admissions, { attempt: request.attempt, basis: normalizedAdmission(request.admission) }] } : {}), attempts: [...held.attempts.map(copyAttempt), attempt] });
+  return change(address, value, head.revision, [reference(head), ...(admission?.guards ?? [])], head);
 }
 
-function prepareComplete(store: Store, request: CompleteAttemptRequest): OmResult<Prepared> {
+function prepareComplete(store: Store, request: AnyCompleteAttemptRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "An outcome is recorded through a request object");
   const address = requireAddress(request);
@@ -714,7 +843,7 @@ function prepareComplete(store: Store, request: CompleteAttemptRequest): OmResul
   return change(address, value, head.revision, [reference(head)], head);
 }
 
-function prepareResume(store: Store, request: ResumeSeriesRequest): OmResult<Prepared> {
+function prepareResume(store: Store, request: AnyResumeSeriesRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "A stopped series is continued through a request object");
   const address = requireAddress(request);
@@ -743,6 +872,8 @@ function prepareResume(store: Store, request: ResumeSeriesRequest): OmResult<Pre
     if (hashJson(continuationOf(already)) === hashJson(basis)) return unchanged(head);
     return problem("continuation_conflict", `The stop after attempt ${request.stop} is continued already, and a later ground does not replace the earlier one`, context, "ground");
   }
+  if (address.owner.kind === "mechanism" && store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
+    return problem("series_conflict", "A new continuation or escalation belongs to the existing successor", context, "line");
   const stop = held.stop;
   if (stop === null || stop.attempt !== request.stop) {
     return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
@@ -764,7 +895,7 @@ function prepareResume(store: Store, request: ResumeSeriesRequest): OmResult<Pre
   return change(address, value, head.revision, [reference(head)], head, grounded.write === null ? [] : [grounded.write]);
 }
 
-function prepareEscalate(store: Store, request: EscalateSeriesRequest): OmResult<Prepared> {
+function prepareEscalate(store: Store, request: AnyEscalateSeriesRequest): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "A stop is escalated through a request object");
   const address = requireAddress(request);
@@ -791,6 +922,8 @@ function prepareEscalate(store: Store, request: EscalateSeriesRequest): OmResult
     if (sameRef(already.review, escalation.review)) return unchanged(head);
     return problem("escalation_conflict", `The stop after attempt ${request.stop} was sent to the owner on another review already, and a later review does not replace it`, context, "review");
   }
+  if (address.owner.kind === "mechanism" && store.get(ownerSeriesId(address.project, address.owner, address.line + 1)))
+    return problem("series_conflict", "A new continuation or escalation belongs to the existing successor", context, "line");
   const stop = held.stop;
   if (stop === null || stop.attempt !== request.stop) {
     return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
@@ -882,7 +1015,7 @@ function basisFrom(request: ContinuationRequest, ref: Ref): ContinuationBasis {
 
 /** Weighs the content of a ground's record against the history this series holds, whichever way the record came. */
 function groundStanding(
-  store: Store, address: Address, basis: ContinuationBasis, value: unknown, held: RepairSeries, stop: SeriesStop, context: Context,
+  store: Store, address: Address, basis: ContinuationBasis, value: unknown, held: AnyRepairSeries, stop: SeriesStop, context: Context,
 ): OmResult<never> | null {
   if (basis.ground === "review-record") return weighReview(value, address, stop, context, "decided");
   if (basis.ground === "inputs-fixed") return weighFix(store, address, basis, value, held, stop, context);
@@ -900,7 +1033,9 @@ function groundStanding(
 function aboutStop(value: unknown, address: Address, stop: SeriesStop): { readonly value: Record<string, unknown> } | { readonly field: string } {
   if (!isPlainObject(value)) return { field: "" };
   const record = value as Record<string, unknown>;
-  if (record['projectId'] !== address.project || record['block'] !== address.block) return { field: ".block" };
+  if (record['projectId'] !== address.project || (address.owner.kind === "block"
+    ? record['block'] !== address.owner.block || Object.hasOwn(record, "owner")
+    : Object.hasOwn(record, "block") || canonical(record['owner'] ?? null) !== canonical(address.owner))) return { field: address.owner.kind === "block" ? ".block" : ".owner" };
   if (record['stop'] !== stop.attempt) return { field: ".stop" };
   const goals = record['goals'];
   if (!Array.isArray(goals) || goals.length === 0 || !goals.every(isText)) return { field: ".goals" };
@@ -988,7 +1123,7 @@ function weighDecision(value: unknown, address: Address, stop: SeriesStop, conte
  * the repeated ADDRESSED check establishes, and its record is read here, not re-run.
  */
 function weighFix(
-  store: Store, address: Address, basis: InputsContinuation, value: unknown, held: RepairSeries, stop: SeriesStop, context: Context,
+  store: Store, address: Address, basis: InputsContinuation, value: unknown, held: AnyRepairSeries, stop: SeriesStop, context: Context,
 ): OmResult<never> | null {
   const journal = readJournal(store, { project: address.project });
   if (!journal.ok) {
@@ -1060,24 +1195,24 @@ function linkedRefusals(store: Store, address: Address, claimed: readonly Claime
   return null;
 }
 
-function currentSeries(store: Store, address: Address): OmResult<Revision<RepairSeries>> | null {
+function currentSeries(store: Store, address: Address): OmResult<Revision<AnyRepairSeries>> | null {
   // The head revision of the exact id is what a reference to it is made of; the record is then read as any record is,
   // so a foreign kind standing at this address is refused instead of being extended.
-  const head = store.get<RepairSeries>(address.id);
+  const head = store.get<AnyRepairSeries>(address.id);
   if (!head) return null;
-  const read = readRecord<RepairSeries>(store, reference(head), {
+  const read = readRecord<AnyRepairSeries>(store, reference(head), {
     unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: address.id,
   });
   if (!read.ok) return read;
   const broken = checkSeries(store, read.value.value, address, { target: address.id, ref: reference(head) });
-  return broken ?? { ok: true, value: read.value as Revision<RepairSeries> };
+  return broken ?? { ok: true, value: read.value as Revision<AnyRepairSeries> };
 }
 
 const missing = (address: Address): OmResult<never> =>
   refused("series_missing", "No series of repairs stands for this block and line",
     { unit: UNIT, target: address.id }, "producer");
 
-const running = (value: RepairSeries): Attempt | null => value.attempts.find(item => item.outcome === null) ?? null;
+const running = (value: AnyRepairSeries): Attempt | null => value.attempts.find(item => item.outcome === null) ?? null;
 
 // ---------------------------------------------------------------------------
 // What the series derives for itself: the verdict of every attempt, the count, the saved stop and the ladder.
@@ -1103,7 +1238,7 @@ interface StopDraft {
   window: StopWindow | null;
 }
 
-type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "ladder" | "stop">;
+type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "ladder" | "stop"> | Omit<MechanismRepairSeries, "withoutProgress" | "ladder" | "stop">;
 
 // A ladder is built here rather than shared: what is written holds no object of a policy table (T11).
 const ladderAt = (rung: number, goals: readonly string[], windows: readonly number[]): SeriesLadder =>
@@ -1276,12 +1411,13 @@ const resumeOf = (ordinal: number, ladder: SeriesLadder): string => (ladder.rung
   : `attempt ${ordinal + 1} needs the owner's decision: the first rung of the ladder is spent for ${ladder.goals.join(", ")}`);
 
 /** The value as it is written: the attempts carry the verdicts the walk derived, and the count, ladder and stop follow. */
-function settled(draft: SeriesDraft): RepairSeries {
+function settled(draft: SeriesDraft): AnyRepairSeries {
   const derived = walk(draft);
   const verdict = (attempt: Attempt): Attempt =>
     ({ ...copyAttempt(attempt), verdict: derived.verdicts.get(attempt.ordinal) ?? null });
   return {
-    projectId: draft.projectId, block: draft.block, line: draft.line, slice: draft.slice,
+    projectId: draft.projectId, ...ownerFields(seriesOwner(draft)), line: draft.line, slice: draft.slice,
+    ...("owner" in draft ? { scope: normalizedScope(draft.scope), admissions: sealed(draft.admissions) } : {}),
     predecessor: draft.predecessor === null ? null : exactRef(draft.predecessor),
     basis: draft.basis === null ? null : plainBasis(draft.basis),
     inherited: draft.inherited.map(verdict),
@@ -1291,7 +1427,7 @@ function settled(draft: SeriesDraft): RepairSeries {
     withoutProgress: derived.withoutProgress,
     ladder: derived.ladder,
     stop: derived.stop,
-  };
+  } as AnyRepairSeries;
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,15 +1480,16 @@ const copyAttempt = (attempt: Attempt): Attempt => ({
   verdict: attempt.verdict,
 });
 
-const plainSeries = (value: RepairSeries): SeriesDraft => ({
-  projectId: value.projectId, block: value.block, line: value.line, slice: value.slice,
+const plainSeries = (value: AnyRepairSeries): SeriesDraft => ({
+  projectId: value.projectId, ...ownerFields(seriesOwner(value)), line: value.line, slice: value.slice,
+  ...("owner" in value ? { scope: normalizedScope(value.scope), admissions: sealed(value.admissions) } : {}),
   predecessor: value.predecessor === null ? null : exactRef(value.predecessor),
   basis: value.basis === null ? null : plainBasis(value.basis),
   inherited: value.inherited.map(copyAttempt),
   attempts: value.attempts.map(copyAttempt),
   continuations: value.continuations.map(plainContinuation),
   escalations: value.escalations.map(plainEscalation),
-});
+} as SeriesDraft);
 
 // ---------------------------------------------------------------------------
 // Shape. The same shape is read on two paths — as it arrives from a caller, and as it already stands in the store.
@@ -1496,15 +1633,18 @@ const said = (value: unknown): boolean =>
  * close on itself.
  */
 function checkSeries(store: Store, value: unknown, address: Address, context: Context): OmResult<never> | null {
-  if (!isPlainObject(value) || !exactKeys(value, SERIES_KEYS)) {
+  const mechanism = address.owner.kind === "mechanism";
+  const keys = mechanism ? [...SERIES_KEYS.filter(key => key !== "block"), "owner", "scope", "admissions"] : SERIES_KEYS;
+  if (!isPlainObject(value) || !exactKeys(value, keys)) {
     return problem("series_invalid", "A series carries its address, its history of attempts and what follows from them, and nothing else", context, "value");
   }
   const series = value as Record<string, unknown>;
-  if (!isText(series['projectId']) || !isText(series['block']) || !Number.isSafeInteger(series['line'])) {
+  if (!isText(series['projectId']) || (!mechanism && !isText(series['block'])) || !Number.isSafeInteger(series['line'])) {
     return problem("series_invalid", "A series names the project, block and line it belongs to", context, "projectId");
   }
   // A series of another block, project or line standing at this address is not this series, however well it reads.
-  if (series['projectId'] !== address.project || series['block'] !== address.block || series['line'] !== address.line) {
+  if (series['projectId'] !== address.project || series['line'] !== address.line
+    || (address.owner.kind === "block" ? series['block'] !== address.owner.block : canonical(series['owner'] ?? null) !== canonical(address.owner))) {
     return problem("series_foreign", `A series of ${String(series['block'])} in ${String(series['projectId'])} cannot stand for ${address.id}`, context, "block");
   }
   if (!isText(series['slice'])) return problem("series_invalid", "A series names the slice of the horizon it belongs to", context, "slice");
@@ -1579,10 +1719,40 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
     raised = Number(after);
   }
 
-  const draft = plainSeries(series as unknown as RepairSeries);
+  if (mechanism) {
+    if (!isPlainObject(series['scope']) || !Array.isArray(series['admissions']))
+      return problem("series_invalid", "A mechanism retains its full scope and exact attempt admissions", context, "scope");
+    const checked = mechanismResult(() => {
+      const scope = series['scope'] as unknown as GapReadRequest;
+      try { requireScope(scope); } catch (error) {
+        if (error instanceof EngineError && error.code === 'series_request_invalid') mechanismCheck(false, address.id, 'scope', 'The saved mechanism scope is malformed');
+        throw error;
+      }
+      const projected = mechanismProjection(store, address.project, scope, false);
+      mechanismCheck(projected.slice === series['slice'] && projected.value.questions.length > 0, address.id, 'slice', 'The saved semantic slice must follow from its exact full D1 evidence');
+      const admissions = series['admissions'] as unknown[];
+      mechanismCheck(admissions.length === all.length, address.id, 'admissions', 'Every inherited and own attempt retains exactly one admission');
+      for (let index = 0; index < admissions.length; index++) {
+        const row = admissions[index];
+        mechanismCheck(mechanismObject(row) && exactKeys(row, ['attempt', 'basis']) && row.attempt === index + 1, address.id, 'admissions', 'Admission order and attempt identity must agree');
+        try { requireAdmission(row.basis); } catch (error) {
+          if (error instanceof EngineError && error.code === 'series_request_invalid') mechanismCheck(false, address.id, 'admissions', 'A saved attempt admission is malformed');
+          throw error;
+        }
+        const proof = mechanismAdmission(store, { project: address.project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: address.line }, row.basis, false);
+        const attempt = all[index] as Attempt;
+        mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
+          address.id, 'admissions.goal', 'The historical declared goal must equal the exact whole batch');
+        if (index >= inherited.length) mechanismCheck(proof.slice === projected.slice, address.id, 'admissions.scope', 'Own attempts must belong to this exact semantic slice');
+      }
+      return true;
+    });
+    if (!checked.ok) return checked;
+  }
+  const draft = plainSeries(series as unknown as AnyRepairSeries);
   if (predecessor !== null) {
-    const at = seriesId(address.project, address.block, address.line - 1);
-    const read = readRecord<RepairSeries>(store, predecessor, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: at });
+    const at = ownerSeriesId(address.project, address.owner, address.line - 1);
+    const read = readRecord<AnyRepairSeries>(store, predecessor, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: at });
     if (!read.ok) {
       return problem("series_invalid", `The predecessor a series names is not a series of this block: ${read.refusal.code}`, context, "predecessor");
     }
@@ -1591,6 +1761,8 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
     // T3: the inherited history is derived AGAIN from the predecessor at the revision it names, so a predecessor that
     // has since moved on does not make this record false, and a rewritten history is not taken for an inherited one.
     const handedDown = [...read.value.value.inherited, ...read.value.value.attempts].map(copyAttempt);
+    if ("owner" in draft && "owner" in read.value.value && canonical(draft.admissions.slice(0, read.value.value.admissions.length)) !== canonical(read.value.value.admissions))
+      return problem("series_invalid", "The successor must inherit every exact admission unchanged", context, "admissions");
     if (hashJson(handedDown) !== hashJson(draft.inherited)) {
       return problem("series_invalid", "The inherited history is not the history its predecessor holds", context, "inherited");
     }
@@ -1682,9 +1854,262 @@ function requireStore(store: unknown): asserts store is Store {
   requireCondition(store instanceof Store, "series_request_invalid", "A series is read and written through a store");
 }
 
-function requireAddress(request: SeriesRequest): Address {
-  const id = seriesId(request.project, request.block, request.line);
-  return { project: request.project, block: request.block, line: request.line, id };
+/** The addressing slice contains semantic tasks and allowed accepted consumers; revisions remain evidence. */
+export interface MechanismSlice {
+  contract: 'addressing-slice/v1'; owner: MechanismOwner;
+  questions: { target: string; field: string; classification: unknown; task: unknown; producer: unknown; protected: unknown; decision?: unknown }[];
+  consumers: { id: string; kind: string }[];
+}
+export interface MechanismProjection { slice: string; value: MechanismSlice; guards: Ref[]; references: Ref[] }
+export interface SeriesAdmissionProof extends MechanismProjection {
+  goal: Omit<AttemptGoal, 'key'>; gaps: { id: string; target: string; field: string }[];
+}
+class MechanismFailure extends Error { constructor(readonly result: Extract<OmResult<never>, { ok: false }>) { super(result.refusal.message); } }
+function mechanismTake<T>(result: OmResult<T>): T { if (!result.ok) throw new MechanismFailure(result); return result.value; }
+function mechanismCheck(condition: unknown, target: string, field: string, message: string): asserts condition {
+  if (!condition) mechanismTake(problem('series_invalid', message, { target, ref: undefined }, field));
+}
+function mechanismResult<T>(action: () => T): OmResult<Sealed<T>> {
+  return withHistoricalReads(() => {
+    try { return delivered(action()); } catch (error) { if (error instanceof MechanismFailure) return error.result; throw error; }
+  });
+}
+const mechanismObject = (value: unknown): value is Record<string, any> => isPlainObject(value);
+const refsUnique = (refs: readonly Ref[]): Ref[] => ordered([...new Map(refs.map(ref => [canonical(ref), exactRef(ref)])).values()], canonical);
+function normalizedScope(scope: Sealed<GapReadRequest>): GapReadRequest {
+  return sealed({ sources: scope.sources, records: ordered(scope.records, canonical) }) as GapReadRequest;
+}
+function requireScope(scope: unknown): asserts scope is GapReadRequest {
+  requireCondition(mechanismObject(scope) && exactKeys(scope, ['sources', 'records']) && isPlainObject(scope.sources)
+    && isText(scope.sources.project) && isRef(scope.sources.input)
+    && Array.isArray(scope.records) && scope.records.every(isRef), 'series_request_invalid', 'A mechanism scope requires the complete exact D1 source and record set');
+}
+function normalizedAdmission(admission: MechanismAdmission): MechanismAdmission {
+  return { gaps: normalizedScope(admission.gaps), routes: exactRef(admission.routes), batch: admission.batch };
+}
+function requireAdmission(admission: unknown): asserts admission is MechanismAdmission {
+  requireCondition(mechanismObject(admission) && exactKeys(admission, ['gaps', 'routes', 'batch']) && isRef(admission.routes)
+    && isText(admission.batch), 'series_request_invalid', 'Admission needs the full D1 and one exact selected M6 batch');
+  requireScope(admission.gaps);
+}
+function mechanismGaps(store: Store, project: string, scope: Sealed<GapReadRequest>) {
+  return historicalRead(store, { reader: 'A3.3.full-gaps', project, ref: scope.sources.input, parameters: normalizedScope(scope) as unknown as Json },
+    () => mechanismTake(readGaps(store, scope as GapReadRequest)), () => {
+      mechanismCheck(false, scope.sources.input.id, 'scope.history', 'The complete D1 basis must not form a cycle');
+      throw new Error('Unreachable cycle refusal');
+    });
+}
+function mechanismProjection(store: Store, project: string, scope: Sealed<GapReadRequest>, current: boolean): MechanismProjection {
+  const historical = historicalRead(store, { reader: 'A3.3.mechanism-slice', project, ref: scope.sources.input,
+    parameters: normalizedScope(scope) as unknown as Json }, () => deriveMechanismProjection(store, project, scope), () => {
+      mechanismCheck(false, scope.sources.input.id, 'scope.history', 'A mechanism slice must not depend cyclically on itself');
+      throw new Error('Unreachable cycle refusal');
+    });
+  if (!current) return historical;
+  const full = mechanismGaps(store, project, scope);
+  const prepared = mechanismTake(prepareGaps(store, full.sources as GapReadRequest['sources']));
+  mechanismCheck(canonical(prepared.collection) === canonical(full.collection), project, 'scope', 'Admission must stand on the current complete D1 derivation');
+  const guards = refsUnique([...prepared.guards, scope.sources.input, ...scope.records]);
+  for (const ref of guards) {
+    const head = store.get(ref.id);
+    mechanismCheck(head && sameRef(reference(head), ref), ref.id, 'head', 'A current addressing prerequisite has changed');
+  }
+  return { ...historical, guards, references: refsUnique([...historical.references, ...prepared.references]) };
+}
+function deriveMechanismProjection(store: Store, project: string, scope: Sealed<GapReadRequest>): MechanismProjection {
+  const full = mechanismGaps(store, project, scope);
+  mechanismCheck(full.sources.project === project, project, 'scope.project', 'The complete gap snapshot belongs to this project');
+  const source = full.sources as GapReadRequest['sources'];
+  const input = mechanismTake(readOmInput(store, project, source.input));
+  const operations = mechanismTake(readFrameBasis(store, source.operations.frame));
+  const references: Ref[] = [source.input, source.graph, ...scope.records, ...operations.references];
+  const guards: Ref[] = [];
+  const catalog = new Map(operations.upper.nodes.map(node => [node.id, { id: node.id, kind: node.kind }]));
+  if (operations.accepted) for (const node of operations.accepted.graph.nodes.filter(node => node.kind === 'operation'))
+    catalog.set(node.id, { id: node.id, kind: node.kind });
+  if (!('state' in source.works)) {
+    const works = mechanismTake(readFrameBasis(store, source.works.frame));
+    references.push(...works.references);
+    if (works.accepted) for (const node of works.accepted.graph.nodes.filter(node => node.kind === 'work'))
+      catalog.set(node.id, { id: node.id, kind: node.kind });
+  }
+  const questions: MechanismSlice['questions'] = [];
+  for (const gap of full.collection.gaps.filter(gap => gap.code === 'question_unaddressed'
+    && gap.mechanism === 'M5:addressing' && gap.field === 'address')) {
+    const matching = input.value.input.questions.filter(question => question.id === gap.target);
+    mechanismCheck(matching.length === 1, gap.target, 'question', 'The full D1 task must match exactly one original B1 question');
+    const question = matching[0]!, { source: producerRef, addressedBy, ...task } = question;
+    const rawGraph = mechanismTake(readRecord<{ nodes: { id: string }[] }>(store, source.graph,
+      { unit: UNIT, target: gap.target, id: `graph:${project}`, kind: 'graph' }));
+    mechanismCheck(!rawGraph.value.nodes.some(node => node.id === question.consumer) || catalog.has(question.consumer),
+      gap.target, 'consumer', 'An already supplied consumer needs its exact accepted layer, not an unaccepted graph node');
+    const producer = input.value.input.sources.find(row => row.id === producerRef.id);
+    mechanismCheck(producer, gap.target, 'producer', 'The task must have a verified stable producer');
+    const { id: _id, evidence: _evidence, addressedBy: _addressedBy, ...classification } = gap;
+    const row: MechanismSlice['questions'][number] = {
+      target: gap.target, field: gap.field, classification,
+      task, producer: { id: producerRef.id, contractVersion: producer.contractVersion },
+      protected: { ...(catalog.has(question.consumer) ? { consumer: question.consumer } : {}),
+        ...(question.kind !== null ? { kind: question.kind } : {}) },
+    };
+    if (addressedBy) {
+      // B1 has already proved this exact F5.3 derivation. Its semantic decision, not its revision, is a condition.
+      const decision = mechanismTake(readRecord<{ decision: unknown }>(store, addressedBy,
+        { unit: UNIT, target: gap.target, kind: 'input-decision', idPrefix: inputDecisionNamespace(project) }));
+      row.decision = decision.value.decision; references.push(addressedBy);
+    }
+    questions.push(row);
+  }
+  const value: MechanismSlice = { contract: 'addressing-slice/v1', owner: { kind: 'mechanism', mechanism: 'M5:addressing' },
+    questions: ordered(questions, row => canonical([row.target, row.field])), consumers: ordered([...catalog.values()], canonical) };
+  return { slice: hashJson(value), value, guards: refsUnique(guards), references: refsUnique(references) };
+}
+export function projectMechanismSlice(store: Store, project: string, scope: Sealed<GapReadRequest>, current = false): OmResult<Sealed<MechanismProjection>> {
+  requireStore(store); requireProject(project); requireScope(scope);
+  requireCondition(typeof current === 'boolean', 'series_request_invalid', 'The reading mode must be explicit');
+  return mechanismResult(() => mechanismProjection(store, project, normalizedScope(scope), current));
+}
+function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission, current: boolean): SeriesAdmissionProof {
+  const historical = historicalRead(store, { reader: 'A3.3.mechanism-admission', project: request.project, ref: admission.routes,
+    parameters: { request, admission: normalizedAdmission(admission) } as unknown as Json },
+    () => deriveMechanismAdmission(store, request, admission), () => {
+      mechanismCheck(false, admission.routes.id, 'admission.history', 'A mechanism admission must not depend cyclically on itself');
+      throw new Error('Unreachable cycle refusal');
+    });
+  if (!current) return historical;
+  mechanismCheck(!store.get(ownerSeriesId(request.project, request.owner, request.line + 1)),
+    ownerSeriesId(request.project, request.owner, request.line), 'line', 'Current admission belongs to the latest mechanism successor');
+  const scope = mechanismProjection(store, request.project, admission.gaps, true);
+  const saved = mechanismTake(readRoutes(store, { project: request.project, record: admission.routes })).record.value.request;
+  const prepared = mechanismTake(prepareRoutes(store, { ...saved, gaps: normalizedScope(saved.gaps),
+    catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, tasks: saved.tasks.map(record => ({ record })) }));
+  mechanismCheck(canonical(reference(prepared.record)) === canonical(admission.routes) && prepared.writes.length === 0,
+    admission.routes.id, 'routes', 'New admission requires the saved current route, not an unrecorded replacement');
+  return { ...historical, guards: refsUnique([...scope.guards, ...prepared.guards, admission.routes]),
+    references: refsUnique([...historical.references, ...scope.references, ...prepared.references]) };
+}
+function deriveMechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): SeriesAdmissionProof {
+  const scope = mechanismProjection(store, request.project, admission.gaps, false);
+  const routes = mechanismTake(readRoutes(store, { project: request.project, record: admission.routes }));
+  mechanismCheck(canonical(normalizedScope(routes.record.value.request.gaps)) === canonical(normalizedScope(admission.gaps)),
+    admission.routes.id, 'gaps', 'The selected route must stand on the same complete D1 snapshot');
+  const batches = routes.record.value.batches.filter(batch => batch.id === admission.batch);
+  mechanismCheck(batches.length === 1, admission.routes.id, 'batch', 'Admission must name exactly one saved M6 batch');
+  const batch = batches[0]!;
+  mechanismCheck(batch.model === 'MC2' && batch.task === 'input-field' && batch.items.length > 0,
+    admission.routes.id, 'batch', 'M5:addressing only owns a nonempty MC2 input-field task');
+  const full = mechanismGaps(store, request.project, admission.gaps);
+  const gaps = batch.items.map(item => {
+    const gap = full.collection.gaps.find(gap => gap.id === item.gap);
+    mechanismCheck(gap && gap.target === item.target && gap.field === item.field && gap.code === 'question_unaddressed'
+      && gap.mechanism === 'M5:addressing' && gap.field === 'address' && gap.consumers.length === 0
+      && scope.value.questions.some(question => question.target === gap.target && question.field === gap.field),
+    item.target, 'batch', 'Every selected assignment must belong to this mechanism slice');
+    return { id: gap.id, target: gap.target, field: gap.field };
+  });
+  mechanismCheck(new Set(gaps.map(gap => gap.id)).size === gaps.length, admission.routes.id, 'batch', 'An assignment may occur only once');
+  const guards = [...scope.guards], references = [...scope.references, ...routes.references];
+  return { ...scope, guards: refsUnique(guards), references: refsUnique(references), gaps,
+    goal: { questions: ordered(gaps.map(gap => gapLineKey(request.project, gap.target, gap.field)), value => value),
+      result: gapLineExpectedResult(request.project, gaps[0]!.target, gaps[0]!.field) } };
+}
+export function prepareSeriesAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): OmResult<Sealed<SeriesAdmissionProof>> {
+  requireStore(store); const address = seriesAddress(request); requireAdmission(admission);
+  requireCondition(address.owner.kind === 'mechanism', 'series_request_invalid', 'This admission belongs to a mechanism');
+  return mechanismResult(() => mechanismAdmission(store, request, admission, true));
+}
+interface MechanismAdmissionRequest {
+  project: string; series: Ref; attempt: number; admission: MechanismAdmission; current: boolean;
+}
+type MechanismAttemptProof = SeriesAdmissionProof & { series: Revision<MechanismRepairSeries>; owner: MechanismOwner; goal: AttemptGoal };
+export function readMechanismAdmission(store: Store, request: MechanismAdmissionRequest): OmResult<Sealed<MechanismAttemptProof>> {
+  return readMechanismAttemptAdmission(store, request, 'design');
+}
+/**
+ * Analysis serves a saved attempt's stop or hold, even after its questions have changed or disappeared.
+ * Its original admission is historical evidence. A different supplied admission names additional analysis
+ * sources: these have their own current admission and guards, without replacing the original assignment.
+ * E1 proves the exact stop/hold and permitted rung before dispatching.
+ */
+export function readMechanismAnalysisAdmission(store: Store, request: MechanismAdmissionRequest): OmResult<Sealed<MechanismAttemptProof>> {
+  return readMechanismAttemptAdmission(store, request, 'analysis');
+}
+function readMechanismAttemptAdmission(store: Store, request: MechanismAdmissionRequest, purpose: 'design' | 'analysis'): OmResult<Sealed<MechanismAttemptProof>> {
+  requireStore(store); requireCondition(isPlainObject(request), 'series_request_invalid', 'Admission reading requires an exact request');
+  requireProject(request.project); requireAdmission(request.admission);
+  requireCondition(isRef(request.series) && Number.isSafeInteger(request.attempt) && request.attempt > 0 && typeof request.current === 'boolean',
+    'series_request_invalid', 'The exact series, attempt and admission mode are required');
+  return mechanismResult(() => {
+    const series = mechanismTake(readAnySeriesAt(store, request.project, request.series)) as Revision<AnyRepairSeries>;
+    mechanismCheck('owner' in series.value, request.series.id, 'owner', 'A mechanism admission needs a mechanism series');
+    const value = series.value as MechanismRepairSeries;
+    const attempt = [...value.inherited, ...value.attempts].find(attempt => attempt.ordinal === request.attempt);
+    const admitted = value.admissions.find(row => row.attempt === request.attempt);
+    mechanismCheck(attempt && admitted, request.series.id, 'admission', 'The admission belongs to this exact saved attempt');
+    const address = { project: request.project, owner: value.owner, line: value.line };
+    if (purpose === 'analysis') {
+      const original = mechanismAdmission(store, address, admitted.basis, false);
+      if (request.current) {
+        const head = store.get(request.series.id);
+        mechanismCheck(head && canonical(reference(head)) === canonical(request.series)
+          && !store.get(ownerSeriesId(request.project, value.owner, value.line + 1)),
+        request.series.id, 'line', 'A new analysis belongs to the current successor of the mechanism lineage');
+      }
+      const sameSources = canonical(normalizedAdmission(request.admission)) === canonical(normalizedAdmission(admitted.basis));
+      const sources = sameSources ? original : mechanismAdmission(store, address, request.admission, request.current);
+      return { ...original, series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal,
+        references: refsUnique([...original.references, ...sources.references, request.series]),
+        guards: request.current ? refsUnique([request.series, ...(sameSources ? [] : sources.guards)]) : [] };
+    }
+    const proof = mechanismAdmission(store, address, request.admission, request.current);
+    const original = mechanismProjection(store, request.project, admitted.basis.gaps, false);
+    mechanismCheck(proof.slice === original.slice, request.series.id, 'admission.scope', 'A refreshed admission must preserve the exact semantic task and consumer conditions');
+    mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
+      request.series.id, 'goal', 'The complete selected task must equal the declared goal');
+    return { ...proof, series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal };
+  });
+}
+
+function requireAddress(request: AnySeriesRequest): Address { return seriesAddress(request); }
+export function seriesAddress(request: AnySeriesRequest): SeriesAddress {
+  requireCondition(isPlainObject(request), "series_request_invalid", "A series needs an explicit owner address");
+  const project = requireProject(request.project), line = requireLine(request.line);
+  if (Object.hasOwn(request, "owner")) {
+    const owner = (request as MechanismSeriesRequest).owner;
+    requireCondition(isPlainObject(owner) && exactKeys(owner, ["kind", "mechanism"]) && owner.kind === "mechanism"
+      && owner.mechanism === "M5:addressing" && !Object.hasOwn(request, "block"), "series_request_invalid", "An explicit supported mechanism owner cannot masquerade as a block");
+    const id = ownerSeriesId(project, owner, line);
+    requireCondition(id.length <= MAX_ENTITY_ID, "series_request_invalid", "The mechanism address exceeds the entity limit");
+    return { project, line, owner: { kind: "mechanism", mechanism: "M5:addressing" }, id };
+  }
+  requireCondition(!Object.hasOwn(request, "scope") && !Object.hasOwn(request, "admission"), "series_request_invalid",
+    "A modern mechanism envelope requires its explicit owner and cannot fall through to the legacy block contract");
+  const block = requireBlock((request as SeriesRequest).block);
+  return { project, line, owner: { kind: "block", block }, id: seriesId(project, block, line) };
+}
+export function seriesOwner(value: { readonly block: string } | { readonly owner: MechanismOwner }): SeriesOwner {
+  requireCondition(isPlainObject(value), "series_request_invalid", "An owner comes from an explicit series value");
+  if ("owner" in value) {
+    requireCondition(isPlainObject(value.owner) && exactKeys(value.owner, ["kind", "mechanism"])
+      && value.owner.kind === "mechanism" && value.owner.mechanism === "M5:addressing" && !Object.hasOwn(value, "block"),
+      "series_request_invalid", "The mechanism owner is explicit and cannot also be a block");
+    return { ...value.owner };
+  }
+  return { kind: "block", block: requireBlock(value.block) };
+}
+export function seriesRequestOf(value: Sealed<AnyRepairSeries>): AnySeriesRequest {
+  const owner = seriesOwner(value), project = requireProject(value.projectId), line = requireLine(value.line);
+  return owner.kind === "mechanism" ? { project, owner, line } : { project, block: owner.block, line };
+}
+const ownerSeriesId = (project: string, owner: SeriesOwner, line: number): string => owner.kind === "block"
+  ? seriesId(project, owner.block, line) : `${REPAIR_SERIES_KIND}:${project}:mechanism:${line}:${owner.mechanism}`;
+const ownerFields = (owner: SeriesOwner) => owner.kind === "block" ? { block: owner.block } : { owner: { ...owner } };
+export const readAnySeries = (store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> => readSeries(store, request);
+export function readSeriesAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<RepairSeries>>> {
+  const read = readAnySeriesAt(store, project, ref);
+  if (!read.ok) return read;
+  if ("owner" in read.value.value) return problem("series_foreign", "This reader requires a block series", { target: ref.id, ref }, "owner");
+  return delivered(read.value as Revision<RepairSeries>);
 }
 
 function requireProject(project: unknown): string {

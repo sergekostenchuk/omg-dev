@@ -12,11 +12,14 @@ import {
   type JournalRow, type OriginSource, type OriginSourceContext, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
 } from "./refusal-journal.js";
 import {
-  prepareBeginAttempt, prepareCompleteAttempt, readSeries, seriesId, REPAIR_SERIES_KIND,
+  prepareBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, REPAIR_SERIES_KIND,
   type Attempt, type AttemptGoal, type AttemptVerdict, type BeginAttemptRequest, type ClaimedRefusal,
-  type CompleteAttemptRequest, type CompletionReason, type Continuation, type GroundRecord, type RepairSeries,
+  type CompletionReason, type Continuation, type GroundRecord, type RepairSeries,
   type SeriesLadder, type SeriesRequest, type SeriesStop, type SeriesTransition,
+  type SeriesOwner, type MechanismSeriesRequest, type MechanismBeginAttemptRequest,
+  type MechanismRepairSeries, type AnyRepairSeries, type AnySeriesRequest, type AnySeriesTransition,
 } from "./series.js";
+import { withHistoricalReads } from "./input.js";
 import { confirmResults, type ConfirmedResults } from "./achievements.js";
 import { projectGraph } from "../graph/project.js";
 import type { Graph } from "../graph/model.js";
@@ -242,6 +245,9 @@ export interface OriginHold {
 }
 
 /** A standing hold as it is shown to whoever takes the analysis: where it is, what it is about, and the origin. */
+export type MechanismOriginHold = Omit<OriginHold, 'block'> & { readonly owner: Extract<SeriesOwner, { kind: 'mechanism' }> };
+export type AnyOriginHold = OriginHold | MechanismOriginHold;
+
 export interface HoldContext {
   readonly hold: Ref;
   readonly attempt: number;
@@ -336,6 +342,10 @@ export interface CloseAttemptRequest extends SeriesRequest {
   readonly outcome: GateOutcome;
 }
 
+export type MechanismCloseAttemptRequest = MechanismSeriesRequest & { readonly attempt: number; readonly outcome: GateOutcome };
+export type AnyCloseAttemptRequest = CloseAttemptRequest | MechanismCloseAttemptRequest;
+type AnyBeginAttemptRequest = BeginAttemptRequest | MechanismBeginAttemptRequest;
+
 /** Names the exact standing hold it lifts, so a late repeat finds its own lift and never lifts another hold (T5). */
 export interface LiftOriginHoldRequest {
   readonly project: string;
@@ -359,10 +369,10 @@ export interface RepeatTransition {
 export interface HoldTransition {
   readonly writes: readonly GateWrite[];
   readonly guards: readonly Ref[];
-  readonly value: OriginHold;
+  readonly value: AnyOriginHold;
 }
 
-interface Address { readonly project: string; readonly block: string; readonly line: number; readonly id: string }
+type Address = ReturnType<typeof seriesAddress>;
 interface SourceReading {
   readonly role: OriginRole; readonly ref: Ref; readonly holdsSubject: boolean;
   readonly context: Sealed<OriginSourceContext> | null;
@@ -378,7 +388,7 @@ interface WeighedOrigin { readonly stage: string; readonly subject: string; read
 interface Placing {
   readonly project: string;
   readonly target: string;
-  readonly block: string;
+  readonly owner: SeriesOwner;
   readonly series: string;
   readonly sources: string;
   readonly code: RepeatGateCode;
@@ -391,6 +401,7 @@ interface Holds { readonly standing: readonly HoldContext[]; readonly guards: re
 
 const GATE_OUTCOME_KEYS = Object.freeze(["reason", "accepting", "cancelling", "refusals"] as const);
 const HOLD_KEYS = Object.freeze(["projectId", "block", "series", "attempt", "row", "address", "lift"] as const);
+const MECHANISM_HOLD_KEYS = Object.freeze(HOLD_KEYS.map(key => key === "block" ? "owner" : key));
 const LIFT_KEYS = Object.freeze(["ground", "record", "class", "addressee", "basis"] as const);
 const REF_SOURCE_KEYS = Object.freeze(["ref"] as const);
 const PENDING_SOURCE_KEYS = Object.freeze(["pending"] as const);
@@ -407,10 +418,11 @@ export function originDecisionNamespace(project: string): string {
 }
 
 /** The one address of the hold of one refusal met by one attempt of one block's lineage. */
-export function originHoldId(project: string, block: string, attempt: number, row: string): string {
-  requireCondition(isText(block) && Number.isSafeInteger(attempt) && attempt >= 1 && isText(row),
+export function originHoldId(project: string, block: string | SeriesOwner, attempt: number, row: string): string {
+  requireCondition((isText(block) || validOwner(block)) && Number.isSafeInteger(attempt) && attempt >= 1 && isText(row),
     "repeat_request_invalid", "A hold is addressed by its block, the attempt and the journal row it is about");
-  return `${originHoldNamespace(project)}${hashJson({ block, attempt, row })}`;
+  return `${originHoldNamespace(project)}${hashJson(typeof block === "string" ? { block, attempt, row } : block.kind === "block"
+    ? { block: block.block, attempt, row } : { owner: block, attempt, row })}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,18 +434,23 @@ export function originHoldId(project: string, block: string, attempt: number, ro
  * route of such a refusal is an analysis, not more attempts. Everything else — the ordinal, a running attempt, a stop
  * without progress — is the series' to rule on, and repeating an attempt that is already open changes nothing (T5).
  */
-export function openAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>> {
+export function openAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>>;
+export function openAttempt(store: Store, request: MechanismBeginAttemptRequest): OmResult<Sealed<Revision<MechanismRepairSeries>>>;
+export function openAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
+export function openAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
   const prepared = prepareOpen(store, request);
   if (!prepared.ok) return prepared;
   const { writes, guards } = prepared.value.transition;
   if (writes.length === 0) return delivered(prepared.value.current);
-  const written = writeGuarded<RepairSeries>(store, { unit: UNIT, target: writes[0]!.id, guards, writes: [...writes] });
+  const written = writeGuarded<AnyRepairSeries>(store, { unit: UNIT, target: writes[0]!.id, guards, writes: [...writes] });
   if (!written.ok) return written;
   return delivered(written.value[0]!);
 }
 
 /** The same, prepared and not written, for a caller that opens an attempt together with records of its own. */
-export function prepareOpenAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<SeriesTransition>> {
+export function prepareOpenAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<SeriesTransition>>;
+export function prepareOpenAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>>;
+export function prepareOpenAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> {
   const prepared = prepareOpen(store, request);
   return prepared.ok ? delivered(prepared.value.transition) : prepared;
 }
@@ -443,7 +460,7 @@ export function prepareOpenAttempt(store: Store, request: BeginAttemptRequest): 
  * of its refusals in the journal and a hold for each refusal of unknown origin — in ONE guarded transaction.
  * Either all of it stands afterwards or none of it does. Delivering the same cycle again writes nothing (T5).
  */
-export function closeAttempt(store: Store, request: CloseAttemptRequest): OmResult<Sealed<RepeatOutcome>> {
+export function closeAttempt(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<RepeatOutcome>> {
   const prepared = prepareClose(store, request);
   if (!prepared.ok) return prepared;
   const { writes, guards, value } = prepared.value;
@@ -458,7 +475,7 @@ export function closeAttempt(store: Store, request: CloseAttemptRequest): OmResu
  * The same change, prepared and not written, for a caller that writes MORE than these records at once — MC2 closing
  * the entry of the model call in the ledger together with the outcome the call produced (T7).
  */
-export function prepareCloseAttempt(store: Store, request: CloseAttemptRequest): OmResult<Sealed<RepeatTransition>> {
+export function prepareCloseAttempt(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<RepeatTransition>> {
   const prepared = prepareClose(store, request);
   return prepared.ok ? delivered(prepared.value) : prepared;
 }
@@ -470,14 +487,30 @@ export function prepareCloseAttempt(store: Store, request: CloseAttemptRequest):
  * already is refused, and a record about another hold lifts nothing (T5). A hold switches nothing but the opening of
  * attempts of its series, and so does its lift (T8).
  */
-export function liftOriginHold(store: Store, request: LiftOriginHoldRequest): OmResult<Sealed<Revision<OriginHold>>> {
+export function liftOriginHold(store: Store, request: LiftOriginHoldRequest): OmResult<Sealed<Revision<AnyOriginHold>>> {
   const prepared = prepareLift(store, request);
   if (!prepared.ok) return prepared;
   const { writes, guards } = prepared.value.transition;
   if (writes.length === 0) return delivered(prepared.value.current);
-  const written = writeGuarded<OriginHold>(store, { unit: UNIT, target: writes[0]!.id, guards, writes: [...writes] });
+  const written = writeGuarded<AnyOriginHold>(store, { unit: UNIT, target: writes[0]!.id, guards, writes: [...writes] });
   if (!written.ok) return written;
   return delivered(written.value[0]!);
+}
+
+/** Reads a hold at its exact historical revision through the same proof used for lifting and current holds. */
+export function readOriginHoldAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyOriginHold>>> {
+  return withHistoricalReads(() => {
+    requireStore(store); requireProject(project);
+    requireCondition(isRef(ref), "repeat_request_invalid", "A historical hold requires its exact reference");
+    const read = readRecord<AnyOriginHold>(store, ref, { unit: UNIT, target: ref.id,
+      kind: ORIGIN_HOLD_KIND, idPrefix: originHoldNamespace(project) });
+    if (!read.ok) return read;
+    const journal = readJournal(store, { project });
+    if (!journal.ok) return refused("hold_invalid", "The hold has no checked journal of its refusal",
+      { unit: UNIT, target: ref.id, field: "row", ref }, "producer");
+    const broken = checkHold(store, project, read.value as Revision<AnyOriginHold>, journal.value.value as RefusalJournal);
+    return broken ?? delivered(read.value);
+  });
 }
 
 /** The same, prepared and not written, for A6 or H2 writing the ground and lifting on it in one transaction. */
@@ -491,7 +524,7 @@ export function prepareLiftOriginHold(store: Store, request: LiftOriginHoldReque
  * the owner and whoever takes an analysis alike. It reads and changes nothing; a series where nothing stops the work
  * has no context to give, and says so.
  */
-export function stopContext(store: Store, request: SeriesRequest): OmResult<Sealed<StopContext>> {
+export function stopContext(store: Store, request: AnySeriesRequest): OmResult<Sealed<StopContext>> {
   const read = contextReading(store, request);
   return read.ok ? delivered(read.value.context) : read;
 }
@@ -500,18 +533,21 @@ export function stopContext(store: Store, request: SeriesRequest): OmResult<Seal
  * The same context, with the mutable heads it was read from beside it (ContextReading), for a consumer that goes on to
  * write on it: it guards its transaction with them instead of guessing which records this gate touched.
  */
-export function readStopContext(store: Store, request: SeriesRequest): OmResult<Sealed<ContextReading>> {
+export function readStopContext(store: Store, request: AnySeriesRequest): OmResult<Sealed<ContextReading>> {
   const read = contextReading(store, request);
   return read.ok ? delivered(read.value) : read;
 }
 
-function contextReading(store: Store, request: SeriesRequest): OmResult<ContextReading> {
+function contextReading(store: Store, request: AnySeriesRequest): OmResult<ContextReading> {
+  return withHistoricalReads(() => contextReadingInScope(store, request));
+}
+function contextReadingInScope(store: Store, request: AnySeriesRequest): OmResult<ContextReading> {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "The context of a stop is asked for through a request object");
   const address = requireAddress(request);
-  const series = readSeries(store, request);
+  const series = readAnySeries(store, request);
   if (!series.ok) return series;
-  const current = series.value as Revision<RepairSeries>;
+  const current = series.value as Revision<AnyRepairSeries>;
   const held = current.value;
   const holds = holdsOf(store, address, held);
   if ("ok" in holds) return holds;
@@ -534,17 +570,21 @@ function contextReading(store: Store, request: SeriesRequest): OmResult<ContextR
 
 // ---------------------------------------------------------------------------
 
-function prepareOpen(store: Store, request: BeginAttemptRequest):
-OmResult<{ readonly transition: SeriesTransition; readonly current: Revision<RepairSeries> }> {
+function prepareOpen(store: Store, request: AnyBeginAttemptRequest):
+OmResult<{ readonly transition: AnySeriesTransition; readonly current: Revision<AnyRepairSeries> }> {
+  return withHistoricalReads(() => prepareOpenInScope(store, request));
+}
+function prepareOpenInScope(store: Store, request: AnyBeginAttemptRequest):
+OmResult<{ readonly transition: AnySeriesTransition; readonly current: Revision<AnyRepairSeries> }> {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "An attempt is opened at this gate through a request object");
   const address = requireAddress(request);
   const begun = prepareBeginAttempt(store, request);
-  const series = readSeries(store, { project: address.project, block: address.block, line: address.line });
+  const series = readAnySeries(store, requestOf(address));
   if (!series.ok) return begun.ok ? series : begun;
-  const current = series.value as Revision<RepairSeries>;
+  const current = series.value as Revision<AnyRepairSeries>;
   // T5: an attempt this series already holds is that attempt; a late delivery of its opening lands on nothing.
-  if (begun.ok && begun.value.writes.length === 0) return { ok: true, value: { transition: begun.value as SeriesTransition, current } };
+  if (begun.ok && begun.value.writes.length === 0) return { ok: true, value: { transition: begun.value as AnySeriesTransition, current } };
 
   // The hold is weighed before the series' own rules: its route is direct, and the ladder does not replace it.
   const holds = holdsOf(store, address, current.value);
@@ -560,13 +600,16 @@ OmResult<{ readonly transition: SeriesTransition; readonly current: Revision<Rep
   return {
     ok: true,
     value: {
-      transition: { writes: begun.value.writes, guards: uniqueGuards([...begun.value.guards, ...holds.guards]), value: begun.value.value as RepairSeries },
+      transition: { writes: begun.value.writes, guards: uniqueGuards([...begun.value.guards, ...holds.guards]), value: begun.value.value as AnyRepairSeries },
       current,
     },
   };
 }
 
-function prepareClose(store: Store, request: CloseAttemptRequest): OmResult<RepeatTransition> {
+function prepareClose(store: Store, request: AnyCloseAttemptRequest): OmResult<RepeatTransition> {
+  return withHistoricalReads(() => prepareCloseInScope(store, request));
+}
+function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmResult<RepeatTransition> {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "A cycle is closed at this gate through a request object");
   requireCondition(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
@@ -588,16 +631,19 @@ function prepareClose(store: Store, request: CloseAttemptRequest): OmResult<Repe
       "repeat_request_invalid", "Each refusal of a cycle names the row of the journal it stands for");
   }
   const address = requireAddress(request);
-  const at = { project: address.project, block: address.block, line: address.line };
+  const at = requestOf(address);
 
   // What the cycle achieved and cancelled, as the providers of acceptance confirm it, never as the caller says it.
   let results: ConfirmedResults = { achieved: [], cancelled: [] };
   if (accepting.length + cancelling.length > 0) {
-    const standing = readSeries(store, at);
+    if (address.owner.kind === "mechanism") return refused(accepting.length ? "acceptance_unconfirmed" : "cancellation_unconfirmed",
+      "No acceptance provider confirms a mechanism addressing result yet",
+      { unit: UNIT, target: address.id, field: accepting.length ? "outcome.accepting" : "outcome.cancelling" }, "producer");
+    const standing = readAnySeries(store, at);
     if (!standing.ok) return standing;
     const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts].find(item => item.ordinal === request.attempt);
     const confirmed = confirmResults(store, {
-      project: address.project, block: address.block, target: address.id,
+      project: address.project, block: address.owner.block, target: address.id,
       goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling,
     });
     if (!confirmed.ok) return confirmed;
@@ -635,7 +681,7 @@ function prepareClose(store: Store, request: CloseAttemptRequest): OmResult<Repe
   }
 
   // The series decides the verdict, the count, the stop and the rung, from the results as they were confirmed.
-  const completion: CompleteAttemptRequest = {
+  const completion = {
     ...at, attempt: request.attempt,
     outcome: { reason, achieved: results.achieved, cancelled: results.cancelled, refusals: claimed },
   };
@@ -654,7 +700,7 @@ function prepareClose(store: Store, request: CloseAttemptRequest): OmResult<Repe
   }
 
   // Every refusal of unknown origin raises its hold here, with the outcome it belongs to, not a cycle later.
-  const held = series.value.value as RepairSeries;
+  const held = series.value.value as AnyRepairSeries;
   const raised: HoldContext[] = [];
   const unknown = routed.filter(item => item.class === "unknown");
   if (unknown.length > 0) {
@@ -701,11 +747,11 @@ function recordedAt(store: Store, address: Address, written: readonly { readonly
 function raise(
   store: Store, address: Address, attempt: number, item: RoutedRefusal, series: Ref, origin: RefusalOrigin,
 ): OmResult<never> | { readonly write: GateWrite | null; readonly guard: Ref | null; readonly standing: HoldContext | null } {
-  const id = originHoldId(address.project, address.block, attempt, item.row);
-  const value: OriginHold = {
-    projectId: address.project, block: address.block, series, attempt, row: item.row, address: item.addressee, lift: null,
+  const id = originHoldId(address.project, address.owner, attempt, item.row);
+  const value: AnyOriginHold = {
+    projectId: address.project, ...ownerFields(address.owner), series, attempt, row: item.row, address: item.addressee, lift: null,
   };
-  const found = store.get<OriginHold>(id);
+  const found = store.get<AnyOriginHold>(id);
   if (found === null) {
     const hold = { id, revision: 1, hash: hashJson(value) };
     return {
@@ -715,11 +761,15 @@ function raise(
     };
   }
   const same = found.kind === ORIGIN_HOLD_KIND && isPlainObject(found.value)
-    && found.value.projectId === value.projectId && found.value.block === value.block
+    && found.value.projectId === value.projectId && sameOwner(found.value, value)
     && found.value.attempt === value.attempt && found.value.row === value.row && found.value.address === value.address;
   if (!same) {
     return refused("hold_invalid", "Another record already stands where the hold of this refusal belongs",
       { unit: UNIT, target: id, field: "id", ref: reference(found) }, "producer");
+  }
+  if (address.owner.kind === "mechanism") {
+    const checked = readOriginHoldAt(store, address.project, reference(found));
+    if (!checked.ok) return checked;
   }
   return {
     write: null,
@@ -740,7 +790,7 @@ function raise(
  */
 const derive = (store: Store, row: JournalRow, address: Address, path: string): OmResult<never> | Derived =>
   placeOrigin(store, row.origin, {
-    project: address.project, target: address.id, block: address.block, series: address.id,
+    project: address.project, target: address.id, owner: address.owner, series: address.id,
     sources: `${path}.sources`, code: "origin_unreadable", route: "producer",
   });
 
@@ -775,7 +825,12 @@ function placeOrigin(store: Store, origin: WeighedOrigin, where: Placing): OmRes
 
   // A stage this gate does not name has no defined effect; inventing one would be a choice about the product.
   if (!REFUSAL_STAGES.includes(stage as RefusalStage)) return unplaced(where, basis);
-  if (stage === "readiness") return { class: "readiness", addressee: addressed("readiness", where.block), basis };
+  if (stage === "readiness") {
+    if (where.owner.kind !== "block") return refused(where.code,
+      "Readiness belongs to a block; a mechanism owner cannot stand for that block",
+      { unit: UNIT, target: where.target, field: "owner" }, where.route);
+    return { class: "readiness", addressee: addressed("readiness", where.owner.block), basis };
+  }
   // The conditions of the repository, the environment and the executor come from the feasibility check. A feasibility
   // refusal that names records of the MAP is the other case the rules put on this path — one that turned out to be a
   // defect of the map — and it is placed by its subject like any other.
@@ -949,7 +1004,7 @@ const addressed = (item: RefusalClass, target: string): string => `${ADDRESSEE_K
  * the record it was lifted on — before it is believed (T3). A hold that should stand and does not is not a lifted one:
  * the series is held until it is raised, which closing that cycle through this gate again does.
  */
-function holdsOf(store: Store, address: Address, series: RepairSeries): OmResult<never> | Holds {
+function holdsOf(store: Store, address: Address, series: AnyRepairSeries): OmResult<never> | Holds {
   const rows = rowsOf(series);
   if (rows.size === 0) return { standing: [], guards: [] };
   const journal = readJournal(store, { project: address.project });
@@ -964,8 +1019,8 @@ function holdsOf(store: Store, address: Address, series: RepairSeries): OmResult
     for (const row of [...new Set(attempt.outcome.refusals.map(item => item.row))].sort(compare)) {
       const decision = classes.get(row);
       if (decision === undefined || decision.class !== "unknown") continue;
-      const id = originHoldId(address.project, address.block, attempt.ordinal, row);
-      const found = store.get<OriginHold>(id);
+      const id = originHoldId(address.project, address.owner, attempt.ordinal, row);
+      const found = store.get<AnyOriginHold>(id);
       if (found === null) {
         return refused("origin_held",
           `The refusal attempt ${attempt.ordinal} ran into is of unknown origin and no hold of it stands yet: closing that cycle through this gate again raises it`,
@@ -988,24 +1043,29 @@ function holdsOf(store: Store, address: Address, series: RepairSeries): OmResult
  * refusal as unknown, at this address) and — once lifted — the record it was lifted on, weighed AGAIN by the very
  * function that lifted it. A hold that merely agrees with itself, or a lift written by hand, is refused (T3).
  */
-function checkHold(store: Store, project: string, found: Revision<OriginHold>, journal: RefusalJournal): OmResult<never> | null {
+function checkHold(store: Store, project: string, found: Revision<AnyOriginHold>, journal: RefusalJournal): OmResult<never> | null {
   const context = { target: found.id, ref: reference(found) };
   const bad = (message: string, field: string): OmResult<never> =>
     refused("hold_invalid", message, { unit: UNIT, target: context.target, field, ref: context.ref }, "producer");
   if (found.kind !== ORIGIN_HOLD_KIND) return bad(`A ${found.kind} record cannot stand for a hold`, "kind");
   const value = found.value as unknown;
-  if (!isPlainObject(value) || !exactKeys(value, HOLD_KEYS)) return bad("A hold carries its series, attempt, row, address and lift, and nothing else", "value");
-  const hold = value as OriginHold;
-  if (hold.projectId !== project || !isText(hold.block) || !Number.isSafeInteger(hold.attempt) || hold.attempt < 1
+  if (!isPlainObject(value) || !exactKeys(value, Object.hasOwn(value as object, "owner") ? MECHANISM_HOLD_KEYS : HOLD_KEYS)) return bad("A hold carries its series, attempt, row, address and lift, and nothing else", "value");
+  const hold = value as AnyOriginHold;
+  if (hold.projectId !== project || !validHeldOwner(hold) || !Number.isSafeInteger(hold.attempt) || hold.attempt < 1
     || !isText(hold.row) || !isText(hold.address) || !isRef(hold.series)) {
     return bad("A hold names its project, block, series, attempt, row and address", "value");
   }
-  if (found.id !== originHoldId(project, hold.block, hold.attempt, hold.row)) {
+  if (found.id !== originHoldId(project, heldOwner(hold), hold.attempt, hold.row)) {
     return bad("A hold does not stand at the address its own content belongs at", "id");
   }
-  const series = store.get(hold.series.id, hold.series.revision);
-  const met = series !== null && series.hash === hold.series.hash && series.kind === REPAIR_SERIES_KIND
-    && recordsRefusal(series.value, project, hold.block, hold.attempt, hold.row);
+  const owner = heldOwner(hold);
+  const series = owner.kind === "mechanism" ? readAnySeriesAt(store, project, hold.series) : null;
+  const old = owner.kind === "block" ? store.get(hold.series.id, hold.series.revision) : null;
+  const met = series !== null ? series.ok && sameOwner(series.value.value, hold)
+    && [...series.value.value.inherited, ...series.value.value.attempts].some(attempt => attempt.ordinal === hold.attempt
+      && attempt.outcome?.refusals.some(item => item.row === hold.row))
+    : old !== null && old.hash === hold.series.hash && old.kind === REPAIR_SERIES_KIND && owner.kind === "block"
+      && recordsRefusal(old.value, project, owner.block, hold.attempt, hold.row);
   if (!met) return bad("The series a hold names does not record that attempt running into that refusal", "series");
   const decision = journal.classifications.find(item => item.row === hold.row);
   if (decision === undefined || decision.class !== "unknown" || decision.addressee !== hold.address) {
@@ -1052,7 +1112,11 @@ function recordsRefusal(value: unknown, project: string, block: string, attempt:
 const codeOf = (result: OmResult<never>): string => (result.ok ? "delivered" : result.refusal.code);
 
 function prepareLift(store: Store, request: LiftOriginHoldRequest):
-OmResult<{ readonly transition: HoldTransition; readonly current: Revision<OriginHold> }> {
+OmResult<{ readonly transition: HoldTransition; readonly current: Revision<AnyOriginHold> }> {
+  return withHistoricalReads(() => prepareLiftInScope(store, request));
+}
+function prepareLiftInScope(store: Store, request: LiftOriginHoldRequest):
+OmResult<{ readonly transition: HoldTransition; readonly current: Revision<AnyOriginHold> }> {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "A hold is lifted through a request object");
   const project = requireProject(request.project);
@@ -1061,11 +1125,11 @@ OmResult<{ readonly transition: HoldTransition; readonly current: Revision<Origi
   requireCondition(isGroundRecord(request.record), "repeat_request_invalid",
     "A lift carries the record it stands on — stored and named by its exact reference, or written with it, never both and never neither");
 
-  const named = readRecord<OriginHold>(store, request.hold, {
+  const named = readRecord<AnyOriginHold>(store, request.hold, {
     unit: UNIT, target: request.hold.id, kind: ORIGIN_HOLD_KIND, idPrefix: originHoldNamespace(project),
   });
   if (!named.ok) return named;
-  const head = store.get<OriginHold>(request.hold.id)!;
+  const head = store.get<AnyOriginHold>(request.hold.id)!;
   const journal = readJournal(store, { project });
   if (!journal.ok) {
     return refused("hold_invalid", `This project holds no journal a hold could stand on: ${journal.refusal.code}`,
@@ -1096,7 +1160,7 @@ OmResult<{ readonly transition: HoldTransition; readonly current: Revision<Origi
   const row = book.rows.find(item => item.id === hold.row)!;
   const resolution = weighLift(store, request.ground, ground.value, hold, row, head.id);
   if ("ok" in resolution) return resolution;
-  const value: OriginHold = {
+  const value: AnyOriginHold = {
     ...plainHold(hold),
     lift: { ground: request.ground, record: exactRef(ground.ref), class: resolution.class, addressee: resolution.addressee, basis: resolution.basis },
   };
@@ -1127,12 +1191,12 @@ OmResult<{ readonly transition: HoldTransition; readonly current: Revision<Origi
  * An owner's decision names what the owner decided, and establishes no class. Nothing a record says of itself —
  * "independent", "approved", "final" — is consulted.
  */
-function weighLift(store: Store, ground: LiftGround, value: unknown, hold: OriginHold, row: JournalRow, target: string): OmResult<never> | Resolution {
+function weighLift(store: Store, ground: LiftGround, value: unknown, hold: AnyOriginHold, row: JournalRow, target: string): OmResult<never> | Resolution {
   const unusable = (message: string, field: string): OmResult<never> =>
     refused("lift_unusable", message, { unit: UNIT, target, field }, ground === "owner-decision" ? "owner" : "producer");
   if (!isPlainObject(value)) return unusable("A ground of a lift is a record about one hold", "record");
   const record = value as Record<string, unknown>;
-  if (record['projectId'] !== hold.projectId || record['block'] !== hold.block) return unusable("This record is about another block", "record.block");
+  if (record['projectId'] !== hold.projectId || !sameOwner(record, hold)) return unusable("This record is about another series owner", "owner" in hold ? "record.owner" : "record.block");
   if (record['attempt'] !== hold.attempt) return unusable("This record is about another attempt", "record.attempt");
   if (record['row'] !== hold.row) return unusable("This record is about another refusal", "record.row");
   if (ground === "owner-decision") {
@@ -1161,7 +1225,7 @@ function weighLift(store: Store, ground: LiftGround, value: unknown, hold: Origi
   // ONE mechanism for one class: the grounds of the analysis are weighed by the function that weighs any origin, over
   // the stage and the subject of the refusal this hold is about. The claim is then compared with what was weighed.
   const placed = placeOrigin(store, { stage: row.origin.stage, subject: row.origin.subject, sources: basis }, {
-    project: hold.projectId, target, block: hold.block, series: hold.series.id, sources: "record.basis", code: "lift_unusable", route: "producer",
+    project: hold.projectId, target, owner: heldOwner(hold), series: hold.series.id, sources: "record.basis", code: "lift_unusable", route: "producer",
   });
   if ("ok" in placed) return placed;
   if (placed.class === "unknown") {
@@ -1177,7 +1241,7 @@ function weighLift(store: Store, ground: LiftGround, value: unknown, hold: Origi
 // What the gate reports.
 
 function reported(
-  address: Address, series: RepairSeries, attempt: number,
+  address: Address, series: AnyRepairSeries, attempt: number,
   routed: readonly RoutedRefusal[], raised: readonly HoldContext[], decided: readonly RefusalClassification[],
 ): RepeatOutcome {
   const closed = [...series.inherited, ...series.attempts].find(item => item.ordinal === attempt) ?? null;
@@ -1236,7 +1300,7 @@ function gateRefusal(code: GateRefusalCode, message: string, target: string, fie
 // ---------------------------------------------------------------------------
 // The context of what stops a series, assembled from the records of the attempts.
 
-const rowsOf = (series: RepairSeries): ReadonlySet<string> => {
+const rowsOf = (series: AnyRepairSeries): ReadonlySet<string> => {
   const rows = new Set<string>();
   for (const attempt of [...series.inherited, ...series.attempts]) {
     for (const item of attempt.outcome?.refusals ?? []) rows.add(item.row);
@@ -1245,7 +1309,7 @@ const rowsOf = (series: RepairSeries): ReadonlySet<string> => {
 };
 
 function contextOf(
-  address: Address, series: RepairSeries, holds: readonly HoldContext[], decided: ReadonlyMap<string, RefusalClassification>,
+  address: Address, series: AnyRepairSeries, holds: readonly HoldContext[], decided: ReadonlyMap<string, RefusalClassification>,
 ): StopContext {
   const attempts = new Map([...series.inherited, ...series.attempts].map(item => [item.ordinal, item as Attempt]));
   // The window a stop was counted in, or — when only holds stand — the attempts that raised them.
@@ -1355,8 +1419,8 @@ const unlinked = (address: Address, code: string, field: string): OmResult<never
 const exactRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
 const sameRef = (left: Ref, right: Ref): boolean => left.id === right.id && left.revision === right.revision && left.hash === right.hash;
 const copyGoal = (goal: AttemptGoal): AttemptGoal => ({ key: goal.key, questions: [...goal.questions], result: goal.result });
-const plainHold = (hold: OriginHold): Omit<OriginHold, "lift"> => ({
-  projectId: hold.projectId, block: hold.block, series: exactRef(hold.series), attempt: hold.attempt, row: hold.row, address: hold.address,
+const plainHold = (hold: AnyOriginHold) => ({
+  projectId: hold.projectId, ...ownerFields(heldOwner(hold)), series: exactRef(hold.series), attempt: hold.attempt, row: hold.row, address: hold.address,
 });
 // Not localeCompare: what a reviewer and the owner are handed must not depend on the machine's locale.
 const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
@@ -1393,8 +1457,33 @@ function requireProject(project: unknown): string {
   return project;
 }
 
-function requireAddress(request: SeriesRequest): Address {
+function requireAddress(request: AnySeriesRequest): Address {
   const project = requireProject(request.project);
-  const id = seriesId(project, request.block, request.line);
-  return { project, block: request.block, line: request.line, id };
+  return seriesAddress({ ...request, project });
+}
+
+function validOwner(value: unknown): value is SeriesOwner {
+  if (!isPlainObject(value)) return false;
+  const owner = value as Record<string, unknown>;
+  return exactKeys(owner, ["kind", "block"]) && owner.kind === "block" && isText(owner.block)
+    || exactKeys(owner, ["kind", "mechanism"]) && owner.kind === "mechanism" && owner.mechanism === "M5:addressing";
+}
+function validHeldOwner(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  const held = value as Record<string, unknown>;
+  return Object.hasOwn(held, "owner") ? !Object.hasOwn(held, "block") && validOwner(held.owner) && held.owner.kind === "mechanism"
+    : isText(held.block);
+}
+function heldOwner(value: AnyOriginHold): SeriesOwner {
+  return "owner" in value ? value.owner : { kind: "block", block: value.block };
+}
+function ownerFields(owner: SeriesOwner): { block: string } | { owner: Extract<SeriesOwner, { kind: "mechanism" }> } {
+  return owner.kind === "block" ? { block: owner.block } : { owner: { ...owner } };
+}
+function sameOwner(left: unknown, right: unknown): boolean {
+  if (!validHeldOwner(left) || !validHeldOwner(right)) return false;
+  return canonical(heldOwner(left as AnyOriginHold)) === canonical(heldOwner(right as AnyOriginHold));
+}
+function requestOf(address: Address): AnySeriesRequest {
+  return { project: address.project, line: address.line, ...ownerFields(address.owner) };
 }

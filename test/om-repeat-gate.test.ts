@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store, type Revision } from "../src/storage/store.js";
+import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -21,6 +21,11 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { gardenGraph, createOmFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
+import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
+import { writeGaps, type GapReadRequest, type GapRequest } from "../src/om/gaps.js";
+import { gapLineKey, gapLineExpectedResult } from "../src/om/gap-lines.js";
+import { writeRoutes } from "../src/om/routes.js";
 import {
   classifyRefusal, journalId, normalizeOriginSource, originSourceKey, recordRefusal, unitRefusalNamespace,
   REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal, type OriginSource,
@@ -31,7 +36,7 @@ import {
   type AttemptGoal, type BeginAttemptRequest, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
 import {
-  readDefinitions, closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, readStopContext, stopContext,
+  readDefinitions, readOriginHoldAt, closeAttempt, liftOriginHold, openAttempt, prepareCloseAttempt, prepareLiftOriginHold, prepareOpenAttempt, readStopContext, stopContext,
   originAnalysisNamespace, originDecisionNamespace, originHoldId, originHoldNamespace,
   ADDRESSEE_KINDS, GATE_REFUSAL_CODES, LIFT_GROUNDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND,
   ORIGIN_ROLES, REFUSAL_CLASSES, REFUSAL_STAGES, REPEAT_GATE_CODES, SUBJECT_DECISIONS,
@@ -2241,4 +2246,222 @@ test("G7 refuses individually valid sources from another assembly on close, lift
   assert.equal(deliveredOf(liftOriginHold(back, request)).hash, lifted.hash);
   assert.deepEqual(snapshot(back), before);
   deliveredOf(openAttempt(back, { ...address(PROJECT), attempt: 3, goal: goal() }));
+});
+
+
+// A3.3 uses the same D1/M6 path as the first real addressing pass. No series field stands in for a D1 source.
+const addressingOwner = { kind: "mechanism", mechanism: "M5:addressing" } as const;
+function mechanismFixture(t: test.TestContext, names = ["format-a", "format-b"]) {
+  const root = mkdtempSync(join(tmpdir(), "omg-g7-mechanism-")), path = join(root, "state.sqlite"), project = "garden";
+  let store = new Store(path), version = 0;
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const { level: _level, ...upper } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(new ProductEngine(store), project, upper as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns = names.map(id => ({ id,
+      question: `Which ${id} is required?`, consumer: "garden-consume-block", blocksCurrentStage: false,
+      resolution: "Address this question during OM" }));
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  let input = deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
+  const graph = reference(store.get(`graph:${project}`)!);
+  function refresh() {
+    const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph, refinement: null,
+      choice: { choiceVersion: `mechanism-${++version}`, features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
+    const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
+      operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+      works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+    const records = deliveredOf(writeGaps(store, sources)).records;
+    const scope: GapReadRequest = { sources, records: records.map(reference) };
+    const routes = deliveredOf(writeRoutes(store, { project, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+    const batch = routes.value.batches.find(item => item.model === "MC2" && item.task === "input-field"
+      && item.items.every(gap => gap.field === "address"));
+    const goal: AttemptGoal | null = batch ? { key: "address-questions", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) } : null;
+    return { scope, routes: reference(routes), batch, goal };
+  }
+  function addressQuestions(ids: string[]) {
+    input = deliveredOf(writeAddressing(store, { project, input: reference(input), graph,
+      decisions: ids.map(id => ({ pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph, layers: [],
+        decision: { target: `discovery:${id}`, field: "address", value: { consumer: "garden-consume-block", kind: "owner-decision" } },
+      })) as Write })) }));
+    return refresh();
+  }
+  const initial = refresh();
+  assert.ok(initial.batch && initial.goal, "native D1 must expose the real unaddressed batch");
+  const address = (line = 1) => ({ project, owner: addressingOwner, line });
+  const begin = (state: ReturnType<typeof refresh>, attempt: number, line = 1) => {
+    assert.ok(state.batch && state.goal);
+    return { ...address(line), attempt, goal: state.goal, admission: { gaps: state.scope, routes: state.routes, batch: state.batch.id } };
+  };
+  return { project, path, graph, initial, address, begin, refresh, addressQuestions,
+    get store() { return store; }, get input() { return input; },
+    restart() { store.close(); store = new Store(path); } };
+}
+const mechanismSnapshot = (store: Store) => store.list().map(record => ({ ref: reference(record), history: store.history(record.id).map(reference) }));
+
+test("A3.3 G7 mechanism cycles inherit the count, stop, ladder and context across a changed D1 slice and restart", t => {
+  const f = mechanismFixture(t), initial = deliveredOf(openSeries(f.store,
+    { ...f.address(), scope: f.initial.scope, predecessor: null, basis: null }));
+  let stopped: RepeatOutcome | undefined;
+  for (const attempt of [1, 2, 3]) {
+    const opened = deliveredOf(openAttempt(f.store, f.begin(f.initial, attempt)));
+    assert.equal(opened.value.attempts.at(-1)!.outcome, null);
+    const result = deliveredOf(closeAttempt(f.store, { ...f.address(), attempt, outcome: outcome() }));
+    assert.equal(result.verdict, "none"); assert.equal(result.withoutProgress, attempt);
+    assert.deepEqual(result.routed, []); assert.deepEqual(result.holds, []);
+    stopped = result as RepeatOutcome;
+  }
+  assert.ok(stopped?.stop && stopped.ladder && stopped.context);
+  assert.equal(stopped.stop.attempt, 3); assert.equal(stopped.ladder.rung, 1);
+  assert.deepEqual(stopped.context.accepted, []);
+  const sourceSeries = f.store.get(initial.id)!;
+  const nextScope = f.addressQuestions(["format-a"]);
+  const successor = deliveredOf(openSeries(f.store, { ...f.address(2), scope: nextScope.scope,
+    predecessor: reference(sourceSeries), basis: { ground: "inputs-changed", text: "D3 addressed the first producer question" } }));
+  assert.equal(successor.value.inherited.length, 3);
+  const inherited = deliveredOf(stopContext(f.store, f.address(2)));
+  assert.deepEqual(inherited.stop, stopped.stop); assert.equal(inherited.ladder.rung, 1);
+  assert.deepEqual(inherited.endings, stopped.context.endings);
+  assert.equal(refusalOf(openAttempt(f.store, f.begin(nextScope, 4, 2))).code, "series_stopped");
+  const reviewValue = { ...review(f.project, 3, stopped.stop.goals), owner: addressingOwner } as Record<string, unknown>;
+  delete reviewValue.block;
+  const reviewRef = storedAs(f.store, STOP_REVIEW_KIND, stopReviewNamespace(f.project), reviewValue);
+  deliveredOf(resumeSeries(f.store, { ...f.address(2), stop: 3, ground: "review-record", text: "Review changed the addressing approach", review: { ref: reviewRef } }));
+  let second: typeof stopped;
+  for (const attempt of [4, 5, 6]) {
+    deliveredOf(openAttempt(f.store, f.begin(nextScope, attempt, 2)));
+    second = deliveredOf(closeAttempt(f.store, { ...f.address(2), attempt, outcome: outcome() })) as RepeatOutcome;
+  }
+  assert.equal(second!.stop!.attempt, 6); assert.equal(second!.ladder!.rung, 2);
+  assert.deepEqual(second!.ladder!.grounds, ["owner-decision"]);
+  const current = f.store.get(successor.id)!, context = deliveredOf(readStopContext(f.store, f.address(2)));
+  assert.ok(context.reads.some(ref => canonical(ref) === canonical(reference(current))));
+  const before = mechanismSnapshot(f.store);
+  assert.equal(deliveredOf(closeAttempt(f.store, { ...f.address(), attempt: 1, outcome: outcome() })).verdict, "none");
+  assert.deepEqual(mechanismSnapshot(f.store), before, "late closure cannot alter the successor or the old series");
+  f.restart();
+  assert.deepEqual(deliveredOf(stopContext(f.store, f.address(2))), context.context);
+  assert.equal(refusalOf(openAttempt(f.store, f.begin(nextScope, 7, 2))).code, "series_stopped");
+});
+
+test("A3.3 G7 mechanism unknown-origin hold survives succession and only its own owner decision lifts it historically", t => {
+  const f = mechanismFixture(t), first = deliveredOf(openSeries(f.store,
+    { ...f.address(), scope: f.initial.scope, predecessor: null, basis: null }));
+  const refusal = journalled(f.store, f.project, { sources: [] }, { goal: f.initial.goal!.result });
+  deliveredOf(openAttempt(f.store, f.begin(f.initial, 1)));
+  const readiness = journalled(f.store, f.project, { stage: "readiness", subject: "garden-consume-block",
+    sources: [source("base", remember(f.graph, { kind: "frame", request: f.initial.scope.sources.operations.frame }))] },
+    { gate: "M2", code: "readiness_stale" });
+  const beforeReadiness = mechanismSnapshot(f.store);
+  const noBlock = refusalOf(closeAttempt(f.store, { ...f.address(), attempt: 1, outcome: refusedBy(readiness) }));
+  assert.equal(noBlock.code, "origin_unreadable"); assert.equal(noBlock.at.field, "owner");
+  assert.deepEqual(mechanismSnapshot(f.store), beforeReadiness);
+  const closed = deliveredOf(closeAttempt(f.store, { ...f.address(), attempt: 1, outcome: refusedBy(refusal) }));
+  assert.equal(closed.holds.length, 1); assert.equal(closed.routed[0]!.class, "unknown");
+  const hold = closed.holds[0]!, content = f.store.get<{ projectId: string; owner: typeof addressingOwner; attempt: number; row: string; lift: unknown }>(hold.id)!.value;
+  assert.deepEqual(content.owner, addressingOwner);
+  assert.equal(Object.hasOwn(content, "block"), false);
+  assert.equal(originHoldId(f.project, addressingOwner, 1, refusal.row), hold.id);
+  const nextScope = f.addressQuestions(["format-a"]);
+  deliveredOf(openSeries(f.store, { ...f.address(2), scope: nextScope.scope, predecessor: reference(f.store.get(first.id)!),
+    basis: { ground: "inputs-changed", text: "Only the second question still needs addressing" } }));
+  assert.equal(refusalOf(openAttempt(f.store, f.begin(nextScope, 2, 2))).code, "origin_held");
+  assert.deepEqual(deliveredOf(stopContext(f.store, f.address(2))).holds.map(item => item.hold), [hold]);
+  const decision = { projectId: f.project, owner: addressingOwner, attempt: 1, row: refusal.row,
+    decided: "Continue addressing after reviewing the origin", approved: true };
+  for (const substitution of [{ ...decision, owner: { kind: "mechanism", mechanism: "M6" } },
+    { projectId: f.project, block: "M5:addressing", attempt: 1, row: refusal.row, decided: decision.decided, approved: true }]) {
+    const id = `${originDecisionNamespace(f.project)}mechanism-foreign-${next()}`, before = mechanismSnapshot(f.store);
+    assert.equal(refusalOf(liftOriginHold(f.store, { project: f.project, hold, ground: "owner-decision",
+      record: { pending: { id, kind: ORIGIN_DECISION_KIND, value: substitution as Json } } })).code, "lift_unusable");
+    assert.deepEqual(mechanismSnapshot(f.store), before);
+  }
+  // The reverse substitution fails too: an explicit mechanism owner is not the block whose name resembles it.
+  opened(f.store, f.project);
+  const blockHeld = heldBy(f.store, f.project), block = holdAt(f.store, blockHeld.hold);
+  const wrongForBlock = { ...decision, attempt: block.attempt, row: block.row };
+  assert.equal(refusalOf(liftOriginHold(f.store, { project: f.project, hold: blockHeld.hold, ground: "owner-decision",
+    record: { pending: { id: `${originDecisionNamespace(f.project)}mechanism-for-block`, kind: ORIGIN_DECISION_KIND,
+      value: wrongForBlock as Json } } })).code, "lift_unusable");
+  const decisionRef = storedAs(f.store, ORIGIN_DECISION_KIND, originDecisionNamespace(f.project), decision);
+  const request = { project: f.project, hold, ground: "owner-decision" as const, record: { ref: decisionRef } };
+  const lifted = deliveredOf(liftOriginHold(f.store, request));
+  assert.equal(deliveredOf(readOriginHoldAt(f.store, f.project, hold)).value.lift, null);
+  assert.deepEqual(reference(deliveredOf(readOriginHoldAt(f.store, f.project, reference(lifted)))), reference(lifted));
+  deliveredOf(openAttempt(f.store, f.begin(nextScope, 2, 2)));
+  deliveredOf(closeAttempt(f.store, { ...f.address(2), attempt: 2, outcome: outcome() }));
+  const before = mechanismSnapshot(f.store);
+  assert.equal(deliveredOf(liftOriginHold(f.store, request)).revision, lifted.revision);
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...f.address(), attempt: 1, outcome: refusedBy(refusal) })).holds, []);
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+  f.restart();
+  assert.equal(deliveredOf(liftOriginHold(f.store, request)).revision, lifted.revision);
+  assert.equal(deliveredOf(readOriginHoldAt(f.store, f.project, hold)).value.lift, null);
+  deliveredOf(openAttempt(f.store, f.begin(nextScope, 3, 2)));
+  // A stored lift is checked against the same owner contract again; a rehashed body cannot launder substitution.
+  const substituted = storedAs(f.store, ORIGIN_DECISION_KIND, originDecisionNamespace(f.project),
+    { ...decision, owner: { kind: "mechanism", mechanism: "M6" } });
+  const currentHold = f.store.get<Record<string, Json>>(hold.id)!;
+  f.store.write({ id: hold.id, kind: ORIGIN_HOLD_KIND, expected: currentHold.revision,
+    value: { ...currentHold.value, lift: { ...(currentHold.value.lift as Record<string, Json>), record: substituted as unknown as Json } } });
+  f.restart();
+  assert.equal(refusalOf(stopContext(f.store, f.address(2))).code, "hold_invalid");
+  assert.equal(refusalOf(liftOriginHold(f.store, request)).code, "hold_invalid");
+  assert.equal(refusalOf(readOriginHoldAt(f.store, f.project, reference(f.store.get(hold.id)!))).code, "hold_invalid");
+  assert.equal(deliveredOf(readOriginHoldAt(f.store, f.project, hold)).value.lift, null);
+});
+
+test("A3.3 G7 closes the saved mechanism goal after D3 has removed its gaps without inventing an achievement or cancellation", t => {
+  const f = mechanismFixture(t), series = deliveredOf(openSeries(f.store,
+    { ...f.address(), scope: f.initial.scope, predecessor: null, basis: null }));
+  deliveredOf(openAttempt(f.store, f.begin(f.initial, 1)));
+  const filled = f.addressQuestions(["format-a", "format-b"]);
+  assert.equal(filled.batch, undefined);
+  const before = mechanismSnapshot(f.store);
+  for (const [field, code] of [["accepting", "acceptance_unconfirmed"], ["cancelling", "cancellation_unconfirmed"]] as const) {
+    const rejection = refusalOf(closeAttempt(f.store, { ...f.address(), attempt: 1,
+      outcome: outcome({ [field]: [reference(f.input)] }) }));
+    assert.equal(rejection.code, code); assert.ok(rejection.at.target);
+    assert.deepEqual(mechanismSnapshot(f.store), before);
+  }
+  const request = { ...f.address(), attempt: 1, outcome: outcome() };
+  const result = deliveredOf(closeAttempt(f.store, request));
+  assert.equal(result.verdict, "none"); assert.equal(result.withoutProgress, 1);
+  const current = f.store.get<{ attempts: { goal: AttemptGoal; outcome: { achieved: unknown[]; cancelled: unknown[] } }[] }>(series.id)!;
+  assert.deepEqual(current.value.attempts[0]!.goal, f.initial.goal);
+  assert.deepEqual(current.value.attempts[0]!.outcome.achieved, []);
+  assert.deepEqual(current.value.attempts[0]!.outcome.cancelled, []);
+  const beforeRepeat = mechanismSnapshot(f.store);
+  assert.deepEqual(deliveredOf(prepareCloseAttempt(f.store, request)).writes, []);
+  assert.equal(openSeries(f.store, { ...f.address(2), scope: filled.scope, predecessor: reference(current),
+    basis: { ground: "inputs-changed", text: "Every question was addressed" } }).ok, false, "empty mechanism work cannot erase the chain");
+  assert.deepEqual(mechanismSnapshot(f.store), beforeRepeat);
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), result);
+  assert.deepEqual(mechanismSnapshot(f.store), beforeRepeat);
+});
+
+test("A3.3 G7 prepared mechanism admission and closure guard their whole transaction against concurrent changes", t => {
+  const f = mechanismFixture(t), series = deliveredOf(openSeries(f.store,
+    { ...f.address(), scope: f.initial.scope, predecessor: null, basis: null }));
+  const prepared = deliveredOf(prepareOpenAttempt(f.store, f.begin(f.initial, 1)));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(f.input))));
+  f.addressQuestions(["format-a"]);
+  const noAttempt = mechanismSnapshot(f.store), neighbor = { id: "mechanism-race-neighbor", kind: "test-neighbor", expected: 0, value: {} };
+  assert.equal(refusalOf(writeGuarded(f.store, { unit: "G7", target: series.id,
+    writes: [...prepared.writes, neighbor], guards: [...prepared.guards] })).code, "input_stale");
+  assert.equal(f.store.get(neighbor.id), null); assert.deepEqual(mechanismSnapshot(f.store), noAttempt);
+
+  const nextScope = f.refresh(), successor = deliveredOf(openSeries(f.store, { ...f.address(2), scope: nextScope.scope,
+    predecessor: reference(f.store.get(series.id)!), basis: { ground: "inputs-changed", text: "The first question is now addressed" } }));
+  deliveredOf(openAttempt(f.store, f.begin(nextScope, 1, 2)));
+  const refusal = journalled(f.store, f.project, { sources: [] }, { goal: nextScope.goal!.result });
+  const closing = deliveredOf(prepareCloseAttempt(f.store, { ...f.address(2), attempt: 1, outcome: refusedBy(refusal) }));
+  const winner = deliveredOf(closeAttempt(f.store, { ...f.address(2), attempt: 1, outcome: outcome() })), beforeRace = mechanismSnapshot(f.store);
+  assert.ok(["input_stale", "revision_conflict"].includes(refusalOf(writeGuarded(f.store, { unit: "G7", target: successor.id,
+    writes: [...closing.writes, neighbor], guards: [...closing.guards] })).code));
+  assert.equal(f.store.get(neighbor.id), null); assert.deepEqual(mechanismSnapshot(f.store), beforeRace);
+  assert.deepEqual(f.store.list(ORIGIN_HOLD_KIND), []); assert.equal(winner.verdict, "none");
 });
