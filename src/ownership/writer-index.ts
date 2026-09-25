@@ -8,7 +8,7 @@ import type { Revision, Store, Write } from "../storage/store.js";
 import { readWriter } from "./owners.js";
 
 export interface WriterIndex {
-  contract: "writer-index/v1";
+  contract: "writer-index/v1" | "writer-index/om-m8-v1";
   project: string;
   path: string;
   writers: Ref[];
@@ -46,7 +46,7 @@ function rootAt(store: Store, project: string, path: string, ref: Ref | null): R
     || !text(record.value.head) || !isRef(record.value.workspace)) invalid(project, path, "root");
   return record;
 }
-function writerSource(store: Store, project: string, path: string, ref: Ref): { record: Revision<TaskRun>; task: CompiledTask } {
+function writerSource(store: Store, project: string, path: string, ref: Ref): { record: Revision<TaskRun>; task: CompiledTask; plan: Revision<MachinePlan> } {
   const record = store.get<TaskRun>(ref.id, ref.revision);
   if (!record || record.kind !== "task-run" || record.hash !== ref.hash || !object(record.value)
     || record.value.projectId !== project || record.value.state !== "committed" || !text(record.value.commit)
@@ -56,7 +56,18 @@ function writerSource(store: Store, project: string, path: string, ref: Ref): { 
     || plan.value.projectId !== project || !Array.isArray(plan.value.tasks)) invalid(project, path, "writers.plan");
   const task = plan.value.tasks.find(item => object(item) && item.id === record.value.taskId);
   if (!task || !Array.isArray(task.writePaths) || !task.writePaths.every(text)) invalid(project, path, "writers.task");
-  return { record, task };
+  return { record, task, plan };
+}
+/** The exact plan's namespace chooses the era; a missing index marker cannot downgrade an OM writer. */
+function writerContract(store: Store, project: string, path: string, ref: Ref): WriterIndex["contract"] {
+  const { plan } = writerSource(store, project, path, ref);
+  const feasibility: unknown = plan.value.feasibility;
+  if (object(feasibility) && text(feasibility.id) && feasibility.id.startsWith("om-feasibility:")) {
+    if (plan.value.version !== 2 || !isRef(feasibility) || feasibility.id !== `om-feasibility:${project}`)
+      invalid(project, path, "index.contract");
+    return "writer-index/om-m8-v1";
+  }
+  return "writer-index/v1";
 }
 function committedTransition(store: Store, project: string, path: string, ref: Ref): Revision<TaskRun> {
   const { record, task } = writerSource(store, project, path, ref);
@@ -67,7 +78,8 @@ function committedTransition(store: Store, project: string, path: string, ref: R
   return record;
 }
 /** The date is the root transition of this exact accepted run, not an author-supplied later checkpoint. */
-function commitOrigin(store: Store, project: string, path: string, root: Revision<ExecutionRoot> | null, runRef: Ref, repository?: string): void {
+function commitOrigin(store: Store, project: string, path: string, root: Revision<ExecutionRoot> | null, runRef: Ref, repository?: string,
+  boundaryOnly = false): void {
   if (!root || root.revision < 2) invalid(project, path, "origin.root");
   const run = committedTransition(store, project, path, runRef);
   const previous = store.get<ExecutionRoot>(root.id, root.revision - 1);
@@ -76,22 +88,28 @@ function commitOrigin(store: Store, project: string, path: string, root: Revisio
   if (previous.value.head !== run.value.parent || root.value.head !== run.value.commit
     || !same({ ...previous.value, head: run.value.commit }, root.value)) invalid(project, path, "origin.root");
   const directory = repository ?? root.value.sourceRoot;
-  readWriter(store, project, { root: directory, head: root.value.head }, runRef, path);
+  // A future OM writer dates the interval, but its gate depends on the very M8 slice being read.
+  // The selected index still uses the full common writer proof; a boundary proves only the transition.
+  if (boundaryOnly) {
+    if (git(directory, ["rev-parse", `${run.value.commit}^{tree}`]) !== run.value.tree) invalid(project, path, "origin.tree");
+  } else readWriter(store, project, { root: directory, head: root.value.head }, runRef, path);
   if (git(directory, ["rev-list", "--parents", "-n", "1", run.value.commit!]) !== `${run.value.commit} ${run.value.parent}`)
     invalid(project, path, "origin.parent");
 }
 function checked(store: Store, project: string, path: string, record: Revision<WriterIndex>,
-  checkedWriters = new Set<string>(), repository?: string, checkedIndexes = new Set<string>()): Revision<WriterIndex> {
+  checkedWriters = new Set<string>(), repository?: string, checkedIndexes = new Set<string>(), boundaryOnly = false): Revision<WriterIndex> {
   const key = canonical(reference(record));
-  if (checkedIndexes.has(key)) return record;
+  if (!boundaryOnly && checkedIndexes.has(key)) return record;
   const value = record.value;
   if (record.id !== writerIndexId(project, path) || record.kind !== "writer-index" || !isRef(record)
-    || !object(value) || Object.keys(value).length !== 7 || value.contract !== "writer-index/v1"
+    || !object(value) || Object.keys(value).length !== 7 || !["writer-index/v1", "writer-index/om-m8-v1"].includes(value.contract)
     || value.project !== project || value.path !== path || !Array.isArray(value.writers) || !value.writers.every(isRef)
     || !same(uniqueRefs(value.writers), value.writers) || hashJson(value) !== record.hash
     || !(value.previous === null || isRef(value.previous)) || !(value.root === null || isRef(value.root))
     || !object(value.origin) || !(value.origin.kind === "bootstrap" && Object.keys(value.origin).length === 1
       || value.origin.kind === "commit" && Object.keys(value.origin).length === 2 && isRef(value.origin.run))) invalid(project, path, "index");
+  const contract = value.origin.kind === "commit" ? writerContract(store, project, path, value.origin.run) : "writer-index/v1";
+  if (value.contract !== contract || boundaryOnly && contract !== "writer-index/om-m8-v1") invalid(project, path, "index.contract");
   const root = rootAt(store, project, path, value.root);
   let previous: Revision<WriterIndex> | null = null;
   if (record.revision === 1) {
@@ -111,15 +129,17 @@ function checked(store: Store, project: string, path: string, record: Revision<W
   if (!root && (record.revision !== 1 || value.writers.length !== 0 || value.origin.kind !== "bootstrap")) invalid(project, path, "root");
   if (value.origin.kind === "commit") {
     if (!value.writers.some(ref => same(ref, value.origin.kind === "commit" ? value.origin.run : null))) invalid(project, path, "origin.run");
-    commitOrigin(store, project, path, root, value.origin.run, repository);
+    commitOrigin(store, project, path, root, value.origin.run, repository, boundaryOnly);
   }
   for (const ref of value.writers) {
     const key = canonical(ref);
     if (checkedWriters.has(key)) continue;
     if (!writerSource(store, project, path, ref).task.writePaths.includes(path)) invalid(project, path, "writers.path");
+    if (value.origin.kind === "bootstrap" && writerContract(store, project, path, ref) !== "writer-index/v1")
+      invalid(project, path, "index.contract");
     checkedWriters.add(key);
   }
-  checkedIndexes.add(key);
+  if (!boundaryOnly) checkedIndexes.add(key);
   return record;
 }
 function interval(store: Store, project: string, path: string, record: Revision<WriterIndex>, root: Ref | null): Revision<WriterIndex> {
@@ -129,7 +149,7 @@ function interval(store: Store, project: string, path: string, record: Revision<
   if ((record.value.root?.revision ?? 0) > (root?.revision ?? 0)) invalid(project, path, "root.interval");
   const next = store.get<WriterIndex>(record.id, record.revision + 1);
   if (next) {
-    checked(store, project, path, next, writers, repository, indexes);
+    checked(store, project, path, next, writers, repository, indexes, next.value?.contract === "writer-index/om-m8-v1");
     if (!same(next.value.previous, reference(record)) || (next.value.root?.revision ?? 0) <= (root?.revision ?? 0))
       invalid(project, path, "root.interval");
   }
@@ -188,7 +208,8 @@ export function prepareWriterIndex(store: Store, project: string, path: string, 
   const writers = uniqueRefs([...(old?.value.writers ?? current), ...(pending ? [pending.ref] : [])]);
   const guards = uniqueRefs([...(root ? [root] : []), ...(old ? [reference(old)] : []), ...current]);
   if (old && same(old.value.writers, writers)) return { record: old, writes: [], guards };
-  const value: WriterIndex = { contract: "writer-index/v1", project, path, writers, previous: old ? reference(old) : null,
+  const value: WriterIndex = { contract: pending ? writerContract(view, project, path, pending.ref) : "writer-index/v1",
+    project, path, writers, previous: old ? reference(old) : null,
     root: pending ? reference(pending.root) : root, origin: pending ? { kind: "commit", run: pending.ref } : { kind: "bootstrap" } };
   const write: Write = { id: writerIndexId(project, path), kind: "writer-index", expected: old?.revision ?? 0, value };
   const record = checked(view, project, path, { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(value), value }, new Set<string>(), pending?.root.value.path ?? before?.value.path);

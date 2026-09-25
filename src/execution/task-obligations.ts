@@ -9,6 +9,8 @@ import type { Graph } from '../graph/model.js';
 import type { TaskRun } from './model.js';
 import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
 import { findObligationConfirmation, frozenObligationConfirmation, type ObligationConfirmation } from '../graph/obligation-readiness.js';
+import type { OmFeasibility } from '../om/feasibility.js';
+import { requireBasis } from '../compiler/basis.js';
 
 export interface TaskRuntimeProof { binding: string; subject: string; kind: 'runtime'; confirmation: ObligationConfirmation }
 export interface TaskImplementationProof { binding: string; subject: string; kind: 'implementation';
@@ -21,7 +23,12 @@ export function requirePlanTaskObligations(store: Store, plan: MachinePlan, task
   const basis = store.get<Feasibility>(plan.feasibility.id, plan.feasibility.revision);
   requireCondition(basis?.kind === 'feasibility' && basis.hash === plan.feasibility.hash && basis.value.projectId === plan.projectId,
     'task_obligation_plan_foreign', 'Task obligations need the exact feasibility basis');
-  const handoff = taskObligationHandoff(store, plan.projectId, basis.value.inputs);
+  let handoff: ReturnType<typeof taskObligationHandoff>;
+  if (plan.feasibility.id.startsWith('om-feasibility:')) {
+    const checked = requireBasis(store, plan);
+    requireCondition(checked, 'task_obligation_plan_foreign', 'An M8 plan needs its proved compilation basis');
+    handoff = structuredClone(checked.value.obligations.handoff) as OmFeasibility['obligations']['handoff'];
+  } else handoff = taskObligationHandoff(store, plan.projectId, basis.value.inputs);
   if (!handoff) return;
   const graph = store.get<Graph>(plan.graph.id, plan.graph.revision);
   requireCondition(graph?.kind === 'graph' && graph.hash === plan.graph.hash && canonical(graph.value) === canonical(plan.graphSnapshot),

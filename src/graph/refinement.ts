@@ -21,6 +21,7 @@ import { withObligationEvidence } from './obligation-evidence.js';
 import { readinessObligations, type ReadinessObligations } from './obligation-readiness.js';
 import { obligationHandoff } from './obligation-handoff.js';
 import { requireTaskObligations, TASK_OBLIGATION_CONTRACT } from './task-obligations.js';
+import { gateFeasibility as gateOmFeasibility } from '../om/feasibility.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -230,6 +231,16 @@ export class Refinement {
   }
   feasibilityGate(project: string, ref: Ref, allowHistorical = false): GateResult {
     if (!isRef(ref)) return { findings: [{ code: "feasibility_missing", target: project, message: "R3 result reference is required" }], guards: [] };
+    if (ref.id.startsWith('om-feasibility:')) {
+      const checked = gateOmFeasibility(this.store, { project, record: ref });
+      if (!checked.ok) return { findings: [{ code: checked.refusal.code, target: checked.refusal.at.target,
+        message: checked.refusal.message, ...(checked.refusal.at.field === undefined ? {} : { field: checked.refusal.at.field }) }], guards: [] };
+      const admissionGuards = uniqueTransactionGuards(checked.value.guards);
+      const guards: Ref[] = [];
+      // The M8 closure is historical evidence; only its current positive guards become stage proofs.
+      for (const guard of admissionGuards) if (!('absent' in guard)) guards.push(guard);
+      return { findings: [], guards, admissionGuards };
+    }
     const record = this.store.get<Feasibility>(ref.id);
     if (!record || record.kind !== "feasibility" || record.value.projectId !== project || record.hash !== ref.hash || record.revision !== ref.revision || !record.value.ready) {
       return { findings: [{ code: "feasibility_not_ready", target: project, message: "R3 is missing, stale or not ready" }], guards: [] };

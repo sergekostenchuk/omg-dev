@@ -23,7 +23,7 @@ import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readWorksFrame } from './works-frame.js';
 
-export const FEASIBILITY_PRODUCER_CONTRACT = 'om-m8/v1' as const;
+export const FEASIBILITY_PRODUCER_CONTRACT = 'om-m8/v2' as const;
 export interface FeasibilityRequest {
   project: string; graph: Ref; layer: Ref; frame: Ref; environment: Ref; expected: number;
 }
@@ -124,6 +124,8 @@ function requireRecord(value: unknown, project: string): asserts value is OmFeas
     || !Object.hasOwn(value, 'repository') || !refs(value['inputs']) || !findingsShape(value['findings'])) bad('record');
   const producer = value['producer'];
   if (!object(producer)) return bad('producer');
+  if (producer['contract'] === 'om-m8/v1')
+    fail('feasibility_contract_superseded', id(project), 'producer.contract', 'The M8/v1 producer contract has been replaced by M8/v2');
   if (producer['contract'] !== FEASIBILITY_PRODUCER_CONTRACT || producer['project'] !== project
     || !['layer', 'frame', 'candidate', 'horizon'].every(key => isRef(producer[key]))) bad('producer');
   const obligations = producer['obligations'], readiness = producer['readiness'], inspection = producer['inspection'];
@@ -243,10 +245,15 @@ function deliveryInputs(store: Store, project: string, basis: Sources, inspectio
   const derived = deriveTasks(project, basis.accepted.graph!.hash, basis.graph as Graph, resolve,
     { version: 2, owner, researchObligations });
   inputGuards.push(...derived.guards);
+  const resolutions = [...resolved.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, input]) => input);
+  // Saved bases name each selected slice and immediate resolution. Later right-boundary proofs remain observable
+  // in the historical trace but cannot change this already saved producer's inputs.
+  const inputs = uniqueRefs([...indexes.values(), ...(inspection.executionRoot ? [inspection.executionRoot] : []),
+    ...resolutions.flatMap(input => [...(input.source ? [input.source] : []), ...(input.receipt ? [input.receipt] : [])])]);
   const value: FeasibilityDeliveries = { ownership: { root: inspection.executionRoot, indexes: Object.fromEntries(indexes) },
-    resolved: [...resolved.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, input]) => input), inputs: uniqueRefs(dependencies) };
+    resolved: resolutions, inputs };
   if (saved && !same(saved, value)) badRecord(id(project), 'deliveries');
-  return { value, findings, guards: uniqueRefs(inputGuards), references: value.inputs };
+  return { value, findings, guards: uniqueRefs(inputGuards), references: uniqueRefs(dependencies) };
 }
 
 function resultValue(request: Pick<FeasibilityRequest, 'project' | 'graph' | 'layer' | 'frame' | 'environment'>,
@@ -254,10 +261,10 @@ function resultValue(request: Pick<FeasibilityRequest, 'project' | 'graph' | 'la
   const retained = readiness.value;
   if (!retained || !same(retained.handoff, basis.obligations.handoff)) return badRecord(id(request.project), 'readiness');
   const d7 = { producer: reference(basis.obligations.producer), ledger: reference(basis.obligations.record) };
-  const inputs = uniqueRefs([...basis.frame.references, request.graph, request.layer, request.frame, request.environment,
+  const inputs = uniqueRefs([request.graph, request.layer, request.frame, request.environment,
     reference(basis.candidate), basis.frame.request.horizon, d7.producer, d7.ledger,
     ...(inspection.executionRoot ? [inspection.executionRoot] : []), ...(inspection.workspace ? [inspection.workspace] : []),
-    ...readiness.dependencies, ...deliveries.references]);
+    ...readiness.dependencies, ...deliveries.value.inputs]);
   const findings = [...inspection.result.findings, ...readiness.findings, ...deliveries.findings];
   return { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: request.project, ready: findings.length === 0,
     graph: request.graph, environment: request.environment, repository: inspection.result.state, inputs, findings,

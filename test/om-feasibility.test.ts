@@ -212,7 +212,7 @@ test('G1 prepares and writes real accepted works with complete empty D7 and plan
   assert.equal(value.contractVersion, 2); assert.equal(value.ready, true, canonical(value.findings));
   assert.deepEqual(value.findings, []); assert.deepEqual(prepared.refusals, []);
   assert.deepEqual(value.graph, f.acceptance.graph); assert.deepEqual(value.environment, reference(f.environment));
-  assert.equal(value.producer.contract, 'om-m8/v1');
+  assert.equal(value.producer.contract, 'om-m8/v2');
   assert.deepEqual(value.producer.layer, f.acceptance.layer);
   assert.deepEqual(value.producer.frame, f.acceptance.frame);
   assert.deepEqual(value.producer.horizon, f.horizon);
