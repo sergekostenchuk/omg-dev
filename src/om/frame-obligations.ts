@@ -622,6 +622,8 @@ export interface PreparedFrame extends FrameRead {
   // protected by expected.frame=0; Store read guards describe existing revisions, never absence.
   expected: { graph: number; layer: number; frame: number };
 }
+export interface HorizonBasisRequest { project: string; graph: Ref; horizon: Ref }
+export interface PreparedHorizonBasis { horizon: HorizonRecords; upperRef: Ref; upper: Graph; guards: Ref[] }
 type FrameLayer = LayerBasis;
 function frameTake<T>(result: OmResult<T>): T {
   if (!result.ok) throw new FrameFailure(result.refusal);
@@ -682,8 +684,9 @@ function frameCompareUpper(layer: FrameLayer, graph: Graph, level: 1 | 2, target
 function frameReadConnection(store: Store, project: string, level: FrameLevel, ref: Ref | null, refs: Ref[]): AcceptedFrame['frame'] {
   return ref ? { reference: ref, value: frameReadRecord<ConnectionFrame>(store, ref, `om-frame:${project}:${level}`, "connection-frame", refs).value } : null;
 }
-function frameSources(store: Store, request: FrameRequest): FrameBasis {
-  const refs: Ref[] = [];
+function horizonBasisSources(store: Store, request: HorizonBasisRequest, refs: Ref[]): {
+  horizon: HorizonRecords; graph: Graph; upperRef: Ref; upper: Graph;
+} {
   const horizon = frameAcceptedHorizon(store, request.project, request.horizon, refs);
   const inputRef = horizon.horizon.value.request.input;
   const input = frameTake(readOmInput(store, request.project, inputRef));
@@ -695,6 +698,12 @@ function frameSources(store: Store, request: FrameRequest): FrameBasis {
   requireFrameGraph(graph, "graph");
   const l1 = frameReadLayer(store, l1ref, request.project, 1, refs);
   frameCompareUpper(l1.value, graph, 1, l1.id);
+  return { horizon, graph, upperRef: l1ref, upper: frameProjection(graph, 1) };
+}
+function frameSources(store: Store, request: FrameRequest): FrameBasis {
+  const refs: Ref[] = [];
+  const { horizon, graph, upperRef: l1ref } = horizonBasisSources(store, request, refs);
+  const inputRef = horizon.horizon.value.request.input;
   const ownerScope = horizon.horizon.value.result.horizon;
   let scope: FrameScope = { nodes: ownerScope.nodes, excluded: ownerScope.excluded, hash: ownerScope.hash };
   let upperRef: Ref = l1ref;
@@ -824,6 +833,26 @@ function frameCurrentSources(store: Store) {
   };
   return { traced, guards, remember, current, acceptGate };
 }
+/** Admit a saved horizon against today's graph without requiring its historical graph or refinement heads. */
+export function prepareHorizonBasis(store: Store, request: HorizonBasisRequest): OmResult<Sealed<PreparedHorizonBasis>> {
+  if (!(store instanceof Store)) frameInvalid("store");
+  if (!frameObject(request) || !frameText(request['project'])
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(request['project'])) frameInvalid("request");
+  for (const key of ['graph', 'horizon']) if (!isRef(request[key])) frameInvalid(key);
+  request = frameCopy(request);
+  return frameResult(() => {
+    const { traced, guards, remember, current } = frameCurrentSources(store);
+    const basis = horizonBasisSources(traced, request, []);
+    const inputRef = basis.horizon.horizon.value.request.input;
+    for (const ref of [request.graph, request.horizon, reference(basis.horizon.horizon), inputRef, basis.upperRef,
+      ...Object.values(basis.horizon.horizon.value.request.available).flatMap(value => Object.values(value))]) current(ref);
+    const prepared = frameTake(prepareExistingOmInput(traced, request.project, inputRef));
+    if (!prepared.existing || canonical(reference(prepared.existing)) !== canonical(inputRef))
+      frameReject("input_stale", inputRef.id, "input", "The horizon needs the currently admitted OM input");
+    for (const guard of prepared.guards) remember(guard);
+    return { horizon: basis.horizon, upperRef: basis.upperRef, upper: basis.upper, guards: frameSorted([...guards.values()]) };
+  });
+}
 /** Admit a layer by its producer without introducing an input or horizon dependency. */
 export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceRequest): OmResult<Sealed<HistoricalLayerBasis & { guards: Ref[] }>> {
   return frameResult(() => {
@@ -853,7 +882,9 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
   return frameResult(() => {
     const read = frameReading(store, request);
     const { traced, guards, remember, current, acceptGate } = frameCurrentSources(store);
-    for (const ref of [request.graph, request.horizon, ...(request.layer ? [request.layer] : []),
+    const horizonBasis = frameTake(prepareHorizonBasis(traced, { project: request.project, graph: request.graph, horizon: request.horizon }));
+    for (const guard of horizonBasis.guards) remember(guard);
+    for (const ref of [...(request.layer ? [request.layer] : []),
       ...(request.frame ? [request.frame] : []), ...(request.upper ? [request.upper.horizon, ...(request.upper.frame ? [request.upper.frame] : [])] : [])]) current(ref);
     const frameHead = traced.get(`om-frame:${request.project}:${request.level}`);
     if (!request.frame && frameHead) frameReject("input_stale", frameHead.id, "frame", "An existing frame cannot be omitted");
@@ -862,15 +893,6 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
     const layerHead = traced.get<FrameLayer>(`graph-layer:${request.project}:${request.level}`);
     if (!request.layer && (layerHead?.value.acceptance !== undefined || layerHead?.value.layerProofs?.some(proof => proof.level === request.level)))
       frameReject("frame_basis_unproven", layerHead.id, "layer", "An accepted lower layer cannot be omitted");
-    const horizon = frameTake(readHorizon(traced, request.project, request.horizon));
-    current(reference(horizon.horizon));
-    for (const basis of Object.values(horizon.horizon.value.request.available)) for (const ref of Object.values(basis)) current(ref);
-    const inputRef = horizon.horizon.value.request.input;
-    current(inputRef);
-    const prepared = frameTake(prepareExistingOmInput(traced, request.project, inputRef));
-    if (!prepared.existing || canonical(reference(prepared.existing)) !== canonical(inputRef))
-      frameReject("input_stale", inputRef.id, "input", "The frame needs the currently admitted OM input");
-    for (const guard of prepared.guards) remember(guard);
     const engine = new ProductEngine(traced);
     if (request.layer) {
       const admission = frameTake(prepareLayerAcceptance(store,
