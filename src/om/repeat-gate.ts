@@ -676,6 +676,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
     const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts].find(item => item.ordinal === request.attempt);
     const confirmed = confirmResults(store, {
       project: address.project, block: address.owner.block, target: address.id,
+      attempt: { series: reference(standing.value), ordinal: request.attempt },
       goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling,
     });
     if (!confirmed.ok) return confirmed;

@@ -1,11 +1,14 @@
-import type { Json } from "../canonical.js";
+import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { isRef, type Ref } from "../pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
-import type { Achievement, AttemptGoal } from "./series.js";
+import { readSeriesAt, type Achievement, type AttemptGoal, type RepairSeries } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
+import { FRAME_ACCEPTANCE_CONTRACT, readAcceptedFrameLayer } from "./layer-basis.js";
+import { readResultIdentity } from "./result-identity.js";
+import { withHistoricalReads } from "./input.js";
 
 /**
  * The contract of the PROVIDERS OF ACCEPTANCE: who may say that a result was accepted, and what its lasting key is.
@@ -26,8 +29,8 @@ import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted
  *
  * The providers are the units that write accepting records — the closing of a gap line (D2), the checked answer (D5),
  * the accepted frame (C5). D2 verifies its historical closing grounds and recorded goal through its registered
- * provider, then derives the shared structural result identity. Cancellation providers remain unconnected. Connecting a provider is one
- * line in its table below; nothing in G7 changes, and no caller can hand a table of its own to any function here.
+ * provider, then derives the shared structural result identity. Cancellation providers remain unconnected. Provider
+ * selection stays in the table below; no caller can hand a table of its own to any function here.
  */
 const UNIT = "om-acceptance";
 
@@ -37,6 +40,8 @@ export interface AcceptanceContext {
   readonly block: string;
   /** The goal the attempt was begun for: a record that accepted a result of another goal is no progress of this one. */
   readonly goal: AttemptGoal;
+  /** Exact historical slice being closed or reported; older suppliers retain their goal-only contract. */
+  readonly attempt?: { readonly series: Ref; readonly ordinal: number };
 }
 
 /** What a provider answers about one record: the keys it derived from it, or why the record confirms nothing. */
@@ -71,7 +76,8 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
  * Historical grounds and semantic result identity are interpreted by that provider, never by this table.
  */
 export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult },
-  "accepted-answer": { namespace: acceptedAnswerNamespace, confirm: confirmAcceptedAnswerResult } });
+  "accepted-answer": { namespace: acceptedAnswerNamespace, confirm: confirmAcceptedAnswerResult },
+  "connection-frame": { namespace: project => `om-frame:${project}:`, confirm: confirmAcceptedFrameResult } });
 
 /**
  * Kind of a TRANSITION that cancelled an earlier result → its provider, which derives the keys of the results it
@@ -90,6 +96,7 @@ export interface ConfirmRequest {
   readonly target: string;
   /** The goal of the attempt being closed, or null when no attempt of that ordinal stands to confirm anything for. */
   readonly goal: AttemptGoal | null;
+  readonly attempt?: AcceptanceContext["attempt"];
   readonly accepting: readonly Ref[];
   readonly cancelling: readonly Ref[];
 }
@@ -120,6 +127,8 @@ export function confirmResults(store: Store, request: ConfirmRequest): OmResult<
     "acceptance_request_invalid", "A confirmation names the project, the block and the series it is for");
   requireCondition(request.goal === null || isPlainObject(request.goal),
     "acceptance_request_invalid", "A confirmation names the goal of the attempt, or says that no such attempt stands");
+  requireCondition(!Object.hasOwn(request, "attempt") || validAttempt(request.attempt),
+    "acceptance_request_invalid", "An explicit attempt context names an exact series and positive ordinal");
   // An absent set is not an empty one: a cycle that accepted nothing says so.
   requireCondition(Array.isArray(request.accepting) && request.accepting.every(isRef),
     "acceptance_request_invalid", "A cycle names the records that accepted its results by exact references, explicitly none");
@@ -161,10 +170,62 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
   if (request.goal === null) {
     return problem(side.code, "No attempt of that ordinal stands, so nothing it accepted can be confirmed for it", request.target, "attempt", ref);
   }
-  const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal }, store);
+  const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal,
+    ...(request.attempt === undefined ? {} : { attempt: request.attempt }) }, store);
   const keys = keysOf(answer);
   if (keys === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
   return keys;
+}
+
+const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
+function validAttempt(value: unknown): value is NonNullable<AcceptanceContext["attempt"]> {
+  return object(value) && Object.keys(value).length === 2 && isRef(value['series'])
+    && Number.isSafeInteger(value['ordinal']) && (value['ordinal'] as number) > 0;
+}
+const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
+const goalOf = (goal: AttemptGoal) => ({ ...goal, questions: [...goal.questions].sort() });
+
+/** C5 proves acceptance and its one bound attempt; the shared identity reader alone defines the result keys. */
+export function confirmAcceptedFrameResult(record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store): Confirmation {
+  requireCondition(store instanceof Store && isPlainObject(record) && isRef(record) && isPlainObject(context)
+    && isText(context.project) && isText(context.block) && isPlainObject(context.goal)
+    && Object.keys(context.goal).length === 3 && isText(context.goal.key) && isText(context.goal.result) && Array.isArray(context.goal.questions)
+    && Array.from(context.goal.questions).every(isText), "acceptance_request_invalid", "Frame confirmation needs its exact record and full attempt goal");
+  return withHistoricalReads(() => {
+    if (!validAttempt(context.attempt)) return { unconfirmed: "A frame achievement needs its exact attempt context" };
+    if (!object(record.value) || (record.value['level'] !== 2 && record.value['level'] !== 3))
+      return { unconfirmed: "The record must be an accepted N2 or N3 frame" };
+    const accepted = readAcceptedFrameLayer(store, { project: context.project, level: record.value['level'], frame: reference(record) });
+    if (!accepted.ok) return { unconfirmed: `${accepted.refusal.code}: ${accepted.refusal.message}` };
+    const production = accepted.value.frame.value.acceptance;
+    if (production.contract !== FRAME_ACCEPTANCE_CONTRACT || !production.binding)
+      return { unconfirmed: "This acceptance has no proved attempt binding" };
+    const binding = production.binding, at = context.attempt;
+    if (at.series.id !== binding.series.id || at.series.revision < binding.series.revision || at.ordinal !== binding.ordinal)
+      return { unconfirmed: "The frame belongs to another series, attempt or later admission" };
+    const original = readSeriesAt(store, context.project, binding.series);
+    if (!original.ok) return { unconfirmed: `${original.refusal.code}: ${original.refusal.message}` };
+    const checked = readSeriesAt(store, context.project, at.series);
+    if (!checked.ok) return { unconfirmed: `${checked.refusal.code}: ${checked.refusal.message}` };
+    const before = original.value.value, after = checked.value.value;
+    const lineage = (series: Sealed<RepairSeries>) => ({ project: series.projectId, block: series.block, line: series.line,
+      slice: series.slice, predecessor: series.predecessor, basis: series.basis, inherited: series.inherited,
+      earlier: series.attempts.filter(item => item.ordinal < binding.ordinal) });
+    const source = before.attempts.find(item => item.ordinal === binding.ordinal);
+    const target = after.attempts.find(item => item.ordinal === binding.ordinal);
+    if (before.block !== context.block || !same(lineage(before), lineage(after)) || !source || !target
+      || !same(goalOf(source.goal), goalOf(target.goal)) || !same(goalOf(source.goal), goalOf(context.goal)))
+      return { unconfirmed: "The context must preserve the bound line, prior history, attempt and full declared goal" };
+    const acceptance = { project: context.project, level: accepted.value.frame.value.level,
+      graph: reference(accepted.value.graph), layer: reference(accepted.value.layer), frame: reference(accepted.value.frame) };
+    const keys: string[] = [];
+    for (const obligation of binding.obligations) {
+      const identity = readResultIdentity(store, { acceptance, obligation });
+      if (!identity.ok) return { unconfirmed: `${identity.refusal.code}: ${identity.refusal.message}` };
+      keys.push(identity.value.key);
+    }
+    return { keys };
+  });
 }
 
 // A provider is code of this module, so an answer it cannot give is a defect of that code, not data to refuse.

@@ -256,6 +256,7 @@ function attemptResult(store: Store, project: string, call: AnyCallLedgerEntry, 
   if (achieved.length) {
     if ('owner' in series.value) fail('achievement_unconfirmed', at.id, 'achieved', 'No mechanism acceptance provider is declared');
     const confirmed = take(confirmResults(store, { project, block: series.value.block, target: at.id,
+      attempt: { series: reference(series), ordinal: call.attempt },
       goal: attempt.goal, accepting: refs(achieved.map(item => item.basis)), cancelling: [] }));
     const ordered = (items: readonly Achievement[]) => [...items].sort(compare);
     if (!same(ordered(confirmed.achieved), ordered(achieved))) fail('spend_basis_invalid', at.id, 'achieved', 'Every saved achievement is derived by its acceptance provider');
