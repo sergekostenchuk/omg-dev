@@ -17,6 +17,7 @@ import type { Feasibility } from "../graph/refinement.js";
 import { composeLayer } from "../graph/layer-design.js";
 import { nodeSignature } from "../compiler/model.js";
 import { reopenRejectedRepair } from "./repair-feedback.js";
+import { beginLegacyOperation, finishLegacyOperation } from "./preparation-run.js";
 
 export interface PlanRepair {
   projectId: string; run: Ref; defect: Ref; parked: Ref; level: 1 | 2;
@@ -27,7 +28,36 @@ export interface PlanRepair {
 export class PlanRepairs {
   constructor(private readonly engine: ProductEngine) {}
   async prepare(project: string, runRef: Ref): Promise<Revision<PlanRepair>> {
-    return this.#prepare(project, runRef, this.engine.legacyRoute(project));
+    const route = this.engine.legacyRoute(project);
+    return this.#withOperation(project, runRef, route, () => this.#prepare(project, runRef, route));
+  }
+  async #withOperation(project: string, runRef: Ref, route: { om: boolean; guards: TransactionGuard[] },
+    work: () => Promise<Revision<PlanRepair>>): Promise<Revision<PlanRepair>> {
+    requireCondition(isRef(runRef), "repair_run_foreign", "Repair needs an exact failed plan attempt");
+    if (route.om) return work();
+    const { store } = this.engine;
+    const previous = store.get<PlanRepair>(`plan-repair:${hashJson(runRef)}`);
+    if (previous?.value.phase === "reissued") {
+      requireCondition(previous.kind === "plan-repair" && previous.value.projectId === project,
+        "repair_foreign", "Repair belongs to another project");
+      return previous;
+    }
+    const run = store.get<TaskRun>(runRef.id);
+    requireCondition(run?.kind === "task-run" && canonical(reference(run)) === canonical(runRef)
+      && run.value.projectId === project && run.value.state === "needs_plan",
+    "repair_run_foreign", "Repair needs this project's exact plan defect");
+    const lease = beginLegacyOperation(store, project, "repair", runRef, [], [runRef, ...route.guards]);
+    let result: Revision<PlanRepair> | null = null;
+    let failure: unknown = null;
+    try {
+      result = await work();
+      return result;
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      finishLegacyOperation(store, lease, result ? reference(result) : null, failure);
+    }
   }
   async #prepare(project: string, runRef: Ref, route: { om: boolean; guards: TransactionGuard[] }): Promise<Revision<PlanRepair>> {
     const { store, compiler, discovery, graphs, refinement } = this.engine;
@@ -97,6 +127,9 @@ export class PlanRepairs {
   async run(project: string, runRef: Ref, maxTurns: number): Promise<Revision<PlanRepair>> {
     requireCondition(Number.isInteger(maxTurns) && maxTurns > 0 && maxTurns <= 100, "research_budget_invalid", "Repair needs a bounded research allowance");
     const route = this.engine.legacyRoute(project);
+    return this.#withOperation(project, runRef, route, () => this.#run(project, runRef, maxTurns, route));
+  }
+  async #run(project: string, runRef: Ref, maxTurns: number, route: { om: boolean; guards: TransactionGuard[] }): Promise<Revision<PlanRepair>> {
     let repair = await this.#prepare(project, runRef, route);
     if (repair.value.phase === "reissued") return repair;
     const { store, researcher, refinement, compiler, pipeline } = this.engine;

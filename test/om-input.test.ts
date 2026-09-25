@@ -287,7 +287,7 @@ test("questions preserve producer knowledge and consumers while inventory absenc
   assert.deepEqual(present.input!.inventory, inventory);
   const prepared = delivered(prepareOmInput(f.store, { ...request(f), inventory }));
   assert.deepEqual(prepared.record.input.inventory, inventory);
-  assert.ok(prepared.guards.some(guard => guard.id === inventory.id && guard.hash === inventory.hash));
+  assert.ok(prepared.guards.some(guard => isRef(guard) && guard.id === inventory.id && guard.hash === inventory.hash));
   delete fields(stages, "discovery").preparation.unknowns[0].consumer;
   hasCode(buildOmInput(stages), "question_consumer_missing");
 });

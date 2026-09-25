@@ -12,7 +12,7 @@ import { allocateResearchTrial } from '../discovery/research-trial.js';
 import { retryPlannedRead } from '../discovery/reading-plan.js';
 import { applyObligationPolicy } from '../graph/obligation-application.js';
 import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-observation.js';
-import { continuePreparation } from "./preparation-run.js";
+import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
@@ -457,6 +457,7 @@ export class ProductEngine {
       case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
       case 'retry-planned-read': this.#project(command.project); return retryPlannedRead(this.store,command.project,command.child);
       case 'allocate-research-trial': this.#project(command.project); return allocateResearchTrial(this.store,command.project,command);
+      case "recover-legacy-operation": this.#project(command.project); return recoverLegacyOperation(this,command);
       case "continue-preparation": this.#project(command.project); return continuePreparation(this,command.project,command.maxCalls);
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
         { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);

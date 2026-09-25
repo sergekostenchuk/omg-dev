@@ -1,7 +1,7 @@
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { EngineError } from '../errors.js';
+import { EngineError, requireCondition } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
   prepareLateModelReceipt, readLateModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
@@ -1167,9 +1167,16 @@ function transportAssignment(store: Store, request: ModelTransportRequest) {
 async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal) {
   const assignment = transportAssignment(store, request), prepared = take(prepareCallDispatch(store, request.project, request.call));
   const admissionGuards = refs([...guards, ...prepared.guards]);
+  const counterId = `project-dispatch:${hashJson(request.project)}`;
+  const counter = store.get<{ projectId: string; serial: number }>(counterId);
+  requireCondition(!counter || (counter.kind === 'project-dispatch' && object(counter.value)
+    && counter.value.projectId === request.project && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0),
+  'research_dispatch_invalid', 'Invalid project dispatch counter');
   let record = take(writeGuarded<ModelCall>(store, { unit: 'E4', target: running.id,
-    writes: [{ ...running, value: { ...running.value as ModelCall, ...physicalClaim() } }],
-    guards: admissionGuards }))[0]!;
+    writes: [{ ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
+      { id: counterId, kind: 'project-dispatch', expected: counter?.revision ?? 0,
+        value: { projectId: request.project, serial: (counter?.value.serial ?? 0) + 1 } }],
+    guards: [...admissionGuards, ...(counter ? [reference(counter)] : [])] }))[0]!;
   let processResult: ProcessResult | null = null, launchError: ModelExchange['launchError'] = null;
   try { processResult = await runProcess(assignment.binding.command, assignment.environment.workspace,
     canonical(assignment.wire), assignment.environment.timeoutMs, signal, true, pid => {

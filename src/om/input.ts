@@ -10,6 +10,7 @@ import { projectGraph } from "../graph/project.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { ProductEngine } from "../product/engine.js";
+import { readLegacyOperation } from "../product/preparation-run.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
@@ -57,7 +58,7 @@ export interface ReopenFactInputDerivation { kind: "reopen-facts"; previous: Ref
 export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation | FactInputDerivation | ReopenFactInputDerivation;
 export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[]; derivation?: InputDerivation }
 export type DerivedInputRequest = { project: string } & (DecisionInputDerivation | FactInputDerivation | ReopenFactInputDerivation);
-export interface PreparedOmInput { record: OmInputRecord; writes: Write[]; guards: Ref[]; existing: Revision<OmInputRecord> | null }
+export interface PreparedOmInput<G extends TransactionGuard = Ref> { record: OmInputRecord; writes: Write[]; guards: G[]; existing: Revision<OmInputRecord> | null }
 export const INPUT_REFRESH_CONFLICT = "input_refresh_conflict";
 
 type Row = Record<string, any>;
@@ -517,15 +518,23 @@ function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed
   }
 }
 
-export function prepareOmInput(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput>> {
+export function prepareOmInput(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   return withHistoricalReads(() => prepareOmInputInScope(store, request));
 }
-function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput>> {
+function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   requireInputRequest(store, request);
   request = copy(request);
+  const id = `om-input:${request.project}`, current = store.get<OmInputRecord>(id);
+  const initialGuards: TransactionGuard[] = [];
+  if (!current) {
+    const operation = readLegacyOperation(store, request.project);
+    if (operation?.value.state === "active")
+      return refused("legacy_operation_active", "The first OM input requires the legacy operation to finish",
+        at(operation.id, "state", reference(operation)), "producer");
+    initialGuards.push(operation ? reference(operation) : { id: `legacy-operation:${request.project}`, absent: true });
+  }
   const derived = deriveInputRecord(store, request);
   if (!derived.ok) return derived;
-  const id = `om-input:${request.project}`, current = store.get<OmInputRecord>(id);
   const checked = current && current.revision === request.expected
     ? readOmInput(store, request.project, reference(current)) : null;
   if (checked && !checked.ok) return checked;
@@ -551,7 +560,7 @@ function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Se
   const guards = [...acceptance.value];
   const existing = current?.kind === "om-input" && current.revision === request.expected && canonical(current.value) === canonical(record) ? current : null;
   return delivered({ record, existing, writes: existing ? [] : [{ id, kind: "om-input", expected: request.expected, value: record }],
-    guards: [...guards, ...(existing ? [reference(existing)] : [])] });
+    guards: [...guards, ...(existing ? [reference(existing)] : []), ...initialGuards] });
 }
 
 export function writeOmInput(store: Store, request: InputRequest): OmResult<Sealed<Revision<OmInputRecord>>> {

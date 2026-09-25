@@ -20,7 +20,7 @@ import { join } from 'node:path';
 import { Store, type Revision, type Write, type TransactionGuard } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Environments, git, uniqueTransactionGuards, transactionGuardsCurrent } from '../src/runtime/environment.js';
-import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
+import { reference, isRef } from '../src/pipeline/contracts.js';
 import { preparedFeatures } from './product-fixture.js';
 import { answerTechnicalFixture } from './technical-research-fixture.js';
 import { deriveLayerFixture } from './layer-design-fixture.js';
@@ -383,7 +383,7 @@ test('D8.1 native OM gates have no absence channel and all four bridge entrances
   const second = reference(f.store.write({ id: 'd81-bridge-second', kind: 'fixture', expected: 0, value: { project } }));
   const absent = { id: positive.id, absent: true };
   const before = f.store.list().map(reference);
-  const routes: Record<string, () => OmResult<{ readonly guards: readonly Ref[] }>> = {
+  const routes: Record<string, () => OmResult<{ readonly guards: readonly TransactionGuard[] }>> = {
     input: () => prepareOmInput(f.store, inputRequest),
     horizon: () => prepareHorizon(f.store, horizonRequest),
     layer: () => prepareLayerAcceptance(f.store, layerRequest),

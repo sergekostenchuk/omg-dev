@@ -77,7 +77,7 @@ function requireEmptyProviderGroup(group: number | null): void {
   'model_call_process_uncertain', 'The original provider group still has live descendants; its termination is unproven');
 }
 
-function requireIdentityGone(identity: ProcessIdentity, message: string): void {
+export function requireIdentityGone(identity: ProcessIdentity, message: string): void {
   const observed = spawnSync('ps', ['-p', String(identity.pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 5000 });
   requireCondition(!observed.error && (observed.status === 0 || observed.status === 1 && observed.stdout.trim() === '' && observed.stderr.trim() === ''),
     'model_call_process_uncertain', 'Process identity could not be observed; observation failure is not proof of death');

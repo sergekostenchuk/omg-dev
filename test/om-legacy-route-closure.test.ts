@@ -275,32 +275,35 @@ const preparationWindows: PreparationWindow[] = [
 ];
 
 for (const boundary of preparationWindows) {
-  test(`G1.3 preparation retains the captured B1 absence through ${boundary.name}`, async t => {
+  test(`G1.4 preparation excludes the first B1 through ${boundary.name}`, async t => {
     const f = nativeFixture(t, boundary.point), other = new Store(f.store.path), writeMany = f.store.writeMany.bind(f.store);
     if (boundary.staleRepository)
       git(f.workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'New R3 repository basis']);
-    const protectedHistory = (store: Store) => canonical(store.list().filter(record => record.id !== 'preparation-run:p').flatMap(record => store.history(record.id)));
-    let inserted = false, afterB1: string | null = null, calls = 0;
+    let attempted = false, calls = 0;
     f.engine.refinementResearch.run = async () => { calls++; throw new Error('The existing R2 and L3 phases must be reused'); };
     f.store.writeMany = (<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] => {
-      if (!inserted && writes.some(boundary.matches)) {
-        inserted = true;
+      if (!attempted && writes.some(boundary.matches)) {
+        attempted = true;
         assert.equal(f.store.get<{ status: string }>('preparation-run:p')!.value.status, 'running');
-        firstInput(other); afterB1 = protectedHistory(other);
+        const before = history(other);
+        const result = writeOmInput(other, { project: 'p', expected: 0,
+          stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(other.get(`stage:p:${stage}`)!)])) as Record<UpstreamStage, Ref> });
+        assert.equal(result.ok, false);
+        if (!result.ok) { assert.equal(result.refusal.code, 'legacy_operation_active'); assert.equal(result.refusal.at.target, 'legacy-operation:p'); }
+        assert.equal(history(other), before, 'A busy first B1 writes nothing');
       }
       return writeMany<T>(writes, guards);
     }) as Store['writeMany'];
     try {
       const result = await continuePreparation(f.engine, 'p', 1);
-      assert.ok(inserted, `Preparation must reach ${boundary.name} after its initial run was saved`);
-      assert.equal(result.value.status, 'paused');
-      assert.equal(result.value.code, 'input_stale');
+      assert.ok(attempted, `Preparation must reach ${boundary.name} after its initial run was saved`);
+      assert.equal(result.value.status, 'accepted', result.value.error ?? 'Preparation must finish');
       assert.equal(calls, 0);
-      assert.equal(protectedHistory(f.store), afterB1, 'Only the paused run may be recorded after B1; the protected write and all later production remain absent');
-      assert.ok(f.store.history<{ status: string }>('preparation-run:p').every(record => record.value.status !== 'accepted'));
+      assert.equal(f.store.get('om-input:p'), null);
+      assert.equal(f.store.get<{ state: string }>('legacy-operation:p')!.value.state, 'released');
     } finally { f.store.writeMany = writeMany; other.close(); }
     f.reopen();
-    assert.equal(protectedHistory(f.store), afterB1);
+    firstInput(f.store);
   });
 }
 
@@ -380,7 +383,7 @@ test('G1.3 a reissued repair remains a completed repeat after B1 and restart', a
   assert.equal(f.calls().length, calls);
 });
 
-test('G1.3 a real repair guards its final plan reissue against B1 after compilation was accepted', async t => {
+test('G1.4 a real repair excludes the first B1 through final plan reissue', async t => {
   const f = executionFixture(t, 'repair');
   const failed = (await f.engine.executor.run('p', reference(f.plan), f.options))[1]!;
   assert.equal(failed.value.state, 'needs_plan');
@@ -391,32 +394,32 @@ test('G1.3 a real repair guards its final plan reissue against B1 after compilat
     command: { executable: process.execPath, args: ['check.mjs', 'consume-mutation'] } });
   writeFileSync(join(f.directory, 'calls.jsonl.repair.json'), JSON.stringify({ design: layerDesignOf(graph, 3, L3_ASSEMBLY) }));
   const other = new Store(f.store.path), writeMany = f.store.writeMany.bind(f.store);
-  const protectedHistory = (store: Store) => canonical(store.list().filter(record => !['plan-repair', 'execution-lock'].includes(record.kind)).flatMap(record => store.history(record.id)));
-  let inserted = false, afterB1: string | null = null, conflict: unknown, callsAtB1 = 0;
+  let attempted = false, callsAtB1 = 0;
   f.store.writeMany = (<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] => {
-    const reissue = writes.some(write => write.kind === 'plan-reissue');
-    if (!inserted && reissue) {
-      inserted = true;
+    if (!attempted && writes.some(write => write.kind === 'plan-reissue')) {
+      attempted = true;
       assert.equal(f.store.get<StageArtifact>('stage:p:compilation')!.value.status, 'accepted');
-      firstInput(other); afterB1 = protectedHistory(other); callsAtB1 = f.calls().length;
+      const before = history(other);
+      const result = writeOmInput(other, { project: 'p', expected: 0,
+        stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(other.get(`stage:p:${stage}`)!)])) as Record<UpstreamStage, Ref> });
+      assert.equal(result.ok, false);
+      if (!result.ok) { assert.equal(result.refusal.code, 'legacy_operation_active'); assert.equal(result.refusal.at.target, 'legacy-operation:p'); }
+      assert.equal(history(other), before);
+      callsAtB1 = f.calls().length;
     }
-    try { return writeMany<T>(writes, guards); }
-    catch (error) { if (reissue) conflict = error; throw error; }
+    return writeMany<T>(writes, guards);
   }) as Store['writeMany'];
   try {
     const result = await f.engine.repairs.run('p', reference(failed), 20);
-    assert.ok(inserted, 'The real repair must finish research and compilation before B1 is inserted');
-    assert.ok(conflict instanceof EngineError);
-    assert.equal(conflict.code, 'input_stale');
-    assert.equal(result.value.phase, 'compile');
-    assert.equal(result.value.plan, null);
-    assert.ok(result.value.error);
-    assert.equal(f.store.list('plan-reissue').length, 0);
+    assert.ok(attempted, 'The real repair must finish research and compilation before B1 is attempted');
+    assert.equal(result.value.phase, 'reissued', result.value.error ?? 'Repair must finish');
+    assert.ok(result.value.plan);
+    assert.equal(f.store.list('plan-reissue').length, 1);
     assert.equal(f.calls().length, callsAtB1);
-    assert.equal(protectedHistory(f.store), afterB1, 'The atomic reissue is refused; only repair pause and lock release are recorded');
+    assert.equal(f.store.get('om-input:p'), null);
+    assert.equal(f.store.get<{ state: string }>('legacy-operation:p')!.value.state, 'released');
   } finally { f.store.writeMany = writeMany; other.close(); }
-  f.reopen();
-  assert.equal(protectedHistory(f.store), afterB1);
+  f.reopen(); firstInput(f.store);
 });
 
 test('G1.3 an already accepted native plan executes and cold-resumes across B1 without repeated work', async t => {

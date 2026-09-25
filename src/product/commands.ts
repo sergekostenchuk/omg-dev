@@ -13,6 +13,7 @@ import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligati
 import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
 
 export type ProductCommand =
+  | {type:"recover-legacy-operation";project:string;operation:Ref;token:string}
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
@@ -76,6 +77,7 @@ const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const schema = { oneOf: [
+  command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),
   command('apply-obligation-policy',{project,scope:ref,policy:obligationPolicySchema}),
