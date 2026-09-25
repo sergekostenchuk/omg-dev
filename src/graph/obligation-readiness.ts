@@ -1,7 +1,7 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, uniqueRefs, type Finding, type Ref } from '../pipeline/contracts.js';
-import type { Store, TransactionGuard } from '../storage/store.js';
+import { Store, type TransactionGuard } from '../storage/store.js';
 import type { Source } from '../evidence/evidence.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import type { ResearchScope } from './research-scope.js';
@@ -14,6 +14,11 @@ import { transactionGuardsCurrent, uniqueTransactionGuards } from '../runtime/en
 
 export interface ObligationConfirmation { obligation: string; source: Ref; observation: Ref }
 export interface ReadinessObligations { handoff: ObligationHandoff; confirmations: ObligationConfirmation[] }
+
+interface ReadinessResult {
+  findings: Finding[]; guards: Ref[]; admissionGuards: TransactionGuard[]; dependencies: Ref[];
+  value: ReadinessObligations | undefined;
+}
 
 function confirmation(store: Store, project: string, obligation: CarriedObligation, source: Ref, dispatch: Ref | null) {
   if (!dispatch) return null;
@@ -84,24 +89,55 @@ export function frozenObligationConfirmation(store: Store, project: string, obli
   } catch { return false; }
 }
 
+function readinessBasis(store: Store, project: string, inputs: Ref[]) {
+  const handoff = obligationHandoff(store, project, inputs);
+  return { handoff, due: handoff?.obligations.filter(obligation => obligation.moment === 'R3') ?? [] };
+}
+
+function retainedReadiness(saved: ReadinessObligations, handoff: ObligationHandoff, due: CarriedObligation[], complete: boolean): boolean {
+  return !!saved && canonical(saved.handoff ?? null) === canonical(handoff) && Array.isArray(saved.confirmations)
+    && saved.confirmations.every(item => item && typeof item.obligation === 'string' && isRef(item.source) && isRef(item.observation))
+    && (!complete || saved.confirmations.length === due.length)
+    && new Set(saved.confirmations.map(item => item.obligation)).size === (complete ? due.length : saved.confirmations.length)
+    && saved.confirmations.every(item => due.some(obligation => runtimeObligationId(obligation) === item.obligation));
+}
+
+function resolvedReadiness(handoff: ObligationHandoff, due: CarriedObligation[],
+  resolve: (obligation: CarriedObligation, address: string) => ReturnType<typeof confirmation> | undefined): ReadinessResult {
+  const findings: Finding[] = [], guards: Ref[] = [], dependencies: Ref[] = [], confirmations: ObligationConfirmation[] = [];
+  const admissionGuards: TransactionGuard[] = [];
+  for (const obligation of due) {
+    const found = resolve(obligation, runtimeObligationId(obligation));
+    if (!found) {
+      findings.push({ code: obligation.kind === 'environment-confirmation' ? 'environment_confirmation_required' : 'obligation_resolution_required',
+        target: obligation.obligation, message: `Before R3: ${obligation.returnCondition}. Exact current confirmation is missing, failed or not declared as certifying this condition.` });
+      continue;
+    }
+    confirmations.push(found.proof); guards.push(...found.guards); dependencies.push(...found.dependencies);
+    admissionGuards.push(...found.admissionGuards);
+  }
+  return { findings, guards: uniqueRefs(guards), admissionGuards: uniqueTransactionGuards(admissionGuards),
+    dependencies: uniqueRefs(dependencies), value: { handoff, confirmations } };
+}
+
 /** Machine readiness consumes an explicitly declared pass predicate. Merely
  * running a version command (even exit zero) or quoting an owner report cannot
  * certify the condition. No provider call or command is launched by this gate. */
 export function readinessObligations(store: Store, project: string, inputs: Ref[], saved?: ReadinessObligations,
-  mode: 'assess' | 'consume' = 'assess', allowHistorical = false) {
+  mode: 'assess' | 'consume' = 'assess', allowHistorical = false): ReadinessResult {
   const findings: Finding[] = [], guards: Ref[] = [], dependencies: Ref[] = [], confirmations: ObligationConfirmation[] = [];
   const admissionGuards: TransactionGuard[] = [];
-  let handoff: ObligationHandoff | null;
-  try { handoff = obligationHandoff(store, project, inputs); }
+  let basis: ReturnType<typeof readinessBasis>;
+  try { basis = readinessBasis(store, project, inputs); }
   catch (error) {
     return { findings: [{ code: error instanceof EngineError ? error.code : 'obligation_handoff_invalid', target: 'R3',
       message: error instanceof Error ? error.message : 'Invalid R2 handoff' }], guards, admissionGuards, dependencies, value: undefined };
   }
+  const { handoff, due } = basis;
   if (!handoff) {
     if (saved !== undefined) findings.push({ code: 'obligation_handoff_foreign', target: 'R3', message: 'Readiness obligations do not belong to this R3 basis' });
     return { findings, guards, admissionGuards, dependencies, value: undefined };
   }
-  const due = handoff.obligations.filter(obligation => obligation.moment === 'R3');
   // Only a legacy producing R2 can waive the old R3 field. An OM ledger,
   // including an empty one, always survives into the saved readiness result.
   if ('r2' in handoff) {
@@ -113,16 +149,13 @@ export function readinessObligations(store: Store, project: string, inputs: Ref[
     findings.push({ code: 'obligation_handoff_missing', target: 'R3', message: 'This scoped R3 result omitted its required obligation handoff; do not infer it as accepted' });
     return { findings, guards, admissionGuards, dependencies, value: undefined };
   }
-  if (saved !== undefined && (!saved || canonical(saved.handoff ?? null) !== canonical(handoff) || !Array.isArray(saved.confirmations)
-    || !saved.confirmations.every(item => item && typeof item.obligation === 'string' && isRef(item.source) && isRef(item.observation))
-    || saved.confirmations.length !== due.length || new Set(saved.confirmations.map(item => item.obligation)).size !== due.length
-    || saved.confirmations.some(item => !due.some(obligation => runtimeObligationId(obligation) === item.obligation)))) {
+  if (saved !== undefined && !retainedReadiness(saved, handoff, due, true)) {
     findings.push({ code: 'obligation_handoff_invalid', target: 'R3', message: 'R3 must preserve the complete R2 handoff and one exact confirmation per due obligation' });
     return { findings, guards, admissionGuards, dependencies, value: { handoff, confirmations } };
   }
   const counter = due.length ? store.get(`project-dispatch:${hashJson(project)}`) : null, dispatch = counter ? reference(counter) : null;
-  for (const obligation of due) {
-    const pinned = saved?.confirmations.find(item => item.obligation === runtimeObligationId(obligation));
+  return resolvedReadiness(handoff, due, (obligation, address) => {
+    const pinned = saved?.confirmations.find(item => item.obligation === address);
     const sources = saved !== undefined ? pinned && isRef(pinned.source) ? [pinned.source] : []
       : store.list<Source>('source').filter(source => source.value.projectId === project && source.value.provenance?.kind === 'runtime-observation')
         .sort((a, b) => {
@@ -131,13 +164,42 @@ export function readinessObligations(store: Store, project: string, inputs: Ref[
         }).map(reference);
     const found = sources.map(source => confirmation(store, project, obligation, source, dispatch)).find(Boolean);
     if (!found || !confirmationIsCurrent(store, found) || pinned && canonical(pinned) !== canonical(found.proof)) {
-      findings.push({ code: obligation.kind === 'environment-confirmation' ? 'environment_confirmation_required' : 'obligation_resolution_required',
-        target: obligation.obligation, message: `Before R3: ${obligation.returnCondition}. Exact current confirmation is missing, failed or not declared as certifying this condition.` });
-      continue;
+      return null;
     }
-    confirmations.push(found.proof); guards.push(...found.guards); dependencies.push(...found.dependencies);
-    admissionGuards.push(...found.admissionGuards);
+    return found;
+  });
+}
+
+/** Reconstruct the readiness retained by an OM producer from immutable records.
+ * A missing retained confirmation yields the ordinary finding; it does not
+ * claim that no other successful observation existed. This is not admission:
+ * current guards, heads, runtime configuration and files are never consulted. */
+export function readReadinessObligations(store: Store, project: string, inputs: Ref[], saved: ReadinessObligations): ReadinessResult {
+  const invalid = (message: string): never => { throw new EngineError('obligation_handoff_invalid', message, { target: 'R3' }); };
+  if (!(store instanceof Store) || typeof project !== 'string' || !project.trim()
+    || !Array.isArray(inputs) || !Array.from(inputs).every(isRef)
+    || !saved || typeof saved !== 'object' || Array.isArray(saved)
+    || !saved.handoff || typeof saved.handoff !== 'object' || Array.isArray(saved.handoff)
+    || !Array.isArray(saved.confirmations) || !Array.from(saved.confirmations).every(proof => proof && typeof proof === 'object'
+      && !Array.isArray(proof) && typeof proof.obligation === 'string' && proof.obligation.length > 0
+      && isRef(proof.source) && isRef(proof.observation)))
+    return invalid('Historical readiness requires a Store, project, exact inputs and explicit saved handoff and confirmations');
+  try {
+    const { handoff, due } = readinessBasis(store, project, inputs);
+    if (!handoff || !('producer' in handoff)) return invalid('Historical OM readiness requires its exact producer and complete ledger');
+    if (!retainedReadiness(saved, handoff, due, false))
+      return invalid('Historical readiness must retain its exact handoff and distinct addressed confirmations');
+    return resolvedReadiness(handoff, due, (obligation, address) => {
+      const proof = saved.confirmations.find(item => item.obligation === address);
+      if (!proof) return null;
+      if (canonical(proof) !== canonical({ obligation: address, source: proof.source, observation: proof.observation })
+        || !frozenObligationConfirmation(store, project, obligation, proof))
+        return invalid('A retained R3 confirmation must prove this exact assignment, observation and produced Source');
+      return { proof, guards: [], admissionGuards: [], dependencies: uniqueRefs([proof.source, proof.observation,
+        obligation.runtimeCheck!.script, ...obligation.runtimeCheck!.dependencies]) };
+    });
+  } catch (error) {
+    if (!(error instanceof EngineError) || error.code === 'obligation_handoff_invalid') throw error;
+    return invalid(error.message);
   }
-  return { findings, guards: uniqueRefs(guards), admissionGuards: uniqueTransactionGuards(admissionGuards),
-    dependencies: uniqueRefs(dependencies), value: { handoff, confirmations } };
 }

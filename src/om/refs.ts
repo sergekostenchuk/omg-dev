@@ -1,7 +1,8 @@
 import type { Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { isRef, type Ref } from "../pipeline/contracts.js";
-import type { Revision, Store, Write } from "../storage/store.js";
+import { isRef } from "../pipeline/contracts.js";
+import type { Revision, Store, TransactionGuard, Write } from "../storage/store.js";
+import { transactionGuardsCurrent, uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
 
 // Every refusal this unit can produce. The list is the checklist its test walks, so a new code cannot arrive untested.
@@ -33,7 +34,7 @@ export interface GuardedWrite {
   readonly unit: string;
   readonly target: string;
   readonly writes: readonly Write[];
-  readonly guards: readonly Ref[];
+  readonly guards: readonly TransactionGuard[];
 }
 
 /**
@@ -79,7 +80,7 @@ export function readRecord<T = Json>(store: Store, reference: unknown, request: 
 }
 
 /**
- * Writes one transaction guarded by exact references.
+ * Writes one transaction guarded by exact references or record absence.
  * The guards are checked by the store inside the same transaction, so there is no window between check and write (T7);
  * its input_stale and revision_conflict become addressed refusals instead of an exception without an address.
  */
@@ -100,20 +101,28 @@ export function writeGuarded<T = Json>(store: Store, request: GuardedWrite): OmR
   for (const write of request.writes) requireWriteShape(write);
   const subject = request.writes[0]!.id;
   for (const guard of request.guards) {
-    if (!isRef(guard)) {
+    if (isPlainObject(guard) && "absent" in guard) {
+      try { uniqueTransactionGuards([guard]); }
+      catch (error) {
+        if (!(error instanceof EngineError) || error.code !== "invalid_guard") throw error;
+        return refused("reference_invalid", "An absent guard needs an ID and only absent: true",
+          { unit, target: subject, field: isText(guard.id) ? "absent" : "id" }, "producer");
+      }
+    } else if (!isRef(guard)) {
       return refused("reference_invalid", "A guard is an exact {id, revision, hash} reference",
         { unit, target: subject, field: referenceField(guard) }, "producer");
     }
   }
+  const guards = uniqueTransactionGuards(request.guards);
   try {
-    return delivered(store.writeMany<T>([...request.writes], [...request.guards]));
+    return delivered(store.writeMany<T>([...request.writes], guards));
   } catch (error) {
     if (!(error instanceof EngineError)) throw error;
     if (error.code === "input_stale") {
       // Revisions only grow and never change, so the guard that failed inside the transaction still fails here.
       const stale = staleGuard(store, request.guards);
       return refused("input_stale", "A guarded input changed before this transaction could commit",
-        { unit, target: stale?.id ?? subject, ref: stale ?? undefined }, "producer");
+        { unit, target: stale?.id ?? subject, ref: stale && !("absent" in stale) ? stale : undefined }, "producer");
     }
     if (error.code === "revision_conflict") {
       return refused("revision_conflict", "The written record is no longer at the expected revision",
@@ -156,10 +165,9 @@ function referenceField(value: unknown): string {
   return "reference";
 }
 
-function staleGuard(store: Store, guards: readonly Ref[]): Ref | null {
+function staleGuard(store: Store, guards: readonly TransactionGuard[]): TransactionGuard | null {
   for (const guard of guards) {
-    const current = store.get(guard.id);
-    if (!current || current.revision !== guard.revision || current.hash !== guard.hash) return guard;
+    if (!transactionGuardsCurrent(store, [guard])) return guard;
   }
   return null;
 }

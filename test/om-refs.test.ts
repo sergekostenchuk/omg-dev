@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/storage/store.js";
+import { Store, type TransactionGuard } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson } from "../src/canonical.js";
-import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, refused, sealed, type OmResult, type Refusal, type RefusalAddress, type RefusalRoute } from "../src/om/refusal.js";
 import { readRecord, writeGuarded, REFS_REFUSAL_CODES, type GuardedWrite, type RecordRequest } from "../src/om/refs.js";
 
@@ -427,4 +427,158 @@ test("every exported function refuses a missing, null or mistyped argument as a 
   assert.throws(() => sealed({ field: undefined }), code("unsealable_value"));
   assert.throws(() => sealed({ nested: { call: () => 1 } }), code("unsealable_value"));
   assert.throws(() => sealed([undefined]), code("unsealable_value"));
+});
+
+test("writeGuarded accepts explicit absence beside a positive guard without creating a fictitious input", t => {
+  const { store } = fixture(t);
+  const base = store.write({ id: "om-input:alpha", kind: "om-input", expected: 0, value: { claim: "x" } });
+  const absent = { id: "reader-pilot:alpha", absent: true } as const;
+  const guards = [reference(base), absent];
+  const before = canonical(guards);
+  const written = deliveredOf(writeGuarded(store, {
+    unit: UNIT, target: "answers:alpha", guards,
+    writes: [
+      { id: "om-answers:alpha", kind: "om-answers", expected: 0, value: { from: reference(base) } },
+      { id: "om-gaps:alpha", kind: "om-gaps", expected: 0, value: {} },
+    ],
+  }));
+  assert.equal(written.length, 2);
+  assert.equal(store.get(absent.id), null);
+  assert.equal(canonical(guards), before);
+  assert.equal(isRef(absent), false);
+  const invalid = addressed(refusalOf(readRecord(store, absent,
+    { unit: UNIT, target: absent.id, kind: "reader-pilot", id: absent.id })), "reference_invalid");
+  assert.equal(invalid.at.field, "revision");
+  assert.deepEqual(store.get("om-answers:alpha")!.value, { from: reference(base) });
+});
+
+test("writeGuarded carries absence into the native transaction when a second Store creates the input at write time", t => {
+  const { store, path } = fixture(t);
+  const absent = { id: "reader-pilot:alpha", absent: true } as const;
+  assert.equal(store.get(absent.id), null);
+  const second = new Store(path);
+  t.after(() => second.close());
+  const native = store.writeMany.bind(store);
+  let transactions = 0;
+  store.writeMany = ((writes, guards) => {
+    transactions++;
+    assert.deepEqual(guards, [absent]);
+    second.write({ id: absent.id, kind: "reader-pilot", expected: 0, value: { configured: true } });
+    return native(writes, guards);
+  }) as typeof store.writeMany;
+  const refused = addressed(refusalOf(writeGuarded(store, {
+    unit: UNIT, target: "answers:alpha", guards: [absent],
+    writes: [
+      { id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} },
+      { id: "om-gaps:alpha", kind: "om-gaps", expected: 0, value: {} },
+    ],
+  })), "input_stale");
+  assert.equal(transactions, 1);
+  assert.equal(refused.at.target, absent.id);
+  assert.equal(Object.hasOwn(refused.at, "ref"), false);
+  assert.equal(store.get("om-answers:alpha"), null);
+  assert.equal(store.get("om-gaps:alpha"), null);
+  assert.equal(store.history(absent.id).length, 1);
+});
+
+test("writeGuarded rejects an already present negative dependency without placing absence in at.ref", t => {
+  const { store } = fixture(t);
+  const root = store.write({ id: "execution-root:alpha", kind: "execution-root", expected: 0, value: { state: "ready" } });
+  const refusal = addressed(refusalOf(writeGuarded(store, {
+    unit: UNIT, target: "answers:alpha", guards: [{ id: root.id, absent: true }],
+    writes: [{ id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} }],
+  })), "input_stale");
+  assert.deepEqual(refusal.at, { unit: UNIT, target: root.id });
+  assert.equal(store.get("om-answers:alpha"), null);
+  assert.deepEqual(store.get(root.id), root);
+});
+
+test("writeGuarded checks absence in the original state and may create that same ID with expected zero", t => {
+  const { store } = fixture(t);
+  const id = "om-input:alpha";
+  const written = deliveredOf(writeGuarded(store, {
+    unit: UNIT, target: id, guards: [{ id, absent: true }],
+    writes: [
+      { id, kind: "om-input", expected: 0, value: { claim: "new" } },
+      { id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} },
+    ],
+  }));
+  assert.deepEqual(written.map(record => [record.id, record.revision]), [[id, 1], ["om-answers:alpha", 1]]);
+  assert.equal(store.history(id).length, 1);
+});
+
+for (const existing of [false, true]) for (const reverse of [false, true]) {
+  test(`writeGuarded preserves contradictory absence and revision in both orders (existing=${existing}, reverse=${reverse})`, t => {
+    const { store } = fixture(t);
+    const id = "om-input:alpha", value = { claim: "x" };
+    const positive = { id, revision: 1, hash: hashJson(value) };
+    const negative = { id, absent: true } as const;
+    if (existing) store.write({ id, kind: "om-input", expected: 0, value });
+    const guards: TransactionGuard[] = reverse ? [positive, negative] : [negative, positive];
+    const native = store.writeMany.bind(store);
+    let transactions = 0;
+    store.writeMany = ((writes, captured) => {
+      transactions++;
+      assert.equal(captured!.length, 2);
+      assert.ok(captured!.some(guard => canonical(guard) === canonical(positive)));
+      assert.ok(captured!.some(guard => canonical(guard) === canonical(negative)));
+      return native(writes, captured);
+    }) as typeof store.writeMany;
+    const refusal = addressed(refusalOf(writeGuarded(store, {
+      unit: UNIT, target: "answers:alpha", guards: [...guards, ...guards],
+      writes: [
+        { id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} },
+        { id: "om-gaps:alpha", kind: "om-gaps", expected: 0, value: {} },
+      ],
+    })), "input_stale");
+    assert.equal(transactions, 1);
+    assert.equal(refusal.at.target, id);
+    if (existing) assert.equal(Object.hasOwn(refusal.at, "ref"), false);
+    else assert.deepEqual(refusal.at.ref, positive);
+    assert.equal(store.get("om-answers:alpha"), null);
+    assert.equal(store.get("om-gaps:alpha"), null);
+  });
+}
+
+test("writeGuarded rejects malformed absence and mixed guard forms before entering the Store", t => {
+  const { store } = fixture(t);
+  const id = "om-input:alpha", hash = hashJson({ claim: "x" });
+  const cases: [unknown, string][] = [
+    [{ absent: true }, "id"], [{ id: "", absent: true }, "id"], [{ id: 7, absent: true }, "id"],
+    ...[undefined, null, false, 1, "true"].map(absent => [{ id, absent }, "absent"] as [unknown, string]),
+    [{ id, absent: true, revision: 1 }, "absent"], [{ id, absent: true, hash }, "absent"],
+    [{ id, absent: true, revision: 1, hash }, "absent"],
+    [{ id, absent: true, revision: undefined }, "absent"], [{ id, absent: true, hash: undefined }, "absent"],
+    [{ id, absent: false, revision: 1, hash }, "absent"],
+  ];
+  store.writeMany = (() => { assert.fail("a malformed guard must not reach the Store"); }) as typeof store.writeMany;
+  for (const [guard, field] of cases) {
+    const refusal = addressed(refusalOf(writeGuarded(store, {
+      unit: UNIT, target: "answers:alpha", guards: [guard] as TransactionGuard[],
+      writes: [{ id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} }],
+    })), "reference_invalid");
+    assert.deepEqual(refusal.at, { unit: UNIT, target: "om-answers:alpha", field });
+  }
+  assert.equal(store.get("om-answers:alpha"), null);
+});
+
+test("writeGuarded keeps the previous malformed Ref refusal fields while accepting the new guard channel", t => {
+  const { store } = fixture(t);
+  const id = "om-input:alpha", hash = hashJson({ claim: "x" });
+  const cases: [unknown, string][] = [
+    [undefined, "reference"], [null, "reference"], [7, "reference"], ["ref", "reference"],
+    [{}, "id"], [{ id: "", revision: 1, hash }, "id"], [{ revision: 1, hash }, "id"],
+    [{ id, hash }, "revision"], [{ id, revision: 0, hash }, "revision"], [{ id, revision: 1.5, hash }, "revision"],
+    [{ id, revision: "1", hash }, "revision"], [{ id, revision: 1 }, "hash"],
+    [{ id, revision: 1, hash: "bad" }, "hash"], [{ id, revision: 1, hash: "A".repeat(64) }, "hash"],
+  ];
+  store.writeMany = (() => { assert.fail("a malformed Ref must not reach the Store"); }) as typeof store.writeMany;
+  for (const [guard, field] of cases) {
+    const refusal = addressed(refusalOf(writeGuarded(store, {
+      unit: UNIT, target: "answers:alpha", guards: [guard] as TransactionGuard[],
+      writes: [{ id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} }],
+    })), "reference_invalid");
+    assert.deepEqual(refusal.at, { unit: UNIT, target: "om-answers:alpha", field });
+  }
+  assert.equal(store.get("om-answers:alpha"), null);
 });
