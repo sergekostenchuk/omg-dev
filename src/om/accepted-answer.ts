@@ -12,7 +12,7 @@ import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
-import { readSeries, type RepairSeries, type AttemptGoal } from './series.js';
+import { readSeries, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
 
@@ -545,16 +545,19 @@ function deriveAnswerHistory(store: Store, request: AnswerRequest, era: GroundsE
     assessment.value.environment, ...grounds.map(item => item.observation.source), ...(attempt ? [attempt.series] : [])]);
   return { value, references, guards, question: q.record as Revision<Mc1QuestionRecord>, gap: context.gap, attempt };
 }
-function deriveAnswer(store: Store, request: AnswerRequest, current: boolean, era: GroundsEra = ANSWER_GROUNDS_ERA) {
+function deriveAnswer(store: Store, request: AnswerRequest, current: boolean, era: GroundsEra = ANSWER_GROUNDS_ERA,
+  currentAttempt = true) {
   const historical = historicalRead(store, { reader: 'D5.answer-sources', project: request.project, ref: request.answer,
     parameters: { request, era } as unknown as Json }, () => copy(deriveAnswerHistory(store, request, era)),
   () => fail('answer_unconfirmed', request.answer.id, 'history', 'The accepted answer has cyclic historical sources'));
   if (!current) return historical;
   const question = loadMc1Question(store, { project: request.project, record: request.question });
   const context = currentQuestionContext(store, question.record.value.request, question.context);
-  for (const guard of historical.guards) head(store, guard);
+  // Reusing an exact accepted fact does not assign a new result to its historical attempt.
+  const guards = historical.guards.filter(ref => currentAttempt || !request.attempt || !same(ref, request.attempt.series));
+  for (const guard of guards) head(store, guard);
   for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, era);
-  return { ...historical, guards: unique([...historical.guards, ...context.guards]) };
+  return { ...historical, guards: unique([...guards, ...context.guards]) };
 }
 function predicted(value: AcceptedAnswerRecord): Revision<AcceptedAnswerRecord> {
   return { id: `${acceptedAnswerNamespace(value.project)}${hashJson(value.groundsEra === undefined ? value.request : { request: value.request, groundsEra: value.groundsEra })}`, kind: ACCEPTED_ANSWER_KIND,
@@ -671,11 +674,13 @@ export function prepareAnswerSearch(store: Store, request: { project: string; ta
 export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<PreparedAnswer>> {
   requireStore(store); requireAnswer(request); request = copy(request);
   return result(() => {
-    const checked = deriveAnswer(store, request, true), record = predicted(checked.value), old = store.get(record.id);
+    const history = deriveAnswer(store, request, false), record = predicted(history.value), old = store.get(record.id);
     check(!old || same(old, record), 'answer_record_invalid', record.id, 'record', 'A fact acceptance cannot be overwritten under the same source request');
+    const checked = deriveAnswer(store, request, true, ANSWER_GROUNDS_ERA, !old);
+    const admission = !old && request.attempt ? take(prepareSeriesLineAdmission(store, request.project, request.attempt.series)).guards : [];
     const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
     const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target, field: checked.gap.field, pending: old ? [] : [write] }));
-    return { record, writes: search.writes as Write[], guards: unique([...checked.guards, ...search.guards]), references: unique([...checked.references, ...search.references]),
+    return { record, writes: search.writes as Write[], guards: unique([...checked.guards, ...admission, ...search.guards]), references: unique([...checked.references, ...search.references]),
       closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record), acceptance: null, attempt: request.attempt,
         answer: old ? { record: reference(record) } : { pending: write } } };
   });
@@ -1024,7 +1029,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       const sources = currentAnswerSources(view.store, request.project, checked);
       check(sources.applicable, 'answer_inapplicable', request.target, 'closure.sources', 'The applied fact no longer describes its current evidence');
       guards.push(...sources.guards.filter(ref => !view.writes.length || ref.id !== view.ref.id));
-      if (checked.attempt) { head(store, checked.attempt.series); guards.push(checked.attempt.series); }
+      if (checked.attempt) guards.push(...take(prepareSeriesLineAdmission(store, request.project, checked.attempt.series)).guards);
       if (!view.writes.length) guards.push(view.ref);
       else {
         const acceptance = deriveAnswer(view.store, checked.record.value.request, false, checked.record.value.groundsEra ?? 'legacy');

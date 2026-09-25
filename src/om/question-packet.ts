@@ -20,7 +20,7 @@ import { readCapacity } from './capacity.js';
 import { prepareRoutes, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
-import { readSeries, readAnySeriesAt, readMechanismAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
+import { readSeries, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
@@ -229,7 +229,10 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
       fail('packet_attempt_invalid', item.target, 'attempt.goal',
         'The declared attempt must name this result at its exact gap-line address and belong to its consumer', item.record);
   }
-  if (current) { head(store, ref); guards.push(ref); }
+  if (current) {
+    if (mechanism) { head(store, ref); guards.push(ref); }
+    else guards.push(...take(prepareSeriesLineAdmission(store, request.project, ref)).guards);
+  }
   references.push(ref);
   // A3 owns goal identity. E2 only carries refusals from the preceding attempt of that same declared goal.
   const prior = [...checked.value.inherited, ...checked.value.attempts].filter(item => item.ordinal < attempt.ordinal

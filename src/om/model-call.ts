@@ -634,7 +634,8 @@ import { runProcess } from '../runtime/process.js';
 import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyRecordCallRequest, type DispatchContract, type CallHistory } from './call-record.js';
 import { prepareQuestionPacket, preparePartResult, partResponseId,
   PART_RESPONSE_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
-import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, type CompletionReason } from './series.js';
+import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, prepareSeriesLineAdmission,
+  readSeriesWorkAdmission, readSeriesAdmissionChange, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
 import { prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
 import { prepareAddressing, deriveInputDecisions } from './addressing.js';
 import { readOmInput, type OmInputRecord } from './input.js';
@@ -659,7 +660,15 @@ export type ModelCallState =
   | { state: 'applied' | 'application-refused' | 'recovered'; outcome: ModelCallOutcome };
 export interface OmModelCall extends ModelCall {
   om: { version: 'om-model-call/v1'; application: ModelApplicationState; request: ModelCallRequest; call: Ref; exchange: Ref | null;
-    part: { proposal: Ref; result: Ref } | null; diagnostic: Ref | null; input: Ref | null; failure: Refusal | null; rejection: Ref | null; completion?: Ref | null };
+    part: { proposal: Ref; result: Ref } | null; diagnostic: Ref | null; input: Ref | null; failure: Refusal | null; rejection: Ref | null; completion?: Ref | null;
+    admission?: ModelWorkAdmission; terminal?: ModelTerminalWitness };
+}
+export interface ModelWorkAdmission {
+  contract: 'om-model-admission/v1'; series: Ref; pointer: Ref | null;
+}
+export interface ModelTerminalWitness {
+  contract: 'om-model-terminal/v1'; source: Ref; call: Ref; series: Ref; attempt: number; goal: AttemptGoal;
+  admission: ModelWorkAdmission; change: SeriesAdmissionChange; reason: 'interrupted';
 }
 export interface FinishModelAttemptRequest {
   project: string; packet: Ref; call: Ref; response: Ref | null; code: string; message: string;
@@ -734,6 +743,82 @@ function modelAssignment(store: Store, request: ModelCallRequest) {
     : { ...common, block: series.value.block, gaps: assignedItems.flatMap(item => item.consumers.map(consumer =>
       ({ id: item.target, goal: item.target, field: item.field, consumer }))) };
   return { packet, payload, environment, binding, wire, series, admission };
+}
+function modelWorkAdmission(store: Store, record: Revision<OmModelCall>, series: Ref): ModelWorkAdmission {
+  if (!object(record.value) || !object(record.value.om) || record.value.om.version !== 'om-model-call/v1')
+    fail('model_call_record_invalid', record.id, 'admission', 'An original admission belongs to a complete E4 runtime record');
+  const saved = record.value.om.admission;
+  if (saved !== undefined && (!object(saved) || !exactKeys(saved, ['contract', 'series', 'pointer'])
+    || saved.contract !== 'om-model-admission/v1' || !isRef(saved.series) || !same(saved.series, series)
+    || !(saved.pointer === null || isRef(saved.pointer))))
+    fail('model_call_record_invalid', record.id, 'admission', 'The physical call retains its exact original series admission');
+  const admission: ModelWorkAdmission = saved ?? { contract: 'om-model-admission/v1', series, pointer: null };
+  // A missing field is legacy only when the exact source series proves that era.
+  take(readSeriesWorkAdmission(store, { project: record.value.projectId, series, pointer: admission.pointer }));
+  return admission;
+}
+function prepareModelTerminalWitness(store: Store, source: Revision<OmModelCall>) {
+  const call = take(readCall(store, source.value.projectId, source.value.om.call));
+  const admission = modelWorkAdmission(store, source, call.value.series);
+  const changed = readSeriesAdmissionChange(store, { project: source.value.projectId,
+    series: admission.series, pointer: admission.pointer });
+  if (!changed.ok) return null;
+  return { witness: { contract: 'om-model-terminal/v1', source: reference(source), call: source.value.om.call,
+    series: call.value.series, attempt: call.value.attempt, goal: call.value.goal, admission,
+    change: changed.value.proof, reason: 'interrupted' } as ModelTerminalWitness, guards: changed.value.guards };
+}
+/** This proof ends at the physical outcome, before any later explicit A3 completion. */
+function modelTerminalBasis(store: Store, project: string, witness: ModelTerminalWitness) {
+  if (!object(witness) || !exactKeys(witness, ['contract', 'source', 'call', 'series', 'attempt', 'goal', 'admission', 'change', 'reason'])
+    || witness.contract !== 'om-model-terminal/v1' || ![witness.source, witness.call, witness.series].every(isRef)
+    || !Number.isSafeInteger(witness.attempt) || witness.attempt < 1 || witness.reason !== 'interrupted'
+    || !object(witness.change) || !exactKeys(witness.change, ['contract', 'project', 'series', 'pointer', 'applied', 'currentPointer'])
+    || witness.change.contract !== 'series-admission-change/v1' || witness.change.project !== project
+    || ![witness.change.series, witness.change.applied, witness.change.currentPointer].every(isRef)
+    || !(witness.change.pointer === null || isRef(witness.change.pointer)))
+    fail('model_call_record_invalid', project, 'terminal', 'A terminal outcome requires its complete versioned admission-change witness');
+  const source = take(readModelCallPhysical(store, { project, record: witness.source }));
+  if (!['running', 'received'].includes(source.record.value.om.application))
+    fail('model_call_record_invalid', witness.source.id, 'terminal', 'A terminal witness starts at a running claim or saved receipt');
+  const call = take(readCall(store, project, witness.call));
+  const admission = modelWorkAdmission(store, source.record as Revision<OmModelCall>, call.value.series);
+  if (!same(source.call, witness.call) || !same(call.value.series, witness.series) || call.value.attempt !== witness.attempt
+    || !same(call.value.goal, witness.goal) || !same(admission, witness.admission)
+    || !same(witness.change.series, witness.series) || !same(witness.change.pointer, admission.pointer))
+    fail('model_call_record_invalid', witness.source.id, 'terminal', 'Terminal evidence belongs to this exact call, attempt, goal and admission era');
+  const changed = take(readSeriesAdmissionChange(store, { project, series: witness.series,
+    pointer: admission.pointer, currentPointer: witness.change.currentPointer }));
+  if (!same(changed.proof, witness.change))
+    fail('model_call_record_invalid', witness.source.id, 'terminal', 'Only the applied A3 change can end the saved admission');
+  return { source: source.record as Revision<OmModelCall>, references: refs([witness.source, witness.call, witness.series, ...changed.references]) };
+}
+function checkModelTerminal(store: Store, record: Revision<OmModelCall>): void {
+  if (!Object.hasOwn(record.value.om, 'terminal')) return;
+  const witness = record.value.om.terminal!;
+  const checked = modelTerminalBasis(store, record.value.projectId, witness), source = checked.source;
+  const application = record.value.om.application;
+  if (!['application-refused', 'recovered'].includes(application) || source.id !== record.id || source.revision >= record.revision
+    || !same(source.value.om.request, record.value.om.request) || !same(source.value.om.call, record.value.om.call)
+    || !same(source.value.om.admission ?? null, record.value.om.admission ?? null)
+    || record.value.om.diagnostic !== null || record.value.om.completion !== null
+    || application === 'application-refused' && (source.value.om.application !== 'received'
+      || !same(source.value.om.exchange, record.value.om.exchange))
+    || application === 'recovered' && source.value.om.application !== 'running')
+    fail('model_call_record_invalid', record.id, 'terminal', 'The terminal witness retains the exact preceding physical outcome without completing A3');
+}
+export function readModelTerminalWitness(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
+  series: Ref; attempt: number; goal: AttemptGoal; reason: 'interrupted'; call: Ref; change: SeriesAdmissionChange; references: Ref[];
+}>> {
+  return result(() => {
+    const state = take(readModelCallState(store, request));
+    if (state.state !== 'application-refused' && state.state !== 'recovered')
+      fail('model_call_record_invalid', request.record.id, 'terminal', 'Only a proved terminal physical outcome can authorize explicit completion');
+    const witness = state.outcome.record.value.om.terminal;
+    if (!witness) fail('model_call_record_invalid', request.record.id, 'terminal', 'The terminal admission-change witness is required');
+    const checked = modelTerminalBasis(store, request.project, witness as ModelTerminalWitness);
+    return { series: witness.series, attempt: witness.attempt, goal: witness.goal, reason: witness.reason,
+      call: witness.call, change: witness.change, references: refs([request.record, ...checked.references]) };
+  });
 }
 function requireFinish(store: Store, request: unknown): asserts request is FinishModelAttemptRequest {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.packet) || !isRef(request.call)
@@ -846,11 +931,58 @@ function requireRunningModelCall(record: Revision<OmModelCall>): void {
   const value = record.value;
   if (value.om.exchange !== null || value.om.part !== null
     || value.om.input !== null || value.om.diagnostic !== null || value.om.failure !== null || value.om.rejection !== null
-    || Object.hasOwn(value.om, 'completion'))
+    || Object.hasOwn(value.om, 'completion') || Object.hasOwn(value.om, 'terminal'))
     fail('model_call_record_invalid', record.id, 'application', 'A running dispatch has no received or applied evidence');
 }
 
-/** Exact E4 provenance and physical usage, independent of subsequent product application. */
+/** Both readers require the original completion unless the checked terminal witness ends admission.
+ * This check uses the saved outcome's producers, never the subject reader of the same runtime. */
+function checkModelCompletion(store: Store, record: Revision<OmModelCall>, source: { incident: Ref } | { transport: AdapterResult }): void {
+  const value = record.value, project = value.projectId;
+  if ('incident' in source) {
+    if (value.om.terminal) return;
+    if (value.om.completion) {
+      const admitted = take(readCall(store, project, value.om.call));
+      const completed = take(readAnySeriesAt(store, project, value.om.completion));
+      const attempt = completed.value.attempts.find(item => item.ordinal === admitted.value.attempt);
+      if (completed.id !== admitted.value.series.id || !attempt?.outcome || !same(attempt.goal, admitted.value.goal)
+        || value.om.diagnostic !== null)
+        fail('model_call_record_invalid', record.id, 'completion', 'Recovery preserves the exact already completed attempt');
+    } else {
+      if (!isRef(value.om.diagnostic))
+        fail('model_call_record_invalid', record.id, 'diagnostic', 'Recovery without a terminal witness retains its original completion diagnostic');
+      const finish = recoveryFinish(store, record, source.incident);
+      if (finish.writes.length || !same(value.om.diagnostic, finish.diagnostic))
+        fail('model_call_record_invalid', record.id, 'diagnostic', 'Physical loss completes A3 once through its shared transition');
+    }
+    return;
+  }
+  if (!isRef(value.om.rejection) || !isRef(value.om.exchange))
+    fail('model_call_record_invalid', record.id, 'rejection', 'Application rejection needs exact retained source heads and exchange');
+  const rejected = take(readModelApplicationRejection(store, { project, record: value.om.rejection }));
+  const transport = source.transport;
+  if (!same(rejected.record.value.packet, value.om.request.packet) || !same(rejected.record.value.call, value.om.call)
+    || !same(rejected.record.value.exchange, value.om.exchange) || !same(value.om.failure, rejected.failure)
+    || value.status !== 'failed' || value.error !== rejected.failure.code || value.om.part !== null || value.om.input !== null
+    || !same(value.om.terminal ?? null, rejected.record.value.terminal ?? null)
+    || !same(value.response, transport.kind === 'answered'
+      ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null))
+    fail('model_call_record_invalid', record.id, 'rejection', 'A rejected application retains its original transport and checked failing source window');
+  if (!rejected.record.value.terminal && rejected.record.value.completion) {
+    if (value.om.diagnostic !== null)
+      fail('model_call_record_invalid', record.id, 'diagnostic', 'An already completed attempt is preserved, not completed again');
+  } else if (!rejected.record.value.terminal) {
+    if (!isRef(value.om.diagnostic))
+      fail('model_call_record_invalid', record.id, 'diagnostic', 'Rejection without a terminal witness retains its original completion diagnostic');
+    const finish = prepareModelFinish(store, { project, packet: value.om.request.packet, call: value.om.call,
+      response: null, code: rejected.failure.code, message: rejected.failure.message, reason: 'interrupted',
+      evidence: [value.om.exchange, value.om.rejection] });
+    if (finish.writes.length || !same(finish.diagnostic, value.om.diagnostic))
+      fail('model_call_record_invalid', record.id, 'diagnostic', 'A rejected application completes its attempt exactly once');
+  }
+}
+
+/** Exact E4 provenance and physical usage, including the original terminal completion contract. */
 export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallPhysical>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('record');
@@ -875,6 +1007,8 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
       || !same(admitted.value.goal, assignment.admission.goal) || admitted.value.purpose !== assignment.admission.purpose
       || !same(admitted.value.gaps, [...assignment.admission.gaps].sort(compareJson)))
       fail('model_call_record_invalid', record.id, 'call', 'The runtime call must reproduce its E1 admission');
+    modelWorkAdmission(store, record as Revision<OmModelCall>, admitted.value.series);
+    checkModelTerminal(store, record as Revision<OmModelCall>);
     if (value.om.application === 'running') {
       requireRunningModelCall(record as Revision<OmModelCall>);
       return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport: null };
@@ -888,8 +1022,11 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
         || !(value.om.completion === null || isRef(value.om.completion)))
         fail('model_call_record_invalid', record.id, 'recovery', 'Recovery retains the original unreceived E4 assignment');
       requireRunningModelCall(recovery.original as Revision<OmModelCall>);
+      if (value.om.terminal && !same(value.om.terminal.source, reference(recovery.original)))
+        fail('model_call_record_invalid', record.id, 'terminal', 'Recovery witness must name the exact lost physical claim');
       if (!Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
         fail('model_call_record_invalid', record.id, 'recovery', 'Physical recovery retains a valid completion time');
+      checkModelCompletion(store, record as Revision<OmModelCall>, { incident: reference(recovery.incident) });
       return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport: null };
     }
     if (!isRef(value.om.exchange)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed runtime call needs immutable transport evidence');
@@ -919,11 +1056,13 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
         || !same(value.response, transport.kind === 'answered'
           ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null)
         || value.om.part !== null || value.om.input !== null || value.om.diagnostic !== null
-        || value.om.failure !== null || value.om.rejection !== null)
+        || value.om.failure !== null || value.om.rejection !== null || Object.hasOwn(value.om, 'terminal'))
         fail('model_call_record_invalid', record.id, 'receipt', 'A physical receipt is derived solely from its immutable original exchange');
     } else if (!['applied', 'application-refused'].includes(value.om.application)
       || (value.om.application === 'application-refused') !== (value.om.rejection !== null))
       fail('model_call_record_invalid', record.id, 'application', 'Terminal application states distinguish a product result from a proved refusal');
+    if (value.om.application === 'application-refused')
+      checkModelCompletion(store, record as Revision<OmModelCall>, { transport });
     return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport };
   });
 }
@@ -935,19 +1074,6 @@ export function readModelCallState(store: Store, request: { project: string; rec
     const record = physical.record as Revision<OmModelCall>, value = record.value;
     if (value.om.application === 'running') return { state: 'running', record };
     if (value.om.application === 'recovered') {
-      const recovery = readModelCallRecovery(store, request.project, request.record);
-      if (value.om.completion) {
-        const admitted = take(readCall(store, request.project, value.om.call));
-        const completed = take(readAnySeriesAt(store, request.project, value.om.completion));
-        const attempt = completed.value.attempts.find(item => item.ordinal === admitted.value.attempt);
-        if (completed.id !== admitted.value.series.id || !attempt?.outcome || !same(attempt.goal, admitted.value.goal)
-          || value.om.diagnostic !== null)
-          fail('model_call_record_invalid', record.id, 'completion', 'Recovery preserves the exact already completed attempt');
-      } else {
-        const finish = recoveryFinish(store, record, reference(recovery.incident));
-        if (finish.writes.length || !same(value.om.diagnostic, finish.diagnostic))
-          fail('model_call_record_invalid', record.id, 'diagnostic', 'Physical loss completes A3 once through its shared transition');
-      }
       return { state: 'recovered', outcome: { record, packet: value.om.request.packet,
         call: value.om.call, response: null, outcome: null, part: null, diagnostic: value.om.diagnostic, repeated: true } };
     }
@@ -960,24 +1086,6 @@ export function readModelCallState(store: Store, request: { project: string; rec
       return { state: 'received', record, exchange: exchange as Revision<ModelExchange>, transport };
     }
     if (value.om.rejection !== null) {
-      if (!isRef(value.om.rejection)) fail('model_call_record_invalid', record.id, 'rejection', 'Application rejection needs exact retained source heads');
-      const rejected = take(readModelApplicationRejection(store, { project: request.project, record: value.om.rejection }));
-      if (!same(rejected.record.value.packet, value.om.request.packet) || !same(rejected.record.value.call, value.om.call)
-        || !same(rejected.record.value.exchange, value.om.exchange) || !same(value.om.failure, rejected.failure)
-        || value.status !== 'failed' || value.error !== rejected.failure.code || value.om.part !== null || value.om.input !== null
-        || !same(value.response, transport.kind === 'answered'
-          ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null))
-        fail('model_call_record_invalid', record.id, 'rejection', 'A rejected application retains its original transport and checked failing source window');
-      if (rejected.record.value.completion) {
-        if (value.om.diagnostic !== null)
-          fail('model_call_record_invalid', record.id, 'diagnostic', 'An already completed attempt is preserved, not completed again');
-      } else {
-        const finish = prepareModelFinish(store, { project: request.project, packet: value.om.request.packet, call: value.om.call,
-          response: null, code: rejected.failure.code, message: rejected.failure.message, reason: 'interrupted',
-          evidence: [value.om.exchange, value.om.rejection] });
-        if (finish.writes.length || !same(finish.diagnostic, value.om.diagnostic))
-          fail('model_call_record_invalid', record.id, 'diagnostic', 'A rejected application completes its attempt exactly once');
-      }
       return { state: 'application-refused', outcome: { record: record as Revision<OmModelCall>, packet: value.om.request.packet, call: value.om.call,
         response: null, outcome: null, part: null, diagnostic: value.om.diagnostic, repeated: true } };
     }
@@ -1045,6 +1153,8 @@ function applyReceivedModelCall(store: Store, state: Extract<ModelCallState, { s
   const writes: Write[] = [], guards: Ref[] = refs([reference(receiptRecord), call, ...exchange.value.admissionGuards, request.packet]);
   try {
     const assignment = modelAssignment(store, request);
+    const admission = take(prepareSeriesLineAdmission(store, request.project, assignment.admission.series));
+    guards.push(...admission.guards);
     const prepared = take(prepareQuestionPacket(store, assignment.packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet))
       fail('model_call_request_invalid', request.packet.id, 'packet', 'Application retains its exact currently admitted assignment');
@@ -1137,10 +1247,11 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
         : state.outcome as ModelCallOutcome;
       return delivered(settleAppliedCall(store, outcome as ModelCallOutcome)) as OmResult<Sealed<ModelCallOutcome>>;
     }
+    const admission = take(prepareSeriesLineAdmission(store, request.project, assignment.admission.series));
     const prepared = take(prepareQuestionPacket(store, packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet)) fail('model_call_request_invalid', request.packet.id, 'packet', 'Dispatch uses exactly the currently admitted E2 packet');
     const guarded = new Proxy(store, { get(target, key) {
-      if (key === 'writeMany') return (writes: Write[], guards: Ref[] = []) => target.writeMany(writes, refs([...guards, ...prepared.guards, request.packet]));
+      if (key === 'writeMany') return (writes: Write[], guards: Ref[] = []) => target.writeMany(writes, refs([...guards, ...prepared.guards, ...admission.guards, request.packet]));
       const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
     } });
     const admitted = take(recordCall(guarded, request.project, assignment.admission));
@@ -1151,9 +1262,10 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
       requestId: wire.requestId, startedAt, finishedAt: null, status: 'running', requested: binding,
       confirmed: unknownConfirmed(), request: { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(payload), record: request.packet },
       response: null, usage: null, usageSource: 'unavailable', error: null,
-      om: { version: 'om-model-call/v1', application: 'running', request, call, exchange: null, part: null, diagnostic: null, input: null, failure: null, rejection: null } };
+      om: { version: 'om-model-call/v1', application: 'running', request, call, exchange: null, part: null, diagnostic: null, input: null, failure: null, rejection: null,
+        admission: { contract: 'om-model-admission/v1', series: assignment.admission.series, pointer: admission.pointer } } };
     const physical = await startPhysicalTransport(store, { project: request.project, call, packet: payload as Json, role: request.role },
-      { id, kind: 'model-call', expected: 0, value: running }, [...prepared.guards, request.packet], signal);
+      { id, kind: 'model-call', expected: 0, value: running }, [...prepared.guards, ...admission.guards, request.packet], signal);
     const runningRecord = physical.record as Revision<OmModelCall>;
     const exchange: ModelExchange = { project: request.project, request, call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError, admissionGuards: physical.guards };
@@ -1220,7 +1332,9 @@ function transportAssignment(store: Store, request: ModelTransportRequest, histo
 async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal,
   extraGuards: readonly TransactionGuard[] = []) {
   const assignment = transportAssignment(store, request), prepared = take(prepareCallDispatch(store, request.project, request.call));
-  const admissionGuards = refs([...guards, ...prepared.guards]);
+  const line = 'om' in (running.value as ModelCall)
+    ? take(prepareSeriesLineAdmission(store, request.project, assignment.call.value.series)) : null;
+  const admissionGuards = refs([...guards, ...prepared.guards, ...(line?.guards ?? [])]);
   const counterId = `project-dispatch:${hashJson(request.project)}`;
   const counter = store.get<{ projectId: string; serial: number }>(counterId);
   requireCondition(!counter || (counter.kind === 'project-dispatch' && object(counter.value)
@@ -1371,6 +1485,7 @@ function historicalApplicationBasis(store: Store, request: ModelCallRequest, cal
 
 interface ModelApplicationRejection {
   project: string; packet: Ref; call: Ref; exchange: Ref; guards: Ref[]; completion: Ref | null;
+  terminal?: ModelTerminalWitness;
   expectations: { id: string; expected: number }[]; heads: { id: string; head: Ref | null }[]; failure: Refusal;
   files: { source: Ref; observation: { kind: 'read'; bytes: string } | { kind: 'unavailable'; code: string } }[];
 }
@@ -1383,7 +1498,8 @@ export function readModelApplicationRejection(store: Store, request: { project: 
     const record = take(readRecord<ModelApplicationRejection>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `${APPLICATION_REJECTION_KIND}:${request.project}:`, kind: APPLICATION_REJECTION_KIND }));
     const value = record.value;
-    if (record.revision !== 1 || !object(value) || !exactKeys(value, ['project', 'packet', 'call', 'exchange', 'guards', 'expectations', 'heads', 'failure', 'files', 'completion'])
+    if (record.revision !== 1 || !object(value) || !exactKeys(value, ['project', 'packet', 'call', 'exchange', 'guards', 'expectations', 'heads', 'failure', 'files', 'completion',
+      ...(Object.hasOwn(value, 'terminal') ? ['terminal'] : [])])
       || value.project !== request.project || ![value.packet, value.call, value.exchange].every(isRef)
       || !(value.completion === null || isRef(value.completion))
       || !Array.isArray(value.guards) || !value.guards.every(isRef) || !Array.isArray(value.expectations)
@@ -1403,9 +1519,22 @@ export function readModelApplicationRejection(store: Store, request: { project: 
     if (!same(exchange.value.wire, assignment.wire)) fail('model_call_record_invalid', record.id, 'wire', 'A rejection keeps the actual admitted wire');
     const decoded = transportOf(exchange.value as ModelExchange);
     const checked = decoded.kind === 'answered' ? checkAnswerForm(store, { project: request.project, packet: value.packet, raw: decoded.raw }) : null;
-    const runtimeId = modelRecordId(request.project, exchange.value.wire.requestId), runtime = store.get(runtimeId, 1);
+    const runtimeId = modelRecordId(request.project, exchange.value.wire.requestId), runtime = store.get<OmModelCall>(runtimeId, 1);
     if (!runtime) fail('model_call_record_invalid', record.id, 'runtime', 'A rejected transaction follows its durable pre-dispatch claim');
-    const relevant = new Set(refs([reference(runtime),
+    const originalCall = take(readCall(store, request.project, value.call));
+    const originalAdmission = modelWorkAdmission(store, runtime, originalCall.value.series);
+    const originalProof = take(readSeriesWorkAdmission(store, { project: request.project,
+      series: originalAdmission.series, pointer: originalAdmission.pointer }));
+    let terminalReferences: Ref[] = [];
+    if (Object.hasOwn(value, 'terminal')) {
+      const terminal = modelTerminalBasis(store, request.project, value.terminal!);
+      if (terminal.source.id !== runtimeId || terminal.source.value.om.application !== 'received'
+        || !same(value.terminal!.call, value.call) || !same(terminal.source.value.om.request.packet, value.packet)
+        || !same(terminal.source.value.om.exchange, value.exchange) || value.completion !== null || value.failure.code !== 'input_stale')
+        fail('model_call_record_invalid', record.id, 'terminal', 'The rejected application retains its own received outcome and proved admission change');
+      terminalReferences = terminal.references;
+    }
+    const relevant = new Set(refs([reference(runtime), ...originalProof.references,
       ...value.guards.filter(ref => {
         if (ref.id !== runtimeId) return false;
         const prior = store.get<OmModelCall>(ref.id, ref.revision);
@@ -1457,7 +1586,7 @@ export function readModelApplicationRejection(store: Store, request: { project: 
       } else if (observation.kind === 'unavailable' && ['ENOENT', 'ENOTDIR', 'EACCES', 'EISDIR', 'EPERM', 'file_alias', 'file_too_large'].includes(observation.code)) fileStale = true;
       else fail('model_call_record_invalid', record.id, 'files', 'Unavailable file evidence names the concrete failed read');
     }
-    const stale = fileStale || relevantStale.length > 0;
+    const stale = fileStale || relevantStale.length > 0 || terminalReferences.length > 0;
     const conflict = value.expectations.some(row => outputIds.has(row.id) && (head(row.id)?.revision ?? 0) !== row.expected);
     if (value.failure.code === 'revision_conflict' ? !conflict : !stale)
       fail('model_call_record_invalid', record.id, 'failure', 'The retained identities must prove the rejected transaction class');
@@ -1470,14 +1599,17 @@ function saveRejectedModelApplication(store: Store, input: { request: ModelCallR
     const { request, call, running, exchange, transport } = input, exchangeRef = writeRef(exchange);
     const normalized = refused('input_stale', `${input.failure.code}: ${input.failure.message}`,
       { ...input.failure.at, unit: 'E4' }, 'producer');
-    const failure = ['input_stale', 'revision_conflict'].includes(input.failure.code) ? input.failure
+    let failure = ['input_stale', 'revision_conflict'].includes(input.failure.code) ? input.failure
       : !normalized.ok ? normalized.refusal : input.failure;
     const admitted = take(readCall(store, request.project, call)), seriesHead = store.get(admitted.value.series.id);
     const series = seriesHead ? take(readAnySeriesAt(store, request.project, reference(seriesHead))) : null;
     const completed = series?.value.attempts.find(item => item.ordinal === admitted.value.attempt)?.outcome;
     const completion = completed && series ? reference(series) : null;
+    const terminal = completion ? null : prepareModelTerminalWitness(store, running);
+    if (terminal && !normalized.ok) failure = normalized.refusal;
     const ids = [...new Set([...input.guards.map(ref => ref.id), ...input.writes.map(write => write.id)])].sort();
     const value: ModelApplicationRejection = { project: request.project, packet: request.packet, call, exchange: exchangeRef, completion,
+      ...(terminal ? { terminal: terminal.witness } : {}),
       guards: input.guards, expectations: input.writes.map(write => ({ id: write.id, expected: write.expected })),
       heads: ids.map(id => { const head = store.get(id); return { id, head: head ? reference(head) : null }; }), failure,
       files: input.guards.flatMap(ref => {
@@ -1502,14 +1634,15 @@ function saveRejectedModelApplication(store: Store, input: { request: ModelCallR
       kind: APPLICATION_REJECTION_KIND, expected: 0, value };
     const rejectionRef = writeRef(rejected), writes = [rejected];
     take(readModelApplicationRejection(pendingCallStore(store, writes), { project: request.project, record: rejectionRef }));
-    const finish = completion ? { diagnostic: null, writes: [], guards: [] }
+    const finish = completion || terminal ? { diagnostic: null, writes: [], guards: terminal?.guards ?? [] }
       : prepareModelFinish(pendingCallStore(store, writes), { project: request.project, packet: request.packet, call,
         response: null, code: failure.code, message: failure.message, reason: 'interrupted', evidence: [exchangeRef, rejectionRef] });
     writes.push(...finish.writes);
     const finished: OmModelCall = { ...running.value, finishedAt: Math.max(Date.now(), running.value.startedAt), status: 'failed',
       confirmed: transport.confirmed, usage: transport.usage, usageSource: transport.usage === null ? 'unavailable' : 'adapter', error: failure.code,
       response: transport.kind === 'answered' ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: exchangeRef } : null,
-      om: { ...running.value.om, application: 'application-refused', exchange: exchangeRef, failure, rejection: rejectionRef, diagnostic: finish.diagnostic } };
+      om: { ...running.value.om, application: 'application-refused', exchange: exchangeRef, failure, rejection: rejectionRef, diagnostic: finish.diagnostic,
+        ...(terminal ? { terminal: terminal.witness, completion: null } : {}) } };
     writes.push({ id: running.id, kind: running.kind, expected: running.revision, value: finished });
     const committed = take(writeGuarded<OmModelCall>(store, { unit: 'E4', target: running.id, writes,
       guards: externalGuards([reference(running), ...finish.guards], writes) }));
@@ -1552,10 +1685,12 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
       if (!attempt || !same(attempt.goal, admitted.value.goal))
         fail('model_call_record_invalid', ref.id, 'attempt', 'Recovery belongs to the original admitted attempt');
       const completion = attempt.outcome ? reference(series) : null;
-      const finish = completion ? { writes: [], guards: [], diagnostic: null }
+      const terminal = completion ? null : prepareModelTerminalWitness(store, record);
+      const finish = completion || terminal ? { writes: [], guards: terminal?.guards ?? [], diagnostic: null }
         : recoveryFinish(pendingCallStore(store, writes), record, incident);
       writes.push(...finish.writes); guards.push(reference(seriesHead), ...finish.guards);
-      finished = { ...finished, om: { ...record.value.om, application: 'recovered', diagnostic: finish.diagnostic, completion } } as OmModelCall;
+      finished = { ...finished, om: { ...record.value.om, application: 'recovered', diagnostic: finish.diagnostic, completion,
+        ...(terminal ? { terminal: terminal.witness } : {}) } } as OmModelCall;
     } else if ('transport' in original.value) {
       const record = original as Revision<TransportModelCall>;
       const assignment = transportAssignment(store, record.value.transport.request);

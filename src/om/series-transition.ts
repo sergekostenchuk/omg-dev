@@ -11,7 +11,7 @@ import { readHorizon, prepareHorizon, type Horizon, type HorizonBasis, type Hori
 import { readFrameBasis, readFrame, fillObligations, flowKey, type FilledFrame, type FrameRequest, type FrameScope } from './frame-obligations.js';
 import { readLayerAcceptance } from './layer-basis.js';
 import { historicalTrace, withHistoricalReads } from './input.js';
-import { readAnySeriesAt, prepareSeriesLineAdmission, type RepairSeries } from './series.js';
+import { readAnySeriesAt, prepareSeriesParticipantAdmission, type RepairSeries } from './series.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, type OmResult, type Refusal, type Sealed } from './refusal.js';
 
@@ -319,7 +319,7 @@ export function prepareSeriesTransition(store: Store, request: SeriesTransitionR
     const horizon = horizonSource(store, request);
     const admission = take(prepareHorizon(store, horizon.horizon.value.request));
     const guards: TransactionGuard[] = [...admission.guards];
-    for (const ref of request.series) guards.push(...take(prepareSeriesLineAdmission(store, request.project, ref)).guards);
+    for (const ref of request.series) guards.push(...take(prepareSeriesParticipantAdmission(store, request.project, ref)).guards);
     if (existing) guards.push(reference(existing));
     return { record, writes: existing ? [] : [{ id, kind: SERIES_TRANSITION_KIND, expected: 0, value: record.value }],
       guards: uniqueTransactionGuards(guards) };

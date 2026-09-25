@@ -7,6 +7,7 @@ import { readCapacity } from './capacity.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readAnySeriesAt, seriesRequestOf, prepareSeriesLineAdmission, prepareEscalateSeries,
+  readSeriesWorkAdmission, seriesRequiresAdmissionProof,
   STOP_REVIEW_KIND, stopReviewNamespace, type AnyRepairSeries, type AttemptGoal } from './series.js';
 import { stopReport, stopReportSources, readStopReport, type AnyStopReport, type StopReportSources } from './stop-report.js';
 import { prepareLiftOriginHold, readOriginHoldAt, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace,
@@ -32,6 +33,10 @@ export interface AnalysisIntent {
   sources: StopReportSources; report: AnyStopReport; packet: Json; call: AnyRecordCallRequest;
 }
 export interface PreparedStopAnalysis { intent: AnalysisIntent; writes: Write[]; guards: TransactionGuard[] }
+interface AnalysisAdmission {
+  contract: 'om-analysis-admission/v1'; project: string; intent: Ref; series: Ref; pointer: Ref; activation: Ref;
+  owner: { kind: 'block'; block: string };
+}
 export interface AnalysisRecord {
   contract: typeof STOP_ANALYSIS_CONTRACT; projectId: string; intent: Ref; transport: Ref;
   state: 'decided' | 'undecided' | 'origin-established' | 'origin-unestablished' | 'failed';
@@ -87,6 +92,7 @@ function identity(store: Store, request: StopAnalysisRequest, series: AnyRepairS
   return hashJson({ project: request.project, series: origin.id, stop: series.stop.attempt });
 }
 const intentId = (project: string, key: string) => `om-analysis-intent:${project}:${key}`;
+const analysisAdmissionId = (project: string, intent: Ref) => `om-analysis-admission:${project}:${hashJson(intent)}`;
 const failureId = (project: string, key: string) => `${STOP_ANALYSIS_FAILURE_KIND}:${project}:${key}`;
 function groundId(request: StopAnalysisRequest, key: string): string {
   return `${request.hold === null ? stopReviewNamespace(request.project) : originAnalysisNamespace(request.project)}${key}`;
@@ -153,10 +159,26 @@ function readIntent(store: Store, project: string, ref: Ref): Revision<AnalysisI
   const derived = deriveIntent(store, saved.request as StopAnalysisRequest, report);
   if (record.id !== intentId(project, identity(store, derived.request, seriesOf(store, derived.request).value))
     || record.revision !== 1 || !same(derived, saved)) fail('analysis_invalid', ref.id, 'intent', 'The exact sources do not reproduce this intent');
+  originalGuards(store, reference(record), derived);
   return record as Revision<AnalysisIntent>;
 }
-function originalGuards(intent: AnalysisIntent): TransactionGuard[] {
-  return uniqueTransactionGuards([...intent.report.guards, intent.request.dispatch.config, intent.request.dispatch.adapter]);
+function originalGuards(store: Store, intentRef: Ref, intent: AnalysisIntent): TransactionGuard[] {
+  const guards: TransactionGuard[] = [...intent.report.guards, intent.request.dispatch.config, intent.request.dispatch.adapter];
+  const source = seriesOf(store, intent.request);
+  if (!seriesRequiresAdmissionProof(source.value)) return uniqueTransactionGuards(guards);
+  const id = analysisAdmissionId(intent.request.project, intentRef), saved = store.get<AnalysisAdmission>(id, 1);
+  if (!saved) fail('analysis_invalid', id, 'admission', 'This series era requires the immutable admission of its analysis intent');
+  const value = saved.value;
+  if (saved.kind !== 'om-analysis-admission' || saved.hash !== hashJson(value) || !object(value)
+    || !keys(value, ['contract', 'project', 'intent', 'series', 'pointer', 'activation', 'owner'])
+    || value.contract !== 'om-analysis-admission/v1' || value.project !== intent.request.project
+    || !same(value.intent, intentRef) || !same(value.series, intent.request.series) || !isRef(value.pointer) || !isRef(value.activation)
+    || 'owner' in source.value || !same(value.owner, { kind: 'block', block: source.value.block }))
+    fail('analysis_invalid', id, 'admission', 'The fixed proof must name this exact intent, owner, series and activation');
+  const admitted = take(readSeriesWorkAdmission(store, { project: intent.request.project, series: value.series, pointer: value.pointer }));
+  if (!same(admitted.activation, value.activation))
+    fail('analysis_invalid', id, 'activation', 'The common historical admission must prove this activation');
+  return uniqueTransactionGuards([...guards, ...admitted.guards, reference(saved)]);
 }
 export function prepareStopAnalysis(store: Store, request: StopAnalysisRequest): OmResult<Sealed<PreparedStopAnalysis>> {
   requireRequest(store, request);
@@ -166,12 +188,23 @@ export function prepareStopAnalysis(store: Store, request: StopAnalysisRequest):
     if (existing) {
       const saved = readIntent(store, request.project, reference(existing));
       if (!same(saved.value.request, request)) fail('analysis_conflict', id, 'request', 'This saved ground already has its fixed analysis request');
-      return { intent: saved.value, writes: [], guards: originalGuards(saved.value) };
+      return { intent: saved.value, writes: [], guards: originalGuards(store, reference(saved), saved.value) };
     }
-    take(prepareSeriesLineAdmission(store, request.project, request.series));
+    const admission = take(prepareSeriesLineAdmission(store, request.project, request.series));
     const report = take(stopReport(store, seriesRequestOf(source.value))) as AnyStopReport;
     const intent = deriveIntent(store, request, report);
-    return { intent, writes: [{ id, kind: 'om-analysis-intent', expected: 0, value: json(intent) }], guards: originalGuards(intent) };
+    const writes: Write[] = [{ id, kind: 'om-analysis-intent', expected: 0, value: json(intent) }];
+    if (seriesRequiresAdmissionProof(source.value)) {
+      if ('owner' in source.value || !admission.pointer || !admission.activation)
+        fail('analysis_invalid', id, 'admission', 'Managed work requires its proved pointer and activation');
+      const ref = { id, revision: 1, hash: hashJson(intent) };
+      const proof: AnalysisAdmission = { contract: 'om-analysis-admission/v1', project: request.project, intent: ref,
+        series: request.series, pointer: admission.pointer, activation: admission.activation,
+        owner: { kind: 'block', block: source.value.block } };
+      writes.push({ id: analysisAdmissionId(request.project, ref), kind: 'om-analysis-admission', expected: 0, value: json(proof) });
+    }
+    return { intent, writes, guards: uniqueTransactionGuards([...intent.report.guards,
+      request.dispatch.config, request.dispatch.adapter, ...admission.guards]) };
   });
 }
 function responseError(target: string, field: string, message: string): Refusal {

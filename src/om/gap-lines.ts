@@ -8,7 +8,7 @@ import { gapId, prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, typ
 import { readAcceptedFrame, type AcceptedFrameRequest } from './frame-accept.js';
 import { readCandidate } from './frame-candidate.js';
 import { prepareFrame, readFrame, type FrameObligation, type PreparedFrame, type FrameRequest } from './frame-obligations.js';
-import { readSeries, REPAIR_SERIES_KIND, type AttemptGoal, type RepairSeries } from './series.js';
+import { readSeries, prepareSeriesLineAdmission, REPAIR_SERIES_KIND, type AttemptGoal, type RepairSeries } from './series.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
@@ -339,6 +339,7 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
     || !fills.length || fills.some(fill => fill.source !== 'accepted'))
     fail('closure_unconfirmed', line.id, 'fill', 'The same obligation must be fully filled by accepted real definitions, not identities or a changed requirement');
   const attempt = seriesGoal(store, project, line, closure.attempt, current);
+  const admission = current && attempt ? take(prepareSeriesLineAdmission(store, project, attempt.series)).guards : [];
   const belongs = !attempt || (level === 2 ? attempt.block === obligation.upper.node
     : source.gap.consumers.includes(attempt.block)
       && frame.upper.nodes.some(node => node.id === attempt.block && node.kind === 'block')
@@ -348,7 +349,7 @@ function confirmClosure(store: Store, project: string, line: GapLine, closure: G
   return { kind: 'frame', obligation: obligation as FrameObligation, acceptance: closure.acceptance, attempt, writes: [], references: unique([...frame.references, ...previousFrame.references, closure.basis,
       closure.acceptance.graph, closure.acceptance.layer, ...(attempt ? [attempt.series] : [])]),
     guards: fresh ? guardsOf([...fresh.guards,
-      ...(attempt ? [attempt.series] : [])]) : [] };
+      ...admission]) : [] };
 }
 function loadHistory(store: Store, project: string, ref: Ref): History {
   return historicalProof(store, { reader: 'D2.loadHistory', project, ref }, store => deriveHistory(store, project, ref),

@@ -53,7 +53,8 @@ export interface StageContent { draft: Ref; fields: Record<string, Json>; graph:
 // Shared pre-B1 records are handled below by their provenance fields, never by arbitrary text.
 const recordObject = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const B1_PRODUCERS = Object.freeze([
-  'horizon', 'om-horizon', 'block-weight', 'om-input-decision', 'om-gap', 'om-gap-lines', 'om-candidate',
+  'horizon', 'om-horizon', 'series-transition', 'om-horizon-issuance', 'om-series-applied', 'om-series-era', 'om-analysis-admission',
+  'block-weight', 'om-input-decision', 'om-gap', 'om-gap-lines', 'om-candidate',
   'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes',
   'om-owner-gap-assignment', 'om-obligation-transfer', 'om-obligation-basis', 'om-obligations',
   'om-question-packet', 'om-part-response', 'om-part-result', 'om-part-assembly',
@@ -61,7 +62,7 @@ const B1_PRODUCERS = Object.freeze([
   'om-model-application-rejection', 'om-neighbors', 'om-atomic-gate', 'om-works-acceptance', 'om-work-rejection',
 ]);
 function b1Address(project: string, id: unknown): boolean {
-  return typeof id === 'string' && (id === `om-input:${project}` || id === `om-feasibility:${project}`
+  return typeof id === 'string' && (id === `om-input:${project}` || id === `om-feasibility:${project}` || id === `om-series-current:${project}`
     || B1_PRODUCERS.some(namespace => id.startsWith(`${namespace}:${project}:`))
     || [2, 3].some(level => id === `om-frame:${project}:${level}`)
     || ['part', 'assembly'].some(source => id.startsWith(`om-proposal:${project}:${source}:`))
@@ -96,9 +97,14 @@ function provenance(refs: readonly string[], sources: readonly string[] = [], ow
 }
 // Closed producer schema map. Unknown namespaces are not evidence of B1; fixed B1 addresses above are.
 const B1_SHARED_ORIGINS: Readonly<Record<string, ProvenanceFields>> = Object.freeze({
+  'om-series-era': provenance(['firstManaged', 'origin.applied', 'origin.membership', 'origin.pointer']),
+  'om-series-membership': provenance(['activation', 'roots.*.root']),
+  'om-analysis-intent': provenance(['request.series', 'request.hold', 'sources.series', 'sources.journal', 'sources.holds.*',
+    'report.guards.*', ...under('call', CALL_ORIGIN_REFS)], [], ['call.owner']),
   'om-proposal': provenance(['base.graph', 'base.frame', 'replaces.*.base.graph', 'verdict.candidate', 'verdict.gate',
     'verdict.refusal.at.ref', ...under('verdict.request', PROPOSAL_ORIGIN_REFS)]),
   'repair-series': provenance(['predecessor', 'inherited.*.outcome.achieved.*.basis', 'attempts.*.outcome.achieved.*.basis',
+    'activation.registered', 'activation.applied', 'activation.prepared', 'activation.activeBasis', 'attempts.*.terminal',
     'continuations.*.review', 'continuations.*.input', 'continuations.*.confirmation', 'continuations.*.decision',
     'escalations.*.review', ...under('scope', GAP_ORIGIN_REFS), 'admissions.*.basis.routes',
     ...under('admissions.*.basis.gaps', GAP_ORIGIN_REFS)], [], ['owner']),
@@ -114,7 +120,10 @@ const B1_SHARED_ORIGINS: Readonly<Record<string, ProvenanceFields>> = Object.fre
   'om-refusal-journal': provenance(['rows.*.source'], ['rows.*.origin.sources.*', 'classifications.*.basis.*']),
   'model-call': provenance(['request.record', 'response.record', 'recovery', 'profile', 'packet.archive', 'budget.segment',
     'runtime.declaration', 'om.request.dispatch.adapter', 'om.request.dispatch.config', 'om.input', 'om.call', 'om.exchange', 'om.part.proposal', 'om.part.result', 'om.diagnostic',
-    'om.rejection', 'om.completion', 'om.failure.at.ref', 'om.request.packet', 'transport.exchange', 'transport.request.call']),
+    'om.rejection', 'om.completion', 'om.failure.at.ref', 'om.request.packet', 'transport.exchange', 'transport.request.call',
+    'om.admission.series', 'om.admission.pointer', 'om.terminal.source', 'om.terminal.call', 'om.terminal.series',
+    'om.terminal.admission.series', 'om.terminal.admission.pointer', 'om.terminal.change.series', 'om.terminal.change.pointer',
+    'om.terminal.change.applied', 'om.terminal.change.currentPointer']),
   'om-model-transport': provenance(['request.call', 'call']),
   'graph-layer': provenance(['acceptance.frame', 'inputs.*', 'obligations.*.inputs.*', 'layerProofs.*.inputs.*',
     'projection.researchObligations.*.scope']),
@@ -167,7 +176,10 @@ function savedB1Origin(project: string, record: Revision<unknown>): boolean {
       record.id === stageId(project, stage as Stage) && namedB1References(project, value, paths))
       || UPSTREAM_STAGES.some(stage => record.id === stageId(project, stage))
         && namedB1References(project, value, ['content.draft', 'content.graph']))
-    || namespace === 'writer-index' && value['contract'] === 'writer-index/om-m8-v1';
+    || namespace === 'writer-index' && value['contract'] === 'writer-index/om-m8-v1'
+    || namespace === 'repair-series' && (value['contract'] === 'om-repair-series/v2'
+      || recordObject(value['activation']) && value['activation']['contract'] === 'om-series-activation/v1')
+    || namespace === 'om-series-membership' && value['mode'] === 'transition-managed';
 }
 export class ProductEngine {
   readonly discovery: Discovery;
