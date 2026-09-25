@@ -214,7 +214,7 @@ export class Refinement {
       result.findings.push({ code: "phase_stale", target: milestone.id, message: "A phase input changed while its admission was checked" });
     return result;
   }
-  assess(project: string, expected: number): Revision<Feasibility> {
+  assess(project: string, expected: number, extraGuards: TransactionGuard[] = []): Revision<Feasibility> {
     assertPilotBoundary(this.store, project, "R3");
     const admissionGuards: TransactionGuard[] = [];
     const inputs = this.#inputs(project, "R3", admissionGuards); const effective = this.environments.effective(project); const environment = effective.environment;
@@ -227,7 +227,7 @@ export class Refinement {
     return this.store.writeMany<Feasibility>([{ id: `feasibility:${project}`, kind: "feasibility", expected,
       value: { contractVersion: REFINEMENT_CONTRACT_VERSION, projectId: project, ready: findings.length === 0, graph: reference(graph), environment: reference(environment),
         repository: inspected.state, inputs: guards, findings, ...(obligations.value ? { obligations: obligations.value } : {}) } }],
-      uniqueTransactionGuards([...guards, ...admissionGuards, ...(graphGate.admissionGuards ?? []), ...effective.admissionGuards, ...obligations.guards, ...obligations.admissionGuards]))[0]!;
+      uniqueTransactionGuards([...guards, ...admissionGuards, ...(graphGate.admissionGuards ?? []), ...effective.admissionGuards, ...obligations.guards, ...obligations.admissionGuards, ...extraGuards]))[0]!;
   }
   feasibilityGate(project: string, ref: Ref, allowHistorical = false): GateResult {
     if (!isRef(ref)) return { findings: [{ code: "feasibility_missing", target: project, message: "R3 result reference is required" }], guards: [] };
