@@ -3,7 +3,7 @@ import { requireCondition } from '../errors.js';
 import { reference } from '../pipeline/contracts.js';
 import type { Store, TransactionGuard } from '../storage/store.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
-import type { CompiledTask, MachinePlan } from '../compiler/model.js';
+import { checkedPlanDerivation, type CompiledTask, type MachinePlan } from '../compiler/model.js';
 import type { Feasibility } from '../graph/refinement.js';
 import type { Graph } from '../graph/model.js';
 import type { TaskRun } from './model.js';
@@ -104,6 +104,7 @@ export function requireTaskObligationProofs(store: Store, run: TaskRun, task: Co
   const plan = store.get<MachinePlan>(run.plan.id, run.plan.revision);
   requireCondition(plan?.kind === 'plan' && canonical(reference(plan)) === canonical(run.plan) && plan.value.projectId === run.projectId
     && run.taskId === task.id, 'task_obligation_plan_foreign', 'Proofs must belong to the exact project, plan and named task');
+  checkedPlanDerivation(plan, run.projectId);
   requirePlanTaskObligations(store, plan.value, task);
   if (task.researchObligations === undefined) return;
   for (const [moment, saved] of [['task-start', run.obligationStartProofs], ['task-result', run.obligationResultProofs]] as const) {

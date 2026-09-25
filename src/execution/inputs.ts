@@ -1,6 +1,6 @@
 import type { Store, Revision } from "../storage/store.js";
-import type { MachinePlan, CompiledTask, ArtifactReceipt } from "../compiler/model.js";
-import { resolveArtifact } from "../compiler/inputs.js";
+import { checkedPlanDerivation, type MachinePlan, type CompiledTask, type ArtifactReceipt } from "../compiler/model.js";
+import { resolveArtifact, resolvePlanExternalSource } from "../compiler/inputs.js";
 import { reference, uniqueRefs } from "../pipeline/contracts.js";
 import { canonical } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -8,9 +8,15 @@ import { git, type ExecutionRoot } from "../runtime/environment.js";
 import type { TaskRun } from "./model.js";
 
 export function executionInputs(store: Store, plan: Revision<MachinePlan>, task: CompiledTask, root: ExecutionRoot) {
+  const derivation = checkedPlanDerivation(plan, plan.value.projectId);
   const graph = plan.value.graphSnapshot;
   const repository = { root: root.path, head: root.head, tree: git(root.path, ["rev-parse", `${root.head}^{tree}`]), files: [] };
   const inputs = task.inputs.map(input => {
+    if (derivation === "external-inputs/v1" && graph.artifacts.some(artifact => artifact.id === input.artifact && artifact.external)) {
+      const ref = resolvePlanExternalSource(store, plan, input.artifact).source!;
+      const record = store.get(ref.id, ref.revision)!;
+      return { connector: input.connector, artifact: input.artifact, ref, kind: record.kind, value: record.value };
+    }
     const producer = input.producerTask ? plan.value.tasks.find(task => task.id === input.producerTask)?.node
       : input.receipt ? store.get<ArtifactReceipt>(input.receipt.id, input.receipt.revision)?.value.node
         : graph.connectors.find(connector => connector.id === input.connector)?.bindings.find(binding => binding.level === 3)?.producer.node;

@@ -523,7 +523,7 @@ export async function load(url,context,next){
  return next(url,context);
 }`;
 
-test('G1.3 complete daa81a530cae producer and current unguarded native APIs preserve identical record bytes', t => {
+test('G1.3 complete daa81a530cae history and new plan era preserve native semantics and exact dependent references', t => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g13-base-')));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -590,12 +590,39 @@ try{
     const omRepeated = engine.pipeline.accept('p', 'om-g2', omAccepted.revision);
     const compilationRepeated = engine.pipeline.accept('p', 'compilation', compilationAccepted.revision);
     const productRepeated = engine.execute({ type: 'compile', project: 'p' });
-    assert.deepEqual({ omDraft, omAccepted, plan, planRepeated, compilationDraft, compilationAccepted, omRepeated, compilationRepeated, productRepeated }, old.results);
-    assert.equal(history(store), old.after, 'Omitted extraGuards preserve all native revisions, values and hashes');
+    // V3 changes new production's envelope; every other plan field stays equal to the Git producer.
+    const oldPlan = old.results['plan'] as Revision<MachinePlan>;
+    const { hash: oldHash, ...oldBody } = oldPlan.value;
+    const newBody = { ...oldBody, derivation: 'external-inputs/v1' as const };
+    const newValue = { ...newBody, hash: hashJson(newBody) };
+    const expectedPlan = { ...oldPlan, id: `plan:p:external-inputs-v1:${newValue.hash}`, value: newValue, hash: hashJson(newValue) };
+    assert.notEqual(expectedPlan.id, oldPlan.id);
+    const expectedHistory = (JSON.parse(old.after) as Revision<any>[]).map(row => {
+      if (row.id === oldPlan.id) return expectedPlan;
+      if (row.id === 'current-plan:p') {
+        assert.deepEqual(row.value, reference(oldPlan));
+        const value = reference(expectedPlan); return { ...row, value, hash: hashJson(value) };
+      }
+      if (row.id === 'stage:p:compilation') {
+        assert.deepEqual(row.value.content, { plan: reference(oldPlan) });
+        const value = { ...row.value, content: { plan: reference(expectedPlan) },
+          proofs: row.value.proofs.map((ref: Ref) => canonical(ref) === canonical(reference(oldPlan)) ? reference(expectedPlan) : ref) };
+        return { ...row, value, hash: hashJson(value) };
+      }
+      return row;
+    }).sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision);
+    assert.deepEqual({ omDraft, omAccepted, plan, planRepeated, compilationDraft, compilationAccepted, omRepeated, compilationRepeated, productRepeated },
+      { ...old.results, plan: expectedPlan, planRepeated: expectedPlan, productRepeated: expectedPlan,
+        compilationDraft: expectedHistory.find(row => row.id === compilationDraft.id && row.revision === compilationDraft.revision),
+        compilationAccepted: expectedHistory.find(row => row.id === compilationAccepted.id && row.revision === compilationAccepted.revision),
+        compilationRepeated: expectedHistory.find(row => row.id === compilationRepeated.id && row.revision === compilationRepeated.revision) });
+    const exactHistory = () => canonical(store.list().flatMap(row => store.history(row.id))
+      .sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision));
+    assert.equal(exactHistory(), canonical(expectedHistory), 'Only the plan envelope and its declared dependent references change');
     store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(plan.id), old.results['plan']);
+    assert.deepEqual(engine.compiler.read(plan.id), expectedPlan);
     assert.equal(engine.pipeline.inspect('p', 'compilation').state, 'accepted');
-    assert.equal(history(store), old.after);
+    assert.equal(exactHistory(), canonical(expectedHistory));
     assert.equal(store.get('om-input:p'), null);
   } finally { store.close(); }
 });

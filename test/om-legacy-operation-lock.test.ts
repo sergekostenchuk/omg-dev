@@ -467,7 +467,7 @@ export async function load(url,context,next){const prefix=new URL('dist/',root).
  return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}}
  return next(url,context);}`;
 
-test('G1.4 whole f8136c1 producer history stays readable and native product bytes remain identical apart from operation bookkeeping', async t => {
+test('G1.4 whole f8136c1 history stays exact while new production uses the new plan envelope', async t => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g14-history-'))); t.after(() => rmSync(directory, { recursive: true, force: true }));
   const repository = fileURLToPath(new URL('../../', import.meta.url)), loader = join(directory, 'loader.mjs'), producer = join(directory, 'producer.mjs');
   writeFileSync(loader, HISTORY_LOADER);
@@ -502,11 +502,34 @@ process.stdout.write(JSON.stringify({database,comparison,run,plan,input:input.va
   let store = new Store(old.comparison);
   try {
     const current = await continuePreparation(new ProductEngine(store), 'p', 1);
-    assert.equal(current.value.status, 'accepted'); assert.deepEqual(current.value.plan, old.run.value.plan);
-    assert.deepEqual(new ProductEngine(store).compiler.read(old.plan.id), old.plan);
+    const { hash: oldHash, ...oldBody } = old.plan.value;
+    const newBody = { ...oldBody, derivation: 'external-inputs/v1' };
+    const newValue = { ...newBody, hash: hashJson(newBody) };
+    const expectedPlan = { ...old.plan, id: `plan:p:external-inputs-v1:${newValue.hash}`, value: newValue, hash: hashJson(newValue) };
+    assert.equal(current.value.status, 'accepted'); assert.deepEqual(current.value.plan, reference(expectedPlan));
+    assert.deepEqual(new ProductEngine(store).compiler.read(expectedPlan.id), expectedPlan);
     assert.deepEqual(firstInput(store), old.input, 'The marker must not enter B1 sources or its historical formula');
-    assert.equal(canonical(store.list().filter(row => !['preparation-run', 'legacy-operation'].includes(row.kind)).flatMap(row => store.history(row.id))), old.core,
-      'Runtime owner/run bookkeeping is separate; all graph, phase, feasibility, stage, plan and B1 bytes are unchanged');
+    const expectedCore = (JSON.parse(old.core) as Revision<any>[]).map(row => {
+      if (row.id === old.plan.id) return expectedPlan;
+      if (row.id === 'current-plan:p') {
+        assert.deepEqual(row.value, reference(old.plan));
+        const value = reference(expectedPlan); return { ...row, value, hash: hashJson(value) };
+      }
+      if (row.id === 'stage:p:compilation') {
+        assert.deepEqual(row.value.content, { plan: reference(old.plan) });
+        const value = { ...row.value, content: { plan: reference(expectedPlan) },
+          proofs: row.value.proofs.map((ref: Ref) => canonical(ref) === canonical(reference(old.plan)) ? reference(expectedPlan) : ref) };
+        return { ...row, value, hash: hashJson(value) };
+      }
+      return row;
+    }).sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision);
+    assert.equal(canonical(store.list().filter(row => !['preparation-run', 'legacy-operation'].includes(row.kind))
+      .flatMap(row => store.history(row.id)).sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision)), canonical(expectedCore),
+      'All core bytes remain exact except the new plan envelope and its declared dependent references');
+    store.close(); store = new Store(old.comparison);
+    assert.deepEqual(new ProductEngine(store).compiler.read(expectedPlan.id), expectedPlan);
+    assert.equal(canonical(store.list().filter(row => !['preparation-run', 'legacy-operation'].includes(row.kind))
+      .flatMap(row => store.history(row.id)).sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision)), canonical(expectedCore));
     assert.equal(readLegacyOperation(store, 'p')!.value.state, 'released'); assert.equal(store.history(markerId).length, 2);
     store.close(); store = new Store(old.database);
     assert.equal(readLegacyOperation(store, 'p'), null);

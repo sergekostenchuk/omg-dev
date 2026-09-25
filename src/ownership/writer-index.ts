@@ -1,6 +1,6 @@
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import type { CompiledTask, MachinePlan } from "../compiler/model.js";
+import { checkedPlanDerivation, type CompiledTask, type MachinePlan } from "../compiler/model.js";
 import type { TaskRun } from "../execution/model.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { git, type ExecutionRoot } from "../runtime/environment.js";
@@ -54,6 +54,7 @@ function writerSource(store: Store, project: string, path: string, ref: Ref): { 
   const plan = store.get<MachinePlan>(record.value.plan.id, record.value.plan.revision);
   if (!plan || plan.kind !== "plan" || plan.hash !== record.value.plan.hash || !object(plan.value)
     || plan.value.projectId !== project || !Array.isArray(plan.value.tasks)) invalid(project, path, "writers.plan");
+  checkedPlanDerivation(plan, project);
   const task = plan.value.tasks.find(item => object(item) && item.id === record.value.taskId);
   if (!task || !Array.isArray(task.writePaths) || !task.writePaths.every(text)) invalid(project, path, "writers.task");
   return { record, task, plan };

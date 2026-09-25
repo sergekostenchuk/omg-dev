@@ -823,9 +823,9 @@ process.stdout.write(JSON.stringify(response));
   assert.equal(supplierRun.value.state, "committed");
   const consumerTask = plan.value.tasks.find(task => task.node === "garden-consume-work")!;
   const consumerRun = runs.find(run => run.value.taskId === consumerTask.id)!;
-  // B3 consumes the committed supplier evidence. Legacy execution of this external consumer is a separate existing limitation.
-  assert.equal(consumerRun.value.state, "needs_plan");
-  assert.equal(consumerRun.value.error, "The predecessor result must belong to this exact plan task");
+  // V3 executes the external consumer; B3 still consumes the exact committed supplier evidence below.
+  assert.equal(consumerRun.value.state, "committed");
+  assert.equal(consumerRun.value.error, null);
   const dataReceipt = store.get<ArtifactReceipt>(receiptId(project, "garden-data"))!;
   const externalReceipt = store.get<ArtifactReceipt>(receiptId(project, external))!;
   assert.ok(dataReceipt?.value.run && externalReceipt?.value.run, "Both named receipts are produced by actual committed fixture execution");

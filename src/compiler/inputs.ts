@@ -5,10 +5,10 @@ import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { git, type RepositoryState } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
-import { reference, isRef, type Ref } from "../pipeline/contracts.js";
+import { reference, isRef, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { hashJson, digest } from "../canonical.js";
-import { receiptId, nodeSignature, type ArtifactReceipt, type TaskInput, type MachinePlan } from "./model.js";
+import { hashJson, digest, canonical } from "../canonical.js";
+import { receiptId, nodeSignature, checkedPlanDerivation, type ArtifactReceipt, type TaskInput, type MachinePlan } from "./model.js";
 
 const graphShapes = new Ajv({ strict: true, allowUnionTypes: true });
 const receiptGraphShapes = [graphShapes.compile<Graph>(graphSchema), graphShapes.compile<Graph>(graphV2Schema)];
@@ -94,6 +94,32 @@ export function resolveExternalSource(store: Store, project: string, graph: Grap
   return { receipt: null, source: reference(record) };
 }
 
+/** The new plan supplies its exact Source, never a first matching historical guard or M8 receipt. */
+export function resolvePlanExternalSource(store: Store, plan: Revision<MachinePlan>, artifactId: string): Pick<TaskInput, 'receipt' | 'source'> {
+  const invalid = (field: string): never => { throw new EngineError('plan_input_invalid',
+    'Every external input must bind the same exact Source and its sealed guard',
+    { unit: 'compiler/inputs', target: typeof plan?.id === 'string' ? plan.id : 'plan', field }); };
+  if (!plan || !object(plan.value) || !text(artifactId)) invalid('plan');
+  const value = plan.value;
+  if (!Array.isArray(value.tasks) || !Array.isArray(value.guards) || !value.guards.every(isRef)) invalid('guards');
+  const inputs: TaskInput[] = [];
+  for (const task of value.tasks) {
+    if (!object(task) || !Array.isArray(task.inputs)) invalid('tasks.inputs');
+    for (const input of task.inputs) {
+      if (!object(input)) invalid('tasks.inputs');
+      if (input.artifact === artifactId) inputs.push(input as unknown as TaskInput);
+    }
+  }
+  if (!inputs.length || !inputs.every(input => input.producerTask === null && input.receipt === null && isRef(input.source)
+    && input.source.id === `source:${value.projectId}:${artifactId}`)) invalid('tasks.inputs.source');
+  const sources = uniqueRefs(inputs.map(input => input.source!));
+  if (sources.length !== 1) invalid('tasks.inputs.source');
+  const source = sources[0]!;
+  const guards = uniqueRefs(value.guards.filter(guard => guard.id === source.id));
+  if (guards.length !== 1 || canonical(guards[0]) !== canonical(source)) invalid('guards');
+  return resolveExternalSource(store, value.projectId, value.graphSnapshot, artifactId, source, false);
+}
+
 export function resolveArtifact(store: Store, project: string, graph: Graph, repository: RepositoryState,
   producerId: string, artifactId: string, sealed?: Ref[]): Pick<TaskInput, "receipt" | "source"> {
           const read = <T>(id: string): Revision<T> | null => {
@@ -125,6 +151,7 @@ export function resolveArtifact(store: Store, project: string, graph: Graph, rep
                 && plan?.kind === "plan" && plan.hash === receipt.value.plan.hash && plan.value.projectId === project
                 && plan.value.tasks.some(task => task.id === run.value.taskId && task.node === producerId && task.signature === receipt.value.signature && task.produces.includes(artifactId)),
               "implementation_proof_foreign", "Implementation receipt does not bind its accepted run");
+              checkedPlanDerivation(plan, project);
               const paths = producer.code.filter(ref => ref.access === "write").map(ref => ref.path).sort();
               requireCondition(hashJson(receipt.value.value.files.map(file => file.path).sort()) === hashJson([...new Set(paths)])
                 && receipt.value.value.files.every(file => file.hash === null || typeof file.hash === "string" && /^[a-f0-9]{64}$/.test(file.hash)),

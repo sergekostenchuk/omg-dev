@@ -8,9 +8,9 @@ import { hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
-import type { MachinePlan } from "./model.js";
+import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, type MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
-import { resolveArtifact } from "./inputs.js";
+import { resolveArtifact, resolvePlanExternalSource } from "./inputs.js";
 import { requireBasis } from "./basis.js";
 import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, loadTaskContextSources, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
@@ -41,20 +41,39 @@ export class Compiler {
     const researchObligations = handoff ? requireTaskObligations(this.store, project, graph, handoff) : undefined;
     const derived = deriveTasks(project, record.hash, graph, (producer, artifact) =>
       resolveArtifact(this.store, project, graph, feasibility.value.repository!, producer, artifact), { version: 2, owner: path => owners.latest(path),
-        ...(researchObligations ? { researchObligations } : {}) });
+        externalInputs: EXTERNAL_INPUT_DERIVATION, ...(researchObligations ? { researchObligations } : {}) });
     const inputs = [...stage.guards, ...checked.guards, ...derived.guards];
     // M8's historical closure is proved by its reader, not pinned as a collection of current heads.
     const guards = om ? uniqueRefs([...inputs, reference(stage.artifact), feasibilityRef, reference(record), reference(environment)])
       : [...new Map(inputs.map(ref => [`${ref.id}:${ref.revision}`, ref])).values()];
-    const body = { version: 2 as const, projectId: project, graph: reference(record), environment: reference(environment),
+    const body = { version: 2 as const, derivation: EXTERNAL_INPUT_DERIVATION, projectId: project, graph: reference(record), environment: reference(environment),
       stage: reference(stage.artifact), feasibility: feasibilityRef, base: feasibility.value.repository,
       guards, tasks: derived.tasks, graphSnapshot: graph };
-    const value: MachinePlan = { ...body, hash: hashJson(body) }; const id = `plan:${project}:${value.hash}`;
+    const value: MachinePlan = { ...body, hash: hashJson(body) }; const id = `plan:${project}:external-inputs-v1:${value.hash}`;
     const admissionGuards = uniqueTransactionGuards([...guards, ...(stage.admissionGuards ?? []), ...(checked.admissionGuards ?? [])]);
     const existing = this.store.get<MachinePlan>(id);
     if (existing) {
+      checkedPlanDerivation(existing, project);
       requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while compiling");
       return existing;
+    }
+    // Equal task bytes do not imply equal execution rules for external inputs.
+    // Only a nonexternal exact v2 result can be a completed legacy repetition.
+    const hasExternalInput = derived.tasks.some(task => task.inputs.some(input =>
+      graph.artifacts.some(artifact => artifact.id === input.artifact && artifact.external)));
+    if (!hasExternalInput) {
+      const { derivation: _derivation, ...legacyBody } = body;
+      const legacyValue = { ...legacyBody, hash: hashJson(legacyBody) };
+      const legacyId = `plan:${project}:${legacyValue.hash}`;
+      const completed = this.store.get<MachinePlan>(legacyId);
+      if (completed) {
+        if (completed.kind !== 'plan' || completed.value?.projectId !== project || completed.value.version !== 2
+          || completed.hash !== hashJson(completed.value) || completed.hash !== hashJson(legacyValue)
+          || completed.value.hash !== legacyValue.hash) throw new EngineError('plan_corrupt',
+          'Completed legacy plan must equal its exact derived result', { unit: 'compiler/compiler', target: legacyId });
+        requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while compiling");
+        return completed;
+      }
     }
     const pointer = this.store.get<Ref>(`current-plan:${project}`);
     return this.store.writeMany<MachinePlan>([
@@ -66,12 +85,16 @@ export class Compiler {
   read(id: string): Revision<MachinePlan> {
     const plan = this.store.get<MachinePlan>(id);
     requireCondition(plan && plan.kind === "plan", "plan_missing", "Machine plan is missing");
+    const derivation = planDerivation(plan.id);
     const om = requireBasis(this.store, plan.value);
     const { hash, ...body } = plan.value;
     requireCondition(hashJson(body) === hash, "plan_corrupt", "Machine plan checksum mismatch");
     const graph = this.store.get<Graph>(plan.value.graph.id, plan.value.graph.revision);
     requireCondition(graph?.kind === "graph" && graph.hash === plan.value.graph.hash
       && hashJson(graph.value) === hashJson(plan.value.graphSnapshot), "plan_foreign", "Plan must bind its exact graph version");
+    const externalRules = derivation === EXTERNAL_INPUT_DERIVATION ? { externalInputs: derivation } : {};
+    const external = (artifact: string) => derivation === EXTERNAL_INPUT_DERIVATION
+      && graph.value.artifacts.some(item => item.id === artifact && item.external);
     const derived = (() => {
       if (om) {
         const deliveries = om.value.producer.deliveries, ownership = deliveries.ownership;
@@ -89,22 +112,25 @@ export class Compiler {
           return writer;
         };
         return deriveTasks(plan.value.projectId, graph.hash, requireGraph(graph.value), (producer, artifact) => {
+          if (external(artifact)) return resolvePlanExternalSource(this.store, plan, artifact);
           const matches = deliveries.resolved.filter(item => item.producer === producer && item.artifact === artifact);
           requireCondition(matches.length === 1, 'plan_input_invalid', 'Every input needs its exact M8 producer and artifact resolution');
           const input = matches[0]!;
           return resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact,
             [...(input.source ? [input.source] : []), ...(input.receipt ? [input.receipt] : [])]);
-        }, { version: plan.value.version, owner, researchObligations });
+        }, { version: plan.value.version, owner, researchObligations, ...externalRules });
       }
       const owners = plan.value.version === 2 ? new Owners(this.store, plan.value.projectId, plan.value.base) : null;
       const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
       const handoff = taskObligationHandoff(this.store, plan.value.projectId, basis.value.inputs);
       const researchObligations = handoff ? requireTaskObligations(this.store, plan.value.projectId, graph.value, handoff) : undefined;
       return deriveTasks(plan.value.projectId, graph.hash, requireGraph(graph.value), (producer, artifact) =>
-        resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards),
-      { version: plan.value.version, owner: path => owners?.latest(path) ?? null, ...(researchObligations ? { researchObligations } : {}) });
+        external(artifact) ? resolvePlanExternalSource(this.store, plan, artifact)
+          : resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards),
+      { version: plan.value.version, owner: path => owners?.latest(path) ?? null, ...(researchObligations ? { researchObligations } : {}), ...externalRules });
     })();
     requireCondition(hashJson(derived.tasks) === hashJson(plan.value.tasks), "plan_derivation_mismatch", "Tasks must be derived from the bound map without manual edits");
+    checkedPlanDerivation(plan);
     return plan;
   }
   gate(project: string, ref: Ref, allowHistorical = false): GateResult {

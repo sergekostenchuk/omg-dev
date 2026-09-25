@@ -12,7 +12,8 @@ import type { BoundTaskObligation } from '../graph/task-obligation-model.js';
 
 export function deriveTasks(project: string, graphHash: string, graph: Graph,
   resolveInput: (producer: string, artifact: string) => Pick<TaskInput, "receipt" | "source">,
-  rules: { version: 1 | 2; owner: (path: string) => WriterProof | null; researchObligations?: Map<string, BoundTaskObligation[]> } = { version: 1, owner: () => null }) {
+  rules: { version: 1 | 2; owner: (path: string) => WriterProof | null; researchObligations?: Map<string, BoundTaskObligation[]>;
+    externalInputs?: 'external-inputs/v1' } = { version: 1, owner: () => null }) {
     const nodes = graph.nodes.filter(node => graph.horizon.includes(node.id));
     requireCondition(nodes.length > 0, "horizon_empty", "There are no current work nodes to compile");
     const ids = new Map(nodes.map(node => [node.id, `task:${hashJson([project, graphHash, node.id]).slice(0,40)}`]));
@@ -26,7 +27,8 @@ export function deriveTasks(project: string, graphHash: string, graph: Graph,
       const inputs: TaskInput[] = [];
       for (const connector of graph.connectors) for (const binding of connector.bindings.filter(binding => binding.level === 3
         && binding.consumers.some(consumer => consumer.node === node.id) && binding.producer.node !== node.id)) {
-        const producerTask = ids.get(binding.producer.node) ?? null;
+        const external = rules.externalInputs === 'external-inputs/v1' && graph.artifacts.some(artifact => artifact.id === connector.artifact && artifact.external);
+        const producerTask = external ? null : ids.get(binding.producer.node) ?? null;
         if (producerTask && binding.anchor === null) {
           edges.push([producerTask, ids.get(node.id)!]);
           inputs.push({ connector: connector.id, artifact: connector.artifact, producerTask, receipt: null, source: null });
@@ -40,7 +42,8 @@ export function deriveTasks(project: string, graphHash: string, graph: Graph,
       for (const predecessor of controlPredecessors(graph, node.id)) {
         if (rules.version === 2 && graph.transfers?.some(transfer => transfer.id === predecessor.id)) continue;
         const producer = graph.nodes.find(item => item.id === predecessor.producer)!;
-        const producerTask = ids.get(producer.id) ?? null;
+        const external = rules.externalInputs === 'external-inputs/v1' && graph.artifacts.some(artifact => artifact.id === producer.outcome && artifact.external);
+        const producerTask = external ? null : ids.get(producer.id) ?? null;
         if (producerTask) {
           edges.push([producerTask, ids.get(node.id)!]);
           inputs.push({ connector: predecessor.id, artifact: producer.outcome, producerTask, receipt: null, source: null });
