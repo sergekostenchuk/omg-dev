@@ -114,7 +114,7 @@ export class Refinement {
       : this.#matchesQuestions(project, level, specs, draft.value.inputs, draft.value.basisContract === 'typed-v1', draft.value.obligationContract === 'evidence-v1'))
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
     "research_contract_mismatch", "Research must use this phase's contract and actual predecessor context");
-    const runtimeAdmissionGuards:Ref[]=[];
+    const runtimeAdmissionGuards:TransactionGuard[]=[];
     if (level !== "R0") {
       const effective = this.environments.effective(project);
       admissionGuards.push(...effective.admissionGuards);

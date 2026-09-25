@@ -1,11 +1,11 @@
 import { researchGapDeferred } from "./research-scope.js";
 import { realpathSync } from "node:fs";
 import { relative } from "node:path";
-import { Store } from "../storage/store.js";
+import { Store, type TransactionGuard } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { STAGES, stageId, type StageArtifact, type Finding, type Ref } from "../pipeline/contracts.js";
+import { STAGES, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
 import type { Source, Observation } from "../evidence/evidence.js";
-import { workspacePath } from "../runtime/environment.js";
+import { workspacePath, uniqueTransactionGuards } from "../runtime/environment.js";
 import type { Graph } from "./model.js";
 import type { TechnicalReport } from "./research-contracts.js";
 import { resolveResearchBasis } from './research-basis.js';
@@ -79,7 +79,7 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   return findings;
 }
 
-export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string, admissionGuards:Ref[]=[]): Finding[] {
+export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string, admissionGuards:TransactionGuard[]=[]): Finding[] {
   return draft.questions.flatMap(questionId => {
     const question = store.get<Question>(questionId)!;
     const field = question.value.spec.field;
@@ -88,7 +88,7 @@ export function technicalResearchFindings(store: Store, discovery: Discovery, dr
       message: "Technical research requires an evidence-assessed report; a manual declaration is insufficient" }];
     const report=draft.fields[field] as unknown as TechnicalReport,observations=discovery.observations(questionId);
     const runtime=collectRuntimeEvidence(store,draft.projectId,question.value.spec,report,observations);
-    admissionGuards.push(...runtime.guards);
+    admissionGuards.push(...uniqueTransactionGuards([...runtime.guards, ...runtime.admissionGuards]));
     return technicalProposalFindings(store, draft.projectId, draft.level, questionId, field,report,observations,graph,root,runtime);
   });
 }

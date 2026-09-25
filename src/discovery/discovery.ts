@@ -1,6 +1,6 @@
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -11,7 +11,7 @@ import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import { deriveFields, type Derivation } from "./derived-draft.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
 import type { TechnicalReport } from '../graph/research-contracts.js';
-import { Environments } from '../runtime/environment.js';
+import { Environments, uniqueTransactionGuards } from '../runtime/environment.js';
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
 
@@ -86,7 +86,7 @@ export class Discovery {
     requireCondition(question.value.status !== "answered", "question_already_answered", "Reopen the question before changing an answer");
     return question;
   }
-  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "design" | "fact" | "research-answer", guards: Ref[]): Revision<DiscoveryDraft> {
+  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "design" | "fact" | "research-answer", guards: TransactionGuard[]): Revision<DiscoveryDraft> {
     const q = question.value; const draft = this.store.get<DiscoveryDraft>(q.draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.projectId === q.projectId
       && draft.value.questions.includes(question.id), "question_unbound", "Question must belong to this draft");
@@ -100,7 +100,7 @@ export class Discovery {
       { id: draft.id, kind: draft.kind, expected: draft.revision, value: { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } } },
       { id, kind, expected: 0, value: answer },
       { id: question.id, kind: question.kind, expected: question.revision, value: { ...q, status: "answered", answer: answerRef } },
-    ], [...guards, ...draft.value.inputs, reference(question), reference(draft)])[0]!;
+    ], uniqueTransactionGuards([...guards, ...draft.value.inputs, reference(question), reference(draft)]))[0]!;
   }
   decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
@@ -126,16 +126,18 @@ export class Discovery {
     const draft = this.store.get<DiscoveryDraft>(question.value.draftId);
     requireCondition(question.value.spec.basisContract === draft?.value.basisContract && question.value.spec.obligationContract === draft?.value.obligationContract,
       'research_contract_mismatch', 'Answer must retain the basis contract of its draft');
-    const runtimeGuards:Ref[]=[];
+    const runtimeGuards:TransactionGuard[]=[];
     if (question.value.spec.basisContract === 'typed-v1') {
       requireCondition(ajv.compile(question.value.spec.schema as object)(assessment.value.value), 'answer_invalid', 'Typed answer must match its recorded schema');
+      const effective = new Environments(this.store).effective(question.value.projectId);
+      runtimeGuards.push(reference(effective.environment), ...effective.guards, ...effective.admissionGuards);
       const result = resolveResearchBasis(this.store, question.value.projectId, assessment.value.value as unknown as TechnicalReport,
-        assessment.value.observations, new Environments(this.store).effective(question.value.projectId).root, question.value.spec.field);
+        assessment.value.observations, effective.root, question.value.spec.field);
       requireCondition(result.findings.length === 0 && Array.isArray(assessment.value.bases)
         && canonical(result.bases) === canonical(assessment.value.bases), 'research_basis_invalid', 'Assessment must retain the exact machine-resolved bases and their proof limits');
       const runtime = collectRuntimeEvidence(this.store,question.value.projectId,question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations);
       requireCondition(canonical(runtime.proofs)===canonical(assessment.value.runtimeProofs??[]),'research_runtime_evidence_invalid','Runtime provenance must remain exact at acceptance');
-      runtimeGuards.push(...runtime.guards);
+      runtimeGuards.push(...runtime.guards, ...runtime.admissionGuards);
       const obligations = obligationEvidenceFindings(question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations,runtime.proofs);
       if (obligations.length) throw new EngineError('research_obligation_evidence_invalid','An assessed value still must satisfy its assigned knowledge kind',obligations);
     }
