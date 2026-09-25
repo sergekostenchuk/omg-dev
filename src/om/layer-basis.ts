@@ -5,6 +5,7 @@ import { Discovery } from "../discovery/discovery.js";
 import { LEVEL, type Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { projectGraph } from "../graph/project.js";
+import { RefinementRelations } from "../graph/relations.js";
 import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "../graph/layer-design.js";
 import { obligationHandoff } from "../graph/obligation-handoff.js";
 import { requireTaskObligations } from "../graph/task-obligations.js";
@@ -12,11 +13,13 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { delivered, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
 import { readRecord } from "./refs.js";
-import { gateCandidate, type CandidateGate, type FrameCandidateRecord } from "./frame-candidate.js";
+import { gateCandidate, readCandidate, type CandidateGate, type FrameCandidateRecord } from "./frame-candidate.js";
 import { WORKS_FRAME_CONTRACT, readFrame, readFrameBasis, carryFrameFills, type FrameFill, type FrameRequest, type ConnectionFrame, type FrameCarrySource } from "./frame-obligations.js";
 import type { LayerProposal } from "./frame-proposals.js";
 import { readAtomicGate, type AtomicGateRecord } from "./atomic-gate.js";
 import { withHistoricalReads, historicalProof, historicalTrace } from "./input.js";
+import { readSeriesAt } from "./series.js";
+import { gapLineKey, GAP_LINE_EXPECTED_RESULT } from "./gap-lines.js";
 
 export const LAYER_BASIS_REFUSAL_CODES = Object.freeze(["layer_basis_request_invalid", "layer_basis_unproven"] as const);
 export interface LayerBasis {
@@ -35,11 +38,16 @@ export interface HistoricalLayerBasis {
 export interface LayerAcceptanceRequest extends LayerEnvelopeRequest { level: 2 | 3 }
 export type AcceptedAtomicGate = AtomicGateRecord['result'] & { basis: Ref };
 export type AcceptedFrameGate = CandidateGate | AcceptedAtomicGate;
-export interface OmFrameAcceptance {
+export const FRAME_ACCEPTANCE_CONTRACT = "om-frame-acceptance/v1" as const;
+export interface FrameAttemptBinding { series: Ref; ordinal: number; obligations: string[] }
+export interface FrameAcceptanceProduction {
+  contract: typeof FRAME_ACCEPTANCE_CONTRACT; binding: FrameAttemptBinding | null; layer: { id: string; revision: number };
+}
+export type OmFrameAcceptance = {
   producer: "om"; candidate: Ref;
   gate: CandidateGate & { name: "G3" } | AcceptedAtomicGate & { name: "G5" };
   graph: Ref; upper: Ref;
-}
+} & (FrameAcceptanceProduction | { contract?: never; binding?: never; layer?: never });
 export type OmAcceptedFrame = {
   project: string; candidateHash: string; layerHash: string; upperHash: string; lowerHash: string;
   fills: FrameFill[]; acceptance: OmFrameAcceptance;
@@ -57,6 +65,9 @@ export interface RebasedLayerRequest {
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const positive = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => Object.keys(value).length === keys.length
+  && Object.keys(value).every(key => keys.includes(key));
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(values: T[]) => [...values].sort((a, b) => order(canonical(a), canonical(b)));
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
@@ -128,6 +139,74 @@ function envelope(store: Store, request: LayerEnvelopeRequest): LayerEnvelope {
   return { graph, layer, references: refs };
 }
 const unique = (items: Ref[]) => sorted([...new Map(items.map(ref => [canonical(ref), ref])).values()]);
+/** A binding names one exact attempt and a nonempty unique set of raw frame-obligation ids. */
+export function isFrameAttemptBinding(value: unknown): value is FrameAttemptBinding {
+  return object(value) && isRef(value['series']) && positive(value['ordinal'])
+    && Array.isArray(value['obligations']) && value['obligations'].length > 0 && Array.from(value['obligations']).every(text)
+    && new Set(value['obligations']).size === value['obligations'].length
+    && exactKeys(value, ['series', 'ordinal', 'obligations']);
+}
+function productionShape(value: unknown, project: string, level: 2 | 3): value is FrameAcceptanceProduction {
+  return object(value) && value['contract'] === FRAME_ACCEPTANCE_CONTRACT && Object.hasOwn(value, 'binding')
+    && (value['binding'] === null || isFrameAttemptBinding(value['binding'])) && object(value['layer'])
+    && value['layer']['id'] === `graph-layer:${project}:${level}` && positive(value['layer']['revision'])
+    && exactKeys(value['layer'], ['id', 'revision']) && exactKeys(value, ['contract', 'binding', 'layer']);
+}
+function acceptanceProduction(value: OmFrameAcceptance, project: string, level: 2 | 3, target: string): FrameAcceptanceProduction | undefined {
+  if (!Object.hasOwn(value, 'contract')) {
+    if (Object.hasOwn(value, 'binding') || Object.hasOwn(value, 'layer'))
+      reject(target, 'acceptance.contract', 'Attempt bindings and result locators require their explicit producer contract');
+    return undefined;
+  }
+  const production = { contract: value.contract, binding: value.binding, layer: value.layer };
+  if (!productionShape(production, project, level))
+    reject(target, 'acceptance.contract', 'The new acceptance contract requires its binding or explicit null and exact result-layer locator');
+  return production;
+}
+/** Historical binding proof; current producers separately guard the exact series revision before their write. */
+export function readFrameAttemptBinding(store: Store, request: {
+  project: string; candidate: Ref; binding: FrameAttemptBinding | null;
+}): OmResult<Sealed<{ binding: FrameAttemptBinding | null; references: Ref[] }>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.candidate)) invalidRequest();
+  return result(() => withHistoricalReads(() => {
+    if (request.binding !== null && !isFrameAttemptBinding(request.binding))
+      reject(request.candidate.id, 'acceptance.binding', 'A binding needs one exact series, positive ordinal and unique obligation ids');
+    if (request.binding === null) return { binding: null, references: [] };
+    const candidate = readCandidate(store, { project: request.project, candidate: request.candidate });
+    if (!candidate.ok) reject(candidate.refusal.at.target, candidate.refusal.at.field ?? 'candidate', candidate.refusal.message);
+    return proveFrameAttemptBinding(store, request.project, candidate.value as Revision<FrameCandidateRecord>, request.binding);
+  }));
+}
+function proveFrameAttemptBinding(store: Store, project: string, candidate: Revision<FrameCandidateRecord>, binding: FrameAttemptBinding): {
+  binding: FrameAttemptBinding; references: Ref[];
+} {
+  const checked = readSeriesAt(store, project, binding.series);
+  if (!checked.ok) reject(checked.refusal.at.target, `acceptance.binding.${checked.refusal.at.field ?? 'series'}`, checked.refusal.message);
+  const attempt = checked.value.value.attempts.find(item => item.ordinal === binding.ordinal);
+  if (!attempt || attempt.outcome !== null || attempt.goal.result !== GAP_LINE_EXPECTED_RESULT
+    || attempt.goal.questions.length === 0 || new Set(attempt.goal.questions).size !== attempt.goal.questions.length)
+    reject(binding.series.id, 'acceptance.binding.goal', 'Acceptance must refer to a running attempt whose goal declared unique frame fillings');
+  const source = readFrame(store, candidate.value.request.frame);
+  if (!source.ok) reject(source.refusal.at.target, `acceptance.binding.${source.refusal.at.field ?? 'frame'}`, source.refusal.message);
+  const { block } = checked.value.value, upper = source.value.upper as Graph, relations = new RefinementRelations(upper);
+  if (!upper.nodes.some(node => node.id === block && node.kind === 'block'))
+    reject(binding.series.id, 'acceptance.binding.block', 'The attempt belongs to a block of the exact source frame');
+  const obligations = new Map(source.value.result.obligations.map(obligation => [obligation.id, obligation]));
+  const declared = new Map(source.value.result.obligations.map(obligation => [gapLineKey(project, obligation.id, 'fill'), obligation]));
+  for (const question of attempt.goal.questions) {
+    const obligation = declared.get(question);
+    if (!obligation || (candidate.value.level === 2 ? obligation.upper.node !== block : !relations.refines(obligation.upper.node, block)))
+      reject(binding.series.id, 'acceptance.binding.goal', 'Every declared filling must be an obligation of this attempt block in the exact source frame');
+  }
+  for (const id of binding.obligations) {
+    const obligation = obligations.get(id), fills = candidate.value.fills.filter(fill => fill.obligation === id);
+    if (!obligation || !attempt.goal.questions.includes(gapLineKey(project, id, 'fill')) || !fills.length
+      || fills.some(fill => fill.source === 'identity'))
+      reject(binding.series.id, 'acceptance.binding.obligations', 'A bound result must be a declared obligation filled by real accepted definitions');
+  }
+  return { binding: { series: binding.series, ordinal: binding.ordinal, obligations: sorted(binding.obligations) },
+    references: unique([reference(candidate), binding.series, ...source.value.references]) };
+}
 /** Legacy consumers use the same envelope rules without inventing research requirements for their era. */
 export function readLayerEnvelope(store: Store, request: LayerEnvelopeRequest): OmResult<Sealed<LayerEnvelope>> {
   requireRequest(store, request);
@@ -150,6 +229,41 @@ export function readLayerAcceptance(store: Store, request: LayerAcceptanceReques
     const uppers = unique(own[0]!.inputs.filter(ref => ref.id === `graph-layer:${request.project}:${request.level - 1}`));
     if (uppers.length !== 1) reject(request.layer.id, "upper", "The producer must name one exact upper basis");
     return historicalBasis(store, { ...request, upper: uppers[0]! }, found);
+  }));
+}
+/** Restore an accepting event's exact output; the new contract never chooses a matching historical layer. */
+export function readAcceptedFrameLayer(store: Store, request: { project: string; level: 2 | 3; frame: Ref }): OmResult<Sealed<{
+  graph: Revision<Graph>; layer: Revision<LayerBasis>; frame: Revision<OmAcceptedFrame>; references: Ref[];
+}>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project)
+    || ![2, 3].includes(request.level) || !isRef(request.frame)) invalidRequest();
+  return result(() => withHistoricalReads(() => {
+    const { project, level } = request, refs: Ref[] = [];
+    const frame = exactRecord<OmAcceptedFrame>(store, request.frame, `om-frame:${project}:${level}`, 'connection-frame', refs);
+    if (!object(frame.value) || frame.value.project !== project || frame.value.level !== level
+      || !object(frame.value.acceptance) || frame.value.acceptance.producer !== 'om' || !isRef(frame.value.acceptance.graph))
+      reject(frame.id, 'acceptance', 'The result must come from an exact candidate-accepting frame');
+    const production = acceptanceProduction(frame.value.acceptance, project, level, frame.id);
+    const layerId = `graph-layer:${project}:${level}`;
+    let layer: Revision<LayerBasis> | null;
+    if (production) {
+      layer = store.get<LayerBasis>(production.layer.id, production.layer.revision);
+      if (!layer || layer.id !== production.layer.id || layer.revision !== production.layer.revision)
+        reject(frame.id, 'acceptance.layer', 'The exact result-layer revision named by the producer is absent');
+    } else {
+      // This first-event lookup is the previous producer's historical contract only.
+      layer = store.history<LayerBasis>(layerId).filter(row => object(row.value) && object(row.value.acceptance)
+        && canonical(row.value.acceptance.frame ?? null) === canonical(request.frame)).sort((a, b) => a.revision - b.revision)[0] ?? null;
+      if (!layer) reject(frame.id, 'acceptance.layer', 'The historical accepting frame needs its saved result layer');
+    }
+    const found = envelope(store, { project, level, graph: frame.value.acceptance.graph, layer: reference(layer) });
+    if (!object(found.layer.value.acceptance) || canonical(found.layer.value.acceptance.frame) !== canonical(request.frame))
+      reject(layerId, 'acceptance.frame', 'The exact result layer must link back to this accepting frame');
+    const basis = readLayerAcceptance(store, { project, level, graph: reference(found.graph), layer: reference(found.layer) });
+    if (!basis.ok) reject(basis.refusal.at.target, basis.refusal.at.field ?? 'acceptance', basis.refusal.message);
+    if (basis.value.producer !== 'om' || canonical(basis.value.frame) !== canonical(request.frame))
+      reject(layerId, 'acceptance.frame', 'The complete output must derive from this exact candidate acceptance');
+    return { graph: found.graph, layer: found.layer, frame, references: unique([...refs, ...found.references, ...basis.value.references]) };
   }));
 }
 function historicalBasis(store: Store, request: HistoricalLayerRequest, found: LayerEnvelope): HistoricalLayerBasis {
@@ -222,7 +336,8 @@ export function lowerLayerHash(graph: Graph, level: 2 | 3): string {
     transfers: own("transfers"), packets: own("packets"), horizon: sorted(projection.horizon) });
 }
 /** Shared accepted-body derivation: the writer and historical reader must not define different acceptance records. */
-export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate: AcceptedFrameGate | Sealed<AcceptedFrameGate>, graph: Ref, upper: Ref): Sealed<OmAcceptedFrame> {
+export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate: AcceptedFrameGate | Sealed<AcceptedFrameGate>, graph: Ref, upper: Ref,
+  production?: FrameAcceptanceProduction): Sealed<OmAcceptedFrame> {
   if (!object(candidate) || !isRef(candidate) || candidate.kind !== "frame-candidate" || candidate.revision !== 1
     || !object(candidate.value) || !text(candidate.value.project) || ![2, 3].includes(candidate.value.level)
     || !object(candidate.value.graph) || !graphShapes[candidate.value.graph.version === 2 ? 1 : 0]!(candidate.value.graph)
@@ -233,6 +348,7 @@ export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate:
     || !hash(gate.graphHash) || !Array.isArray(gate.findings) || gate.findings.length !== 0) invalidRequest();
   const value = candidate.value;
   const level = value.level, upperLevel = (level - 1) as 1 | 2;
+  if (production !== undefined && !productionShape(production, value.project, level)) invalidRequest();
   if (level === 3 ? value.works?.contract !== WORKS_FRAME_CONTRACT || !('gate' in gate) || gate.gate !== 'G5'
     || !('basis' in gate) || !isRef(gate.basis) || !Array.isArray(gate.codes) || gate.codes.length !== 0
     : 'basis' in gate || 'gate' in gate) invalidRequest();
@@ -244,7 +360,9 @@ export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate:
   return sealed({ project: value.project, level, ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}),
     candidateHash: value.graphHash, layerHash: value.layerHash,
     upperHash: value.upperHash, lowerHash: lowerLayerHash(value.graph, level), fills: acceptedCandidateFills(value.fills),
-    acceptance: { producer: "om", candidate: reference(candidate), gate: { name: level === 3 ? "G5" : "G3", ...gate }, graph, upper } }) as Sealed<OmAcceptedFrame>;
+    acceptance: { producer: "om", candidate: reference(candidate), gate: { name: level === 3 ? "G5" : "G3", ...gate }, graph, upper,
+      ...(production === undefined ? {} : { ...production, binding: production.binding === null ? null
+        : { ...production.binding, obligations: sorted(production.binding.obligations) } }) } }) as Sealed<OmAcceptedFrame>;
 }
 
 /** The accepted L3 envelope exposes its exact D7 pair to native consumers of layer inputs. */
@@ -259,6 +377,21 @@ export function acceptedLayerProof(candidate: Revision<FrameCandidateRecord>, up
     || level === 3 && (!object(works) || works.contract !== WORKS_FRAME_CONTRACT || !isRef(works.producer) || !isRef(works.ledger))) invalidRequest();
   return sealed({ level, hash: candidate.value.layerHash,
     inputs: unique([upper, reference(candidate), frame, ...(level === 3 ? [works!.producer, works!.ledger] : [])]) });
+}
+
+/** One complete output formula is shared by the producer and the new historical contract. */
+export function buildAcceptedLayer(candidate: Revision<FrameCandidateRecord>, upper: Revision<LayerBasis>, frame: Ref): Sealed<LayerBasis> {
+  if (!object(candidate) || !object(candidate.value) || ![2, 3].includes(candidate.value.level)
+    || !object(upper) || !isRef(upper) || upper.kind !== 'graph-layer'
+    || !validLayer(upper.value, (candidate.value.level - 1) as 1 | 2)
+    || upper.hash !== hashJson(upper.value) || !object(candidate.value.graph)
+    || !graphShapes[candidate.value.graph.version === 2 ? 1 : 0]!(candidate.value.graph)) invalidRequest();
+  const proof = acceptedLayerProof(candidate, reference(upper), frame);
+  if (canonical(upper.value.projection) !== canonical(projectGraph(candidate.value.graph, (candidate.value.level - 1) as 1 | 2))) invalidRequest();
+  const proofs = [...(upper.value.layerProofs ?? []), { ...proof, inputs: [...proof.inputs] }];
+  return sealed({ projection: projectGraph(candidate.value.graph, candidate.value.level), obligations: upper.value.obligations,
+    layerProofs: proofs, inputs: unique([...upper.value.obligations.flatMap(item => item.inputs), ...proofs.flatMap(item => item.inputs)]),
+    acceptance: { producer: 'om', frame } });
 }
 
 function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revision<LayerBasis>, upperRef: Ref, refs: Ref[]): void {
@@ -276,6 +409,9 @@ function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revisi
     || !('basis' in frame.acceptance.gate) || !isRef(frame.acceptance.gate.basis)))
     reject(frameRef.id, "acceptance.contract", "A work acceptance needs its exact works contract and original G5 basis");
   const witness = frame.acceptance;
+  const production = acceptanceProduction(witness, project, level, frameRef.id);
+  if (production && (production.layer.id !== lower.id || production.layer.revision !== lower.revision))
+    reject(frameRef.id, 'acceptance.layer', 'The layer must be the exact output revision retained by its accepting producer');
   const traced = historicalTrace(store, (ref, _head, method) => { if (method === 'get') refs.push(ref); }, 'distinct');
   {
     const candidate = exactRecord<FrameCandidateRecord>(traced, witness.candidate, witness.candidate.id, "frame-candidate", refs);
@@ -306,7 +442,11 @@ function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revisi
       || frameRef.revision !== (value.base.frame?.revision ?? 0) + 1)
       reject(frameRef.id, "acceptance.graph", "The OM result must be the exact candidate graph at the transition from its named base");
     if (candidate.value.level !== level) reject(frameRef.id, "acceptance.level", "The accepted candidate belongs to this exact layer");
-    const expected = omAcceptedFrame(candidate, verifiedGate, witness.graph, upperRef);
+    if (production && production.binding !== null) {
+      const binding = proveFrameAttemptBinding(traced, project, candidate, production.binding);
+      refs.push(...binding.references);
+    }
+    const expected = omAcceptedFrame(candidate, verifiedGate, witness.graph, upperRef, production);
     if (canonical(frame) !== canonical(expected))
       reject(frameRef.id, "acceptance.fills", "The accepted frame must derive completely from the exact candidate and verified gate");
     if (canonical(witness.upper) !== canonical(upperRef)
@@ -322,11 +462,13 @@ function proveOmLayer(store: Store, project: string, graph: Graph, lower: Revisi
         reject(ref.id, "acceptance.proposals", "OM acceptance must retain every exact proposed-to-accepted transition");
       refs.push(reference(accepted));
     }
-    const upper = readLayer(store, upperRef, project, upperLevel, refs).value;
+    const upperRecord = readLayer(store, upperRef, project, upperLevel, refs), upper = upperRecord.value;
     const proof = acceptedLayerProof(candidate, upperRef, frameRef);
     if (canonical(lower.value.obligations) !== canonical(upper.obligations)
       || canonical(lower.value.layerProofs) !== canonical([...(upper.layerProofs ?? []), proof]))
       reject(lower.id, "acceptance.inputs", "The OM layer must retain exactly its upper proof envelope and own accepted transition");
+    if (production && canonical(lower.value) !== canonical(buildAcceptedLayer(candidate, upperRecord, frameRef)))
+      reject(lower.id, 'acceptance.layer', 'The complete result layer must equal the producer derivation with its exact accepting frame');
   }
 }
 

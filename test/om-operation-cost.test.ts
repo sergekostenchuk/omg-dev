@@ -223,7 +223,14 @@ try {
   const store = cloneStore(seed.database, 'cold-acceptance');
   const accepted = measured('writeWorksAcceptance', () => ok(writeWorksAcceptance(store, f.request))).result;
   assert.equal(accepted.state, 'accepted'); assert.ok(accepted.acceptance);
-  assert.deepEqual(accepted, legacy.accepted, 'The current producer preserves every original acceptance byte, reference and guard');
+  const freshAcceptance = ok(readAcceptedFrame(store, accepted.acceptance));
+  const { contract, binding, layer, ...originalAcceptance } = freshAcceptance.frame.value.acceptance;
+  assert.equal(contract, 'om-frame-acceptance/v1'); assert.equal(binding, null);
+  assert.deepEqual(layer, { id: freshAcceptance.layer.id, revision: freshAcceptance.layer.revision });
+  assert.deepEqual(originalAcceptance, legacy.frame.frame.value.acceptance);
+  assert.deepEqual(freshAcceptance.graph, legacy.frame.graph); assert.deepEqual(freshAcceptance.proposals, legacy.frame.proposals);
+  assert.deepEqual({ ...freshAcceptance.frame.value, acceptance: originalAcceptance }, legacy.frame.frame.value,
+    'The fresh producer changes the explicit acceptance era while preserving its candidate, gate and filled result');
   const sibling = cloneStore(seed.database, 'warm-acceptance');
   const warmAccepted = withHistoricalReads(() => {
     ok(readAcceptedFrame(sibling, { project: f.project, level: 2, graph: f.graph, layer: f.layer2, frame: f.upperFrame }));
@@ -234,7 +241,10 @@ try {
   source.graph = acceptance.graph; source.operations.frame.graph = acceptance.graph;
   source.works = { frame: { ...source.works.frame, graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame }, proposals: [] };
   const current = ok(writeGaps(store, source));
-  assert.deepEqual(current, legacy.current);
+  assert.deepEqual(current.collection, legacy.current.collection); assert.deepEqual(current.gate, legacy.current.gate);
+  assert.deepEqual(current.sources, source);
+  assert.deepEqual(current.records.map(row => row.value.gap), legacy.current.records.map(row => row.value.gap),
+    'D1 preserves the same gap meanings while its exact sources name the fresh accepted frame and layer');
   const gaps = { sources: current.sources, records: current.records.map(reference) };
   const declared = f.openGoal, goal = declared.goal;
   const targets = f.gaps.records.map(row => row.value.gap).filter(gap => gap.code === 'obligation_open'
@@ -251,7 +261,20 @@ try {
         attempt: { series: declared.series, attempt: declared.ordinal } })) };
     const before = copy.list().map(reference);
     const cold = measured('prepareGapLines.' + size, () => ok(prepareGapLines(copy, request)));
-    if (size === 4) assert.deepEqual(cold.result, legacy.prepared, 'Current full preparation preserves the accepted producer references and guards');
+    if (size === 4) {
+      const oldFrame = legacy.accepted.acceptance.frame;
+      const expectedLines = legacy.prepared.record.lines.map(line => line.basis && canonical(line.basis) === canonical(oldFrame)
+        ? { ...line, basis: acceptance.frame } : line);
+      assert.deepEqual(cold.result.record.lines, expectedLines);
+      const byCanonical = (a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0;
+      assert.deepEqual(cold.result.record.request, { ...request,
+        gaps: { ...request.gaps, records: [...request.gaps.records].sort(byCanonical) },
+        closures: [...request.closures].sort(byCanonical) });
+      for (const ref of [acceptance.graph, acceptance.layer, acceptance.frame, declared.series])
+        assert.ok(cold.result.guards.some(guard => canonical(guard) === canonical(ref)), 'Fresh preparation guards ' + ref.id);
+      assert.ok(!cold.result.references.some(ref => canonical(ref) === canonical(oldFrame)),
+        'The newly closed lines retain the exact current acceptance rather than the old producer hash');
+    }
     if (preparationFamilies === null) preparationFamilies = cold.families;
     else assert.deepEqual(cold.families, preparationFamilies, 'More closures of the same frame do not create additional historical foundations');
     const next = measured('prepareGapLines.external.' + size, () => ok(prepareGapLines(copy, request)));
@@ -268,7 +291,12 @@ try {
     const saved = ok(writeGapLines(copy, request));
     const confirmation = { project: f.project, block: declared.block, target: declared.series.id, goal, accepting: [reference(saved)], cancelling: [] };
     const confirmed = measured('confirmResults.' + size, () => ok(confirmResults(copy, confirmation)));
-    if (size === 4) assert.deepEqual(confirmed.result, legacy.confirmed);
+    if (size === 4) {
+      assert.deepEqual(confirmed.result.achieved.map(item => item.key), legacy.confirmed.achieved.map(item => item.key));
+      assert.deepEqual(confirmed.result.cancelled, legacy.confirmed.cancelled);
+      assert.ok(confirmed.result.achieved.every(item => canonical(item.basis) === canonical(reference(saved))),
+        'Stable result keys use the exact fresh D2 acceptance as their basis');
+    }
     if (confirmationFamilies === null) confirmationFamilies = confirmed.families;
     else assert.deepEqual(confirmed.families, confirmationFamilies, 'Distinct result keys share the same exact accepted frame and prior D2 history');
     assert.equal(confirmed.result.achieved.length, size);

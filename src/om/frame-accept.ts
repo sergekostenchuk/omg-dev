@@ -1,14 +1,15 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
-import { projectGraph } from '../graph/project.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, type FrameCandidateRecord } from './frame-candidate.js';
 import type { LayerProposal, ProposalObservation, ProposalRequest } from './frame-proposals.js';
 import { WORKS_FRAME_CONTRACT, currentFrameRequest, prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
 import type { Finding } from '../pipeline/contracts.js';
-import { omAcceptedFrame, acceptedLayerProof, readLayerAcceptance, type AcceptedFrameGate, type LayerBasis, type OmAcceptedFrame } from './layer-basis.js';
+import { omAcceptedFrame, buildAcceptedLayer, readLayerAcceptance, readAcceptedFrameLayer, readFrameAttemptBinding, isFrameAttemptBinding, FRAME_ACCEPTANCE_CONTRACT,
+  type FrameAttemptBinding, type AcceptedFrameGate, type LayerBasis, type OmAcceptedFrame } from './layer-basis.js';
+import { prepareSeriesLineAdmission } from './series.js';
 import { prepareAtomicGate, readAtomicGate, type AtomicGateRequest, type AtomicGateRecord } from './atomic-gate.js';
 import { journalId, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, REFUSAL_JOURNAL_KIND,
   type RefusalJournal, type UnitRefusalRecord, type OriginSource } from './refusal-journal.js';
@@ -21,7 +22,7 @@ export const FRAME_ACCEPT_CODES = Object.freeze([
   'input_stale', 'frame_acceptance_invalid',
 ] as const);
 export interface FrameGateOutcome { gate: 'G3' | 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[]; basis?: Ref }
-export interface SettleCandidateRequest { project: string; level: 2 | 3; candidate: Ref; outcome: FrameGateOutcome }
+export interface SettleCandidateRequest { project: string; level: 2 | 3; candidate: Ref; outcome: FrameGateOutcome; binding?: FrameAttemptBinding | null }
 export interface Settlement {
   state: 'accepted' | 'rejected' | 'unchanged' | 'obsolete';
   graph: Revision<Graph> | null; layer: Revision<LayerBasis> | null; frame: Revision<OmAcceptedFrame> | null;
@@ -56,6 +57,7 @@ function invalid(field: string): never {
 function requireRequest(store: Store, value: unknown): asserts value is SettleCandidateRequest {
   if (!(store instanceof Store)) invalid('store');
   if (!object(value) || !text(value['project']) || ![2, 3].includes(value['level'] as number) || !isRef(value['candidate'])) invalid('request');
+  if (Object.hasOwn(value, 'binding') && value['binding'] !== null && !isFrameAttemptBinding(value['binding'])) invalid('binding');
   const outcome = value['outcome'];
   if (!object(outcome) || !['G3', 'G5'].includes(outcome['gate'] as string) || !isRef(outcome['candidate'])
     || !hash(outcome['graphHash']) || typeof outcome['passed'] !== 'boolean' || !Array.isArray(outcome['codes'])
@@ -87,31 +89,33 @@ export function readAcceptedFrame(store: Store, request: AcceptedFrameRequest): 
       fail('frame_acceptance_invalid', request.frame.id, 'acceptance', 'A rebase cannot substitute for an actual candidate acceptance');
     const graph = exact<Graph>(store, request.graph, `graph:${request.project}`, 'graph');
     const layer = exact<LayerBasis>(store, request.layer, `graph-layer:${request.project}:${request.level}`, 'graph-layer');
-    const candidate = take(readCandidate(store, { project: request.project, candidate: frame.value.acceptance.candidate }));
     if (!same(request.graph, frame.value.acceptance.graph))
       fail('frame_acceptance_invalid', request.graph.id, 'graph', 'The historical event names its exact accepted graph revision');
-    // The shared layer reader already verified each accepted transition against its original proposal.
-    const proposals = candidate.value.proposals.map(ref => store.get<LayerProposal>(ref.id, ref.revision + 1)!);
-    return { state: 'accepted', graph, layer, frame, proposals };
+    return acceptedSettlement(store, { graph, layer, frame });
   });
+}
+function acceptedSettlement(store: Store, found: { graph: Revision<Graph>; layer: Revision<LayerBasis>; frame: Revision<OmAcceptedFrame> }): Settlement {
+  const { graph, layer, frame } = found;
+  const candidate = take(readCandidate(store, { project: frame.value.project, candidate: frame.value.acceptance.candidate }));
+  // The common layer reader already proved every proposed-to-accepted transition.
+  const proposals = candidate.value.proposals.map(ref => store.get<LayerProposal>(ref.id, ref.revision + 1)!);
+  return { state: 'accepted', graph, layer, frame, proposals };
 }
 function priorAcceptance(store: Store, request: SettleCandidateRequest): Settlement | null {
   for (const row of store.history<OmAcceptedFrame>(`om-frame:${request.project}:${request.level}`)) {
     if (!object(row.value) || !object(row.value.acceptance) || !same(row.value.acceptance.candidate ?? null, request.candidate)) continue;
     if (!isRef(row.value.acceptance.graph))
       fail('frame_acceptance_invalid', row.id, 'acceptance.graph', 'The accepting event must name its exact result graph');
-    const layers = store.history<LayerBasis>(`graph-layer:${request.project}:${request.level}`).filter(layer =>
-      object(layer.value) && object(layer.value.acceptance) && same(layer.value.acceptance.frame ?? null, reference(row)));
-    if (!layers.length) fail('frame_acceptance_invalid', row.id, 'layer', 'An accepting frame needs its saved result layer');
-    // Later identical revisions do not replace the original accepting event.
-    layers.sort((a, b) => a.revision - b.revision);
-    return take(readAcceptedFrame(store, { project: request.project, level: request.level,
-      graph: row.value.acceptance.graph, layer: reference(layers[0]!), frame: reference(row) })) as Settlement;
+    const found = take(readAcceptedFrameLayer(store, { project: request.project, level: request.level, frame: reference(row) }));
+    if (!same(found.frame.value.acceptance.binding ?? null, request.binding ?? null))
+      fail('frame_acceptance_invalid', row.id, 'acceptance.binding', 'An accepted candidate cannot be assigned to a different attempt or obligation set');
+    return acceptedSettlement(store, found as unknown as Parameters<typeof acceptedSettlement>[1]);
   }
   return null;
 }
 function normalizeOutcome(request: SettleCandidateRequest): SettleCandidateRequest {
-  return sealed({ ...request, outcome: { ...request.outcome, codes: sorted(request.outcome.codes) } }) as SettleCandidateRequest;
+  return sealed({ ...request, ...(request.binding ? { binding: { ...request.binding, obligations: sorted(request.binding.obligations) } } : {}),
+    outcome: { ...request.outcome, codes: sorted(request.outcome.codes) } }) as SettleCandidateRequest;
 }
 function workRejectionId(request: SettleCandidateRequest): string {
   return `om-work-rejection:${request.project}:${hashJson([request.candidate, request.outcome.basis])}`;
@@ -275,6 +279,8 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
       fail('candidate_graph_mismatch', candidate.id, 'candidate', 'Current preparation did not reproduce this exact saved candidate');
     if (atomic && !atomic.value.result.passed) return prepareWorkRejection(store, request, candidate,
       atomic as Revision<AtomicGateRecord>, unique([...prepared.guards, ...gateGuards, request.candidate]), prepared.expected);
+    const binding = take(readFrameAttemptBinding(store, { project: request.project, candidate: request.candidate, binding: request.binding ?? null })).binding;
+    const bindingGuards = binding ? take(prepareSeriesLineAdmission(store, request.project, binding.series)).guards : [];
     const upperId = `graph-layer:${request.project}:${request.level - 1}`;
     const upperCandidates = prepared.guards.filter(ref => ref.id === upperId);
     if (upperCandidates.length !== 1) fail('frame_acceptance_invalid', upperId, 'upper', 'The acceptance must retain exactly one admitted upper basis');
@@ -282,14 +288,12 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     const upper = exact<LayerBasis>(store, upperRef, upperId, 'graph-layer');
     const graphWrite: Write = { id: `graph:${request.project}`, kind: 'graph', expected: prepared.expected.graph, value: candidate.value.graph };
     const graph = proposedRevision<Graph>(graphWrite);
-    const frameValue = omAcceptedFrame(candidate, checked, reference(graph), upperRef);
+    const frameValue = omAcceptedFrame(candidate, checked, reference(graph), upperRef, { contract: FRAME_ACCEPTANCE_CONTRACT,
+      binding: binding ? { ...binding, obligations: [...binding.obligations] } : null,
+      layer: { id: `graph-layer:${request.project}:${request.level}`, revision: prepared.expected.layer + 1 } });
     const frameWrite: Write = { id: `om-frame:${request.project}:${request.level}`, kind: 'connection-frame', expected: prepared.expected.frame, value: frameValue };
     const frame = proposedRevision<OmAcceptedFrame>(frameWrite);
-    const own = acceptedLayerProof(candidate, upperRef, reference(frame));
-    const proofs = [...(upper.value.layerProofs ?? []), { ...own, inputs: [...own.inputs] }];
-    const layerValue: LayerBasis = { projection: projectGraph(candidate.value.graph, request.level), obligations: upper.value.obligations,
-      layerProofs: proofs, inputs: unique([...upper.value.obligations.flatMap(item => item.inputs), ...proofs.flatMap(proof => proof.inputs)]),
-      acceptance: { producer: 'om', frame: reference(frame) } };
+    const layerValue = buildAcceptedLayer(candidate, upper, reference(frame));
     const layerWrite: Write = { id: `graph-layer:${request.project}:${request.level}`, kind: 'graph-layer', expected: prepared.expected.layer, value: layerValue };
     const layer = proposedRevision<LayerBasis>(layerWrite);
     const proposalWrites = candidate.value.proposals.map(ref => {
@@ -299,7 +303,7 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     });
     const proposals = proposalWrites.map(write => proposedRevision<LayerProposal>(write));
     return { result: { state: 'accepted', graph, layer, frame, proposals },
-      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: unique([...prepared.guards, ...gateGuards, request.candidate, upperRef]), expected: prepared.expected };
+      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: unique([...prepared.guards, ...gateGuards, ...bindingGuards, request.candidate, upperRef]), expected: prepared.expected };
   });
 }
 export function settleCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<Settlement>> {

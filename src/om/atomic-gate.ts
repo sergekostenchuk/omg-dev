@@ -20,6 +20,7 @@ import { readDeliveries } from './deliveries.js';
 import { prepareSettleCandidate, readAcceptedFrame, readRejectedCandidate, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
 import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
+import { isFrameAttemptBinding, type FrameAttemptBinding } from './layer-basis.js';
 import type { ProposalRequest } from './frame-proposals.js';
 import { prepareGapLines, readGapLines } from './gap-lines.js';
 import { prepareCurrentGaps, prepareGaps, readGaps, type GapCollection, type GapReadRequest, type GapRequest } from './gaps.js';
@@ -354,7 +355,7 @@ export function writeAtomicGate(store: Store, request: AtomicGateRequest): OmRes
   });
 }
 
-export interface WorksAcceptanceRequest { project: string; results: WorkProposalSource[]; environment: Ref; sources: Ref[] }
+export interface WorksAcceptanceRequest { project: string; results: WorkProposalSource[]; environment: Ref; sources: Ref[]; binding?: FrameAttemptBinding | null }
 export interface WorksAcceptanceRecord {
   contract: 'om-works-acceptance/v1'; request: WorksAcceptanceRequest; gate: Ref;
   acceptance: AcceptedFrameRequest | null;
@@ -366,7 +367,12 @@ export interface PreparedWorksAcceptance {
 function requireAcceptance(store: Store, request: WorksAcceptanceRequest): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.environment)
     || !sourcesShape(request.results) || !request.results.length || !sourcesRefs(request.sources)
-    || Object.keys(request).some(key => !['project', 'results', 'environment', 'sources'].includes(key))) invalid('acceptance');
+    || Object.keys(request).some(key => !['project', 'results', 'environment', 'sources', 'binding'].includes(key))
+    || Object.hasOwn(request, 'binding') && request.binding !== null && !isFrameAttemptBinding(request.binding)) invalid('acceptance');
+}
+function normalizeAcceptance(request: WorksAcceptanceRequest): WorksAcceptanceRequest {
+  return { project: request.project, results: sorted(copy(request.results)), environment: copy(request.environment), sources: sorted(copy(request.sources)),
+    ...(request.binding ? { binding: { ...copy(request.binding), obligations: sorted(request.binding.obligations) } } : {}) };
 }
 const acceptanceId = (request: WorksAcceptanceRequest) => `om-works-acceptance:${request.project}:${hashJson(request)}`;
 function acceptanceRow(value: WorksAcceptanceRecord): Revision<WorksAcceptanceRecord> {
@@ -385,6 +391,7 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
     const gate = take(readAtomicGate(store, { project: request.project, record: value.gate }));
     if (!same(gate.value.request.results, value.request.results) || !same(gate.value.request.environment, value.request.environment)
       || !same(gate.value.request.sources, value.request.sources)
+      || !same(value.request, normalizeAcceptance(value.request as WorksAcceptanceRequest))
       || !same(saved, acceptanceRow(value as WorksAcceptanceRecord)))
       fail('atomic_gate_record_forged', saved.id, 'request', 'Acceptance must name the same checked answers and configuration as G5');
     if (gate.value.result.passed) {
@@ -392,7 +399,8 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
       const accepted = take(readAcceptedFrame(store, value.acceptance as AcceptedFrameRequest));
       if (!accepted.frame || accepted.frame.value.acceptance.gate.name !== 'G5'
         || !same(accepted.frame.value.acceptance.candidate, gate.value.result.candidate)
-        || !same(accepted.frame.value.acceptance.gate.basis, value.gate))
+        || !same(accepted.frame.value.acceptance.gate.basis, value.gate)
+        || !same(accepted.frame.value.acceptance.binding ?? null, value.request.binding ?? null))
         fail('atomic_gate_record_forged', saved.id, 'gate', 'The accepted layer must preserve this exact G5 outcome');
     } else {
       if (value.acceptance !== null) fail('atomic_gate_record_forged', saved.id, 'acceptance', 'A refused gate cannot claim an accepted graph');
@@ -407,7 +415,7 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
 export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest): OmResult<Sealed<PreparedWorksAcceptance>> {
   return run(() => {
     requireAcceptance(store, raw);
-    const request = { ...copy(raw), results: sorted(raw.results), sources: sorted(raw.sources) }, id = acceptanceId(request), existing = store.get(id);
+    const request = normalizeAcceptance(raw), id = acceptanceId(request), existing = store.get(id);
     if (existing) {
       const saved = take(readWorksAcceptance(store, { project: request.project, record: reference(existing) }));
       return { state: 'unchanged' as const, record: saved as Revision<WorksAcceptanceRecord>, acceptance: saved.value.acceptance as AcceptedFrameRequest | null,
@@ -460,7 +468,7 @@ export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest
     const neighbors = take(prepareNeighbors(tx.view, { project: request.project, candidate: candidateRef })); tx.add(neighbors);
     const gate = take(prepareAtomicGate(tx.view, { project: request.project, candidate: candidateRef, neighbors: neighbors.reference,
       environment: request.environment, gaps: gapRead, results: request.results, sources: request.sources })); tx.add(gate);
-    const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef,
+    const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef, binding: request.binding ?? null,
       outcome: { ...gate.record.value.result, codes: [...gate.record.value.result.codes], basis: reference(gate.record) } })); tx.add(settlement);
     const accepted = settlement.result;
     const acceptance: AcceptedFrameRequest | null = gate.record.value.result.passed && accepted.graph && accepted.layer && accepted.frame
