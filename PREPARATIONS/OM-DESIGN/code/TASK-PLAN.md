@@ -1460,11 +1460,12 @@
 - Отдаёт: output-map
 - Читает записи: MachinePlan.graphSnapshot; записи каркасов и оснований по охранным ссылкам плана (точные ревизии)
 - Пишет записи: —
-- Разрешённые пути: `src/compiler/context.ts`, `src/compiler/compiler.ts`, `src/execution/runner.ts`, `test/om-task-neighbors.test.ts`
+- Разрешённые пути: `src/compiler/context.ts`, `src/compiler/compiler.ts`, `src/execution/runner.ts`, `test/om-task-neighbors.test.ts`, `test/om-handoff.test.ts`, `test/om-feasibility-boundary.test.ts`
 - Из движка как есть: taskContext — src/compiler/context.ts:19; Compiler.context — src/compiler/compiler.ts:108; Executor — src/execution/runner.ts:106; F4; V1
 - После: F4, G2, V1
 - **Изменение движка:** объявленное изменение: поле соседей в контексте выдачи задачи у двух потребителей; вместимость исполнителя из единого источника
 - Тесты сверх обязательных:
+  - шов №1001: om-handoff.test.ts:220 и om-feasibility-boundary.test.ts:434/:521 — только замена maxContextChars:100_000 на V1 (200_000), следствие правила «исполнитель эры M8 отвергает maxContextChars, отличный от V1»
   - ОСМОТР ПОСЛЕ G1–G2 (оркестратор): у плана эры M8 (plan.feasibility в пространстве om-feasibility) plan.guards содержит только непосредственные stage/feasibility/graph/environment и stage.proofs (договор G1.1 №912-3/№920) — каркасы и основания НЕ обязательно лежат в plan.guards; их точные ревизии даёт общий исторический читатель M8 по сохранённым inputs om-m8/v2 и deliveries; прежняя эра — прежняя формула по plan.guards; Compiler.context/detail после G1.1 перепроверяют исходный допуск перед выдачей; currentBasis исполнителя признаёт продвижение writer-index собственными прогонами (G1.1); сначала опись стыков — откуда каждый потребитель берёт точные ревизии каркасов и оснований в обеих эрах; путь вне списка — стоп и вопрос
   - стык V2 (№722): оба потребителя (Compiler.context и исполнитель) получают одинаковое содержательное наполнение из V2; исполнитель дополняет его настоящими данными (parent, фактические inputs/ownership, correction, protocol/requestId/mode/model/effort/speed/prompt/subject) и проверяет ВЕСЬ фактически отправляемый конверт величиной V1 до запуска процесса; «контекст помещается, полный конверт превышает лимит» — адресный отказ без отправки; произвольный резерв, усечение и пустые будущие данные недопустимы; G3 подключает загрузку оснований и отправку, а не впервые добавляет соседей в измеренный F5 договор
   - контекст узла, участвующий в подписи узла, НЕ изменился: подписи и хэш плана прежние, прежние квитанции годны
