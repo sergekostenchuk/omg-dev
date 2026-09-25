@@ -1396,11 +1396,12 @@
 - Отдаёт: M9 · Передать компилятору; Журнал отказов ворот
 - Читает записи: om-input:<project> rev 1 (B1) и B1-зависимые записи; прежние черновики om-g2/compilation
 - Пишет записи: — (типизированные отказы прежних производящих входов в эре OM)
-- Разрешённые пути: `src/product/preparation-run.ts`, `src/product/repairs.ts`, `src/product/engine.ts`, `test/om-legacy-route-closure.test.ts`
+- Разрешённые пути: `src/product/preparation-run.ts`, `src/product/repairs.ts`, `src/product/engine.ts`, `src/compiler/compiler.ts`, `src/graph/refinement.ts`, `src/pipeline/pipeline.ts`, `test/om-legacy-route-closure.test.ts`
 - Из движка как есть: общий доказательный определитель эры и распознавание потерянного B1 — src/product/engine.ts (G1.2); refinement.assess extra TransactionGuard[] (G1.2); AbsentGuard — src/storage/store.ts (D8.0)
 - После: G1.2
 - **Изменение движка:** объявленное изменение: закрытие прежних производящих маршрутов в проекте эры OM (вердикт №941)
 - Тесты сверх обязательных:
+  - шов №954-1 (оркестратор): явный канал extraGuards: TransactionGuard[] в Compiler.compile/publish, Refinement.publish, Pipeline.accept — только транзакционные охраны; сохраняемые inputs/proofs/MachinePlan, исторические читатели и завершённые повторы (compile — существующий точный план; accept — уже accepted при точном expected) не меняются; без extra — байт в байт
   - вердикт №941 (~/REPORTS/review/omg-code-g12_verdict-941.md): в проекте эры OM закрыть preparation-run (product/preparation-run.ts:53–60), repairs (product/repairs.ts:110–118), прямые draft-om, compile, draft-plan и accept-stage для прежних черновиков om-g2/compilation; одних проверок в двух оркестраторах недостаточно; общий доказательный определитель эры; прежняя ветвь несёт отрицательную охрану B1 до транзакции; подготовка и ремонт останавливаются ДО новых исследований и изменения графа; НЕ затрагивать точное историческое чтение, завершённые повторы и выполнение/возобновление уже принятого прежнего плана; безусловный запрет в общих исторических читателях или во всех вызовах feasibilityGate/Compiler.gate — слишком широк
   - регрессии: смешанный проект legacy → B1 — по каждому перечисленному производящему входу отказ с адресом; гонка появления B1 вторым Store между выбором прежнего маршрута и транзакцией — атомарный отказ; прежний проект без B1 — прежнее поведение байт в байт; уже принятый прежний план исполняется и возобновляется; если нужен путь вне списка (pipeline/compiler) — стоп и вопрос
 
