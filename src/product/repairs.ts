@@ -1,12 +1,12 @@
 import type { ProductEngine } from "./engine.js";
-import type { Revision } from "../storage/store.js";
+import type { Revision, TransactionGuard } from "../storage/store.js";
 import type { TaskRun } from "../execution/model.js";
 import { runId } from "../execution/model.js";
 import { acquire, release } from "../execution/lock.js";
 import { parkCandidate } from "../execution/park.js";
 import { canonical, hashJson } from "../canonical.js";
-import { requireCondition } from "../errors.js";
-import { reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { EngineError, requireCondition } from "../errors.js";
+import { reference, isRef, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { git } from "../runtime/environment.js";
 import type { Source } from "../evidence/evidence.js";
 import type { PlanDefect, PlanReissue } from "../graph/plan-defects.js";
@@ -27,10 +27,39 @@ export interface PlanRepair {
 export class PlanRepairs {
   constructor(private readonly engine: ProductEngine) {}
   async prepare(project: string, runRef: Ref): Promise<Revision<PlanRepair>> {
+    return this.#prepare(project, runRef, this.engine.legacyRoute(project));
+  }
+  async #prepare(project: string, runRef: Ref, route: { om: boolean; guards: TransactionGuard[] }): Promise<Revision<PlanRepair>> {
     const { store, compiler, discovery, graphs, refinement } = this.engine;
+    requireCondition(isRef(runRef), "repair_run_foreign", "Repair needs an exact failed plan attempt");
+    const id = `plan-repair:${hashJson(runRef)}`;
+    if (route.om) {
+      const previous = store.get<PlanRepair>(id);
+      if (previous?.kind === "plan-repair" && previous.value?.projectId === project && previous.value.phase === "reissued"
+        && isRef(previous.value.run) && canonical(previous.value.run) === canonical(runRef) && isRef(previous.value.plan) && isRef(previous.value.defect)) {
+        const plan = compiler.read(previous.value.plan.id);
+        const result: PlanReissue = { projectId: project, defect: previous.value.defect, plan: previous.value.plan };
+        const reissue = store.get<PlanReissue>(`plan-reissue:${hashJson(result)}`);
+        const defect = store.get<PlanDefect>(previous.value.defect.id, previous.value.defect.revision);
+        const failed = store.get<TaskRun>(runRef.id, runRef.revision);
+        const accepted = store.history<StageArtifact>(stageId(project, "compilation")).some(stage => stage.kind === "stage"
+          && stage.value?.projectId === project && stage.value.stage === "compilation" && stage.value.status === "accepted"
+          && canonical(stage.value.content ?? null) === canonical({ plan: previous.value.plan })
+          && Array.isArray(stage.value.inputs) && stage.value.inputs.length === 1 && canonical(stage.value.inputs[0]) === canonical(plan.value.stage)
+          && Array.isArray(stage.value.proofs) && stage.value.proofs.some(ref => canonical(ref) === canonical(previous.value.plan)));
+        if (plan.value.projectId === project && canonical(reference(plan)) === canonical(previous.value.plan) && accepted
+          && reissue?.kind === "plan-reissue" && canonical(reissue.value) === canonical(result)
+          && defect?.kind === "plan-defect" && canonical(reference(defect)) === canonical(previous.value.defect)
+          && defect.value?.projectId === project && isRef(defect.value.run) && canonical(defect.value.run) === canonical(runRef)
+          && failed?.kind === "task-run" && canonical(reference(failed)) === canonical(runRef)
+          && failed.value?.projectId === project && failed.value.state === "needs_plan"
+          && isRef(failed.value.plan) && canonical(defect.value.plan ?? null) === canonical(failed.value.plan)) return previous;
+      }
+      throw new EngineError("legacy_route_closed", "OM projects cannot continue legacy plan repair", { unit: "product", target: `om-input:${project}` });
+    }
     const lock = acquire(store, project);
     try {
-      const id = `plan-repair:${hashJson(runRef)}`, previous = store.get<PlanRepair>(id);
+      const previous = store.get<PlanRepair>(id);
       if (previous) { requireCondition(previous.value.projectId === project, "repair_foreign", "Repair belongs to another project"); return previous; }
       const run = store.get<TaskRun>(runRef.id);
       requireCondition(run?.kind === "task-run" && canonical(reference(run)) === canonical(runRef) && run.value.projectId === project
@@ -56,18 +85,19 @@ export class PlanRepairs {
       const defect = store.get<PlanDefect>(defectId) ?? store.writeMany<PlanDefect>([{ id: defectId, kind: "plan-defect", expected: 0,
         value: { projectId: project, run: runRef, plan: run.value.plan, node: task.node,
           question: `Исполнение не смогло подтвердить результат «${task.title}»: ${run.value.review?.findings.join("; ") ?? run.value.error}. Исправь причину в плане, а не повторяй то же задание.`,
-          source: reference(source), parked: reference(parked) } }], [runRef, reference(source), reference(parked)])[0]!;
+          source: reference(source), parked: reference(parked) } }], [runRef, reference(source), reference(parked), ...route.guards])[0]!;
       if (canonical(currentGraph.value.horizon) !== canonical(remaining)) graphs.save(project, { ...currentGraph.value, horizon: remaining }, currentGraph.revision, "engine:plan-repair");
       const level = refinement.gate(project, "L2").findings.length ? 1 : 2;
       const draft = refinement.begin(project, level === 1 ? "R1" : "R2");
       return store.writeMany<PlanRepair>([{ id, kind: "plan-repair", expected: 0, value: { projectId: project, run: runRef,
         defect: reference(defect), parked: reference(parked), level, phase: "research", draftId: draft.id, plan: null, error: null } }],
-      [runRef, reference(defect), reference(parked)])[0]!;
+      [runRef, reference(defect), reference(parked), ...route.guards])[0]!;
     } finally { release(store, lock); }
   }
   async run(project: string, runRef: Ref, maxTurns: number): Promise<Revision<PlanRepair>> {
     requireCondition(Number.isInteger(maxTurns) && maxTurns > 0 && maxTurns <= 100, "research_budget_invalid", "Repair needs a bounded research allowance");
-    let repair = await this.prepare(project, runRef);
+    const route = this.engine.legacyRoute(project);
+    let repair = await this.#prepare(project, runRef, route);
     if (repair.value.phase === "reissued") return repair;
     const { store, researcher, refinement, compiler, pipeline } = this.engine;
     const lock = acquire(store, project); let remaining = maxTurns;
@@ -108,22 +138,22 @@ export class PlanRepairs {
           }
         } else {
           const old = store.get<Feasibility>(`feasibility:${project}`);
-          const feasibility = old && refinement.feasibilityGate(project, reference(old)).findings.length === 0 ? old : refinement.assess(project, old?.revision ?? 0);
+          const feasibility = old && refinement.feasibilityGate(project, reference(old)).findings.length === 0 ? old : refinement.assess(project, old?.revision ?? 0, route.guards);
           requireCondition(feasibility.value.ready, "repair_not_feasible", "The corrected map still has unresolved feasibility findings");
           const stage = store.get<StageArtifact>(stageId(project, "om-g2"));
           if (canonical(stage?.value.content ?? null) !== canonical({ feasibility: reference(feasibility) }) || stage?.value.status !== "accepted") {
-            const artifact = refinement.publish(project, reference(feasibility), stage?.revision ?? 0); pipeline.accept(project, "om-g2", artifact.revision);
+            const artifact = refinement.publish(project, reference(feasibility), stage?.revision ?? 0, route.guards); pipeline.accept(project, "om-g2", artifact.revision, route.guards);
           }
-          const plan = compiler.compile(project);
+          const plan = compiler.compile(project, route.guards);
           const prior = store.get<StageArtifact>(stageId(project, "compilation"));
           if (canonical(prior?.value.content ?? null) !== canonical({ plan: reference(plan) }) || prior?.value.status !== "accepted") {
-            const artifact = compiler.publish(project, reference(plan), prior?.revision ?? 0); pipeline.accept(project, "compilation", artifact.revision);
+            const artifact = compiler.publish(project, reference(plan), prior?.revision ?? 0, route.guards); pipeline.accept(project, "compilation", artifact.revision, route.guards);
           }
           const result: PlanReissue = { projectId: project, defect: repair.value.defect, plan: reference(plan) };
           repair = store.writeMany<PlanRepair>([
             { id: repair.id, kind: repair.kind, expected: repair.revision, value: { ...repair.value, phase: "reissued", plan: reference(plan), error: null } },
             { id: `plan-reissue:${hashJson(result)}`, kind: "plan-reissue", expected: 0, value: result },
-          ], [reference(plan), repair.value.defect])[0]!;
+          ], [reference(plan), repair.value.defect, ...route.guards])[0]!;
         }
       }
       return repair;

@@ -321,6 +321,54 @@ export class ProductEngine {
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
     };
   }
+  /** Capture the absent dependency before resolving the project era. It belongs only to new production. */
+  legacyRoute(project: string): { om: boolean; guards: TransactionGuard[] } {
+    const guards: TransactionGuard[] = [{ id: `om-input:${project}`, absent: true }];
+    return { om: this.#omProject(project), guards };
+  }
+  #legacyProductionGuards(project: string): TransactionGuard[] {
+    const route = this.legacyRoute(project);
+    if (route.om)
+      throw new EngineError('legacy_route_closed', 'New legacy production is closed after the first OM input',
+        { unit: 'product', target: `om-input:${project}` });
+    return route.guards;
+  }
+  #production<T>(project: string, guards: TransactionGuard[], produce: () => T): T {
+    try { return produce(); }
+    catch (error) {
+      const id = `om-input:${project}`;
+      if (error instanceof EngineError && error.code === 'input_stale'
+        && guards.some(guard => guard.id === id && 'absent' in guard)
+        && !transactionGuardsCurrent(this.store, [{ id, absent: true }]))
+        throw new EngineError(error.code, error.message, { unit: 'product', target: id });
+      throw error;
+    }
+  }
+  #planProductionGuards(project: string, planRef: Ref): TransactionGuard[] {
+    const plan = this.store.get<MachinePlan>(planRef.id, planRef.revision);
+    // The publisher still proves this exact plan. Only the declared producer address selects the route.
+    return plan?.value?.feasibility?.id === `om-feasibility:${project}` ? []
+      : this.#legacyProductionGuards(project);
+  }
+  compile(project: string, extraGuards: TransactionGuard[] = []) {
+    assertPilotBoundary(this.store, project, 'R3');
+    this.#project(project);
+    const route = this.legacyRoute(project);
+    const basis = this.store.get<StageArtifact>(stageId(project, 'om-g2'));
+    const feasibility = (basis?.value?.content as unknown as { feasibility?: Ref } | undefined)?.feasibility;
+    const guards = uniqueTransactionGuards([...extraGuards,
+      ...(feasibility?.id === `om-feasibility:${project}` && basis ? [reference(basis)] : route.guards)]);
+    // Core compile/accept keep their existing no-write repeats. The negative dependency is checked
+    // only if this command actually creates a plan, publishes a stage, or accepts a draft.
+    return this.#production(project, guards, () => {
+      const plan = this.compiler.compile(project, guards);
+      const current = this.store.get<StageArtifact>(stageId(project, 'compilation'));
+      if (current?.value.status === 'accepted' && (current.value.content as unknown as { plan?: Ref }).plan?.hash === plan.hash) return plan;
+      const stage = this.compiler.publish(project, reference(plan), current?.revision ?? 0, guards);
+      this.pipeline.accept(project, 'compilation', stage.revision, guards);
+      return plan;
+    });
+  }
   /** The first B1 is an immutable era boundary, independent of current stage or layer readiness. */
   #omProject(project: string): boolean {
     const id = `om-input:${project}`;
@@ -439,16 +487,17 @@ export class ProductEngine {
       case "task-context": this.#project(command.project); return this.compiler.context(command.project, command.plan, command.task, command.maxChars);
       case "task-detail": this.#project(command.project); return this.compiler.detail(command.project, command.plan, command.task, command.kind, command.selector, command.maxChars);
       case "assess": this.#project(command.project); return this.#assess(command.project, command.expected);
-      case "draft-om": this.#project(command.project); return this.refinement.publish(command.project, command.feasibility, command.expected);
-      case "compile": {
-        assertPilotBoundary(this.store, command.project, "R3");
-        this.#project(command.project); const plan = this.compiler.compile(command.project);
-        const current = this.store.get<StageArtifact>(stageId(command.project, "compilation"));
-        if (current?.value.status === "accepted" && (current.value.content as unknown as { plan?: Ref }).plan?.hash === plan.hash) return plan;
-        const stage = this.compiler.publish(command.project, reference(plan), current?.revision ?? 0);
-        this.pipeline.accept(command.project, "compilation", stage.revision); return plan;
+      case "draft-om": {
+        this.#project(command.project);
+        const guards = command.feasibility.id === `om-feasibility:${command.project}` ? [] : this.#legacyProductionGuards(command.project);
+        return this.#production(command.project, guards, () => this.refinement.publish(command.project, command.feasibility, command.expected, guards));
       }
-      case "draft-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3"); return this.compiler.publish(command.project, command.plan, command.expected);
+      case "compile": return this.compile(command.project);
+      case "draft-plan": {
+        this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3");
+        const guards = this.#planProductionGuards(command.project, command.plan);
+        return this.#production(command.project, guards, () => this.compiler.publish(command.project, command.plan, command.expected, guards));
+      }
       case "create-project": return this.store.write<Project>({ id: `project:${command.project}`, kind: "project", expected: 0, value: { id: command.project, title: command.title } });
       case "prepare-stage": return this.prepare(command.project, command.stage);
       case "source-document": this.#project(command.project); return this.discovery.evidence.document(command.project, command.id, command.text, command.media, command.expected);
@@ -481,9 +530,21 @@ export class ProductEngine {
       }
       case "refine-graph": this.#project(command.project); return this.graphs.refine(command.project, command.expected, command.draft, this.actor);
       case "draft-stage": return this.draft(command.project, command.stage, command.draftId, command.expected);
-      case "accept-stage": this.#project(command.project);
+      case "accept-stage": {
+        this.#project(command.project);
         if (["om-g2", "compilation", "execution"].includes(command.stage)) assertPilotBoundary(this.store, command.project, "R3");
-        return this.pipeline.accept(command.project, command.stage, command.expected);
+        let guards: TransactionGuard[] = [];
+        if (command.stage === 'om-g2' || command.stage === 'compilation') {
+          const route = this.legacyRoute(command.project);
+          const artifact = this.store.get<StageArtifact>(stageId(command.project, command.stage));
+          const content = artifact?.value?.content as unknown as { feasibility?: Ref; plan?: Ref } | undefined;
+          const plan = isRef(content?.plan) ? this.store.get<MachinePlan>(content.plan.id, content.plan.revision) : null;
+          const om = command.stage === 'om-g2' ? content?.feasibility?.id === `om-feasibility:${command.project}`
+            : plan?.value?.feasibility?.id === `om-feasibility:${command.project}`;
+          guards = uniqueTransactionGuards([...(artifact ? [reference(artifact)] : []), ...(om ? [] : route.guards)]);
+        }
+        return this.#production(command.project, guards, () => this.pipeline.accept(command.project, command.stage, command.expected, guards));
+      }
       case "project": return this.projection(command.project);
       case "export-stage": return this.exportStage(command.project, command.stage);
     }

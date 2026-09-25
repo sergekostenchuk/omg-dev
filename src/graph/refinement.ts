@@ -270,11 +270,11 @@ export class Refinement {
       result.findings.push({ code: "feasibility_stale", target: ref.id, message: "An R3 input changed while its admission was checked" });
     return result;
   }
-  publish(project: string, ref: Ref, expected: number) {
+  publish(project: string, ref: Ref, expected: number, extraGuards: TransactionGuard[] = []) {
     assertPilotBoundary(this.store, project, "R3");
     const result = this.feasibilityGate(project, ref);
     requireCondition(result.findings.length === 0, "feasibility_not_ready", "The current R3 result is not ready");
     return this.pipeline.draft(project, "om-g2", { feasibility: ref } as unknown as Json, expected,
-      uniqueTransactionGuards([...result.guards, ...(result.admissionGuards ?? [])]));
+      uniqueTransactionGuards([...result.guards, ...(result.admissionGuards ?? []), ...extraGuards]));
   }
 }

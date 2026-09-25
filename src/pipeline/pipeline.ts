@@ -83,7 +83,7 @@ export class Pipeline {
     return { stage, state, artifact, findings, guards: uniqueRefs(guards),
       ...(admissionGuards.length ? { admissionGuards: uniqueTransactionGuards(admissionGuards) } : {}) };
   }
-  accept(projectId: string, stage: Stage, expected: number): Revision<StageArtifact> {
+  accept(projectId: string, stage: Stage, expected: number, extraGuards: TransactionGuard[] = []): Revision<StageArtifact> {
     const checked = this.inspect(projectId, stage);
     requireCondition(checked.artifact && checked.artifact.revision === expected, "revision_conflict", "Stage changed; reload before accepting");
     if (checked.findings.length) throw new EngineError("gate_rejected", "Stage validation refused acceptance", checked.findings);
@@ -92,7 +92,7 @@ export class Pipeline {
     return this.store.writeMany<StageArtifact>([{
       id: checked.artifact.id, kind: "stage", expected,
       value: { ...checked.artifact.value, status: "accepted", proofs: checked.guards.filter(ref => ref.id !== checked.artifact!.id) },
-    }], uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]))[0]!;
+    }], uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? []), ...extraGuards]))[0]!;
   }
   project(projectId: string): StageProjection[] { return STAGES.map(stage => this.inspect(projectId, stage)); }
 }

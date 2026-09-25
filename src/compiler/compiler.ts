@@ -1,4 +1,4 @@
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { Refinement, type Feasibility } from "../graph/refinement.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
@@ -25,7 +25,7 @@ export type { MachinePlan } from "./model.js";
 export class Compiler {
   constructor(private readonly store: Store, private readonly pipeline: Pipeline, private readonly refinement: Refinement,
     private readonly environments: Environments) {}
-  compile(project: string): Revision<MachinePlan> {
+  compile(project: string, extraGuards: TransactionGuard[] = []): Revision<MachinePlan> {
     const stage = this.pipeline.inspect(project, "om-g2");
     requireCondition(stage.state === "accepted" && stage.artifact, "om_not_ready", "OM-G2 must be accepted and current");
     const feasibilityRef = (stage.artifact.value.content as unknown as { feasibility: Ref }).feasibility;
@@ -61,7 +61,7 @@ export class Compiler {
       { id, kind: "plan", expected: 0, value },
       { id: `current-plan:${project}`, kind: "current-plan", expected: pointer?.revision ?? 0,
         value: { id, revision: 1, hash: hashJson(value) } },
-    ], admissionGuards)[0]!;
+    ], uniqueTransactionGuards([...admissionGuards, ...extraGuards]))[0]!;
   }
   read(id: string): Revision<MachinePlan> {
     const plan = this.store.get<MachinePlan>(id);
@@ -139,10 +139,10 @@ export class Compiler {
       result.findings.push({ code: "plan_stale", target: ref.id, message: "An admission dependency changed while this plan was checked" });
     return result;
   }
-  publish(project: string, planRef: Ref, expected: number) {
+  publish(project: string, planRef: Ref, expected: number, extraGuards: TransactionGuard[] = []) {
     const checked = this.gate(project, planRef); requireCondition(checked.findings.length === 0, "plan_stale", "Plan inputs are not current");
     return this.pipeline.draft(project, "compilation", { plan: planRef } as unknown as Json, expected,
-      uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]));
+      uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? []), ...extraGuards]));
   }
   #contextPlan(project: string, planRef: Ref, task: string) {
     const checked = this.gate(project, planRef);
