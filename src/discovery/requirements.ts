@@ -1,5 +1,5 @@
 import type { FieldSpec } from "./discovery.js";
-import { UPSTREAM_DETAILS } from "./preparation-contracts.js";
+import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, QUESTION_MOMENT_CONTRACT_VERSION } from "./preparation-contracts.js";
 import { mapDesignSchema } from "../graph/builder.js";
 import type { Json } from "../canonical.js";
 
@@ -33,12 +33,15 @@ export const LEGACY_REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = {
     } },
   ],
 };
-export const RESEARCH_CONTRACT_VERSION = 3;
+export const RESEARCH_CONTRACT_VERSION = QUESTION_MOMENT_CONTRACT_VERSION;
 export const VERSION2_REQUIREMENTS = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
   [...LEGACY_REQUIREMENTS[stage].map(spec => ({ ...spec, kind: spec.kind === "decision" && spec.field !== "objective" ? "design" as const : spec.kind })), UPSTREAM_DETAILS[stage]],
 ])) as Record<UpstreamStage, FieldSpec[]>;
-export const REQUIREMENTS = { ...VERSION2_REQUIREMENTS, "operation-map": [...VERSION2_REQUIREMENTS['operation-map'], {
+export const VERSION3_REQUIREMENTS = { ...VERSION2_REQUIREMENTS, "operation-map": [...VERSION2_REQUIREMENTS['operation-map'], {
   field: "mapDesign", kind: "design", proof: "assessment", schema: mapDesignSchema as unknown as Json,
   prompt: "Построй полную L1-топологию из принятых участников, результатов, требований и сценариев. Выбери осмысленные блоки и контракты артефактов; свяжи их коннекторами и явными переходами успеха/отказа. Укажи пользу и получателя каждого блока, пути к успешному результату и безопасному отказу. Ссылайся на точные идентификаторы actors и requirements из предшествующих данных. Их реестры и идентичность графа подставляет движок, не копируй их в ответ. Не добавляй code refs, executable tests, L2/L3 или атомарные задачи на этом этапе.",
   risk: "Карта является линейным списком названий, а не исследованной топологией продукта",
 } satisfies FieldSpec] };
+export const REQUIREMENTS = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
+  VERSION3_REQUIREMENTS[stage].map(spec => spec.field === UPSTREAM_DETAILS[stage].field ? UPSTREAM_MOMENT_DETAILS[stage] : spec),
+])) as Record<UpstreamStage, FieldSpec[]>;

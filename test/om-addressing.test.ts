@@ -52,7 +52,7 @@ function refused(result: OmResult<unknown>, code?: string): void {
 }
 function fixture(t: TestContext, unknowns: Json[] = [{ id: 'output-format',
   question: 'Which output format does the repository support?', consumer: block,
-  blocksCurrentStage: false, resolution: 'Read repository facts during OM' }]) {
+  moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }]) {
   const root = mkdtempSync(join(tmpdir(), 'omg-addressing-')), path = join(root, 'state.sqlite');
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -85,8 +85,8 @@ function gapRequest(f: ReturnType<typeof fixture>, input: Revision<OmInputRecord
     operations: { frame, proposals: [] }, works: { state: 'upper-not-accepted', layer: reference(f.store.get('graph-layer:garden:2')!) } };
 }
 
-function factFixture(t: TestContext) {
-  const f = fixture(t), input = ok(writeAddressing(f.store, f.request()));
+function factFixture(t: TestContext, unknowns?: Json[]) {
+  const f = fixture(t, unknowns), input = ok(writeAddressing(f.store, f.request()));
   function gapsFor(inputRef: Ref) {
     const current = ok(readOmInput(f.store, f.project, inputRef));
     const sources = gapRequest(f, current, `fact-application-${inputRef.revision}`);
@@ -364,7 +364,11 @@ test('D3 cannot address a required field rejected by the real G1 era contract', 
 });
 
 test('D3 environment addressing stays an open task-start obligation and preserves own JSON keys', t => {
-  const f = fixture(t), request = f.request(reference(f.input), 'address', question, { consumer: block, kind: 'environment-confirmation' });
+  const f = fixture(t, [{ id: 'output-format', question: 'Which output format does the environment support?', consumer: block,
+    moment: 'task-start', blocksCurrentStage: false, resolution: 'Confirm the environment before starting the work' }]);
+  assert.equal(f.input.value.input.questions[0]!.moment, 'task-start');
+  assert.ok(Object.hasOwn(f.input.value.input.questions[0]!, 'moment'));
+  const request = f.request(reference(f.input), 'address', question, { consumer: block, kind: 'environment-confirmation' });
   const addressed = ok(writeAddressing(f.store, request));
   const gaps = ok(writeGaps(f.store, gapRequest(f, addressed, 'environment-addressed')));
   const gap = gaps.records.find(row => row.value.gap.target === question)!.value.gap;
@@ -377,6 +381,52 @@ test('D3 environment addressing stays an open task-start obligation and preserve
   assert.deepEqual(result.refusals, []);
   assert.equal(Object.hasOwn(result.result.input!.contracts[0]!.state, '__proto__'), true);
   assert.deepEqual(result.result.input!.contracts[0]!.state['__proto__'], { sensitive: true });
+});
+
+test('B1.1 D3 preserves distinct environment deadlines while question addressing remains an om-pass service', t => {
+  const declarations = [
+    { id: 'feasibility-environment', question: 'Which environment is needed to establish feasibility?', consumer: block,
+      moment: 'feasibility', blocksCurrentStage: false, resolution: 'Confirm during feasibility' },
+    { id: 'start-environment', question: 'Which environment must be checked before work starts?', consumer: block,
+      moment: 'task-start', blocksCurrentStage: false, resolution: 'Confirm before task start' },
+    { id: 'result-environment', question: 'Which environment observation establishes the completed result?', consumer: block,
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Confirm the task result' },
+  ];
+  const f = fixture(t, declarations), initial = ok(writeGaps(f.store, gapRequest(f, f.input, 'deadline-addressing')));
+  for (const declared of declarations) {
+    const target = `discovery:${declared.id}`, produced = f.input.value.input.questions.find(row => row.id === target)!;
+    assert.equal(produced.moment, declared.moment);
+    assert.deepEqual(produced.source, f.stages.discovery);
+    const service = initial.records.find(row => row.value.gap.target === target)!.value.gap;
+    assert.equal(service.code, 'question_unaddressed'); assert.equal(service.kind, 'design-decision');
+    assert.equal(service.moment, 'om-pass'); assert.equal(service.mechanism, 'M5:addressing'); assert.equal(service.blocking, true);
+    assert.deepEqual(service.evidence.find(row => row.origin === 'question')!.value, produced);
+    const invalid = applyInputDecisions(f.pure(), [{ target, field: 'address', basis: fakeRef,
+      value: { consumer: block, kind: 'environment-confirmation', moment: 'om-pass' } }], f.graph.value as Graph);
+    assert.equal(invalid.refusals[0]!.code, 'addressing_invalid'); assert.deepEqual(invalid.result, f.pure());
+  }
+  const request: AddressingRequest = { ...f.request(), decisions: declarations.flatMap(declared =>
+    f.request(reference(f.input), 'address', `discovery:${declared.id}`, { consumer: block, kind: 'environment-confirmation' }).decisions) };
+  const addressed = ok(writeAddressing(f.store, request));
+  const inventory = f.store.write({ id: 'repo-inventory:garden', kind: 'repo-inventory', expected: 0,
+    value: { projectId: f.project, paths: [] } });
+  const refreshed = ok(writeOmInput(f.store, { project: f.project, stages: f.stages,
+    expected: addressed.revision, inventory: reference(inventory) }));
+  assert.deepEqual(refreshed.value.input.questions, addressed.value.input.questions);
+  const gaps = ok(writeGaps(f.store, gapRequest(f, refreshed, 'deadline-addressed')));
+  for (const declared of declarations) {
+    const target = `discovery:${declared.id}`, retained = refreshed.value.input.questions.find(row => row.id === target)!;
+    const produced = f.input.value.input.questions.find(row => row.id === target)!;
+    assert.equal(retained.moment, declared.moment); assert.deepEqual(retained.source, produced.source);
+    assert.equal(retained.question, produced.question); assert.equal(retained.kind, 'environment-confirmation');
+    const gap = gaps.records.find(row => row.value.gap.target === target)!.value.gap;
+    assert.equal(gap.code, 'predecessor_question'); assert.equal(gap.moment, declared.moment);
+    assert.equal(gap.kind, 'environment-confirmation'); assert.equal(gap.blocking, false);
+  }
+  f.restart();
+  for (const record of [f.input, addressed, refreshed]) assert.deepEqual(ok(readOmInput(f.store, f.project, reference(record))), record);
+  for (const saved of [initial, gaps]) ok(readGaps(f.store, {
+    sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) }));
 });
 
 
@@ -545,6 +595,38 @@ test('D3.1 independent inventory refresh preserves the fact contract, addressing
   f.restart();
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(refreshedAgain))), refreshedAgain);
   assert.deepEqual(ok(writeApplyAnswer(f.store, request)), applied);
+});
+
+test('B1.1 a nondefault producer deadline survives D3, fact application, refresh and recovery after restart', async t => {
+  const f = factFixture(t, [{ id: 'output-format', question: 'Which output format does the repository support?', consumer: block,
+    moment: 'feasibility', blocksCurrentStage: false, resolution: 'Establish the repository fact during feasibility' }]);
+  const original = f.input.value.input.questions.find(row => row.id === question)!;
+  assert.equal(original.kind, 'repository-fact'); assert.equal(original.moment, 'feasibility');
+  assert.equal(f.gaps.gap!.value.gap.moment, 'feasibility');
+  const accepted = await f.accept(), refreshed = f.refreshInventory();
+  assert.deepEqual(refreshed.value.input.questions.find(row => row.id === question), original);
+  const request: ApplyAnswerRequest = { project: f.project, input: reference(refreshed),
+    answer: reference(accepted.saved), question: reference(accepted.question) };
+  const applied = ok(writeApplyAnswer(f.store, request));
+  assert.equal(applied.value.input.questions.some(row => row.id === question), false);
+  assert.deepEqual(applied.value.input.facts![0]!.question, original);
+  const refreshedFact = f.refreshInventory();
+  assert.deepEqual(refreshedFact.value.input.facts![0]!.question, original);
+  f.changeEvidence('XML'); f.restart();
+  const recovery = { project: f.project, input: reference(refreshedFact) }, recovered = ok(writeReopenAnswers(f.store, recovery));
+  assert.deepEqual(recovered.value.input.questions.find(row => row.id === question), original);
+  assert.equal(recovered.value.input.facts?.some(fact => fact.question.id === question), false);
+  const resumed = f.gapsFor(reference(recovered));
+  assert.equal(resumed.gap!.value.gap.kind, 'repository-fact'); assert.equal(resumed.gap!.value.gap.moment, 'feasibility');
+  const next = await f.accept(f.issue(resumed), null, 'XML');
+  const appliedAgain = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(recovered),
+    answer: reference(next.saved), question: reference(next.question) }));
+  assert.deepEqual(appliedAgain.value.input.facts![0]!.question, original);
+  const completed = f.store.list().map(reference); f.restart();
+  for (const record of [f.input, refreshed, applied, refreshedFact, recovered, appliedAgain])
+    assert.deepEqual(ok(readOmInput(f.store, f.project, reference(record))), record);
+  assert.deepEqual(ok(writeReopenAnswers(f.store, recovery)), recovered);
+  assert.deepEqual(f.store.list().map(reference), completed);
 });
 
 test('D3.1 different contract and changed evidence refuse application without writing', async t => {
@@ -891,7 +973,7 @@ async function dependentFacts(t: TestContext) {
   const targets = { A: question, B: 'discovery:dependent-format', C: 'discovery:independent-format', D: 'discovery:downstream-format' };
   type Role = keyof typeof targets;
   const f = fixture(t, Object.values(targets).map(target => ({ id: target.slice('discovery:'.length),
-    question: `Which value establishes ${target}?`, consumer: block, blocksCurrentStage: false, resolution: 'Read repository evidence' })));
+    question: `Which value establishes ${target}?`, consumer: block, moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository evidence' })));
   let input = ok(writeAddressing(f.store, { ...f.request(), decisions: Object.values(targets).flatMap(target =>
     f.request(reference(f.input), 'address', target).decisions) }));
   const command = { executable: process.execPath, args: ['-e',
@@ -1028,7 +1110,7 @@ test('D3.1 recovery closes A to B to D contracts, preserves C, proves reasons an
 async function independentFactPrefixes(t: TestContext) {
   const targets = Array.from({ length: 4 }, (_, index) => `discovery:cost-${index + 1}`);
   const f = fixture(t, targets.map(target => ({ id: target.slice('discovery:'.length), question: `Which value establishes ${target}?`,
-    consumer: block, blocksCurrentStage: false, resolution: 'Read repository evidence' })));
+    consumer: block, moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository evidence' })));
   let input = ok(writeAddressing(f.store, { ...f.request(), decisions: targets.flatMap(target =>
     f.request(reference(f.input), 'address', target).decisions) }));
   const command = { executable: process.execPath, args: ['-e',

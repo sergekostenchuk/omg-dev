@@ -127,7 +127,7 @@ function firstWorks(t: TestContext, late = false, upperWake = false) {
     const value = preparedField('garden', field);
     if (late && field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'late-proof',
       question: 'Which result proof must each retained consumer provide?', consumer: 'garden-later-operation',
-      blocksCurrentStage: false, resolution: 'Retain the result proof for concrete work' }];
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Retain the result proof for concrete work' }];
     return value;
   });
   let input = ok(writeOmInput(store, { project: 'garden', expected: 0,

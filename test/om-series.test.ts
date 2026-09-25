@@ -2792,7 +2792,7 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
   preparedFeatures(engine, project, graph as Graph, field => {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = questions.map(id => ({ id,
-      question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', blocksCurrentStage: false,
+      question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', moment: 'om-pass', blocksCurrentStage: false,
       resolution: 'Resolve the question during OM' }));
     return value;
   });
@@ -2831,7 +2831,7 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
             const value = field === 'mapDesign' ? designOf(store.get<Graph>(`graph:${project}`)!.value) as unknown as Json
               : preparedField(project, field);
             if (field === 'preparation') (value as Record<string, Json>).unknowns = ids.map(id => ({ id,
-              question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', blocksCurrentStage: false,
+              question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', moment: 'om-pass', blocksCurrentStage: false,
               resolution: 'Resolve the question during OM' }));
             engine.discovery.decision(id, question.revision, 'owner', value);
           }

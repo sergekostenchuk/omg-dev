@@ -80,7 +80,7 @@ function fixture(t: TestContext, kinds: Array<"environment-confirmation" | "post
     const value = preparedField(project, field);
     if (field === "preparation" && kinds.length) (value as Record<string, Json>).unknowns = kinds.map((kind, index) => ({
       id: `late-${index}`, question: `Which ${kind} is required for the repository?`, consumer: lateConsumer,
-      blocksCurrentStage: false, resolution: "Address the retained question during OM",
+      moment: kind === "environment-confirmation" ? "task-start" : "task-result", blocksCurrentStage: false, resolution: "Address the retained question during OM",
     }));
     return value;
   });

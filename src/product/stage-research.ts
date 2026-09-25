@@ -21,7 +21,6 @@ export class StageResearch {
     const draft = store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project
       && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage), "discovery_foreign", "Stage research needs this project's upstream draft");
-    requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required", "New stage research requires the current contract");
     const stage = draft.value.stage as UpstreamStage;
     let artifact = store.get<StageArtifact>(stageId(project, stage));
     if (artifact?.value.status === "accepted") {
@@ -30,6 +29,7 @@ export class StageResearch {
       const checked = pipeline.inspect(project, stage);
       return { status: checked.state === "accepted" ? "accepted" : "blocked", stage: reference(artifact), research: null, feedback: null, findings: checked.findings };
     }
+    requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required", "New stage research requires the current contract");
     let graphExpected = store.get(`graph:${project}`)?.revision ?? 0;
     const result = await researchForConsumer(store, researcher, project, draftId, maxTurns, () => {
       // Capture before the model call; a competing stage edit must never be overwritten.

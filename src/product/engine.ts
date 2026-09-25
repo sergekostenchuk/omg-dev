@@ -14,7 +14,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -95,9 +95,9 @@ export class ProductEngine {
     const result = this.discovery.gate(context.projectId, content.draft);
     const version = draft.value.contractVersion ?? 1;
     const legacy = version === 1;
-    if ((version !== RESEARCH_CONTRACT_VERSION && !context.accepted) || ![1, 2, RESEARCH_CONTRACT_VERSION].includes(version))
+    if ((version !== RESEARCH_CONTRACT_VERSION && !context.accepted) || ![1, 2, 3, RESEARCH_CONTRACT_VERSION].includes(version))
       result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const expected = (legacy ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
+    const expected = (legacy ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS : version === 3 ? VERSION3_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
     if (!legacy && result.findings.length === 0) {
@@ -112,7 +112,7 @@ export class ProductEngine {
     if (stage === "operation-map") {
       if (!isRef(content.graph)) result.findings.push({ code: "graph_missing", target: stage, message: "An operation map is required" });
       else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
-      if (version === RESEARCH_CONTRACT_VERSION && result.findings.length === 0) {
+      if ([3, 4].includes(version) && result.findings.length === 0) {
         const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
         const initial = this.store.get<StageArtifact>(stageId(context.projectId, "discovery"))!.value.content as unknown as StageContent;
         const concept = this.store.get<StageArtifact>(stageId(context.projectId, "concept"))!.value.content as unknown as StageContent;

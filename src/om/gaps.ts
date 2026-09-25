@@ -1,5 +1,6 @@
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
+import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from '../discovery/preparation-contracts.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
 import { RefinementRelations } from '../graph/relations.js';
@@ -16,7 +17,7 @@ import { prepareFrameProposals, readFrameProposals, type FrameGap, type Proposal
 
 export const KNOWLEDGE_KINDS = sealed([...ENGINE_KINDS]);
 export const RESOLUTION_MOMENTS = sealed([...ENGINE_MOMENTS]);
-export const GAP_MOMENTS = sealed(['om-pass', 'feasibility', 'task-start', 'task-result'] as const);
+export const GAP_MOMENTS = sealed(QUESTION_MOMENTS);
 export type GapKind = typeof KNOWLEDGE_KINDS[number];
 export type GapMoment = typeof GAP_MOMENTS[number];
 export const GAP_ROUTES = sealed({
@@ -145,6 +146,10 @@ function frameSource(value: unknown, level: 2 | 3): value is FrameGap {
 export function collectGaps(sources: GapSources): Sealed<GapCollection> {
   const missing = missingSource(sources);
   if (missing) return sealed({ gaps: [], refusals: [failure('gap_source_missing', missing, 'source', 'Each gap source must be explicitly supplied')] });
+  for (const question of sources.inputResult.input!.questions) if (object(question)
+    && Object.hasOwn(question, 'moment') && question.moment === undefined)
+    return sealed({ gaps: [], refusals: [failure('gap_moment_unknown', text(question.id) ? question.id : 'inputResult',
+      'moment', 'An explicit undefined is not a question moment')] });
   sources = copy(sources);
   const { inputResult, graph } = sources, input = inputResult.input!;
   const refusals: Refusal[] = [], found = new Map<string, Gap>(), conflicts = new Set<string>();
@@ -254,6 +259,16 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       || typeof question.blocks !== 'boolean' || !isRef(question.source)) {
       fail('gap_source_missing', 'inputResult', 'questions', 'A predecessor question needs its complete producer metadata'); continue;
     }
+    const producer = Array.isArray(input.sources) ? input.sources.filter(source => object(source)
+      && source.id === question.source.id && source.revision === question.source.revision && source.hash === question.source.hash) : [];
+    if (producer.length !== 1 || !['discovery', 'features'].includes(producer[0]!.stage)
+      || !Object.hasOwn(producer[0]!, 'contractVersion')
+      || (producer[0]!.contractVersion !== null && ![1, 2, 3, 4].includes(producer[0]!.contractVersion!))) {
+      fail('gap_source_missing', question.id, 'source', 'A question must identify its exact stage producer and contract era'); continue;
+    }
+    if ((producer[0]!.contractVersion ?? 0) >= QUESTION_MOMENT_CONTRACT_VERSION && !Object.hasOwn(question, 'moment')) {
+      fail('gap_moment_unknown', question.id, 'moment', 'This producer contract requires its explicit question moment'); continue;
+    }
     if (question.kind !== null && !isKind(question.kind)) { fail('gap_kind_unknown', question.id, 'kind', 'The assigned knowledge kind is unknown'); continue; }
     if (Object.hasOwn(question, 'moment') && !isMoment(question.moment)) {
       fail('gap_moment_unknown', question.id, 'moment', 'An assigned moment must be preserved and recognized'); continue;
@@ -262,6 +277,7 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       fail('gap_source_missing', question.id, 'addressedBy', 'Addressing needs its exact basis'); continue;
     }
     const addressed = nodes.has(question.consumer) && isKind(question.kind);
+    // Addressing is an OM-pass prerequisite; the answer deadline remains in the source question.
     push({ target: question.id, code: addressed ? 'predecessor_question' : 'question_unaddressed', field: addressed ? 'answer' : 'address',
       consumer: addressed ? question.consumer : { mechanism: 'M5:addressing' }, source: question.source,
       ...(addressed ? { kind: question.kind, ...(Object.hasOwn(question, 'moment') ? { moment: question.moment } : {}),

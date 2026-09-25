@@ -2259,7 +2259,7 @@ function mechanismFixture(t: test.TestContext, names = ["format-a", "format-b"])
   preparedFeatures(new ProductEngine(store), project, upper as Graph, field => {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Record<string, Json>).unknowns = names.map(id => ({ id,
-      question: `Which ${id} is required?`, consumer: "garden-consume-block", blocksCurrentStage: false,
+      question: `Which ${id} is required?`, consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false,
       resolution: "Address this question during OM" }));
     return value;
   });

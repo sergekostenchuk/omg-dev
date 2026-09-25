@@ -5,6 +5,8 @@ export const JOURNEY_VARIANTS = ["success", "first_use", "repeated_use", "reload
   "invalid_incomplete_input", "partial_success", "dependency_unavailable", "safe_failure", "crash_recovery",
   "unauthorized_adversarial", "operator_admin", "cli_api_agent", "migration_compatibility", "concurrent_replayed",
   "export_retention_deletion", "accessibility"] as const;
+export const QUESTION_MOMENTS = Object.freeze(["om-pass", "feasibility", "task-start", "task-result"] as const);
+export const QUESTION_MOMENT_CONTRACT_VERSION = 4;
 const text: Json = { type: "string", minLength: 1 };
 const list = (items: Json, minItems = 0): Json => ({ type: "array", minItems, items });
 const texts = (minimum = 0): Json => list(text, minimum);
@@ -17,15 +19,21 @@ const variant: Json = { oneOf: [
   object({ applicability: { const: "not_applicable" }, reason: text, scenarios: { type: "array", maxItems: 0 } }),
 ] };
 
-export const preparationSchema = object({
+const unknownQuestion = { id: text, question: text, consumer: text, blocksCurrentStage: { type: "boolean" }, resolution: text };
+const remainingQuestion = { question: text, consumer: text, blocksCurrentStage: { type: "boolean" } };
+const moment: Json = { enum: [...QUESTION_MOMENTS] };
+const preparation = {
   problem: text, existingSituation: text,
   actors: list(actor, 1), outcomes: list(outcome, 1),
   journeys: object(Object.fromEntries(JOURNEY_VARIANTS.map(name => [name, variant]))),
   constraints: list(object({ id: text, rule: text, basis: text })),
   externalSystems: list(object({ id: text, purpose: text, inputs: texts(), outputs: texts(), availability: text })),
   risks: list(object({ id: text, consequence: text, affectedOutcome: text, mitigation: text })),
-  unknowns: list(object({ id: text, question: text, consumer: text, blocksCurrentStage: { type: "boolean" }, resolution: text })),
-});
+  unknowns: list(object(unknownQuestion)),
+};
+// These schemas remain the contract of already saved version 2/3 questions.
+export const preparationSchema = object(preparation);
+export const preparationMomentSchema = object({ ...preparation, unknowns: list(object({ ...unknownQuestion, moment })) });
 
 export const sectionSchema = list(object({ id: text, title: text, requirements: list(object({ id: text, statement: text,
   benefit: text, beneficiary: text, outcome: text, acceptance: texts(1) }), 1) }), 1);
@@ -44,10 +52,14 @@ export const behaviorContractsSchema = list(object({
   compatibility: text, proof: text,
 }), 1);
 
-export const featurePreparationSchema = list(object({
+const featurePreparation = {
   featureTitle: text, outcome: text, requirements: texts(1), behaviorContracts: texts(1), beneficiary: text, benefit: text,
   success: texts(1), failures: texts(1), interactions: list(object({ outcome: text, condition: text })),
-  remainingQuestions: list(object({ question: text, consumer: text, blocksCurrentStage: { type: "boolean" } })),
+  remainingQuestions: list(object(remainingQuestion)),
+};
+export const featurePreparationSchema = list(object(featurePreparation), 1);
+export const featurePreparationMomentSchema = list(object({ ...featurePreparation,
+  remainingQuestions: list(object({ ...remainingQuestion, moment })),
 }), 1);
 
 export function preparationField(field: string, prompt: string, risk: string, schema: Json): FieldSpec {
@@ -60,4 +72,10 @@ export const UPSTREAM_DETAILS = {
   "operation-map": preparationField("operationRequirements", "Для каждого результата концепции раскрой ответственность производителя, потребителей, предпосылки, успех, отказ и восстановление. Покрой адресуемые требования концепции; не назначай произвольные одинаковые контракты всем блокам.", "Карта состоит из названий блоков без содержательных связей", operationRequirementsSchema),
   specification: preparationField("behaviorContracts", "Уточни проверяемое поведение: вход, участник, результат, успех/отказ, запрещённые последствия, полномочия, запись/восстановление/повтор, совместимость и способ доказательства. Ссылайся на требования концепции и исходы карты.", "Фичи и атомарные работы не имеют точного проверяемого поведения", behaviorContractsSchema),
   features: preparationField("featurePreparation", "Подготовь фичи с пользой и потребителем, требованиями концепции, контрактами ТЗ, критериями успеха/отказа, взаимодействиями и оставшимися адресными вопросами. Существенное неизвестное нельзя объявлять разрешённым.", "Детализация фич теряет ограничения, взаимодействия и основания", featurePreparationSchema),
+} satisfies Record<string, FieldSpec>;
+
+const momentInstruction = " Для каждого вопроса явно укажи moment: om-pass (до завершения OM), feasibility (до проверки выполнимости), task-start (до начала работы) или task-result (при подтверждении результата работы). Срок задаётся этим вопросом и не выводится из его текста или blocksCurrentStage.";
+export const UPSTREAM_MOMENT_DETAILS = { ...UPSTREAM_DETAILS,
+  discovery: { ...UPSTREAM_DETAILS.discovery, schema: preparationMomentSchema, prompt: UPSTREAM_DETAILS.discovery.prompt + momentInstruction },
+  features: { ...UPSTREAM_DETAILS.features, schema: featurePreparationMomentSchema, prompt: UPSTREAM_DETAILS.features.prompt + momentInstruction },
 } satisfies Record<string, FieldSpec>;

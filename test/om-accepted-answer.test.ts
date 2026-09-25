@@ -139,7 +139,7 @@ function factFixture(t: TestContext) {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'output-format',
       question: 'Which output format does the repository support?', consumer: block,
-      blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -1006,7 +1006,7 @@ test('D5 does not turn an unclassified native predecessor question into an MC1 f
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>)['unknowns'] = [{ id: 'output-format',
       question: 'Which output format does the repository support?', consumer: 'garden-produce-block',
-      blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
     return value;
   });
   const input = ok(writeOmInput(store, { project, expected: 0,

@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { canonical, digest, hashJson, type Json } from "../src/canonical.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
+import { QUESTION_MOMENTS, preparationMomentSchema, featurePreparationMomentSchema } from "../src/discovery/preparation-contracts.js";
+import { collectGaps, GAP_MOMENTS, type GapSources } from "../src/om/gaps.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
 import { Store, type Revision } from "../src/storage/store.js";
@@ -171,7 +173,7 @@ test("every G1 refusal has an exact producer address and leaves no om-input", as
     ["feature_preparation_missing", s => { fields(s, "features").featurePreparation = []; }],
     ["feature_preparation_ambiguous", s => { const preps = fields(s, "features").featurePreparation; preps.push(clone(preps[0])); }],
     ["feature_preparation_foreign", s => { const preps = fields(s, "features").featurePreparation; preps.push({ ...clone(preps[0]), featureTitle: "foreign" }); }],
-    ["question_consumer_missing", s => { fields(s, "features").featurePreparation[0].remainingQuestions = [{ question: "Where?", blocksCurrentStage: false, kind: "fact" }]; }],
+    ["question_consumer_missing", s => { fields(s, "features").featurePreparation[0].remainingQuestions = [{ question: "Where?", blocksCurrentStage: false, kind: "fact", moment: "om-pass" }]; }],
     ["stage_contract_version_unknown", s => { s.specification.contractVersion = null; }, { nodesRequiredSince: 3 }],
     ["contract_node_unbound", () => {}, { nodesRequiredSince: 3 }],
     ["acceptance_kind_missing", () => {}, { nodesRequiredSince: 3 }],
@@ -253,10 +255,10 @@ test("questions preserve producer knowledge and consumers while inventory absenc
   const stages = sources(f);
   const metadata = JSON.parse('{"name":"repository-fact","__proto__":{"source":"producer"}}') as Json;
   fields(stages, "discovery").preparation.unknowns = [{ id: "u1", question: "Which module?", consumer: "garden-produce-block",
-    kind: metadata, blocksCurrentStage: false }];
+    kind: metadata, blocksCurrentStage: false, moment: "om-pass" }];
   const questions = fields(stages, "features").featurePreparation[0].remainingQuestions = [
-    { question: "Which design?", consumer: "garden-consume-block", kind: "decision", blocksCurrentStage: false },
-    { question: "Which environment?", consumer: "garden-produce-block", kind: "environment", blocksCurrentStage: false },
+    { question: "Which design?", consumer: "garden-consume-block", kind: "decision", blocksCurrentStage: false, moment: "om-pass" },
+    { question: "Which environment?", consumer: "garden-produce-block", kind: "environment", blocksCurrentStage: false, moment: "task-start" },
   ];
   const result = buildOmInput(stages);
   assert.equal(gateInput(result as InputBuildResult).passed, true);
@@ -912,7 +914,7 @@ function refreshFixture(t: TestContext) {
   preparedFeatures(new ProductEngine(store), project, graph as Graph, field => {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Row).unknowns = [{ id: "output-format", question: "Which repository output format is supported?",
-      consumer: "The producing team", blocksCurrentStage: false, resolution: "Read the repository during OM" }];
+      consumer: "The producing team", moment: "om-pass", blocksCurrentStage: false, resolution: "Read the repository during OM" }];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as InputRequest['stages'];
@@ -1530,4 +1532,80 @@ test("S1 opaque synthetic reads never become observations of a source collector 
     assert.deepEqual(cold, [reference(row)]);
     assert.deepEqual(warm, cold, 'Synthetic reads behind an opaque boundary were never read through the source collector');
   });
+});
+
+test('B1.1 both v4 question producers require explicit moments before normalization and preserve per-source eras', async t => {
+  const f = await createOmFixture(t), stages = sources(f);
+  const unknown = { id: 'late', question: 'Which environment is needed?', consumer: 'garden-produce-block',
+    kind: 'environment-confirmation', blocksCurrentStage: false, resolution: 'Observe the requested moment', moment: 'feasibility' };
+  const remaining = { question: 'Which result environment is needed?', consumer: 'garden-consume-block',
+    kind: 'environment-confirmation', blocksCurrentStage: false, moment: 'task-result' };
+  fields(stages, 'discovery').preparation.unknowns = [unknown];
+  fields(stages, 'features').featurePreparation[0].remainingQuestions = [remaining];
+  const valid = buildOmInput(stages);
+  assert.deepEqual(valid.refusals, []);
+  assert.deepEqual(valid.input!.questions.map(q => [q.id, q.moment]), [['feature:0:1', 'task-result'], ['discovery:late', 'feasibility']]);
+  assert.equal(valid.hash, hashJson(valid.input));
+  for (const origin of ['discovery', 'features'] as const) for (const missing of ['absent', null, undefined, 'R3', 'later', 0]) {
+    const changed = clone(stages), raw = origin === 'discovery' ? fields(changed, origin).preparation.unknowns[0]
+      : fields(changed, origin).featurePreparation[0].remainingQuestions[0];
+    if (missing === 'absent') delete raw.moment; else raw.moment = missing;
+    const error = hasCode(buildOmInput(changed), 'input_field_missing');
+    assert.ok(error.at.field!.endsWith('.moment')); assert.deepEqual(error.at.ref, stages[origin].ref);
+  }
+  for (const oldStage of ['discovery', 'features'] as const) {
+    const mixed = clone(stages); mixed[oldStage].contractVersion = 3;
+    const old = oldStage === 'discovery' ? fields(mixed, oldStage).preparation.unknowns[0]
+      : fields(mixed, oldStage).featurePreparation[0].remainingQuestions[0];
+    delete old.moment;
+    const result = buildOmInput(mixed); assert.deepEqual(result.refusals, []);
+    for (const question of result.input!.questions) {
+      const oldQuestion = question.source.id === mixed[oldStage].ref.id;
+      assert.equal(Object.hasOwn(question, 'moment'), !oldQuestion);
+    }
+  }
+});
+
+test('B1.1 deadline policy survives exported-table mutation across producer B1 and D1', async t => {
+  const f = await createOmFixture(t), stages = sources(f);
+  fields(stages, 'discovery').preparation.unknowns = [{ id: 'late', question: 'Which environment is required?',
+    consumer: 'garden-produce-block', blocksCurrentStage: false, resolution: 'Confirm before feasibility', moment: 'feasibility' }];
+  fields(stages, 'features').featurePreparation[0].remainingQuestions = [{ question: 'Which consumer environment is required?',
+    consumer: 'garden-consume-block', blocksCurrentStage: false, moment: 'feasibility' }];
+  const expected = buildOmInput(stages); assert.deepEqual(expected.refusals, []);
+  const gapSource = (moment: string): GapSources => {
+    const result = clone(expected) as InputBuildResult;
+    for (const question of result.input!.questions) Object.assign(question, { kind: 'environment-confirmation', moment });
+    result.hash = hashJson(result.input);
+    return { inputResult: result, graph: f.graph, horizon: { nodes: ['garden-produce-block', 'garden-consume-block'] },
+      frameGaps: { operations: [], works: [] } };
+  };
+  const validGaps = gapSource('feasibility'), expectedGaps = collectGaps(validGaps);
+  assert.deepEqual(expectedGaps.refusals, []);
+  assert.equal(expectedGaps.gaps.filter(gap => gap.code === 'predecessor_question' && gap.moment === 'feasibility').length, 2);
+  const producerChecks = (data: InputStages) => {
+    // Compile after the mutation attempt, so a prior Ajv cache cannot hide a changed declaration.
+    const ajv = new Ajv({ strict: true, allowUnionTypes: true });
+    return [ajv.compile(preparationMomentSchema as object)(fields(data, 'discovery').preparation),
+      ajv.compile(featurePreparationMomentSchema as object)(fields(data, 'features').featurePreparation)];
+  };
+  assert.deepEqual(producerChecks(stages), [true, true]);
+  const foreign = clone(stages);
+  fields(foreign, 'discovery').preparation.unknowns[0].moment = 'later';
+  fields(foreign, 'features').featurePreparation[0].remainingQuestions[0].moment = 'later';
+  const exported = QUESTION_MOMENTS as unknown as string[], original = [...exported];
+  for (const change of [() => exported.splice(exported.indexOf('feasibility'), 1), () => exported.push('later')]) {
+    try {
+      try { change(); } catch (error) { assert.ok(error instanceof TypeError); }
+      assert.deepEqual(buildOmInput(stages), expected);
+      hasCode(buildOmInput(foreign), 'input_field_missing');
+      assert.deepEqual(collectGaps(validGaps), expectedGaps);
+      assert.ok(collectGaps(gapSource('later')).refusals.some(item => item.code === 'gap_moment_unknown'));
+      assert.deepEqual(producerChecks(stages), [true, true]);
+      assert.deepEqual(producerChecks(foreign), [false, false]);
+      assert.deepEqual(GAP_MOMENTS, original);
+    } finally {
+      if (!Object.isFrozen(exported)) exported.splice(0, exported.length, ...original);
+    }
+  }
 });

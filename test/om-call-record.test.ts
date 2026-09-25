@@ -897,7 +897,7 @@ test("E1 exact-series admission shares A3 validation and still requires the curr
 const mechanismOwner = { kind: "mechanism", mechanism: "M5:addressing" } as const;
 function mechanismQuestion(id: string): Json {
   return { id, question: id === "encoding" ? "Which output encoding is supported?" : id === "transport" ? "Which transport needs confirmation?" : `What is ${id}?`,
-    consumer: `${PROJECT}-consume-block`, blocksCurrentStage: false, resolution: "Address this question before research" };
+    consumer: `${PROJECT}-consume-block`, moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question before research" };
 }
 function mechanismFixture(t: test.TestContext, label: string, StoreType: typeof Store = Store, questions = ["encoding", "transport"]) {
   const f = fixture(t, label, StoreType), engine = new ProductEngine(f.store);

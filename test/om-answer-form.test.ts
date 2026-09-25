@@ -64,13 +64,13 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false) {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'output-format',
       question: 'Which output format and versions are supported?', consumer: 'garden-consume-block',
-      blocksCurrentStage: false, resolution: 'Resolve this addressed question during OM' },
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve this addressed question during OM' },
       { id: 'unaddressed-format', question: 'Which encoding does the output use?', consumer: 'garden-consume-block',
-        blocksCurrentStage: false, resolution: 'Address the knowledge kind during OM' },
+        moment: 'om-pass', blocksCurrentStage: false, resolution: 'Address the knowledge kind during OM' },
       ...(multiple ? [{ id: 'other-format', question: 'Which alternate format is supported?', consumer: 'garden-consume-block',
-        blocksCurrentStage: false, resolution: 'Resolve the alternate format during OM' },
+        moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the alternate format during OM' },
       { id: 'unaddressed-owner', question: 'Which input needs owner attribution?', consumer: 'garden-consume-block',
-        blocksCurrentStage: false, resolution: 'Address this input before research' }] : [])];
+        moment: 'om-pass', blocksCurrentStage: false, resolution: 'Address this input before research' }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -580,7 +580,7 @@ function bindingAuthority(t: TestContext) {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [0, 1].map(index => ({ id: `late-${index}`,
       question: `Which post-implementation proof is required for result ${index}?`, consumer: 'garden-produce-block',
-      blocksCurrentStage: false, resolution: 'Retain and address this question in OM' }));
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Retain and address this question in OM' }));
     return value;
   });
   const graph = store.get<Graph>(`graph:${project}`)!, base = ok(writeOmInput(store, { project, expected: 0,

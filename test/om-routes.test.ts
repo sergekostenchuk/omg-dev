@@ -111,9 +111,9 @@ function routesFixture(t: TestContext, withEncoding = false) {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "output-format",
       question: "Which output format does the repository support?", consumer: block,
-      blocksCurrentStage: false, resolution: "Read repository facts during OM" }, ...(withEncoding ? [{ id: "encoding",
+      moment: "om-pass", blocksCurrentStage: false, resolution: "Read repository facts during OM" }, ...(withEncoding ? [{ id: "encoding",
         question: "Which encoding does the repository support?", consumer: "garden-consume-block",
-        blocksCurrentStage: false, resolution: "Read repository facts during OM" }] : [])];
+        moment: "om-pass", blocksCurrentStage: false, resolution: "Read repository facts during OM" }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;

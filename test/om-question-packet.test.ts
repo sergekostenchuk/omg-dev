@@ -85,7 +85,7 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = descriptors.map(item => ({
       id: item.id, question: `What is the supported ${item.id}?`, consumer: item.consumer,
-      blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM',
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM',
     }));
     return value;
   });
@@ -1219,7 +1219,7 @@ async function workExpansionFixture(database: string, root: string, late?: 'mult
       const value = preparedField(project, field);
       if (late && field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'work-proof',
         question: 'Which result proof do these work consumers retain?', consumer: responsible,
-        blocksCurrentStage: false, resolution: 'Carry this result proof until work execution' }];
+        moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry this result proof until work execution' }];
       return value;
     });
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;

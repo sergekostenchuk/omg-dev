@@ -2,7 +2,8 @@ import { isProxy } from "node:util/types";
 import { Ajv, type AnySchema } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
@@ -17,7 +18,7 @@ import { deriveInputDecisions } from "./addressing.js";
 import { answerSourceGuards, checkAnswerInputBody, prepareAnswerInvalidation, readAnswerForInput,
   readAnswerInvalidation, type AnswerInvalidation, type AnswerRequirementChange } from "./accepted-answer.js";
 
-// The producer still emits contract v3 without structured nodes or check kinds.
+// Question deadlines do not introduce structured nodes or check kinds.
 export const NODES_REQUIRED_SINCE: number | null = null;
 const INPUT_STAGES = Object.freeze([...UPSTREAM_STAGES]);
 export const INPUT_REFUSAL_CODES = Object.freeze([
@@ -40,7 +41,7 @@ export interface OmInput {
     success: string[]; failures: string[]; forbiddenEffects: string[]; state: Record<string, Json>; proof: string }[];
   features: { index: number; title: string; outcome: string; behaviorIndexes: number[]; requirementIds: string[]; contracts: string[] }[];
   questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
-    addressedBy?: Ref; originalConsumer?: string }[];
+    moment?: typeof QUESTION_MOMENTS[number]; addressedBy?: Ref; originalConsumer?: string }[];
   facts?: AppliedInputFact[];
   map: { nodes: string[]; artifacts: string[]; connectors: string[] };
 }
@@ -114,6 +115,20 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
   }
   const finish = (input: OmInput | null): Sealed<InputBuildResult> => sealed({ input: refusals.length ? null : input,
     hash: refusals.length || !input ? null : hashJson(input), refusals: sorted(refusals), gaps: sorted(gaps) });
+  if (refusals.length) return finish(null);
+  // Check the new mandatory field before JSON normalization, including explicit undefined.
+  for (const stage of ["discovery", "features"] as const) {
+    if ((stages[stage].contractVersion ?? 0) < QUESTION_MOMENT_CONTRACT_VERSION) continue;
+    const fields = stages[stage].fields;
+    const lists = stage === "discovery"
+      ? [{ rows: object(fields.preparation) ? (fields.preparation as Row).unknowns : undefined, field: "preparation.unknowns" }]
+      : Array.isArray(fields.featurePreparation) ? fields.featurePreparation.map((prep, index) => ({
+        rows: object(prep) ? (prep as Row).remainingQuestions : undefined, field: `featurePreparation[${index}].remainingQuestions` })) : [];
+    for (const list of lists) if (Array.isArray(list.rows)) for (const [index, row] of list.rows.entries()) {
+      if (object(row) && (!Object.hasOwn(row, "moment") || !(QUESTION_MOMENTS as readonly unknown[]).includes(row.moment)))
+        fail("input_field_missing", stage, `${list.field}[${index}].moment`, "This producer contract requires an explicit recognized question moment");
+    }
+  }
   if (refusals.length) return finish(null);
   stages = copy(stages);
   const rows = (value: unknown, stage: UpstreamStage, field: string): Row[] => {
@@ -214,7 +229,8 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     if (!text(raw.consumer)) { fail("question_consumer_missing", stage, `${id}.consumer`, "A question must have its producer's consumer"); return; }
     if (typeof raw.blocksCurrentStage !== "boolean") fail("input_field_missing", stage, `${id}.blocksCurrentStage`, "The producer must specify whether the question blocks its stage");
     questions.push({ id, question: wording, consumer: raw.consumer, kind: Object.hasOwn(raw, "kind") ? raw.kind : null,
-      blocks: raw.blocksCurrentStage === true, source: stages[stage].ref });
+      blocks: raw.blocksCurrentStage === true, source: stages[stage].ref,
+      ...((stages[stage].contractVersion ?? 0) >= QUESTION_MOMENT_CONTRACT_VERSION ? { moment: raw.moment } : {}) });
   };
   for (const [index, raw] of unknowns.entries()) question(raw, `discovery:${requiredText(raw.id, "discovery", `unknowns[${index}].id`)}`, "discovery");
   const features: OmInput['features'] = [];
@@ -254,7 +270,7 @@ export function gateInput(result: InputBuildResult): Sealed<{ passed: boolean; c
   return sealed({ passed, codes: [...new Set(result.refusals.map(item => item.code))].sort(order) });
 }
 
-const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, [RESEARCH_CONTRACT_VERSION]: REQUIREMENTS });
+const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, [RESEARCH_CONTRACT_VERSION]: REQUIREMENTS });
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 
 function requireInputRequest(store: Store, request: InputRequest): void {
@@ -412,7 +428,7 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
         const unique = (refs: Ref[]) => sorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]);
         check(canonical(unique(dependencies)) === canonical(sorted(layer.inputs)), "content.graph.inputs", "Layer inputs must cover all field and layer evidence");
         for (const input of layer.inputs) proof(input);
-        if (version === RESEARCH_CONTRACT_VERSION) {
+        if (version === 3 || version === 4) {
           const initial = sources.discovery!.fields, concept = sources.concept!.fields;
           const proposed = buildL1(projection.id, projection.title, content.fields.mapDesign, initial, concept);
           check(canonical(projectGraph(proposed, 1)) === canonical(projection), "content.graph", "The exact map must derive from its saved stage fields");

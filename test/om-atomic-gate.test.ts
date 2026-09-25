@@ -119,7 +119,7 @@ async function produceAtomicSeed() {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'atomic-proof',
       question: 'Which result proof must both retained consumers receive?', consumer: 'garden-produce-operation',
-      blocksCurrentStage: false, resolution: 'Carry the proof until execution of the concrete work' }];
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry the proof until execution of the concrete work' }];
     return value;
   });
   let input = ok(writeOmInput(store, { project, expected: 0,

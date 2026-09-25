@@ -847,3 +847,111 @@ test("current D1 admission distinguishes eras even when both legitimate derivati
     assert.throws(() => prepareCurrentGaps(unread, bad as unknown as GapReadRequest), malformed);
   assert.throws(() => prepareCurrentGaps(undefined as unknown as Store, current), malformed);
 });
+
+test('B1.1 D1 uses the exact question producer era and never defaults missing v4 moments', () => {
+  const source = sources();
+  source.inputResult.input!.sources.find(item => item.stage === 'features')!.contractVersion = 4;
+  source.inputResult.input!.questions = [{ ...question('environment', 'environment-confirmation'), moment: 'feasibility' }];
+  stamp(source);
+  const valid = collectGaps(source);
+  assert.deepEqual(valid.refusals, []);
+  assert.equal(valid.gaps.find(gap => gap.target === 'environment')!.moment, 'feasibility');
+  for (const addressed of [true, false]) for (const moment of ['absent', null, undefined, 'R3', 'later', 1]) {
+    const changed = clone(source), q = changed.inputResult.input!.questions[0]! as unknown as Record<string, unknown>;
+    if (!addressed) q.consumer = 'unresolved team';
+    if (moment === 'absent') delete q.moment; else q.moment = moment;
+    if (moment !== undefined) stamp(changed);
+    const result = collectGaps(changed), refusal = result.refusals.find(item => item.code === 'gap_moment_unknown');
+    assert.ok(refusal); assert.equal(refusal.at.target, 'environment'); assert.equal(refusal.at.field, 'moment');
+    assert.ok(!result.gaps.some(gap => gap.target === 'environment'));
+  }
+  const mixed = clone(source), input = mixed.inputResult.input!;
+  const prior = { ...question('old-environment', 'environment-confirmation'), source: fakeRef('stage:garden:discovery') };
+  input.questions.push(prior); stamp(mixed);
+  const history = collectGaps(mixed); assert.deepEqual(history.refusals, []);
+  assert.equal(history.gaps.find(gap => gap.target === 'old-environment')!.moment, 'task-start');
+  assert.equal(history.gaps.find(gap => gap.target === 'environment')!.moment, 'feasibility');
+  assert.equal(Object.hasOwn(prior, 'moment'), false);
+  const service = clone(source); service.inputResult.input!.questions[0]!.consumer = 'unresolved team'; stamp(service);
+  const serviceGap = collectGaps(service).gaps.find(gap => gap.target === 'environment')!;
+  assert.equal(serviceGap.code, 'question_unaddressed'); assert.equal(serviceGap.moment, 'om-pass');
+  assert.equal(serviceGap.mechanism, 'M5:addressing');
+  assert.equal((serviceGap.evidence[0]!.value as Record<string, Json>).moment, 'feasibility');
+  for (const mutation of ['revision', 'hash', 'missing', 'duplicate', 'missing-era', 'unknown-era'] as const) {
+    const changed = clone(source), q = changed.inputResult.input!.questions[0]!;
+    if (mutation === 'revision') q.source.revision++;
+    if (mutation === 'hash') q.source.hash = '0'.repeat(64);
+    if (mutation === 'missing') changed.inputResult.input!.sources = [];
+    if (mutation === 'duplicate') changed.inputResult.input!.sources.push(clone(changed.inputResult.input!.sources.find(item => item.stage === 'features')!));
+    const producer = changed.inputResult.input!.sources.find(item => item.stage === 'features');
+    if (mutation === 'missing-era') delete (producer as unknown as Record<string, unknown>).contractVersion;
+    if (mutation === 'unknown-era') producer!.contractVersion = 99;
+    stamp(changed); assert.ok(collectGaps(changed).refusals.some(item => item.code === 'gap_source_missing'));
+  }
+});
+
+test('B1.1 the complete 1189043 producer retains v3 stages questions defaults and gap bytes after restart', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const { createRequire } = await import('node:module');
+  const { fileURLToPath, pathToFileURL } = await import('node:url');
+  const { readOmInput } = await import('../src/om/input.js');
+  const root = mkdtempSync(join(tmpdir(), 'omg-b11-history-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), database = join(root, 'history.sqlite');
+  const loader = join(root, 'loader.mjs'), producer = join(root, 'producer.mjs');
+  const tsUrl = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, String.raw`import{execFileSync}from'node:child_process';import{fileURLToPath}from'node:url';let root,ts;
+export async function initialize(data){root=data.root;ts=(await import(data.ts)).default;}
+export async function load(url,context,next){const prefix=new URL('dist/',root).href;
+ if(url.startsWith(prefix)&&/\.js$/.test(url)){const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
+  if(relative.startsWith('src/')||relative.startsWith('test/')){const source=execFileSync('git',['show','1189043f4bc71316195b2c387ff03b31689558b8:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
+   return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}}
+ return next(url,context);}`);
+  writeFileSync(producer, String.raw`import assert from'node:assert/strict';import{pathToFileURL}from'node:url';import{join}from'node:path';
+const root=process.argv[2], database=process.argv[3], load=p=>import(pathToFileURL(join(root,'dist',p)).href);
+const{Store}=await load('src/storage/store.js'),{ProductEngine}=await load('src/product/engine.js');
+const{reference}=await load('src/pipeline/contracts.js'),{UPSTREAM_STAGES}=await load('src/discovery/requirements.js');
+const{canonical,hashJson}=await load('src/canonical.js'),{projectGraph}=await load('src/graph/project.js');
+const{gardenGraph}=await load('test/om-fixture.js'),{preparedFeatures}=await load('test/product-fixture.js'),{preparedField}=await load('test/preparation-fixture.js');
+const{writeOmInput}=await load('src/om/input.js'),{inputDecisionWrite,writeAddressing}=await load('src/om/addressing.js');
+const{writeHorizon}=await load('src/om/horizon.js'),{writeGaps,readGaps}=await load('src/om/gaps.js');
+const ok=r=>{assert.equal(r.ok,true,r.ok?'':r.refusal.code);return r.value;};
+const store=new Store(database), engine=new ProductEngine(store),project='garden';
+const{level,...graph}=projectGraph(gardenGraph(),1);
+preparedFeatures(engine,project,graph,field=>{const value=preparedField(project,field);
+ if(field==='preparation')value.unknowns=[{id:'old-environment',question:'Which environment?',consumer:'garden-produce-block',blocksCurrentStage:false,resolution:'Retain the original question'}];
+ if(field==='featurePreparation')value[0].remainingQuestions=[{question:'Which implementation proof?',consumer:'garden-consume-block',blocksCurrentStage:false}];return value;});
+const stages=Object.fromEntries(UPSTREAM_STAGES.map(stage=>[stage,reference(store.get('stage:'+project+':'+stage))]));
+const base=ok(writeOmInput(store,{project,stages,expected:0})),graphRef=reference(store.get('graph:'+project));
+assert.ok(base.value.input.sources.every(s=>s.contractVersion===3));
+assert.ok(base.value.input.questions.every(q=>!Object.hasOwn(q,'moment')));
+const input=ok(writeAddressing(store,{project,input:reference(base),graph:graphRef,decisions:base.value.input.questions.map(q=>({pending:inputDecisionWrite({project,input:reference(base),graph:graphRef,layers:[],decision:{target:q.id,field:'address',value:{consumer:q.consumer,kind:q.id.startsWith('discovery:')?'environment-confirmation':'post-implementation-proof'}}})}))}));
+const horizon=ok(writeHorizon(store,{project,input:reference(input),graph:graphRef,refinement:null,available:{},choice:{choiceVersion:'b11-base',features:[{outcome:'garden-result'}],excluded:[]}}));
+const request={project,input:reference(input),graph:graphRef,horizon:reference(horizon.gate),operations:{proposals:[],frame:{project,level:2,graph:graphRef,horizon:reference(horizon.gate),layer:null,frame:null,upper:null}},works:{state:'upper-not-accepted',layer:reference(store.get('graph-layer:garden:2'))}};
+const gaps=ok(writeGaps(store,request)),readRequest={sources:gaps.sources,records:gaps.records.map(reference)},historical=ok(readGaps(store,readRequest));
+assert.equal(gaps.collection.gaps.find(g=>g.target==='discovery:old-environment').moment,'task-start');
+assert.equal(gaps.collection.gaps.find(g=>g.target==='feature:0:1').moment,'task-result');
+const rows=store.list().flatMap(row=>store.history(row.id));for(const row of rows)assert.equal(hashJson(row.value),row.hash);
+const result={base,input,gaps,readRequest,historical,rows,bytes:canonical(rows),gates:UPSTREAM_STAGES.map(stage=>engine.pipeline.inspect(project,stage))};
+store.close();process.stdout.write(JSON.stringify(result));`);
+  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
+    {data:{root:${JSON.stringify(pathToFileURL(repository).href)},ts:${JSON.stringify(tsUrl)}}});`;
+  const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+  const previous = JSON.parse(execFileSync(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
+    { cwd: repository, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 50_000_000 }));
+  for (let restart = 0; restart < 2; restart++) {
+    const store = new Store(database), engine = new ProductEngine(store);
+    try {
+      for (const input of [previous.base, previous.input]) {
+        assert.deepEqual(delivered(readOmInput(store, 'garden', reference(input))), input);
+        assert.ok(input.value.input.questions.every((q: object) => !Object.hasOwn(q, 'moment')));
+      }
+      assert.deepEqual(delivered(readGaps(store, previous.readRequest)), previous.historical);
+      assert.deepEqual(UPSTREAM_STAGES.map(stage => engine.pipeline.inspect('garden', stage)), previous.gates);
+      const rows = store.list().flatMap(row => store.history(row.id));
+      assert.equal(canonical(rows), previous.bytes); assert.deepEqual(rows, previous.rows);
+      for (const row of rows) assert.equal(hashJson(row.value), row.hash);
+    } finally { store.close(); }
+  }
+});

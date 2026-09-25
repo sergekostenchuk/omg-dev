@@ -275,7 +275,7 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'What encoding is supported?',
-      consumer: 'garden-consume-block', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }];
+      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -372,7 +372,7 @@ function e4WorksFixture(t: TestContext) {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'late-proof',
       question: 'Which result proof must the concrete producer provide?', consumer: 'garden-produce-operation',
-      blocksCurrentStage: false, resolution: 'Retain the result proof for the concrete work' }];
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Retain the result proof for the concrete work' }];
     return value;
   });
   let input = valueOf(writeOmInput(store, { project, expected: 0,
