@@ -387,15 +387,27 @@ export function readJournal(store: Store, request: JournalRequest): OmResult<Sea
   return current;
 }
 
+/** Historical journal sources are checked by the same derivation without consulting a head. */
+export function readJournalAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<RefusalJournal>>> {
+  const invalid = (field: string): never => { throw new EngineError("journal_request_invalid", "A historical journal needs its project and exact reference",
+    { unit: UNIT, target: REFUSAL_JOURNAL_KIND, field }); };
+  if (!(store instanceof Store)) invalid("store");
+  try { project = requireProject(project); }
+  catch (error) { if (error instanceof EngineError && error.code === "journal_request_invalid") invalid("project"); throw error; }
+  if (!isRef(ref)) invalid("reference");
+  const target = journalId(project);
+  const read = readRecord<RefusalJournal>(store, ref, { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
+  if (!read.ok) return read;
+  const broken = checkJournal(store, read.value.value, project, { target, ref });
+  return broken ?? read;
+}
+
 function currentJournal(store: Store, project: string, target: string): OmResult<Sealed<Revision<RefusalJournal>>> | null {
   // The head revision of an exact id is what a reference to it is made of; the record itself is then read as any
   // accepted record is, so a foreign kind sitting at this address is refused instead of being appended to.
   const head = store.get<RefusalJournal>(target);
   if (!head) return null;
-  const read = readRecord<RefusalJournal>(store, reference(head), { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
-  if (!read.ok) return read;
-  const broken = checkJournal(store, read.value.value, project, { target, ref: reference(head) });
-  return broken ?? read;
+  return readJournalAt(store, project, reference(head));
 }
 
 function rowOf(gate: string, entry: UnitRefusal, source: Ref): JournalRow {

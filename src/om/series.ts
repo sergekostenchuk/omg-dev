@@ -606,7 +606,23 @@ function currentLineProblem(store: Store, address: Address, ref?: Ref): OmResult
 export function readStopHistory(store: Store, request: AnySeriesRequest): OmResult<Sealed<StopHistory>> {
   const read = readSeries(store, request);
   if (!read.ok) return read;
-  const derived = walk(plainSeries(read.value.value as unknown as AnyRepairSeries));
+  return stopHistoryOf(read.value.value);
+}
+
+/** The same history, derived from the exact saved series rather than its current head. */
+export function readStopHistoryAt(store: Store, project: string, ref: Ref): OmResult<Sealed<StopHistory>> {
+  const invalid = (field: string): never => { throw new EngineError("series_request_invalid", "Historical stop history needs its project and exact series",
+    { unit: UNIT, target: REPAIR_SERIES_KIND, field }); };
+  if (!(store instanceof Store)) invalid("store");
+  try { project = requireProject(project); }
+  catch (error) { if (error instanceof EngineError && error.code === "series_request_invalid") invalid("project"); throw error; }
+  if (!isRef(ref)) invalid("reference");
+  const read = readAnySeriesAt(store, project, ref);
+  return read.ok ? stopHistoryOf(read.value.value) : read;
+}
+
+function stopHistoryOf(value: Sealed<AnyRepairSeries>): OmResult<Sealed<StopHistory>> {
+  const derived = walk(plainSeries(value as unknown as AnyRepairSeries));
   return delivered({ stops: derived.stops, standing: derived.stop === null ? null : derived.stop.attempt });
 }
 

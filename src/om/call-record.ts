@@ -2,7 +2,8 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { tokenUsage, type TokenUsage } from "../runtime/model-usage.js";
-import { Store, type Revision } from "../storage/store.js";
+import { uniqueTransactionGuards } from "../runtime/environment.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
 import { readStopContext, readOriginHoldAt } from "./repeat-gate.js";
 import { writeGuarded } from "./refs.js";
@@ -210,10 +211,13 @@ export function callLedgerId(project: string): string {
 }
 
 /** Reads one exact historical call revision without admitting a dispatch or consulting later source heads. */
-export function readCall(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyCallRecord>>> {
-  return withHistoricalReads(() => readCallInScope(store, project, ref));
+export interface CallHistory { readonly journal: Ref }
+export function readCall(store: Store, project: string, ref: Ref, history?: CallHistory): OmResult<Sealed<Revision<AnyCallRecord>>> {
+  requireCondition(history === undefined || (isPlainObject(history) && exactKeys(history, ['journal']) && isRef(history.journal)),
+    'call_request_invalid', 'Historical call context needs its exact journal');
+  return withHistoricalReads(() => readCallInScope(store, project, ref, history));
 }
-function readCallInScope(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyCallRecord>>> {
+function readCallInScope(store: Store, project: string, ref: Ref, history?: CallHistory): OmResult<Sealed<Revision<AnyCallRecord>>> {
   requireCondition(store instanceof Store, "call_request_invalid", "A call is read through a store");
   if (!validProject(project)) return problem("call_request_invalid", "A call belongs to one named project without a namespace separator", "call", "project");
   if (!exactReference(ref)) return problem("call_unresolved", "A call is read by an exact reference", targetOf(ref), "call");
@@ -225,7 +229,7 @@ function readCallInScope(store: Store, project: string, ref: Ref): OmResult<Seal
   if (!record || record.id !== ref.id || record.revision !== ref.revision || record.hash !== ref.hash || record.kind !== CALL_RECORD_KIND) {
     return problem("call_unresolved", "No call record stands at this exact reference", ref.id, "call", "producer", ref);
   }
-  return checkedCall(store, record, project, ref.id);
+  return checkedCall(store, record, project, ref.id, history);
 }
 
 /**
@@ -254,15 +258,18 @@ export function prepareCallDispatch(
  * The running series, adapter and configuration are all guarded heads: a change in the read/write window admits
  * nothing. A late repeat finds the already admitted identity and never re-validates it against later heads (T5).
  */
-export function recordCall(store: Store, project: string, request: RecordCallRequest): OmResult<Sealed<RecordedCall<CallRecord>>>;
-export function recordCall(store: Store, project: string, request: MechanismRecordCallRequest): OmResult<Sealed<RecordedCall<MechanismCallRecord>>>;
-export function recordCall(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>>;
-export function recordCall(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>> {
-  return withHistoricalReads(() => recordCallInScope(store, project, request));
+export function recordCall(store: Store, project: string, request: RecordCallRequest, extraGuards?: readonly TransactionGuard[]): OmResult<Sealed<RecordedCall<CallRecord>>>;
+export function recordCall(store: Store, project: string, request: MechanismRecordCallRequest, extraGuards?: readonly TransactionGuard[]): OmResult<Sealed<RecordedCall<MechanismCallRecord>>>;
+export function recordCall(store: Store, project: string, request: AnyRecordCallRequest, extraGuards?: readonly TransactionGuard[]): OmResult<Sealed<RecordedCall>>;
+export function recordCall(store: Store, project: string, request: AnyRecordCallRequest,
+  extraGuards: readonly TransactionGuard[] = []): OmResult<Sealed<RecordedCall>> {
+  return withHistoricalReads(() => recordCallInScope(store, project, request, extraGuards));
 }
-function recordCallInScope(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<RecordedCall>> {
+function recordCallInScope(store: Store, project: string, request: AnyRecordCallRequest,
+  extraGuards: readonly TransactionGuard[]): OmResult<Sealed<RecordedCall>> {
   requireCondition(store instanceof Store, "call_request_invalid", "A call is recorded through a store");
   if (!validProject(project)) return problem("call_request_invalid", "A call belongs to one named project without a namespace separator", String(project), "project");
+  extraGuards = uniqueTransactionGuards(extraGuards);
   const checked = checkRequest(project, request);
   if (!checked.ok) return checked;
 
@@ -313,9 +320,9 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
       { id, kind: CALL_RECORD_KIND, expected: 0, value },
       { id: callLedgerId(project), kind: CALL_LEDGER_KIND, expected: ledger.value?.record.revision ?? 0, value: ledgerValue },
     ],
-    guards: uniqueRefs([
+    guards: uniqueTransactionGuards([
       checked.value.series, checked.value.dispatch.adapter, checked.value.dispatch.config,
-      ...ledgerGuards, ...dispatchGuards, ...seriesGuards,
+      ...ledgerGuards, ...dispatchGuards, ...seriesGuards, ...extraGuards,
     ]),
   });
   if (!written.ok) return written;
@@ -593,7 +600,7 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
 /** The admission proof is common A3 work; E1 only binds its own dispatch address and purpose to it. */
 function resolveMechanismSeries(
   store: Store, project: string, request: Omit<MechanismRecordCallRequest, "packet"> | MechanismCallRecord,
-  target: string, current: boolean,
+  target: string, current: boolean, history?: CallHistory,
 ): OmResult<Sealed<readonly Ref[]>> {
   if (current) {
     const head = store.get(request.series.id);
@@ -640,7 +647,7 @@ function resolveMechanismSeries(
     return delivered(uniqueRefs(guards));
   }
   const basis = request.basis as OriginHoldBasis;
-  const hold = readOriginHoldAt(store, project, basis.hold);
+  const hold = readOriginHoldAt(store, project, basis.hold, history?.journal);
   if (!hold.ok || !("owner" in hold.value.value) || hashJson(hold.value.value.owner) !== hashJson(request.owner)
     || hold.value.value.attempt !== request.attempt || hold.value.value.lift !== null
     || !attempt.outcome.refusals.some(refusal => refusal.row === hold.value.value.row))
@@ -707,13 +714,13 @@ function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLe
 }
 
 function checkedCall(
-  store: Store, record: Revision<AnyCallRecord>, project: string, target: string,
+  store: Store, record: Revision<AnyCallRecord>, project: string, target: string, history?: CallHistory,
 ): OmResult<Sealed<Revision<AnyCallRecord>>> {
   if (!validCallShape(record, project)) {
     return problem("call_record_invalid", "The stored call record is not one this unit writes", target, "record", "producer", reference(record));
   }
   if ("owner" in record.value) {
-    const owner = resolveMechanismSeries(store, project, record.value, target, false);
+    const owner = resolveMechanismSeries(store, project, record.value, target, false, history);
     if (!owner.ok) return problem("call_record_invalid", "The saved mechanism admission does not follow from its exact series and task", target, "admission", "producer", reference(record));
   }
   if (record.revision === 1 && record.value.status === "open") return delivered(record);

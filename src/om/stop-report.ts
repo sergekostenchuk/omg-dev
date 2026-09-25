@@ -1,15 +1,17 @@
-import { hashJson, type Json } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store } from "../storage/store.js";
-import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
+import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
 import { readRecord } from "./refs.js";
-import { readJournal, normalizeOriginSource, type JournalRow, type RefusalOrigin } from "./refusal-journal.js";
+import { readJournal, readJournalAt, journalId, normalizeOriginSource, type JournalRow, type RefusalOrigin } from "./refusal-journal.js";
 import {
-  readStopHistory, seriesId, stopReviewNamespace, COMPLETION_REASONS, STOP_REVIEW_KIND,
+  readStopHistory, readStopHistoryAt, readAnySeriesAt, seriesRequestOf, seriesAddress, stopReviewNamespace, COMPLETION_REASONS, STOP_REVIEW_KIND,
   type CompletionReason, type Continuation, type SeriesRequest, type StopHistory, type StopHistoryEntry,
+  type AnySeriesRequest, type SeriesAddress, type MechanismOwner,
 } from "./series.js";
-import { readStopContext, ADDRESSEE_KINDS, REFUSAL_CLASSES, type RefusalClass, type StopContext } from "./repeat-gate.js";
+import { readStopContext, readStopContextAt, originHoldNamespace, ADDRESSEE_KINDS, REFUSAL_CLASSES,
+  type RefusalClass, type StopContext, type StopContextSources } from "./repeat-gate.js";
 
 /**
  * THE EXPLANATION OF A STOP, ASSEMBLED BY CODE.
@@ -211,6 +213,10 @@ export interface StopReport {
   readonly lines: readonly string[];
 }
 
+export interface MechanismStopReport extends Omit<StopReport, "block"> { readonly owner: MechanismOwner }
+export type AnyStopReport = StopReport | MechanismStopReport;
+export type StopReportSources = StopContextSources;
+
 const BLAMING_CLASSES: readonly RefusalClass[] = Object.freeze(["proposal", "input", "derivation", "readiness"] as const);
 const blamed = (facts: StopFacts): number => BLAMING_CLASSES.reduce((sum, item) => sum + facts.classes[item], 0);
 
@@ -253,11 +259,12 @@ const REPORT_KEYS = Object.freeze([
   "project", "block", "line", "series", "rung", "audience", "context", "obstacles", "finding", "remedies", "proposed",
   "guards", "lines",
 ] as const);
+const MECHANISM_REPORT_KEYS = Object.freeze([...REPORT_KEYS.filter(key => key !== "block"), "owner"]);
 const REVIEW_PARTS = Object.freeze(["cause", "change"] as const);
 
-interface Assembled { readonly report: StopReport; readonly guards: readonly Ref[] }
+interface Assembled { readonly report: AnyStopReport; readonly guards: readonly Ref[] }
 /** The address of the series being explained, as the request names it and the record was checked against it (A3). */
-interface Address { readonly project: string; readonly block: string; readonly line: number; readonly id: string }
+type Address = SeriesAddress;
 
 // ---------------------------------------------------------------------------
 
@@ -267,10 +274,38 @@ interface Address { readonly project: string; readonly block: string; readonly l
  * recorded, and it changes nothing. A series where nothing stops the work has no explanation to give, and the gate
  * says so (stop_absent).
  */
-export function stopReport(store: Store, request: SeriesRequest): OmResult<Sealed<StopReport>> {
+export function stopReport(store: Store, request: SeriesRequest): OmResult<Sealed<StopReport>>;
+export function stopReport(store: Store, request: AnySeriesRequest): OmResult<Sealed<AnyStopReport>>;
+export function stopReport(store: Store, request: AnySeriesRequest): OmResult<Sealed<AnyStopReport>> {
   requireStore(store);
   requireCondition(isPlainObject(request), "stop_report_invalid", "The explanation of a stop is asked for through a request object");
   const assembled = assemble(store, request);
+  return assembled.ok ? delivered(assembled.value.report) : assembled;
+}
+
+/** Capture only the mutable inputs of the checked report; all deeper witnesses remain in their saved records. */
+export function stopReportSources(report: Sealed<AnyStopReport>): Sealed<StopReportSources> {
+  requireReport(report);
+  const address = seriesAddress(reportRequest(report)), byId = new Map(report.guards.map(ref => [ref.id, ref]));
+  if (byId.size !== report.guards.length || report.series !== address.id || !byId.has(address.id)) reportInvalid("guards");
+  const series = byId.get(address.id)!, journal = byId.get(journalId(address.project)) ?? null;
+  const holds = report.guards.filter(ref => ref.id.startsWith(originHoldNamespace(address.project)));
+  if (1 + Number(journal !== null) + holds.length !== report.guards.length) reportInvalid("guards");
+  return sealed({ series: exactRef(series), journal: journal === null ? null : exactRef(journal), holds: holds.map(exactRef) });
+}
+
+/** Reassemble through A3/A4 and the same report formula from exact saved sources, without current admission. */
+export function readStopReport(store: Store, request: { project: string; sources: StopReportSources }): OmResult<Sealed<AnyStopReport>> {
+  if (!(store instanceof Store)) reportInvalid("store");
+  if (!(isPlainObject(request) && isText(request.project) && isPlainObject(request.sources)
+    && exactKeys(request.sources, ["series", "journal", "holds"]) && isRef(request.sources.series)
+    && (request.sources.journal === null || isRef(request.sources.journal))
+    && Array.isArray(request.sources.holds) && request.sources.holds.every(isRef))) reportInvalid("sources");
+  const fixed = sealed({ project: request.project, sources: { series: exactRef(request.sources.series),
+    journal: request.sources.journal === null ? null : exactRef(request.sources.journal), holds: request.sources.holds.map(exactRef) } });
+  const series = readAnySeriesAt(store, fixed.project, fixed.sources.series);
+  if (!series.ok) return series;
+  const assembled = assemble(store, seriesRequestOf(series.value.value), fixed.sources);
   return assembled.ok ? delivered(assembled.value.report) : assembled;
 }
 
@@ -282,23 +317,20 @@ export function stopReport(store: Store, request: SeriesRequest): OmResult<Seale
  * moved on are read at their exact references, so the report goes on standing. What comes back is the report as the
  * records give it NOW, so that the caller acts on that one and guards its transaction with its guards.
  */
-export function checkStanding(store: Store, report: Sealed<StopReport>): OmResult<Sealed<StopReport>> {
+export function checkStanding(store: Store, report: Sealed<StopReport>): OmResult<Sealed<StopReport>>;
+export function checkStanding(store: Store, report: Sealed<AnyStopReport>): OmResult<Sealed<AnyStopReport>>;
+export function checkStanding(store: Store, report: Sealed<AnyStopReport>): OmResult<Sealed<AnyStopReport>> {
   requireStore(store);
-  requireCondition(isPlainObject(report) && exactKeys(report, REPORT_KEYS),
-    "stop_report_invalid", "A report is weighed again as the report this unit assembles, and nothing else");
-  requireCondition(isText(report.project) && isText(report.block) && Number.isSafeInteger(report.line) && isText(report.series),
-    "stop_report_invalid", "A report names the series it explains");
-  requireCondition(Array.isArray(report.guards) && report.guards.every(isRef),
-    "stop_report_invalid", "A report names the exact revision of every head it was read from");
+  requireReport(report);
   // The address is derived from the project, the block and the line: what a report says its own series is would be
   // the caller's word, and a refusal must be addressed at the series the records are read for.
-  const target = seriesId(report.project, report.block, report.line);
+  const request = reportRequest(report), target = seriesAddress(request).id;
   const moved = movedGuard(store, report.guards);
   if (moved !== null) {
     return refused("report_stale", "A head this explanation was read from has moved since, so the explanation no longer stands for what the records hold",
       { unit: UNIT, target, field: "guards", ref: moved }, "producer");
   }
-  const again = assemble(store, { project: report.project, block: report.block, line: report.line });
+  const again = assemble(store, request);
   if (!again.ok) return again;
   // Every head the report was read from is among its guards, so unchanged guards give the same explanation again:
   // a difference here is a difference in the report, not in the records (T3).
@@ -311,20 +343,20 @@ export function checkStanding(store: Store, report: Sealed<StopReport>): OmResul
 
 // ---------------------------------------------------------------------------
 
-function assemble(store: Store, request: SeriesRequest): OmResult<Assembled> {
+function assemble(store: Store, request: AnySeriesRequest, sources?: StopReportSources): OmResult<Assembled> {
   // The context is assembled by the ONE function that assembles it, and it hands over the heads it read: the series,
   // the journal and every hold of the lineage, lifted or standing. Nothing is guessed about what the gate touched.
-  const read = readStopContext(store, request);
+  const read = sources ? readStopContextAt(store, { project: request.project, sources }) : readStopContext(store, request);
   if (!read.ok) return read;
   const held = read.value.context as StopContext;
   const guards: Ref[] = [...read.value.reads];
   // The history of the stops — their exact goals and the boundaries of their windows — from the one derivation of the
   // rules of a series. This unit reads the series' record through these two and not a third time of its own.
-  const history = readStopHistory(store, request);
+  const history = sources ? readStopHistoryAt(store, request.project, sources.series) : readStopHistory(store, request);
   if (!history.ok) return history;
   // A3 checks the record's own projectId, block and line against the address the request names before it returns
   // anything, so the request's address IS the record's.
-  const at: Address = { project: request.project, block: request.block, line: request.line, id: held.series };
+  const at = seriesAddress(request);
 
   const rung = held.ladder.rung;
   const audience = Object.hasOwn(AUDIENCE_OF, rung) ? AUDIENCE_OF[rung] : undefined;
@@ -332,7 +364,7 @@ function assemble(store: Store, request: SeriesRequest): OmResult<Assembled> {
   // of engine code, not data a consumer handed over.
   requireCondition(audience !== undefined, "stop_report_broken", "The ladder after a stop has two rungs, and each has its audience");
 
-  const obstacles = obstaclesOf(store, at, held, guards);
+  const obstacles = obstaclesOf(store, at, held, guards, sources);
   if ("ok" in obstacles) return obstacles;
   const remedies = remediesOf(store, at, history.value as StopHistory, held.ladder.goals);
   if ("ok" in remedies) return remedies;
@@ -346,8 +378,8 @@ function assemble(store: Store, request: SeriesRequest): OmResult<Assembled> {
   const finding = findingOf(held, facts, obstacles);
   // A change nobody named is no proposal: an analysis that found none says so, and none is invented in its place.
   const proposed = remedies.flatMap(item => item.claims.filter(claim => claim.what === "change" && claim.stated !== null));
-  const report: StopReport = {
-    project: at.project, block: at.block, line: at.line,
+  const report: AnyStopReport = {
+    project: at.project, ...(at.owner.kind === "block" ? { block: at.owner.block } : { owner: at.owner }), line: at.line,
     series: at.id, rung, audience: audience as ReportAudience,
     context: held, obstacles, finding, remedies, proposed,
     guards: uniqueGuards(guards),
@@ -365,9 +397,11 @@ function assemble(store: Store, request: SeriesRequest): OmResult<Assembled> {
  * addressee G7 derived for it. A row the journal does not hold is not an obstacle anybody can be sent to work on, and
  * it is refused rather than reported as a bare hash.
  */
-function obstaclesOf(store: Store, at: Address, context: StopContext, guards: Ref[]): readonly StopObstacleRow[] | OmResult<never> {
+function obstaclesOf(store: Store, at: Address, context: StopContext, guards: Ref[], sources?: StopReportSources): readonly StopObstacleRow[] | OmResult<never> {
   if (context.repeated.length === 0) return [];
-  const journal = readJournal(store, { project: at.project });
+  if (sources && sources.journal === null) return refused("obstacle_unrecorded", "The saved obstacles require their historical journal",
+    { unit: UNIT, target: at.id, field: "sources.journal" }, "producer");
+  const journal = sources ? readJournalAt(store, at.project, sources.journal!) : readJournal(store, { project: at.project });
   if (!journal.ok) return journal;
   guards.push(reference(journal.value));
   const rows = new Map(journal.value.value.rows.map(row => [row.id, row as JournalRow]));
@@ -481,8 +515,10 @@ readonly StopClaim[] | OmResult<never> {
   const record = value as Record<string, unknown>;
   // The address of the record. Whether its reviewer was independent and whether its cause is worth anything are A6's
   // to establish, and no field of the record claiming either is consulted here.
-  if (record['projectId'] !== at.project || record['block'] !== at.block) {
-    return invalid("An analysis of another block explains nothing about this stop", "block");
+  if (record['projectId'] !== at.project || (at.owner.kind === "block"
+    ? record['block'] !== at.owner.block || Object.hasOwn(record, "owner")
+    : Object.hasOwn(record, "block") || canonical(record['owner'] ?? null) !== canonical(at.owner))) {
+    return invalid("An analysis of another series owner explains nothing about this stop", at.owner.kind === "block" ? "block" : "owner");
   }
   if (record['stop'] !== entry.attempt) return invalid("An analysis of another stop explains nothing about this one", "stop");
   if (!sameGoals(record['goals'], entry.goals)) {
@@ -702,4 +738,24 @@ function exactKeys(value: unknown, keys: readonly string[]): boolean {
 
 function requireStore(store: unknown): asserts store is Store {
   requireCondition(store instanceof Store, "stop_report_invalid", "A stop is explained out of a store");
+}
+
+function requireReport(report: unknown): asserts report is Sealed<AnyStopReport> {
+  if (!(isPlainObject(report) && exactKeys(report, Object.hasOwn(report as object, "owner") ? MECHANISM_REPORT_KEYS : REPORT_KEYS))) reportInvalid("report");
+  const value = report as unknown as AnyStopReport;
+  if (!(isText(value.project) && Number.isSafeInteger(value.line) && isText(value.series)
+    && ("owner" in value ? isPlainObject(value.owner) && exactKeys(value.owner, ["kind", "mechanism"])
+      && value.owner.kind === "mechanism" && value.owner.mechanism === "M5:addressing" : isText(value.block)))) reportInvalid("owner");
+  if (!(Array.isArray(value.guards) && value.guards.every(isRef))) reportInvalid("guards");
+}
+
+function reportInvalid(field: string): never {
+  throw new EngineError("stop_report_invalid", "A stop report needs its explicit owner and complete exact sources",
+    { unit: UNIT, target: "stop-report", field });
+}
+
+function reportRequest(report: Sealed<AnyStopReport>): AnySeriesRequest {
+  const address = seriesAddress(report);
+  return address.owner.kind === "block" ? { project: address.project, block: address.owner.block, line: address.line }
+    : { project: address.project, owner: address.owner, line: address.line };
 }

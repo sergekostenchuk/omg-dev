@@ -5,11 +5,11 @@ import { EngineError, requireCondition } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
   prepareLateModelReceipt, readLateModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
 import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
-import { workspacePath, type Environment } from '../runtime/environment.js';
+import { uniqueTransactionGuards, workspacePath, type Environment } from '../runtime/environment.js';
 import { tokenUsage, type TokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
 import { delivered, refused, sealed, isPlainObject, type Refusal, type OmResult, type Sealed } from './refusal.js';
@@ -631,7 +631,7 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
 // Dispatch lifecycle.
 import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
-import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyRecordCallRequest, type DispatchContract } from './call-record.js';
+import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyRecordCallRequest, type DispatchContract, type CallHistory } from './call-record.js';
 import { prepareQuestionPacket, preparePartResult, partResponseId,
   PART_RESPONSE_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
 import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, type CompletionReason } from './series.js';
@@ -1142,8 +1142,8 @@ function requireTransport(store: Store, request: unknown): asserts request is Mo
     || !exactKeys(request, ['project', 'call', 'packet', 'role'])) invalid('transport');
   try { canonical(request.packet); } catch (error) { if (error instanceof EngineError) invalid('packet'); throw error; }
 }
-function transportAssignment(store: Store, request: ModelTransportRequest) {
-  const call = take(readCall(store, request.project, request.call));
+function transportAssignment(store: Store, request: ModelTransportRequest, history?: CallHistory) {
+  const call = take(readCall(store, request.project, request.call, history));
   if (call.revision !== 1) fail('model_call_request_invalid', request.call.id, 'call', 'A transport names the original E1 admission');
   const packet = canonical(request.packet);
   if (!same(call.value.packet, { hash: hashJson(request.packet), chars: packet.length, bytes: Buffer.byteLength(packet) }))
@@ -1164,7 +1164,8 @@ function transportAssignment(store: Store, request: ModelTransportRequest) {
   return { call, environment, binding, wire };
 }
 /** Shared physical boundary: real body fingerprint, current purpose admission and durable claim before spawn. */
-async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal) {
+async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal,
+  extraGuards: readonly TransactionGuard[] = []) {
   const assignment = transportAssignment(store, request), prepared = take(prepareCallDispatch(store, request.project, request.call));
   const admissionGuards = refs([...guards, ...prepared.guards]);
   const counterId = `project-dispatch:${hashJson(request.project)}`;
@@ -1176,7 +1177,7 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
     writes: [{ ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
       { id: counterId, kind: 'project-dispatch', expected: counter?.revision ?? 0,
         value: { projectId: request.project, serial: (counter?.value.serial ?? 0) + 1 } }],
-    guards: [...admissionGuards, ...(counter ? [reference(counter)] : [])] }))[0]!;
+    guards: uniqueTransactionGuards([...admissionGuards, ...extraGuards, ...(counter ? [reference(counter)] : [])]) }))[0]!;
   let processResult: ProcessResult | null = null, launchError: ModelExchange['launchError'] = null;
   try { processResult = await runProcess(assignment.binding.command, assignment.environment.workspace,
     canonical(assignment.wire), assignment.environment.timeoutMs, signal, true, pid => {
@@ -1192,9 +1193,10 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
 }
 const transportExchangeId = (request: ModelTransportRequest) => `om-model-transport:${request.project}:${hashJson(request)}`;
 /** Analysis keeps A6's body and outcome opaque; it uses the same process boundary as ordinary E2/E3 calls. */
-export function readModelTransport(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelTransportOutcome>> {
+export function readModelTransport(store: Store, request: { project: string; record: Ref }, history?: CallHistory): OmResult<Sealed<ModelTransportOutcome>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('transport-record');
+  if (history !== undefined && (!object(history) || !exactKeys(history, ['journal']) || !isRef(history.journal))) invalid('history');
   return result(() => {
     const record = take(readRecord<TransportModelCall>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `model-call:${request.project}:om:`, kind: 'model-call' }));
@@ -1203,7 +1205,7 @@ export function readModelTransport(store: Store, request: { project: string; rec
     const source = record.value.transport.request;
     requireTransport(store, source);
     if (source.project !== request.project) fail('model_call_record_invalid', record.id, 'project', 'This transport belongs to this project');
-    const { call, wire, binding } = transportAssignment(store, source);
+    const { call, wire, binding } = transportAssignment(store, source, history);
     if (!['stop-analysis', 'origin-analysis'].includes(call.value.purpose))
       fail('model_call_request_invalid', call.id, 'purpose', 'Ordinary dispatch is admitted through the E2/E3 orchestrator');
     const value = record.value;
@@ -1240,9 +1242,11 @@ export function readModelTransport(store: Store, request: { project: string; rec
     return { record: record as Revision<TransportModelCall>, call: source.call, exchange: ref, result: decoded, repeated: true };
   });
 }
-export async function runModelTransport(store: Store, request: ModelTransportRequest, signal?: AbortSignal): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
+export async function runModelTransport(store: Store, request: ModelTransportRequest, signal?: AbortSignal,
+  extraGuards: readonly TransactionGuard[] = []): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
   requireTransport(store, request); request = sealed(request) as ModelTransportRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  extraGuards = uniqueTransactionGuards(extraGuards);
   try {
     const { call, wire, binding } = transportAssignment(store, request), id = modelRecordId(request.project, wire.requestId);
     if (!['stop-analysis', 'origin-analysis'].includes(call.value.purpose))
@@ -1260,7 +1264,7 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
       request: { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(request.packet) },
       response: null, usage: null, usageSource: 'unavailable', error: null,
       transport: { version: 'om-model-transport/v1', request, exchange: null } };
-    const physical = await startPhysicalTransport(store, request, { id, kind: 'model-call', expected: 0, value: running }, [], signal);
+    const physical = await startPhysicalTransport(store, request, { id, kind: 'model-call', expected: 0, value: running }, [], signal, extraGuards);
     const exchange: TransportExchange = { project: request.project, request, call: request.call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError };
     const exchangeWrite: Write = { id: transportExchangeId(request), kind: EXCHANGE_KIND, expected: 0, value: exchange }, ref = writeRef(exchangeWrite);

@@ -8,11 +8,11 @@ import {
 } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import {
-  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal,
+  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal, readJournalAt,
   type JournalRow, type OriginSource, type OriginSourceContext, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
 } from "./refusal-journal.js";
 import {
-  prepareBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, REPAIR_SERIES_KIND,
+  prepareBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, seriesRequestOf, REPAIR_SERIES_KIND,
   type Attempt, type AttemptGoal, type AttemptVerdict, type BeginAttemptRequest, type ClaimedRefusal,
   type CompletionReason, type Continuation, type GroundRecord, type RepairSeries,
   type SeriesLadder, type SeriesRequest, type SeriesStop, type SeriesTransition,
@@ -304,6 +304,12 @@ export interface ContextReading {
   readonly reads: readonly Ref[];
 }
 
+export interface StopContextSources {
+  readonly series: Ref;
+  readonly journal: Ref | null;
+  readonly holds: readonly Ref[];
+}
+
 /**
  * What the gate hands back once a cycle has been closed through it.
  * The verdict, the count, the stop and the rung are the SERIES' findings, reported here rather than derived again.
@@ -497,15 +503,15 @@ export function liftOriginHold(store: Store, request: LiftOriginHoldRequest): Om
   return delivered(written.value[0]!);
 }
 
-/** Reads a hold at its exact historical revision through the same proof used for lifting and current holds. */
-export function readOriginHoldAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyOriginHold>>> {
+/** Reads a hold through the same proof; an explicit journal keeps the whole reading on saved historical sources. */
+export function readOriginHoldAt(store: Store, project: string, ref: Ref, journalRef?: Ref): OmResult<Sealed<Revision<AnyOriginHold>>> {
   return withHistoricalReads(() => {
     requireStore(store); requireProject(project);
     requireCondition(isRef(ref), "repeat_request_invalid", "A historical hold requires its exact reference");
     const read = readRecord<AnyOriginHold>(store, ref, { unit: UNIT, target: ref.id,
       kind: ORIGIN_HOLD_KIND, idPrefix: originHoldNamespace(project) });
     if (!read.ok) return read;
-    const journal = readJournal(store, { project });
+    const journal = journalRef === undefined ? readJournal(store, { project }) : readJournalAt(store, project, journalRef);
     if (!journal.ok) return refused("hold_invalid", "The hold has no checked journal of its refusal",
       { unit: UNIT, target: ref.id, field: "row", ref }, "producer");
     const broken = checkHold(store, project, read.value as Revision<AnyOriginHold>, journal.value.value as RefusalJournal);
@@ -538,6 +544,30 @@ export function readStopContext(store: Store, request: AnySeriesRequest): OmResu
   return read.ok ? delivered(read.value) : read;
 }
 
+/** Every mutable source is named explicitly; the saved series and journal determine which holds must be present. */
+export function readStopContextAt(store: Store, request: { project: string; sources: StopContextSources }): OmResult<Sealed<ContextReading>> {
+  const invalid = (field: string): never => { throw new EngineError("repeat_request_invalid", "A historical context needs its complete exact sources",
+    { unit: UNIT, target: "stop-context", field }); };
+  if (!(store instanceof Store)) invalid("store");
+  if (!isPlainObject(request)) invalid("request");
+  let project: string;
+  try { project = requireProject(request.project); }
+  catch (error) { if (error instanceof EngineError && error.code === "repeat_request_invalid") invalid("project"); throw error; }
+  const sources = request.sources;
+  if (!(isPlainObject(sources) && exactKeys(sources, ["series", "journal", "holds"])
+    && isRef(sources.series) && (sources.journal === null || isRef(sources.journal))
+    && Array.isArray(sources.holds) && sources.holds.every(isRef))) invalid("sources");
+  const fixed = sealed({ series: exactRef(sources.series), journal: sources.journal === null ? null : exactRef(sources.journal),
+    holds: sources.holds.map(exactRef) });
+  return withHistoricalReads(() => {
+    const series = readAnySeriesAt(store, project, fixed.series);
+    if (!series.ok) return series;
+    const address = seriesAddress(seriesRequestOf(series.value.value));
+    const read = contextReadingOf(store, address, series.value as Revision<AnyRepairSeries>, fixed);
+    return read.ok ? delivered(read.value) : read;
+  });
+}
+
 function contextReading(store: Store, request: AnySeriesRequest): OmResult<ContextReading> {
   return withHistoricalReads(() => contextReadingInScope(store, request));
 }
@@ -547,9 +577,11 @@ function contextReadingInScope(store: Store, request: AnySeriesRequest): OmResul
   const address = requireAddress(request);
   const series = readAnySeries(store, request);
   if (!series.ok) return series;
-  const current = series.value as Revision<AnyRepairSeries>;
+  return contextReadingOf(store, address, series.value as Revision<AnyRepairSeries>);
+}
+function contextReadingOf(store: Store, address: Address, current: Revision<AnyRepairSeries>, sources?: StopContextSources): OmResult<ContextReading> {
   const held = current.value;
-  const holds = holdsOf(store, address, held);
+  const holds = holdsOf(store, address, held, sources);
   if ("ok" in holds) return holds;
   if (held.stop === null && holds.standing.length === 0) {
     return refused("stop_absent", "Neither a saved stop nor a hold stands in this series, so there is no context of one to assemble",
@@ -560,7 +592,7 @@ function contextReadingInScope(store: Store, request: AnySeriesRequest): OmResul
   const reads: Ref[] = [reference(current), ...holds.guards];
   let decided: ReadonlyMap<string, RefusalClassification> = new Map();
   if (rowsOf(held).size > 0) {
-    const journal = readJournal(store, { project: address.project });
+    const journal = contextJournal(store, address, sources);
     if (!journal.ok) return unlinked(address, journal.refusal.code, "stop.refusals");
     reads.push(reference(journal.value));
     decided = new Map(journal.value.value.classifications.map(item => [item.row, item as RefusalClassification]));
@@ -1004,23 +1036,46 @@ const addressed = (item: RefusalClass, target: string): string => `${ADDRESSEE_K
  * the record it was lifted on — before it is believed (T3). A hold that should stand and does not is not a lifted one:
  * the series is held until it is raised, which closing that cycle through this gate again does.
  */
-function holdsOf(store: Store, address: Address, series: AnyRepairSeries): OmResult<never> | Holds {
+function contextJournal(store: Store, address: Address, sources?: StopContextSources): OmResult<Sealed<Revision<RefusalJournal>>> {
+  if (sources === undefined) return readJournal(store, { project: address.project });
+  if (sources.journal === null) return refused("hold_invalid", "Recorded refusals require their exact historical journal",
+    { unit: UNIT, target: address.id, field: "sources.journal" }, "producer");
+  return readJournalAt(store, address.project, sources.journal);
+}
+
+function holdsOf(store: Store, address: Address, series: AnyRepairSeries, sources?: StopContextSources): OmResult<never> | Holds {
   const rows = rowsOf(series);
-  if (rows.size === 0) return { standing: [], guards: [] };
-  const journal = readJournal(store, { project: address.project });
+  const incomplete = (field: string): OmResult<never> => refused("hold_invalid", "Historical context sources must contain exactly the journal and holds of the saved series",
+    { unit: UNIT, target: address.id, field: `sources.${field}` }, "producer");
+  if (rows.size === 0) {
+    if (sources && sources.journal !== null) return incomplete("journal");
+    if (sources && sources.holds.length !== 0) return incomplete("holds");
+    return { standing: [], guards: [] };
+  }
+  const journal = contextJournal(store, address, sources);
   if (!journal.ok) return unlinked(address, journal.refusal.code, "hold");
   const guards: Ref[] = [reference(journal.value)];
   const book = journal.value.value as RefusalJournal;
   const classes = new Map(book.classifications.map(item => [item.row, item]));
   const byId = new Map(book.rows.map(row => [row.id, row]));
   const standing: HoldContext[] = [];
+  const named = new Map(sources?.holds.map(ref => [ref.id, ref]) ?? []), used = new Set<string>();
+  if (sources && named.size !== sources.holds.length) return incomplete("holds");
+  if (sources) for (const row of rows) if (!byId.has(row)) return incomplete("journal");
   for (const attempt of [...series.inherited, ...series.attempts]) {
     if (attempt.outcome === null) continue;
     for (const row of [...new Set(attempt.outcome.refusals.map(item => item.row))].sort(compare)) {
       const decision = classes.get(row);
       if (decision === undefined || decision.class !== "unknown") continue;
       const id = originHoldId(address.project, address.owner, attempt.ordinal, row);
-      const found = store.get<AnyOriginHold>(id);
+      let found: Revision<AnyOriginHold> | null;
+      if (sources) {
+        const ref = named.get(id);
+        if (!ref) return incomplete("holds");
+        const read = readRecord<AnyOriginHold>(store, ref, { unit: UNIT, target: address.id, kind: ORIGIN_HOLD_KIND, id });
+        if (!read.ok) return read;
+        found = read.value as Revision<AnyOriginHold>; used.add(id);
+      } else found = store.get<AnyOriginHold>(id);
       if (found === null) {
         return refused("origin_held",
           `The refusal attempt ${attempt.ordinal} ran into is of unknown origin and no hold of it stands yet: closing that cycle through this gate again raises it`,
@@ -1034,6 +1089,7 @@ function holdsOf(store: Store, address: Address, series: AnyRepairSeries): OmRes
       }
     }
   }
+  if (sources && used.size !== named.size) return incomplete("holds");
   return { standing, guards };
 }
 
