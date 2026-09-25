@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import type { Store, Revision, Write } from '../storage/store.js';
+import { Store, type Revision, type Write } from '../storage/store.js';
 import type { ModelCall, ModelExecution, ProcessIdentity } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -19,7 +19,10 @@ export function physicalClaim(): Pick<ModelCall, 'ownerProcess' | 'execution'> {
   return { ownerProcess: owner, execution: { version: 'model-execution/v1', phase: 'claimed', owner, provider: null } };
 }
 
-function executionOf(call: ModelCall): ModelExecution | null {
+export function executionOf(call: ModelCall): ModelExecution | null {
+  requireCondition(call && typeof call === 'object' && !Array.isArray(call)
+    && [Object.prototype, null].includes(Object.getPrototypeOf(call)),
+  'model_call_execution_invalid', 'Physical execution is read from an explicit model-call body');
   if (call.execution === undefined) return null;
   const e = call.execution;
   requireCondition(e && e.version === 'model-execution/v1' && identity(e.owner) && same(e.owner, call.ownerProcess ?? null)
@@ -174,17 +177,38 @@ export function prepareLateModelReceipt(store: Store, project: string, dispatch:
   return { record, recovered, writes: prior ? [] as Write[] : [{ id, kind: record.kind, expected: 0, value }], guards: [reference(head), reference(recovered.incident)] };
 }
 
-export function readLateModelReceipt(store: Store, project: string, recovered: Ref): Revision<LateModelReceipt> | null {
-  const recovery = readModelCallRecovery(store, project, recovered), dispatch = reference(recovery.original);
-  const record = store.get<LateModelReceipt>(`model-late-receipt:${hashJson({ dispatch })}`);
-  if (!record) return null;
+function checkedLateModelReceipt(project: string, recovered: Ref, recovery: ReturnType<typeof readModelCallRecovery>,
+  record: Revision<LateModelReceipt>): Revision<LateModelReceipt> {
+  const dispatch = reference(recovery.original);
   const v = record.value;
-  requireCondition(record.kind === 'model-late-receipt' && record.revision === 1 && v.version === 'model-late-receipt/v1'
+  requireCondition(record.id === `model-late-receipt:${hashJson({ dispatch })}`
+    && record.kind === 'model-late-receipt' && record.revision === 1 && v && typeof v === 'object'
+    && v.version === 'model-late-receipt/v1'
     && v.projectId === project && same(v.dispatch, dispatch) && same(v.recovered, recovered) && same(v.incident, reference(recovery.incident))
     && executionOf(recovery.original.value)?.phase === 'authorized',
   'model_call_late_receipt_invalid', 'Late evidence does not belong to the exact recovered dispatch');
   lateEvidence(v.evidence);
   return record;
+}
+
+export function readLateModelReceipt(store: Store, project: string, recovered: Ref): Revision<LateModelReceipt> | null {
+  const recovery = readModelCallRecovery(store, project, recovered), dispatch = reference(recovery.original);
+  const record = store.get<LateModelReceipt>(`model-late-receipt:${hashJson({ dispatch })}`);
+  return record ? checkedLateModelReceipt(project, recovered, recovery, record) : null;
+}
+
+/** An explicit historical receipt never consults today's receipt or call heads. */
+export function readLateModelReceiptAt(store: Store, project: string, recovered: Ref, receiptRef: Ref): Revision<LateModelReceipt> {
+  requireCondition(store instanceof Store && typeof project === 'string' && project.length > 0
+    && isRef(recovered) && isRef(receiptRef), 'model_call_late_receipt_invalid',
+  'Historical late evidence needs an exact recovered call and receipt reference');
+  const recovery = readModelCallRecovery(store, project, recovered), dispatch = reference(recovery.original);
+  requireCondition(receiptRef.id === `model-late-receipt:${hashJson({ dispatch })}` && receiptRef.revision === 1,
+    'model_call_late_receipt_invalid', 'Late evidence must name the original dispatch receipt');
+  const record = store.get<LateModelReceipt>(receiptRef.id, receiptRef.revision);
+  requireCondition(record && same(reference(record), receiptRef), 'model_call_late_receipt_invalid',
+    'The exact historical late receipt is missing or has different content');
+  return checkedLateModelReceipt(project, recovered, recovery, record);
 }
 
 /** Legacy callers retain their original two-identity recovery. OM routes this

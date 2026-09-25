@@ -212,6 +212,93 @@ export function callLedgerId(project: string): string {
 
 /** Reads one exact historical call revision without admitting a dispatch or consulting later source heads. */
 export interface CallHistory { readonly journal: Ref }
+/** The named row fixes the call identity; its unchanged admission and settlement share this origin context. */
+export interface CallLedgerHistory extends CallHistory { readonly call: Ref }
+
+/** The complete current E1 ledger; absence is legal only when this project has no call records. */
+export function readCallLedger(store: Store, project: string,
+  history: readonly CallLedgerHistory[] = [],
+): OmResult<Sealed<Revision<CallLedger> | null>> {
+  requireLedgerRead(store, project, history);
+  return withHistoricalReads(() => {
+    const checked = checkedLedger(store, project, history);
+    return checked.ok ? delivered(checked.value?.record ?? null) : checked;
+  });
+}
+
+/** Reads the saved ledger's own exact cut, not all physical calls in the database at a guessed time. */
+export function readCallLedgerAt(store: Store, project: string, ref: Ref,
+  history: readonly CallLedgerHistory[] = [],
+): OmResult<Sealed<Revision<CallLedger>>> {
+  requireLedgerRead(store, project, history);
+  return withHistoricalReads(() => {
+    const id = callLedgerId(project);
+    if (!exactReference(ref) || ref.id !== id) {
+      return problem("ledger_invalid", "A ledger snapshot needs its exact project reference", id, "ledger");
+    }
+    const record = store.get<CallLedger>(id, ref.revision);
+    if (!record || record.revision !== ref.revision || record.hash !== ref.hash) {
+      return problem("ledger_invalid", "No ledger stands at the exact named snapshot", id, "ledger", "producer", ref);
+    }
+    const shape = ledgerShape(record, project);
+    if (shape) return shape;
+    const contexts = ledgerContexts(history, record.value.calls.map(row => row?.call), id);
+    if (!contexts.ok) return contexts;
+    const calls = new Map<string, Revision<AnyCallRecord>>();
+    let previous: Revision<CallLedger> | null = null;
+    for (let revision = 1; revision <= record.revision; revision += 1) {
+      const step = revision === record.revision ? record : store.get<CallLedger>(id, revision);
+      if (!step) return problem("ledger_invalid", "A ledger snapshot retains every preceding ledger revision", id, "revision");
+      const malformed = ledgerShape(step, project);
+      if (malformed) return malformed;
+      const sources: Revision<AnyCallRecord>[] = [];
+      for (const row of step.value.calls) {
+        if (!validLedgerRow(row)) return problem("ledger_invalid", "Each ledger row needs its complete E1 shape", id, "calls", "producer", reference(step));
+        const key = canonical(row.call);
+        let source = calls.get(key);
+        if (!source) {
+          const journal = contexts.value.find(item => item.call.id === row.call.id);
+          if (journal && (!("owner" in row) || row.purpose !== "origin-analysis")) {
+            return problem("ledger_invalid", "An origin journal is supplied only for a mechanism origin-analysis call", id, "history");
+          }
+          // Mechanism origin history cannot silently fall back to today's journal.
+          if ("owner" in row && row.purpose === "origin-analysis" && !journal) {
+            return problem("ledger_invalid", "Historical mechanism origin analysis needs its exact journal", id, "history", "producer", row.call);
+          }
+          const checked = readCallInScope(store, project, row.call, journal && { journal: journal.journal });
+          if (!checked.ok) return checked;
+          source = checked.value;
+          calls.set(key, source);
+        }
+        sources.push(source);
+      }
+      const checked = checkLedgerRows(step, project, sources);
+      if (!checked.ok) return checked;
+      if (!ledgerStep(previous?.value.calls ?? [], step.value.calls)) {
+        return problem("ledger_invalid", "A ledger revision admits one call or settles one admitted call, preserving every other row",
+          id, "calls", "producer", reference(step));
+      }
+      previous = step;
+    }
+    return delivered(record);
+  });
+}
+
+function requireLedgerRead(store: Store, project: string, history: readonly CallLedgerHistory[]): void {
+  requireCondition(store instanceof Store && validProject(project), "call_request_invalid", "A ledger is read through a store for one named project");
+  requireCondition(Array.isArray(history) && Array.from(history).every(item => isPlainObject(item)
+    && exactKeys(item, ["call", "journal"]) && exactReference(item.call) && exactReference(item.journal))
+    && new Set(history.map(item => item.call.id)).size === history.length,
+  "call_request_invalid", "Ledger history names each call once with its exact origin journal");
+}
+
+function ledgerContexts(history: readonly CallLedgerHistory[], calls: readonly Ref[], id: string): OmResult<Sealed<readonly CallLedgerHistory[]>> {
+  if (history.some(item => !calls.some(call => exactReference(call) && sameRef(item.call, call)))) {
+    return problem("ledger_invalid", "Historical contexts belong to exact rows of this ledger snapshot", id, "history");
+  }
+  return delivered(history);
+}
+
 export function readCall(store: Store, project: string, ref: Ref, history?: CallHistory): OmResult<Sealed<Revision<AnyCallRecord>>> {
   requireCondition(history === undefined || (isPlainObject(history) && exactKeys(history, ['journal']) && isRef(history.journal)),
     'call_request_invalid', 'Historical call context needs its exact journal');
@@ -677,14 +764,20 @@ function ownerFields(value: CheckedRequest | AnyCallRecord): { block: string } |
     : { block: value.block };
 }
 
-function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLedger | null>> {
+function checkedLedger(store: Store, project: string, history: readonly CallLedgerHistory[] = []): OmResult<Sealed<CheckedLedger | null>> {
   const id = callLedgerId(project);
   const calls = store.list<AnyCallRecord>(CALL_RECORD_KIND)
     .filter(call => call.id.startsWith(callRecordNamespace(project)));
+  const contexts = ledgerContexts(history, calls.map(reference), id);
+  if (!contexts.ok) return contexts;
   const sources: Revision<AnyCallRecord>[] = [];
   for (const call of calls) {
-    const valid = checkedCall(store, call, project, call.id);
+    const journal = contexts.value.find(item => sameRef(item.call, reference(call)));
+    const valid = checkedCall(store, call, project, call.id, journal && { journal: journal.journal });
     if (!valid.ok) return valid;
+    if (journal && (!("owner" in valid.value.value) || valid.value.value.purpose !== "origin-analysis")) {
+      return problem("ledger_invalid", "An origin journal is supplied only for a mechanism origin-analysis call", id, "history");
+    }
     sources.push(valid.value);
   }
   const record = store.get<CallLedger>(id);
@@ -694,12 +787,23 @@ function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLe
     }
     return delivered(null);
   }
-  if (record.kind !== CALL_LEDGER_KIND || !isPlainObject(record.value) || !exactKeys(record.value, LEDGER_KEYS)
+  return checkLedgerRows(record, project, sources);
+}
+
+function ledgerShape(record: Revision<CallLedger>, project: string): OmResult<never> | null {
+  const id = callLedgerId(project);
+  if (record.id !== id || record.kind !== CALL_LEDGER_KIND || !isPlainObject(record.value) || !exactKeys(record.value, LEDGER_KEYS)
     || record.value.projectId !== project || !Array.isArray(record.value.calls)) {
     return problem("ledger_invalid", "The project's ledger carries only its project and call rows", id, "ledger", "producer", reference(record));
   }
+  return null;
+}
+
+function checkLedgerRows(record: Revision<CallLedger>, project: string, sources: readonly Revision<AnyCallRecord>[]): OmResult<Sealed<CheckedLedger>> {
+  const id = callLedgerId(project), malformed = ledgerShape(record, project);
+  if (malformed) return malformed;
   const expected = orderedRows(sources.map(call => rowOf(reference(call), call.value)));
-  if (record.value.calls.length !== expected.length) {
+  if (record.value.calls.length !== expected.length || new Set(sources.map(call => call.id)).size !== sources.length) {
     return problem("ledger_invalid", "The ledger has one row for every call record in the project's namespace",
       id, "calls", "producer", reference(record));
   }
@@ -711,6 +815,16 @@ function checkedLedger(store: Store, project: string): OmResult<Sealed<CheckedLe
     }
   }
   return delivered({ record, guards: uniqueRefs([reference(record), ...sources.map(reference)]) });
+}
+
+function ledgerStep(previous: readonly AnyCallLedgerEntry[], next: readonly AnyCallLedgerEntry[]): boolean {
+  const before = new Map(previous.map(row => [row.call.id, row]));
+  if (previous.some(row => !next.some(item => item.call.id === row.call.id))) return false;
+  const changes = next.filter(row => canonical(before.get(row.call.id) ?? null) !== canonical(row));
+  if (changes.length !== 1) return false;
+  const row = changes[0]!, old = before.get(row.call.id);
+  return old === undefined ? next.length === previous.length + 1 && row.call.revision === 1
+    : next.length === previous.length && old.call.revision === 1 && row.call.revision === 2;
 }
 
 function checkedCall(

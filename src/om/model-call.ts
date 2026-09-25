@@ -3,7 +3,7 @@ import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { EngineError, requireCondition } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
-  prepareLateModelReceipt, readLateModelReceipt } from '../discovery/model-call-recovery.js';
+  prepareLateModelReceipt, readLateModelReceipt, executionOf } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { ResearchSources } from '../discovery/research-sources.js';
@@ -645,6 +645,9 @@ export interface ModelCallOutcome {
   record: Revision<OmModelCall>; packet: Ref; call: Ref; response: Ref | null; outcome: CheckedAnswerForm | null;
   part: { proposal: Ref; result: Ref } | null; diagnostic: Ref | null; repeated: boolean;
 }
+export interface ModelCallPhysical {
+  record: Revision<OmModelCall>; call: Ref; packet: Ref; transport: AdapterResult | null;
+}
 interface ModelExchange {
   project: string; request: ModelCallRequest; call: Ref; wire: AdapterRequest;
   process: ProcessResult | null; launchError: { code: string; message: string } | null; admissionGuards: Ref[];
@@ -816,11 +819,42 @@ function finishDetail(transport: AdapterResult, form: CheckedAnswerForm | null, 
   return null;
 }
 
-/** Historical playback rederives the wire and form from saved sources, including the original E1 revision. */
-export function readModelCallState(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallState>> {
+/** Unknown expense is justified only by a complete, unreceived physical claim. */
+function requireUnreceivedModelCall(record: Revision<ModelCall>): void {
+  const value = record.value;
+  for (const field of ['finishedAt', 'response', 'usage', 'error'] as const) {
+    if (value[field] !== null)
+      fail('model_call_record_invalid', record.id, field, 'An unreceived dispatch retains an explicit null physical outcome');
+  }
+  if (value.status !== 'running' || Object.hasOwn(value, 'recovery'))
+    fail('model_call_record_invalid', record.id, 'status', 'A running dispatch has no terminal recovery');
+  if (!Number.isSafeInteger(value.startedAt) || value.startedAt < 0)
+    fail('model_call_record_invalid', record.id, 'startedAt', 'A running dispatch retains its physical start time');
+  if (!object(value.confirmed) || !same(value.confirmed, unknownConfirmed()) || value.usageSource !== 'unavailable')
+    fail('model_call_record_invalid', record.id, 'receipt', 'A running dispatch has no confirmed executor or measured expense');
+  try {
+    if (!executionOf(value)) fail('model_call_record_invalid', record.id, 'execution', 'OM dispatch retains its mandatory physical claim');
+  } catch (error) {
+    if (error instanceof EngineError && error.code === 'model_call_execution_invalid')
+      fail('model_call_record_invalid', record.id, 'execution', 'The physical claim retains its exact owner and authorization phase');
+    throw error;
+  }
+}
+
+function requireRunningModelCall(record: Revision<OmModelCall>): void {
+  requireUnreceivedModelCall(record);
+  const value = record.value;
+  if (value.om.exchange !== null || value.om.part !== null
+    || value.om.input !== null || value.om.diagnostic !== null || value.om.failure !== null || value.om.rejection !== null
+    || Object.hasOwn(value.om, 'completion'))
+    fail('model_call_record_invalid', record.id, 'application', 'A running dispatch has no received or applied evidence');
+}
+
+/** Exact E4 provenance and physical usage, independent of subsequent product application. */
+export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallPhysical>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('record');
-  return result<ModelCallState>(() => {
+  return result<ModelCallPhysical>(() => {
     const record = take(readRecord<OmModelCall>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `model-call:${request.project}:om:`, kind: 'model-call' }));
     const value = record.value;
@@ -830,7 +864,8 @@ export function readModelCallState(store: Store, request: { project: string; rec
     if (value.om.request.project !== request.project) fail('model_call_record_invalid', record.id, 'project', 'A call belongs to this project');
     const assignment = modelAssignment(store, value.om.request), { packet, payload, wire, binding } = assignment;
     if (record.id !== modelRecordId(request.project, wire.requestId) || value.projectId !== request.project
-      || value.requestId !== wire.requestId || value.purpose !== payload.purpose || !same(value.requested, binding)
+      || value.draftId !== packet.id || value.requestId !== wire.requestId || value.purpose !== payload.purpose
+      || !object(value.requested) || !object(value.request) || !same(value.requested, binding)
       || !same(value.request, { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(payload), record: reference(packet) })
       || !Number.isSafeInteger(value.startedAt)) fail('model_call_record_invalid', record.id, 'request', 'Runtime request must reproduce its exact packet and executor');
     const admitted = take(readCall(store, request.project, value.om.call));
@@ -841,11 +876,8 @@ export function readModelCallState(store: Store, request: { project: string; rec
       || !same(admitted.value.gaps, [...assignment.admission.gaps].sort(compareJson)))
       fail('model_call_record_invalid', record.id, 'call', 'The runtime call must reproduce its E1 admission');
     if (value.om.application === 'running') {
-      if (value.status !== 'running' || value.finishedAt !== null || value.om.exchange !== null
-        || value.response !== null || value.usage !== null || value.error !== null || value.om.part !== null
-        || value.om.input !== null || value.om.diagnostic !== null || value.om.failure !== null || value.om.rejection !== null)
-        fail('model_call_record_invalid', record.id, 'application', 'A running dispatch has no received or applied evidence');
-      return { state: 'running', record: record as Revision<OmModelCall> };
+      requireRunningModelCall(record as Revision<OmModelCall>);
+      return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport: null };
     }
     if (value.om.application === 'recovered') {
       const recovery = readModelCallRecovery(store, request.project, request.record);
@@ -855,24 +887,16 @@ export function readModelCallState(store: Store, request: { project: string; rec
         || value.om.input !== null || value.om.failure !== null || value.om.rejection !== null
         || !(value.om.completion === null || isRef(value.om.completion)))
         fail('model_call_record_invalid', record.id, 'recovery', 'Recovery retains the original unreceived E4 assignment');
-      if (value.om.completion) {
-        const completed = take(readAnySeriesAt(store, request.project, value.om.completion));
-        const attempt = completed.value.attempts.find(item => item.ordinal === admitted.value.attempt);
-        if (completed.id !== admitted.value.series.id || !attempt?.outcome || !same(attempt.goal, admitted.value.goal)
-          || value.om.diagnostic !== null)
-          fail('model_call_record_invalid', record.id, 'completion', 'Recovery preserves the exact already completed attempt');
-      } else {
-        const finish = recoveryFinish(store, record as Revision<OmModelCall>, reference(recovery.incident));
-        if (finish.writes.length || !same(value.om.diagnostic, finish.diagnostic))
-          fail('model_call_record_invalid', record.id, 'diagnostic', 'Physical loss completes A3 once through its shared transition');
-      }
-      return { state: 'recovered', outcome: { record: record as Revision<OmModelCall>, packet: value.om.request.packet,
-        call: value.om.call, response: null, outcome: null, part: null, diagnostic: value.om.diagnostic, repeated: true } };
+      requireRunningModelCall(recovery.original as Revision<OmModelCall>);
+      if (!Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
+        fail('model_call_record_invalid', record.id, 'recovery', 'Physical recovery retains a valid completion time');
+      return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport: null };
     }
     if (!isRef(value.om.exchange)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed runtime call needs immutable transport evidence');
     const exchange = take(readRecord<ModelExchange>(store, value.om.exchange,
       { unit: 'E4', target: record.id, id: exchangeId(value.om.request), kind: EXCHANGE_KIND }));
-    if (exchange.revision !== 1 || !exactKeys(exchange.value, ['project', 'request', 'call', 'wire', 'process', 'launchError', 'admissionGuards'])
+    if (exchange.revision !== 1 || !object(exchange.value)
+      || !exactKeys(exchange.value, ['project', 'request', 'call', 'wire', 'process', 'launchError', 'admissionGuards'])
       || exchange.value.project !== request.project || !same(exchange.value.request, value.om.request)
       || !same(exchange.value.call, value.om.call) || !same(exchange.value.wire, wire)
       || !Array.isArray(exchange.value.admissionGuards) || !exchange.value.admissionGuards.length
@@ -885,31 +909,62 @@ export function readModelCallState(store: Store, request: { project: string; rec
         fail('model_call_record_invalid', record.id, 'admissionGuards', 'The received exchange retains exact dispatch sources');
     }
     const transport = transportOf(exchange.value as ModelExchange);
+    if (!same(value.usage, transport.usage) || !same(value.confirmed, transport.confirmed)
+      || value.usageSource !== (transport.usage === null ? 'unavailable' : 'adapter')
+      || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
+      fail('model_call_record_invalid', record.id, 'receipt', 'Physical usage and executor confirmation derive from the immutable original exchange');
     if (value.om.application === 'received') {
       if (value.status !== (transport.kind === 'answered' ? 'succeeded' : 'failed')
         || value.error !== (transport.kind === 'answered' ? null : transport.error.code)
-        || !same(value.usage, transport.usage) || !same(value.confirmed, transport.confirmed)
-        || value.usageSource !== (transport.usage === null ? 'unavailable' : 'adapter')
-        || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt
         || !same(value.response, transport.kind === 'answered'
           ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null)
         || value.om.part !== null || value.om.input !== null || value.om.diagnostic !== null
         || value.om.failure !== null || value.om.rejection !== null)
         fail('model_call_record_invalid', record.id, 'receipt', 'A physical receipt is derived solely from its immutable original exchange');
-      return { state: 'received', record: record as Revision<OmModelCall>, exchange: exchange as Revision<ModelExchange>, transport };
-    }
-    if (!['applied', 'application-refused'].includes(value.om.application)
+    } else if (!['applied', 'application-refused'].includes(value.om.application)
       || (value.om.application === 'application-refused') !== (value.om.rejection !== null))
       fail('model_call_record_invalid', record.id, 'application', 'Terminal application states distinguish a product result from a proved refusal');
+    return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport };
+  });
+}
+
+/** Historical playback additionally checks the saved product application through its original producer. */
+export function readModelCallState(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallState>> {
+  return result<ModelCallState>(() => {
+    const physical = take(readModelCallPhysical(store, request));
+    const record = physical.record as Revision<OmModelCall>, value = record.value;
+    if (value.om.application === 'running') return { state: 'running', record };
+    if (value.om.application === 'recovered') {
+      const recovery = readModelCallRecovery(store, request.project, request.record);
+      if (value.om.completion) {
+        const admitted = take(readCall(store, request.project, value.om.call));
+        const completed = take(readAnySeriesAt(store, request.project, value.om.completion));
+        const attempt = completed.value.attempts.find(item => item.ordinal === admitted.value.attempt);
+        if (completed.id !== admitted.value.series.id || !attempt?.outcome || !same(attempt.goal, admitted.value.goal)
+          || value.om.diagnostic !== null)
+          fail('model_call_record_invalid', record.id, 'completion', 'Recovery preserves the exact already completed attempt');
+      } else {
+        const finish = recoveryFinish(store, record, reference(recovery.incident));
+        if (finish.writes.length || !same(value.om.diagnostic, finish.diagnostic))
+          fail('model_call_record_invalid', record.id, 'diagnostic', 'Physical loss completes A3 once through its shared transition');
+      }
+      return { state: 'recovered', outcome: { record, packet: value.om.request.packet,
+        call: value.om.call, response: null, outcome: null, part: null, diagnostic: value.om.diagnostic, repeated: true } };
+    }
+    const transport = physical.transport as AdapterResult;
+    // The physical reader proved this exact exchange; the received DTO also supplies it to application.
+    if (!isRef(value.om.exchange)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed runtime call needs immutable transport evidence');
+    if (value.om.application === 'received') {
+      const exchange = take(readRecord<ModelExchange>(store, value.om.exchange,
+        { unit: 'E4', target: record.id, id: exchangeId(value.om.request), kind: EXCHANGE_KIND }));
+      return { state: 'received', record, exchange: exchange as Revision<ModelExchange>, transport };
+    }
     if (value.om.rejection !== null) {
       if (!isRef(value.om.rejection)) fail('model_call_record_invalid', record.id, 'rejection', 'Application rejection needs exact retained source heads');
       const rejected = take(readModelApplicationRejection(store, { project: request.project, record: value.om.rejection }));
       if (!same(rejected.record.value.packet, value.om.request.packet) || !same(rejected.record.value.call, value.om.call)
         || !same(rejected.record.value.exchange, value.om.exchange) || !same(value.om.failure, rejected.failure)
         || value.status !== 'failed' || value.error !== rejected.failure.code || value.om.part !== null || value.om.input !== null
-        || !same(value.usage, transport.usage) || !same(value.confirmed, transport.confirmed)
-        || value.usageSource !== (transport.usage === null ? 'unavailable' : 'adapter')
-        || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt
         || !same(value.response, transport.kind === 'answered'
           ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null))
         fail('model_call_record_invalid', record.id, 'rejection', 'A rejected application retains its original transport and checked failing source window');
@@ -936,10 +991,8 @@ export function readModelCallState(store: Store, request: { project: string; rec
       if (form.ok) outcome = form.value as CheckedAnswerForm;
     } else if (response !== null) fail('model_call_record_invalid', record.id, 'response', 'An unsuccessful wire envelope cannot supply a product response');
     const failure = failureOf(transport, form), reason = finishReason(transport, outcome, failure);
-    if (!same(value.om.failure, failure) || !same(value.usage, transport.usage) || !same(value.confirmed, transport.confirmed)
-      || value.usageSource !== (transport.usage === null ? 'unavailable' : 'adapter')
+    if (!same(value.om.failure, failure)
       || value.status !== (transport.kind === 'answered' && !failure ? 'succeeded' : 'failed')
-      || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt
       || value.error !== (failure?.code ?? null)
       || !same(value.response, response ? { chars: transport.kind === 'answered' ? transport.raw.length : 0,
         bytes: transport.kind === 'answered' ? Buffer.byteLength(transport.raw) : 0, record: response } : null))
@@ -1210,12 +1263,21 @@ export function readModelTransport(store: Store, request: { project: string; rec
       fail('model_call_request_invalid', call.id, 'purpose', 'Ordinary dispatch is admitted through the E2/E3 orchestrator');
     const value = record.value;
     if (record.id !== modelRecordId(request.project, wire.requestId) || value.projectId !== request.project
-      || value.requestId !== wire.requestId || value.purpose !== call.value.purpose || !same(value.requested, binding)
+      || value.draftId !== call.id || value.requestId !== wire.requestId || value.purpose !== call.value.purpose
+      || !object(value.requested) || !object(value.request) || !same(value.requested, binding)
       || !same(value.request, { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(source.packet) }))
       fail('model_call_record_invalid', record.id, 'request', 'Analysis runtime must reproduce the actual admitted body and executor');
-    if (value.status === 'running') fail('model_call_in_progress', record.id, 'status', 'The admitted analysis already owns a physical dispatch');
+    if (value.status === 'running') {
+      requireUnreceivedModelCall(record as Revision<TransportModelCall>);
+      if (value.transport.exchange !== null)
+        fail('model_call_record_invalid', record.id, 'exchange', 'A running analysis retains an explicit absence of received exchange');
+      fail('model_call_in_progress', record.id, 'status', 'The admitted analysis already owns a physical dispatch');
+    }
     if (value.recovery) {
       const recovered = readModelCallRecovery(store, request.project, request.record);
+      requireUnreceivedModelCall(recovered.original);
+      if (!Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
+        fail('model_call_record_invalid', record.id, 'finishedAt', 'Analysis recovery retains its physical completion time');
       if (!same((recovered.original.value as TransportModelCall).transport, value.transport) || value.transport.exchange !== null)
         fail('model_call_record_invalid', record.id, 'recovery', 'Analysis recovery retains its exact assignment without an invented response');
       return { record: record as Revision<TransportModelCall>, call: source.call, exchange: null, repeated: true,
