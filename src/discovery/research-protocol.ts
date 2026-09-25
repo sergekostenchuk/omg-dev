@@ -18,19 +18,21 @@ import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
 import type { ResearchAction } from "./research-model.js";
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import { tokenUsage, type ModelCall } from "../runtime/model-usage.js";
-import { digest, hashJson } from "../canonical.js";
-import { reference, type Ref } from "../pipeline/contracts.js";
+import { canonical, digest, hashJson } from "../canonical.js";
+import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { DELTA_COLLECTIONS } from "./layer-delta.js";
 import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
-import { recoveryDispatchBoundary, operatorReplayedResponse } from './response-recovery.js';
+import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery } from './response-recovery.js';
+import type { RecoverableContextSession } from './context-recovery.js';
 
 const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const text = { type: "string", minLength: 1 };
@@ -84,10 +86,114 @@ export function researchAction(value: unknown): ResearchAction {
   }
   return value;
 }
+interface ResearchCallAudit {
+  store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
+  session?: Ref; onContext?: (context: Record<string, any>) => void;
+  application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
+}
+type AssessmentReservation = { kind: 'replay-only' } | {
+  kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
+};
+const recordValue = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
+function applicationAuditInvalid(message: string): never {
+  throw new EngineError('research_context_application_invalid', message);
+}
+
+/** This is the atomic transport seam, not another assessment state machine.
+ * The saved session selects the era before optional callback fields can do so. */
+function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleBinding, environment: Environment, context: unknown): AssessmentReservation | null {
+  const namedSession = recordValue(context) ? context.assessmentSession : undefined;
+  const namesNewSession = typeof namedSession === 'string' && namedSession.startsWith('assessment-session:v1:');
+  if (!audit) {
+    if (namesNewSession) applicationAuditInvalid('A new assessment context needs its exact audited session');
+    return null;
+  }
+  const explicit = Object.hasOwn(audit, 'application') || Object.hasOwn(audit, 'prepareCall');
+  if (audit.session === undefined && !explicit && !namesNewSession) return null;
+  try {
+    if (!isRef(audit.session)) applicationAuditInvalid('An assessment reservation needs its exact saved session');
+    const session = audit.store.get<RecoverableContextSession>(audit.session.id, audit.session.revision);
+    if (!session || !recordValue(session.value) || canonical(reference(session)) !== canonical(audit.session)
+      || hashJson(session.value) !== session.hash) applicationAuditInvalid('The reservation session is missing, foreign or changed');
+    const currentEra = session.kind === 'assessment-session' && assessmentSessionEra(session);
+    if (!currentEra) {
+      if (explicit || namesNewSession) applicationAuditInvalid('Application reservation fields require the declared assessment session era');
+      return null;
+    }
+    if (namedSession !== session.id) applicationAuditInvalid('The assessment context must name its exact audited session');
+    // The explicit operator replay predates the reservation callback and never
+    // sends a new call. It must consume its selected response below or refuse.
+    if (!explicit && isResponseRecovery()) return { kind: 'replay-only' };
+    if (!isRef(audit.application) || typeof audit.prepareCall !== 'function' || audit.purpose !== 'assessor')
+      applicationAuditInvalid('A new assessment reservation needs both its exact application and transition callback');
+    const application = audit.store.get<Record<string, any>>(audit.application.id, audit.application.revision);
+    if (!application || application.kind !== 'assessment-application' || application.revision !== 1 || !recordValue(application.value)
+      || canonical(reference(application)) !== canonical(audit.application) || hashJson(application.value) !== application.hash)
+      applicationAuditInvalid('The prepared assessment application is missing, foreign or changed');
+    const app = application.value, binding = session.value.binding;
+    if (!recordValue(binding) || !isRef(binding.draft) || !isRef(binding.question) || !isRef(binding.environment)
+      || !Array.isArray(binding.inputs) || !binding.inputs.every(isRef)
+      || app.contract !== 'assessment-application/v1' || app.projectId !== environment.projectId
+      || session.value.projectId !== environment.projectId || session.value.application !== application.id
+      || !isRef(app.session) || canonical(app.session) !== canonical(audit.session)
+      || application.id !== `assessment-application:${hashJson([session.id, session.revision])}`
+      || app.state !== 'prepared' || app.call !== null || app.after !== null || app.received !== null
+      || app.refusal !== null || app.resolution !== null || !recordValue(app.role) || canonical(app.role) !== canonical(role)
+      || !recordValue(app.dispatch) || canonical(app.dispatch) !== canonical(environment)
+      || !(app.profile === null || isRef(app.profile)) || !Array.isArray(app.guards)
+      || audit.draftId !== binding.draft.id || audit.questionId !== binding.question.id)
+      applicationAuditInvalid('The reservation must preserve the prepared session, source identities, role and runtime');
+    const profile = audit.pilot ? reference(audit.pilot) : null;
+    if (canonical(app.profile) !== canonical(profile)) applicationAuditInvalid('The reservation profile differs from its original admission');
+    if (audit.pilot) {
+      const pilot = audit.store.get<ReaderPilot>(audit.pilot.id, audit.pilot.revision);
+      if (!pilot || pilot.kind !== 'reader-pilot' || canonical(pilot) !== canonical(audit.pilot))
+        applicationAuditInvalid('The reservation profile is not its exact saved producer');
+    }
+    const draft = audit.store.get<DiscoveryDraft>(binding.draft.id, binding.draft.revision);
+    const question = audit.store.get<Question>(binding.question.id, binding.question.revision);
+    if (!draft || draft.kind !== 'discovery-draft' || !recordValue(draft.value) || canonical(reference(draft)) !== canonical(binding.draft)
+      || !question || question.kind !== 'question' || !recordValue(question.value) || canonical(reference(question)) !== canonical(binding.question)
+      || draft.value.projectId !== environment.projectId || question.value.projectId !== environment.projectId
+      || question.value.draftId !== draft.id || !Array.isArray(draft.value.questions) || !draft.value.questions.includes(question.id)
+      || canonical(draft.value.inputs) !== canonical(binding.inputs))
+      applicationAuditInvalid('The application must bind the exact project draft and its question');
+    if (canonical(uniqueTransactionGuards(app.guards)) !== canonical(app.guards))
+      applicationAuditInvalid('The prepared application needs its complete normalized transaction guards');
+    return { kind: 'application', session, application };
+  } catch (error) {
+    if (error instanceof EngineError && error.code === 'research_context_application_invalid') throw error;
+    applicationAuditInvalid('The assessment reservation has an invalid saved admission');
+  }
+}
+
+function preparedAssessmentCall(reservation: AssessmentReservation | null, call: Write, original: string,
+  prepared: { writes: Write[]; guards: TransactionGuard[] } | undefined): void {
+  if (!reservation) return;
+  if (reservation.kind !== 'application') applicationAuditInvalid('Operator recovery cannot reserve another physical call');
+  try {
+    if (!recordValue(prepared) || !Array.isArray(prepared.writes) || !Array.isArray(prepared.guards)
+      || prepared.writes.length !== 1 || canonical(call) !== original)
+      applicationAuditInvalid('The assessment callback must preserve the call and supply its atomic transition and guards');
+    const { application, session } = reservation;
+    const expected = { id: application.id, kind: application.kind, expected: application.revision,
+      value: { ...application.value, state: 'running', call: { id: call.id, revision: call.expected + 1, hash: hashJson(call.value) } } };
+    if (canonical(prepared.writes[0]) !== canonical(expected))
+      applicationAuditInvalid('The reservation must atomically bind this prepared application to this exact pending call');
+    const guards = uniqueTransactionGuards(prepared.guards);
+    const required = uniqueTransactionGuards([reference(session), reference(application), ...application.value.guards]);
+    if (!required.every(guard => guards.some(candidate => canonical(candidate) === canonical(guard))))
+      applicationAuditInvalid('The reservation cannot omit any original application or session guard');
+  } catch (error) {
+    if (error instanceof EngineError && error.code === 'research_context_application_invalid') throw error;
+    applicationAuditInvalid('The assessment callback returned an invalid atomic reservation');
+  }
+}
+
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
-  audit?: { store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
-    session?: Ref; onContext?: (context: Record<string, any>) => void }): Promise<unknown> {
+  audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
+  const assessment = assessmentReservation(audit, role, environment, context);
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
@@ -140,6 +246,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
   const recovered = operatorReplayedResponse(role, input, audit);
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
+  if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
   interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
   if (audit?.pilot && packetState) {
     const previous = audit.store.list<ModelCall>("model-call").filter(c => c.value.status === "failed" && c.value.error === "pilot_reply_limit"
@@ -197,19 +304,26 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   }
   const ownership = audit ? physicalClaim() : null;
   consumeInvocationAllowance();
-  let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([{ id: `model-call:${requestId}`, kind: "model-call", expected: 0,
-    value: { projectId: environment.projectId, draftId: audit.draftId, purpose: audit.purpose, requestId,
+  const callWrite: Write = { id: `model-call:${requestId}`, kind: "model-call", expected: 0,
+    value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
       ...(ownership ?? {}),
-      profile: audit.pilot ? reference(audit.pilot) : null,
-      questionId: audit.questionId ?? null,
+      ...(audit?.application ? { assessmentApplication: audit.application } : {}),
+      profile: audit?.pilot ? reference(audit.pilot) : null,
+      questionId: audit?.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
       ...(runtime ? { runtime } : {}),
       confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(packetState ? {record:{id:`model-request:${requestId}`,revision:1,
-        hash:hashJson({projectId:environment.projectId,draftId:audit.draftId,text:input})}} : {}) },
+        hash:hashJson({projectId:environment.projectId,draftId:audit!.draftId,text:input})}} : {}) },
       ...(packetState ? {packet:{archive:(subject as any).working.archive,kind:packetState.initial?"initial":"continuation",maxChars:requestLimit}} : {}),
-      response: null, usage: null, usageSource: "unavailable", error: null } }, ...reservation.writes], reservation.guards)[0]! : null;
+      response: null, usage: null, usageSource: "unavailable", error: null } };
+  const originalCall = assessment ? canonical(callWrite) : '';
+  const application = audit?.prepareCall?.(callWrite);
+  preparedAssessmentCall(assessment, callWrite, originalCall, application);
+  let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([callWrite, ...reservation.writes, ...(application?.writes ?? [])],
+    [...reservation.guards, ...(application?.guards ?? [])])[0]! : null;
+  const claimed = call ? reference(call) : null;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
   let physicalResult: import('../runtime/process.js').ProcessResult | null = null;
@@ -246,7 +360,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       const responseWrites = [];
       if (rawResponse !== null) {
         const saved = { id: `model-response:${requestId}`, kind: "model-response", expected: 0,
-          value: { projectId: environment.projectId, draftId: audit.draftId, text: rawResponse } };
+          value: { projectId: environment.projectId, draftId: audit.draftId, text: rawResponse,
+            ...(audit.application && physicalResult ? { assessmentExecution: { contract: 'assessment-execution/v1',
+              call: claimed, dispatch: reference(call), process: { exitCode: physicalResult.exitCode,
+                signal: physicalResult.signal, stderr: physicalResult.stderr } } } : {}) } };
         responseWrites.push(saved);
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
