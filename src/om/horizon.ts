@@ -11,10 +11,12 @@ import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { ProductEngine } from "../product/engine.js";
-import { Store, type Revision, type Write } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { readLayerAcceptance, readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
+import { prepareSeriesTransition, readPreparedSeriesTransition } from "./series-transition.js";
 
 export const HORIZON_REFUSAL_CODES = Object.freeze([
   "horizon_empty", "horizon_unclosed", "horizon_feature_unknown", "horizon_requires_excluded",
@@ -496,4 +498,144 @@ export function readHorizon(store: Store, project: string, ref: Ref): OmResult<S
   if (!derived.ok) return derived;
   if (canonical(record) !== canonical(derived.value) || canonical(value) !== canonical(gateRecord(derived.value as HorizonRecord, value.horizon))) return forged();
   return delivered({ horizon: horizon.value, gate: gate.value });
+}
+
+export const HORIZON_ISSUANCE_CONTRACT = "om-horizon-issuance/v1";
+export const HORIZON_ISSUANCE_KIND = "om-horizon-issuance";
+export const HORIZON_ISSUANCE_CODES = Object.freeze([
+  "horizon_issuance_request_invalid", "horizon_issuance_binding_invalid", "horizon_issuance_record_invalid",
+] as const);
+export interface HorizonIssuanceRequest { project: string; choiceVersion: string; horizon: Ref; transition: Ref }
+export interface HorizonIssuanceRecord extends HorizonIssuanceRequest {
+  contract: typeof HORIZON_ISSUANCE_CONTRACT; state: "accepted" | "refused"; codes: string[];
+}
+export interface PreparedHorizonIssuance {
+  record: Revision<HorizonIssuanceRecord>; writes: Write[]; guards: TransactionGuard[];
+}
+export interface CheckedHorizonIssuance { record: Revision<HorizonIssuanceRecord>; references: Ref[] }
+interface DerivedHorizonIssuance extends CheckedHorizonIssuance {
+  transitionRequest: Parameters<typeof prepareSeriesTransition>[1];
+}
+const issuanceObject = (value: unknown): value is Record<string, unknown> => object(value)
+  && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+const issuanceKeys = (value: object, fields: string[]): boolean => canonical(Object.keys(value).sort()) === canonical([...fields].sort());
+const issuanceRef = (value: unknown): value is Ref => issuanceObject(value)
+  && issuanceKeys(value, ["id", "revision", "hash"]) && isRef(value);
+const issuanceProject = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value);
+const issuanceChoice = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value);
+const issuanceRefs = (values: readonly Ref[]): Ref[] => sorted([...new Map(values.map(ref => [canonical(ref), ref])).values()]);
+const issuanceId = (request: HorizonIssuanceRequest): string => `${HORIZON_ISSUANCE_KIND}:${request.project}:${hashJson({ horizon: request.horizon, transition: request.transition })}`;
+function issuanceFailure(code: typeof HORIZON_ISSUANCE_CODES[number], target: string, field: string, message: string, ref?: Ref): OmResult<never> {
+  return refused(code, message, address(target, field, ref), "producer");
+}
+function checkIssuanceRequest(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<HorizonIssuanceRequest>> {
+  const bad = (field: string) => issuanceFailure("horizon_issuance_request_invalid", "horizon-issuance", field,
+    "A G2 issuance needs its explicit project, choice version, exact horizon and saved prepared transition");
+  if (!(store instanceof Store)) return bad("store");
+  if (!issuanceObject(request)) return bad("request");
+  if (!issuanceProject(request.project)) return bad("project");
+  if (!issuanceChoice(request.choiceVersion)) return bad("choiceVersion");
+  if (!issuanceRef(request.horizon)) return bad("horizon");
+  if (!issuanceRef(request.transition)) return bad("transition");
+  if (!issuanceKeys(request, ["project", "choiceVersion", "horizon", "transition"])) return bad("request");
+  return delivered(request);
+}
+/** P proves its own sources; G binds that exact P to the independently checked horizon outcome. */
+function deriveHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<DerivedHorizonIssuance>> {
+  const horizon = readHorizon(store, request.project, request.horizon);
+  if (!horizon.ok) return horizon;
+  const gate = horizon.value.gate.value;
+  if (gate.project !== request.project || gate.choiceVersion !== request.choiceVersion)
+    return issuanceFailure("horizon_issuance_binding_invalid", request.horizon.id, "horizon",
+      "The issuance must name the proved horizon outcome of this exact project and choice version", request.horizon);
+  const transition = readPreparedSeriesTransition(store, { project: request.project, record: request.transition });
+  if (!transition.ok) return transition;
+  const prepared = transition.value.record.value;
+  if (prepared.state !== "prepared" || prepared.request.project !== request.project
+    || prepared.request.choiceVersion !== request.choiceVersion || canonical(prepared.request.horizon) !== canonical(request.horizon))
+    return issuanceFailure("horizon_issuance_binding_invalid", request.transition.id, "horizon",
+      "The prepared transition must derive from this exact horizon, project and choice version", request.transition);
+  const value: HorizonIssuanceRecord = { contract: HORIZON_ISSUANCE_CONTRACT, ...request, state: gate.state, codes: [...gate.codes] };
+  const record: Revision<HorizonIssuanceRecord> = { id: issuanceId(request), kind: HORIZON_ISSUANCE_KIND, revision: 1, hash: hashJson(value), value };
+  return delivered({ record, transitionRequest: prepared.request as Parameters<typeof prepareSeriesTransition>[1],
+    references: issuanceRefs([request.horizon, reference(horizon.value.horizon), request.transition, ...transition.value.references]) });
+}
+function readIssuanceRecord(store: Store, project: string, ref: Ref): OmResult<Sealed<CheckedHorizonIssuance>> {
+  const saved = readRecord<HorizonIssuanceRecord>(store, ref, { unit: "G2", target: ref.id,
+    idPrefix: `${HORIZON_ISSUANCE_KIND}:${project}:`, kind: HORIZON_ISSUANCE_KIND });
+  if (!saved.ok) return saved;
+  const value = saved.value.value;
+  const bad = (field: string) => issuanceFailure("horizon_issuance_record_invalid", ref.id, field,
+    "The issuance must be reproduced from its exact saved prepared transition and horizon", ref);
+  if (!issuanceObject(value)) return bad("record");
+  const fields = ["contract", "project", "choiceVersion", "horizon", "transition", "state", "codes"];
+  for (const field of fields) if (!Object.hasOwn(value, field)) return bad(field);
+  if (!issuanceKeys(value, fields)) return bad("record");
+  if (value.contract !== HORIZON_ISSUANCE_CONTRACT) return bad("contract");
+  if (value.project !== project) return bad("project");
+  const request: HorizonIssuanceRequest = { project: value.project, choiceVersion: value.choiceVersion, horizon: value.horizon, transition: value.transition };
+  const checked = checkIssuanceRequest(store, request);
+  if (!checked.ok) return bad(checked.refusal.at.field ?? "request");
+  if (saved.value.revision !== 1 || saved.value.id !== issuanceId(request)) return bad("identity");
+  if (!["accepted", "refused"].includes(value.state)) return bad("state");
+  if (!Array.isArray(value.codes) || !value.codes.every(text)) return bad("codes");
+  const derived = deriveHorizonIssuance(store, request);
+  if (!derived.ok) return derived;
+  if (canonical(saved.value) !== canonical(derived.value.record)) return bad("content");
+  return delivered({ record: saved.value, references: issuanceRefs([ref, ...derived.value.references]) });
+}
+/** Historical delivery never replaces the named P revision with its later applied/discarded head. */
+export function readHorizonIssuance(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<CheckedHorizonIssuance>> {
+  const bad = (field: string) => issuanceFailure("horizon_issuance_request_invalid", "horizon-issuance", field,
+    "A saved G2 issuance is read by its project and exact record reference");
+  if (!(store instanceof Store)) return bad("store");
+  if (!issuanceObject(request)) return bad("request");
+  if (!issuanceProject(request.project)) return bad("project");
+  if (!issuanceRef(request.record)) return bad("record");
+  if (!issuanceKeys(request, ["project", "record"])) return bad("request");
+  return readIssuanceRecord(store, request.project, request.record);
+}
+export function prepareHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<PreparedHorizonIssuance>> {
+  const checked = checkIssuanceRequest(store, request);
+  if (!checked.ok) return checked;
+  request = checked.value as HorizonIssuanceRequest;
+  const derived = deriveHorizonIssuance(store, request);
+  if (!derived.ok) return derived;
+  const record = derived.value.record, existing = store.get(record.id);
+  if (existing && canonical(existing) !== canonical(record))
+    return issuanceFailure("horizon_issuance_record_invalid", record.id, "content", "An immutable issuance cannot be replaced by different content", reference(existing));
+  const current = prepareSeriesTransition(store, derived.value.transitionRequest as Parameters<typeof prepareSeriesTransition>[1]);
+  if (!current.ok) return current;
+  if (current.value.writes.length || canonical(reference(current.value.record)) !== canonical(request.transition))
+    return issuanceFailure("horizon_issuance_binding_invalid", request.transition.id, "transition",
+      "An issuance uses an already saved exact preparation; it cannot create or replace that preparation", request.transition);
+  for (const source of [request.horizon, request.transition]) {
+    const head = store.get(source.id);
+    if (!head || canonical(reference(head)) !== canonical(source))
+      return refused("input_stale", "The horizon or prepared transition is no longer current", address(source.id, "source", source), "producer");
+  }
+  return delivered({ record, writes: existing ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }],
+    guards: uniqueTransactionGuards([...current.value.guards, request.horizon, request.transition, ...(existing ? [reference(existing)] : [])]) });
+}
+export function writeHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<Revision<HorizonIssuanceRecord>>> {
+  const checked = checkIssuanceRequest(store, request);
+  if (!checked.ok) return checked;
+  request = checked.value as HorizonIssuanceRequest;
+  const existing = store.get(issuanceId(request));
+  if (existing) {
+    const saved = readIssuanceRecord(store, request.project, reference(existing));
+    if (!saved.ok) return saved;
+    const value = saved.value.record.value;
+    if (value.choiceVersion !== request.choiceVersion || canonical(value.horizon) !== canonical(request.horizon)
+      || canonical(value.transition) !== canonical(request.transition))
+      return issuanceFailure("horizon_issuance_binding_invalid", existing.id, "request", "A repeat must name the exact original issuance request", reference(existing));
+    return delivered(saved.value.record);
+  }
+  const prepared = prepareHorizonIssuance(store, request);
+  if (!prepared.ok) return prepared;
+  if (!prepared.value.writes.length) return delivered(prepared.value.record);
+  const written = writeGuarded<HorizonIssuanceRecord>(store, { unit: "G2", target: prepared.value.record.id,
+    writes: prepared.value.writes, guards: prepared.value.guards });
+  if (!written.ok) return written;
+  return delivered(written.value[0]!);
 }
