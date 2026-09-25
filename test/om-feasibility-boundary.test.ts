@@ -431,7 +431,7 @@ test('G1.1 M8 and its compiled plan survive their own first native execution com
   assert.deepEqual(oldIndex.value.writers, []);
   const savedBytes = canonical(saved), planBytes = canonical(plan);
   const inputsBytes = canonical(saved.value.inputs), deliveryInputsBytes = canonical(saved.value.producer.deliveries.inputs);
-  const runs = await engine.executor.run(f.project, reference(plan), { retry: false, maxContextChars: 100_000, maxCorrections: 0 });
+  const runs = await engine.executor.run(f.project, reference(plan), { retry: false, maxContextChars: 200_000, maxCorrections: 0 });
   assert.equal(runs.length, 1); assert.equal(runs[0]!.value.state, 'committed', canonical(runs[0]!.value));
   const run = runs[0]!;
   assert.equal(run.value.parent, plan.value.base.head);
@@ -518,7 +518,7 @@ test('G1.1 two native tasks extend one writer index across restart and reject a 
   const stage = engine.compiler.publish(f.project, reference(plan), 0);
   engine.pipeline.accept(f.project, 'compilation', stage.revision);
   const originalIndexRef = saved.value.producer.deliveries.ownership!.indexes['shared.txt']!;
-  const options = { retry: false, maxContextChars: 100_000, maxCorrections: 0 };
+  const options = { retry: false, maxContextChars: 200_000, maxCorrections: 0 };
   const writeMany = f.store.writeMany.bind(f.store);
   let stopped = false;
   f.store.writeMany = ((writes, guards) => {

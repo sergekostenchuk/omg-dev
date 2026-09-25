@@ -217,7 +217,7 @@ test('G2 genuine F5/E4 and nonempty D7 reach M8 compilation and hold native task
     assert.equal(bound.requirement.kind, 'environment-confirmation');
   }
   requirePlanTaskObligations(f.store, plan.value, task);
-  const run = (retry = false) => f.engine.executor.run(f.project, reference(plan), { retry, maxContextChars: 100_000, maxCorrections: 0 });
+  const run = (retry = false) => f.engine.executor.run(f.project, reference(plan), { retry, maxContextChars: 200_000, maxCorrections: 0 });
   const observe = (bound: typeof start, key: string) => f.engine.execute({ type: 'observe-runtime', project: f.project,
     scope: bound.requirement.scope, obligation: runtimeObligationId(bound.requirement), key }) as Promise<RuntimeObservationResult>;
   const planBytes = canonical(plan), m8Bytes = canonical(saved);

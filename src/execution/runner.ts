@@ -12,7 +12,8 @@ import { executeProcess, stopOrphan, type ProcessObserver } from "./process.js";
 import { checkCommands, commitIntent, publishCommit, finishCommit, subjectHash } from "./commit.js";
 import { runId, type TaskRun, type ExecutionResult, type ExecutionOptions, type AgentUsage } from "./model.js";
 import { executionInputs } from "./inputs.js";
-import { taskContext } from "../compiler/context.js";
+import { loadTaskContextSources, taskContext } from "../compiler/context.js";
+import { readCapacity } from "../om/capacity.js";
 import { canonical } from "../canonical.js";
 import { recoverCommits } from "./recovery.js";
 import { executionOwnership } from "./ownership.js";
@@ -84,6 +85,19 @@ export class Executor {
         }
         if (!run) requireCondition(!git(root.value.path, ["status", "--porcelain", "--untracked-files=all"]),
           "worktree_dirty", "The managed worktree contains an unfinished change; recover that attempt first");
+        const om = plan.value.feasibility.id.startsWith('om-feasibility:');
+        let maxRequestChars = options.maxContextChars;
+        let capacityGuards: readonly Ref[] = [];
+        if (om) {
+          const capacity = readCapacity(this.store, { project, environment: plan.value.environment, current: true });
+          if (!capacity.ok) throw new EngineError(capacity.refusal.code, capacity.refusal.message, capacity.refusal.at);
+          maxRequestChars = capacity.value.maxRequestChars;
+          capacityGuards = capacity.value.guards;
+          if (options.maxContextChars !== maxRequestChars) throw new EngineError('capacity_mismatch',
+            'Execution must use the technical capacity of its exact plan environment',
+            { unit: 'G3', target: environment.id, field: 'maxContextChars', expected: maxRequestChars, actual: options.maxContextChars });
+        }
+        const contextSources = loadTaskContextSources(this.store, plan);
         const previous = run?.value;
         const candidate: TaskRun = { projectId: project, plan: reference(plan), taskId: task.id, attempt: (previous?.attempt ?? 0) + 1,
           state: "implementing", parent, tree: null, commit: null, implementation: null, artifacts: [], checks: [], review: null,
@@ -91,7 +105,7 @@ export class Executor {
         const starts = taskStartProofs(this.store, candidate, task);
         run = this.store.writeMany<TaskRun>([{ id: runId(plan.value.hash, task.id), kind: "task-run", expected: run?.revision ?? 0,
           value: { ...candidate, ...(task.researchObligations !== undefined ? { obligationStartProofs: starts.proofs } : {}) } }],
-        [reference(lock), reference(root), ...guards, ...starts.guards])[0]!;
+        [reference(lock), reference(root), ...guards, ...capacityGuards, ...starts.guards])[0]!;
         const observe: ProcessObserver = child => { run = this.save(run!, { child }); };
         const measure = (value: AgentUsage) => {
           const usage = [...run!.value.usage]; const index = usage.findIndex(item => item.requestHash === value.requestHash);
@@ -103,11 +117,11 @@ export class Executor {
           const inputs = executionInputs(this.store, plan, task, root.value);
           const ownership = executionOwnership(this.store, plan, task, root.value);
           run = this.save(run, { inputs: [...inputs.guards, ...ownership.guards] });
-          const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, options.maxContextChars).text);
+          const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, maxRequestChars, contextSources).text);
           requireCurrentTaskStart(this.store, run.value, task);
           const response = await callAgent(actual.implementer, actual, "implement", "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.",
             { context, parent, inputs: inputs.inputs, ownership: ownership.grants, correction: previous ? { error: previous.error, review: previous.review } : null },
-            options.maxContextChars, measure, observe, signal);
+            maxRequestChars, measure, observe, signal);
           const output = implementation(response, task);
           const tree = capture(root.value, parent, task);
           run = this.save(run, { state: "checking", implementation: output.text, artifacts: output.artifacts, tree });
@@ -121,7 +135,7 @@ export class Executor {
           run = this.save(run, { state: "reviewing", reviewSubject: subject });
           const verdict = review(await callAgent(actual.reviewer, actual, "review", "Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict; use kind=plan only when the plan needs correction, kind=code for implementation defects.",
             { binding: subject, context, parent, tree, artifacts: run.value.artifacts, checks: run.value.checks },
-            options.maxContextChars, measure, observe, signal));
+            maxRequestChars, measure, observe, signal));
           requireCondition(capture(root.value, parent, task) === tree, "candidate_changed", "The candidate changed during independent review");
           run = this.save(run, { review: verdict });
           if (verdict.verdict === "request_changes") {
@@ -142,7 +156,9 @@ export class Executor {
           const planDefect = ["plan_review_failed", "plan_stale", "execution_input_missing", "execution_input_foreign", "producer_not_ready", "implementation_proof_foreign", "artifact_stale"].includes(code);
           const obligationPause = ['task_obligation_start_stale', 'task_obligation_result_required'].includes(code);
           run = this.save(run, { state: obligationPause ? 'awaiting_obligation' : interrupted ? "interrupted" : planDefect ? "needs_plan" : "needs_code",
-            child: null, error: obligationPause ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}` : error instanceof Error ? error.message : "Execution failed" });
+            child: null, error: om && code === 'context_budget_exceeded' && error instanceof EngineError
+              ? `${code}: ${task.id}: ${error.message}; ${canonical(error.details)}`
+              : obligationPause ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}` : error instanceof Error ? error.message : "Execution failed" });
           if (run.value.state === "needs_code" && (corrections.get(task.id) ?? 0) < options.maxCorrections) {
             corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
           }

@@ -1,14 +1,22 @@
 import { Ajv } from "ajv";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import type { Revision } from "../storage/store.js";
+import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
+import { Store, type Revision } from "../storage/store.js";
 import { RefinementRelations } from "../graph/relations.js";
 import type { Command, Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { controlPredecessors } from "../graph/dependencies.js";
-import { sealed, type Sealed } from "../om/refusal.js";
-import type { NeighborCollection, NeighborPacket } from "../om/neighbors.js";
+import { sealed, type OmResult, type Sealed } from "../om/refusal.js";
+import { neighborsOf, readNeighbors, type NeighborCollection, type NeighborPacket, type NeighborSources } from "../om/neighbors.js";
+import { readFeasibility } from "../om/feasibility.js";
+import { readAtomicGate } from "../om/atomic-gate.js";
+import { readAcceptedFrame } from "../om/frame-accept.js";
+import { readFrame, type FrameRequest } from "../om/frame-obligations.js";
+import { readDeliveries, type DeliveryOwnershipBasis } from "../om/deliveries.js";
+import { readWorksFrame } from "../om/works-frame.js";
+import { historicalTrace, withHistoricalReads } from "../om/input.js";
+import { readRecord } from "../om/refs.js";
 import type { CompiledTask, MachinePlan } from "./model.js";
 
 export interface ContextText { text: string; chars: number; utf8Bytes: number; hash: string }
@@ -26,6 +34,10 @@ export interface PreplanContextSource extends TaskContextSource {
   basis: { candidate: Ref; environment: Ref };
   /** Already checked by F4's readNeighbors/prepareNeighbors; a DTO is not proof of acceptance. */
   neighbors: Revision<NeighborCollection>;
+}
+export interface PlanTaskContextSources {
+  plan: Ref; graph: Ref; candidate: Ref; references: Ref[];
+  neighbors: NeighborSources; deliveryOwnership: DeliveryOwnershipBasis;
 }
 
 function requireFullCheck(fullCheck: Command): void {
@@ -81,6 +93,89 @@ function invalid(field: string, target = "task-context"): never {
 function copy<T>(value: T): T {
   try { return sealed(value) as T; }
   catch (error) { if (error instanceof EngineError && error.code === "unsealable_value") invalid("json"); throw error; }
+}
+function take<T>(result: OmResult<T>): T {
+  if (!result.ok) throw new EngineError(result.refusal.code, result.refusal.message, result.refusal.at);
+  return result.value;
+}
+function requirePlan(plan: Revision<MachinePlan>): void {
+  if (!object(plan) || !isRef(plan) || plan.kind !== "plan" || !object(plan.value)) invalid("plan");
+  const value = plan.value;
+  if (!text(value.projectId) || ![value.graph, value.environment, value.feasibility].every(isRef)
+    || !Array.isArray(value.guards) || !value.guards.every(isRef)
+    || !Array.isArray(value.tasks) || !value.tasks.every(object)
+    || !object(value.base) || !text(value.base.head) || !text(value.base.tree)
+    || !object(value.graphSnapshot) || !graphShapes[value.graphSnapshot.version === 2 ? 1 : 0]!(value.graphSnapshot)) invalid("plan.value");
+}
+function needsOmSources(plan: MachinePlan): boolean {
+  return plan.feasibility.id.startsWith("om-feasibility:")
+    || plan.guards.some(ref => ["om-frame:", "om-neighbors:", "om-candidate:"].some(prefix => ref.id.startsWith(prefix)));
+}
+
+/** Resolve exact historical sources once; the returned DTO can be used without reading any current heads. */
+export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>): Sealed<PlanTaskContextSources> | null {
+  if (!(store instanceof Store)) invalid("store");
+  plan = copy(plan); requirePlan(plan);
+  if (!needsOmSources(plan.value)) return null;
+  return withHistoricalReads(() => {
+    const project = plan.value.projectId, references: Ref[] = [];
+    const source = historicalTrace(store, ref => { references.push(ref); }, "distinct");
+    const saved = take(readRecord<MachinePlan>(source, reference(plan),
+      { unit: "G3", target: plan.id, idPrefix: `plan:${project}:`, kind: "plan" }));
+    if (!same(saved.value, plan.value)) invalid("plan.record", plan.id);
+    const graph = take(readRecord<Graph>(source, plan.value.graph,
+      { unit: "G3", target: plan.id, id: `graph:${project}`, kind: "graph" }));
+    if (!same(graph.value, plan.value.graphSnapshot)) invalid("plan.graphSnapshot", plan.id);
+    let candidateRef: Ref, layer: Ref, frame: Ref, ownership: DeliveryOwnershipBasis;
+    if (plan.value.feasibility.id.startsWith("om-feasibility:")) {
+      const checked = take(readFeasibility(source, { project, record: plan.value.feasibility })), value = checked.value;
+      if (!value.ready || !same(value.graph, plan.value.graph) || !same(value.environment, plan.value.environment)
+        || !value.producer.deliveries.ownership) invalid("feasibility", checked.id);
+      references.push(...value.inputs);
+      candidateRef = value.producer.candidate; layer = value.producer.layer; frame = value.producer.frame;
+      ownership = { contract: "delivery-ownership/v1", ...value.producer.deliveries.ownership };
+    } else {
+      // In the earlier plan era these records were direct guards. Never select a head or the first of several revisions.
+      const exact = (id: string): Ref => {
+        const matches = uniqueRefs(plan.value.guards.filter(ref => ref.id === id));
+        if (matches.length !== 1) invalid("plan.guards", id);
+        return matches[0]!;
+      };
+      layer = exact(`graph-layer:${project}:3`); frame = exact(`om-frame:${project}:3`);
+      const accepted = take(readAcceptedFrame(source, { project, level: 3, graph: plan.value.graph, layer, frame }));
+      if (!accepted.frame) invalid("frame", frame.id);
+      candidateRef = accepted.frame.value.acceptance.candidate;
+      const gate = accepted.frame.value.acceptance.gate;
+      if (gate.name !== "G5" || !("basis" in gate) || !isRef(gate.basis)) invalid("frame.acceptance.gate", frame.id);
+      const atomic = take(readAtomicGate(source, { project, record: gate.basis }));
+      if (!same(atomic.value.request.candidate, candidateRef)) invalid("frame.acceptance.candidate", frame.id);
+      const neighbors = take(readNeighbors(source, { project, neighbors: atomic.value.request.neighbors }));
+      if (!same(neighbors.value.source.candidate, candidateRef)) invalid("neighbors.candidate", neighbors.id);
+      ownership = neighbors.value.source.ownership;
+      const roots = uniqueRefs(plan.value.guards.filter(ref => ref.id === `execution-root:${project}`));
+      if (roots.length > 1 || !same(ownership.root, roots[0] ?? null)) invalid("plan.guards.execution-root", plan.id);
+    }
+    const candidate = take(readWorksFrame(source, { project, candidate: candidateRef }));
+    if (!same(candidate.value.graph, plan.value.graphSnapshot)) invalid("candidate.graph", candidate.id);
+    const request: FrameRequest = { ...candidate.value.request.frame, graph: plan.value.graph, layer, frame };
+    const works = take(readFrame(source, request));
+    if (!request.upper) invalid("frame.upper", frame.id);
+    const operations = take(readFrame(source, { project, level: 2, graph: request.graph, horizon: request.horizon,
+      layer: works.upperRef, frame: request.upper.frame, upper: null }));
+    const delivery = take(readDeliveries(source, { project, candidate: candidateRef, ownership }));
+    const finding = delivery.findings[0];
+    if (finding) throw new EngineError(finding.code, finding.message, { unit: "G3", target: finding.target, field: "delivery" });
+    const fills = operations.accepted?.frame?.value.fills ?? null;
+    references.push(plan.value.graph, plan.value.environment, plan.value.feasibility, candidateRef, layer, frame,
+      ...works.references, ...operations.references, ...delivery.references);
+    return sealed({ plan: reference(plan), graph: plan.value.graph, candidate: candidateRef, references: uniqueRefs(references),
+      neighbors: { identity: [...new Set([...candidate.value.fills, ...(fills ?? [])]
+        .filter(fill => fill.source === "identity").map(fill => fill.node))].sort(), receipts: delivery.receipts,
+      frames: { operations: { obligations: operations.result.obligations, fills },
+        works: { obligations: works.result.obligations, fills: candidate.value.fills } } },
+      deliveryOwnership: ownership,
+    });
+  });
 }
 function requireContentSource(source: TaskContextSource): void {
   if (!object(source)) invalid("source");
@@ -181,32 +276,61 @@ function requireNeighbors(source: PreplanContextSource): NeighborPacket {
   return value.packets.find(packet => packet.work === task.node)!;
 }
 
+function omContent(source: TaskContextSource, neighbors: Sealed<NeighborPacket>, deliveryOwnership: Sealed<DeliveryOwnershipBasis>) {
+  const { task, graph } = source;
+  for (const field of ["ownership", "researchObligations", ...(graph.version === 2 ? ["requirements", "packets"] as const : [])] as const)
+    if (!Object.hasOwn(task, field) || !Array.isArray(task[field])) invalid(`task.${field}`, task.id);
+  const body = content(source);
+  return { ...body, scope: { ...body.scope, readPaths: task.readPaths, writePaths: task.writePaths }, neighbors, deliveryOwnership };
+}
+
+function planNeighbors(plan: Revision<MachinePlan>, task: CompiledTask, sources: Sealed<PlanTaskContextSources>): Sealed<NeighborPacket> {
+  if (!object(sources) || !isRef(sources.plan) || !same(sources.plan, reference(plan)) || !isRef(sources.graph)
+    || !same(sources.graph, plan.value.graph) || !isRef(sources.candidate)
+    || !sources.candidate.id.startsWith(`om-candidate:${plan.value.projectId}:`)
+    || !Array.isArray(sources.references) || !sources.references.every(isRef)
+    || ![sources.graph, sources.candidate, plan.value.environment, plan.value.feasibility]
+      .every(ref => sources.references.some(item => same(item, ref)))) invalid("sources", plan.id);
+  const ownership = sources.deliveryOwnership;
+  const paths = [...new Set(plan.value.graphSnapshot.nodes.filter(node => plan.value.graphSnapshot.horizon.includes(node.id))
+    .flatMap(node => node.code.filter(code => code.access === "write").map(code => code.path)))].sort();
+  if (!object(ownership) || ownership.contract !== "delivery-ownership/v1"
+    || !(ownership.root === null || isRef(ownership.root) && ownership.root.id === `execution-root:${plan.value.projectId}`)
+    || !object(ownership.indexes) || !Object.values(ownership.indexes).every(isRef)
+    || !same(Object.keys(ownership.indexes).sort(), paths)) invalid("sources.deliveryOwnership", task.id);
+  return take(neighborsOf(plan.value.graphSnapshot, task.node, sources.neighbors as unknown as NeighborSources));
+}
+
 /** Pre-plan era. The caller verifies candidate/environment, D7 and F4 with their common readers and
  * supplies the allowance from V1. This pure serialization neither admits work nor permits a model send. */
 export function preplanTaskContext(source: PreplanContextSource, maxChars: number): ContextText {
   source = copy(source); requireContentSource(source);
   const packet = requireNeighbors(source), { task, project, basis, neighbors } = source;
-  for (const field of ["ownership", "researchObligations", ...(source.graph.version === 2 ? ["requirements", "packets"] as const : [])] as const)
-    if (!Object.hasOwn(task, field) || !Array.isArray(task[field])) invalid(`task.${field}`, task.id);
-  const body = content(source);
   return boundedContext({ version: "omg-task-context/preplan-v1",
     binding: { candidate: basis.candidate, environment: basis.environment, neighbors: reference(neighbors), task: task.id },
-    ...body, scope: { ...body.scope, readPaths: task.readPaths, writePaths: task.writePaths },
-    neighbors: packet, deliveryOwnership: neighbors.value.source.ownership,
+    ...omContent(source, packet, neighbors.value.source.ownership),
     details: { source: "works-candidate", project, candidate: basis.candidate, task: task.id,
       selectors: ["graph entity ID", "evidence-index", "bound evidence reference ID and JSON pointer or text range"] },
   }, maxChars);
 }
 
 /** This is an implementation brief, not the scheduler's complete machine plan. */
-export function taskContext(plan: Revision<MachinePlan>, fullCheck: Command, taskId: string, maxChars: number): ContextText {
+export function taskContext(plan: Revision<MachinePlan>, fullCheck: Command, taskId: string, maxChars: number,
+  sources?: Sealed<PlanTaskContextSources> | null): ContextText {
   requireFullCheck(fullCheck);
+  plan = copy(plan); requirePlan(plan);
+  if (!text(taskId)) invalid("taskId", plan.id);
   const graph = plan.value.graphSnapshot;
   const task = plan.value.tasks.find(item => item.id === taskId);
   requireCondition(task, "task_foreign", "Task does not belong to the bound machine plan");
+  const source = { graph, task, fullCheck }; requireContentSource(source);
+  const om = needsOmSources(plan.value);
+  if ((om && !sources) || (!om && sources !== undefined && sources !== null)) invalid("sources", plan.id);
+  const checked = sources ? copy(sources) : null;
+  const body = checked ? omContent(source, planNeighbors(plan, task, checked), checked.deliveryOwnership) : content(source);
   return boundedContext({ version: "omg-task-context/v1", binding: { plan: reference(plan), graph: plan.value.graph, task: task.id,
     base: { commit: plan.value.base.head, tree: plan.value.base.tree } },
-    ...content({ graph, task, fullCheck }),
+    ...body,
     details: { command: "task-detail", project: plan.value.projectId, plan: reference(plan), task: task.id,
       selectors: ["graph entity ID", "evidence-index", "bound evidence reference ID and JSON pointer or text range"] },
   }, maxChars);

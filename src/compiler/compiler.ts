@@ -13,11 +13,11 @@ import { deriveTasks } from "./derive.js";
 import { resolveArtifact } from "./inputs.js";
 import { requireBasis } from "./basis.js";
 import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
-import { taskContext, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
+import { taskContext, loadTaskContextSources, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 import { Owners, selectWriter } from "../ownership/owners.js";
 import { readWriterIndex } from "../ownership/writer-index.js";
 import { readFeasibility, type OmFeasibility } from "../om/feasibility.js";
-import { historicalTrace } from "../om/input.js";
+import { historicalTrace, withHistoricalReads } from "../om/input.js";
 import { readinessObligations } from '../graph/obligation-readiness.js';
 import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
 export type { MachinePlan } from "./model.js";
@@ -152,49 +152,53 @@ export class Compiler {
     return { plan, admissionGuards: uniqueTransactionGuards([...checked.guards, ...(checked.admissionGuards ?? [])]) };
   }
   context(project: string, planRef: Ref, task: string, maxChars: number) {
-    const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
-    const ref = plan.value.environment;
-    const environment = this.store.get<Environment>(ref.id, ref.revision);
-    requireCondition(environment?.kind === "environment" && environment.hash === ref.hash && environment.value.projectId === project,
-      "context_environment_foreign", "Full-run criteria must come from the exact plan environment");
-    const context = taskContext(plan, environment.value.fullCheck, task, maxChars);
-    requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task context");
-    return context;
+    return withHistoricalReads(() => {
+      const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
+      const ref = plan.value.environment;
+      const environment = this.store.get<Environment>(ref.id, ref.revision);
+      requireCondition(environment?.kind === "environment" && environment.hash === ref.hash && environment.value.projectId === project,
+        "context_environment_foreign", "Full-run criteria must come from the exact plan environment");
+      const context = taskContext(plan, environment.value.fullCheck, task, maxChars, loadTaskContextSources(this.store, plan));
+      requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task context");
+      return context;
+    });
   }
   detail(project: string, planRef: Ref, task: string, kind: "graph" | "evidence" | "evidence-index", selector: DetailSelector, maxChars: number) {
-    const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
-    const om = plan.value.feasibility.id.startsWith('om-feasibility:');
-    let inputs = plan.value.guards;
-    if (om) {
-      const history: Ref[] = [];
-      const checked = readFeasibility(historicalTrace(this.store, ref => { history.push(ref); }, 'distinct'),
-        { project, record: plan.value.feasibility });
-      if (!checked.ok) throw new EngineError(checked.refusal.code, checked.refusal.message, checked.refusal.at);
-      inputs = uniqueRefs([...inputs, ...checked.value.value.inputs, ...history]);
-    }
-    const evidence = inputs.flatMap(ref => {
-      const record = this.store.get(ref.id, ref.revision);
-      return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
-        && ["source", "stage", "discovery-draft", "research-assessment", "task-run"].includes(record.kind)
-        ? [{ ref, kind: record.kind } satisfies EvidenceDetail] : [];
+    return withHistoricalReads(() => {
+      const { plan, admissionGuards } = this.#contextPlan(project, planRef, task);
+      const om = plan.value.feasibility.id.startsWith('om-feasibility:');
+      let inputs = plan.value.guards;
+      if (om) {
+        const history: Ref[] = [];
+        const checked = readFeasibility(historicalTrace(this.store, ref => { history.push(ref); }, 'distinct'),
+          { project, record: plan.value.feasibility });
+        if (!checked.ok) throw new EngineError(checked.refusal.code, checked.refusal.message, checked.refusal.at);
+        inputs = uniqueRefs([...inputs, ...checked.value.value.inputs, ...history]);
+      }
+      const evidence = inputs.flatMap(ref => {
+        const record = this.store.get(ref.id, ref.revision);
+        return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
+          && ["source", "stage", "discovery-draft", "research-assessment", "task-run"].includes(record.kind)
+          ? [{ ref, kind: record.kind } satisfies EvidenceDetail] : [];
+      });
+      let value: unknown; let source = plan.value.graph;
+      if (kind === "evidence-index") { value = evidence; source = reference(plan); }
+      else if (kind === "evidence") {
+        if (om) requireCondition(evidence.filter(item => item.ref.id === selector.id).length <= 1,
+          "context_evidence_ambiguous", "This evidence ID has several exact revisions; an unqualified ID cannot select one");
+        const found = evidence.find(item => item.ref.id === selector.id);
+        requireCondition(found, "context_evidence_foreign", "Evidence must be an exact input of this plan");
+        source = found.ref; value = this.store.get(found.ref.id, found.ref.revision)!.value;
+      } else {
+        const graph = plan.value.graphSnapshot;
+        value = [graph.nodes, graph.artifacts, graph.contracts, graph.connectors, graph.tests, graph.joins, graph.anchors,
+          graph.actors ?? [], graph.requirements ?? [], graph.edges ?? [], graph.transfers ?? [], graph.packets ?? [], graph.journeys ?? []]
+          .flat().find(item => item.id === selector.id);
+        requireCondition(value, "context_detail_missing", "Graph entity is absent from this exact plan");
+      }
+      const detail = boundedContext({ binding: { plan: reference(plan), task, source }, kind, selector, value: selectDetail(value, selector) }, maxChars);
+      requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task detail");
+      return detail;
     });
-    let value: unknown; let source = plan.value.graph;
-    if (kind === "evidence-index") { value = evidence; source = reference(plan); }
-    else if (kind === "evidence") {
-      if (om) requireCondition(evidence.filter(item => item.ref.id === selector.id).length <= 1,
-        "context_evidence_ambiguous", "This evidence ID has several exact revisions; an unqualified ID cannot select one");
-      const found = evidence.find(item => item.ref.id === selector.id);
-      requireCondition(found, "context_evidence_foreign", "Evidence must be an exact input of this plan");
-      source = found.ref; value = this.store.get(found.ref.id, found.ref.revision)!.value;
-    } else {
-      const graph = plan.value.graphSnapshot;
-      value = [graph.nodes, graph.artifacts, graph.contracts, graph.connectors, graph.tests, graph.joins, graph.anchors,
-        graph.actors ?? [], graph.requirements ?? [], graph.edges ?? [], graph.transfers ?? [], graph.packets ?? [], graph.journeys ?? []]
-        .flat().find(item => item.id === selector.id);
-      requireCondition(value, "context_detail_missing", "Graph entity is absent from this exact plan");
-    }
-    const detail = boundedContext({ binding: { plan: reference(plan), task, source }, kind, selector, value: selectDetail(value, selector) }, maxChars);
-    requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while preparing task detail");
-    return detail;
   }
 }
