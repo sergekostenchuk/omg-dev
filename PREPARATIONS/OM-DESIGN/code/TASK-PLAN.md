@@ -1307,7 +1307,7 @@
 - Отдаёт: M9 · Передать компилятору; Журнал отказов ворот; Записи OM в SQLite
 - Читает записи: принятый граф уровня работ; environment; основания готовности и квитанции; обязательства с моментом «проверка реализуемости»
 - Пишет записи: feasibility
-- Разрешённые пути: `src/om/feasibility.ts`, `src/om/refs.ts`, `test/om-feasibility.test.ts`
+- Разрешённые пути: `src/om/feasibility.ts`, `src/om/refs.ts`, `test/om-feasibility.test.ts`, `test/om-refs.test.ts`
 - Из движка как есть: inspectRepository — src/runtime/environment.ts; readinessObligations — src/graph/obligation-readiness.ts; resolveArtifact — src/compiler/inputs.ts (подлинность квитанций); Feasibility (форма записи), REFINEMENT_CONTRACT_VERSION — src/graph/refinement.ts, src/graph/research-contracts.ts; Refinement.feasibilityGate — src/graph/refinement.ts:219 (не правится)
 - После: F5, D7, D8, B1.1
 - **Изменение движка:** оркестрация: проверку реализуемости вызывает блок OM после G5; функции проверок остаются как есть
