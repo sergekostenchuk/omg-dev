@@ -1301,6 +1301,8 @@ export interface TransportModelCall extends ModelCall {
   transport: { version: 'om-model-transport/v1'; request: ModelTransportRequest; exchange: Ref | null };
 }
 export interface ModelTransportOutcome { record: Revision<TransportModelCall>; call: Ref; exchange: Ref | null; result: AdapterResult; repeated: boolean }
+const DIRECT_TRANSPORT_PURPOSES: readonly string[] = Object.freeze(['fact-assessment', 'stop-analysis', 'origin-analysis']);
+const directTransportPurpose = (purpose: string): boolean => DIRECT_TRANSPORT_PURPOSES.includes(purpose);
 function requireTransport(store: Store, request: unknown): asserts request is ModelTransportRequest {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.call)
     || !Object.hasOwn(request, 'packet') || !['implementer', 'reviewer'].includes(request.role as string)
@@ -1359,7 +1361,7 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
   return { record, process: processResult, launchError, guards: admissionGuards };
 }
 const transportExchangeId = (request: ModelTransportRequest) => `om-model-transport:${request.project}:${hashJson(request)}`;
-/** Analysis keeps A6's body and outcome opaque; it uses the same process boundary as ordinary E2/E3 calls. */
+/** Direct transport keeps E1's body and outcome opaque; it uses the same process boundary as ordinary E2/E3 calls. */
 export function readModelTransport(store: Store, request: { project: string; record: Ref }, history?: CallHistory): OmResult<Sealed<ModelTransportOutcome>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('transport-record');
@@ -1368,45 +1370,45 @@ export function readModelTransport(store: Store, request: { project: string; rec
     const record = take(readRecord<TransportModelCall>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `model-call:${request.project}:om:`, kind: 'model-call' }));
     if (!object(record.value) || !object(record.value.transport) || record.value.transport.version !== 'om-model-transport/v1')
-      fail('model_call_record_invalid', record.id, 'transport', 'Analysis playback requires explicit transport provenance');
+      fail('model_call_record_invalid', record.id, 'transport', 'Direct transport playback requires explicit transport provenance');
     const source = record.value.transport.request;
     requireTransport(store, source);
     if (source.project !== request.project) fail('model_call_record_invalid', record.id, 'project', 'This transport belongs to this project');
     const { call, wire, binding } = transportAssignment(store, source, history);
-    if (!['stop-analysis', 'origin-analysis'].includes(call.value.purpose))
+    if (!directTransportPurpose(call.value.purpose))
       fail('model_call_request_invalid', call.id, 'purpose', 'Ordinary dispatch is admitted through the E2/E3 orchestrator');
     const value = record.value;
     if (record.id !== modelRecordId(request.project, wire.requestId) || value.projectId !== request.project
       || value.draftId !== call.id || value.requestId !== wire.requestId || value.purpose !== call.value.purpose
       || !object(value.requested) || !object(value.request) || !same(value.requested, binding)
       || !same(value.request, { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(source.packet) }))
-      fail('model_call_record_invalid', record.id, 'request', 'Analysis runtime must reproduce the actual admitted body and executor');
+      fail('model_call_record_invalid', record.id, 'request', 'Direct transport runtime must reproduce the actual admitted body and executor');
     if (value.status === 'running') {
       requireUnreceivedModelCall(record as Revision<TransportModelCall>);
       if (value.transport.exchange !== null)
-        fail('model_call_record_invalid', record.id, 'exchange', 'A running analysis retains an explicit absence of received exchange');
-      fail('model_call_in_progress', record.id, 'status', 'The admitted analysis already owns a physical dispatch');
+        fail('model_call_record_invalid', record.id, 'exchange', 'A running direct transport retains an explicit absence of received exchange');
+      fail('model_call_in_progress', record.id, 'status', 'The admitted call already owns a physical dispatch');
     }
     if (value.recovery) {
       const recovered = readModelCallRecovery(store, request.project, request.record);
       requireUnreceivedModelCall(recovered.original);
       if (!Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
-        fail('model_call_record_invalid', record.id, 'finishedAt', 'Analysis recovery retains its physical completion time');
+        fail('model_call_record_invalid', record.id, 'finishedAt', 'Direct transport recovery retains its physical completion time');
       if (!same((recovered.original.value as TransportModelCall).transport, value.transport) || value.transport.exchange !== null)
-        fail('model_call_record_invalid', record.id, 'recovery', 'Analysis recovery retains its exact assignment without an invented response');
+        fail('model_call_record_invalid', record.id, 'recovery', 'Direct transport recovery retains its exact assignment without an invented response');
       return { record: record as Revision<TransportModelCall>, call: source.call, exchange: null, repeated: true,
         result: { kind: 'interrupted' as const, usage: null, confirmed: unknownConfirmed(),
           error: { code: 'process_lost', field: 'process', message: recovered.incident.value.reason } } };
     }
     const ref = value.transport.exchange;
-    if (!isRef(ref)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed analysis keeps the original transport evidence');
+    if (!isRef(ref)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed direct transport keeps the original transport evidence');
     const exchange = take(readRecord<TransportExchange>(store, ref,
       { unit: 'E4', target: record.id, id: transportExchangeId(source), kind: EXCHANGE_KIND }));
     if (exchange.revision !== 1 || !same(exchange.value.request, source) || !same(exchange.value.call, source.call)
       || exchange.value.project !== request.project || !same(exchange.value.wire, wire)
       || !exactKeys(exchange.value, ['project', 'request', 'call', 'wire', 'process', 'launchError'])
       || (exchange.value.process === null) === (exchange.value.launchError === null))
-      fail('model_call_record_invalid', record.id, 'exchange', 'The analysis evidence must belong to this actual E1 body');
+      fail('model_call_record_invalid', record.id, 'exchange', 'The transport evidence must belong to this actual E1 body');
     const decoded = transportOf(exchange.value as TransportExchange);
     if (value.status !== (decoded.kind === 'answered' ? 'succeeded' : 'failed')
       || !same(value.confirmed, decoded.confirmed) || !same(value.usage, decoded.usage)
@@ -1414,7 +1416,7 @@ export function readModelTransport(store: Store, request: { project: string; rec
       || value.error !== (decoded.kind === 'answered' ? null : decoded.error.code)
       || !Number.isSafeInteger(value.startedAt) || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt
       || !same(value.response, decoded.kind === 'answered' ? { chars: decoded.raw.length, bytes: Buffer.byteLength(decoded.raw), record: ref } : null))
-      fail('model_call_record_invalid', record.id, 'outcome', 'Analysis runtime is derived from the saved adapter response');
+      fail('model_call_record_invalid', record.id, 'outcome', 'Direct transport runtime is derived from the saved adapter response');
     return { record: record as Revision<TransportModelCall>, call: source.call, exchange: ref, result: decoded, repeated: true };
   });
 }
@@ -1425,7 +1427,7 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
   extraGuards = uniqueTransactionGuards(extraGuards);
   try {
     const { call, wire, binding } = transportAssignment(store, request), id = modelRecordId(request.project, wire.requestId);
-    if (!['stop-analysis', 'origin-analysis'].includes(call.value.purpose))
+    if (!directTransportPurpose(call.value.purpose))
       fail('model_call_request_invalid', request.call.id, 'purpose', 'Ordinary MC1/MC2 calls require the E2/E3 orchestrator');
     const prior = store.get(id);
     if (prior) {
@@ -1694,9 +1696,9 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
     } else if ('transport' in original.value) {
       const record = original as Revision<TransportModelCall>;
       const assignment = transportAssignment(store, record.value.transport.request);
-      if (!['stop-analysis', 'origin-analysis'].includes(assignment.call.value.purpose)
+      if (!directTransportPurpose(assignment.call.value.purpose)
         || !same(record.value.transport.exchange, null))
-        fail('model_call_record_invalid', ref.id, 'transport', 'Only an unreceived analysis can be interrupted without a result');
+        fail('model_call_record_invalid', ref.id, 'transport', 'Only an unreceived direct transport can be interrupted without a result');
     } else fail('model_call_foreign', ref.id, 'producer', 'The runtime has no E4 producer');
     writes.push({ id: original.id, kind: original.kind, expected: original.revision, value: finished });
     const view = pendingCallStore(store, writes), terminal = writeRef(writes[writes.length - 1]!);

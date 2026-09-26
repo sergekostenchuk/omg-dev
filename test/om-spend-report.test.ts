@@ -32,7 +32,7 @@ import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, type AnswerQuestio
 import { confirmResults } from "../src/om/achievements.js";
 import { writeGuarded } from "../src/om/refs.js";
 import { runModelTransport, runModelCall, readModelTransport, readModelCallPhysical, type ModelTransportRequest, type ModelCallRequest } from "../src/om/model-call.js";
-import { spendReport, readSpendReport, type SpendSnapshot } from "../src/om/spend-report.js";
+import { spendReport, readSpendReport, SPEND_PURPOSE_SET_V2, type SpendReport, type SpendSnapshot } from "../src/om/spend-report.js";
 import { Environments } from "../src/runtime/environment.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import type { ProcessResult } from "../src/runtime/process.js";
@@ -40,7 +40,7 @@ import { executionOf, prepareLateModelReceipt } from "../src/discovery/model-cal
 import {
   CALL_LEDGER_KIND, CALL_RECORD_KIND, callLedgerId, callRecordId,
   readCallLedger, readCallLedgerAt, recordCall, settleCall,
-  type CallLedger, type RecordCallRequest, type MechanismRecordCallRequest,
+  type CallLedger, type CallRecord, type RecordCallRequest, type MechanismRecordCallRequest,
 } from "../src/om/call-record.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -492,6 +492,37 @@ test("E6 report: historical snapshots keep exact expense and unfinished outcomes
   const historical = new ExactOnlyStore(f.path);
   try { assert.deepEqual(deliveredOf(readSpendReport(historical, saved.snapshot as SpendSnapshot)), saved); }
   finally { historical.close(); }
+});
+
+test("E6 report: legacy snapshots retain the four-purpose contract after the current purpose set expands", t => {
+  const f = fixture(t);
+  deliveredOf(recordCall(f.store, PROJECT, request(f, "legacy-purpose")));
+  const current = deliveredOf(spendReport(f.store, { project: PROJECT }));
+  assert.equal(current.snapshot.purposeSet, SPEND_PURPOSE_SET_V2);
+  assert.deepEqual(Object.keys(current.byPurpose).sort(),
+    ["model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment"].sort());
+  const legacy = { ...current.snapshot } as Record<string, unknown>;
+  delete legacy.purposeSet;
+  const legacyBytes = canonical(legacy);
+  const stored = canonical(f.store.list());
+  const expectedBuckets = Object.fromEntries(["model-research", "model-design", "stop-analysis", "origin-analysis"]
+    .map(purpose => [purpose, current.byPurpose[purpose as keyof typeof current.byPurpose]]));
+  assert.deepEqual(Object.keys(legacy).sort(), ["project", "ledger", "calls", "series", "histories", "significance", "late"].sort());
+  const invalid = (error: unknown) => error instanceof EngineError && error.code === "spend_request_invalid";
+  for (const purposeSet of [null, "", "om-e1-purposes/v3", 2, []])
+    assert.throws(() => readSpendReport(f.store, { ...current.snapshot, purposeSet } as unknown as SpendSnapshot), invalid);
+  f.store.close();
+  const historical = new ExactOnlyStore(f.path);
+  try {
+    const replayed = deliveredOf(readSpendReport(historical, legacy as unknown as SpendSnapshot));
+    assert.deepEqual(replayed, { ...current, snapshot: legacy, byPurpose: expectedBuckets });
+    assert.deepEqual(Object.keys(replayed.byPurpose).sort(),
+      ["model-research", "model-design", "stop-analysis", "origin-analysis"].sort());
+  } finally { historical.close(); }
+  assert.equal(canonical(legacy), legacyBytes, "Historical reading does not migrate the supplied snapshot");
+  const reopened = new Store(f.path);
+  try { assert.equal(canonical(reopened.list()), stored, "Historical reading does not rewrite old E1 sources"); }
+  finally { reopened.close(); }
 });
 
 test("E6 report: every historical snapshot field is mandatory, including explicit empty sets and null ledger", t => {
@@ -1298,6 +1329,86 @@ writeFileSync(output, JSON.stringify(expected));
   assert.equal(storageBytes(), old.storageBytes, "Historical E6 creates no new E1 revisions or migrations of their bytes");
 });
 
+test("E6 replays the exact four-purpose report produced by cf5d56f after restart", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-e6-old-purpose-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const run = (executable: string, args: string[], cwd: string): string => {
+    const child = spawnSync(executable, args, { cwd, env: environment, encoding: "utf8", timeout: 60_000, maxBuffer: 20_000_000 });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.status, 0, `${executable} ${args.join(" ")}\n${child.stdout}\n${child.stderr}`);
+    return child.stdout;
+  };
+  const repository = run("git", ["rev-parse", "--show-toplevel"], dirname(fileURLToPath(import.meta.url))).trim();
+  const legacy = join(root, "cf5d56f"), archive = join(root, "cf5d56f.tar");
+  mkdirSync(legacy);
+  run("git", ["archive", "--format=tar", "--output", archive, "cf5d56f"], repository);
+  run("tar", ["-xf", archive, "-C", legacy], root);
+  symlinkSync(join(repository, "node_modules"), join(legacy, "node_modules"), "dir");
+  writeFileSync(join(legacy, "tsconfig.e6-purpose-history.json"), JSON.stringify({
+    extends: "./tsconfig.json", include: ["src/**/*.ts"], exclude: [],
+  }));
+  run(process.execPath, [join(legacy, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.e6-purpose-history.json"], legacy);
+  const database = join(root, "old-e6.sqlite"), output = join(root, "old-e6.json"), producer = join(legacy, "e6-purpose-producer.mjs");
+  writeFileSync(producer, `
+import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { reference } from './dist/src/pipeline/contracts.js';
+import { Store } from './dist/src/storage/store.js';
+import { openSeries, beginAttempt } from './dist/src/om/series.js';
+import { recordCall, settleCall } from './dist/src/om/call-record.js';
+import { spendReport } from './dist/src/om/spend-report.js';
+const ok = result => { assert.equal(result.ok, true, JSON.stringify(result)); return result.value; };
+const project = 'historical-purpose', block = 'historical-block', store = new Store(process.argv[2]);
+try {
+  const adapter = reference(store.write({ id: 'adapter:' + project, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio', status: 'configured-not-accepted' } }));
+  const config = reference(store.write({ id: 'config:' + project, kind: 'dispatch-config', expected: 0,
+    value: { projectId: project, model: 'never-invoked', transport: 'stdio', status: 'configured-not-accepted' } }));
+  ok(openSeries(store, { project, block, line: 1, slice: 'historical-slice', predecessor: null, basis: null }));
+  const goal = { key: 'historical-question', questions: ['Which contract applies?'], result: 'An accepted contract' };
+  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  const request = (call, purpose) => ({ call, purpose, basis: null, block,
+    gaps: [{ id: 'historical-gap', goal: 'historical-contract', field: 'contract', consumer: block }],
+    series: reference(series), attempt: 1, goal, dispatch: { adapter, config }, packet: { question: 'Which contract applies?' } });
+  const research = ok(recordCall(store, project, request('old-research', 'model-research')));
+  const usage = { inputTokens: 41, outputTokens: 13, cachedInputTokens: 5, reasoningOutputTokens: 3 };
+  ok(settleCall(store, reference(research.call), usage, 'succeeded'));
+  ok(recordCall(store, project, request('old-design', 'model-design')));
+  const report = ok(spendReport(store, { project }));
+  assert.deepEqual(Object.keys(report.snapshot).sort(), ['project', 'ledger', 'calls', 'series', 'histories', 'significance', 'late'].sort());
+  assert.deepEqual(Object.keys(report.byPurpose).sort(), ['model-research', 'model-design', 'stop-analysis', 'origin-analysis'].sort());
+  writeFileSync(process.argv[3], JSON.stringify(report));
+} finally { store.close(); }
+`);
+  run(process.execPath, [producer, database, output], legacy);
+  const saved = JSON.parse(readFileSync(output, "utf8")) as SpendReport;
+  const storageBytes = (): string => {
+    const raw = new DatabaseSync(database, { readOnly: true });
+    try { return JSON.stringify({
+      revisions: raw.prepare("SELECT entity_id, revision, kind, body, sha256 FROM revisions ORDER BY entity_id, revision").all(),
+      heads: raw.prepare("SELECT entity_id, revision FROM heads ORDER BY entity_id").all(),
+      events: raw.prepare("SELECT * FROM events ORDER BY rowid").all(),
+    }); } finally { raw.close(); }
+  };
+  const before = storageBytes();
+  const historical = new ExactOnlyStore(database);
+  try {
+    const replayed = deliveredOf(readSpendReport(historical, saved.snapshot));
+    assert.deepEqual(replayed, saved);
+    assert.deepEqual(Object.keys(replayed.byPurpose).sort(),
+      ["model-research", "model-design", "stop-analysis", "origin-analysis"].sort());
+  } finally { historical.close(); }
+  const current = new Store(database);
+  try {
+    const report = deliveredOf(spendReport(current, { project: saved.snapshot.project }));
+    assert.equal(report.snapshot.purposeSet, SPEND_PURPOSE_SET_V2);
+    assert.equal(Object.keys(report.byPurpose).length, 5);
+  } finally { current.close(); }
+  assert.equal(storageBytes(), before, "Neither historical nor current E6 rewrites the old producer's records");
+});
+
 /** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call.test.ts. */
 function ordinarySpendFixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-spend-ordinary-")), database = join(root, "state.sqlite");
@@ -1361,6 +1472,57 @@ function ordinarySpendFixture(t: test.TestContext) {
   return { database, store, project, source, routes, gaps, batch, packet, request, address, goal, series, environment,
     steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); } };
 }
+
+test("E6 report: one assessed fact has its own physical expense beside the original MC1 call", async t => {
+  const f = ordinarySpendFixture(t);
+  const assessmentUsage = { inputTokens: 11, outputTokens: 3, cachedInputTokens: 2, reasoningOutputTokens: 1 };
+  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+    results: [{ questionId: f.batch.items[0]!.gap, value: "UTF-8",
+      citations: [{ source: reference(f.source), selector: { kind: "text-range", start: 0, end: f.source.value.content.length } }] }] },
+    usage: actualUsage }, { research: { verdict: "supported" }, usage: assessmentUsage }]);
+  const original = deliveredOf(await runModelCall(f.store, f.request));
+  assert.equal(original.outcome?.kind, "fact-candidates");
+  if (original.outcome?.kind !== "fact-candidates") assert.fail("The MC1 fixture must produce a checked fact");
+  const fact = original.outcome.facts[0]!;
+  const assignment = f.batch.items.find(item => item.gap === fact.questionId)!;
+  const originalCall = f.store.get<CallRecord>(original.call.id, original.call.revision)!;
+  const addressed = originalCall.value.gaps.filter(gap => gap.goal === assignment.target && gap.field === assignment.field);
+  assert.ok(addressed.length > 0);
+  const response = original.record.value.response?.record;
+  assert.ok(response);
+  const basis = { kind: "fact-assessment" as const, modelCall: reference(original.record), call: original.call,
+    packet: reference(f.packet), response, question: fact.question,
+    questionId: fact.questionId };
+  const packet = JSON.parse(canonical({ question: fact.question, candidate: fact.value, citations: fact.grounds })) as Json;
+  const admitted = deliveredOf(recordCall(f.store, f.project, { call: "spend:fact-assessment", purpose: "fact-assessment",
+    basis, block: f.address.block, gaps: addressed, series: reference(f.series), attempt: 1,
+    goal: f.goal, dispatch: f.request.dispatch, packet }));
+  const assessed = deliveredOf(await runModelTransport(f.store, {
+    project: f.project, call: reference(admitted.call), packet, role: "reviewer",
+  }));
+  const stored = canonical(f.store.list());
+  const report = deliveredOf(spendReport(f.store, { project: f.project }));
+  assert.equal(report.snapshot.purposeSet, SPEND_PURPOSE_SET_V2);
+  assert.equal(report.rows.length, 2);
+  const assessment = report.rows.find(row => row.purpose === "fact-assessment")!;
+  assert.deepEqual(assessment.physical, reference(assessed.record));
+  assert.deepEqual(assessment.usage, assessmentUsage);
+  assert.equal(assessment.settlement, "succeeded");
+  assert.deepEqual(report.byPurpose["fact-assessment"],
+    { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: assessmentUsage });
+  assert.deepEqual(report.byPurpose["model-research"],
+    { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: actualUsage });
+  assert.deepEqual(report.totals.reportedTokens,
+    { inputTokens: 131, outputTokens: 33, cachedInputTokens: 22, reasoningOutputTokens: 11 });
+  assert.deepEqual(report.findings, []);
+  assert.equal(canonical(f.store.list()), stored);
+  const legacy = { ...report.snapshot } as Record<string, unknown>;
+  delete legacy.purposeSet;
+  spendRefused(readSpendReport(f.store, legacy as unknown as SpendSnapshot), "spend_basis_invalid");
+  const historical = new ExactOnlyStore(f.database);
+  try { assert.deepEqual(deliveredOf(readSpendReport(historical, report.snapshot)), report); }
+  finally { historical.close(); }
+});
 
 test("E6 ordinary E4: packet significance and exact physical expense survive later application heads", async t => {
   for (const action of ["answer", "cannot_answer"] as const) await t.test(action, async nested => {

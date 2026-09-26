@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -37,6 +39,9 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
 import { writeRoutes } from "../src/om/routes.js";
+import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
+import { readModelTransport, recoverOmModelCall, runModelCall, runModelTransport } from "../src/om/model-call.js";
+import { gapLineKey, gapLineExpectedResult } from "../src/om/gap-lines.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
@@ -326,7 +331,7 @@ test("readCall preserves storage exceptions from either the requested revision o
 
 test("recordCall writes the call and the one project-ledger row before dispatch, as sealed copies", t => {
   const f = fixture(t, "record");
-  assert.deepEqual([...CALL_PURPOSES], ["model-research", "model-design", "stop-analysis", "origin-analysis"]);
+  assert.deepEqual([...CALL_PURPOSES], ["model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment"]);
   const packet = Object.create(null) as Record<string, Json>;
   Object.defineProperty(packet, "__proto__", { value: { literal: true }, enumerable: true });
   packet['question'] = "who produces the price?";
@@ -1399,4 +1404,281 @@ test("block origin analysis follows its inherited current hold and rejects a lif
     assert.equal(deliveredOf(settleCall(restarted, reference(inherited.call), usage, "succeeded")).settled, true);
     assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).repeated, true);
   } finally { restarted.close(); }
+});
+
+const e4FixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
+
+function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store) {
+  const root = mkdtempSync(join(tmpdir(), "omg-e50-fact-")), path = join(root, "state.sqlite"), project = "garden";
+  let store = new StoreType(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store), desired = gardenGraph("cross");
+  desired.nodes.find(node => node.id === "garden-produce-block")!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
+  desired.nodes.find(node => node.id === "garden-consume-block")!.ports.push({ id: "in-side", direction: "in", contract: "garden-contract" });
+  desired.connectors.push({ id: "garden-side-flow", artifact: "garden-data", returnsTo: "garden-produce-block", wakeTest: null,
+    bindings: [{ level: 1, producer: { node: "garden-produce-block", port: "out-side" },
+      consumers: [{ node: "garden-consume-block", port: "in-side" }], anchor: null }] });
+  const { level: _level, ...l1 } = projectGraph(desired, 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding", question: "What encoding is supported?",
+      consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false,
+      resolution: "Resolve the addressed question during OM" }];
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const base = deliveredOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = deliveredOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: "discovery:encoding", field: "address",
+        value: { consumer: "garden-consume-block", kind: "repository-fact" } } })) as Write }] }));
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null,
+    available: {}, choice: { choiceVersion: "e50-fact", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
+      layer: null, frame: null, upper: null } },
+    works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = deliveredOf(writeGaps(store, sources));
+  const gapRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const tasks = deliveredOf(prepareQuestionTasks(store, { project, gaps: gapRequest,
+    questions: gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing"
+      && !row.value.gap.deferral).map(gap => ({ gap: reference(gap), requirements: [{ pointer: "/contracts/0" }],
+        resultForm: { type: "string" } })) }));
+  const routes = deliveredOf(writeRoutes(store, { project, gaps: gapRequest,
+    tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
+    catalog: { paths: ["e50-source.txt"], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(question => question.target === "discovery:encoding"))!;
+  assert.ok(batch);
+  const block = "garden-consume-block", source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const attemptGoal: AttemptGoal = { key: "e50:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  deliveredOf(openSeries(store, { project, block, line: 1, slice: "e50-fact", predecessor: null, basis: null }));
+  const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [e4FixturePath, "--scenario", scenario, "--trace", trace] };
+  const config = engine.environments.configure(project, { workspace: root,
+    implementer: { actor: "e50-researcher", model: "fixture", effort: "high", command },
+    reviewer: { actor: "e50-assessor", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
+  const adapter = store.write({ id: `adapter:${project}:e50`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: project, protocol: "codex-stdio" } });
+  const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const questionId = batch.items[0]!.gap;
+  const native = (packet as Revision<QuestionPacketRecord>).value.native.find(item => item.gap.id === `om-gap:${project}:${questionId}`)!;
+  assert.ok(native);
+  writeFileSync(join(root, "e50-source.txt"), "UTF-8 is the supported encoding.");
+  const originalStep = { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+    results: [{ questionId, value: "UTF-8", citations: [{ source: reference(source),
+      selector: { kind: "text-range", start: 0, end: source.value.content.length } }] }] }, usage };
+  writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
+  const modelRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(config) },
+    role: "implementer" as const };
+  async function original() {
+    const model = deliveredOf(await runModelCall(store, modelRequest));
+    assert.equal(model.outcome?.kind, "fact-candidates");
+    assert.ok(model.response);
+    assert.equal(store.get<RepairSeries>(series.id)!.value.attempts[0]!.outcome, null);
+    const research = deliveredOf(readCall(store, project, model.call));
+    if ("owner" in research.value) assert.fail("Original MC1 call must belong to its block attempt");
+    const basis = { kind: "fact-assessment" as const, modelCall: reference(model.record), call: model.call,
+      packet: reference(packet), response: model.response, question: native.question, questionId };
+    const addressedFact = research.value.gaps.filter(gap => gap.id === batch.items[0]!.target && gap.field === batch.items[0]!.field);
+    assert.ok(addressedFact.length > 0);
+    const assessment = (over: Partial<RecordCallRequest> = {}): RecordCallRequest => ({
+      call: `assess-encoding-${next()}`, purpose: "fact-assessment", basis, block,
+      gaps: addressedFact,
+      series: reference(store.get<RepairSeries>(series.id)!), attempt: 1, goal: attemptGoal,
+      dispatch: modelRequest.dispatch, packet: { questionId, value: "UTF-8", evidence: model.response }, ...over,
+    });
+    return { model, research, basis, assessment };
+  }
+  return { project, block, path, root, series, packet, native, questionId, get store() { return store; }, original,
+    assessorScenario() { writeFileSync(scenario, JSON.stringify({ steps: [originalStep,
+      { research: { verdict: "supported", reasons: [] }, usage }] })); },
+    sent() { return readFileSync(trace, "utf8").trim().split("\n").filter(Boolean); },
+    restart() { store.close(); store = new StoreType(path); } };
+}
+
+test("fact assessment is admitted only from the applied original MC1 fact in its running attempt", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
+  const recorded = deliveredOf(recordCall(f.store, f.project, input));
+  assert.equal(recorded.call.value.purpose, "fact-assessment");
+  assert.deepEqual(recorded.call.value.basis, origin.basis);
+  assert.equal(recorded.call.value.attempt, origin.research.value.attempt);
+  assert.equal(recorded.call.value.series.id, origin.research.value.series.id);
+  assert.equal(recorded.ledger.value.calls.filter(row => row.purpose === "fact-assessment").length, 1);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  deliveredOf(completeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
+    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+  const exact = reference(recorded.call), before = f.store.list().map(reference);
+  f.restart();
+  assert.deepEqual(deliveredOf(readCall(f.store, f.project, exact)), recorded.call);
+  assert.equal(deliveredOf(recordCall(f.store, f.project, input)).repeated, true);
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test("fact assessment rejects intent imitations, missing and foreign exact sources", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original(), baselineSize = f.store.list().length;
+  const fake = f.store.write({ id: `model-call:${f.project}:om:imitation`, kind: "model-call", expected: 0,
+    value: { projectId: f.project, purpose: "model-research", status: "succeeded", response: { record: origin.basis.response } } });
+  const malformed = [
+    { name: "intent imitation", basis: { ...origin.basis, modelCall: reference(fake) }, code: "call_basis_unresolved" },
+    { name: "missing response", basis: { ...origin.basis, response: { ...origin.basis.response, hash: "0".repeat(64) } }, code: "call_basis_unresolved" },
+    { name: "foreign packet", basis: { ...origin.basis, packet: { ...origin.basis.packet, id: origin.basis.packet.id.replace(f.project, "foreign") } }, code: "call_basis_unresolved" },
+    { name: "another question", basis: { ...origin.basis, questionId: "other-question" }, code: "call_basis_unresolved" },
+    { name: "missing question", basis: { ...origin.basis, question: undefined }, code: "call_basis_invalid" },
+  ];
+  for (const item of malformed) {
+    const input = origin.assessment({ basis: item.basis as RecordCallRequest["basis"] });
+    addressed(recordCall(f.store, f.project, input), item.code);
+    assert.equal(f.store.get(callRecordId(f.project, input.call)), null, item.name);
+  }
+  assert.equal(f.store.list().length, baselineSize + 1);
+});
+
+test("fact assessment rejects incomplete or contradictory applied MC1 sources at admission and historical read", async t => {
+  const corruptions = [
+    { name: "missing om.part", field: "part" },
+    { name: "missing om.input", field: "input" },
+    { name: "missing om.diagnostic", field: "diagnostic" },
+    { name: "contradictory error", field: "error" },
+  ] as const;
+  for (const { name, field } of corruptions) {
+    await t.test(name, async t => {
+      const f = factAssessmentFixture(t), origin = await f.original();
+      const valid = deliveredOf(recordCall(f.store, f.project, origin.assessment()));
+      const value = structuredClone(origin.model.record.value);
+      if (field === "error") {
+        assert.equal(value.error, null);
+        (value as { error: string | null }).error = "fabricated-error";
+      } else {
+        const om = value.om as unknown as Record<string, unknown>;
+        assert.ok(Object.hasOwn(om, field));
+        assert.equal(om[field], null);
+        delete om[field];
+      }
+      const corrupt = f.store.write({ id: origin.model.record.id, kind: "model-call",
+        expected: origin.model.record.revision, value });
+      assert.equal(corrupt.revision, origin.model.record.revision + 1);
+      assert.equal(corrupt.hash, hashJson(value));
+      const corruptBasis = { ...origin.basis, modelCall: reference(corrupt) };
+      const input = origin.assessment({ basis: corruptBasis });
+      const beforeCalls = f.store.list(CALL_RECORD_KIND).map(reference);
+      const beforeLedger = f.store.get<CallLedger>(callLedgerId(f.project));
+      addressed(recordCall(f.store, f.project, input), "call_basis_unresolved");
+      assert.equal(f.store.get(callRecordId(f.project, input.call)), null);
+      assert.deepEqual(f.store.list(CALL_RECORD_KIND).map(reference), beforeCalls);
+      assert.deepEqual(f.store.get<CallLedger>(callLedgerId(f.project)), beforeLedger);
+
+      // A saved opening call can name the same exact damaged origin even when new admission refuses it.
+      const forgedName = `historical-${field}-${next()}`;
+      const forged = f.store.write({ id: callRecordId(f.project, forgedName), kind: CALL_RECORD_KIND, expected: 0,
+        value: { ...structuredClone(valid.call.value), call: forgedName, basis: corruptBasis } });
+      const forgedRef = reference(forged);
+      f.restart();
+      assert.deepEqual(deliveredOf(readCall(f.store, f.project, reference(valid.call))), valid.call);
+      addressed(readCall(f.store, f.project, forgedRef), "call_record_invalid");
+    });
+  }
+});
+
+test("fact assessment cannot move to another attempt or start after its original attempt completes", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original();
+  addressed(recordCall(f.store, f.project, origin.assessment({ attempt: 2 })), "call_basis_unresolved");
+  addressed(recordCall(f.store, f.project, origin.assessment({ goal: goal() })), "call_basis_unresolved");
+  if ("owner" in origin.research.value) assert.fail("Original MC1 call must belong to its block attempt");
+  addressed(recordCall(f.store, f.project, origin.assessment({ gaps: [
+    ...origin.research.value.gaps, { id: "another-fact", goal: "encoding", field: "value", consumer: f.block },
+  ] })), "call_basis_unresolved");
+  deliveredOf(completeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
+    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+  const late = origin.assessment({ series: reference(f.store.get<RepairSeries>(f.series.id)!) });
+  addressed(recordCall(f.store, f.project, late), "call_basis_unresolved");
+  assert.equal(f.store.get(callRecordId(f.project, late.call)), null);
+});
+
+test("fact assessment current series change between origin proof and E1 write rejects atomically", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
+  const beforeCalls = f.store.list(CALL_RECORD_KIND).length, beforeLedger = f.store.get<CallLedger>(callLedgerId(f.project))!;
+  const writeMany = f.store.writeMany.bind(f.store);
+  let raced = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!raced && writes.some(write => write.kind === CALL_RECORD_KIND
+      && (write.value as { purpose?: string }).purpose === "fact-assessment")) {
+      raced = true;
+      const other = new Store(f.path);
+      try {
+        deliveredOf(completeAttempt(other, { project: f.project, block: f.block, line: 1, attempt: 1,
+          outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+      } finally { other.close(); }
+    }
+    return writeMany(writes, guards);
+  }) as Store["writeMany"];
+  try { addressed(recordCall(f.store, f.project, input), "input_stale"); }
+  finally { f.store.writeMany = writeMany; }
+  assert.ok(raced);
+  assert.equal(f.store.list(CALL_RECORD_KIND).length, beforeCalls);
+  assert.deepEqual(f.store.get<CallLedger>(callLedgerId(f.project)), beforeLedger);
+  assert.equal(f.store.get(callRecordId(f.project, input.call)), null);
+});
+
+test("fact assessment uses the shared E4 physical transport and exact replay without another charge", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
+  const admitted = deliveredOf(recordCall(f.store, f.project, input));
+  f.assessorScenario();
+  const request = { project: f.project, call: reference(admitted.call), packet: input.packet, role: "reviewer" as const };
+  const first = deliveredOf(await runModelTransport(f.store, request));
+  assert.equal(first.result.kind, "answered");
+  assert.equal(first.record.value.purpose, "fact-assessment");
+  assert.equal(first.repeated, false);
+  assert.equal(f.sent().length, 2);
+  assert.deepEqual(deliveredOf(readModelTransport(f.store, { project: f.project, record: reference(first.record) })).record, first.record);
+  const historical = deliveredOf(readCall(f.store, f.project, reference(f.store.get(admitted.call.id)!)));
+  assert.equal(historical.value.status, "succeeded");
+  const repeat = deliveredOf(await runModelTransport(f.store, request));
+  assert.equal(repeat.repeated, true);
+  assert.equal(f.sent().length, 2);
+  f.restart();
+  assert.deepEqual(deliveredOf(readModelTransport(f.store, { project: f.project, record: reference(first.record) })).record, first.record);
+  assert.equal(deliveredOf(await runModelTransport(f.store, request)).repeated, true);
+  assert.equal(f.sent().length, 2);
+  assert.equal(f.store.list("model-call").length, 2);
+});
+
+test("fact assessment recovers a lost claimed E4 owner without another physical send", async t => {
+  const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
+  const admitted = deliveredOf(recordCall(f.store, f.project, input));
+  const request = { project: f.project, call: reference(admitted.call), packet: input.packet, role: "reviewer" as const };
+  const checkpoint = join(f.root, "claimed-assessor.json"), spec = join(f.root, "driver-assessor.json"), output = join(f.root, "driver-assessor-output.json");
+  writeFileSync(spec, JSON.stringify({ database: f.path, output, operation: "transport", request,
+    checkpoint: { path: checkpoint, kind: "model-call", matches: [{ path: ["execution", "phase"], value: "claimed" }] } }));
+  const child = spawn(process.execPath, [e4FixturePath, "--driver", spec], { cwd: f.root, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout!.resume(); child.stderr!.resume();
+  const exited = new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("exit", () => resolve()); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await exited; });
+  const deadline = Date.now() + 20_000;
+  while (!existsSync(checkpoint)) {
+    assert.ok(Date.now() < deadline, "local fixture must reach the saved claimed state");
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+  }
+  const claimed = f.store.list<{ purpose: string; status: string }>("model-call")
+    .find(row => row.value.purpose === "fact-assessment")!;
+  assert.ok(claimed);
+  assert.equal(claimed.value.status, "running");
+  assert.equal(f.sent().length, 1);
+  assert.throws(() => recoverOmModelCall(f.store, f.project, reference(claimed)), code("model_call_still_running"));
+  assert.equal(child.kill("SIGKILL"), true);
+  await exited;
+  const recovered = recoverOmModelCall(f.store, f.project, reference(claimed));
+  assert.equal(recovered.value.status, "failed");
+  const read = deliveredOf(readModelTransport(f.store, { project: f.project, record: reference(recovered) }));
+  assert.equal(read.result.kind, "interrupted");
+  assert.equal(deliveredOf(await runModelTransport(f.store, request)).repeated, true);
+  assert.equal(f.sent().length, 1);
+  assert.equal(deliveredOf(readCall(f.store, f.project, reference(admitted.call))).value.status, "open");
+  f.restart();
+  assert.equal(deliveredOf(readModelTransport(f.store, { project: f.project, record: reference(recovered) })).result.kind, "interrupted");
+  assert.equal(deliveredOf(await runModelTransport(f.store, request)).repeated, true);
+  assert.equal(f.sent().length, 1);
 });

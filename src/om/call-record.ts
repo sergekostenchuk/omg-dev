@@ -8,8 +8,10 @@ import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed }
 import { readStopContext, readOriginHoldAt } from "./repeat-gate.js";
 import { writeGuarded } from "./refs.js";
 import { withHistoricalReads } from "./input.js";
+import { readModelCallState } from "./model-call.js";
+import { readPacketResponse } from "./question-packet.js";
 import {
-  prepareSeriesLineAdmission, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
+  prepareSeriesLineAdmission, readAnySeriesAt, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
   type AttemptGoal, type MechanismAdmission, type SeriesOwner,
 } from "./series.js";
 
@@ -22,7 +24,7 @@ export const CALL_SETTLEMENT_STATUSES = Object.freeze(["succeeded", "failed"] as
 export type CallSettlementStatus = typeof CALL_SETTLEMENT_STATUSES[number];
 export type CallStatus = "open" | CallSettlementStatus;
 export const CALL_PURPOSES = Object.freeze([
-  "model-research", "model-design", "stop-analysis", "origin-analysis",
+  "model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment",
 ] as const);
 export type CallPurpose = typeof CALL_PURPOSES[number];
 
@@ -75,7 +77,17 @@ export interface OriginHoldBasis {
   readonly hold: Ref;
 }
 
-export type CallBasis = SeriesStopBasis | OriginHoldBasis;
+export interface FactAssessmentBasis {
+  readonly kind: "fact-assessment";
+  readonly modelCall: Ref;
+  readonly call: Ref;
+  readonly packet: Ref;
+  readonly response: Ref;
+  readonly question: Ref;
+  readonly questionId: string;
+}
+
+export type CallBasis = SeriesStopBasis | OriginHoldBasis | FactAssessmentBasis;
 
 export interface RecordCallRequest {
   readonly call: string;
@@ -175,6 +187,7 @@ const REF_KEYS = Object.freeze(["hash", "id", "revision"] as const);
 const FINGERPRINT_KEYS = Object.freeze(["bytes", "chars", "hash"] as const);
 const STOP_BASIS_KEYS = Object.freeze(["attempt", "kind", "series"] as const);
 const HOLD_BASIS_KEYS = Object.freeze(["hold", "kind"] as const);
+const FACT_BASIS_KEYS = Object.freeze(["call", "kind", "modelCall", "packet", "question", "questionId", "response"] as const);
 const CALL_KEYS = Object.freeze([
   "attempt", "basis", "block", "call", "dispatch", "gaps", "goal", "openedAt", "packet", "projectId",
   "purpose", "series", "settledAt", "status", "usage",
@@ -550,7 +563,7 @@ function checkRequest(project: string, value: unknown): OmResult<Sealed<CheckedR
 function checkBasis(value: unknown, purpose: CallPurpose, target: string): OmResult<Sealed<CallBasis | null>> {
   if (value === null) {
     if (purpose === "model-research" || purpose === "model-design") return delivered(null);
-    return problem("call_basis_invalid", "An analysis call names the saved stop or origin hold it analyses", target, "basis", "gap");
+    return problem("call_basis_invalid", "An analysis or assessment call names its exact saved ground", target, "basis", "gap");
   }
   if (!isPlainObject(value)) {
     return problem("call_basis_invalid", "A call basis is null or one exact saved ground", target, "basis", "gap");
@@ -569,7 +582,63 @@ function checkBasis(value: unknown, purpose: CallPurpose, target: string): OmRes
     }
     return delivered({ kind: "origin-hold", hold: exactRef(basis['hold'] as Ref) });
   }
-  return problem("call_basis_invalid", "A call basis exactly names its saved stop or origin hold", target, "basis", "gap");
+  if (basis['kind'] === "fact-assessment" && exactKeys(basis, FACT_BASIS_KEYS)
+    && [basis['modelCall'], basis['call'], basis['packet'], basis['response'], basis['question']].every(exactReference)
+    && isText(basis['questionId'])) {
+    if (purpose !== "fact-assessment") {
+      return problem("call_basis_invalid", "Only a fact-assessment call can name an original MC1 fact", target, "basis", "gap");
+    }
+    return delivered({ kind: "fact-assessment", modelCall: exactRef(basis['modelCall'] as Ref),
+      call: exactRef(basis['call'] as Ref), packet: exactRef(basis['packet'] as Ref),
+      response: exactRef(basis['response'] as Ref), question: exactRef(basis['question'] as Ref),
+      questionId: basis['questionId'] as string });
+  }
+  return problem("call_basis_invalid", "A call basis exactly names its saved stop, origin hold or MC1 fact", target, "basis", "gap");
+}
+
+function factAssessmentOrigin(store: Store, project: string, basis: FactAssessmentBasis,
+  target: string): OmResult<Sealed<{ call: Revision<AnyCallRecord>; gaps: readonly AddressedGap[] }>> {
+  const checked = readModelCallState(store, { project, record: basis.modelCall });
+  if (!checked.ok) return problem("call_basis_unresolved", "The assessor needs the exact original MC1 result",
+    target, "basis.modelCall", "producer", basis.modelCall);
+  const original = checked.value.state === "applied" ? checked.value.outcome : null;
+  if (!original || original.outcome?.kind !== "fact-candidates"
+    || !sameRef(original.call, basis.call) || !sameRef(original.packet, basis.packet)
+    || original.response === null || !sameRef(original.response, basis.response)) {
+    return problem("call_basis_unresolved", "The original MC1 call must retain its applied saved answer",
+      target, "basis.response", "producer", basis.response);
+  }
+  const response = readPacketResponse(store, { project, packet: basis.packet, call: basis.call, response: basis.response });
+  if (!response.ok || response.value.call.value.purpose !== "model-research" || response.value.call.value.basis !== null
+    || "owner" in response.value.call.value) {
+    return problem("call_basis_unresolved", "The saved answer must belong to the original MC1 admission and packet",
+      target, "basis.call", "producer", basis.call);
+  }
+  if (!original.outcome.facts.some(fact => fact.questionId === basis.questionId && sameRef(fact.question, basis.question))) {
+    return problem("call_basis_unresolved", "The assessor names one concrete fact from the checked original answer",
+      target, "basis.question", "producer", basis.question);
+  }
+  const body: unknown = response.value.packet.value.packet;
+  const packetBody = isPlainObject(body) ? body as Record<string, unknown> : null;
+  const questions: unknown[] = packetBody && Array.isArray(packetBody['questions']) ? packetBody['questions'] : [];
+  const selected = questions.filter(question => isPlainObject(question)
+    && (question as Record<string, unknown>)['id'] === basis.questionId);
+  const question = isPlainObject(selected[0]) ? selected[0] as Record<string, unknown> : null;
+  if (selected.length !== 1 || !question || !isText(question['target']) || !isText(question['field'])
+    || !Array.isArray(question['consumers']) || question['consumers'].length === 0
+    || !question['consumers'].every(isText)) {
+    return problem("call_basis_unresolved", "The assessed fact needs its one complete original question address",
+      target, "basis.questionId", "producer", basis.packet);
+  }
+  const gaps = orderedGaps((question['consumers'] as string[]).map(consumer => ({
+    id: question['target'] as string, goal: question['target'] as string,
+    field: question['field'] as string, consumer,
+  }))) as AddressedGap[];
+  if (gaps.some(gap => !response.value.call.value.gaps.some(original => hashJson(original) === hashJson(gap)))) {
+    return problem("call_basis_unresolved", "The assessed address must be part of the original E1 admission",
+      target, "basis.questionId", "producer", basis.call);
+  }
+  return delivered({ call: response.value.call, gaps });
 }
 
 function checkGaps(value: unknown, target: string, mechanism = false): OmResult<Sealed<readonly AnyAddressedGap[]>> {
@@ -655,6 +724,20 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
     }
     return delivered(guards);
   }
+  if (request.purpose === "fact-assessment") {
+    const basis = request.basis as FactAssessmentBasis;
+    const source = factAssessmentOrigin(store, project, basis, target);
+    if (!source.ok) return source;
+    if (!attempt || attempt.outcome !== null || source.value.call.value.series.id !== request.series.id
+      || source.value.call.value.attempt !== request.attempt || source.value.call.value.block !== request.block
+      || hashJson(copyGoal(source.value.call.value.goal)) !== hashJson(request.goal)
+      || hashJson(copyGoal(attempt.goal)) !== hashJson(request.goal)
+      || hashJson(request.gaps) !== hashJson(source.value.gaps)) {
+      return problem("call_basis_unresolved", "One assessed fact belongs to the still-running original attempt",
+        target, "basis", "producer", basis.call);
+    }
+    return delivered(guards);
+  }
   if (!attempt || attempt.outcome === null) {
     return problem("call_basis_unresolved", "An analysis call belongs to a completed attempt at its saved ground",
       target, "attempt", "producer", request.series);
@@ -689,6 +772,10 @@ function resolveMechanismSeries(
   store: Store, project: string, request: Omit<MechanismRecordCallRequest, "packet"> | MechanismCallRecord,
   target: string, current: boolean, history?: CallHistory,
 ): OmResult<Sealed<readonly Ref[]>> {
+  if (request.purpose === "fact-assessment") {
+    return problem("call_purpose_invalid", "An MC1 fact assessment belongs to its original block attempt",
+      target, "purpose", "gap", request.series);
+  }
   if (current) {
     const head = store.get(request.series.id);
     if (!head || !sameRef(reference(head), request.series))
@@ -833,6 +920,23 @@ function checkedCall(
   if (!validCallShape(record, project)) {
     return problem("call_record_invalid", "The stored call record is not one this unit writes", target, "record", "producer", reference(record));
   }
+  if (record.value.purpose === "fact-assessment") {
+    if ("owner" in record.value) return problem("call_record_invalid", "A fact assessment belongs to a block attempt",
+      target, "owner", "producer", reference(record));
+    const source = factAssessmentOrigin(store, project, record.value.basis as FactAssessmentBasis, target);
+    const series = readAnySeriesAt(store, project, record.value.series);
+    const attempt = series.ok && [...series.value.value.inherited, ...series.value.value.attempts]
+      .find(item => item.ordinal === record.value.attempt);
+    if (!source.ok || !series.ok || "owner" in series.value.value || series.value.value.block !== record.value.block
+      || !attempt || attempt.outcome !== null || hashJson(copyGoal(attempt.goal)) !== hashJson(record.value.goal)
+      || source.value.call.value.series.id !== record.value.series.id
+      || source.value.call.value.attempt !== record.value.attempt || source.value.call.value.block !== record.value.block
+      || hashJson(copyGoal(source.value.call.value.goal)) !== hashJson(record.value.goal)
+      || hashJson(record.value.gaps) !== hashJson(source.value.gaps)) {
+      return problem("call_record_invalid", "The assessment retains the original exact MC1 fact and attempt",
+        target, "basis", "producer", reference(record));
+    }
+  }
   if ("owner" in record.value) {
     const owner = resolveMechanismSeries(store, project, record.value, target, false, history);
     if (!owner.ok) return problem("call_record_invalid", "The saved mechanism admission does not follow from its exact series and task", target, "admission", "producer", reference(record));
@@ -924,7 +1028,10 @@ const copyDispatch = (dispatch: DispatchContract): DispatchContract => ({
 const copyBasis = (basis: CallBasis | null): CallBasis | null => basis === null ? null
   : basis.kind === "series-stop"
     ? { kind: basis.kind, series: exactRef(basis.series), attempt: basis.attempt }
-    : { kind: basis.kind, hold: exactRef(basis.hold) };
+    : basis.kind === "origin-hold" ? { kind: basis.kind, hold: exactRef(basis.hold) }
+      : { kind: basis.kind, modelCall: exactRef(basis.modelCall), call: exactRef(basis.call),
+        packet: exactRef(basis.packet), response: exactRef(basis.response), question: exactRef(basis.question),
+        questionId: basis.questionId };
 
 const exactRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
 
@@ -964,6 +1071,11 @@ function validBasis(value: unknown, purpose: CallPurpose): value is CallBasis | 
   }
   if (purpose === "origin-analysis") {
     return basis['kind'] === "origin-hold" && exactKeys(basis, HOLD_BASIS_KEYS) && exactReference(basis['hold']);
+  }
+  if (purpose === "fact-assessment") {
+    return basis['kind'] === "fact-assessment" && exactKeys(basis, FACT_BASIS_KEYS)
+      && [basis['modelCall'], basis['call'], basis['packet'], basis['response'], basis['question']].every(exactReference)
+      && isText(basis['questionId']);
   }
   return false;
 }
