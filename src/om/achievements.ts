@@ -1,9 +1,9 @@
 import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
-import { readSeriesAt, type Achievement, type AttemptGoal, type RepairSeries } from "./series.js";
+import { readSeriesAt, type Achievement, type AttemptGoal, type ClaimedRefusal, type RepairSeries } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
 import { FRAME_ACCEPTANCE_CONTRACT, readAcceptedFrameLayer } from "./layer-basis.js";
@@ -44,11 +44,13 @@ export interface AcceptanceContext {
   readonly attempt?: { readonly series: Ref; readonly ordinal: number };
   /** The complete claim being closed; E5 uses it to prevent omitting another assessed fact. */
   readonly accepting?: readonly Ref[];
+  /** The complete refusals being closed; E5 binds each negative verdict to its journal row. */
+  readonly refusals?: readonly ClaimedRefusal[];
 }
 
 /** What a provider answers about one record: the keys it derived from it, or why the record confirms nothing. */
 export type Confirmation =
-  | { readonly keys: readonly string[]; readonly guards?: readonly Ref[] }
+  | { readonly keys: readonly string[]; readonly guards?: readonly TransactionGuard[] }
   | { readonly unconfirmed: string };
 
 /**
@@ -101,13 +103,14 @@ export interface ConfirmRequest {
   readonly attempt?: AcceptanceContext["attempt"];
   readonly accepting: readonly Ref[];
   readonly cancelling: readonly Ref[];
+  readonly refusals?: readonly ClaimedRefusal[];
 }
 
 /** What the series may be told: each result under the key its provider derived, with the record that accepted it. */
 export interface ConfirmedResults {
   readonly achieved: readonly Achievement[];
   readonly cancelled: readonly string[];
-  readonly guards?: readonly Ref[];
+  readonly guards?: readonly TransactionGuard[];
 }
 
 interface Side {
@@ -137,8 +140,7 @@ export function confirmResults(store: Store, request: ConfirmRequest): OmResult<
     "acceptance_request_invalid", "A cycle names the records that accepted its results by exact references, explicitly none");
   requireCondition(Array.isArray(request.cancelling) && request.cancelling.every(isRef),
     "acceptance_request_invalid", "A cycle names the transitions that cancelled earlier results by exact references, explicitly none");
-
-  const achieved: Achievement[] = [], guards: Ref[] = [];
+  const achieved: Achievement[] = [], guards: TransactionGuard[] = [];
   for (let index = 0; index < request.accepting.length; index += 1) {
     const ref = request.accepting[index]!;
     const answer = confirmed(store, request, ref, ACCEPTING, index);
@@ -153,11 +155,20 @@ export function confirmResults(store: Store, request: ConfirmRequest): OmResult<
     cancelled.push(...answer.keys);
     guards.push(...answer.guards);
   }
-  return delivered({ achieved, cancelled, ...(guards.length ? { guards } : {}) });
+  // Every exact acceptance was confirmed above. An achievement is a semantic key, so two
+  // independently confirmed records with that key have one deterministic representative.
+  // Keep every provider guard even when its record is not the representative.
+  const byKey = new Map<string, Achievement>();
+  for (const item of achieved) {
+    const previous = byKey.get(item.key);
+    if (!previous || canonical(item.basis) < canonical(previous.basis)) byKey.set(item.key, item);
+  }
+  return delivered({ achieved: [...byKey.values()],
+    cancelled, ...(guards.length ? { guards } : {}) });
 }
 
 function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, index: number):
-  { keys: readonly string[]; guards: readonly Ref[] } | OmResult<never> {
+  { keys: readonly string[]; guards: readonly TransactionGuard[] } | OmResult<never> {
   const field = `${side.field}.${index}`;
   const found = store.get<Json>(ref.id, ref.revision);
   if (!found || found.hash !== ref.hash) {
@@ -177,7 +188,8 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
     return problem(side.code, "No attempt of that ordinal stands, so nothing it accepted can be confirmed for it", request.target, "attempt", ref);
   }
   const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal,
-    accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }) }, store);
+    accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }),
+    ...(request.refusals === undefined ? {} : { refusals: request.refusals }) }, store);
   const confirmed = keysOf(answer);
   if (confirmed === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
   return confirmed;
@@ -235,7 +247,7 @@ export function confirmAcceptedFrameResult(record: Sealed<Revision<Json>>, conte
 }
 
 // A provider is code of this module, so an answer it cannot give is a defect of that code, not data to refuse.
-function keysOf(answer: unknown): { keys: readonly string[]; guards: readonly Ref[] } | null {
+function keysOf(answer: unknown): { keys: readonly string[]; guards: readonly TransactionGuard[] } | null {
   requireCondition(isPlainObject(answer), "acceptance_provider_invalid", "A provider answers with keys or with the reason it confirms none");
   const said = answer as Record<string, unknown>;
   const keys = said['keys'];
@@ -243,9 +255,11 @@ function keysOf(answer: unknown): { keys: readonly string[]; guards: readonly Re
     requireCondition(keys.length > 0 && keys.every(isText) && new Set(keys).size === keys.length,
       "acceptance_provider_invalid", "A provider that confirms a record derives at least one key from it, each once");
     const guards = said['guards'];
-    requireCondition(guards === undefined || Array.isArray(guards) && guards.length > 0 && guards.every(isRef),
-      "acceptance_provider_invalid", "A provider's optional guards must be exact nonempty references");
-    return { keys: [...keys] as string[], guards: guards === undefined ? [] : [...guards as Ref[]] };
+    requireCondition(guards === undefined || Array.isArray(guards) && guards.length > 0
+      && guards.every(guard => isRef(guard) || isPlainObject(guard) && Object.keys(guard).length === 2
+        && isText(guard.id) && guard.absent === true),
+      "acceptance_provider_invalid", "A provider's optional guards must be exact references or guarded absences");
+    return { keys: [...keys] as string[], guards: guards === undefined ? [] : [...guards as TransactionGuard[]] };
   }
   if (Object.keys(said).length === 1 && isText(said['unconfirmed'])) return null;
   throw new EngineError("acceptance_provider_invalid", "A provider answers with keys or with the reason it confirms none");

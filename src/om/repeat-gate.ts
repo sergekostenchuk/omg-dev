@@ -1,7 +1,8 @@
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { uniqueTransactionGuards } from "../runtime/environment.js";
 import {
   delivered, isPlainObject, isText, refused, sealed,
   type OmResult, type Refusal, type RefusalRoute, type Sealed,
@@ -26,6 +27,10 @@ import type { Graph } from "../graph/model.js";
 import { readFrame, type FrameRequest } from "./frame-obligations.js";
 import { definitionIds, observeProposal, type ProposalRequest } from "./frame-proposals.js";
 import { observeCandidate } from "./frame-candidate.js";
+import { assessmentAttemptReason, checkCurrentAssessmentAttemptClosure, isAssessmentCallName,
+  readAssessmentRefusalAt } from "./assessment.js";
+import { acceptedAnswerNamespace } from "./accepted-answer.js";
+import { callLedgerId, readCallLedger, type CallLedger } from "./call-record.js";
 
 /**
  * The gate of repetition. It stands on EVERY return path — the refusal of the layer check (G3), of atomicity (G5), of
@@ -369,7 +374,7 @@ export interface GateWrite {
 }
 export interface RepeatTransition {
   readonly writes: readonly GateWrite[];
-  readonly guards: readonly Ref[];
+  readonly guards: readonly TransactionGuard[];
   readonly value: RepeatOutcome;
 }
 export interface HoldTransition {
@@ -400,7 +405,10 @@ interface Placing {
   readonly code: RepeatGateCode;
   readonly route: RefusalRoute;
 }
-interface Derived { readonly class: RefusalClass; readonly addressee: string; readonly basis: readonly OriginSource[] }
+interface Derived {
+  readonly class: RefusalClass; readonly addressee: string; readonly basis: readonly OriginSource[];
+  readonly assessment?: { readonly intent: Ref; readonly result: Ref; readonly source: Ref; readonly guards: readonly Ref[] };
+}
 interface Resolution { readonly class: RefusalClass | null; readonly addressee: string | null; readonly basis: readonly OriginSource[] }
 interface Located { readonly ref: Ref; readonly value: unknown; readonly write: GateWrite | null }
 interface Holds { readonly standing: readonly HoldContext[]; readonly guards: readonly Ref[] }
@@ -664,6 +672,10 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   }
   const address = requireAddress(request);
   const at = requestOf(address);
+  const assessmentGuards: TransactionGuard[] = [];
+  // This head is captured before any E1 enumeration. Exact completed repeats never traverse today's ledger.
+  const ledgerId = callLedgerId(address.project);
+  const capturedLedger = address.owner.kind === "block" ? store.get<CallLedger>(ledgerId) : null;
 
   // What the cycle achieved and cancelled, as the providers of acceptance confirm it, never as the caller says it.
   let results: ConfirmedResults = { achieved: [], cancelled: [] };
@@ -677,12 +689,11 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
     const confirmed = confirmResults(store, {
       project: address.project, block: address.owner.block, target: address.id,
       attempt: { series: reference(standing.value), ordinal: request.attempt },
-      goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling,
+      goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling, refusals: claimed,
     });
     if (!confirmed.ok) return confirmed;
     results = confirmed.value as ConfirmedResults;
   }
-
   // One row is one refusal, and one refusal gets one class. The set is UNORDERED, so it is put in one order before
   // anything is derived from it — the same refusals delivered in another order are the same decisions (T6).
   const wanted = [...new Set(claimed.map(item => item.row))].sort(compare);
@@ -692,7 +703,8 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   const routed: RoutedRefusal[] = [];
   const classifications: RefusalClassification[] = [];
   const guards: Ref[] = [];
-  if (results.guards) guards.push(...results.guards);
+  let independentRefusal = false;
+  if (results.guards) assessmentGuards.push(...results.guards);
   const rows = new Map<string, JournalRow>();
   if (wanted.length > 0) {
     const journal = readJournal(store, { project: address.project });
@@ -707,10 +719,13 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
         return refused("refusal_unknown", "No refusal stands in the journal of this project under that row",
           { unit: UNIT, target: address.id, field: `outcome.refusals.${index}.row` }, "producer");
       }
-      const derived = derive(store, row, address, `outcome.refusals.${index}.origin`);
+      const derived = derive(store, row, address, request.attempt, `outcome.refusals.${index}.origin`);
       if ("ok" in derived) return derived;
       routed.push({ row: row.id, class: derived.class, addressee: derived.addressee, toModel: TO_MODEL[derived.class], basis: derived.basis });
       classifications.push({ row: row.id, class: derived.class, addressee: derived.addressee, basis: derived.basis });
+      if (derived.assessment) {
+        guards.push(...derived.assessment.guards);
+      } else independentRefusal = true;
     }
   }
 
@@ -721,6 +736,50 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   };
   const series = prepareCompleteAttempt(store, completion);
   if (!series.ok) return series;
+  if (address.owner.kind === "block" && series.value.writes.length > 0) {
+    // The first E1 head was captured before the checks above; its guard closes the admission race even when the
+    // attempt had no assessor at preparation time. A completed repeat has no new A3 write and needs no current E1.
+    assessmentGuards.push(capturedLedger ? reference(capturedLedger) : { id: ledgerId, absent: true });
+    // A missing head is lawful only when the common E1 reader proves that no call records exist. A foreign kind
+    // is never a reason to skip this check: both are otherwise able to hide an assessed attempt from G7.
+    const ledger = readCallLedger(store, address.project);
+    if (!ledger.ok) return refused("origin_unreadable", ledger.refusal.message,
+      { unit: UNIT, target: address.id, field: "ledger",
+        ...(capturedLedger ? { ref: reference(capturedLedger) } : {}) }, "producer");
+    if (capturedLedger === null ? ledger.value !== null
+      : ledger.value === null || !sameRef(reference(capturedLedger), reference(ledger.value)))
+      return refused("input_stale", "The project E1 ledger changed while its closing slice was being checked",
+        { unit: UNIT, target: ledgerId, field: "ledger",
+          ...(capturedLedger ? { ref: reference(capturedLedger) } : {}) }, "producer");
+    const hasAssessment = ledger.value?.value.calls.some(row => row.purpose === "fact-assessment"
+      && row.series.id === address.id && row.attempt === request.attempt
+      && (isAssessmentCallName(row.name)
+        || row.basis !== null && Object.hasOwn(row.basis, "assessment"))) ?? false;
+    if (hasAssessment) {
+      const standing = readAnySeries(store, at);
+      if (!standing.ok) return standing;
+      const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts]
+        .find(item => item.ordinal === request.attempt);
+      if (!attempt) return refused("input_stale", "The assessed attempt changed before its new G7 close",
+        { unit: UNIT, target: address.id, field: "attempt", ref: reference(standing.value) }, "producer");
+      const exactSeries = reference(standing.value);
+      const closure = checkCurrentAssessmentAttemptClosure(store,
+        { project: address.project, block: address.owner.block, series: exactSeries,
+          attempt: request.attempt, goal: attempt.goal },
+        { series: exactSeries, attempt: request.attempt, block: address.owner.block, goal: attempt.goal,
+          reason, accepting, cancelling, refusals: claimed });
+      if (!closure.ok) return refused("origin_unreadable", closure.refusal.message,
+        { unit: UNIT, target: address.id, field: "outcome", ref: exactSeries }, "producer");
+      const expectedReason = assessmentAttemptReason(closure.value.accepting, closure.value.negativeResults,
+        closure.value.technical, results.achieved.some(item => !item.basis.id.startsWith(
+          `${acceptedAnswerNamespace(address.project)}e5:`)) || results.cancelled.length > 0,
+        independentRefusal);
+      if (reason !== expectedReason) return refused("origin_unreadable",
+        "The attempt reason must follow all checked E5 terminals and other confirmed G7 results",
+        { unit: UNIT, target: address.id, field: "outcome.reason", ref: exactSeries }, "producer");
+      assessmentGuards.push(...closure.value.guards);
+    }
+  }
   const writes: GateWrite[] = [...series.value.writes];
   guards.push(...series.value.guards);
 
@@ -758,7 +817,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   }
 
   const value = reported(address, held, request.attempt, routed, raised, decided);
-  return { ok: true, value: { writes, guards: uniqueGuards(guards), value } };
+  return { ok: true, value: { writes, guards: uniqueTransactionGuards([...uniqueGuards(guards), ...assessmentGuards]), value } };
 }
 
 /**
@@ -822,11 +881,38 @@ function raise(
  * refuses a record that does). Sources must first agree on their saved assembly inputs; the definitions they carry
  * at those exact revisions then determine the class, without trusting their own status or class claims.
  */
-const derive = (store: Store, row: JournalRow, address: Address, path: string): OmResult<never> | Derived =>
-  placeOrigin(store, row.origin, {
+const derive = (store: Store, row: JournalRow, address: Address, ordinal: number, path: string): OmResult<never> | Derived => {
+  const e5 = row.gate === "E5" || row.origin.stage === "fact-assessment"
+    || row.source.id.startsWith(`om-unit-refusal:${address.project}:e5:`)
+    || row.origin.sources.some(source => source.role === "assessment");
+  if (e5) {
+    const bad = (field: string, message: string, ref: Ref = row.source): OmResult<never> => refused("origin_unreadable", message,
+      { unit: UNIT, target: address.id, field: `${path}.${field}`, ref }, "producer");
+    const proof = readAssessmentRefusalAt(store, address.project, row.source);
+    if (!proof.ok) return bad("source", proof.refusal.message);
+    if (address.owner.kind !== "block") return bad("owner", "E5 fact assessments belong to block attempts");
+    const standing = readAnySeries(store, requestOf(address));
+    if (!standing.ok) return bad("series", standing.refusal.message);
+    const bound = readAnySeriesAt(store, address.project, proof.value.intent.originalSeries);
+    if (!bound.ok) return bad("series", bound.refusal.message, proof.value.intent.originalSeries);
+    const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts]
+      .find(item => item.ordinal === ordinal);
+    if (!attempt || !('block' in bound.value.value) || bound.value.value.block !== address.owner.block
+      || bound.value.value.line !== address.line || proof.value.intent.originalSeries.id !== address.id
+      || proof.value.intent.block !== address.owner.block || proof.value.consumer !== address.owner.block
+      || proof.value.intent.attempt !== ordinal || hashJson(proof.value.intent.goal) !== hashJson(attempt.goal))
+      return bad("attempt", "The exact E5 result must belong to this original block, line, ordinal and goal",
+        reference(proof.value.result));
+    return { class: "proposal", addressee: addressed("proposal", proof.value.target),
+      basis: [{ role: "assessment", ref: reference(proof.value.result) }],
+      assessment: { intent: proof.value.intent.intent, result: reference(proof.value.result),
+        source: reference(proof.value.record), guards: [...proof.value.guards, reference(standing.value)] } };
+  }
+  return placeOrigin(store, row.origin, {
     project: address.project, target: address.id, owner: address.owner, series: address.id,
     sources: `${path}.sources`, code: "origin_unreadable", route: "producer",
   });
+};
 
 /**
  * THE ONE weighing of an origin this gate has, and the only place a class, its addressee and the grounds they stand on

@@ -22,13 +22,15 @@ import { openSeries, beginAttempt, applySeriesActivation, seriesCurrentId, serie
   type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { writeSeriesTransition } from '../src/om/series-transition.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
+import { readJournal, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
 import { gapLineKey, gapLineExpectedResult, prepareGapLines, writeGapLines, GAP_LINE_KIND } from '../src/om/gap-lines.js';
 import { recordCall } from '../src/om/call-record.js';
 import { runModelCall, runModelTransport } from '../src/om/model-call.js';
 import { readAcceptedAnswer, readAnswerSearch, applicableAnswer, prepareE5AcceptedAnswer,
   confirmAnswerGapClosure, answerIndexId, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
 import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt, readAssessmentResultAt, assessmentResultId,
-  readAssessmentTerminalAt, readAssessmentSet, applyAssessmentResult, assessFact, ASSESSMENT_INTENT_KIND,
+  assessmentRefusalId, finishAssessmentAttempt, readAssessmentTerminalAt, readAssessmentSet, applyAssessmentResult,
+  assessFact, ASSESSMENT_INTENT_KIND,
   ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from '../src/om/assessment.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -130,9 +132,30 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
   }
   return { project, path, series, scenario, originalStep, dispatch, original, questionIds: batch.items.map(item => item.gap),
     get store() { return store; },
+    async secondOriginal(): Promise<AssessmentIntentRequest> {
+      const prior = routes.value.request;
+      const successor = ok(writeRoutes(store, { project, gaps: structuredClone(prior.gaps) as GapReadRequest,
+        tasks: prior.tasks.map(record => ({ record })),
+        catalog: { paths: [...prior.catalog.paths], records: [...prior.catalog.records] },
+        previous: reference(routes) }));
+      const nextBatch = successor.value.batches.find(item => item.model === 'MC1'
+        && item.items.some(row => row.gap === questionId));
+      assert.ok(nextBatch);
+      const nextPacket = ok(writeQuestionPacket(store, { project, routes: reference(successor),
+        batch: nextBatch.id, environment: reference(config),
+        attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, originalStep] }));
+      const model = ok(await runModelCall(store, { project, packet: reference(nextPacket), dispatch, role: 'implementer' }));
+      assert.equal(model.outcome?.kind, 'fact-candidates');
+      return { project, modelCall: reference(model.record), questionId, dispatch };
+    },
     assessor(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
       const choices = verdicts.length ? verdicts : ['supported' as const];
       writeFileSync(scenario, JSON.stringify({ steps: [originalStep, ...choices.map(verdict =>
+        ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
+    },
+    assessorsForTwoOriginals(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
+      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, originalStep, ...verdicts.map(verdict =>
         ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
     },
     sent() { return readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean); },
@@ -190,6 +213,58 @@ test('E5 accepted fact closes its D2 line after G7 completed the original attemp
   assert.deepEqual(ok(writeGapLines(f.store, chain.next)), closed);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, 2);
+});
+
+test('either proved E5 D5 answer of one semantic achievement can close D2 after the attempt', async t => {
+  const f = fixture(t), first = await f.original(), second = await f.secondOriginal();
+  const firstIntent = ok(writeAssessmentIntent(f.store, first));
+  const question = f.store.get<Mc1QuestionRecord>(
+    ok(readAssessmentIntentAt(f.store, f.project, reference(firstIntent))).question.record.id)!;
+  const prior = question.value.request.gaps;
+  const initial = ok(writeGapLines(f.store, { project: f.project, previous: null, pass: 1,
+    gaps: prior, closures: [] }));
+  // Both original MC1 calls are admitted before either assessor terminal; the first result
+  // cannot finish the attempt while the second original response is still awaiting assessment.
+  for (const source of [first, second]) {
+    const intent = ok(writeAssessmentIntent(f.store, source));
+    const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
+    ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
+      block: admission.block, gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
+      goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
+  }
+  f.assessorsForTwoOriginals('supported', 'supported');
+  const firstResult = ok(await assessFact(f.store, first));
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const secondResult = ok(await assessFact(f.store, second));
+  const answers = [firstResult.value.accepted!, secondResult.value.accepted!];
+  assert.notEqual(answers[0]!.id, answers[1]!.id);
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+  assert.equal(saved.reason, 'result');
+  assert.equal(saved.achieved.length, 1);
+  const alternate = answers.find(ref => ref.id !== saved.achieved[0]!.basis.id)!;
+  const checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: alternate }));
+  const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: question.value.request.input,
+    answer: alternate, question: reference(question) }));
+  const graph = prior.sources.graph;
+  const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(applied), graph,
+    refinement: null, available: {}, choice: { choiceVersion: 'e5-equivalent-d2',
+      features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { ...structuredClone(prior.sources), input: reference(applied),
+    horizon: reference(horizon.gate), operations: { ...structuredClone(prior.sources.operations),
+      frame: { ...structuredClone(prior.sources.operations.frame), horizon: reference(horizon.gate) } } };
+  const gaps = ok(writeGaps(f.store, sources));
+  const current: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest,
+    records: gaps.records.map(reference) };
+  const attempt = { series: checked.attempt!.series, attempt: checked.attempt!.ordinal };
+  const closure = { id: checked.gap.id, reason: 'filled' as const, basis: alternate, acceptance: null,
+    attempt, answer: { record: alternate } };
+  const confirmation = { project: f.project, basis: closure.answer, target: checked.gap.target,
+    field: checked.gap.field, prior, current, attempt, currentOnly: true };
+  assert.equal(ok(confirmAnswerGapClosure(f.store, confirmation)).key, checked.key);
+  f.restart();
+  const next = { project: f.project, previous: reference(initial), pass: 2, gaps: current, closures: [closure] };
+  assert.equal(ok(writeGapLines(f.store, next)).value.lines.find(line => line.id === closure.id)?.status, 'closed');
+  assert.equal(f.sent().length, 4);
 });
 
 test('E5 D2 closure keeps the original attempt, goal and current line admission', async t => {
@@ -305,7 +380,7 @@ test('an E5 D5 answer without its terminal result is not readable as accepted', 
   }
 });
 
-test('E5 closes only a complete fully supported source set; a mixed set remains open for E5.1', async t => {
+test('E5.1 closes the complete mixed set with its supported fact and negative refusal', async t => {
   const f = fixture(t, true), first = await f.original();
   assert.equal(f.questionIds.length, 2);
   f.assessor('supported', 'insufficient');
@@ -319,7 +394,12 @@ test('E5 closes only a complete fully supported source set; a mixed set remains 
   assert.equal(set.complete, true);
   assert.equal(set.allSupported, false);
   assert.equal(set.accepted.length, 1);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const mixed = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome;
+  assert.ok(mixed);
+  assert.equal(mixed.reason, 'result');
+  assert.equal(mixed.achieved.length, 1);
+  assert.equal(mixed.achieved[0]!.basis.id, firstResult.value.accepted!.id);
+  assert.equal(mixed.refusals.length, 1);
   const count = f.sent().length;
   f.restart();
   assert.deepEqual(ok(await assessFact(f.store, first)), firstResult);
@@ -401,14 +481,23 @@ test('E5 closes a multi-fact attempt after the final supported result and repeat
   assert.equal(f.sent().length, count);
 });
 
-test('E5 stores an independent insufficient verdict without accepting a fact or ending the attempt early', async t => {
+test('E5.1 closes an insufficient fact as one refusal without D5 acceptance', async t => {
   const f = fixture(t), request = await f.original();
   f.assessor('insufficient');
   const terminal = ok(await assessFact(f.store, request));
   assert.equal(terminal.value.verdict, 'insufficient');
   assert.equal(terminal.value.accepted, null);
   assert.equal(terminal.value.index, null);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const line = f.store.get<RepairSeries>(f.series.id)!.value;
+  const closed = line.attempts[0]!.outcome;
+  assert.equal(closed?.reason, 'refused');
+  assert.equal(closed?.achieved.length, 0);
+  assert.equal(closed?.refusals.length, 1);
+  assert.equal(line.withoutProgress, 1);
+  const row = ok(readJournal(f.store, { project: f.project })).value.rows
+    .find(item => item.id === closed!.refusals[0]!.row);
+  assert.equal(row?.gate, 'E5');
+  assert.equal(row?.code, 'fact_assessment_insufficient');
   f.restart();
   assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
   assert.deepEqual(ok(await assessFact(f.store, request)), terminal);
@@ -425,10 +514,83 @@ test('E5 preserves conflicting and off-form outcomes as their own terminal state
     assert.equal(terminal.value.verdict, variant);
     assert.equal(terminal.value.accepted, null);
     assert.equal(f.store.list('accepted-answer').length, 0);
-    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    if (variant === 'off-form') assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    else {
+      const line = f.store.get<RepairSeries>(f.series.id)!.value;
+      const closed = line.attempts[0]!.outcome;
+      assert.equal(closed?.reason, 'refused');
+      assert.equal(closed?.achieved.length, 0);
+      assert.equal(closed?.refusals.length, 1);
+      assert.equal(line.withoutProgress, 1);
+      const row = ok(readJournal(f.store, { project: f.project })).value.rows
+        .find(item => item.id === closed!.refusals[0]!.row);
+      assert.equal(row?.gate, 'E5');
+      assert.equal(row?.code, 'fact_assessment_conflicting');
+    }
     f.restart();
     assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
     assert.equal(f.sent().length, 2);
+  });
+});
+
+test('real technical E5 terminals permit their own G7 close and exact restart repeat', async t => {
+  for (const variant of ['off-form', 'interrupted'] as const) await t.test(variant, async child => {
+    const f = fixture(child), request = await f.original();
+    const assessorStep = variant === 'off-form'
+      ? { research: { answer: 'untyped reviewer reply' }, usage }
+      : { rawStdout: '{broken', exitCode: 7, stderr: 'intentional assessor failure' };
+    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, assessorStep] }));
+    const terminal = ok(await assessFact(f.store, request));
+    assert.equal(terminal.value.verdict, variant);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    const closing = { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
+      outcome: { reason: variant, accepting: [], cancelling: [], refusals: [] } };
+    const wrongReason = closeAttempt(f.store, { ...closing, outcome: { ...closing.outcome,
+      reason: variant === 'off-form' ? 'interrupted' as const : 'off-form' as const } });
+    assert.equal(wrongReason.ok, false);
+    if (!wrongReason.ok) assert.equal(wrongReason.refusal.code, 'origin_unreadable');
+    const closed = ok(closeAttempt(f.store, closing));
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, variant);
+    const before = f.store.list().map(reference), sent = f.sent().length;
+    f.restart();
+    assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
+    assert.deepEqual(ok(closeAttempt(f.store, closing)), closed);
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.sent().length, sent);
+  });
+});
+
+test('a technical terminal retains its own verdict when a semantic E5 fact closes the attempt', async t => {
+  for (const semantic of ['supported', 'insufficient'] as const) await t.test(semantic, async child => {
+    const f = fixture(child, true), request = await f.original();
+    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep,
+      { research: { verdict: semantic, reasons: semantic === 'supported' ? [] : ['source not decisive'] }, usage },
+      { research: { answer: 'untyped reviewer reply' }, usage }] }));
+    const first = ok(await assessFact(f.store, request));
+    assert.equal(first.value.verdict, semantic);
+    const second = ok(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }));
+    assert.equal(second.value.verdict, 'off-form');
+    const finalized = ok(finishAssessmentAttempt(f.store, f.project, first.value.intent));
+    assert.equal(finalized.complete, true);
+    assert.equal(finalized.closed, true);
+    const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome;
+    assert.ok(saved);
+    assert.equal(saved.reason, semantic === 'supported' ? 'result' : 'refused');
+    assert.equal(saved.achieved.length, semantic === 'supported' ? 1 : 0);
+    assert.equal(saved.refusals.length, semantic === 'insufficient' ? 1 : 0);
+    assert.equal(f.store.list(UNIT_REFUSAL_KIND).length, semantic === 'insufficient' ? 1 : 0);
+    if (semantic === 'supported') assert.equal(saved.achieved[0]!.basis.id, first.value.accepted!.id);
+    else assert.equal(f.store.get(assessmentRefusalId(f.project, reference(first))) !== null, true);
+    const wrong = closeAttempt(f.store, { project: f.project, block: 'garden-consume-block',
+      line: 1, attempt: 1, outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: [] } });
+    assert.equal(wrong.ok, false, 'the aggregate cannot erase the semantic terminal');
+    const before = f.store.list().map(reference), calls = f.sent().length;
+    f.restart();
+    assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(first))), first);
+    assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(second))), second);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, saved.reason);
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.sent().length, calls);
   });
 });
 

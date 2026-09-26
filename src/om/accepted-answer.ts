@@ -12,11 +12,11 @@ import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
-import { readSeries, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
+import { readAnySeriesAt, readSeries, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
-import { assessmentResultId, readAssessmentOutcomeAt, readAssessmentSet,
-  readAssessmentTerminalBasisAt } from './assessment.js';
+import { assessmentResultId, checkCurrentAssessmentAttemptClosure,
+  readAssessmentOutcomeAt, readAssessmentTerminalBasisAt } from './assessment.js';
 
 export interface AnswerQuestionContract {
   establishes: string;
@@ -615,7 +615,7 @@ function deriveE5AnswerHistory(store: Store, request: E5AnswerRequest) {
   return { value, references, guards: unique([request.intent, request.assessor, reference(q.record),
     ...grounds.map(ground => ground.observation.source)]), question: q.record, gap, attempt };
 }
-function currentE5Attempt(store: Store, project: string, attempt: AnswerAttempt,
+function currentAcceptedAttempt(store: Store, project: string, attempt: AnswerAttempt,
   accepted?: { ref: Ref; key: string }): Ref[] {
   const head = store.get<RepairSeries>(attempt.series.id);
   check(head, 'answer_attempt_invalid', attempt.series.id, 'attempt',
@@ -624,10 +624,21 @@ function currentE5Attempt(store: Store, project: string, attempt: AnswerAttempt,
   const series = admission.series.value;
   const running = 'block' in series && series.block === attempt.block
     ? series.attempts.find(item => item.ordinal === attempt.ordinal) : null;
+  const acceptedInOutcome = (): boolean => {
+    if (!running || accepted === undefined || running.outcome?.reason !== 'result') return false;
+    const fact = take(readAcceptedAnswer(store, { project, record: accepted.ref }));
+    if (fact.key !== accepted.key || !fact.attempt
+      || fact.attempt.series.id !== attempt.series.id || fact.attempt.ordinal !== attempt.ordinal
+      || fact.attempt.block !== attempt.block || !same(fact.attempt.goal, attempt.goal)) return false;
+    return running.outcome.achieved.some(item => {
+      if (item.key !== fact.key || !item.basis.id.startsWith(acceptedAnswerNamespace(project))) return false;
+      return acceptedAnswerRepresents(store, { project, block: attempt.block, goal: attempt.goal,
+        attempt: { series: reference(head), ordinal: attempt.ordinal }, accepting: [item.basis] },
+      item.basis, fact.key);
+    });
+  };
   check(running && same(running.goal, attempt.goal)
-    && (accepted === undefined ? running.outcome === null : running.outcome === null
-      || running.outcome.reason === 'result' && running.outcome.achieved.some(item =>
-        item.key === accepted.key && same(item.basis, accepted.ref))),
+    && (accepted === undefined ? running.outcome === null : running.outcome === null || acceptedInOutcome()),
     'answer_attempt_invalid', attempt.series.id, 'attempt',
     'The supported E5 fact must belong to the same full attempt goal and its accepted result');
   return admission.guards as Ref[];
@@ -643,7 +654,7 @@ function deriveE5Answer(store: Store, request: E5AnswerRequest, current: boolean
   for (const guard of guards) head(store, guard);
   for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, ANSWER_GROUNDS_ERA);
   return { ...historical, guards: unique([...guards, ...context.guards,
-    ...(currentAttempt ? currentE5Attempt(store, request.project, historical.attempt) : [])]) };
+    ...(currentAttempt ? currentAcceptedAttempt(store, request.project, historical.attempt) : [])]) };
 }
 function predicted(value: NativeAcceptedAnswerRecord): Revision<NativeAcceptedAnswerRecord>;
 function predicted(value: E5AcceptedAnswerRecord): Revision<E5AcceptedAnswerRecord>;
@@ -1109,7 +1120,8 @@ export function confirmAcceptedAnswerResult(record: Sealed<Revision<Json>>, cont
       || !object(context) || !text(context.project) || !text(context.block) || !object(context.goal)
       || !text(context.goal.key) || !text(context.goal.result) || !Array.isArray(context.goal.questions)
       || !context.goal.questions.every(text)) requestInvalid('confirmation');
-    context = copy(context);
+    const { refusals: closingRefusals, ...existingContext } = context;
+    context = copy(existingContext);
     const checked = readAcceptedAnswer(store, { project: context.project, record: reference(record) });
     if (!checked.ok) return { unconfirmed: `${checked.refusal.code}: ${checked.refusal.message}` };
     const attempt = checked.value.attempt;
@@ -1124,26 +1136,37 @@ export function confirmAcceptedAnswerResult(record: Sealed<Revision<Json>>, cont
         return { unconfirmed: 'The E5 fact belongs to another exact series line or attempt' };
       if (!Array.isArray(context.accepting))
         return { unconfirmed: 'E5 needs the complete accepting set of this attempt' };
-      const source = readAssessmentSet(store, context.project, checked.value.record.value.request.intent);
-      if (!source.ok) return { unconfirmed: `${source.refusal.code}: ${source.refusal.message}` };
-      const siblings: Ref[] = [];
-      for (const ref of context.accepting) {
-        if (!ref.id.startsWith(`${acceptedAnswerNamespace(context.project)}e5:`)) continue;
-        const candidate = readAcceptedAnswer(store, { project: context.project, record: ref });
-        if (!candidate.ok) return { unconfirmed: `${candidate.refusal.code}: ${candidate.refusal.message}` };
-        if (!('producer' in candidate.value.record.value))
-          return { unconfirmed: 'The E5 accepting address must contain an E5 fact' };
-        const candidateSet = readAssessmentSet(store, context.project, candidate.value.record.value.request.intent);
-        if (!candidateSet.ok) return { unconfirmed: `${candidateSet.refusal.code}: ${candidateSet.refusal.message}` };
-        if (same(candidateSet.value.source, source.value.source)) siblings.push(ref);
-      }
-      if (!source.value.complete || !source.value.allSupported
-        || !same(sorted(source.value.accepted), sorted(siblings)))
-        return { unconfirmed: 'E5 closes only when every fact from the original response is accepted together' };
-      return { keys: [checked.value.key], guards: source.value.guards };
+      const series = readAnySeriesAt(store, context.project, closing.series);
+      if (!series.ok) return { unconfirmed: `${series.refusal.code}: ${series.refusal.message}` };
+      const cycle = [...series.value.value.inherited, ...series.value.value.attempts]
+        .find(item => item.ordinal === closing.ordinal);
+      if (!cycle || !same({ ...cycle.goal, questions: sorted(cycle.goal.questions) },
+        { ...attempt.goal, questions: sorted(attempt.goal.questions) }))
+        return { unconfirmed: 'The E5 fact needs its exact original attempt and full goal' };
+      // A completed delivery is compared with the saved A3 outcome by the gate. New work must first account for
+      // every E5 call of the attempt, discovered from E1 rather than from the caller's accepting/refusal claims.
+      if (cycle.outcome !== null) return { keys: [checked.value.key] };
+      const closure = checkCurrentAssessmentAttemptClosure(store,
+        { project: context.project, block: context.block, series: closing.series,
+          attempt: closing.ordinal, goal: cycle.goal },
+        { series: closing.series, attempt: closing.ordinal, block: context.block,
+          goal: cycle.goal, reason: 'result', accepting: context.accepting,
+          cancelling: [], refusals: closingRefusals ?? [] });
+      if (!closure.ok) return { unconfirmed: `${closure.refusal.code}: ${closure.refusal.message}` };
+      return { keys: [checked.value.key], guards: closure.value.guards };
     }
     return { keys: [checked.value.key] };
   });
+}
+
+/** Confirm an outcome representative by its own D5 producer contract. */
+export function acceptedAnswerRepresents(store: Store, context: AcceptanceContext, basis: Ref, key: string): boolean {
+  if (!(store instanceof Store) || !isPlainObject(context) || !isRef(basis) || !text(key))
+    requestInvalid('representative');
+  const record = store.get<Json>(basis.id, basis.revision);
+  if (!record || record.kind !== ACCEPTED_ANSWER_KIND || !same(reference(record), basis)) return false;
+  const confirmation = confirmAcceptedAnswerResult(sealed(record), context, store);
+  return 'keys' in confirmation && confirmation.keys.includes(key);
 }
 
 export interface AnswerGapClosureRequest {
@@ -1208,9 +1231,8 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       const sources = currentAnswerSources(view.store, request.project, checked);
       check(sources.applicable, 'answer_inapplicable', request.target, 'closure.sources', 'The applied fact no longer describes its current evidence');
       guards.push(...sources.guards.filter(ref => !view.writes.length || ref.id !== view.ref.id));
-      if (checked.attempt) guards.push(...('producer' in checked.record.value
-        ? currentE5Attempt(store, request.project, checked.attempt, { ref: view.ref, key: checked.key })
-        : take(prepareSeriesLineAdmission(store, request.project, checked.attempt.series)).guards));
+      if (checked.attempt) guards.push(...currentAcceptedAttempt(store, request.project,
+        checked.attempt, { ref: view.ref, key: checked.key }));
       if (!view.writes.length) guards.push(view.ref);
       else {
         const acceptance = 'producer' in checked.record.value

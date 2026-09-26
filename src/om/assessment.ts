@@ -5,18 +5,20 @@ import { Store, type Revision, type TransactionGuard, type Write } from '../stor
 import { uniqueTransactionGuards, type Environment } from '../runtime/environment.js';
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
+import { readJournal, recordRefusal, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { historicalRead, withHistoricalReads } from './input.js';
 import { checkAnswerForm } from './answer-form.js';
 import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5AcceptedAnswer,
-  readAcceptedAnswer, readAnswerSearch, answerIndexId,
+  readAcceptedAnswer, readAnswerSearch, acceptedAnswerNamespace, acceptedAnswerRepresents, answerIndexId,
   ANSWER_INDEX_KIND,
   type AnswerGround, type AnswerQuestionContract, type Mc1QuestionRequest } from './accepted-answer.js';
-import { readFactAssessmentOrigin, readCall, recordCall, type AddressedGap, type DispatchContract,
-  type FactAssessmentBasis, type RecordCallRequest } from './call-record.js';
+import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recordCall,
+  type AddressedGap, type CallLedger, type DispatchContract, type FactAssessmentBasis,
+  type RecordCallRequest } from './call-record.js';
 import { readModelCallState, readModelTransport, runModelTransport, type TransportModelCall } from './model-call.js';
 import { readPacketResponse } from './question-packet.js';
 import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, seriesCurrentId,
-  seriesId, type AttemptGoal } from './series.js';
+  seriesId, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt } from './repeat-gate.js';
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
@@ -55,9 +57,38 @@ export interface AssessmentResultRecord {
   contract: typeof RESULT_CONTRACT; project: string; intent: Ref; assessor: Ref;
   verdict: AssessmentVerdict; reasons: string[]; accepted: Ref | null; index: Ref | null;
 }
+export interface AssessmentClosureClaim {
+  series: Ref; attempt: number; block: string; goal: AttemptGoal;
+  reason: CompletionReason; accepting: readonly Ref[]; cancelling: readonly Ref[];
+  refusals: readonly ClaimedRefusal[];
+}
+export interface ReadyAssessmentClosure {
+  status: 'ready'; complete: true; source: Ref; originalSeries: Ref; attempt: number;
+  block: string; goal: AttemptGoal; results: readonly Ref[]; negativeResults: readonly Ref[];
+  accepting: readonly Ref[];
+  refusals: readonly ClaimedRefusal[]; cancelling: readonly Ref[]; reason: CompletionReason;
+  technical: readonly TechnicalAssessmentOutcome[]; guards: Ref[];
+}
+export type AssessmentClosure = ReadyAssessmentClosure
+  | { status: 'incomplete'; complete: false; results: Ref[] }
+  | { status: 'needs-refusals'; complete: true; results: Ref[] };
+export interface TechnicalAssessmentOutcome {
+  result: Ref; verdict: 'off-form' | 'interrupted';
+}
+export interface AssessmentAttemptClosureRequest {
+  project: string; block: string; series: Ref; attempt: number; goal: AttemptGoal;
+}
+export interface CurrentAssessmentAttemptClosure {
+  status: 'ready' | 'incomplete' | 'needs-refusals';
+  intents: readonly Ref[]; results: readonly Ref[]; negativeResults: readonly Ref[];
+  technical: readonly TechnicalAssessmentOutcome[]; reason: CompletionReason | null;
+  accepting: readonly Ref[]; refusals: readonly ClaimedRefusal[]; guards: readonly TransactionGuard[];
+}
+export type ReadyCurrentAssessmentAttemptClosure = CurrentAssessmentAttemptClosure & { status: 'ready' };
 
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+const dense = (value: unknown): value is unknown[] => Array.isArray(value) && Object.keys(value).length === value.length;
 const same = (left: unknown, right: unknown): boolean => canonical(left) === canonical(right);
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
@@ -355,7 +386,10 @@ export function readAssessmentOutcomeAt(store: Store, project: string, intent: R
 export function assessmentResultId(project: string, intent: Ref): string {
   if (!text(project) || project.includes(':') || !isRef(intent)
     || !intent.id.startsWith(`${ASSESSMENT_INTENT_KIND}:${project}:`)) invalid('intent');
-  return `${ASSESSMENT_RESULT_KIND}:${project}:${hashJson(intent.id)}`;
+  return resultIdFromIntentId(project, intent.id);
+}
+function resultIdFromIntentId(project: string, id: string): string {
+  return `${ASSESSMENT_RESULT_KIND}:${project}:${hashJson(id)}`;
 }
 function resultReference(write: Write): Ref {
   return { id: write.id, revision: write.expected + 1, hash: hashJson(write.value) };
@@ -410,7 +444,7 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
     return result;
   });
   if (!applied.ok) return applied;
-  const closure = finishSupportedAssessmentAttempt(store, request.project, request.intent);
+  const closure = finishAssessmentAttempt(store, request.project, request.intent);
   return closure.ok ? applied : closure;
 }
 
@@ -455,6 +489,71 @@ export function readAssessmentTerminalAt(store: Store, project: string, ref: Ref
   }, () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
 }
 
+export function assessmentRefusalId(project: string, result: Ref): string {
+  if (!text(project) || project.includes(':') || !isRef(result)
+    || !result.id.startsWith(`${ASSESSMENT_RESULT_KIND}:${project}:`)) invalid('result');
+  return `${unitRefusalNamespace(project)}e5:${hashJson({ result })}`;
+}
+
+function assessmentRefusalBody(store: Store, project: string, resultRef: Ref): {
+  value: UnitRefusalRecord; result: Sealed<Revision<AssessmentResultRecord>>;
+  intent: Sealed<CheckedAssessmentIntent>; target: string; consumer: string;
+} {
+  const result = take(readAssessmentTerminalAt(store, project, resultRef));
+  if (result.value.verdict !== 'insufficient' && result.value.verdict !== 'conflicting')
+    fail('assessment_refusal_invalid', resultRef.id, 'verdict',
+      'Only a saved insufficient or conflicting E5 result produces a refusal', resultRef);
+  const intent = take(readAssessmentIntentAt(store, project, result.value.intent));
+  const question = take(readMc1Question(store, { project, record: intent.question.record }));
+  if (question.gap.target !== intent.question.target || question.gap.field !== intent.question.field
+    || !question.gap.consumers.includes(intent.block))
+    fail('assessment_refusal_invalid', resultRef.id, 'question',
+      'The original question and its consumer must belong to the assessed block', intent.question.record);
+  const verdict = result.value.verdict;
+  const remedy = `${verdict === 'insufficient' ? 'Provide evidence' : 'Resolve conflicting evidence'} for `
+    + `${question.gap.target}/${question.gap.field} toward ${intent.goal.result}: ${result.value.reasons.join('; ')}`;
+  return { result, intent, target: question.gap.target, consumer: intent.block,
+    value: { gate: 'E5', refusals: [{ code: `fact_assessment_${verdict}`, goal: intent.goal.result, remedy,
+      origin: { name: intent.question.record.id, stage: 'fact-assessment', subject: question.gap.target,
+        sources: [{ role: 'assessment', ref: resultRef }] } }] } };
+}
+
+/** Reprove every field of a saved A2 source from the exact paid E5 result. */
+export function readAssessmentRefusalAt(store: Store, project: string, source: Ref): OmResult<Sealed<{
+  record: Sealed<Revision<UnitRefusalRecord>>; result: Sealed<Revision<AssessmentResultRecord>>;
+  intent: Sealed<CheckedAssessmentIntent>; target: string; consumer: string; guards: Ref[];
+}>> {
+  requireIntentRef(store, project, source);
+  return checked(() => historicalRead(store, { reader: 'E5.assessment-refusal', project, ref: source }, () => {
+    const record = take(readRecord<UnitRefusalRecord>(store, source, { unit: 'E5', target: source.id,
+      kind: UNIT_REFUSAL_KIND, idPrefix: `${unitRefusalNamespace(project)}e5:` }));
+    const value = record.value as unknown;
+    const first = object(value) && Array.isArray(value['refusals']) ? value['refusals'][0] as unknown : null;
+    const origin = object(first) ? first['origin'] : null;
+    const firstSource = object(origin) && Array.isArray(origin['sources']) ? origin['sources'][0] as unknown : null;
+    const resultRef = object(firstSource) ? firstSource['ref'] : null;
+    if (record.revision !== 1 || !isRef(resultRef))
+      fail('assessment_refusal_invalid', source.id, 'origin.sources',
+        'An E5 refusal must name its exact terminal result', source);
+    const derived = assessmentRefusalBody(store, project, resultRef);
+    if (record.id !== assessmentRefusalId(project, resultRef) || !same(record.value, derived.value))
+      fail('assessment_refusal_invalid', source.id, 'record',
+        'The whole saved refusal must derive from the exact E5 result', source);
+    return { record, result: derived.result, intent: derived.intent, target: derived.target,
+      consumer: derived.consumer, guards: refs([source, resultRef, derived.intent.intent]) };
+  }, () => fail('assessment_refusal_invalid', source.id, 'history',
+    'An assessment refusal cannot depend on itself', source)));
+}
+
+function writeAssessmentRefusal(store: Store, project: string, result: Ref): Revision<UnitRefusalRecord> {
+  const derived = assessmentRefusalBody(store, project, result), id = assessmentRefusalId(project, result);
+  const old = store.get<UnitRefusalRecord>(id);
+  if (old) return take(readAssessmentRefusalAt(store, project, reference(old))).record;
+  const written = take(writeGuarded<UnitRefusalRecord>(store, { unit: 'E5', target: id,
+    writes: [{ id, kind: UNIT_REFUSAL_KIND, expected: 0, value: derived.value }], guards: [result] }));
+  return written[0]!;
+}
+
 /** The candidate set comes from the original E4 answer, never from the caller's chosen subset. */
 export function readAssessmentSet(store: Store, project: string, intentRef: Ref): OmResult<Sealed<{
   source: Ref; originalSeries: Ref; attempt: number; block: string; goal: AttemptGoal;
@@ -471,7 +570,12 @@ export function readAssessmentSet(store: Store, project: string, intentRef: Ref)
       // Intent and result contracts have one immutable revision. Historical proof reads that revision;
       // new closure guards it as the current head in its transaction.
       const savedIntent = store.get<AssessmentIntentRecord>(id, 1);
-      if (!savedIntent) { complete = false; allSupported = false; continue; }
+      if (!savedIntent) {
+        const orphan = store.get<AssessmentResultRecord>(resultIdFromIntentId(project, id));
+        if (orphan) fail('assessment_set_invalid', orphan.id, 'intent',
+          'A terminal assessment without its exact candidate intent is corrupt, not an incomplete fact', reference(orphan));
+        complete = false; allSupported = false; continue;
+      }
       const checkedIntent = take(readAssessmentIntentAt(store, project, reference(savedIntent)));
       guards.push(reference(savedIntent));
       if (!same(checkedIntent.record.value.source.modelCall, source.modelCall)
@@ -495,28 +599,385 @@ export function readAssessmentSet(store: Store, project: string, intentRef: Ref)
   });
 }
 
-/** G7 closes only an entirely supported original set; E5.1 owns refused and mixed completion. */
+interface AssessmentComponents {
+  accepting: readonly Ref[]; negatives: readonly Ref[]; technical: readonly TechnicalAssessmentOutcome[];
+}
+
+/** Derive every semantic and technical fact from checked terminals before deciding the attempt's reason. */
+function assessmentComponents(store: Store, project: string, results: readonly Ref[]): AssessmentComponents {
+  const accepting: Ref[] = [], negatives: Ref[] = [], technical: TechnicalAssessmentOutcome[] = [];
+  for (const ref of results) {
+    const result = take(readAssessmentTerminalAt(store, project, ref));
+    switch (result.value.verdict) {
+      case 'supported': accepting.push(result.value.accepted!); break;
+      case 'insufficient': case 'conflicting': negatives.push(ref); break;
+      case 'off-form': case 'interrupted': technical.push({ result: ref, verdict: result.value.verdict }); break;
+    }
+  }
+  return { accepting: refs(accepting), negatives: refs(negatives), technical: sorted(technical) };
+}
+
+/** The one S/N/T reason table. G7 supplies additional results only after its registered providers prove them. */
+export function assessmentAttemptReason(accepting: readonly Ref[], negativeResults: readonly Ref[],
+  technical: readonly TechnicalAssessmentOutcome[], otherResult = false,
+  independentRefusal = false): CompletionReason {
+  if (accepting.length > 0 || otherResult) return 'result';
+  if (negativeResults.length > 0 || independentRefusal) return 'refused';
+  return technical.some(item => item.verdict === 'interrupted') ? 'interrupted' : 'off-form';
+}
+
+/** Saved A2 sources complete the negative component; missing rows are pending, damaged rows are refused. */
+function assessmentRefusals(store: Store, project: string, negatives: readonly Ref[]):
+  { complete: boolean; refusals: ClaimedRefusal[]; guards: Ref[] } {
+  if (negatives.length === 0) return { complete: true, refusals: [], guards: [] };
+  const sources: Ref[] = [];
+  for (const resultRef of negatives) {
+    const id = assessmentRefusalId(project, resultRef), saved = store.get<UnitRefusalRecord>(id, 1);
+    if (!saved) return { complete: false, refusals: [], guards: [] };
+    const sourceRef = reference(saved);
+    const source = take(readAssessmentRefusalAt(store, project, sourceRef));
+    if (!same(reference(source.result), resultRef)) fail('assessment_refusal_invalid', id, 'result',
+      'The A2 source must derive from its exact negative E5 result', sourceRef);
+    sources.push(sourceRef);
+  }
+  const journal = readJournal(store, { project });
+  if (!journal.ok) {
+    if (journal.refusal.code === 'journal_missing') return { complete: false, refusals: [], guards: [] };
+    throw new AssessmentFailure(journal.refusal);
+  }
+  const refusals: ClaimedRefusal[] = [], guards: Ref[] = [reference(journal.value)];
+  for (const sourceRef of sources) {
+    const rows = journal.value.value.rows.filter(row => same(row.source, sourceRef));
+    if (rows.length === 0) return { complete: false, refusals: [], guards: [] };
+    if (rows.length !== 1) fail('assessment_refusal_invalid', sourceRef.id, 'journal',
+      'Every negative E5 result needs exactly one checked journal row', sourceRef);
+    const row = rows[0]!;
+    refusals.push({ row: row.id, name: row.code, goal: row.goal });
+    guards.push(sourceRef);
+  }
+  return { complete: true, refusals: sorted(refusals), guards: refs(guards) };
+}
+
+/** One checked E5 closing image, derived from the original response and exact saved A2 sources. */
+export function readAssessmentClosure(store: Store, project: string, intent: Ref): OmResult<Sealed<AssessmentClosure>> {
+  requireIntentRef(store, project, intent);
+  return checked<AssessmentClosure>(() => {
+    const set = take(readAssessmentSet(store, project, intent));
+    if (!set.complete) return { status: 'incomplete', complete: false, results: [...set.results] };
+    const components = assessmentComponents(store, project, set.results);
+    const refused = assessmentRefusals(store, project, components.negatives);
+    if (!refused.complete) return { status: 'needs-refusals', complete: true, results: [...set.results] };
+    return { status: 'ready', complete: true, source: set.source, originalSeries: set.originalSeries,
+      attempt: set.attempt, block: set.block, goal: set.goal, results: [...set.results],
+      negativeResults: components.negatives,
+      accepting: components.accepting, refusals: refused.refusals, cancelling: [],
+      technical: components.technical, reason: assessmentAttemptReason(
+        components.accepting, components.negatives, components.technical),
+      guards: refs([...set.guards, ...refused.guards]) };
+  });
+}
+
+/** Match a complete E5 claim, including multiplicity and its original attempt, against the one derived image. */
+export function checkAssessmentClosure(store: Store, project: string, intent: Ref,
+  claim: AssessmentClosureClaim): OmResult<Sealed<ReadyAssessmentClosure>> {
+  requireIntentRef(store, project, intent);
+  return checked<ReadyAssessmentClosure>(() => {
+    if (!object(claim) || !isRef(claim.series) || !Number.isSafeInteger(claim.attempt) || claim.attempt < 1
+      || !text(claim.block) || !object(claim.goal) || !text(claim.goal.key) || !text(claim.goal.result)
+      || !dense(claim.goal.questions) || !claim.goal.questions.every(text)
+      || !dense(claim.accepting) || !claim.accepting.every(isRef)
+      || !dense(claim.cancelling) || !claim.cancelling.every(isRef)
+      || !dense(claim.refusals) || !claim.refusals.every(item => object(item)
+        && Object.keys(item).length === 3 && text(item.row) && text(item.name) && text(item.goal))
+      || !text(claim.reason))
+      fail('assessment_set_invalid', intent.id, 'claim', 'An E5 closure needs its exact full claim', intent);
+    const closure = take(readAssessmentClosure(store, project, intent));
+    if (closure.status !== 'ready') fail('assessment_set_invalid', intent.id, 'complete',
+      'The original E5 response needs a complete closeable assessment set', intent);
+    if (claim.series.id !== closure.originalSeries.id
+      || claim.series.revision < closure.originalSeries.revision
+      || claim.series.revision === closure.originalSeries.revision && !same(claim.series, closure.originalSeries)
+      || claim.attempt !== closure.attempt || claim.block !== closure.block
+      || !same({ ...claim.goal, questions: [...claim.goal.questions].sort(order) },
+        { ...closure.goal, questions: [...closure.goal.questions].sort(order) }))
+      fail('assessment_set_invalid', intent.id, 'attempt',
+        'The E5 closure belongs to its exact original series line, attempt and full goal', claim.series);
+    const line = take(readAnySeriesAt(store, project, claim.series));
+    const attempt = 'block' in line.value && line.value.block === closure.block
+      ? [...line.value.inherited, ...line.value.attempts].find(item => item.ordinal === closure.attempt) : null;
+    if (!attempt || !same({ ...attempt.goal, questions: [...attempt.goal.questions].sort(order) },
+      { ...closure.goal, questions: [...closure.goal.questions].sort(order) }))
+      fail('assessment_set_invalid', intent.id, 'series',
+        'The claimed series must preserve the assessed attempt and its full goal', claim.series);
+    if (claim.reason !== closure.reason
+      || !same(sorted(claim.accepting), sorted(closure.accepting))
+      || !same(sorted(claim.cancelling), sorted(closure.cancelling))
+      || !same(sorted(claim.refusals), sorted(closure.refusals)))
+      fail('assessment_set_invalid', intent.id, 'outcome',
+        'The E5 closure needs exactly its supported facts and negative journal refusals, with no extras', intent);
+    return { ...closure, results: [...closure.results], accepting: [...closure.accepting],
+      refusals: [...closure.refusals], cancelling: [...closure.cancelling],
+      guards: refs([...closure.guards, claim.series]) };
+  });
+}
+
+const goalShape = (goal: AttemptGoal) => ({ ...goal, questions: [...goal.questions].sort(order) });
+function requireAttemptClosureRequest(store: Store, request: unknown): asserts request is AssessmentAttemptClosureRequest {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || request.project.includes(':')
+    || !text(request.block) || !isRef(request.series)
+    || !Number.isSafeInteger(request.attempt) || (request.attempt as number) < 1
+    || !object(request.goal) || !text(request.goal.key) || !text(request.goal.result)
+    || !dense(request.goal.questions) || !request.goal.questions.every(text)) invalid('closure');
+}
+
+/** Current discovery of every E5 set on this attempt, independent of the closing claims. */
+export function readCurrentAssessmentAttemptClosure(store: Store, request: AssessmentAttemptClosureRequest):
+  OmResult<Sealed<CurrentAssessmentAttemptClosure>> {
+  requireAttemptClosureRequest(store, request);
+  return checked<CurrentAssessmentAttemptClosure>(() => {
+    const { project } = request;
+    // Capture the ledger head or its absence before readCallLedger enumerates the project's E1 calls.
+    const ledgerId = callLedgerId(project), captured = store.get<CallLedger>(ledgerId);
+    const guards: TransactionGuard[] = [captured ? reference(captured) : { id: ledgerId, absent: true }];
+    const ledger = take(readCallLedger(store, project));
+    if (!same(captured ? reference(captured) : null, ledger ? reference(ledger) : null))
+      fail('assessment_set_invalid', ledgerId, 'ledger',
+        'The E1 ledger changed while the complete E5 attempt set was being discovered');
+    const current = store.get(request.series.id);
+    if (!current || !same(reference(current), request.series))
+      fail('assessment_set_invalid', request.series.id, 'series',
+        'The assessment attempt needs its exact current series head', request.series);
+    const line = take(readAnySeriesAt(store, project, request.series));
+    const attempt = 'block' in line.value && line.value.block === request.block
+      ? [...line.value.inherited, ...line.value.attempts].find(item => item.ordinal === request.attempt) : null;
+    if (!attempt || !same(goalShape(attempt.goal), goalShape(request.goal)))
+      fail('assessment_set_invalid', request.series.id, 'attempt',
+        'The current series needs the exact block, ordinal and full goal being closed', request.series);
+    guards.push(request.series);
+
+    const sets = new Map<string, Ref>(), discoveredIntents: Ref[] = [];
+    for (const row of ledger?.value.calls ?? []) {
+      if (row.purpose !== 'fact-assessment' || row.series.id !== request.series.id
+        || row.attempt !== request.attempt) continue;
+      if ('owner' in row || row.block !== request.block || !same(goalShape(row.goal), goalShape(request.goal)))
+        fail('assessment_set_invalid', row.call.id, 'attempt',
+          'An E1 assessment on this attempt must retain its block and full goal', row.call);
+      const basis = row.basis;
+      if (!object(basis) || basis.kind !== 'fact-assessment')
+        fail('assessment_set_invalid', row.call.id, 'basis',
+          'An E1 fact assessment needs its exact source basis', row.call);
+      if (!isRef(basis.assessment)) {
+        if (isAssessmentCallName(row.name) || Object.hasOwn(basis, 'assessment'))
+          fail('assessment_set_invalid', row.call.id, 'basis.assessment',
+          'A new E5 E1 call cannot omit its assessment intent', row.call);
+        continue; // Historical E5.0 calls are not new E5 terminal sets.
+      }
+      const intent = take(readAssessmentIntentAt(store, project, basis.assessment));
+      if (row.name !== assessmentCallName(project, intent.intent)
+        || !same(basis, intent.basis) || !same(row.series, intent.series)
+        || intent.originalSeries.id !== request.series.id || intent.block !== request.block
+        || intent.attempt !== request.attempt || !same(goalShape(intent.goal), goalShape(request.goal)))
+        fail('assessment_set_invalid', row.call.id, 'basis',
+          'The E1 assessor must belong to this exact original E5 response and attempt', row.call);
+      discoveredIntents.push(intent.intent);
+      const sourceKey = canonical(intent.record.value.source.modelCall);
+      if (!sets.has(sourceKey)) sets.set(sourceKey, intent.intent);
+    }
+
+    const intents: Ref[] = refs(discoveredIntents), results: Ref[] = [];
+    let status: CurrentAssessmentAttemptClosure['status'] = 'ready';
+    for (const intentRef of sets.values()) {
+      const intent = take(readAssessmentIntentAt(store, project, intentRef));
+      const source = intent.record.value.source;
+      for (const candidate of intent.candidates) {
+        const id = intentId(project, { call: source.call, question: candidate.question, questionId: candidate.questionId });
+        const candidateIntent = store.get<AssessmentIntentRecord>(id);
+        guards.push(candidateIntent ? reference(candidateIntent) : { id, absent: true });
+        if (candidateIntent && candidateIntent.revision !== 1)
+          fail('assessment_set_invalid', id, 'intent', 'A candidate intent is one immutable revision', reference(candidateIntent));
+        const resultId = resultIdFromIntentId(project, id), candidateResult = store.get<AssessmentResultRecord>(resultId);
+        guards.push(candidateResult ? reference(candidateResult) : { id: resultId, absent: true });
+        if (candidateResult && candidateResult.revision !== 1)
+          fail('assessment_set_invalid', resultId, 'result', 'A terminal assessment is one immutable revision', reference(candidateResult));
+      }
+      const set = take(readAssessmentSet(store, project, intentRef));
+      results.push(...set.results);
+      guards.push(...set.guards);
+      if (!set.complete) status = 'incomplete';
+    }
+    const components = assessmentComponents(store, project, results);
+    const base = { intents: refs(intents), results: refs(results), negativeResults: components.negatives,
+      technical: components.technical, reason: status === 'ready' && intents.length > 0
+        ? assessmentAttemptReason(components.accepting, components.negatives, components.technical) : null,
+      accepting: components.accepting, refusals: [] as ClaimedRefusal[],
+      guards: uniqueTransactionGuards(guards) };
+    if (status !== 'ready') return { status, ...base };
+    const refused = assessmentRefusals(store, project, components.negatives);
+    if (!refused.complete) return { status: 'needs-refusals', ...base };
+    return { status: 'ready', intents: refs(intents), results: refs(results), negativeResults: components.negatives,
+      technical: components.technical, reason: base.reason,
+      accepting: components.accepting, refusals: refused.refusals,
+      guards: uniqueTransactionGuards([...guards, ...refused.guards]) };
+  });
+}
+
+/** Check the E5 portion of a new G7 outcome; other providers own its non-E5 claims. */
+export function checkCurrentAssessmentAttemptClosure(store: Store, request: AssessmentAttemptClosureRequest,
+  claim: AssessmentClosureClaim): OmResult<Sealed<ReadyCurrentAssessmentAttemptClosure>> {
+  requireAttemptClosureRequest(store, request);
+  return checked<ReadyCurrentAssessmentAttemptClosure>(() => {
+    if (!object(claim) || !isRef(claim.series) || !Number.isSafeInteger(claim.attempt)
+      || !text(claim.block) || !object(claim.goal) || !text(claim.goal.key) || !text(claim.goal.result)
+      || !dense(claim.goal.questions) || !claim.goal.questions.every(text)
+      || !dense(claim.accepting) || !claim.accepting.every(isRef)
+      || !dense(claim.cancelling) || !claim.cancelling.every(isRef)
+      || !dense(claim.refusals) || !claim.refusals.every(item => object(item) && text(item.row))
+      || !same(claim.series, request.series)
+      || claim.attempt !== request.attempt || claim.block !== request.block
+      || !same(goalShape(claim.goal), goalShape(request.goal)))
+      fail('assessment_set_invalid', request.series.id, 'claim',
+        'The new E5 closure needs the exact current attempt and complete closing claim', request.series);
+    const expected = take(readCurrentAssessmentAttemptClosure(store, request));
+    if (expected.status !== 'ready')
+      fail('assessment_set_invalid', request.series.id, 'complete',
+        'Every E5 response of the attempt needs its complete terminal set and negative A2 sources', request.series);
+    const e5Answers = claim.accepting.filter(ref => ref.id.startsWith(`${acceptedAnswerNamespace(request.project)}e5:`));
+    if (!same(sorted(e5Answers), sorted(expected.accepting)))
+      fail('assessment_set_invalid', request.series.id, 'accepting',
+        'The closing claim needs every and only the supported E5 facts', request.series);
+    const e5Refusals: ClaimedRefusal[] = [];
+    let claimJournal: Ref | null = null;
+    if (expected.intents.length > 0 && claim.refusals.length > 0) {
+      const journal = take(readJournal(store, { project: request.project }));
+      claimJournal = reference(journal);
+      const rows = new Map(journal.value.rows.map(row => [row.id, row]));
+      for (const item of claim.refusals) {
+        const row = rows.get(item.row);
+        if (!row) continue; // G7 owns the address and error for an unknown non-E5 row.
+        if (row.gate === 'E5' || row.origin.stage === 'fact-assessment'
+          || row.source.id.startsWith(`${unitRefusalNamespace(request.project)}e5:`)
+          || row.origin.sources.some(source => source.role === 'assessment')) {
+          if (Object.keys(item).length !== 3 || !text(item.name) || !text(item.goal))
+            fail('assessment_set_invalid', item.row, 'refusals',
+              'An E5 refusal claim needs its exact journal name and goal', request.series);
+          e5Refusals.push(item);
+        }
+      }
+    }
+    if (!same(sorted(e5Refusals), sorted(expected.refusals)))
+      fail('assessment_set_invalid', request.series.id, 'refusals',
+        'The closing claim needs every and only the negative E5 journal rows', request.series);
+    return { ...expected, status: 'ready', intents: [...expected.intents], results: [...expected.results],
+      negativeResults: [...expected.negativeResults], accepting: [...expected.accepting],
+      refusals: [...expected.refusals], guards: uniqueTransactionGuards([
+      ...expected.guards, ...(claimJournal ? [claimJournal] : []),
+    ]) };
+  });
+}
+
+/** The old positive-only entry delegates its write to the common attempt-level finalizer. */
 export function finishSupportedAssessmentAttempt(store: Store, project: string, intent: Ref): OmResult<Sealed<{
+  complete: boolean; closed: boolean; results: Ref[];
+}>> {
+  return finishAssessmentAttempt(store, project, intent);
+}
+
+/** Complete a saved terminal set without sending any assessor again. */
+export function finishAssessmentAttempt(store: Store, project: string, intent: Ref): OmResult<Sealed<{
   complete: boolean; closed: boolean; results: Ref[];
 }>> {
   requireIntentRef(store, project, intent);
   return checked(() => {
     const set = take(readAssessmentSet(store, project, intent));
-    if (!set.complete || !set.allSupported) return { complete: set.complete, closed: false, results: set.results as Ref[] };
     const line = take(readAnySeriesAt(store, project, set.originalSeries));
     if (!('block' in line.value) || line.value.block !== set.block)
-      fail('assessment_set_invalid', set.originalSeries.id, 'series', 'The complete set belongs to one block attempt', set.originalSeries);
-    const prepared = take(prepareCloseAttempt(store, { project, block: set.block, line: line.value.line, attempt: set.attempt,
-      outcome: { reason: 'result', accepting: set.accepted, cancelling: [], refusals: [] } }));
+      fail('assessment_set_invalid', set.originalSeries.id, 'series',
+        'The assessed set belongs to one block attempt', set.originalSeries);
+    const current = store.get(line.id);
+    if (!current) fail('assessment_set_invalid', line.id, 'series',
+      'The complete attempt needs its current line', set.originalSeries);
+    const standing = take(readAnySeriesAt(store, project, reference(current)));
+    const finished = 'block' in standing.value && standing.value.block === set.block
+      ? [...standing.value.inherited, ...standing.value.attempts]
+        .find(item => item.ordinal === set.attempt) : null;
+    if (finished?.outcome) {
+      const historical = take(readAssessmentClosure(store, project, intent));
+      const saved = finished.outcome;
+      // Re-run G7's existing historical proof for the saved complete claim. Presence of an extra A3 row is not
+      // evidence that another provider or an independent G3 refusal actually produced it.
+      const journal = saved.refusals.length > 0 ? take(readJournal(store, { project })) : null;
+      const replayRefusals: ClaimedRefusal[] = saved.refusals.map(item => {
+        const row = journal?.value.rows.find(candidate => candidate.id === item.row);
+        if (!row) fail('assessment_set_invalid', line.id, 'refusals',
+          'A completed attempt needs each saved refusal in its checked journal', reference(current));
+        return { row: row.id, name: row.code, goal: row.goal };
+      });
+      const replay = prepareCloseAttempt(store, { project, block: set.block, line: line.value.line,
+        attempt: set.attempt, outcome: { reason: saved.reason,
+          accepting: refs(saved.achieved.map(item => item.basis)), cancelling: [], refusals: replayRefusals } });
+      if (!replay.ok || replay.value.writes.length !== 0 || saved.cancelled.length > 0)
+        fail('assessment_set_invalid', line.id, 'attempt',
+          'The attempt already completed with an outcome its checked providers cannot reproduce', reference(current));
+      if (historical.status !== 'ready') fail('assessment_set_invalid', line.id, 'complete',
+        'The attempt already completed, but this original E5 response has no complete local terminal set', intent);
+      // The saved A3 outcome is the whole attempt. This intent proves only one original MC1 set;
+      // another set may supply the representative achievement, a refusal, or an interrupted verdict.
+      // The G7 replay above proves every saved claim. Compare this exact local set with that
+      // checked whole outcome without consulting today's E1 ledger or deriving a global reason here.
+      const localSupported = historical.accepting.map(ref => ({
+        ref, answer: take(readAcceptedAnswer(store, { project, record: ref })),
+      }));
+      const compatible = localSupported.every(({ answer }) => saved.achieved.some(item => {
+        if (item.key !== answer.key || !item.basis.id.startsWith(acceptedAnswerNamespace(project))) return false;
+        return answer.attempt !== null && acceptedAnswerRepresents(store,
+          { project, block: set.block, goal: set.goal,
+            attempt: { series: reference(current), ordinal: set.attempt }, accepting: [item.basis] },
+          item.basis, answer.key);
+      }));
+      const technicalCompatible = saved.reason !== 'off-form'
+        || historical.technical.every(item => item.verdict === 'off-form');
+      if (!compatible
+        || historical.refusals.some(refusal => !saved.refusals.some(item => item.row === refusal.row))
+        || !technicalCompatible
+        || saved.reason === 'result' && saved.achieved.length + saved.cancelled.length === 0
+        || saved.reason === 'refused' && saved.refusals.length === 0
+        || (saved.reason === 'off-form' || saved.reason === 'interrupted')
+          && (historical.accepting.length > 0 || historical.negativeResults.length > 0))
+        fail('assessment_set_invalid', line.id, 'attempt',
+          'The attempt already completed with another saved outcome', reference(current));
+      return { complete: true, closed: true, results: historical.results };
+    }
+    const request: AssessmentAttemptClosureRequest = { project, block: set.block, series: reference(current),
+      attempt: set.attempt, goal: set.goal };
+    let closure = take(readCurrentAssessmentAttemptClosure(store, request));
+    if (!closure.intents.some(found => same(found, intent)))
+      fail('assessment_set_invalid', intent.id, 'ledger',
+        'The current E1 ledger must discover the assessment being finalized', intent);
+    if (closure.status === 'incomplete')
+      return { complete: false, closed: false, results: closure.results };
+    if (closure.status === 'needs-refusals') {
+      for (const resultRef of closure.negativeResults) {
+        const source = writeAssessmentRefusal(store, project, resultRef);
+        take(recordRefusal(store, { project, source: reference(source) }));
+      }
+      closure = take(readCurrentAssessmentAttemptClosure(store, request));
+    }
+    if (closure.status !== 'ready') fail('assessment_set_invalid', intent.id, 'closure',
+      'All terminal E5 sets must derive one complete closing claim after their refusal records are saved', intent);
+    // A fully technical set has a lawful G7 reason but assessFact leaves its close to the public G7 caller.
+    if (closure.accepting.length === 0 && closure.negativeResults.length === 0)
+      return { complete: true, closed: false, results: closure.results };
+    const reason = closure.reason!;
+    const prepared = take(prepareCloseAttempt(store, { project, block: set.block, line: line.value.line,
+      attempt: set.attempt, outcome: { reason, accepting: closure.accepting,
+        cancelling: [], refusals: closure.refusals } }));
     if (prepared.writes.length > 0) {
-      const current = store.get(line.id);
-      if (!current) fail('assessment_set_invalid', line.id, 'series', 'The complete attempt needs its current line', set.originalSeries);
       const admission = take(prepareSeriesLineAdmission(store, project, reference(current)));
       take(writeGuarded(store, { unit: 'E5', target: line.id, writes: [...prepared.writes] as Write[],
-        guards: uniqueTransactionGuards([...prepared.guards, ...admission.guards, ...set.guards,
+        guards: uniqueTransactionGuards([...prepared.guards, ...admission.guards, ...closure.guards,
           { id: seriesId(project, set.block, line.value.line + 1), absent: true }]) }));
     }
-    return { complete: true, closed: true, results: set.results as Ref[] };
+    return { complete: true, closed: true, results: closure.results };
   });
 }
 
