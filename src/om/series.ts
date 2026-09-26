@@ -2261,6 +2261,7 @@ function requireLine(line: unknown): number {
 export const SERIES_MEMBERSHIP_KIND = 'om-series-membership';
 export const SERIES_CURRENT_KIND = 'om-series-current';
 export const SERIES_APPLIED_KIND = 'om-series-applied';
+export const SERIES_DISCARDED_KIND = 'om-series-discarded';
 export const SERIES_ERA_KIND = 'om-series-era';
 export const MANAGED_SERIES_CONTRACT = 'om-repair-series/v2';
 export const SERIES_ACTIVATION_CONTRACT = 'om-series-activation/v1';
@@ -2285,6 +2286,12 @@ export function seriesEraId(project: string, seriesId: string): string {
   return `${SERIES_ERA_KIND}:${project}:${hashJson({ seriesId })}`;
 }
 export interface SeriesActivationRequest { project: string; prepared: Ref; issuance: Ref }
+export interface DiscardedSeriesTransition extends SeriesActivationRequest {
+  contract: 'om-series-discarded/v1'; state: 'discarded'; codes: string[];
+}
+export interface PreparedSeriesDiscard {
+  record: Revision<DiscardedSeriesTransition>; writes: Write[]; guards: TransactionGuard[];
+}
 export interface AppliedSeriesDecision {
   block: string; series: Ref; participation: SeriesParticipation;
   outcome: 'establish-basis' | 'continue' | 'new-work' | 'inactive'; activeBasis: Ref | null;
@@ -2405,12 +2412,72 @@ export function readSeriesMembership(store: Store, request: { project: string; r
     return membership.record;
   });
 }
-function deriveApplied(store: Store, request: SeriesActivationRequest, membership: Ref | null,
-  roots: SeriesMembership['roots'], previous: Ref | null): AppliedSeriesTransition {
+function checkedTransitionPair(store: Store, request: SeriesActivationRequest) {
   const prepared = mechanismTake(readPreparedSeriesTransition(store, { project: request.project, record: request.prepared })).record;
   const issuance = mechanismTake(readHorizonIssuance(store, { project: request.project, record: request.issuance })).record;
-  mechanismCheck(issuance.value.state === 'accepted' && sameRef(issuance.value.transition, request.prepared)
-    && sameRef(issuance.value.horizon, prepared.value.request.horizon), request.issuance.id, 'issuance', 'Activation requires accepted G2 for exactly this P and horizon');
+  mechanismCheck(prepared.value.request.project === request.project && issuance.value.project === request.project
+    && issuance.value.choiceVersion === prepared.value.request.choiceVersion
+    && sameRef(issuance.value.transition, request.prepared) && sameRef(issuance.value.horizon, prepared.value.request.horizon),
+  request.issuance.id, 'issuance', 'G2 must prove exactly this project, choice version, prepared transition and horizon');
+  return { prepared, issuance };
+}
+function requireAcceptedIssuance(issuance: ReturnType<typeof checkedTransitionPair>['issuance']): void {
+  if (issuance.value.state === 'refused') mechanismTake(refused('series_transition_refused',
+    'The bound G2 refused this transition', { unit: 'B3', target: issuance.id, field: 'state', ref: reference(issuance) }, 'producer'));
+}
+function discardId(request: SeriesActivationRequest): string {
+  return `${SERIES_DISCARDED_KIND}:${request.project}:${hashJson({ prepared: request.prepared, issuance: request.issuance })}`;
+}
+function deriveDiscarded(store: Store, request: SeriesActivationRequest): DiscardedSeriesTransition {
+  const { issuance } = checkedTransitionPair(store, request);
+  mechanismCheck(issuance.value.state === 'refused', request.issuance.id, 'state', 'Only a proved negative G2 produces a discarded transition');
+  return { contract: 'om-series-discarded/v1', project: request.project, prepared: exactRef(request.prepared),
+    issuance: exactRef(request.issuance), state: 'discarded', codes: [...issuance.value.codes] };
+}
+function checkedDiscarded(store: Store, project: string, ref: Ref): Revision<DiscardedSeriesTransition> {
+  const record = mechanismTake(readRecord<DiscardedSeriesTransition>(store, ref, { unit: 'B3', target: ref.id,
+    kind: SERIES_DISCARDED_KIND, idPrefix: `${SERIES_DISCARDED_KIND}:${project}:` })) as Revision<DiscardedSeriesTransition>;
+  const value = record.value;
+  mechanismCheck(mechanismObject(value) && exactKeys(value, ['contract', 'project', 'prepared', 'issuance', 'state', 'codes'])
+    && value.contract === 'om-series-discarded/v1' && value.project === project && value.state === 'discarded'
+    && isRef(value.prepared) && exactKeys(value.prepared, ['id', 'revision', 'hash'])
+    && isRef(value.issuance) && exactKeys(value.issuance, ['id', 'revision', 'hash'])
+    && Array.isArray(value.codes) && value.codes.every(code => typeof code === 'string'),
+  ref.id, 'discarded', 'Discarded history requires its producer and all exact negative sources');
+  const request = { project, prepared: value.prepared, issuance: value.issuance };
+  mechanismCheck(record.revision === 1 && ref.id === discardId(request) && record.hash === hashJson(value),
+    ref.id, 'record', 'The discarded record is the immutable, exact-hash result of its P/G pair');
+  mechanismCheck(canonical(value) === canonical(deriveDiscarded(store, request)), ref.id, 'discarded',
+    'Discarded history is rederived from the bound negative G2, including its complete codes');
+  return record;
+}
+export function readDiscardedSeriesTransition(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<DiscardedSeriesTransition>>> {
+  requireStore(store);
+  requireCondition(mechanismObject(request) && exactKeys(request, ['project', 'record']) && isRef(request.record),
+    'series_request_invalid', 'Discarded history names its project and exact saved record');
+  requireProject(request.project);
+  return mechanismResult(() => checkedDiscarded(store, request.project, request.record));
+}
+export function prepareSeriesDiscard(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesDiscard>> {
+  requireActivationRequest(store, request);
+  return mechanismResult(() => {
+    const id = discardId(request), existing = store.get<DiscardedSeriesTransition>(id, 1);
+    if (existing) return { record: checkedDiscarded(store, request.project, reference(existing)), writes: [], guards: [] };
+    const value = deriveDiscarded(store, request), write: Write = { id, kind: SERIES_DISCARDED_KIND, expected: 0, value };
+    // P/G are exact historical sources, not current-head guards. Only the new immutable result is CAS-written.
+    return { record: revisionOfWrite<DiscardedSeriesTransition>(write), writes: [write], guards: [] };
+  });
+}
+export function writeSeriesDiscard(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesDiscard>> {
+  const prepared = prepareSeriesDiscard(store, request);
+  if (!prepared.ok || !prepared.value.writes.length) return prepared;
+  const written = writeGuarded(store, { unit: 'B3', target: prepared.value.record.id, writes: prepared.value.writes, guards: prepared.value.guards });
+  return written.ok ? delivered({ ...prepared.value, writes: [] }) : written;
+}
+function deriveApplied(store: Store, request: SeriesActivationRequest, membership: Ref | null,
+  roots: SeriesMembership['roots'], previous: Ref | null): AppliedSeriesTransition {
+  const { prepared, issuance } = checkedTransitionPair(store, request);
+  requireAcceptedIssuance(issuance);
   const members = membership ? checkedMembership(store, request.project, membership).value : null;
   mechanismCheck(!members || canonical(members.roots) === canonical(roots), request.prepared.id, 'roots', 'Application preserves its captured membership roots');
   mechanismCheck((members?.mode === 'transition-managed') === (previous !== null), request.prepared.id, 'previous', 'Managed transitions retain their original current pointer');
@@ -2535,13 +2602,13 @@ export function prepareSeriesActivation(store: Store, request: SeriesActivationR
       checkedCurrent(store, request.project, reference(pointer));
       return { record, pointer, series: pointer.value.series.map(row => mechanismTake(readAnySeriesAt(store, request.project, row.activation)) as Revision<RepairSeries>), writes: [], guards: [] };
     }
+    const { prepared: p, issuance: g } = checkedTransitionPair(store, request);
+    requireAcceptedIssuance(g);
     const membership = captureMembership(store, request.project);
     const current = store.get<CurrentSeriesPointer>(seriesCurrentId(request.project));
     const previous = current ? reference(checkedCurrent(store, request.project, reference(current))) : null;
-    const p = mechanismTake(readPreparedSeriesTransition(store, { project: request.project, record: request.prepared })).record;
     mechanismCheck(canonical(refsUnique(p.value.request.series)) === canonical(refsUnique(membership.series.map(reference))), request.prepared.id, 'series', 'Prepared participants must equal all current registered block lines');
     const fresh = mechanismTake(prepareSeriesTransition(store, p.value.request as Parameters<typeof prepareSeriesTransition>[1]));
-    const g = mechanismTake(readHorizonIssuance(store, { project: request.project, record: request.issuance })).record;
     const issued = mechanismTake(prepareHorizonIssuance(store, { project: request.project, choiceVersion: g.value.choiceVersion, horizon: g.value.horizon, transition: g.value.transition }));
     mechanismCheck(!fresh.writes.length && !issued.writes.length && sameRef(reference(issued.record), request.issuance), request.issuance.id, 'issuance', 'The exact saved P/G must remain admitted');
     const value = deriveApplied(store, request, membership.record ? reference(membership.record) : null, membership.value.roots, previous);

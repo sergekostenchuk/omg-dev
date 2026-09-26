@@ -53,7 +53,7 @@ export interface StageContent { draft: Ref; fields: Record<string, Json>; graph:
 // Shared pre-B1 records are handled below by their provenance fields, never by arbitrary text.
 const recordObject = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const B1_PRODUCERS = Object.freeze([
-  'horizon', 'om-horizon', 'series-transition', 'om-horizon-issuance', 'om-series-applied', 'om-series-era', 'om-analysis-admission',
+  'horizon', 'om-horizon', 'series-transition', 'om-horizon-issuance', 'om-series-applied', 'om-series-discarded', 'om-series-era', 'om-analysis-admission',
   'block-weight', 'om-input-decision', 'om-gap', 'om-gap-lines', 'om-candidate',
   'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes',
   'om-owner-gap-assignment', 'om-obligation-transfer', 'om-obligation-basis', 'om-obligations',

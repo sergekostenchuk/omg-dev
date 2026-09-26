@@ -21,6 +21,9 @@ import { writeHorizon, writeHorizonIssuance, readHorizonIssuance, type HorizonRe
 import { beginAttempt, completeAttempt, openSeries, prepareOpenSeries, readSeriesAt,
   readSeries, seriesEraId, readSeriesWorkAdmission, prepareBeginAttempt, readStopHistory, readStopHistoryAt, readCurrentSeriesPointer, readAppliedSeriesTransition, prepareSeriesActivation, applySeriesActivation, prepareSeriesParticipantAdmission,
   prepareSeriesLineAdmission, seriesCurrentId, seriesMembershipId, type RepairSeries } from '../src/om/series.js';
+import { prepareSeriesDiscard, writeSeriesDiscard, readDiscardedSeriesTransition } from '../src/om/series.js';
+import { closeAttempt } from '../src/om/repeat-gate.js';
+import type { FrameAttemptBinding } from '../src/om/layer-basis.js';
 import { writeSeriesTransition, readPreparedSeriesTransition } from '../src/om/series-transition.js';
 import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
@@ -40,7 +43,7 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { gardenGraph } from './om-fixture.js';
+import { createOmFixture, gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -136,7 +139,7 @@ function fixture(t: TestContext, includeLater = true) {
 type Fixture = ReturnType<typeof fixture>;
 const workGoal = { key: 'encoding', questions: [gapLineKey(project, 'discovery:encoding', 'answer')],
   result: gapLineExpectedResult(project, 'discovery:encoding', 'answer') };
-function roots(f: Fixture) {
+function roots(f: Pick<Fixture, 'store'>) {
   return f.store.list<RepairSeries>('repair-series').filter(row => row.value.projectId === project && 'block' in row.value)
     .filter(row => !f.store.list<RepairSeries>('repair-series').some(other => other.value.predecessor?.id === row.id)).map(reference);
 }
@@ -758,13 +761,13 @@ test('B3.0b F5.2 saved and pending answer closures guard C but exact closure rep
   }
 });
 
-function appliedPair(f: Fixture, horizon: Ref, choiceVersion: string) {
+function appliedPair(f: Pick<Fixture, 'store'>, horizon: Ref, choiceVersion: string) {
   const prepared = ok(writeSeriesTransition(f.store, { project, choiceVersion, horizon, series: roots(f) }));
   const issuance = ok(writeHorizonIssuance(f.store, { project, choiceVersion, horizon, transition: reference(prepared) }));
   return { project, prepared: reference(prepared), issuance: reference(issuance) };
 }
 
-function acceptMappedFrame(f: Fixture, frame: FrameRequest): AcceptedFrameRequest {
+function acceptMappedFrame(f: Pick<Fixture, 'store'>, frame: FrameRequest): AcceptedFrameRequest {
   const graph = gardenGraph(), current = ok(prepareFrame(f.store, frame));
   const upper = current.upper as Graph;
   graph.nodes = graph.nodes.map(node => clone(upper.nodes.find(row => row.id === node.id) ?? node));
@@ -1178,4 +1181,548 @@ test('B3.0b A6 saved physical response survives bootstrap or exclusion and stale
     const before = snapshot(f.store); f.restart();
     rejected(await runStopAnalysis(f.store, a.request)); assert.deepEqual(snapshot(f.store), before); assert.equal(f.sent().length, 1);
   }
+});
+
+function refusedPair(f: Fixture, choiceVersion = 'discarded-choice') {
+  const horizon = f.horizon(choiceVersion, { excluded: [{ block: 'garden-produce-block',
+    reason: 'The required provider is excluded', returnCondition: 'Select the provider again' }] });
+  assert.equal(horizon.gate.value.state, 'refused');
+  assert.ok(horizon.gate.value.codes.length > 0);
+  const request = appliedPair(f, reference(horizon.gate), choiceVersion);
+  const prepared = ok(readPreparedSeriesTransition(f.store, { project, record: request.prepared })).record;
+  const issuance = ok(readHorizonIssuance(f.store, { project, record: request.issuance })).record;
+  assert.equal(issuance.value.state, 'refused');
+  return { horizon, prepared, issuance, request };
+}
+
+for (const foreign of ['another prepared transition', 'another horizon and choice', 'another project namespace'] as const)
+  test(`B3 application rejects G for ${foreign} without changing any record`, t => {
+    const f = fixture(t); f.series();
+    const pair = transition(f, 'foreign-G-base');
+    let issuance: Ref;
+    if (foreign === 'another prepared transition') {
+      const other = ok(writeSeriesTransition(f.store, { project, choiceVersion: 'foreign-G-base', horizon: reference(pair.horizon.gate), series: [] }));
+      issuance = reference(ok(writeHorizonIssuance(f.store, { project, choiceVersion: 'foreign-G-base',
+        horizon: reference(pair.horizon.gate), transition: reference(other) })));
+    } else if (foreign === 'another horizon and choice') issuance = transition(f, 'foreign-G-other-choice').request.issuance;
+    else issuance = { ...pair.request.issuance, id: pair.request.issuance.id.replace(`:${project}:`, ':foreign-project:') };
+    const request = { ...pair.request, issuance }, before = snapshot(f.store);
+    for (const operation of [prepareSeriesActivation, applySeriesActivation]) {
+      rejected(operation(f.store, request));
+      assert.deepEqual(snapshot(f.store), before);
+    }
+    for (const kind of ['om-series-applied', 'om-series-current', 'om-series-era', 'om-series-discarded'])
+      assert.deepEqual(f.store.list(kind), []);
+  });
+
+test('B3 applied and pointer history rederive the exact G binding after a self-consistent substitution', t => {
+  const f = fixture(t); f.series();
+  const pair = transition(f, 'historical-G-base');
+  const other = ok(writeSeriesTransition(f.store, { project, choiceVersion: 'historical-G-base', horizon: reference(pair.horizon.gate), series: [] }));
+  const issuance = reference(ok(writeHorizonIssuance(f.store, { project, choiceVersion: 'historical-G-base',
+    horizon: reference(pair.horizon.gate), transition: reference(other) })));
+  const applied = ok(applySeriesActivation(f.store, pair.request));
+  const value = { ...clone(applied.record.value), issuance };
+  const forged = f.store.write({ id: `om-series-applied:${project}:${hashJson({ prepared: value.prepared, issuance })}`,
+    kind: applied.record.kind, expected: 0, value });
+  const pointer = rewrite(f.store, applied.pointer, { ...clone(applied.pointer.value), applied: reference(forged) });
+  const before = snapshot(f.store); f.restart();
+  rejected(readAppliedSeriesTransition(f.store, { project, record: reference(forged) }));
+  rejected(readCurrentSeriesPointer(f.store, { project, record: reference(pointer) }));
+  rejected(readCurrentSeriesPointer(f.store, { project }));
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('B3 discarded records only the proved negative pair after heads move and repeats exactly after restart', t => {
+  const f = fixture(t); f.series(); stop(f); activate(f, 'before-negative');
+  const pair = refusedPair(f), historicalP = f.store.history(pair.prepared.id);
+  const afterNegative = snapshot(f.store);
+  const refused = rejected(applySeriesActivation(f.store, pair.request), 'series_transition_refused');
+  assert.deepEqual(refused.at.ref, pair.request.issuance);
+  assert.deepEqual(snapshot(f.store), afterNegative);
+  const first = ok(prepareSeriesDiscard(f.store, pair.request));
+  assert.deepEqual(snapshot(f.store), afterNegative);
+  assert.deepEqual(first.record.value, { contract: 'om-series-discarded/v1', project, prepared: pair.request.prepared,
+    issuance: pair.request.issuance, state: 'discarded', codes: pair.issuance.value.codes });
+  assert.equal(first.record.id, `om-series-discarded:${project}:${hashJson({ prepared: pair.request.prepared, issuance: pair.request.issuance })}`);
+  assert.equal(first.record.kind, 'om-series-discarded'); assert.equal(first.record.revision, 1);
+  assert.equal(first.record.hash, hashJson(first.record.value));
+  assert.deepEqual(first.writes.map(row => ({ id: row.id, expected: row.expected })), [{ id: first.record.id, expected: 0 }]);
+  assert.ok(first.guards.every(guard => guard.id === first.record.id), 'A historical negative outcome takes no current admission guards');
+  activate(f, 'after-negative'); f.series(independent);
+  const beforeWrite = snapshot(f.store), writeMany = f.store.writeMany.bind(f.store); let transactions = 0;
+  f.store.writeMany = ((writes, guards) => {
+    transactions++;
+    assert.deepEqual(writes.map(row => row.id), [first.record.id]);
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  let saved: typeof first.record;
+  try { saved = ok(writeSeriesDiscard(f.store, pair.request)).record; }
+  finally { f.store.writeMany = writeMany; }
+  assert.equal(transactions, 1); assert.deepEqual(saved, first.record);
+  assert.deepEqual(snapshot(f.store).filter(row => row.head.id !== saved.id), beforeWrite);
+  assert.deepEqual(f.store.history(pair.prepared.id), historicalP);
+  f.restart(); const beforeRepeat = snapshot(f.store);
+  const exact = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      assert.notEqual(revision, undefined, `Discarded history cannot select the head of ${id}`); return target.get(id, revision);
+    };
+    if (prop === 'list') return () => assert.fail('Discarded history does not enumerate current membership');
+    if (prop === 'writeMany') return () => assert.fail('An exact discarded repeat performs no transaction');
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  assert.deepEqual(ok(readDiscardedSeriesTransition(exact, { project, record: reference(saved) })), saved);
+  assert.deepEqual(ok(prepareSeriesDiscard(exact, pair.request)), { record: saved, writes: [], guards: [] });
+  assert.deepEqual(ok(writeSeriesDiscard(exact, pair.request)), { record: saved, writes: [], guards: [] });
+  assert.deepEqual(snapshot(f.store), beforeRepeat);
+});
+
+test('B3 discarded refuses accepted foreign and corrupt G and every absent saved field or source', t => {
+  const f = fixture(t); f.series();
+  const accepted = transition(f, 'discard-accepted'), pair = refusedPair(f), other = refusedPair(f, 'discard-other-horizon');
+  const empty = ok(writeSeriesTransition(f.store, { project, choiceVersion: pair.issuance.value.choiceVersion,
+    horizon: pair.issuance.value.horizon, series: [] }));
+  const wrongP = reference(ok(writeHorizonIssuance(f.store, { project, choiceVersion: pair.issuance.value.choiceVersion,
+    horizon: pair.issuance.value.horizon, transition: reference(empty) })));
+  for (const request of [accepted.request, { ...pair.request, issuance: wrongP }, { ...pair.request, issuance: other.request.issuance },
+    { ...pair.request, issuance: { ...pair.request.issuance, hash: '0'.repeat(64) } },
+    { ...pair.request, issuance: { ...pair.request.issuance, id: pair.request.issuance.id.replace(`:${project}:`, ':foreign:') } }]) {
+    const before = snapshot(f.store);
+    rejected(prepareSeriesDiscard(f.store, request)); rejected(writeSeriesDiscard(f.store, request));
+    assert.deepEqual(snapshot(f.store), before);
+  }
+  const forgedG = rewrite(f.store, accepted.issuance, { ...accepted.issuance.value, state: 'refused', codes: pair.issuance.value.codes });
+  const masquerade = { ...accepted.request, issuance: reference(forgedG) }, beforeMasquerade = snapshot(f.store);
+  rejected(readHorizonIssuance(f.store, { project, record: reference(forgedG) }));
+  for (const operation of [prepareSeriesActivation, applySeriesActivation, prepareSeriesDiscard, writeSeriesDiscard])
+    assert.notEqual(rejected(operation(f.store, masquerade)).code, 'series_transition_refused');
+  assert.deepEqual(snapshot(f.store), beforeMasquerade);
+  rewrite(f.store, forgedG, accepted.issuance.value);
+  const saved = ok(writeSeriesDiscard(f.store, pair.request)).record;
+  for (const field of Object.keys(saved.value)) {
+    const value = clone(saved.value) as unknown as Record<string, Json>; delete value[field];
+    const forged = rewrite(f.store, saved, value as unknown as typeof saved.value), before = snapshot(f.store); f.restart();
+    rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }));
+    rejected(prepareSeriesDiscard(f.store, pair.request)); rejected(writeSeriesDiscard(f.store, pair.request));
+    assert.deepEqual(snapshot(f.store), before);
+    rewrite(f.store, forged, saved.value);
+  }
+  for (const value of [{ ...saved.value, codes: [] }, { ...saved.value, state: 'accepted' },
+    { ...saved.value, prepared: other.request.prepared }, { ...saved.value, issuance: other.request.issuance }]) {
+    const forged = rewrite(f.store, saved, value as typeof saved.value); f.restart();
+    rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }));
+    rewrite(f.store, forged, saved.value);
+  }
+  for (const source of [pair.prepared, pair.issuance]) {
+    const view = new Proxy(f.store, { get(target, prop) {
+      if (prop === 'get') return (id: string, revision?: number) => id === source.id ? null : target.get(id, revision);
+      const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    rejected(readDiscardedSeriesTransition(view, { project, record: reference(saved) }));
+    rejected(writeSeriesDiscard(view, pair.request));
+  }
+  assert.deepEqual(ok(readDiscardedSeriesTransition(f.store, { project, record: reference(saved) })), saved);
+});
+
+test('B3 discarded provenance alone detects lost B1 even when its body is incomplete', t => {
+  const f = fixture(t); f.series(); const saved = ok(writeSeriesDiscard(f.store, refusedPair(f).request)).record;
+  for (const value of [saved.value, {}]) {
+    const alone = emptyProject(t); alone.store.write({ id: saved.id, kind: saved.kind, expected: 0, value });
+    alone.restart(); const before = snapshot(alone.store), engine = new ProductEngine(alone.store);
+    for (const operation of [() => engine.projection(project), () => engine.execute({ type: 'assess', project, expected: 0 })]) {
+      assert.throws(operation, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
+        && (error.details as { target?: string }).target === `om-input:${project}`);
+      assert.deepEqual(snapshot(alone.store), before);
+    }
+  }
+});
+
+test('B3 removing another block retains the stopped active series and the inactive last active basis', t => {
+  const f = fixture(t); f.series(); const stopped = stop(f), history = ok(readStopHistory(f.store, { project, block, line: 1 }));
+  activate(f, 'stopped-active'); f.series(independent);
+  const both = ok(applySeriesActivation(f.store, transition(f, 'both-active', {
+    features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] }).request));
+  const independentBasis = both.record.value.decisions.find(row => row.block === independent)!.activeBasis;
+  assert.ok(independentBasis);
+  const pair = transition(f, 'remove-other', { excluded: [{ block: independent,
+    reason: 'The independent result is deferred', returnCondition: 'Select it again' }] });
+  const applied = ok(applySeriesActivation(f.store, pair.request)), retained = head(f), removed = head(f, independent);
+  assert.equal(applied.record.value.decisions.find(row => row.block === block)!.outcome, 'continue');
+  assert.equal(retained.id, stopped.id); assert.equal(retained.value.line, 1);
+  assert.equal(f.store.get(`repair-series:${project}:2:${block}`), null);
+  for (const field of ['stop', 'ladder', 'withoutProgress', 'attempts'] as const) assert.deepEqual(retained.value[field], stopped.value[field]);
+  assert.deepEqual(ok(readStopHistory(f.store, { project, block, line: 1 })), history);
+  rejected(beginAttempt(f.store, { project, block, line: 1, attempt: 4, goal: workGoal }), 'series_stopped');
+  const decision = applied.record.value.decisions.find(row => row.block === independent)!;
+  assert.equal(decision.outcome, 'inactive'); assert.equal(decision.participation, 'excluded');
+  assert.deepEqual(decision.activeBasis, independentBasis);
+  assert.equal(removed.value.activation?.state, 'activated');
+  assert.ok(removed.value.activation?.state === 'activated');
+  assert.deepEqual(removed.value.activation.activeBasis, independentBasis);
+  f.restart(); const before = snapshot(f.store);
+  assert.deepEqual(ok(applySeriesActivation(f.store, pair.request)).writes, []);
+  assert.deepEqual(ok(readStopHistory(f.store, { project, block, line: 1 })), history);
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+function changedPair(f: Fixture, acceptance: AcceptedFrameRequest, choiceVersion: string) {
+  const horizon = ok(writeHorizon(f.store, { project, input: reference(f.input), graph: acceptance.graph, refinement: acceptance.layer,
+    available: {}, choice: { choiceVersion, features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }], excluded: [] } }));
+  assert.equal(horizon.gate.value.state, 'accepted');
+  return appliedPair(f, reference(horizon.gate), choiceVersion);
+}
+
+test('B3 one running participant refuses the whole new-work application and only a fresh pair proceeds', t => {
+  const f = fixture(t); f.series(); f.series(independent);
+  const first = transition(f, 'multi-base', { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] });
+  ok(applySeriesActivation(f.store, first.request));
+  ok(beginAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
+  const accepted = acceptMappedFrame(f, { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null });
+  const pair = changedPair(f, accepted, 'multi-running'), before = snapshot(f.store);
+  rejected(prepareSeriesActivation(f.store, pair), 'attempt_running');
+  rejected(applySeriesActivation(f.store, pair), 'attempt_running');
+  assert.deepEqual(snapshot(f.store), before); assert.deepEqual(f.store.list('om-series-discarded'), []);
+  ok(completeAttempt(f.store, { project, block: independent, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  const afterClose = snapshot(f.store); rejected(applySeriesActivation(f.store, pair)); assert.deepEqual(snapshot(f.store), afterClose);
+  const applied = ok(applySeriesActivation(f.store, changedPair(f, accepted, 'multi-closed')));
+  assert.equal(applied.series.length, 2); assert.ok(applied.record.value.decisions.every(row => row.outcome === 'new-work'));
+  assert.ok(applied.series.every(row => row.value.line === 2)); assert.deepEqual(f.store.list('om-series-discarded'), []);
+});
+
+test('B3 a second Store moving one participant defeats all prepared writes with no changes beyond the rival', t => {
+  const f = fixture(t); f.series(); f.series(independent);
+  const first = transition(f, 'CAS-base', { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] });
+  ok(applySeriesActivation(f.store, first.request));
+  const accepted = acceptMappedFrame(f, { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null });
+  const pair = changedPair(f, accepted, 'CAS-prepared'), prepared = ok(prepareSeriesActivation(f.store, pair)), other = new Store(f.path);
+  t.after(() => other.close());
+  assert.equal(prepared.series.length, 2); assert.ok(prepared.series.every(row => row.value.line === 2));
+  ok(beginAttempt(other, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
+  const afterRival = snapshot(f.store);
+  rejected(commit(f.store, prepared)); assert.deepEqual(snapshot(f.store), afterRival);
+  assert.equal(f.store.get(prepared.record.id), null); assert.deepEqual(f.store.list('om-series-discarded'), []);
+  for (const owner of [block, independent]) assert.equal(f.store.get(`repair-series:${project}:2:${owner}`), null);
+  ok(completeAttempt(other, { project, block: independent, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  const applied = ok(applySeriesActivation(f.store, changedPair(f, accepted, 'CAS-fresh')));
+  assert.ok(applied.series.every(row => row.value.line === 2)); assert.deepEqual(f.store.list('om-series-discarded'), []);
+});
+
+test('B3 accepted new-work blocks old E1 E2 E4 admission while exact call and packet history repeat', async t => {
+  const f = product(fixture(t)), q = ok(prepareQuestionPacket(f.store, f.packetRequest));
+  const oldRequest = e1Request(f, 'old-line-call'), call = ok(recordCall(f.store, project, oldRequest));
+  const launch = ok(prepareCallDispatch(f.store, project, reference(call.call)));
+  ok(commit(f.store, q)); const packet = q.record;
+  const e4: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(f.adapter), config: reference(f.environment) }, role: 'implementer' };
+  ok(completeAttempt(f.store, { project, block, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  const closed = head(f), acceptance = acceptMappedFrame(f, f.gapRequest.sources.operations.frame);
+  const applied = ok(applySeriesActivation(f.store, changedPair(f, acceptance, 'old-call-new-work')));
+  const successor = applied.series.find(row => row.value.block === block)!;
+  assert.equal(successor.value.line, 2);
+  assert.equal(applied.record.value.decisions.find(row => row.block === block)!.outcome, 'new-work');
+  const advanced = f.store.get<RepairSeries>(closed.id)!;
+  for (const restart of [false, true]) {
+    if (restart) f.restart();
+    const before = snapshot(f.store);
+    rejected(commit(f.store, { writes: [{ id: 'B3-stale-E1', kind: 'test', expected: 0, value: null }], guards: launch.guards }));
+    rejected(commit(f.store, { writes: [{ id: 'B3-stale-E2', kind: 'test', expected: 0, value: null }], guards: q.guards }));
+    rejected(prepareCallDispatch(f.store, project, reference(call.call)));
+    for (const series of [reference(f.running), reference(advanced)])
+      rejected(recordCall(f.store, project, { ...oldRequest, call: `fresh-old-${series.revision}`, series }), 'call_series_unresolved');
+    const repeated = ok(recordCall(f.store, project, oldRequest));
+    assert.equal(repeated.repeated, true); assert.deepEqual(repeated.call, call.call);
+    assert.deepEqual(ok(readCall(f.store, project, reference(call.call))), call.call);
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(packet) })), packet);
+    rejected(await runModelCall(f.store, e4)); assert.equal(f.sent().length, 0);
+    assert.equal(f.store.list('model-call').length, 0); assert.deepEqual(snapshot(f.store), before);
+  }
+  const running = ok(beginAttempt(f.store, { project, block, line: 2, attempt: 2, goal: f.goal }));
+  const fresh = ok(recordCall(f.store, project, { ...oldRequest, call: 'new-line-call', series: reference(running), attempt: 2 }));
+  const dispatch = ok(prepareCallDispatch(f.store, project, reference(fresh.call)));
+  assert.ok(dispatch.guards.some(guard => canonical(guard) === canonical(reference(applied.pointer))));
+});
+const B3_HISTORY_BASE = 'e1e87e9596d1be7fb390564782e5aa60f5431e0b';
+const B3_HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
+import {appendFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+let root,base,manifest,ts;
+export async function initialize(data){root=data.root;base=data.base;manifest=data.manifest;ts=(await import(data.typescript)).default;}
+export async function load(url,context,next){
+ const prefix=new URL('dist/',root).href;
+ if(url.startsWith(prefix)&&/\.js$/.test(url)){
+  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
+  if(relative.startsWith('src/')||relative.startsWith('test/')){
+   let source=execFileSync('git',['show',base+':'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
+   appendFileSync(manifest,relative+'\n');
+   if(relative==='test/om-series-current.test.ts'){
+    const firstTest=source.indexOf('\ntest('),registration="import test, { type TestContext } from 'node:test';";
+    if(firstTest<0||!source.startsWith(registration))throw new Error('The exact historical fixture prefix was not found');
+    source=source.slice(registration.length,firstTest)+'\nexport {fixture,stop,transition};\n';
+   }
+   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,
+    {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
+  }
+ }
+ return next(url,context);
+}`;
+
+interface B3HistoricalSeries {
+  managed: {
+    directory: string; database: string; rows: Revision[]; bytes: string;
+    original: Revision<RepairSeries>; stopped: Revision<RepairSeries>; current: Revision<RepairSeries>;
+    stopHistory: unknown; projection: unknown;
+    activations: {
+      request: { project: string; prepared: Ref; issuance: Ref };
+      record: Revision; pointer: Revision; series: Revision<RepairSeries>[]; repeat: unknown;
+    }[];
+  };
+  native: {
+    directory: string; database: string; rows: Revision[]; bytes: string;
+    series: Revision<RepairSeries>; membership: Revision; projection: unknown;
+  };
+}
+
+test('B3 whole e1e87e9 producer retains applied series pointers legacy reads and exact repeats', async t => {
+  const { createRequire } = await import('node:module'), { pathToFileURL } = await import('node:url');
+  const directory = mkdtempSync(join(tmpdir(), 'omg-b3-whole-git-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const root = new URL('../../', import.meta.url).href, repository = fileURLToPath(root);
+  const loader = join(directory, 'loader.mjs'), producer = join(directory, 'producer.mjs'), manifest = join(directory, 'loaded-src.txt');
+  writeFileSync(loader, B3_HISTORY_LOADER);
+  // Both the fixture and every transitive src module come from the same producer commit.
+  writeFileSync(producer, String.raw`import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';import {join} from 'node:path';
+const root=process.argv[2],from=relative=>import(new URL('dist/'+relative,root).href);
+const {fixture,stop,transition}=await from('test/om-series-current.test.js');
+const {Store}=await from('src/storage/store.js');
+const {ProductEngine}=await from('src/product/engine.js');
+const {canonical}=await from('src/canonical.js');
+const {reference}=await from('src/pipeline/contracts.js');
+const {openSeries,readSeries,readSeriesAt,readStopHistory,readCurrentSeriesPointer,readAppliedSeriesTransition,applySeriesActivation,
+ seriesCurrentId,seriesMembershipId}=await from('src/om/series.js');
+const project='garden',block='garden-consume-block',cleanup=[],context={after:fn=>cleanup.push(fn)};
+const ok=result=>{assert.equal(result.ok,true,JSON.stringify(result));return result.value;};
+const rows=store=>store.list().flatMap(row=>store.history(row.id));
+const noneDiscarded=store=>assert.equal(store.list().some(row=>row.kind==='om-series-discarded'||row.id.startsWith('om-series-discarded:'+project+':')),false);
+try{
+ const f=fixture(context),original=f.series(),stopped=stop(f),stopHistory=ok(readStopHistory(f.store,{project,block,line:1}));
+ assert.equal(original.value.contract,undefined);assert.equal(original.value.activation,undefined);assert.ok(stopped.value.stop);
+ const first=transition(f,'b3-history-bootstrap'),initial=ok(applySeriesActivation(f.store,first.request));
+ assert.equal(initial.record.value.decisions[0].outcome,'establish-basis');
+ const later=transition(f,'b3-history-continue'),continued=ok(applySeriesActivation(f.store,later.request));
+ assert.equal(continued.record.value.decisions[0].outcome,'continue');
+ assert.ok(continued.pointer.revision>initial.pointer.revision);
+ assert.deepEqual(ok(readSeriesAt(f.store,project,reference(original))),original);
+ assert.deepEqual(ok(readSeriesAt(f.store,project,reference(stopped))),stopped);
+ const current=ok(readSeries(f.store,{project,block,line:1}));
+ assert.equal(current.value.contract,'om-repair-series/v2');assert.equal(current.value.activation.state,'activated');
+ assert.deepEqual(current.value.attempts,stopped.value.attempts);assert.deepEqual(current.value.stop,stopped.value.stop);
+ const activations=[{pair:first,applied:initial},{pair:later,applied:continued}].map(({pair,applied})=>{
+  const before=canonical(rows(f.store)),repeat=ok(applySeriesActivation(f.store,pair.request));
+  assert.deepEqual(repeat.writes,[]);assert.deepEqual(repeat.guards,[]);assert.equal(canonical(rows(f.store)),before);
+  return {request:pair.request,record:ok(readAppliedSeriesTransition(f.store,{project,record:reference(applied.record)})),
+   pointer:ok(readCurrentSeriesPointer(f.store,{project,record:reference(applied.pointer)})),
+   series:applied.series.map(row=>ok(readSeriesAt(f.store,project,reference(row)))),repeat};
+ });
+ assert.deepEqual(ok(readCurrentSeriesPointer(f.store,{project})),continued.pointer);
+ assert.equal(f.store.get(seriesCurrentId(project)).revision,continued.pointer.revision);
+ noneDiscarded(f.store);
+ const saved=rows(f.store),managed={directory:f.root,database:f.path,rows:saved,bytes:canonical(saved),original,stopped,current,stopHistory,
+  projection:f.engine.projection(project),activations};
+ f.store.close();
+ const nativeDirectory=mkdtempSync(join(tmpdir(),'omg-b3-native-history-')),database=join(nativeDirectory,'state.sqlite'),store=new Store(database);
+ cleanup.push(()=>{store.close();rmSync(nativeDirectory,{recursive:true,force:true});});
+ const engine=new ProductEngine(store);engine.execute({type:'create-project',project,title:'Historical native series'});
+ const projection=engine.projection(project);
+ const series=ok(openSeries(store,{project,block,line:1,slice:'legacy:native-before-b1',predecessor:null,basis:null}));
+ const membership=store.get(seriesMembershipId(project));
+ assert.equal(membership.value.mode,'legacy');assert.equal(membership.value.activation,null);
+ assert.equal(store.get('om-input:'+project),null);assert.equal(store.get(seriesCurrentId(project)),null);
+ assert.deepEqual(ok(readSeriesAt(store,project,reference(series))),series);
+ assert.deepEqual(ok(readSeries(store,{project,block,line:1})),series);
+ assert.deepEqual(engine.projection(project),projection);noneDiscarded(store);
+ const nativeRows=rows(store),native={directory:nativeDirectory,database,rows:nativeRows,bytes:canonical(nativeRows),series,membership,projection};
+ store.close();process.stdout.write(JSON.stringify({managed,native}));
+}catch(error){for(const close of cleanup)try{close();}catch{}throw error;}
+`);
+  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
+{data:{root:${JSON.stringify(root)},base:${JSON.stringify(B3_HISTORY_BASE)},manifest:${JSON.stringify(manifest)},
+typescript:${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href)}}});`;
+  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
+  const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, root],
+    { cwd: repository, env: environment, encoding: 'utf8', timeout: 120000, maxBuffer: 40000000 });
+  assert.equal(child.error, undefined, child.error?.message); assert.equal(child.status, 0, `${child.stdout}\n${child.stderr}`);
+  const old = JSON.parse(child.stdout) as B3HistoricalSeries;
+  for (const source of [old.managed, old.native]) t.after(() => rmSync(source.directory, { recursive: true, force: true }));
+  const loaded = new Set(readFileSync(manifest, 'utf8').trim().split('\n'));
+  for (const path of ['test/om-series-current.test.ts', 'test/product-fixture.ts', 'test/om-fixture.ts', 'src/storage/store.ts',
+    'src/product/engine.ts', 'src/om/series.ts', 'src/om/series-transition.ts', 'src/om/horizon.ts', 'src/om/input.ts'])
+    assert.ok(loaded.has(path), `Historical ${path} must be loaded from the same Git producer`);
+  const unchanged = (store: Store, saved: { rows: Revision[]; bytes: string }) => {
+    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), saved.bytes);
+    for (const row of saved.rows) assert.deepEqual(store.get(row.id, row.revision), row);
+    assert.equal(store.list().some(row => row.kind === 'om-series-discarded' || row.id.startsWith(`om-series-discarded:${project}:`)), false);
+  };
+  let managed = new Store(old.managed.database), native = new Store(old.native.database);
+  try {
+    for (const restart of [false, true]) {
+      if (restart) { managed.close(); native.close(); managed = new Store(old.managed.database); native = new Store(old.native.database); }
+      unchanged(managed, old.managed); unchanged(native, old.native);
+      for (const row of [old.managed.original, old.managed.stopped, old.managed.current])
+        assert.deepEqual(ok(readSeriesAt(managed, project, reference(row))), row);
+      assert.deepEqual(ok(readSeries(managed, { project, block, line: 1 })), old.managed.current);
+      assert.deepEqual(ok(readStopHistory(managed, { project, block, line: 1 })), old.managed.stopHistory);
+      assert.deepEqual(new ProductEngine(managed).projection(project), old.managed.projection);
+      for (const entry of old.managed.activations) {
+        assert.deepEqual(ok(readAppliedSeriesTransition(managed, { project, record: reference(entry.record) })), entry.record);
+        assert.deepEqual(ok(readCurrentSeriesPointer(managed, { project, record: reference(entry.pointer) })), entry.pointer);
+        for (const row of entry.series) assert.deepEqual(ok(readSeriesAt(managed, project, reference(row))), row);
+        assert.deepEqual(ok(prepareSeriesActivation(managed, entry.request)), entry.repeat);
+        assert.deepEqual(ok(applySeriesActivation(managed, entry.request)), entry.repeat);
+      }
+      assert.deepEqual(ok(readCurrentSeriesPointer(managed, { project })), old.managed.activations.at(-1)!.pointer);
+      assert.deepEqual(ok(readSeriesAt(native, project, reference(old.native.series))), old.native.series);
+      assert.deepEqual(ok(readSeries(native, { project, block, line: 1 })), old.native.series);
+      assert.deepEqual(native.get(seriesMembershipId(project)), old.native.membership);
+      assert.deepEqual(new ProductEngine(native).projection(project), old.native.projection);
+      assert.equal(native.get(seriesCurrentId(project)), null);
+      unchanged(managed, old.managed); unchanged(native, old.native);
+    }
+  } finally { managed.close(); native.close(); }
+});
+
+test('B3 discarded rejects malformed public arguments before reading the store', t => {
+  const f = fixture(t), ref = { id: 'absent', revision: 1, hash: '0'.repeat(64) };
+  const view = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get' || prop === 'list' || prop === 'writeMany') return () => assert.fail('Malformed arguments are rejected before storage');
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const invalid = (run: () => unknown) => assert.throws(run, (error: unknown) => error instanceof EngineError && error.code === 'series_request_invalid');
+  for (const request of [undefined, null, [], {}, { prepared: ref, issuance: ref }, { project, prepared: ref }, { project, issuance: ref },
+    { project, prepared: null, issuance: ref }, { project, prepared: ref, issuance: [] },
+    { project, prepared: { id: ref.id, revision: 1 }, issuance: ref },
+    { project, prepared: ref, issuance: { ...ref, revision: 0 } }, { project, prepared: ref, issuance: ref, state: 'discarded' }])
+    for (const operation of [prepareSeriesDiscard, writeSeriesDiscard]) invalid(() => operation(view, request as never));
+  for (const request of [undefined, null, [], {}, { record: ref }, { project }, { project, record: null }, { project, record: [] },
+    { project, record: { id: ref.id, revision: 1 } }, { project, record: ref, codes: [] }])
+    invalid(() => readDiscardedSeriesTransition(view, request as never));
+});
+
+test('B3 discarded exact reading rejects wrong address revision hash kind and extra body fields after restart', t => {
+  const f = fixture(t); f.series(); const pair = refusedPair(f), saved = ok(writeSeriesDiscard(f.store, pair.request)).record;
+  const wrongAddress = f.store.write({ id: `om-series-discarded:${project}:${'0'.repeat(64)}`, kind: saved.kind, expected: 0, value: saved.value });
+  const wrongRevision = f.store.write({ id: saved.id, kind: saved.kind, expected: 1, value: saved.value });
+  const extra = rewrite(f.store, saved, { ...saved.value, extra: null } as typeof saved.value);
+  f.restart();
+  for (const record of [wrongAddress, wrongRevision, extra]) rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(record) }));
+  rewrite(f.store, extra, saved.value);
+  rejected(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), hash: 'f'.repeat(64) } }), 'record_forged');
+  rejected(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), id: saved.id.replace(`:${project}:`, ':foreign:') } }), 'record_foreign');
+  const alone = emptyProject(t); alone.store.write({ id: saved.id, kind: 'om-series-applied', expected: 0, value: saved.value }); alone.restart();
+  rejected(readDiscardedSeriesTransition(alone.store, { project, record: reference(saved) }), 'record_foreign');
+  assert.deepEqual(ok(readDiscardedSeriesTransition(f.store, { project, record: reference(saved) })), saved);
+});
+
+test('B3 two Stores race the same discarded address without another write or series mutation', t => {
+  const f = fixture(t); f.series(); const pair = refusedPair(f), other = new Store(f.path); t.after(() => other.close());
+  const prepared = ok(prepareSeriesDiscard(f.store, pair.request)), before = snapshot(f.store);
+  assert.deepEqual(snapshot(f.store), before);
+  const won = ok(writeSeriesDiscard(other, pair.request)), afterRival = snapshot(f.store);
+  assert.deepEqual(afterRival.filter(row => row.head.id !== won.record.id), before);
+  rejected(commit(f.store, prepared), 'revision_conflict');
+  assert.deepEqual(snapshot(f.store), afterRival); assert.equal(f.store.history(won.record.id).length, 1);
+  f.restart();
+  assert.deepEqual(ok(writeSeriesDiscard(f.store, pair.request)), won);
+  assert.deepEqual(snapshot(f.store), afterRival);
+});
+
+function acceptBoundB3Frame(store: Store, frame: FrameRequest, binding: FrameAttemptBinding): AcceptedFrameRequest {
+  const proposal: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 2,
+    source: 'decision', status: 'proposed', nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [],
+    joins: [], anchors: [], tests: [], edges: [], journeys: [], packets: [], transfers: [],
+    removes: [], replaces: [], redefines: [] };
+  const offered = store.write({ id: `om-proposal:${project}:B3-bound-return`, kind: 'layer-proposal', expected: 0, value: proposal });
+  const produced = ok(writeCandidate(store, { frame, proposals: [reference(offered)] }));
+  assert.equal(produced.state, 'candidate');
+  if (produced.state !== 'candidate') assert.fail('A real C3 candidate is required');
+  const candidate = reference(produced.record), accepted = ok(settleCandidate(store, { project, level: 2, candidate, binding,
+    outcome: { gate: 'G3', candidate, graphHash: produced.record.value.graphHash, passed: true, codes: [] } }));
+  assert.ok(accepted.graph && accepted.layer && accepted.frame);
+  return { project, level: 2, graph: reference(accepted.graph), layer: reference(accepted.layer), frame: reference(accepted.frame) };
+}
+
+test('B3 real managed A to B to A creates successors but never rediscovers the original accepted result', async t => {
+  const f = await createOmFixture(t); let store = f.store;
+  const input = ok(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  ok(openSeries(store, { project, block, line: 1, slice: opaqueSlice, predecessor: null, basis: null }));
+  const phase = reference(store.get('phase:garden:L2')!);
+  const firstHorizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
+    refinement: phase, available: {}, choice: { choiceVersion: 'return-bootstrap', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const bootstrapPair = appliedPair(f, reference(firstHorizon.gate), 'return-bootstrap');
+  const bootstrap = ok(applySeriesActivation(store, bootstrapPair));
+  const standing = bootstrap.series.find(row => row.value.block === block)!;
+  const frame: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), horizon: reference(firstHorizon.gate),
+    layer: reference(f.layers[2]), frame: null, upper: null };
+  const frameRead = ok(prepareFrame(store, frame));
+  const obligations = frameRead.result.obligations.filter(row => row.upper.node === block).map(row => row.id).sort();
+  assert.ok(obligations.length);
+  const goal = { key: 'B3-return-original-accepted-frame', questions: obligations.map(id => gapLineKey(project, id, 'fill')),
+    result: 'accepted-gap-fill' };
+  const begun = ok(beginAttempt(store, { project, block, line: standing.value.line, attempt: 1, goal }));
+  const binding: FrameAttemptBinding = { series: reference(begun), ordinal: 1, obligations };
+  const acceptance = acceptBoundB3Frame(store, frame, binding);
+  assert.equal(ok(closeAttempt(store, { project, block, line: standing.value.line, attempt: 1,
+    outcome: { reason: 'result', accepting: [acceptance.frame], cancelling: [], refusals: [] } })).verdict, 'progress');
+  const achieved = store.get<RepairSeries>(standing.id)!;
+  const achievedKeys = achieved.value.attempts[0]!.outcome!.achieved.map(item => item.key).sort();
+  assert.ok(achievedKeys.length);
+
+  const producer = 'garden-produce-block', data = reference(f.receipts['garden-data']!);
+  const horizonFor = (name: string, ready: boolean) => ok(writeHorizon(store, { project, input: reference(input),
+    graph: acceptance.graph, refinement: acceptance.layer,
+    available: ready ? { [producer]: { 'garden-data': data } } : {},
+    choice: { choiceVersion: name, features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const a = horizonFor('return-A', false), pairA = appliedPair(f, reference(a.gate), 'return-A');
+  const appliedA = ok(applySeriesActivation(store, pairA));
+  const activeA = appliedA.series.find(row => row.value.block === block)!;
+  const sliceA = ok(readPreparedSeriesTransition(store, { project, record: pairA.prepared })).record.value.decisions
+    .find(row => row.block === block)!.slice!;
+  assert.ok([...activeA.value.inherited, ...activeA.value.attempts]
+    .some(item => item.outcome?.achieved.some(result => achievedKeys.includes(result.key))));
+
+  const b = horizonFor('return-B', true), pairB = appliedPair(f, reference(b.gate), 'return-B');
+  const appliedB = ok(applySeriesActivation(store, pairB));
+  assert.equal(appliedB.record.value.decisions.find(row => row.block === block)!.outcome, 'new-work');
+  const activeB = appliedB.series.find(row => row.value.block === block)!;
+  assert.equal(activeB.value.line, activeA.value.line + 1);
+  assert.deepEqual(activeB.value.predecessor, reference(activeA));
+  assert.deepEqual(activeB.value.inherited, [...activeA.value.inherited, ...activeA.value.attempts]);
+  const sliceB = ok(readPreparedSeriesTransition(store, { project, record: pairB.prepared })).record.value.decisions
+    .find(row => row.block === block)!.slice!;
+  assert.notDeepEqual(sliceB, sliceA);
+
+  const returnedHorizon = horizonFor('return-A-again', false), pairReturn = appliedPair(f, reference(returnedHorizon.gate), 'return-A-again');
+  const sliceReturn = ok(readPreparedSeriesTransition(store, { project, record: pairReturn.prepared })).record.value.decisions
+    .find(row => row.block === block)!.slice!;
+  assert.deepEqual(sliceReturn, sliceA, 'The same accepted graph and local readiness reconstruct A exactly');
+  const appliedReturn = ok(applySeriesActivation(store, pairReturn));
+  assert.equal(appliedReturn.record.value.decisions.find(row => row.block === block)!.outcome, 'new-work');
+  const returned = appliedReturn.series.find(row => row.value.block === block)!;
+  assert.equal(returned.value.line, activeA.value.line + 2);
+  assert.equal(returned.value.slice, sliceA.hash);
+  assert.deepEqual(returned.value.predecessor, reference(activeB));
+  assert.deepEqual(returned.value.inherited, [...activeB.value.inherited, ...activeB.value.attempts]);
+  assert.ok(returned.value.inherited.some(item => item.outcome?.achieved.some(result => achievedKeys.includes(result.key))));
+  assert.equal(returned.value.withoutProgress, activeB.value.withoutProgress);
+  assert.deepEqual(returned.value.ladder, activeB.value.ladder);
+  assert.deepEqual(returned.value.stop, activeB.value.stop);
+  const beforeRestart = snapshot(store); f.reopen(); store = f.store;
+  for (const record of [activeA, activeB, returned]) assert.deepEqual(ok(readSeriesAt(store, project, reference(record))), record);
+  assert.deepEqual(ok(prepareSeriesLineAdmission(store, project, reference(returned))).pointer, reference(appliedReturn.pointer));
+  assert.deepEqual(ok(applySeriesActivation(store, pairReturn)).writes, []);
+  assert.deepEqual(snapshot(store), beforeRestart);
 });
