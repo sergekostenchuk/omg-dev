@@ -55,7 +55,7 @@ const recordObject = (value: unknown): value is Record<string, unknown> => isPla
 const B1_PRODUCERS = Object.freeze([
   'horizon', 'om-horizon', 'series-transition', 'om-horizon-issuance', 'om-series-applied', 'om-series-discarded', 'om-series-era', 'om-analysis-admission',
   'block-weight', 'om-input-decision', 'om-gap', 'om-gap-lines', 'om-candidate',
-  'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes',
+  'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes', 'om-answers-gate',
   'om-owner-gap-assignment', 'om-obligation-transfer', 'om-obligation-basis', 'om-obligations',
   'om-question-packet', 'om-part-response', 'om-part-result', 'om-part-assembly',
   'om-assessment-intent', 'om-assessment-result',
