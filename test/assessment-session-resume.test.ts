@@ -14,7 +14,7 @@ import { assessAnswer } from '../src/discovery/research-assessment.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import { modelUsage, type ModelCall, type ProcessIdentity } from '../src/runtime/model-usage.js';
-import { readModelCallRecovery } from '../src/discovery/model-call-recovery.js';
+import { prepareLateModelReceipt, readLateModelReceipt, readModelCallRecovery, type LateModelReceipt } from '../src/discovery/model-call-recovery.js';
 import type { Question } from '../src/discovery/discovery.js';
 import { Environments, git, uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
@@ -236,7 +236,7 @@ async function d83Checkpoint(path: string, driver: D83Driver): Promise<D83Checkp
   return JSON.parse(readFileSync(path, 'utf8')) as D83Checkpoint;
 }
 
-async function d83PhysicalFixture(t: test.TestContext) {
+async function d83PhysicalFixture(t: test.TestContext, providerMode: 'block' | 'answer' = 'block') {
   const root = mkdtempSync(join(tmpdir(), 'omg-assessment-loss-')), workspace = join(root, 'workspace');
   mkdirSync(workspace);
   writeFileSync(join(workspace, 'README.md'), 'Local assessment process fixture\n');
@@ -257,13 +257,14 @@ async function d83PhysicalFixture(t: test.TestContext) {
     store.close(); rmSync(root, { recursive: true, force: true });
   });
   await engine.execute({ type: 'create-project', project: 'p', title: 'Local assessment loss' });
-  const wire = join(root, 'wire.ndjson'), received = join(root, 'provider-received.json'), adapter = join(root, 'adapter.mjs');
+  const wire = join(root, 'wire.ndjson'), received = join(root, 'provider-received.json'), late = join(root, 'late-result.json'), adapter = join(root, 'adapter.mjs');
   writeFileSync(adapter, `import{appendFileSync,readFileSync,writeFileSync}from'node:fs';
 const request=JSON.parse(readFileSync(0,'utf8'));
 appendFileSync(${JSON.stringify(wire)},JSON.stringify(request)+'\\n');
 writeFileSync(${JSON.stringify(received)},JSON.stringify({pid:process.pid,requestId:request.requestId}));
-// This is a real request delivery, but intentionally no receipt or invented usage.
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);
+if(${JSON.stringify(providerMode)}==='answer')console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,
+ research:{verdict:'supported',reasons:[]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));
+else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);
 `);
   const command = { executable: process.execPath, args: [adapter] };
   const environment = engine.environments.configure('p', { workspace,
@@ -279,16 +280,21 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);
     resources: { a: 'A', b: 'B' }, workingSelections: [], readings: [], value: { result: 'AB' }, observations: [observation] };
   const prompt = 'Judge whether the candidate uses both original operands';
   const input = join(root, 'input.json'), driverPath = join(root, 'driver.mjs'), claimed = join(root, 'claimed.json');
-  writeFileSync(input, JSON.stringify({ database, draft, question, environment, dispatch: environment.value, context, prompt, claimed }));
+  writeFileSync(input, JSON.stringify({ database, draft, question, environment, dispatch: environment.value, context, prompt, claimed, late }));
   writeFileSync(driverPath, `import{readFileSync,writeFileSync}from'node:fs';
 import{Store}from${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
 import{assessmentSession}from${JSON.stringify(new URL('../src/discovery/assessment-session.js', import.meta.url).href)};
 const spec=JSON.parse(readFileSync(process.argv[2],'utf8')),mode=process.argv[3],store=new Store(spec.database);
 const original=store.writeMany.bind(store);let stopped=false;
 store.writeMany=(writes,guards=[])=>{
+ const receipt=writes.find(write=>write.kind==='model-response'&&write.value.assessmentExecution);
+ if(!stopped&&mode==='receipt-before-persist'&&receipt){
+  stopped=true;writeFileSync(spec.late,JSON.stringify({process:{...receipt.value.assessmentExecution.process,stdout:receipt.value.text},launchError:null}));
+  process.exit(73);
+ }
  const saved=original(writes,guards);
  const claim=writes.find(write=>write.kind==='model-call'&&write.expected===0&&write.value.execution?.phase==='claimed');
- if(!stopped&&claim&&mode!=='delivered'){
+ if(!stopped&&claim&&(mode==='claimed-exit'||mode==='claimed-hold')){
   if(!writes.some(write=>write.kind==='assessment-application'&&write.value.state==='running'))throw Error('Admission lost its atomic application binding');
   stopped=true;writeFileSync(spec.claimed,JSON.stringify({pid:process.pid,call:claim.id}));
   if(mode==='claimed-exit')process.exit(71);
@@ -300,7 +306,7 @@ try{await assessmentSession(store,spec.draft,spec.question,spec.environment,spec
 catch(error){console.error(error?.stack??String(error));process.exitCode=72;}
 finally{store.close();}
 `);
-  const start = (mode: 'claimed-exit' | 'claimed-hold' | 'delivered'): D83Driver => {
+  const start = (mode: 'claimed-exit' | 'claimed-hold' | 'delivered' | 'receipt-before-persist'): D83Driver => {
     const child = spawn(process.execPath, [driverPath, input, mode], { cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = ''; child.stderr!.on('data', buffer => { stderr += buffer.toString(); }); child.stdout!.resume();
     const exit = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()); });
@@ -308,7 +314,7 @@ finally{store.close();}
   };
   const invoke = (db: Store) => assessmentSession(db, draft, question, environment, environment.value, undefined, context, prompt);
   const sent = () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
-  return { root, database, store, draft, question, environment, context, claimed, received, providers, start, invoke, sent };
+  return { root, database, store, draft, question, environment, context, claimed, received, late, providers, start, invoke, sent };
 }
 
 function d83BoundCall(f: Awaited<ReturnType<typeof d83PhysicalFixture>>, db = f.store) {
@@ -401,6 +407,61 @@ test('assessment application recovers real authorized owner and provider loss wi
     } finally { live.close(); }
     await d83StopProvider(provider);
     await d83ExpectRecovered(f, 1, 'group-terminated');
+  });
+
+test('new assessment era retains a late physical answer after process loss without applying or resending it',
+  { skip: process.platform === 'win32' }, async t => {
+    const f = await d83PhysicalFixture(t, 'answer'), driver = f.start('receipt-before-persist');
+    await driver.exit;
+    assert.equal(driver.child.exitCode, 73, driver.stderr());
+    assert.equal(f.sent().length, 1);
+    const evidence = JSON.parse(readFileSync(f.late, 'utf8')) as Parameters<typeof prepareLateModelReceipt>[3];
+    assert.ok(evidence.process);
+    assert.equal(evidence.process.exitCode, 0);
+    assert.deepEqual(JSON.parse(evidence.process.stdout), { protocol: 'omg-agent/v1', requestId: f.sent()[0]!.requestId,
+      research: verdict, usage: { inputTokens: 10, outputTokens: 2, cachedInputTokens: 0, reasoningOutputTokens: 0 } });
+    const { call: dispatched, admission } = d83BoundCall(f);
+    assert.equal(dispatched.value.execution?.phase, 'authorized');
+    assert.equal(f.store.list('model-response').length, 0);
+    const recoveredStore = new Store(f.database);
+    try {
+      await assert.rejects(f.invoke(recoveredStore), { code: 'research_context_application_refused' });
+      const recovered = recoveredStore.get<ModelCall>(dispatched.id)!, app = recoveredStore.list<any>('assessment-application')[0]!;
+      assert.equal(recovered.value.status, 'failed');
+      assert.equal(recovered.value.error, 'process_lost');
+      assert.deepEqual(app.value.call, reference(admission));
+      assert.deepEqual(app.value.refusal, { kind: 'call', call: reference(recovered), code: 'process_lost' });
+      const recovery = readModelCallRecovery(recoveredStore, 'p', reference(recovered));
+      assert.deepEqual(reference(recovery.original), reference(dispatched));
+      const prepared = prepareLateModelReceipt(recoveredStore, 'p', reference(dispatched), evidence);
+      assert.equal(prepared.writes.length, 1);
+      const receipt = recoveredStore.writeMany<LateModelReceipt>(prepared.writes, prepared.guards)[0]!;
+      assert.deepEqual(reference(receipt), reference(prepared.record));
+      assert.deepEqual(readLateModelReceipt(recoveredStore, 'p', reference(recovered)), receipt);
+      assert.equal(receipt.value.evidence.process?.stdout, evidence.process.stdout);
+      assert.equal(prepareLateModelReceipt(recoveredStore, 'p', reference(dispatched), evidence).writes.length, 0);
+      const saved = recoveredStore.list(), histories = saved.map(row => [row.id, recoveredStore.history(row.id).length]);
+      for (let reopen = 0; reopen < 2; reopen++) {
+        const again = new Store(f.database);
+        try {
+          await assert.rejects(f.invoke(again), { code: 'research_context_application_refused' });
+          assert.deepEqual(again.list(), saved);
+          assert.deepEqual(saved.map(row => [row.id, again.history(row.id).length]), histories);
+          assert.deepEqual(again.get<ModelCall>(dispatched.id), recovered);
+          assert.deepEqual(readModelCallRecovery(again, 'p', reference(recovered)), recovery);
+          assert.deepEqual(readLateModelReceipt(again, 'p', reference(recovered)), receipt);
+          assert.equal(again.list('model-response').length, 0);
+          assert.equal(again.list<any>('assessment-application')[0]!.value.state, 'refused');
+          assert.ok(again.history<any>(app.id).every(row => row.value.state !== 'applied' && row.value.state !== 'retryable'));
+          const usage = modelUsage(again, 'p', 0);
+          assert.equal(usage.cumulative.attempts, 1);
+          assert.equal(usage.cumulative.unmeasuredCalls, 1);
+          assert.equal(usage.cumulative.measuredCalls, 0);
+          assert.equal(usage.cumulative.reportedTokens, null);
+          assert.equal(f.sent().length, 1);
+        } finally { again.close(); }
+      }
+    } finally { recoveredStore.close(); }
   });
 
 // Required existing imports: test from node:test; assert from node:assert/strict.
