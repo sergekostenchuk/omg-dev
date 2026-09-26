@@ -17,7 +17,8 @@ for (const t of TASKS) {
   for (const a of t.after ?? []) if (!byId.has(a)) found.push(`${t.id}: зависимость от несуществующей задачи ${a}`);
   if (!(t.paths ?? []).some(p => /^test\//.test(p))) found.push(`${t.id}: среди путей нет файла тестов`);
   for (const p of t.paths ?? []) if (/[*?]|\/$/.test(p)) found.push(`${t.id}: путь «${p}» — каталог или шаблон; нужны точные пути файлов`);
-  for (const p of t.paths ?? []) if (/^ui\//.test(p)) found.push(`${t.id}: путь в ui/ — UI не трогаем`);
+  // UI не трогаем; исключение — только по явному разрешению владельца, записанному в задаче полем uiAllowed (основание)
+  for (const p of t.paths ?? []) if (/^ui\//.test(p) && !(typeof t.uiAllowed === "string" && t.uiAllowed.trim())) found.push(`${t.id}: путь в ui/ — UI не трогаем (исключение — поле uiAllowed с разрешением владельца)`);
 }
 // покрытие карты: каждая единица и запись уровня 1–2 должна быть в units хотя бы одной задачи
 const covered = new Set(TASKS.flatMap(t => t.units ?? [])); const mustCover = map.nodes.filter(n => ["mechanism", "gate", "model", "store"].includes(n.type)).map(n => n.id);
