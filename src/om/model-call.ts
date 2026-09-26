@@ -22,6 +22,7 @@ import { readRoutes } from './routes.js';
 import { readFrameProposals, prepareFrameProposals, type LayerProposal } from './frame-proposals.js';
 import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
 import { withHistoricalReads, historicalRead } from './input.js';
+import { prepareAssessmentAdmission, readAssessmentIntentAt } from './assessment.js';
 
 export const MODEL_CALL_CODES = Object.freeze([
   'model_call_request_invalid', 'model_adapter_response_invalid', 'model_adapter_interrupted',
@@ -631,7 +632,7 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
 // Dispatch lifecycle.
 import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
-import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyRecordCallRequest, type DispatchContract, type CallHistory } from './call-record.js';
+import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory } from './call-record.js';
 import { prepareQuestionPacket, preparePartResult, partResponseId,
   PART_RESPONSE_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
 import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, prepareSeriesLineAdmission,
@@ -1330,10 +1331,39 @@ function transportAssignment(store: Store, request: ModelTransportRequest, histo
     model: binding.model, effort: binding.effort, ...(binding.speed === undefined ? {} : { speed: binding.speed }) }));
   return { call, environment, binding, wire };
 }
+
+function assessmentTransportAdmission(store: Store, request: ModelTransportRequest,
+  call: Revision<AnyCallRecord>, binding: { actor: string }, current: boolean): readonly TransactionGuard[] {
+  if (call.value.purpose !== 'fact-assessment') return [];
+  const basis = call.value.basis;
+  if (!basis || basis.kind !== 'fact-assessment' || !basis.assessment) {
+    if (!current) return []; // E5.0 physical history predates the mandatory E5 intent.
+    fail('model_call_request_invalid', call.id, 'basis.assessment', 'A new assessor dispatch needs its proved E5 intent');
+  }
+  let proof: { readonly call: string; readonly basis: unknown; readonly gaps: unknown; readonly series: unknown;
+    readonly attempt: number; readonly goal: unknown; readonly dispatch: unknown; readonly packet: unknown;
+    readonly originalActor: string };
+  let admissionGuards: readonly TransactionGuard[] = [];
+  if (current) {
+    const prepared = take(prepareAssessmentAdmission(store, request.project, basis.assessment));
+    proof = prepared;
+    admissionGuards = prepared.guards;
+  } else proof = take(readAssessmentIntentAt(store, request.project, basis.assessment));
+  if (request.role !== 'reviewer' || binding.actor === proof.originalActor
+    || call.value.call !== proof.call || !same(call.value.basis, proof.basis)
+    || !same(call.value.gaps, proof.gaps) || !same(call.value.series, proof.series)
+    || call.value.attempt !== proof.attempt || !same(call.value.goal, proof.goal)
+    || !same(call.value.dispatch, proof.dispatch) || !same(request.packet, proof.packet)) {
+    fail(current ? 'model_call_request_invalid' : 'model_call_record_invalid', call.id, 'assessment',
+      'The assessor dispatch must reproduce its exact intent with a different actual actor');
+  }
+  return admissionGuards;
+}
 /** Shared physical boundary: real body fingerprint, current purpose admission and durable claim before spawn. */
 async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal,
   extraGuards: readonly TransactionGuard[] = []) {
   const assignment = transportAssignment(store, request), prepared = take(prepareCallDispatch(store, request.project, request.call));
+  const assessmentGuards = assessmentTransportAdmission(store, request, assignment.call, assignment.binding, true);
   const line = 'om' in (running.value as ModelCall)
     ? take(prepareSeriesLineAdmission(store, request.project, assignment.call.value.series)) : null;
   const admissionGuards = refs([...guards, ...prepared.guards, ...(line?.guards ?? [])]);
@@ -1346,7 +1376,8 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
     writes: [{ ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
       { id: counterId, kind: 'project-dispatch', expected: counter?.revision ?? 0,
         value: { projectId: request.project, serial: (counter?.value.serial ?? 0) + 1 } }],
-    guards: uniqueTransactionGuards([...admissionGuards, ...extraGuards, ...(counter ? [reference(counter)] : [])]) }))[0]!;
+    guards: uniqueTransactionGuards([...admissionGuards, ...assessmentGuards, ...extraGuards,
+      ...(counter ? [reference(counter)] : [])]) }))[0]!;
   let processResult: ProcessResult | null = null, launchError: ModelExchange['launchError'] = null;
   try { processResult = await runProcess(assignment.binding.command, assignment.environment.workspace,
     canonical(assignment.wire), assignment.environment.timeoutMs, signal, true, pid => {
@@ -1377,6 +1408,7 @@ export function readModelTransport(store: Store, request: { project: string; rec
     const { call, wire, binding } = transportAssignment(store, source, history);
     if (!directTransportPurpose(call.value.purpose))
       fail('model_call_request_invalid', call.id, 'purpose', 'Ordinary dispatch is admitted through the E2/E3 orchestrator');
+    assessmentTransportAdmission(store, source, call, binding, false);
     const value = record.value;
     if (record.id !== modelRecordId(request.project, wire.requestId) || value.projectId !== request.project
       || value.draftId !== call.id || value.requestId !== wire.requestId || value.purpose !== call.value.purpose

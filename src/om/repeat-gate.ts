@@ -692,6 +692,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   const routed: RoutedRefusal[] = [];
   const classifications: RefusalClassification[] = [];
   const guards: Ref[] = [];
+  if (results.guards) guards.push(...results.guards);
   const rows = new Map<string, JournalRow>();
   if (wanted.length > 0) {
     const journal = readJournal(store, { project: address.project });

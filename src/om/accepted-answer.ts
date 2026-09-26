@@ -15,6 +15,8 @@ import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-li
 import { readSeries, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
+import { assessmentResultId, readAssessmentOutcomeAt, readAssessmentSet,
+  readAssessmentTerminalBasisAt } from './assessment.js';
 
 export interface AnswerQuestionContract {
   establishes: string;
@@ -80,15 +82,22 @@ export interface Mc1QuestionRecord { project: string; request: Mc1QuestionReques
 export interface AnswerRequest {
   project: string; question: Ref; answer: Ref; answeredQuestion: Ref; draft: Ref; attempt: GapLineAttempt | null;
 }
+export interface E5AnswerRequest { project: string; intent: Ref; assessor: Ref }
 export const ANSWER_GROUNDS_ERA = 'citation-v2';
 type GroundsEra = typeof ANSWER_GROUNDS_ERA | 'legacy';
 export interface AnswerCitation { source: Ref; selector: Selector }
 export interface AnswerCitationsRequest { project: string; citations: AnswerCitation[] }
 export interface AnswerGround { observation: Observation; state: string; proofLimit: 'repository-observation' | 'reported-not-runtime-proof' | 'quoted-intent-requires-attribution' }
-export interface AcceptedAnswerRecord {
+export interface NativeAcceptedAnswerRecord {
   project: string; request: AnswerRequest; target: string; field: string; contract: AnswerQuestionContract;
   fingerprint: string; value: Json; grounds: AnswerGround[]; groundsEra?: typeof ANSWER_GROUNDS_ERA;
 }
+export interface E5AcceptedAnswerRecord {
+  project: string; producer: 'E5'; request: E5AnswerRequest; assessment: Ref;
+  target: string; field: string; contract: AnswerQuestionContract; fingerprint: string;
+  value: Json; grounds: AnswerGround[]; groundsEra: typeof ANSWER_GROUNDS_ERA;
+}
+export type AcceptedAnswerRecord = NativeAcceptedAnswerRecord | E5AcceptedAnswerRecord;
 export type AnswerBasis = { record: Ref } | { pending: Write };
 export interface AnswerReadRequest { project: string; record: Ref }
 export interface AnswerAttempt { series: Ref; ordinal: number; block: string; goal: AttemptGoal }
@@ -100,6 +109,8 @@ export interface PreparedAnswer {
   record: Revision<AcceptedAnswerRecord>; writes: Write[]; guards: Ref[]; references: Ref[];
   closure: { id: string; reason: 'filled'; basis: Ref; acceptance: null; attempt: GapLineAttempt | null; answer: AnswerBasis };
 }
+export type PreparedNativeAnswer = Omit<PreparedAnswer, 'record'> & { record: Revision<NativeAcceptedAnswerRecord> };
+export type PreparedE5Answer = Omit<PreparedAnswer, 'record'> & { record: Revision<E5AcceptedAnswerRecord> };
 export interface AnswerInvalidation { record: Ref; sources: { before: Ref; after: Ref }[] }
 export interface AnswerIndex { project: string; target: string; field: string; answers: Ref[]; previous: Ref | null }
 export interface PreparedAnswerSearch { record: Revision<AnswerIndex>; answers: Ref[]; writes: Write[]; guards: Ref[]; references: Ref[] }
@@ -154,6 +165,10 @@ function requireAnswer(value: unknown): asserts value is AnswerRequest {
   if (!object(value) || !text(value.project) || !['question', 'answer', 'answeredQuestion', 'draft'].every(key => isRef(value[key]))
     || !(value.attempt === null || object(value.attempt) && isRef(value.attempt.series)
       && Number.isSafeInteger(value.attempt.attempt) && value.attempt.attempt > 0)) requestInvalid('answer');
+}
+function requireE5Answer(value: unknown): asserts value is E5AnswerRequest {
+  if (!object(value) || !text(value.project) || !isRef(value.intent) || !isRef(value.assessor)
+    || Object.keys(value).some(key => !['project', 'intent', 'assessor'].includes(key))) requestInvalid('e5-answer');
 }
 function head(store: Store, ref: Ref): void {
   check(same(store.get(ref.id) ? reference(store.get(ref.id)!) : null, ref), 'input_stale', ref.id, 'reference', 'A current source changed');
@@ -537,7 +552,7 @@ function deriveAnswerHistory(store: Store, request: AnswerRequest, era: GroundsE
   check(valid, 'answer_unconfirmed', answer.id, 'value', 'The fact value must match the saved result form');
   const grounds = sorted(assessment.value.observations.map(raw => checkedGround(store, request.project, raw, false, era)));
   const attempt = attemptOf(store, request.project, context.gap, request.attempt, false);
-  const value: AcceptedAnswerRecord = { project: request.project, request, target: context.gap.target, field: context.gap.field,
+  const value: NativeAcceptedAnswerRecord = { project: request.project, request, target: context.gap.target, field: context.gap.field,
     contract: q.record.value.request.contract as AnswerQuestionContract, fingerprint: q.record.value.fingerprint, value: answer.value.value, grounds, ...(era === 'legacy' ? {} : { groundsEra: era }) };
   const references = unique([...q.references, request.answer, request.answeredQuestion, request.draft, answer.value.assessment,
     assessment.value.environment, ...grounds.map(item => item.observation.source), ...(attempt ? [attempt.series] : [])]);
@@ -559,29 +574,136 @@ function deriveAnswer(store: Store, request: AnswerRequest, current: boolean, er
   for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, era);
   return { ...historical, guards: unique([...guards, ...context.guards]) };
 }
+function deriveE5AnswerHistory(store: Store, request: E5AnswerRequest) {
+  const outcome = take(readAssessmentOutcomeAt(store, request.project, request.intent, request.assessor));
+  const intent = outcome.intent, fact = intent.fact;
+  check(same(intent.intent, request.intent) && same(reference(outcome.assessor), request.assessor)
+    && outcome.verdict === 'supported', 'answer_unconfirmed', request.assessor.id, 'assessment',
+    'The supported assessor outcome must belong to this exact prepared intent and transport');
+  const q = loadMc1Question(store, { project: request.project, record: intent.question.record });
+  const gap = q.context.gap;
+  check(same(fact.question, intent.question.record) && same(intent.question.record, reference(q.record))
+    && intent.question.target === gap.target && intent.question.field === gap.field
+    && same(intent.question.contract, q.record.value.request.contract)
+    && intent.question.fingerprint === q.record.value.fingerprint,
+  'answer_unconfirmed', request.intent.id, 'question', 'The assessment must retain the exact issued MC1 fact and full question contract');
+  const schema = q.record.value.request.contract.resultForm;
+  const validator = new Ajv({ strict: true, allowUnionTypes: true });
+  check(validator.validateSchema(schema as object), 'answer_question_invalid', q.record.id, 'resultForm', 'The question must contain a valid result schema');
+  check(validator.compile(schema as object)(fact.value), 'answer_unconfirmed', request.assessor.id, 'value',
+    'The supported value must match the exact saved question result form');
+  check(Array.isArray(fact.grounds) && fact.grounds.length > 0, 'answer_unconfirmed', request.intent.id, 'grounds',
+    'The supported fact needs its checked citation grounds');
+  const grounds = sorted(fact.grounds.map(ground => {
+    check(object(ground) && object(ground.observation), 'answer_unconfirmed', request.intent.id, 'grounds',
+      'Each assessment ground needs a complete saved observation');
+    const checked = checkedGround(store, request.project, ground.observation as unknown as Observation, false, ANSWER_GROUNDS_ERA);
+    check(same(ground, checked), 'answer_unconfirmed', request.intent.id, 'grounds',
+      'The assessment grounds must be derived from the exact saved citations');
+    return checked;
+  }));
+  const link = { series: intent.originalSeries, attempt: intent.attempt };
+  const attempt = attemptOf(store, request.project, gap, link, false);
+  check(attempt !== null, 'answer_attempt_invalid', request.intent.id, 'attempt',
+    'An E5 fact acceptance belongs to its original running attempt');
+  const value: E5AcceptedAnswerRecord = { project: request.project, producer: 'E5', request,
+    assessment: request.assessor, target: gap.target, field: gap.field,
+    contract: q.record.value.request.contract as AnswerQuestionContract, fingerprint: q.record.value.fingerprint,
+    value: fact.value as unknown as Json, grounds, groundsEra: ANSWER_GROUNDS_ERA };
+  const references = unique([...q.references, request.intent, request.assessor, ...outcome.references,
+    ...grounds.map(ground => ground.observation.source), attempt.series, intent.series]);
+  return { value, references, guards: unique([request.intent, request.assessor, reference(q.record),
+    ...grounds.map(ground => ground.observation.source)]), question: q.record, gap, attempt };
+}
+function currentE5Attempt(store: Store, project: string, attempt: AnswerAttempt,
+  accepted?: { ref: Ref; key: string }): Ref[] {
+  const head = store.get<RepairSeries>(attempt.series.id);
+  check(head, 'answer_attempt_invalid', attempt.series.id, 'attempt',
+    'The original E5 fact attempt needs a current series line');
+  const admission = take(prepareSeriesLineAdmission(store, project, reference(head)));
+  const series = admission.series.value;
+  const running = 'block' in series && series.block === attempt.block
+    ? series.attempts.find(item => item.ordinal === attempt.ordinal) : null;
+  check(running && same(running.goal, attempt.goal)
+    && (accepted === undefined ? running.outcome === null : running.outcome === null
+      || running.outcome.reason === 'result' && running.outcome.achieved.some(item =>
+        item.key === accepted.key && same(item.basis, accepted.ref))),
+    'answer_attempt_invalid', attempt.series.id, 'attempt',
+    'The supported E5 fact must belong to the same full attempt goal and its accepted result');
+  return admission.guards as Ref[];
+}
+function deriveE5Answer(store: Store, request: E5AnswerRequest, current: boolean, currentAttempt = true) {
+  const historical = historicalRead(store, { reader: 'D5.e5-answer-sources', project: request.project, ref: request.assessor,
+    parameters: request as unknown as Json }, () => copy(deriveE5AnswerHistory(store, request)),
+  () => fail('answer_unconfirmed', request.assessor.id, 'history', 'The supported E5 answer has cyclic historical sources'));
+  if (!current) return historical;
+  const question = loadMc1Question(store, { project: request.project, record: reference(historical.question) });
+  const context = currentQuestionContext(store, question.record.value.request, question.context);
+  const guards = historical.guards;
+  for (const guard of guards) head(store, guard);
+  for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, ANSWER_GROUNDS_ERA);
+  return { ...historical, guards: unique([...guards, ...context.guards,
+    ...(currentAttempt ? currentE5Attempt(store, request.project, historical.attempt) : [])]) };
+}
+function predicted(value: NativeAcceptedAnswerRecord): Revision<NativeAcceptedAnswerRecord>;
+function predicted(value: E5AcceptedAnswerRecord): Revision<E5AcceptedAnswerRecord>;
+function predicted(value: AcceptedAnswerRecord): Revision<AcceptedAnswerRecord>;
 function predicted(value: AcceptedAnswerRecord): Revision<AcceptedAnswerRecord> {
-  return { id: `${acceptedAnswerNamespace(value.project)}${hashJson(value.groundsEra === undefined ? value.request : { request: value.request, groundsEra: value.groundsEra })}`, kind: ACCEPTED_ANSWER_KIND,
+  const id = 'producer' in value
+    ? `${acceptedAnswerNamespace(value.project)}e5:${hashJson(value.request)}`
+    : `${acceptedAnswerNamespace(value.project)}${hashJson(value.groundsEra === undefined ? value.request : { request: value.request, groundsEra: value.groundsEra })}`;
+  return { id, kind: ACCEPTED_ANSWER_KIND,
     revision: 1, hash: hashJson(value), value };
 }
 function checkAcceptedRecord(store: Store, project: string, record: Revision<AcceptedAnswerRecord>): CheckedAnswer {
   check(record.kind === ACCEPTED_ANSWER_KIND && record.id.startsWith(acceptedAnswerNamespace(project))
     && object(record.value) && record.value.project === project && object(record.value.request),
     'answer_record_invalid', record.id, 'record', 'An accepted fact must retain its source request');
-  try { requireAnswer(record.value.request); }
+  try { if ('producer' in record.value) requireE5Answer(record.value.request); else requireAnswer(record.value.request); }
   catch (error) { if (error instanceof EngineError && error.code === 'answer_request_invalid') fail('answer_record_invalid', record.id, 'request', 'The saved answer request is malformed'); throw error; }
   check(record.value.request.project === project, 'answer_record_invalid', record.id, 'project', 'The source request belongs to this project');
   check(!Object.hasOwn(record.value, 'groundsEra') || record.value.groundsEra === ANSWER_GROUNDS_ERA,
     'answer_record_invalid', record.id, 'groundsEra', 'The saved evidence contract must name a supported era');
-  const derived = deriveAnswer(store, record.value.request, false, record.value.groundsEra ?? 'legacy');
+  const derived = 'producer' in record.value
+    ? (check(record.value.producer === 'E5' && same(record.value.assessment, record.value.request.assessor)
+        && record.value.groundsEra === ANSWER_GROUNDS_ERA,
+      'answer_record_invalid', record.id, 'producer', 'An E5 answer names its exact assessment and evidence era'),
+      deriveE5Answer(store, record.value.request, false))
+    : deriveAnswer(store, record.value.request, false, record.value.groundsEra ?? 'legacy');
   check(same(record, predicted(derived.value)), 'answer_record_invalid', record.id, 'content', 'Acceptance must be rederived from its exact saved sources');
   return copy({ record, question: derived.question, gap: derived.gap, attempt: derived.attempt,
     key: factResultKey({ project, target: record.value.target, field: record.value.field, contract: record.value.contract, value: record.value.value }),
     references: unique([reference(record), ...derived.references]) });
 }
-function loadAnswer(store: Store, request: AnswerReadRequest): CheckedAnswer {
-  return historicalRead(store, { reader: 'D5.accepted-answer', project: request.project, ref: request.record }, () => {
+type IndexHistory = { record: Ref; answers: Ref[] }[];
+function loadAnswer(store: Store, request: AnswerReadRequest, indexHistory?: IndexHistory): CheckedAnswer {
+  return historicalRead(store, { reader: indexHistory ? 'D5.accepted-answer-index-member' : 'D5.accepted-answer',
+    project: request.project, ref: request.record }, () => {
     const record = exact<AcceptedAnswerRecord>(store, request.project, request.record, ACCEPTED_ANSWER_KIND, acceptedAnswerNamespace(request.project));
-    return checkAcceptedRecord(store, request.project, record);
+    const checked = checkAcceptedRecord(store, request.project, record);
+    if ('producer' in record.value) {
+      const resultId = assessmentResultId(request.project, record.value.request.intent);
+      const saved = store.get(resultId, 1);
+      check(saved, 'answer_record_invalid', record.id, 'assessmentResult',
+        'An E5 answer is accepted only with its atomic terminal result');
+      const terminal = take(readAssessmentTerminalBasisAt(store, request.project, reference(saved)));
+      check(terminal.value.verdict === 'supported' && same(terminal.value.accepted, reference(record))
+        && terminal.value.index !== null,
+        'answer_record_invalid', record.id, 'assessmentResult',
+        'The exact supported E5 terminal result must name this accepted fact and its index');
+      if (indexHistory) {
+        const entry = indexHistory.find(item => same(item.record, terminal.value.index));
+        check(entry && entry.answers.some(ref => same(ref, reference(record))),
+          'answer_record_invalid', record.id, 'assessmentResult.index',
+          'The terminal index must be a checked revision containing this accepted fact');
+      } else {
+        const search = loadAnswerSearch(store, { project: request.project, record: terminal.value.index });
+        check(search.answers.some(ref => same(ref, reference(record))),
+          'answer_record_invalid', record.id, 'assessmentResult.index',
+          'The terminal index must include this exact accepted fact');
+      }
+    }
+    return checked;
   }, () => fail('answer_record_invalid', request.record.id, 'history', 'The accepted answer has cyclic historical sources'));
 }
 export function readAcceptedAnswer(store: Store, request: AnswerReadRequest): OmResult<Sealed<CheckedAnswer>> {
@@ -591,7 +713,9 @@ export function answerIndexId(project: string, target: string, field: string): s
   if (!text(project) || !text(target) || !text(field)) requestInvalid('search');
   return `om-answer-index:${project}:${hashJson({ target, field })}`;
 }
-function loadAnswerSearch(store: Store, request: AnswerReadRequest): { record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] } {
+function loadAnswerSearch(store: Store, request: AnswerReadRequest): {
+  record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[]; indexHistory: IndexHistory;
+} {
   return historicalRead(store, { reader: 'D5.answer-index', project: request.project, ref: request.record }, () => {
     const record = exact<AnswerIndex>(store, request.project, request.record, ANSWER_INDEX_KIND, `om-answer-index:${request.project}:`), value = record.value;
     check(object(value) && value.project === request.project && text(value.target) && text(value.field) && Array.isArray(value.answers)
@@ -600,6 +724,7 @@ function loadAnswerSearch(store: Store, request: AnswerReadRequest): { record: R
       && new Set(value.answers.map(ref => ref.id)).size === value.answers.length,
       'answer_record_invalid', record.id, 'index', 'The answer index must preserve its exact line and canonical complete set');
     const references: Ref[] = [request.record];
+    let indexHistory: IndexHistory = [{ record: request.record, answers: value.answers }];
     if (value.previous === null) check(record.revision === 1, 'answer_record_invalid', record.id, 'index.previous', 'Only the first index revision can omit its predecessor');
     else {
       check(value.previous.id === record.id && value.previous.revision === record.revision - 1,
@@ -608,18 +733,24 @@ function loadAnswerSearch(store: Store, request: AnswerReadRequest): { record: R
       check(previous.answers.length < value.answers.length && previous.answers.every(ref => value.answers.some(item => same(item, ref))),
         'answer_record_invalid', record.id, 'index.answers', 'An index revision only adds answers and never loses a previous answer');
       references.push(...previous.references);
+      indexHistory = [...indexHistory, ...previous.indexHistory];
     }
     for (const ref of value.answers) {
-      const checked = loadAnswer(store, { project: request.project, record: ref });
+      const checked = loadAnswer(store, { project: request.project, record: ref },
+        ref.id.startsWith(`${acceptedAnswerNamespace(request.project)}e5:`) ? indexHistory : undefined);
       check(checked.record.value.target === value.target && checked.record.value.field === value.field,
         'answer_record_invalid', record.id, 'index.answers', 'Every indexed answer must belong to this exact obligation');
       references.push(...checked.references);
     }
-    return copy({ record, answers: value.answers, references: unique(references) });
+    return copy({ record, answers: value.answers, references: unique(references), indexHistory });
   }, () => fail('answer_record_invalid', request.record.id, 'index.previous', 'The answer index history is cyclic'));
 }
 export function readAnswerSearch(store: Store, request: AnswerReadRequest): OmResult<Sealed<{ record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] }>> {
-  requireRefRequest(store, request); return result(() => loadAnswerSearch(store, request));
+  requireRefRequest(store, request);
+  return result(() => {
+    const { record, answers, references } = loadAnswerSearch(store, request);
+    return { record, answers, references };
+  });
 }
 function prepareAnswerIndex(store: Store, request: { project: string; target: string; field: string; pending?: Write[] }): OmResult<Sealed<PreparedAnswerSearch>> {
   requireStore(store);
@@ -671,7 +802,7 @@ export function prepareAnswerSearch(store: Store, request: { project: string; ta
   if (!object(request) || !text(request.project) || !text(request.target) || !text(request.field) || Object.hasOwn(request, 'pending')) requestInvalid('search');
   return prepareAnswerIndex(store, request);
 }
-export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<PreparedAnswer>> {
+export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<PreparedNativeAnswer>> {
   requireStore(store); requireAnswer(request); request = copy(request);
   return result(() => {
     const history = deriveAnswer(store, request, false), record = predicted(history.value), old = store.get(record.id);
@@ -685,9 +816,28 @@ export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmR
         answer: old ? { record: reference(record) } : { pending: write } } };
   });
 }
+/** E5 accepts one supported assessor outcome and joins the fact with D5's complete index CAS. */
+export function prepareE5AcceptedAnswer(store: Store, request: E5AnswerRequest): OmResult<Sealed<PreparedE5Answer>> {
+  requireStore(store); requireE5Answer(request); request = copy(request);
+  return result(() => {
+    const history = deriveE5Answer(store, request, false), record = predicted(history.value), old = store.get(record.id);
+    check(!old || same(old, record), 'answer_record_invalid', record.id, 'record',
+      'An assessed fact cannot be overwritten under the same exact outcome');
+    const checked = deriveE5Answer(store, request, true, !old);
+    const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
+    const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target,
+      field: checked.gap.field, pending: old ? [] : [write] }));
+    const attempt = { series: checked.attempt.series, attempt: checked.attempt.ordinal };
+    return { record, writes: search.writes as Write[],
+      guards: unique([...checked.guards, ...search.guards]),
+      references: unique([...checked.references, ...search.references]),
+      closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record),
+        acceptance: null, attempt, answer: old ? { record: reference(record) } : { pending: write } } };
+  });
+}
 /** A neighbour needing several answers takes this whole bundle; one line receives one final index CAS. */
 export function prepareAcceptedAnswers(store: Store, requests: AnswerRequest[]): OmResult<Sealed<{
-  records: Revision<AcceptedAnswerRecord>[]; closures: PreparedAnswer['closure'][]; writes: Write[]; guards: Ref[]; references: Ref[];
+  records: Revision<NativeAcceptedAnswerRecord>[]; closures: PreparedAnswer['closure'][]; writes: Write[]; guards: Ref[]; references: Ref[];
 }>> {
   requireStore(store);
   if (!Array.isArray(requests) || requests.length === 0) requestInvalid('answers');
@@ -706,13 +856,13 @@ export function prepareAcceptedAnswers(store: Store, requests: AnswerRequest[]):
     const searches = [...groups.values()].map(group => take(prepareAnswerIndex(store, group)));
     const intermediate = new Set(prepared.flatMap(item => item.writes.filter(write => write.kind === ANSWER_INDEX_KIND).map(write =>
       canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }))));
-    return { records: prepared.map(item => item.record) as Revision<AcceptedAnswerRecord>[],
+    return { records: prepared.map(item => item.record) as Revision<NativeAcceptedAnswerRecord>[],
       closures: prepared.map(item => item.closure) as PreparedAnswer['closure'][], writes: searches.flatMap(item => item.writes) as Write[],
       guards: unique([...prepared.flatMap(item => item.guards), ...searches.flatMap(item => item.guards)]),
       references: unique([...prepared.flatMap(item => item.references).filter(ref => !intermediate.has(canonical(ref))), ...searches.flatMap(item => item.references)]) };
   });
 }
-export function writeAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<Revision<AcceptedAnswerRecord>>> {
+export function writeAcceptedAnswer(store: Store, request: AnswerRequest): OmResult<Sealed<Revision<NativeAcceptedAnswerRecord>>> {
   return withHistoricalReads(() => {
     const prepared = prepareAcceptedAnswer(store, request);
     if (!prepared.ok) return prepared;
@@ -965,6 +1115,33 @@ export function confirmAcceptedAnswerResult(record: Sealed<Revision<Json>>, cont
     const attempt = checked.value.attempt;
     if (!attempt || attempt.block !== context.block || !same({ ...attempt.goal, questions: sorted(attempt.goal.questions) },
       { ...context.goal, questions: sorted(context.goal.questions) })) return { unconfirmed: 'The fact does not belong to this previously recorded full attempt goal' };
+    if ('producer' in checked.value.record.value) {
+      const closing = context.attempt;
+      if (!closing || !isRef(closing.series) || !Number.isSafeInteger(closing.ordinal)
+        || closing.series.id !== attempt.series.id || closing.series.revision < attempt.series.revision
+        || closing.series.revision === attempt.series.revision && !same(closing.series, attempt.series)
+        || closing.ordinal !== attempt.ordinal)
+        return { unconfirmed: 'The E5 fact belongs to another exact series line or attempt' };
+      if (!Array.isArray(context.accepting))
+        return { unconfirmed: 'E5 needs the complete accepting set of this attempt' };
+      const source = readAssessmentSet(store, context.project, checked.value.record.value.request.intent);
+      if (!source.ok) return { unconfirmed: `${source.refusal.code}: ${source.refusal.message}` };
+      const siblings: Ref[] = [];
+      for (const ref of context.accepting) {
+        if (!ref.id.startsWith(`${acceptedAnswerNamespace(context.project)}e5:`)) continue;
+        const candidate = readAcceptedAnswer(store, { project: context.project, record: ref });
+        if (!candidate.ok) return { unconfirmed: `${candidate.refusal.code}: ${candidate.refusal.message}` };
+        if (!('producer' in candidate.value.record.value))
+          return { unconfirmed: 'The E5 accepting address must contain an E5 fact' };
+        const candidateSet = readAssessmentSet(store, context.project, candidate.value.record.value.request.intent);
+        if (!candidateSet.ok) return { unconfirmed: `${candidateSet.refusal.code}: ${candidateSet.refusal.message}` };
+        if (same(candidateSet.value.source, source.value.source)) siblings.push(ref);
+      }
+      if (!source.value.complete || !source.value.allSupported
+        || !same(sorted(source.value.accepted), sorted(siblings)))
+        return { unconfirmed: 'E5 closes only when every fact from the original response is accepted together' };
+      return { keys: [checked.value.key], guards: source.value.guards };
+    }
     return { keys: [checked.value.key] };
   });
 }
@@ -1020,7 +1197,9 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       { project: request.project, record: view.ref, question: filling.mc1Question, input, current: false })));
     check(bindings.every(binding => binding.applicable), 'answer_inapplicable', request.target, 'closure.contract',
       'Both saved D1 inputs must retain the exact question, consumer and essential conditions of this accepted answer');
-    check(same(request.attempt, checked.record.value.request.attempt), 'answer_attempt_invalid', request.target, 'closure.attempt',
+    check(same(request.attempt, checked.attempt
+      ? { series: checked.attempt.series, attempt: checked.attempt.ordinal } : null),
+      'answer_attempt_invalid', request.target, 'closure.attempt',
       'A line may not reattribute a fact to a different attempt');
     const guards: Ref[] = [];
     if (request.currentOnly) {
@@ -1029,10 +1208,14 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       const sources = currentAnswerSources(view.store, request.project, checked);
       check(sources.applicable, 'answer_inapplicable', request.target, 'closure.sources', 'The applied fact no longer describes its current evidence');
       guards.push(...sources.guards.filter(ref => !view.writes.length || ref.id !== view.ref.id));
-      if (checked.attempt) guards.push(...take(prepareSeriesLineAdmission(store, request.project, checked.attempt.series)).guards);
+      if (checked.attempt) guards.push(...('producer' in checked.record.value
+        ? currentE5Attempt(store, request.project, checked.attempt, { ref: view.ref, key: checked.key })
+        : take(prepareSeriesLineAdmission(store, request.project, checked.attempt.series)).guards));
       if (!view.writes.length) guards.push(view.ref);
       else {
-        const acceptance = deriveAnswer(view.store, checked.record.value.request, false, checked.record.value.groundsEra ?? 'legacy');
+        const acceptance = 'producer' in checked.record.value
+          ? deriveE5Answer(view.store, checked.record.value.request, false)
+          : deriveAnswer(view.store, checked.record.value.request, false, checked.record.value.groundsEra ?? 'legacy');
         for (const guard of acceptance.guards) { head(store, guard); guards.push(guard); }
       }
     }

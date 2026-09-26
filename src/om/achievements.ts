@@ -42,11 +42,13 @@ export interface AcceptanceContext {
   readonly goal: AttemptGoal;
   /** Exact historical slice being closed or reported; older suppliers retain their goal-only contract. */
   readonly attempt?: { readonly series: Ref; readonly ordinal: number };
+  /** The complete claim being closed; E5 uses it to prevent omitting another assessed fact. */
+  readonly accepting?: readonly Ref[];
 }
 
 /** What a provider answers about one record: the keys it derived from it, or why the record confirms nothing. */
 export type Confirmation =
-  | { readonly keys: readonly string[] }
+  | { readonly keys: readonly string[]; readonly guards?: readonly Ref[] }
   | { readonly unconfirmed: string };
 
 /**
@@ -105,6 +107,7 @@ export interface ConfirmRequest {
 export interface ConfirmedResults {
   readonly achieved: readonly Achievement[];
   readonly cancelled: readonly string[];
+  readonly guards?: readonly Ref[];
 }
 
 interface Side {
@@ -135,23 +138,26 @@ export function confirmResults(store: Store, request: ConfirmRequest): OmResult<
   requireCondition(Array.isArray(request.cancelling) && request.cancelling.every(isRef),
     "acceptance_request_invalid", "A cycle names the transitions that cancelled earlier results by exact references, explicitly none");
 
-  const achieved: Achievement[] = [];
+  const achieved: Achievement[] = [], guards: Ref[] = [];
   for (let index = 0; index < request.accepting.length; index += 1) {
     const ref = request.accepting[index]!;
-    const keys = confirmed(store, request, ref, ACCEPTING, index);
-    if (!Array.isArray(keys)) return keys as OmResult<never>;
-    for (const key of keys) achieved.push({ key, basis: { id: ref.id, revision: ref.revision, hash: ref.hash } });
+    const answer = confirmed(store, request, ref, ACCEPTING, index);
+    if ('ok' in answer) return answer;
+    for (const key of answer.keys) achieved.push({ key, basis: { id: ref.id, revision: ref.revision, hash: ref.hash } });
+    guards.push(...answer.guards);
   }
   const cancelled: string[] = [];
   for (let index = 0; index < request.cancelling.length; index += 1) {
-    const keys = confirmed(store, request, request.cancelling[index]!, CANCELLING, index);
-    if (!Array.isArray(keys)) return keys as OmResult<never>;
-    cancelled.push(...keys);
+    const answer = confirmed(store, request, request.cancelling[index]!, CANCELLING, index);
+    if ('ok' in answer) return answer;
+    cancelled.push(...answer.keys);
+    guards.push(...answer.guards);
   }
-  return delivered({ achieved, cancelled });
+  return delivered({ achieved, cancelled, ...(guards.length ? { guards } : {}) });
 }
 
-function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, index: number): readonly string[] | OmResult<never> {
+function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, index: number):
+  { keys: readonly string[]; guards: readonly Ref[] } | OmResult<never> {
   const field = `${side.field}.${index}`;
   const found = store.get<Json>(ref.id, ref.revision);
   if (!found || found.hash !== ref.hash) {
@@ -171,10 +177,10 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
     return problem(side.code, "No attempt of that ordinal stands, so nothing it accepted can be confirmed for it", request.target, "attempt", ref);
   }
   const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal,
-    ...(request.attempt === undefined ? {} : { attempt: request.attempt }) }, store);
-  const keys = keysOf(answer);
-  if (keys === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
-  return keys;
+    accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }) }, store);
+  const confirmed = keysOf(answer);
+  if (confirmed === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
+  return confirmed;
 }
 
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
@@ -229,14 +235,17 @@ export function confirmAcceptedFrameResult(record: Sealed<Revision<Json>>, conte
 }
 
 // A provider is code of this module, so an answer it cannot give is a defect of that code, not data to refuse.
-function keysOf(answer: unknown): readonly string[] | null {
+function keysOf(answer: unknown): { keys: readonly string[]; guards: readonly Ref[] } | null {
   requireCondition(isPlainObject(answer), "acceptance_provider_invalid", "A provider answers with keys or with the reason it confirms none");
   const said = answer as Record<string, unknown>;
   const keys = said['keys'];
-  if (Object.keys(said).length === 1 && Array.isArray(keys)) {
+  if ((Object.keys(said).length === 1 || Object.keys(said).length === 2 && Object.hasOwn(said, 'guards')) && Array.isArray(keys)) {
     requireCondition(keys.length > 0 && keys.every(isText) && new Set(keys).size === keys.length,
       "acceptance_provider_invalid", "A provider that confirms a record derives at least one key from it, each once");
-    return [...keys] as string[];
+    const guards = said['guards'];
+    requireCondition(guards === undefined || Array.isArray(guards) && guards.length > 0 && guards.every(isRef),
+      "acceptance_provider_invalid", "A provider's optional guards must be exact nonempty references");
+    return { keys: [...keys] as string[], guards: guards === undefined ? [] : [...guards as Ref[]] };
   }
   if (Object.keys(said).length === 1 && isText(said['unconfirmed'])) return null;
   throw new EngineError("acceptance_provider_invalid", "A provider answers with keys or with the reason it confirms none");

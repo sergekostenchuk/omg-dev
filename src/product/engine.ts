@@ -58,6 +58,7 @@ const B1_PRODUCERS = Object.freeze([
   'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes',
   'om-owner-gap-assignment', 'om-obligation-transfer', 'om-obligation-basis', 'om-obligations',
   'om-question-packet', 'om-part-response', 'om-part-result', 'om-part-assembly',
+  'om-assessment-intent', 'om-assessment-result',
   'om-read-delivery', 'om-read-deliveries', 'om-model-cycle', 'om-model-exchange',
   'om-model-application-rejection', 'om-neighbors', 'om-atomic-gate', 'om-works-acceptance', 'om-work-rejection',
 ]);
@@ -85,7 +86,7 @@ const PROPOSAL_ORIGIN_REFS = Object.freeze([...under('frame', FRAME_ORIGIN_REFS)
 const GAP_ORIGIN_REFS = Object.freeze(['records.*', 'sources.input', 'sources.horizon', 'sources.graph',
   ...under('sources.operations', PROPOSAL_ORIGIN_REFS), 'sources.works.layer',
   ...under('sources.works', PROPOSAL_ORIGIN_REFS)]);
-const CALL_ORIGIN_REFS = Object.freeze(['series', 'basis.series', 'basis.hold', 'admission.routes',
+const CALL_ORIGIN_REFS = Object.freeze(['series', 'basis.series', 'basis.hold', 'basis.assessment', 'admission.routes',
   ...under('admission.gaps', GAP_ORIGIN_REFS)]);
 interface ProvenanceFields {
   readonly refs: readonly string[];
@@ -97,6 +98,10 @@ function provenance(refs: readonly string[], sources: readonly string[] = [], ow
 }
 // Closed producer schema map. Unknown namespaces are not evidence of B1; fixed B1 addresses above are.
 const B1_SHARED_ORIGINS: Readonly<Record<string, ProvenanceFields>> = Object.freeze({
+  'om-assessment-intent': provenance(['source.modelCall', 'source.call', 'source.packet', 'source.response',
+    'source.question', 'candidates.*.question', 'fact.question', 'originalSeries', 'series',
+    'dispatch.adapter', 'dispatch.config', 'originalGuards.*']),
+  'om-assessment-result': provenance(['intent', 'assessor', 'accepted', 'index']),
   'om-series-era': provenance(['firstManaged', 'origin.applied', 'origin.membership', 'origin.pointer']),
   'om-series-membership': provenance(['activation', 'roots.*.root']),
   'om-analysis-intent': provenance(['request.series', 'request.hold', 'sources.series', 'sources.journal', 'sources.holds.*',

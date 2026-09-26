@@ -32,6 +32,7 @@ import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, type AnswerQuestio
 import { confirmResults } from "../src/om/achievements.js";
 import { writeGuarded } from "../src/om/refs.js";
 import { runModelTransport, runModelCall, readModelTransport, readModelCallPhysical, type ModelTransportRequest, type ModelCallRequest } from "../src/om/model-call.js";
+import { readAssessmentIntentAt, writeAssessmentIntent } from "../src/om/assessment.js";
 import { spendReport, readSpendReport, SPEND_PURPOSE_SET_V2, type SpendReport, type SpendSnapshot } from "../src/om/spend-report.js";
 import { Environments } from "../src/runtime/environment.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
@@ -40,7 +41,7 @@ import { executionOf, prepareLateModelReceipt } from "../src/discovery/model-cal
 import {
   CALL_LEDGER_KIND, CALL_RECORD_KIND, callLedgerId, callRecordId,
   readCallLedger, readCallLedgerAt, recordCall, settleCall,
-  type CallLedger, type CallRecord, type RecordCallRequest, type MechanismRecordCallRequest,
+  type CallLedger, type RecordCallRequest, type MechanismRecordCallRequest,
 } from "../src/om/call-record.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -1484,19 +1485,14 @@ test("E6 report: one assessed fact has its own physical expense beside the origi
   assert.equal(original.outcome?.kind, "fact-candidates");
   if (original.outcome?.kind !== "fact-candidates") assert.fail("The MC1 fixture must produce a checked fact");
   const fact = original.outcome.facts[0]!;
-  const assignment = f.batch.items.find(item => item.gap === fact.questionId)!;
-  const originalCall = f.store.get<CallRecord>(original.call.id, original.call.revision)!;
-  const addressed = originalCall.value.gaps.filter(gap => gap.goal === assignment.target && gap.field === assignment.field);
-  assert.ok(addressed.length > 0);
-  const response = original.record.value.response?.record;
-  assert.ok(response);
-  const basis = { kind: "fact-assessment" as const, modelCall: reference(original.record), call: original.call,
-    packet: reference(f.packet), response, question: fact.question,
-    questionId: fact.questionId };
-  const packet = JSON.parse(canonical({ question: fact.question, candidate: fact.value, citations: fact.grounds })) as Json;
-  const admitted = deliveredOf(recordCall(f.store, f.project, { call: "spend:fact-assessment", purpose: "fact-assessment",
-    basis, block: f.address.block, gaps: addressed, series: reference(f.series), attempt: 1,
-    goal: f.goal, dispatch: f.request.dispatch, packet }));
+  const intent = deliveredOf(writeAssessmentIntent(f.store, { project: f.project,
+    modelCall: reference(original.record), questionId: fact.questionId, dispatch: f.request.dispatch }));
+  const admission = deliveredOf(readAssessmentIntentAt(f.store, f.project, reference(intent)));
+  const packet = admission.packet as unknown as Json;
+  const admitted = deliveredOf(recordCall(f.store, f.project, {
+    call: admission.call, purpose: "fact-assessment", basis: admission.basis, block: admission.block,
+    gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
+    goal: admission.goal, dispatch: admission.dispatch, packet }));
   const assessed = deliveredOf(await runModelTransport(f.store, {
     project: f.project, call: reference(admitted.call), packet, role: "reviewer",
   }));
