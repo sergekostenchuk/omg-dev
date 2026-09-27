@@ -1,3 +1,4 @@
+import { checkManagedCompletionClaims } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { delivered, refused, isPlainObject, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -12,7 +13,7 @@ import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
-import { readAnySeriesAt, readSeries, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
+import { readAnySeriesAt, readSeriesAt, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
 import { assessmentResultId, checkCurrentAssessmentAttemptClosure,
@@ -430,11 +431,9 @@ function attemptOf(store: Store, project: string, gap: Gap, link: GapLineAttempt
   const exactSeries = exact<RepairSeries>(store, project, link.series, 'repair-series');
   check(object(exactSeries.value) && text(exactSeries.value.block) && Number.isSafeInteger(exactSeries.value.line),
     'answer_attempt_invalid', gap.target, 'attempt', 'A fact achievement needs a saved repair series');
-  const view = new Proxy(store, { get(target, prop) {
-    if (prop === 'get') return (id: string, revision?: number) => id === link.series.id && revision === undefined ? exactSeries : target.get(id, revision);
-    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
-  const series = take(readSeries(view, { project, block: exactSeries.value.block, line: exactSeries.value.line }));
+  // The attempt is historical evidence. Read that exact S through the common reader rather than
+  // impersonating its current head: the latter creates a new opaque history view at every use.
+  const series = take(readSeriesAt(store, project, link.series));
   const attempt = series.value.attempts.find(item => item.ordinal === link.attempt);
   check(attempt && attempt.outcome === null && gap.consumers.includes(series.value.block)
     && attempt.goal.questions.includes(gapLineKey(project, gap.target, gap.field))
@@ -1136,6 +1135,16 @@ export function confirmAcceptedAnswerResult(record: Sealed<Revision<Json>>, cont
         return { unconfirmed: 'The E5 fact belongs to another exact series line or attempt' };
       if (!Array.isArray(context.accepting))
         return { unconfirmed: 'E5 needs the complete accepting set of this attempt' };
+      if (context.managedClosure) {
+        const checkedClosure = checkManagedCompletionClaims(store, context.project, context.managedClosure,
+          context.accepting, closingRefusals ?? []);
+        if (!checkedClosure.ok) return { unconfirmed: `${checkedClosure.refusal.code}: ${checkedClosure.refusal.message}` };
+        if (checkedClosure.value.binding.value.series.id !== attempt.series.id
+          || checkedClosure.value.binding.value.attempt !== attempt.ordinal
+          || !same(checkedClosure.value.binding.value.goal, attempt.goal))
+          return { unconfirmed: 'The exact pre-close registry belongs to another original attempt' };
+        return { keys: [checked.value.key] };
+      }
       const series = readAnySeriesAt(store, context.project, closing.series);
       if (!series.ok) return { unconfirmed: `${series.refusal.code}: ${series.refusal.message}` };
       const cycle = [...series.value.value.inherited, ...series.value.value.attempts]

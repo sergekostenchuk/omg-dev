@@ -1,3 +1,4 @@
+import { prepareCompletionCall } from './model-call.js';
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -420,6 +421,8 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
   const ledger = checkedLedger(store, project);
   if (!ledger.ok) return ledger;
 
+  const completion = prepareCompletionCall(store, project, request);
+  if (!completion.ok) return completion;
   const openedAt = Date.now();
   const value: AnyCallRecord = {
     call: checked.value.call, purpose: checked.value.purpose, basis: copyBasis(checked.value.basis),
@@ -440,12 +443,13 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
   const written = writeGuarded(store, {
     unit: UNIT, target: id,
     writes: [
+      ...completion.value.writes,
       { id, kind: CALL_RECORD_KIND, expected: 0, value },
       { id: callLedgerId(project), kind: CALL_LEDGER_KIND, expected: ledger.value?.record.revision ?? 0, value: ledgerValue },
     ],
     guards: uniqueTransactionGuards([
       checked.value.series, checked.value.dispatch.adapter, checked.value.dispatch.config,
-      ...ledgerGuards, ...dispatchGuards, ...seriesGuards, ...assessmentGuards, ...extraGuards,
+      ...ledgerGuards, ...dispatchGuards, ...seriesGuards, ...assessmentGuards, ...extraGuards, ...completion.value.guards,
     ]),
   });
   if (!written.ok) return written;

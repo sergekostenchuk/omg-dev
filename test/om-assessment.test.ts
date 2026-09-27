@@ -1,3 +1,7 @@
+import { openAttempt as managedOpenAttempt, closeAttempt as managedCloseAttempt } from '../src/om/repeat-gate.js';
+import { readCompletionBinding, completionWorkId } from '../src/om/series.js';
+import { readCompletionWorkAt } from '../src/om/model-call.js';
+import { spendReport, readSpendReport } from '../src/om/spend-report.js';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -16,8 +20,8 @@ import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from '../src/om
 import { writeOmInput } from '../src/om/input.js';
 import { writeHorizon, writeHorizonIssuance } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest, type GapReadRequest } from '../src/om/gaps.js';
-import { writeRoutes } from '../src/om/routes.js';
-import { prepareQuestionTasks, writeQuestionPacket } from '../src/om/question-packet.js';
+import { prepareManagedRouteBatch, writeRoutes } from '../src/om/routes.js';
+import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, applySeriesActivation, seriesCurrentId, seriesId,
   type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { writeSeriesTransition } from '../src/om/series-transition.js';
@@ -25,7 +29,7 @@ import { closeAttempt } from '../src/om/repeat-gate.js';
 import { readJournal, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
 import { gapLineKey, gapLineExpectedResult, prepareGapLines, writeGapLines, GAP_LINE_KIND } from '../src/om/gap-lines.js';
 import { recordCall } from '../src/om/call-record.js';
-import { runModelCall, runModelTransport } from '../src/om/model-call.js';
+import { runModelCall, runModelCycle, runModelTransport } from '../src/om/model-call.js';
 import { readAcceptedAnswer, readAnswerSearch, applicableAnswer, prepareE5AcceptedAnswer,
   confirmAnswerGapClosure, answerIndexId, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
 import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt, readAssessmentResultAt, assessmentResultId,
@@ -38,6 +42,9 @@ import { type OmResult } from '../src/om/refusal.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
+import { prepareFrame, fillObligations } from '../src/om/frame-obligations.js';
+import { writeCandidate } from '../src/om/frame-candidate.js';
+import { settleCandidate } from '../src/om/frame-accept.js';
 
 const adapterFixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
@@ -53,7 +60,7 @@ function denied(result: OmResult<unknown>, code?: string): void {
   assert.ok(result.refusal.at.target);
   if (result.refusal.at.unit === 'E5' && result.refusal.code !== 'input_stale') assert.ok(result.refusal.at.field);
 }
-function fixture(t: TestContext, twoFacts = false, managed = false) {
+function fixture(t: TestContext, twoFacts = false, managed = false, completion = false, twoRoots = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e5-')), path = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -70,7 +77,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
       question: 'What encoding is supported?', consumer: 'garden-consume-block', moment: 'om-pass',
       blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' },
       ...(twoFacts ? [{ id: 'transport', question: 'What transport is supported?', consumer: 'garden-consume-block',
-        moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }] : [])];
+          moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -96,8 +103,10 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
     catalog: { paths: ['e5-source.txt'], records: [] }, previous: null }));
   const batch = routes.value.batches.find(item => item.model === 'MC1' && item.items.some(question => question.target === 'discovery:encoding'))!;
   assert.ok(batch);
+  const rootBatches = twoRoots ? [batch, routes.value.batches.find(row => row.task === 'node-expansion' && row.node === 'garden-consume-block')!] : [batch];
+  if (twoRoots) assert.equal(rootBatches.length, 2);
   const block = 'garden-consume-block', source = store.get<{ content: string }>(`source:${project}:brief`)!;
-  const goal: AttemptGoal = { key: 'e5:fact', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+  const goal: AttemptGoal = { key: 'e5:fact', questions: rootBatches.flatMap(row => row.items.map(item => gapLineKey(project, item.target, item.field))),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const opened = ok(openSeries(store, { project, block, line: 1, slice: 'e5-fact', predecessor: null, basis: null }));
   if (managed) {
@@ -107,7 +116,8 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
       horizon: reference(horizon.gate), transition: reference(prepared) }));
     ok(applySeriesActivation(store, { project, prepared: reference(prepared), issuance: reference(issuance) }));
   }
-  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  const series = ok((completion ? managedOpenAttempt : beginAttempt)(store, { project, block, line: 1, attempt: 1, goal,
+    ...(completion ? { completion: { routes: reference(routes), batches: rootBatches.map(row => row.id) } } : {}) }));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const config = engine.environments.configure(project, { workspace: root,
@@ -131,6 +141,14 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
     return { project, modelCall: reference(model.record), questionId, dispatch };
   }
   return { project, path, series, scenario, originalStep, dispatch, original, questionIds: batch.items.map(item => item.gap),
+    otherRoot() {
+      const other = rootBatches.find(row => row.id !== batch.id)!;
+      const next = ok(writeQuestionPacket(store,{project,routes:reference(routes),batch:other.id,environment:reference(config),
+        attempt:{series:reference(series),ordinal:1},previous:[]})).record;
+      return {request:{project,packet:reference(next),dispatch,role:'implementer' as const},questionId:other.items[0]!.gap,
+        step:{research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'answer',results:other.items.map(item=>({questionId:item.gap,
+          value:'UTF-8',citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]}))},usage}};
+    },
     get store() { return store; },
     async secondOriginal(): Promise<AssessmentIntentRequest> {
       const prior = routes.value.request;
@@ -163,7 +181,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false) {
   };
 }
 
-async function completedFactClosure(f: ReturnType<typeof fixture>) {
+async function completedFactClosure(f: ReturnType<typeof fixture>, explicitCompletion = false) {
   const request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request));
   const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
@@ -175,6 +193,12 @@ async function completedFactClosure(f: ReturnType<typeof fixture>) {
   const terminal = ok(await assessFact(f.store, request));
   assert.ok(terminal.value.accepted);
   const accepted = terminal.value.accepted;
+  if (explicitCompletion) {
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+    const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    ok(closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
+      outcome: { reason: 'result', accepting: work.accepting, cancelling: [], refusals: work.refusals } }));
+  }
   const checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: accepted }));
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, 'result');
   const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: question.value.request.input,
@@ -839,4 +863,361 @@ test('E5 saved producer addresses retain the B1 era when its first input is miss
       }
     });
   }
+});
+
+test('19 H1.0a E5 registers every original fact and atomically retains S plus N until the single explicit G7 close', async t => {
+  const f = fixture(t, true, false, true), request = await f.original();
+  f.assessor('supported', 'insufficient');
+  const first = ok(await assessFact(f.store, request));
+  assert.ok(first.value.accepted);
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+  const id = completionWorkId(f.project, binding.id);
+  let work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(id)!)));
+  assert.equal(work.complete, false);
+  assert.equal(work.assignments.filter(row => row.value.kind === 'fact').length, 2);
+  const premature = managedCloseAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1,
+    attempt: 1, outcome: { reason: 'result', accepting: [first.value.accepted], cancelling: [], refusals: [] } });
+  assert.equal(premature.ok, false);
+  const secondRequest = { ...request, questionId: f.questionIds[1]! };
+  const second = ok(await assessFact(f.store, secondRequest));
+  assert.equal(second.value.verdict, 'insufficient');
+  work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(id)!)));
+  assert.equal(work.complete, true);
+  assert.equal(work.refusals.length, 1);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const claim = { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
+    outcome: { reason: 'result' as const, accepting: work.accepting, cancelling: [], refusals: work.refusals } };
+  ok(managedCloseAttempt(f.store, claim));
+  const saved = f.store.get(f.series.id);
+  f.restart();
+  ok(managedCloseAttempt(f.store, claim));
+  assert.deepEqual(f.store.get(f.series.id), saved);
+  assert.deepEqual(ok(await assessFact(f.store, request)), first);
+  assert.deepEqual(ok(await assessFact(f.store, secondRequest)), second);
+  assert.equal(f.sent().length, 3);
+});
+
+test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 counts before and after closing', async t => {
+  const combinations = [
+    ['supported', 'supported'], ['supported', 'off-form'], ['insufficient', 'conflicting'],
+    ['conflicting', 'off-form'], ['off-form', 'interrupted'], ['off-form', 'off-form'],
+  ] as const;
+  for (const choices of combinations) await t.test(choices.join('+'), async child => {
+    const f = fixture(child, true, choices[0] === 'supported', true), request = await f.original();
+    const step = (verdict: typeof choices[number]) => verdict === 'interrupted'
+      ? { rawStdout: '{broken', exitCode: 7, stderr: 'intentional assessor failure' }
+      : { research: verdict === 'off-form' ? { answer: 'no typed verdict' }
+        : { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage };
+    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, ...choices.map(step)] }));
+    const requests = f.questionIds.map(questionId => ({ ...request, questionId }));
+    const first = ok(await assessFact(f.store, requests[0]!));
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+    const snapshot = () => ok(readCompletionWorkAt(f.store, f.project,
+      reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    assert.equal(snapshot().complete, false);
+    assert.equal(closeAttempt(f.store, { project:f.project, block:'garden-consume-block', line:1, attempt:1,
+      outcome:{ reason:'off-form', accepting:[], cancelling:[], refusals:[] } }).ok, false);
+    const second = ok(await assessFact(f.store, requests[1]!));
+    const work = snapshot(); assert.equal(work.complete, true);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    const local = ok(spendReport(f.store, { project:f.project }));
+    assert.equal(local.totals.calls, 3);
+    assert.equal(local.byPurpose['fact-assessment']!.calls, 2);
+    assert.equal(local.byPurpose['model-research'].calls, 1);
+    const reason = work.accepting.length ? 'result' : work.negative.length ? 'refused'
+      : choices.includes('interrupted' as never) ? 'interrupted' : 'off-form';
+    const claim = { project:f.project, block:'garden-consume-block', line:1, attempt:1,
+      outcome:{ reason, accepting:work.accepting, cancelling:[], refusals:work.refusals } } as const;
+    if (work.accepting.length) assert.equal(closeAttempt(f.store, { ...claim,
+      outcome:{...claim.outcome, accepting:[]} }).ok, false, 'A technical terminal cannot conceal S');
+    if (work.refusals.length) assert.equal(closeAttempt(f.store, { ...claim,
+      outcome:{...claim.outcome, refusals:[]} }).ok, false, 'A neighbouring T cannot conceal N');
+    let completed:ReturnType<typeof ok<ReturnType<typeof closeAttempt> extends OmResult<infer T>?T:never>>;
+    await child.test('29 complete composition is closed once only by explicit G7',()=>{
+      completed=ok(closeAttempt(f.store,claim));
+      assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason,reason);
+    });
+    const after = ok(spendReport(f.store, { project:f.project }));
+    assert.deepEqual(after.totals, local.totals);
+    const records = f.store.list().map(reference); f.restart();
+    assert.deepEqual(ok(closeAttempt(f.store,claim)),completed!);
+    await child.test('31 each local result repeats against the entire saved outcome',async()=>{
+      assert.deepEqual(ok(await assessFact(f.store,requests[0]!)),first);
+      assert.deepEqual(ok(await assessFact(f.store,requests[1]!)),second);
+    });
+    assert.deepEqual(ok(readSpendReport(f.store, local.snapshot)), local);
+    assert.deepEqual(ok(readSpendReport(f.store, after.snapshot)), after);
+    assert.deepEqual(f.store.list().map(reference), records);
+    assert.equal(f.sent().length, 3);
+  });
+});
+
+test('C28 H1.0a managed accepted E5 remains a lawful D2 source after explicit G7 and restart', async t => {
+  const f = fixture(t, false, false, true), chain = await completedFactClosure(f, true);
+  assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
+  f.restart();
+  assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
+  const prepared = ok(prepareGapLines(f.store, chain.next));
+  ok(writeGuarded(f.store, {unit:'D2',target:f.project,writes:prepared.writes,guards:prepared.guards}));
+  assert.equal(f.sent().length, 2);
+});
+
+test('C10 H1.0a G7 carries product-head guards from before the full managed derivation', async t => {
+  const f = fixture(t, true, false, true), request = await f.original();
+  f.assessor('supported','supported');
+  const first = ok(await assessFact(f.store, request));
+  ok(await assessFact(f.store, {...request,questionId:f.questionIds[1]!}));
+  const binding = ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+  const work = ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+  const original = f.store.writeMany.bind(f.store); let raced = false;
+  f.store.writeMany = ((writes,guards) => {
+    if (!raced && writes.some(row => row.kind === 'om-completion-close')) {
+      raced = true; const second = new Store(f.path);
+      try { const head=second.get(first.id)!; second.write({id:head.id,kind:head.kind,expected:head.revision,value:head.value}); }
+      finally {second.close();}
+    }
+    return original(writes,guards);
+  }) as Store['writeMany'];
+  try {
+    const result=closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
+      outcome:{reason:'result',accepting:work.accepting,cancelling:[],refusals:work.refusals}});
+    assert.equal(result.ok,false); if(!result.ok) assert.equal(result.refusal.code,'input_stale');
+  } finally {f.store.writeMany=original;}
+  assert.equal(raced,true);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+  assert.equal(f.store.list('om-completion-close').length,0);
+  assert.equal(f.sent().length,3);
+});
+
+test('24 H1.0a a complete MC1 root cannot hide an unpaid MC2 root in the initial plan', async t => {
+  const f=fixture(t,false,false,true,true), firstRequest=await f.original();
+  f.assessor(); const first=ok(await assessFact(f.store,firstRequest));
+  const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+  const getWork=()=>ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+  assert.equal(getWork().assignments.filter(row=>row.value.kind==='root').length,2);
+  assert.equal(getWork().complete,false);
+  const firstIntent=ok(writeAssessmentIntent(f.store,firstRequest));
+  await t.test('25 H1.0a local finish reports complete but the whole attempt is open',()=>{
+    const finish=ok(finishAssessmentAttempt(f.store,f.project,reference(firstIntent)));
+    assert.equal(finish.complete,true); assert.equal(finish.closed,false);
+    assert.equal(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
+      outcome:{reason:'result',accepting:[first.value.accepted!],cancelling:[],refusals:[]}}).ok,false);
+  });
+  const other=f.otherRoot();
+  writeFileSync(f.scenario,JSON.stringify({steps:[f.originalStep,{research:{verdict:'supported',reasons:[]},usage},
+    {research:{wrong:true},usage}]}));
+  const physical=ok(await runModelCycle(f.store,other.request));
+  assert.equal(physical.record.value.terminal,'outcome');
+  const work=getWork();assert.equal(work.complete,true);assert.equal(work.accepting.length,1);
+  const claim={project:f.project,block:'garden-consume-block',line:1,attempt:1,
+    outcome:{reason:'result' as const,accepting:work.accepting,cancelling:[],refusals:work.refusals}};
+  ok(closeAttempt(f.store,claim));const saved=f.store.list().map(reference); f.restart();
+  ok(closeAttempt(f.store,claim));
+  assert.deepEqual(ok(await assessFact(f.store,firstRequest)),first);
+  assert.deepEqual(ok(await runModelCycle(f.store,other.request)).record,physical.record);
+  assert.deepEqual(f.store.list().map(reference),saved);assert.equal(f.sent().length,3);
+});
+
+test('18 H1.0a answered assessor transport is still I until its exact E5 application',async t=>{
+  const f=fixture(t,false,false,true),request=await f.original(),intent=ok(writeAssessmentIntent(f.store,request));
+  const admission=ok(readAssessmentIntentAt(f.store,f.project,reference(intent)));
+  const admitted=ok(recordCall(f.store,f.project,{call:admission.call,purpose:'fact-assessment',basis:admission.basis,
+    block:admission.block,gaps:admission.gaps,series:admission.series,attempt:admission.attempt,goal:admission.goal,
+    dispatch:admission.dispatch,packet:admission.packet as Json}));
+  f.assessor();
+  const physical=ok(await runModelTransport(f.store,{project:f.project,call:reference(admitted.call),packet:admission.packet as Json,role:'reviewer'}));
+  assert.equal(physical.record.value.transport.version,'om-model-transport/managed-v1');
+  const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+  const getWork=()=>ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+  assert.equal(getWork().complete,false);
+  assert.equal(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
+    outcome:{reason:'result',accepting:[],cancelling:[],refusals:[]}}).ok,false);
+  const result=ok(await assessFact(f.store,request));assert.equal(result.value.verdict,'supported');
+  assert.equal(getWork().complete,true);assert.equal(f.sent().length,2);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+});
+
+test('2 H1.0a standalone E5 keeps its accepted automatic completion and exact historical repeat',async t=>{
+  const f=fixture(t),request=await f.original();f.assessor();
+  const terminal=ok(await assessFact(f.store,request));
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason,'result');
+  assert.equal(f.store.list('om-completion-owner').length,0);
+  const saved=f.store.list().map(reference);f.restart();
+  assert.deepEqual(ok(await assessFact(f.store,request)),terminal);assert.deepEqual(f.store.list().map(reference),saved);
+  assert.equal(f.sent().length,2);
+});
+
+/** Two unique input questions share one block through the accepted L2 realizes relation. */
+function twoMc1Fixture(t: TestContext, deferredPackets = false) {
+  const root=mkdtempSync(join(tmpdir(),'omg-h10a-multi-')), path=join(root,'state.sqlite'), project='garden';
+  let store=new Store(path); const engine=new ProductEngine(store);
+  t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
+  const block='garden-produce-block', other='garden-consume-block', operation='garden-produce-operation';
+  const descriptors=[{id:'shared-format',consumer:operation},{id:'local-encoding',consumer:block}];
+  const graph=gardenGraph();
+  graph.edges!.push({id:'shared-produce-realizes-consume',relation:'realizes',source:operation,target:other,condition:'shared responsibility'});
+  const {level:_level,...l1}=projectGraph(graph,1);
+  preparedFeatures(engine,project,{...l1,version:graph.version},field=>{
+    const value=preparedField(project,field) as Record<string,Json>;
+    if(field==='preparation')value.unknowns=descriptors.map(d=>({id:d.id,question:`Which ${d.id} is supported?`,
+      consumer:d.consumer,moment:'om-pass',blocksCurrentStage:false,resolution:'Resolve during OM'}));
+    return value;
+  });
+  const stages=Object.fromEntries(UPSTREAM_STAGES.map(stage=>[stage,reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage,Ref>;
+  const input=ok(writeOmInput(store,{project,expected:0,stages})),graph0=reference(store.get('graph:garden')!);
+  const horizon0=ok(writeHorizon(store,{project,input:reference(input),graph:graph0,refinement:null,available:{},
+    choice:{choiceVersion:'before-l2',features:[{outcome:'garden-result'}],excluded:[]}}));
+  const frame={project,level:2 as const,graph:graph0,horizon:reference(horizon0.gate),layer:null,frame:null,upper:null};
+  const initial=ok(prepareFrame(store,frame)), projected=projectGraph(graph,2);
+  const fills=ok(fillObligations(initial.upper as Graph,structuredClone(initial.scope) as Parameters<typeof fillObligations>[1],
+    {graph,reference:{...graph0,hash:hashJson(graph)},frame:null},initial.upperRef,2));
+  const offered=store.write({id:'om-proposal:garden:shared-operation',kind:'layer-proposal',expected:0,value:{
+    base:{graph:graph0,frame:null},level:2,source:'decision',status:'proposed',nodes:projected.nodes.filter(n=>n.kind==='operation'),
+    fills:fills.fills.map(f=>({obligation:f.obligation,node:f.node,...(f.port===undefined?{}:{port:f.port})})),
+    localConnectors:projected.connectors.map(c=>({...c,bindings:c.bindings.filter(b=>b.level===2)})).filter(c=>c.bindings.length),
+    artifacts:projected.artifacts,contracts:projected.contracts,joins:projected.joins,anchors:projected.anchors,tests:projected.tests,
+    edges:projected.edges??[],journeys:projected.journeys??[],packets:projected.packets??[],transfers:projected.transfers??[],
+    removes:[],replaces:[],redefines:[]}});
+  const candidate=ok(writeCandidate(store,{frame,proposals:[reference(offered)]}));
+  assert.equal(candidate.state,'candidate');assert.ok(candidate.record);
+  const accepted=ok(settleCandidate(store,{project,level:2,candidate:reference(candidate.record),outcome:{gate:'G3',
+    candidate:reference(candidate.record),graphHash:candidate.record.value.graphHash,passed:true,codes:[]}}));
+  assert.equal(accepted.state,'accepted');assert.ok(accepted.graph&&accepted.layer&&accepted.frame);
+  const graphRef=reference(accepted.graph),layerRef=reference(accepted.layer),frameRef=reference(accepted.frame);
+  const addressed=ok(writeAddressing(store,{project,input:reference(input),graph:graphRef,decisions:descriptors.map(d=>({pending:
+    structuredClone(inputDecisionWrite({project,input:reference(input),graph:graphRef,layers:d.consumer===operation?[layerRef]:[],
+      decision:{target:`discovery:${d.id}`,field:'address',value:{consumer:d.consumer,kind:'repository-fact'}}})) as Write}))}));
+  const horizon=ok(writeHorizon(store,{project,input:reference(addressed),graph:graphRef,refinement:layerRef,available:{},
+    choice:{choiceVersion:'shared-operation',features:[{outcome:'garden-result'}],excluded:[]}}));
+  const sources:GapRequest={project,input:reference(addressed),graph:graphRef,horizon:reference(horizon.gate),
+    operations:{proposals:[],frame:{project,level:2,graph:graphRef,horizon:reference(horizon.gate),layer:layerRef,frame:frameRef,upper:null}},
+    works:{proposals:[],frame:{project,level:3,graph:graphRef,horizon:reference(horizon.gate),layer:null,frame:null,
+      upper:{horizon:reference(horizon.gate),frame:frameRef}}}};
+  const gaps=ok(writeGaps(store,sources));
+  const facts=gaps.records.filter(r=>r.value.gap.kind==='repository-fact'&&r.value.gap.code==='predecessor_question'&&!r.value.gap.deferral);
+  assert.equal(facts.length,2);
+  assert.deepEqual(facts.find(r=>r.value.gap.target==='discovery:shared-format')!.value.gap.consumers,[other,block].sort());
+  assert.deepEqual(facts.find(r=>r.value.gap.target==='discovery:local-encoding')!.value.gap.consumers,[block]);
+  const gapRequest:GapReadRequest={sources:structuredClone(gaps.sources) as GapRequest,records:gaps.records.map(reference)};
+  const tasks=ok(prepareQuestionTasks(store,{project,gaps:gapRequest,questions:facts.map(gap=>({gap:reference(gap),
+    requirements:[{pointer:'/contracts/0'}],resultForm:{type:'string'}}))}));
+  const routes=ok(writeRoutes(store,{project,gaps:gapRequest,tasks:tasks.tasks.map(task=>({pending:structuredClone(task.writes[0]!) as Write})),
+    catalog:{paths:[],records:[]},previous:null}));
+  const batches=routes.value.batches.filter(b=>b.model==='MC1');
+  assert.equal(batches.length,2);assert.ok(batches.every(b=>b.items.every(item=>item.consumers.includes(block))));
+  ok(openSeries(store,{project,block,line:1,slice:'two-mc1',predecessor:null,basis:null}));
+  const goal={key:'two-mc1',questions:batches.flatMap(b=>b.items.map(item=>gapLineKey(project,item.target,item.field))),
+    result:gapLineExpectedResult(project,batches[0]!.items[0]!.target,batches[0]!.items[0]!.field)};
+  const opening={project,block,line:1,attempt:1,goal,completion:{routes:reference(routes),batches:batches.map(b=>b.id)}};
+  const series=ok(managedOpenAttempt(store,opening)),scenario=join(root,'scenario.json'),trace=join(root,'trace.jsonl');
+  const command={executable:process.execPath,args:[adapterFixture,'--scenario',scenario,'--trace',trace]};
+  const config=engine.environments.configure(project,{workspace:root,implementer:{actor:'multi-researcher',model:'fixture',effort:'high',command},
+    reviewer:{actor:'multi-assessor',model:'fixture-reviewer',effort:'high',command},fullCheck:{executable:process.execPath,args:['--version']},
+    timeoutMs:5000,requestCapacityChars:100_000},0);
+  const adapter=store.write({id:`adapter:${project}:multi`,kind:'dispatch-adapter',expected:0,value:{projectId:project,protocol:'codex-stdio'}});
+  const dispatch={config:reference(config),adapter:reference(adapter)},source=store.get<{content:string}>(`source:${project}:brief`)!;
+  const packetRequests=batches.map(batch=>({project,routes:reference(routes),batch:batch.id,environment:reference(config),
+    attempt:{series:reference(series),ordinal:1},previous:[]}));
+  const requests:{project:string;dispatch:typeof dispatch;role:'implementer';packet:Ref}[]=[];
+  function requestFor(index:number){return requests[index]??=(
+    {project,dispatch,role:'implementer',packet:reference(ok(writeQuestionPacket(store,packetRequests[index]!)).record)});}
+  if(!deferredPackets)batches.forEach((_,index)=>requestFor(index));
+  const steps=batches.map(batch=>({research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'answer',results:batch.items.map(item=>({
+    questionId:item.gap,value:'UTF-8',citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]}))},usage}));
+  return {project,block,series,dispatch,requests,packetRequests,requestFor,batches,steps,scenario,opening,path,get store(){return store;},
+    sent(){return readFileSync(trace,'utf8').trim().split('\n').filter(Boolean);},restart(){store.close();store=new Store(path);}};
+}
+
+test('24 H1.0a two genuine MC1 roots share a block through realizes and retain both mandatory fact sets',async t=>{
+  for(const deferredPackets of [false,true])for(const order of [[0,1],[1,0]])await t.test(`C38 root order ${order.join(',')}; E2 ${deferredPackets?'after':'before'} neighbouring S`,async child=>{
+    const f=twoMc1Fixture(child,deferredPackets),results:ReturnType<typeof reference>[]=[];
+    writeFileSync(f.scenario,JSON.stringify({steps:order.flatMap(i=>[f.steps[i],{research:{verdict:'supported',reasons:[]},usage}])}));
+    const intents:Ref[]=[],assessments:AssessmentIntentRequest[]=[];
+    for(const [position,i] of order.entries()){
+      const model=ok(await runModelCall(f.store,f.requestFor(i)));assert.equal(model.outcome?.kind,'fact-candidates');
+      const request={project:f.project,modelCall:reference(model.record),questionId:f.batches[i]!.items[0]!.gap,dispatch:f.dispatch};
+      const terminal=ok(await assessFact(f.store,request));results.push(reference(terminal));assessments.push(request);intents.push(terminal.value.intent);
+      const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+      const work=ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+      assert.equal(work.complete,position===1);
+      assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+      assert.deepEqual(ok(finishAssessmentAttempt(f.store,f.project,terminal.value.intent)),{complete:true,closed:false,results:[reference(terminal)]});
+      if(position===0){
+        const denied=prepareQuestionPacket(f.store,f.packetRequests[i]!);
+        assert.equal(denied.ok,false);if(!denied.ok)assert.equal(denied.refusal.code,'route_stale','An applicable target D5 forbids another send');
+        const before=f.store.list().map(reference);
+        assert.equal(closeAttempt(f.store,{project:f.project,block:f.block,line:1,attempt:1,
+          outcome:{reason:'result',accepting:work.accepting,cancelling:[],refusals:work.refusals}}).ok,false);
+        assert.deepEqual(f.store.list().map(reference),before);
+      }
+    }
+    const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+    const work=ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+    assert.equal(work.accepting.length,2);assert.equal(work.assignments.filter(row=>row.value.kind==='fact').length,2);
+    const claim={project:f.project,block:f.block,line:1,attempt:1,
+      outcome:{reason:'result' as const,accepting:work.accepting,cancelling:[],refusals:work.refusals}};
+    const closed=ok(closeAttempt(f.store,claim)),saved=f.store.list().map(reference);f.restart();
+    assert.deepEqual(ok(closeAttempt(f.store,claim)),closed);
+    for(const [i,request]of assessments.entries()){
+      assert.deepEqual(reference(ok(await assessFact(f.store,request))),results[i]);
+      assert.deepEqual(ok(finishAssessmentAttempt(f.store,f.project,intents[i]!)),{complete:true,closed:true,results:[results[i]!]});
+    }
+    for(const request of f.requests)assert.equal(ok(await runModelCall(f.store,request)).repeated,true);
+    assert.deepEqual(f.store.list().map(reference),saved);assert.equal(f.sent().length,4);
+    assert.equal(ok(spendReport(f.store,{project:f.project})).totals.calls,4);
+  });
+});
+
+test('C38 H1.0a neighbouring S during receipt preserves target admission while target and common changes remain guarded',async t=>{
+  const f=twoMc1Fixture(t,true);
+  writeFileSync(f.scenario,JSON.stringify({steps:[f.steps[0],{research:{verdict:'supported',reasons:[]},usage},
+    f.steps[1],{research:{verdict:'supported',reasons:[]},usage}]}));
+  const original=ok(await runModelCall(f.store,f.requestFor(0)));
+  const intent=ok(writeAssessmentIntent(f.store,{project:f.project,modelCall:reference(original.record),
+    questionId:f.batches[0]!.items[0]!.gap,dispatch:f.dispatch}));
+  const assessment=ok(readAssessmentIntentAt(f.store,f.project,reference(intent)));
+  const admitted=ok(recordCall(f.store,f.project,{call:assessment.call,purpose:'fact-assessment',basis:assessment.basis,
+    block:assessment.block,gaps:assessment.gaps,series:assessment.series,attempt:assessment.attempt,goal:assessment.goal,
+    dispatch:assessment.dispatch,packet:assessment.packet as Json}));
+  const transport=ok(await runModelTransport(f.store,{project:f.project,call:reference(admitted.call),packet:assessment.packet as Json,role:'reviewer'}));
+  const before=(index:number)=>ok(prepareManagedRouteBatch(f.store,{project:f.project,series:reference(f.series),attempt:1,
+    routes:f.opening.completion.routes,batch:f.batches[index]!.id}));
+  const own=before(0),target=before(1),request=f.requestFor(1);
+  assert.ok(target.guards.some(ref=>canonical(ref)===canonical(reference(f.series))));
+  const get=f.store.get.bind(f.store);
+  f.store.get=((id:string,revision?:number)=>id===f.series.id&&revision===undefined?null:get(id,revision)) as Store['get'];
+  try {
+    const missingLine=prepareManagedRouteBatch(f.store,{project:f.project,series:reference(f.series),attempt:1,
+      routes:f.opening.completion.routes,batch:f.batches[1]!.id});
+    assert.equal(missingLine.ok,false);
+    if(!missingLine.ok)assert.equal(missingLine.refusal.code,'series_conflict');
+  } finally { f.store.get=get; }
+  const ownIndex=answerIndexId(f.project,f.batches[0]!.items[0]!.target,f.batches[0]!.items[0]!.field);
+  assert.ok(own.guards.some(ref=>ref.id===ownIndex));assert.ok(!target.guards.some(ref=>ref.id===ownIndex));
+  const writeMany=f.store.writeMany.bind(f.store);let raced=false;
+  f.store.writeMany=((writes,guards)=>{
+    const saved=writeMany(writes,guards);
+    if(!raced&&writes.some(row=>row.kind==='model-call'&&(row.value as {om?:{application:string;request:{packet:Ref}}}).om?.application==='received')){
+      raced=true;const second=new Store(f.path);
+      try{ok(applyAssessmentResult(second,{project:f.project,intent:reference(intent),assessor:reference(transport.record)}));}
+      finally{second.close();}
+    }
+    return saved;
+  }) as Store['writeMany'];
+  let received:ReturnType<typeof ok<Awaited<ReturnType<typeof runModelCall>> extends OmResult<infer T>?T:never>>;
+  try{received=ok(await runModelCall(f.store,request));}finally{f.store.writeMany=writeMany;}
+  assert.equal(raced,true);assert.equal(received.outcome?.kind,'fact-candidates');
+  assert.equal(received.record.value.om.application,'applied');assert.equal(f.sent().length,3);
+  const stale=writeGuarded(f.store,{unit:'test',target:'target-search',writes:[{id:'test:target-search',kind:'test',expected:0,value:{}}],guards:own.guards});
+  assert.equal(stale.ok,false);if(!stale.ok)assert.equal(stale.refusal.code,'input_stale');
+  assert.equal(f.store.get('test:target-search'),null);
+  const answer=ok(await assessFact(f.store,{project:f.project,modelCall:reference(received.record),
+    questionId:f.batches[1]!.items[0]!.gap,dispatch:f.dispatch}));assert.equal(answer.value.verdict,'supported');
+  const saved=f.store.list().map(reference);f.restart();
+  assert.equal(ok(await runModelCall(f.store,request)).repeated,true);assert.deepEqual(f.store.list().map(reference),saved);
+  const graph=f.store.get<Graph>(`graph:${f.project}`)!;
+  new ProductEngine(f.store).graphs.save(f.project,graph.value,graph.revision,'change a shared source');
+  const common=writeGuarded(f.store,{unit:'test',target:'common-source',writes:[{id:'test:common-source',kind:'test',expected:0,value:{}}],guards:target.guards});
+  assert.equal(common.ok,false);if(!common.ok)assert.equal(common.refusal.code,'input_stale');
+  assert.equal(prepareQuestionPacket(f.store,f.packetRequests[1]!).ok,false);
 });

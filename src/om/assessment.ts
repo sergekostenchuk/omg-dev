@@ -5,7 +5,7 @@ import { Store, type Revision, type TransactionGuard, type Write } from '../stor
 import { uniqueTransactionGuards, type Environment } from '../runtime/environment.js';
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { readJournal, recordRefusal, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
+import { readJournal, recordRefusal, prepareRecordRefusal, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { historicalRead, withHistoricalReads } from './input.js';
 import { checkAnswerForm } from './answer-form.js';
 import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5AcceptedAnswer,
@@ -15,10 +15,10 @@ import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5A
 import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recordCall,
   type AddressedGap, type CallLedger, type DispatchContract, type FactAssessmentBasis,
   type RecordCallRequest } from './call-record.js';
-import { readModelCallState, readModelTransport, runModelTransport, type TransportModelCall } from './model-call.js';
+import { readModelCallState, readModelTransport, runModelTransport, prepareCompletionProducts, pendingCallStore, type TransportModelCall } from './model-call.js';
 import { readPacketResponse } from './question-packet.js';
 import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, seriesCurrentId,
-  seriesId, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
+  seriesId, readCompletionBinding, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt } from './repeat-gate.js';
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
@@ -412,6 +412,9 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
       const historical = take(readAssessmentTerminalAt(store, request.project, reference(prior)));
       if (!same(historical.value.intent, request.intent) || !same(historical.value.assessor, request.assessor))
         fail('assessment_identity_conflict', id, 'assessor', 'One fact has one terminal assessment', reference(prior));
+      const completion = prepareManagedAssessmentProducts(store, request.project, reference(historical));
+      if (completion.writes.length) take(writeGuarded(store, { unit: 'E5', target: id,
+        writes: completion.writes, guards: completion.guards }));
       return historical;
     }
     const outcome = take(readAssessmentResultAt(store, request.project, request.intent, request.assessor));
@@ -437,8 +440,12 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
     const write: Write = { id, kind: ASSESSMENT_RESULT_KIND, expected: 0, value };
     const result: Revision<AssessmentResultRecord> = { id, kind: ASSESSMENT_RESULT_KIND,
       revision: 1, hash: hashJson(value), value };
-    const saved = take(writeGuarded(store, { unit: 'E5', target: id,
-      writes: [...writes, write], guards: uniqueTransactionGuards(guards) }));
+    writes.push(write);
+    const completion = prepareManagedAssessmentProducts(pendingCallStore(store, writes), request.project, resultReference(write));
+    writes.push(...completion.writes); guards.push(...completion.guards);
+    const pendingRefs = new Set(writes.map(write => canonical(resultReference(write))));
+    const saved = take(writeGuarded(store, { unit: 'E5', target: id, writes,
+      guards: uniqueTransactionGuards(guards.filter(guard => !isRef(guard) || !pendingRefs.has(canonical(guard)))) }));
     const written = saved.find(row => row.id === id);
     if (!written || !same(written, result)) fail('assessment_result_invalid', id, 'write', 'The terminal result must be written with the full answer bundle');
     return result;
@@ -446,6 +453,33 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
   if (!applied.ok) return applied;
   const closure = finishAssessmentAttempt(store, request.project, request.intent);
   return closure.ok ? applied : closure;
+}
+
+/** New application and cursor recovery use the same complete terminal/A2/work producer. */
+function prepareManagedAssessmentProducts(store: Store, project: string, result: Ref): { writes: Write[]; guards: TransactionGuard[] } {
+  const terminal = take(readAssessmentTerminalAt(store, project, result));
+  const intent = take(readAssessmentIntentAt(store, project, terminal.value.intent));
+  const owner = take(readCompletionBinding(store, project, intent.originalSeries, intent.attempt));
+  if (!owner) return { writes: [], guards: [] };
+  const writes: Write[] = [], guards: TransactionGuard[] = [], products = [result];
+  if (terminal.value.verdict === 'insufficient' || terminal.value.verdict === 'conflicting') {
+    const body = assessmentRefusalBody(store, project, result);
+    const write: Write = { id: assessmentRefusalId(project, result), kind: UNIT_REFUSAL_KIND, expected: 0, value: body.value };
+    const prior = store.get(write.id);
+    if (prior) {
+      const exact = take(readAssessmentRefusalAt(store, project, reference(prior)));
+      if (!same(exact.record.value, write.value)) fail('assessment_result_invalid', write.id, 'refusal', 'A negative terminal retains its one derived A2 source');
+    } else writes.push(write);
+    products.push(resultReference(write));
+    if (!prior) {
+      const journal = take(prepareRecordRefusal(pendingCallStore(store, writes), { project, source: resultReference(write) }));
+      writes.push(...journal.writes as Write[]); guards.push(...journal.guards);
+    }
+  }
+  const work = take(prepareCompletionProducts(pendingCallStore(store, writes), reference(owner), products));
+  writes.push(...work.writes as Write[]); guards.push(...work.guards);
+  const pending = new Set(writes.map(write => canonical(resultReference(write))));
+  return { writes, guards: uniqueTransactionGuards(guards.filter(guard => !isRef(guard) || !pending.has(canonical(guard)))) };
 }
 
 /** Reprove the paid terminal outcome without descending into its D5 answer or index. */
@@ -889,6 +923,20 @@ export function finishAssessmentAttempt(store: Store, project: string, intent: R
   requireIntentRef(store, project, intent);
   return checked(() => {
     const set = take(readAssessmentSet(store, project, intent));
+    const managed = take(readCompletionBinding(store, project, set.originalSeries, set.attempt));
+    if (managed) {
+      for (const result of set.results) {
+        const completion = prepareManagedAssessmentProducts(store, project, result);
+        if (completion.writes.length) take(writeGuarded(store, { unit: 'E5', target: intent.id,
+          writes: completion.writes, guards: completion.guards }));
+      }
+      const head = store.get(managed.value.series.id);
+      if (!head) fail('assessment_set_invalid', intent.id, 'series', 'A managed result retains its original line');
+      const series = take(readAnySeriesAt(store, project, reference(head)));
+      const attempt = series.value.attempts.find(row => row.ordinal === set.attempt);
+      return { complete: set.complete, closed: attempt?.outcome !== null && attempt?.outcome !== undefined,
+        results: [...set.results] };
+    }
     const line = take(readAnySeriesAt(store, project, set.originalSeries));
     if (!('block' in line.value) || line.value.block !== set.block)
       fail('assessment_set_invalid', set.originalSeries.id, 'series',

@@ -9,18 +9,18 @@ import {
 } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import {
-  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal, readJournalAt,
+  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal, readJournalAt, journalId,
   type JournalRow, type OriginSource, type OriginSourceContext, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
 } from "./refusal-journal.js";
 import {
-  prepareBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, seriesRequestOf, REPAIR_SERIES_KIND,
+  prepareManagedBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, seriesRequestOf, REPAIR_SERIES_KIND,
   type Attempt, type AttemptGoal, type AttemptVerdict, type BeginAttemptRequest, type ClaimedRefusal,
   type CompletionReason, type Continuation, type GroundRecord, type RepairSeries,
   type SeriesLadder, type SeriesRequest, type SeriesStop, type SeriesTransition,
   type SeriesOwner, type MechanismSeriesRequest, type MechanismBeginAttemptRequest,
   type MechanismRepairSeries, type AnyRepairSeries, type AnySeriesRequest, type AnySeriesTransition,
 } from "./series.js";
-import { withHistoricalReads } from "./input.js";
+import { withHistoricalReads, historicalRead } from "./input.js";
 import { confirmResults, type ConfirmedResults } from "./achievements.js";
 import { projectGraph } from "../graph/project.js";
 import type { Graph } from "../graph/model.js";
@@ -619,7 +619,7 @@ OmResult<{ readonly transition: AnySeriesTransition; readonly current: Revision<
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "An attempt is opened at this gate through a request object");
   const address = requireAddress(request);
-  const begun = prepareBeginAttempt(store, request);
+  const begun = prepareManagedBeginAttempt(store, request);
   const series = readAnySeries(store, requestOf(address));
   if (!series.ok) return begun.ok ? series : begun;
   const current = series.value as Revision<AnyRepairSeries>;
@@ -647,9 +647,10 @@ OmResult<{ readonly transition: AnySeriesTransition; readonly current: Revision<
 }
 
 function prepareClose(store: Store, request: AnyCloseAttemptRequest): OmResult<RepeatTransition> {
-  return withHistoricalReads(() => prepareCloseInScope(store, request));
+  const address = requireCloseRequest(store, request);
+  return withHistoricalReads(() => prepareManagedGateClose(store, request) ?? prepareCloseInScope(store, request, address));
 }
-function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmResult<RepeatTransition> {
+function requireCloseRequest(store: Store, request: AnyCloseAttemptRequest): Address {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "A cycle is closed at this gate through a request object");
   requireCondition(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
@@ -658,7 +659,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
   // offering the series a result nobody accepted, and it is refused rather than quietly read or quietly dropped.
   requireCondition(isPlainObject(request.outcome) && exactKeys(request.outcome, GATE_OUTCOME_KEYS),
     "repeat_request_invalid", "An outcome names why the cycle ended, the records that accepted its results, the transitions that cancelled earlier ones and its refusals, and never a result by a key of its own");
-  const { reason, accepting, cancelling, refusals: claimed } = request.outcome;
+  const { accepting, cancelling, refusals: claimed } = request.outcome;
   requireCondition(Array.isArray(accepting) && accepting.every(isRef),
     "repeat_request_invalid", "An outcome names the records that accepted its results by exact references, explicitly none");
   requireCondition(Array.isArray(cancelling) && cancelling.every(isRef),
@@ -670,7 +671,10 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest): OmR
     requireCondition(isPlainObject(item) && isText(item.row),
       "repeat_request_invalid", "Each refusal of a cycle names the row of the journal it stands for");
   }
-  const address = requireAddress(request);
+  return requireAddress(request);
+}
+function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, address: Address): OmResult<RepeatTransition> {
+  const { reason, accepting, cancelling, refusals: claimed } = request.outcome;
   const at = requestOf(address);
   const assessmentGuards: TransactionGuard[] = [];
   // This head is captured before any E1 enumeration. Exact completed repeats never traverse today's ledger.
@@ -1630,4 +1634,218 @@ function sameOwner(left: unknown, right: unknown): boolean {
 }
 function requestOf(address: Address): AnySeriesRequest {
   return { project: address.project, line: address.line, ...ownerFields(address.owner) };
+}
+
+import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_WORK_KIND,
+  readCompletionBinding, prepareManagedCompleteAttempt,
+  type CompletionWork, type ManagedClosure, type ClaimedOutcome } from './series.js';
+import { readCompletionWorkAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
+  type CompletionSnapshot } from './model-call.js';
+export interface CompletionCloseRecord {
+  contract: 'om-completion-close/v1'; project: string; binding: Ref; work: Ref; series: Ref;
+  ledger: Ref | null; journal: Ref | null; claim: GateOutcome; outcome: ClaimedOutcome; waiting: Ref[];
+}
+class ManagedCloseFailure extends Error {
+  constructor(readonly refusal: Refusal) { super(refusal.message); }
+}
+function managedTake<T>(result: OmResult<T>): T { if (!result.ok) throw new ManagedCloseFailure(result.refusal); return result.value; }
+function managedFail(id: string, field: string, message: string, code = 'completion_invalid'): never {
+  const result = refused(code, message, { unit: UNIT, target: id, field }, 'producer');
+  if (!result.ok) throw new ManagedCloseFailure(result.refusal);
+  throw new Error('Unreachable');
+}
+function managedResult<T>(read: () => T): OmResult<Sealed<T>> {
+  return withHistoricalReads(() => {
+    try { return delivered(read()); }
+    catch (error) { if (error instanceof ManagedCloseFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  });
+}
+function completionClaim(claim: GateOutcome): GateOutcome {
+  return { reason: claim.reason,
+    accepting: [...new Map(claim.accepting.map(ref => [canonical(ref), ref])).values()].sort((a,b) => canonical(a).localeCompare(canonical(b))),
+    cancelling: [...new Map(claim.cancelling.map(ref => [canonical(ref), ref])).values()].sort((a,b) => canonical(a).localeCompare(canonical(b))),
+    refusals: [...new Map(claim.refusals.map(row => [row.row, row])).values()].sort((a,b) => a.row.localeCompare(b.row)) };
+}
+/** Exact registry context for the D5 supplier. It is evidence to rederive, never a completeness flag. */
+export function checkManagedCompletionClaims(store: Store, project: string, context: ManagedClosure,
+  accepting: readonly Ref[], refusals: readonly ClaimedRefusal[]): OmResult<Sealed<CompletionSnapshot>> {
+  return managedResult(() => {
+    const snapshot = managedTake(readCompletionWorkAt(store, project, context.work));
+    if (!sameRef(reference(snapshot.binding), context.binding) || !snapshot.complete || snapshot.work.value.closed)
+      managedFail(context.work.id, 'work', 'The close must use one complete exact pre-close registry', 'completion_incomplete');
+    const e5 = (ref: Ref) => ref.id.startsWith(`${acceptedAnswerNamespace(project)}e5:`);
+    const ordered = (values: readonly Ref[]) => [...values].sort((a,b) => canonical(a).localeCompare(canonical(b)));
+    if (canonical(ordered(accepting.filter(e5))) !== canonical(ordered(snapshot.accepting)))
+      managedFail(context.work.id, 'accepting', 'The close must retain every exact supported E5 basis');
+    const required = new Set(snapshot.refusals.map(row => row.row));
+    if (snapshot.refusals.some(row => !refusals.some(item => canonical(item) === canonical(row))))
+      managedFail(context.work.id, 'refusals', 'The close must retain every semantic, technical and control diagnostic');
+    if (refusals.some(row => row.name.startsWith('fact_assessment_') && !required.has(row.row)))
+      managedFail(context.work.id, 'refusals', 'A foreign assessment refusal cannot be added to this complete set');
+    return snapshot as CompletionSnapshot;
+  });
+}
+/** The single managed outcome table: prove the entire work, collect source classes, then derive the reason. */
+function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'>) {
+  const snapshot = managedTake(checkManagedCompletionClaims(store, input.project,
+    { binding: input.binding, work: input.work }, input.claim.accepting, input.claim.refusals));
+  const owner = snapshot.binding.value, series = managedTake(readAnySeriesAt(store, input.project, input.series));
+  const address = seriesAddress(seriesRequestOf(series.value));
+  const attempt = series.value.attempts.find(row => row.ordinal === owner.attempt);
+  if (series.id !== owner.series.id || !attempt || attempt.outcome !== null || canonical(attempt.goal) !== canonical(owner.goal))
+    managedFail(series.id, 'attempt', 'The close retains its exact open original attempt');
+  if (input.ledger) managedTake(checkCompletionLedger(store, snapshot as CompletionSnapshot, input.ledger, input.journal));
+  // A ready registry has physical products, hence an E1 ledger. Absence cannot erase them.
+  else managedFail(series.id, 'ledger', 'Completed managed work requires its exact E1 ledger');
+  const journal = input.journal ? managedTake(readJournalAt(store, input.project, input.journal)) : null;
+  const rows = new Map(journal?.value.rows.map(row => [row.id, row]) ?? []);
+  const routed: RoutedRefusal[] = [], classifications: RefusalClassification[] = [];
+  let subject = false;
+  for (const claim of input.claim.refusals) {
+    const row = rows.get(claim.row);
+    if (!row || row.code !== claim.name || row.goal !== claim.goal) managedFail(series.id, 'refusals', 'Every claim needs its exact checked journal row');
+    let classified: RefusalClassification;
+    if (row.gate === 'E5') {
+      const proof = managedTake(readAssessmentRefusalAt(store, input.project, row.source));
+      if (proof.intent.originalSeries.id !== owner.series.id || proof.intent.attempt !== owner.attempt
+        || canonical(proof.intent.goal) !== canonical(owner.goal) || !snapshot.negative.some(ref => sameRef(ref, reference(proof.result))))
+        managedFail(row.id, 'assessment', 'An E5 row must belong to the exact negative subset');
+      classified = { row: row.id, class: 'proposal', addressee: `node:${proof.target}`, basis: [{ role: 'assessment', ref: reference(proof.result) }] };
+      subject = true;
+    } else if (row.gate === 'E4') {
+      const proof = managedTake(readManagedModelDiagnostic(store, snapshot.binding, row.source));
+      const semantic = proof.reason === 'refused';
+      subject ||= semantic;
+      classified = { row: row.id, class: semantic ? 'proposal' : 'conditions',
+        addressee: semantic ? `node:${row.goal}` : `owner:${address.id}`, basis: row.origin.sources };
+    } else {
+      const proof = derive(store, row as JournalRow, address, owner.attempt, 'outcome.refusals');
+      if ('ok' in proof) managedTake(proof);
+      const derived = proof as Derived;
+      classified = { row: row.id, class: derived.class, addressee: derived.addressee, basis: derived.basis };
+      subject = true;
+    }
+    classifications.push(classified);
+    routed.push({ ...classified, toModel: TO_MODEL[classified.class as RefusalClass] } as RoutedRefusal);
+  }
+  let confirmed: ConfirmedResults = { achieved: [], cancelled: [] };
+  if (owner.owner.kind === 'block') confirmed = managedTake(confirmResults(store, {
+    project: input.project, target: owner.series.id, block: owner.owner.block, goal: owner.goal,
+    attempt: { series: owner.series, ordinal: owner.attempt }, accepting: input.claim.accepting,
+    cancelling: input.claim.cancelling, refusals: input.claim.refusals, managedClosure: { binding: input.binding, work: input.work },
+  }));
+  else if (input.claim.accepting.length || input.claim.cancelling.length)
+    managedFail(owner.series.id, 'accepting', 'No mechanism acceptance provider is registered yet', 'acceptance_unconfirmed');
+  const reason: CompletionReason | null = confirmed.achieved.length || confirmed.cancelled.length ? 'result'
+    : subject ? 'refused' : snapshot.technical.some(row => row.reason === 'interrupted') ? 'interrupted'
+    : snapshot.technical.some(row => row.reason === 'off-form') ? 'off-form' : snapshot.waiting.length ? 'awaiting-owner' : null;
+  if (reason === null || input.claim.reason !== reason)
+    managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
+  const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals };
+  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', ...input,
+    claim: completionClaim(input.claim), outcome, waiting: [...snapshot.waiting] };
+  return { value, snapshot, routed, classifications, rows, address, guards: confirmed.guards ?? [] };
+}
+export function readCompletionCloseAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionCloseRecord>> {
+  return managedResult(() => historicalRead(store, { reader: 'G7.completion-close', project, ref }, () => {
+    const record = managedTake(readRecord<CompletionCloseRecord>(store, ref, { unit: UNIT, target: ref.id,
+      kind: COMPLETION_CLOSE_KIND, idPrefix: `${COMPLETION_CLOSE_KIND}:${project}:` }));
+    const value = record.value;
+    if (!isPlainObject(value) || value.contract !== 'om-completion-close/v1' || value.project !== project
+      || !isRef(value.binding) || !isRef(value.work) || !isRef(value.series) || !isPlainObject(value.claim)
+      || !Array.isArray(value.claim.accepting) || !value.claim.accepting.every(isRef)
+      || !Array.isArray(value.claim.cancelling) || !value.claim.cancelling.every(isRef)
+      || !Array.isArray(value.claim.refusals) || !value.claim.refusals.every(row => isPlainObject(row)
+        && isText(row.row) && isText(row.name) && isText(row.goal))
+      || !['result', 'refused', 'off-form', 'interrupted', 'awaiting-owner'].includes(value.claim.reason)
+      || ![value.ledger, value.journal].every(item => item === null || isRef(item)))
+      managedFail(ref.id, 'record', 'The immutable close proof retains all exact pre-close sources');
+    const derived = deriveManagedClose(store, { project, binding: value.binding, work: value.work,
+      series: value.series, ledger: value.ledger, journal: value.journal, claim: value.claim });
+    if (record.revision !== 1 || record.id !== completionCloseId(project, value.binding.id) || canonical(value) !== canonical(derived.value))
+      managedFail(ref.id, 'record', 'The close proof must equal the single full managed outcome derivation');
+    return derived.value;
+  }, () => managedFail(ref.id, 'history', 'A close proof cannot depend on its own closed attempt')));
+}
+function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<RepeatTransition>> | null {
+  const seriesHead = store.get<AnyRepairSeries>(seriesAddress(request).id);
+  if (!seriesHead) return null;
+  const selected = readCompletionBinding(store, request.project, reference(seriesHead), request.attempt);
+  if (!selected.ok) return selected;
+  if (!selected.value) return null;
+  return managedResult(() => {
+    const binding = selected.value!, id = completionCloseId(request.project, binding.id), old = store.get(id);
+    if (old) {
+      const close = managedTake(readCompletionCloseAt(store, request.project, reference(old)));
+      if (canonical(completionClaim(request.outcome)) !== canonical(close.claim))
+        managedFail(id, 'outcome', 'An already completed managed attempt keeps its entire original claim', 'outcome_conflict');
+      const series = managedTake(readAnySeriesAt(store, request.project, reference(seriesHead)));
+      const attempt = series.value.attempts.find(row => row.ordinal === request.attempt);
+      if (!attempt?.outcome) managedFail(id, 'series', 'A saved close proof requires its atomic A3 outcome');
+      const derived = deriveManagedClose(store, close);
+      const journal = close.journal ? managedTake(readJournalAt(store, request.project, close.journal)) : null;
+      const decided = [...(journal?.value.classifications ?? []).filter(row => !derived.classifications.some(next => next.row === row.row)),
+        ...derived.classifications];
+      const raised: HoldContext[] = [];
+      for (const row of derived.routed.filter(row => row.class === 'unknown')) {
+        const hold = raise(store, derived.address, request.attempt, row, reference(series), derived.rows.get(row.row)!.origin);
+        if ('ok' in hold) managedTake(hold);
+        const checked = hold as Exclude<typeof hold, OmResult<never>>;
+        if (checked.write) managedFail(id, 'hold', 'A completed claim must retain its atomic hold');
+        if (checked.standing) raised.push(checked.standing);
+      }
+      return { writes: [], guards: [], value: reported(seriesAddress(request), series.value as AnyRepairSeries,
+        request.attempt, derived.routed, raised, decided) };
+    }
+    // Capture every mutable head before traversing any supplier or product.
+    const workHead = store.get<CompletionWork>(completionWorkId(request.project, binding.id));
+    const ledgerHead = store.get(callLedgerId(request.project));
+    // Capture mutable product cursors before the historical walk. Their exact old
+    // revisions remain evidence; moving a cursor during this close must still lose CAS.
+    const productHeads = new Map<string, Ref>();
+    if (workHead && Array.isArray(workHead.value.products) && Array.isArray(workHead.value.assignments)) {
+      for (const ref of [...workHead.value.products, ...workHead.value.assignments]) if (isRef(ref)) {
+        const head = store.get(ref.id);
+        if (head) productHeads.set(ref.id, reference(head));
+      }
+    }
+    const journalRead = readJournal(store, { project: request.project });
+    if (!journalRead.ok && journalRead.refusal.code !== 'journal_missing') managedTake(journalRead);
+    const journalHead = journalRead.ok ? journalRead.value : null;
+    if (!workHead) managedFail(id, 'work', 'The managed registry is mandatory');
+    const ledger = managedTake(readCallLedger(store, request.project));
+    if (!ledger || !ledgerHead || !sameRef(reference(ledger), reference(ledgerHead)))
+      managedFail(id, 'ledger', 'Managed closure must retain the captured lawful E1 head');
+    const derived = deriveManagedClose(store, { project: request.project, binding: reference(binding), work: reference(workHead),
+      series: reference(seriesHead), ledger: reference(ledgerHead), journal: journalHead ? reference(journalHead) : null,
+      claim: completionClaim(request.outcome) });
+    const closeWrite = { id, kind: COMPLETION_CLOSE_KIND, expected: 0, value: derived.value };
+    const closeRef = { id, revision: 1, hash: hashJson(derived.value) };
+    const view = pendingCallStore(store, [closeWrite]);
+    const completed = managedTake(prepareManagedCompleteAttempt(view, { ...request,
+      outcome: derived.value.outcome }, closeRef));
+    const writes: GateWrite[] = [closeWrite, ...completed.writes];
+    const guards: TransactionGuard[] = [reference(seriesHead), reference(workHead), reference(ledgerHead),
+      ...productHeads.values(), ...completed.guards, ...derived.guards];
+    let decided: readonly RefusalClassification[] = [];
+    if (derived.classifications.length) {
+      const classified = managedTake(prepareClassifyRefusal(store, { project: request.project, classifications: derived.classifications }));
+      writes.push(...classified.writes); guards.push(...classified.guards); decided = classified.value.classifications;
+    }
+    guards.push(journalHead ? reference(journalHead) : { id: journalId(request.project), absent: true });
+    const raised: HoldContext[] = [];
+    const recorded = { id: seriesHead.id, revision: seriesHead.revision + 1, hash: hashJson(completed.value) };
+    for (const row of derived.routed.filter(row => row.class === 'unknown')) {
+      const hold = raise(store, derived.address, request.attempt, row, recorded, derived.rows.get(row.row)!.origin);
+      if ('ok' in hold) managedTake(hold);
+      const checked = hold as Exclude<typeof hold, OmResult<never>>;
+      if (checked.write) writes.push(checked.write);
+      if (checked.guard) guards.push(checked.guard);
+      if (checked.standing) raised.push(checked.standing);
+    }
+    writes.push({ id: workHead.id, kind: COMPLETION_WORK_KIND, expected: workHead.revision,
+      value: { ...workHead.value, previous: reference(workHead), closed: closeRef } satisfies CompletionWork });
+    return { writes, guards: uniqueTransactionGuards(guards),
+      value: reported(derived.address, completed.value as AnyRepairSeries, request.attempt, derived.routed, raised, decided) };
+  });
 }

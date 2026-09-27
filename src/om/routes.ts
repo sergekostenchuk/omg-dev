@@ -3,6 +3,8 @@ import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
+import { readCompletionWorkAt } from './model-call.js';
+import { completionWorkId, prepareSeriesLineAdmission, readCompletionBinding } from './series.js';
 import { historicalRead, readOmInput, withHistoricalReads } from './input.js';
 import { collectGaps, gateGaps, readGaps, prepareCurrentGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
   type GapMoment, type GapSources } from './gaps.js';
@@ -93,7 +95,7 @@ function normalized(request: RoutesRequest): RoutesRequest {
   return copy({ ...request, tasks: sorted(request.tasks), gaps: { ...request.gaps, records: sorted(request.gaps.records) },
     catalog: { paths: sorted(request.catalog.paths), records: sorted(request.catalog.records) } });
 }
-function routeSources(store: Store, request: RoutesRequest, current: boolean) {
+function routeSources(store: Store, request: RoutesRequest, current: boolean, currentTasks?: ReadonlySet<string>) {
   const gaps = take(readGaps(store, request.gaps));
   if (gaps.sources.project !== request.project) fail('route_source_invalid', request.project, 'gaps', 'The D1 source belongs to another project');
   const input = take(readOmInput(store, request.project, gaps.sources.input));
@@ -121,7 +123,11 @@ function routeSources(store: Store, request: RoutesRequest, current: boolean) {
   }
   for (const ref of unique(guards)) head(store, ref);
   const tasks = new Map<string, ReturnType<typeof checkedTask>>(), writes: Write[] = [];
-  function checkedTask(basis: AnswerTaskBasis) { return take(readAnswerTaskBasis(store, { project: request.project, task: basis, current })); }
+  function checkedTask(basis: AnswerTaskBasis) {
+    const historical = take(readAnswerTaskBasis(store, { project: request.project, task: basis, current: false }));
+    return current && (!currentTasks || currentTasks.has(historical.gap.id))
+      ? take(readAnswerTaskBasis(store, { project: request.project, task: basis, current: true })) : historical;
+  }
   const needed = gaps.collection.gaps.filter(gap => gap.kind === 'repository-fact' && gap.code !== 'inventory_missing' && !gap.deferral);
   for (const basis of request.tasks) {
     const task = checkedTask(basis), gap = needed.find(gap => gap.id === task.gap.id);
@@ -233,16 +239,14 @@ function idOf(request: SavedRoutesRequest): string { return `om-routes:${request
 function requestForHistory(request: SavedRoutesRequest): RoutesRequest {
   return { ...request, tasks: request.tasks.map(record => ({ record })) };
 }
-function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, grouping: RouteGrouping, history?: RouteSearch[]) {
-  const source = routeSources(store, request, current), writes = [...source.writes], guards = [...source.guards], references = [...source.references];
-  if (request.previous) {
-    const previous = loadRoutes(store, { project: request.project, record: request.previous });
-    references.push(reference(previous.record));
-  }
+/** The same answer-selection rule serves full M6 production and one already-owned batch. */
+function selectTaskAnswers(store: Store, request: RoutesRequest, tasks: ReturnType<typeof routeSources>['tasks'],
+  current: boolean, history?: RouteSearch[]) {
+  const writes: Write[] = [], guards: Ref[] = [], references: Ref[] = [];
   const answers = new Map<string, Ref>(), searches: RouteSearch[] = [];
-  if (!current && (!Array.isArray(history) || history.length !== source.tasks.size))
+  if (!current && (!Array.isArray(history) || history.length !== tasks.size))
     fail('route_record_invalid', request.project, 'searches', 'Historical routing must retain every fact search');
-  for (const [gap, task] of source.tasks) {
+  for (const [gap, task] of tasks) {
     const old = history?.filter(item => item.gap === gap);
     if (!current && old?.length !== 1) fail('route_record_invalid', gap, 'searches', 'A fact requires one historical search basis');
     const preparedSearch = current
@@ -272,6 +276,16 @@ function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, gr
     if (matches.length) answers.set(gap, sorted(matches.map(match => match.record))[0]!);
     searches.push({ gap, index: reference(search.record), checks: sorted(checks) });
   }
+  return { answers, searches, writes, guards, references };
+}
+function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, grouping: RouteGrouping, history?: RouteSearch[]) {
+  const source = routeSources(store, request, current), writes = [...source.writes], guards = [...source.guards], references = [...source.references];
+  if (request.previous) {
+    const previous = loadRoutes(store, { project: request.project, record: request.previous });
+    references.push(reference(previous.record));
+  }
+  const { answers, searches, ...selection } = selectTaskAnswers(store, request, source.tasks, current, history);
+  writes.push(...selection.writes); guards.push(...selection.guards); references.push(...selection.references);
   const fallback = planVerifiedGaps(source.gaps.collection.gaps as Gap[], request.catalog, grouping);
   const recordFor = (gap: string): Ref => reference(source.gaps.records.find(record => record.value.gap.id === gap)!);
   const taskFor = (gap: string): Ref | null => source.tasks.has(gap) ? reference(source.tasks.get(gap)!.record) : null;
@@ -322,6 +336,40 @@ function loadRoutes(store: Store, request: RoutesReadRequest) {
 export function readRoutes(store: Store, request: RoutesReadRequest): OmResult<Sealed<{ record: Revision<RoutesRecord>; references: Ref[] }>> {
   requireRead(store, request); request = copy(request);
   return outcome(() => loadRoutes(store, request));
+}
+/** Existing managed work keeps its immutable whole assignment while rechecking only its own searches.
+ * The owner reader proves the initial complete M6 and full attempt goal; this is never an opening admission. */
+export function prepareManagedRouteBatch(store: Store, request: {
+  project: string; series: Ref; attempt: number; routes: Ref; batch: string;
+}): OmResult<Sealed<{ record: Revision<RoutesRecord>; batch: RoutedBatch; writes: Write[]; guards: Ref[]; references: Ref[] }>> {
+  requireStore(store);
+  if (!object(request) || !text(request.project) || !isRef(request.series) || !isRef(request.routes)
+    || !Number.isSafeInteger(request.attempt) || request.attempt < 1 || !text(request.batch)) invalid('managed');
+  return outcome(() => {
+    const binding = take(readCompletionBinding(store, request.project, request.series, request.attempt));
+    if (!binding || !same(binding.value.plan.routes, request.routes) || !binding.value.plan.batches.includes(request.batch))
+      fail('answer_route_foreign', request.routes.id, 'completion', 'The exact whole batch must belong to this proved managed attempt');
+    const line = take(prepareSeriesLineAdmission(store, request.project, request.series));
+    const attempt = line.series.value.attempts.find(row => row.ordinal === request.attempt);
+    if (!attempt || attempt.outcome !== null || !same(attempt.goal, binding.value.goal))
+      fail('answer_route_foreign', request.series.id, 'attempt', 'Current admission requires the same unfinished attempt and full original goal');
+    const workHead = store.get(completionWorkId(request.project, binding.id));
+    if (!workHead) fail('completion_invalid', binding.id, 'work', 'The current managed registry is mandatory');
+    const work = take(readCompletionWorkAt(store, request.project, reference(workHead)));
+    if (work.work.value.closed) fail('completion_closed', binding.id, 'work', 'A completed attempt cannot prepare a new action');
+    const historical = loadRoutes(store, { project: request.project, record: request.routes });
+    const batch = historical.record.value.batches.find(row => row.id === request.batch)!;
+    const sourceRequest = normalized(requestForHistory(historical.record.value.request));
+    const targets = new Set(batch.items.map(item => item.gap));
+    const source = routeSources(store, sourceRequest, true, targets);
+    const selection = selectTaskAnswers(store, sourceRequest, new Map([...source.tasks].filter(([gap]) => targets.has(gap))), true);
+    if (selection.answers.size)
+      fail('route_stale', request.batch, 'searches', 'A target item now has an applicable answer; the original whole batch cannot be sent again');
+    head(store, request.routes);
+    return { record: historical.record, batch, writes: mergedWrites([...source.writes, ...selection.writes]),
+      guards: unique([reference(binding), request.routes, ...line.guards, ...source.guards, ...selection.guards]),
+      references: unique([...historical.references, reference(binding), ...line.references, ...source.references, ...selection.references]) };
+  });
 }
 /** Includes the task, index initialization, captured evidence and route in one guarded transaction. */
 export function prepareRoutes(store: Store, request: RoutesRequest): OmResult<Sealed<PreparedRoutes>> {

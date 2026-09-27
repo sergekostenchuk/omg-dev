@@ -1,3 +1,5 @@
+import { readCompletionCloseAt } from './repeat-gate.js';
+import { isProxy } from 'node:util/types';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -410,10 +412,30 @@ export function assembleModelParts(store: Store, request: PartAssemblyRequest): 
   requireAssembly(store, request); request = sealed(request) as PartAssemblyRequest;
   return result(() => {
     const id = `om-part-assembly:${request.project}:${hashJson(request)}`, old = store.get(id);
-    if (old) return take(readPartAssembly(store, { project: request.project, record: reference(old) }));
+    if (old) {
+      const saved = take(readPartAssembly(store, { project: request.project, record: reference(old) }));
+      const first = take(readPartResult(store, { project: request.project, record: request.results[0]! }));
+      const admitted = take(readCall(store, request.project, first.record.value.request.call));
+      const binding = take(readCompletionBinding(store, request.project, admitted.value.series, admitted.value.attempt));
+      if (binding) {
+        const update = take(prepareCompletionProducts(store, reference(binding), [reference(saved.record)]));
+        if (update.writes.length) take(writeGuarded(store, { unit: 'E4', target: id,
+          writes: update.writes as Write[], guards: update.guards as TransactionGuard[] }));
+      }
+      return saved;
+    }
     const prepared = deriveAssembly(store, request, true);
-    take(writeGuarded(store, { unit: 'E4', target: id, guards: prepared.guards, writes: [prepared.proposal, prepared.record]
-      .map(record => ({ id: record.id, kind: record.kind, expected: 0, value: record.value })) }));
+    const writes: Write[] = [prepared.proposal, prepared.record]
+      .map(record => ({ id: record.id, kind: record.kind, expected: 0, value: record.value }));
+    const guards: TransactionGuard[] = [...prepared.guards];
+    const first = take(readPartResult(store, { project: request.project, record: request.results[0]! }));
+    const admitted = take(readCall(store, request.project, first.record.value.request.call));
+    const binding = take(readCompletionBinding(store, request.project, admitted.value.series, admitted.value.attempt));
+    if (binding) {
+      const update = take(prepareCompletionProducts(pendingCallStore(store, writes), reference(binding), [reference(prepared.record)]));
+      writes.push(...update.writes as Write[]); guards.push(...update.guards);
+    }
+    take(writeGuarded(store, { unit: 'E4', target: id, guards, writes }));
     return { record: prepared.record, proposal: prepared.proposal, references: prepared.references };
   });
 }
@@ -558,6 +580,23 @@ export function readModelCycle(store: Store, request: { project: string; record:
     return { record: record as Revision<ModelCycleRecord>, last, assembly: record.value.assembly, diagnostic: record.value.diagnostic, repeated: true };
   });
 }
+/** A cycle cursor may be lost after all its products have already closed the attempt.
+ * Restore only that cursor; closed work still admits no new products or assignments. */
+function prepareCycleCompletion(store: Store, binding: Ref, cycle: Ref, value: ModelCycleRecord) {
+  const products = [cycle, ...(value.assembly ? [value.assembly] : []), ...(value.diagnostic ? [value.diagnostic] : [])];
+  const head = store.get<CompletionWork>(completionWorkId(value.request.project, binding.id));
+  if (!head) fail('completion_invalid', binding.id, 'work', 'A cycle retains its original completion registry');
+  const snapshot = take(readCompletionWorkAt(store, value.request.project, reference(head)));
+  if (!same(reference(snapshot.binding), binding))
+    fail('completion_foreign', cycle.id, 'binding', 'A cycle belongs to its exact completion owner');
+  if (!snapshot.work.value.closed) return take(prepareCompletionProducts(store, binding, products));
+  // readCompletionWorkAt proves the exact pre-close composition and the common G7 outcome.
+  // The cursor itself is optional; every underlying terminal product must be in that composition.
+  const sources = refs([...value.steps.map(step => step.record), ...products.slice(1)]);
+  if (!sources.every(source => snapshot.products.some(product => same(product, source))))
+    fail('completion_closed', cycle.id, 'products', 'Cycle recovery cannot add evidence to a closed attempt');
+  return { writes: [] as Write[], guards: [reference(head), binding, ...sources] as TransactionGuard[] };
+}
 /** Continue only addressed source reads and assigned node parts; neither starts another A3 attempt. */
 export async function runModelCycle(store: Store, request: ModelCallRequest, signal?: AbortSignal): Promise<OmResult<Sealed<ModelCycleOutcome>>> {
   requireModelRequest(store, request);
@@ -571,7 +610,13 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
     for (const step of saved.record.value.steps) {
       const call = same(step.record, reference(saved.last.record)) ? saved.last
         : take(readModelCall(store, { project: request.project, record: step.record }));
-      settlePhysicalCall(store, call.record, call.call);
+      settleAppliedCall(store, call as ModelCallOutcome);
+    }
+    const owner = saved.last.record.value.om.completionOwner;
+    if (owner) {
+      const prepared = prepareCycleCompletion(store, owner.binding, reference(saved.record), saved.record.value as ModelCycleRecord);
+      if (prepared.writes.length) take(writeGuarded(store, { unit: 'E4', target: owner.binding.id,
+        writes: prepared.writes as Write[], guards: prepared.guards as TransactionGuard[] }));
     }
     return saved as ModelCycleOutcome;
   });
@@ -620,9 +665,15 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       break;
     }
     return result(() => {
-      cycleSources(store, request.project, value);
-      const written = take(writeGuarded<ModelCycleRecord>(store, { unit: 'E4', target: id,
-        writes: [{ id, kind: MODEL_CYCLE_KIND, expected: 0, value }], guards: refs(value.steps.map(step => step.record)) }));
+      const last = cycleSources(store, request.project, value);
+      const cycleWrite: Write = { id, kind: MODEL_CYCLE_KIND, expected: 0, value };
+      const writes = [cycleWrite], guards: TransactionGuard[] = refs(value.steps.map(step => step.record));
+      const owner = last.record.value.om.completionOwner;
+      if (owner) {
+        const work = prepareCycleCompletion(pendingCallStore(store, writes), owner.binding, writeRef(cycleWrite), value);
+        writes.push(...work.writes as Write[]); guards.push(...work.guards);
+      }
+      const written = take(writeGuarded<ModelCycleRecord>(store, { unit: 'E4', target: id, writes, guards }));
       const read = take(readModelCycle(store, { project: request.project, record: reference(written[0]!) }));
       return { ...read, repeated: false } as ModelCycleOutcome;
     });
@@ -632,9 +683,9 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
 // Dispatch lifecycle.
 import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
-import { recordCall, readCall, settleCall, prepareCallDispatch, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory } from './call-record.js';
+import { recordCall, readCall, readCallLedgerAt, settleCall, prepareCallDispatch, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory, type CallLedger } from './call-record.js';
 import { prepareQuestionPacket, preparePartResult, partResponseId,
-  PART_RESPONSE_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
+  PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
 import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, prepareSeriesLineAdmission,
   readSeriesWorkAdmission, readSeriesAdmissionChange, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
 import { prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
@@ -660,7 +711,7 @@ export type ModelCallState =
   | { state: 'received'; record: Revision<OmModelCall>; exchange: Revision<ModelExchange>; transport: AdapterResult }
   | { state: 'applied' | 'application-refused' | 'recovered'; outcome: ModelCallOutcome };
 export interface OmModelCall extends ModelCall {
-  om: { version: 'om-model-call/v1'; application: ModelApplicationState; request: ModelCallRequest; call: Ref; exchange: Ref | null;
+  om: { version: 'om-model-call/v1' | 'om-model-call/managed-v1'; completionOwner?: CompletionCallOwner; application: ModelApplicationState; request: ModelCallRequest; call: Ref; exchange: Ref | null;
     part: { proposal: Ref; result: Ref } | null; diagnostic: Ref | null; input: Ref | null; failure: Refusal | null; rejection: Ref | null; completion?: Ref | null;
     admission?: ModelWorkAdmission; terminal?: ModelTerminalWitness };
 }
@@ -679,13 +730,34 @@ const EXCHANGE_KIND = 'om-model-exchange';
 const modelRecordId = (project: string, requestId: string) => `model-call:${project}:om:${hashJson(requestId)}`;
 const exchangeId = (request: ModelCallRequest) => `${EXCHANGE_KIND}:${request.project}:${hashJson(request)}`;
 const writeRef = (write: Write): Ref => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) });
-function pendingCallStore(store: Store, writes: readonly Write[]): Store {
-  const pending = new Map(writes.map(write => [write.id, { ...writeRef(write), kind: write.kind, value: write.value }]));
+export function pendingCallStore(store: Store, writes: readonly Write[]): Store {
+  const pending = new Map(writes.map(write => [write.id,
+    sealed({ ...writeRef(write), kind: write.kind, value: write.value })]));
+  const get = (id: string, revision?: number) => {
+    const value = pending.get(id);
+    return value && (revision === undefined || revision === value.revision) ? value : store.get(id, revision);
+  };
+  // A frozen locally constructed overlay over a real Store is an immutable source view.
+  // Keep opaque caller proxies opaque: their exact reads may intentionally change beneath a test or transaction.
+  if (!isProxy(store)) {
+    const methods = Object.create(Store.prototype) as Store;
+    const view = Object.create(methods) as Store;
+    Object.defineProperty(view, 'path', { value: store.path });
+    for (const name of Object.getOwnPropertyNames(Store.prototype)) {
+      if (name === 'constructor') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(Store.prototype, name)!;
+      if (descriptor.get) {
+        Object.defineProperty(methods, name, { get: () => Reflect.get(store, name, store) });
+        continue;
+      }
+      const member: unknown = Reflect.get(store, name, store);
+      if (typeof member === 'function') Object.defineProperty(methods, name, { value: name === 'get' ? get : member.bind(store) });
+    }
+    Object.freeze(methods);
+    return Object.freeze(view) as Store;
+  }
   return new Proxy(store, { get(target, key) {
-    if (key === 'get') return (id: string, revision?: number) => {
-      const value = pending.get(id);
-      return value && (revision === undefined || revision === value.revision) ? value : target.get(id, revision);
-    };
+    if (key === 'get') return get;
     const member: unknown = Reflect.get(target, key, target);
     return typeof member === 'function' ? member.bind(target) : member;
   } });
@@ -746,7 +818,7 @@ function modelAssignment(store: Store, request: ModelCallRequest) {
   return { packet, payload, environment, binding, wire, series, admission };
 }
 function modelWorkAdmission(store: Store, record: Revision<OmModelCall>, series: Ref): ModelWorkAdmission {
-  if (!object(record.value) || !object(record.value.om) || record.value.om.version !== 'om-model-call/v1')
+  if (!object(record.value) || !object(record.value.om) || !['om-model-call/v1', 'om-model-call/managed-v1'].includes(record.value.om.version))
     fail('model_call_record_invalid', record.id, 'admission', 'An original admission belongs to a complete E4 runtime record');
   const saved = record.value.om.admission;
   if (saved !== undefined && (!object(saved) || !exactKeys(saved, ['contract', 'series', 'pointer'])
@@ -759,6 +831,7 @@ function modelWorkAdmission(store: Store, record: Revision<OmModelCall>, series:
   return admission;
 }
 function prepareModelTerminalWitness(store: Store, source: Revision<OmModelCall>) {
+  if (source.value.om.completionOwner) return null;
   const call = take(readCall(store, source.value.projectId, source.value.om.call));
   const admission = modelWorkAdmission(store, source, call.value.series);
   const changed = readSeriesAdmissionChange(store, { project: source.value.projectId,
@@ -836,24 +909,17 @@ function prepareModelFinish(store: Store, request: FinishModelAttemptRequest) {
     || call.value.attempt !== packet.value.request.attempt.ordinal)
     fail('model_call_request_invalid', request.packet.id, 'call', 'Completion belongs to this exact admitted packet and attempt');
   if (request.response) take(readPacketResponse(store, { project: request.project, packet: request.packet, call: request.call, response: request.response }));
-  const sources = refs([request.packet, request.call, ...(request.response ? [request.response] : []), ...(request.evidence ?? [])]);
-  for (const ref of sources) {
-    const record = store.get(ref.id, ref.revision);
-    if (!record || !same(reference(record), ref)) fail('model_call_request_invalid', ref.id, 'evidence', 'Completion evidence must exist at the exact reference');
-  }
-  const diagnosticValue: UnitRefusalRecord = { gate: 'E4', refusals: [...new Set(call.value.gaps.map(gap => gap.goal))].sort().map(goal =>
-    ({ code: request.code, goal, remedy: request.message, origin: { name: request.code, stage: `model-call:${request.reason}`, subject: call.value.call,
-      sources: sources.map(ref => ({ role: ref.id === request.packet.id ? 'packet' : ref.id === request.call.id ? 'call'
-        : ref.id === request.response?.id ? 'response' : 'evidence', ref })) } })) };
-  const diagnosticWrite: Write = { id: `${unitRefusalNamespace(request.project)}e4:${hashJson(diagnosticValue)}`,
-    kind: UNIT_REFUSAL_KIND, expected: 0, value: diagnosticValue };
+  const binding = take(readCompletionBinding(store, request.project, call.value.series, call.value.attempt)) as Revision<CompletionOwner> | null;
+  const diagnosticWrite = modelFinishDiagnostic(store, request, binding);
   const diagnostic = writeRef(diagnosticWrite), old = store.get(diagnostic.id);
-  if (old && (old.kind !== UNIT_REFUSAL_KIND || old.revision !== 1 || !same(old.value, diagnosticValue)))
+  if (old && (old.kind !== UNIT_REFUSAL_KIND || old.revision !== 1 || !same(old.value, diagnosticWrite.value)))
     fail('model_call_record_invalid', diagnostic.id, 'diagnostic', 'The immutable diagnostic cannot be replaced');
+  if (binding && old) return { diagnostic, writes: [] as Write[], guards: [reference(old)] };
   const writes: Write[] = old ? [] : [diagnosticWrite];
   const journal = take(prepareRecordRefusal(pendingCallStore(store, writes), { project: request.project, source: diagnostic }));
   writes.push(...journal.writes);
   const claims = journal.value.rows.filter(row => same(row.source, diagnostic)).map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+  if (binding) return { diagnostic, writes, guards: externalGuards([...journal.guards, ...(old ? [reference(old)] : [])], writes) };
   const series = take(readAnySeriesAt(store, request.project, call.value.series));
   const completion = take(prepareCompleteAttempt(pendingCallStore(store, writes), { ...seriesRequestOf(series.value),
     attempt: call.value.attempt, outcome: { reason: request.reason, achieved: [], cancelled: [], refusals: claims } }));
@@ -969,6 +1035,10 @@ function checkModelCompletion(store: Store, record: Revision<OmModelCall>, sourc
     || !same(value.response, transport.kind === 'answered'
       ? { chars: transport.raw.length, bytes: Buffer.byteLength(transport.raw), record: value.om.exchange } : null))
     fail('model_call_record_invalid', record.id, 'rejection', 'A rejected application retains its original transport and checked failing source window');
+  if (value.om.completionOwner) {
+    if (value.om.diagnostic !== null) fail('completion_invalid', record.id, 'diagnostic', 'Lost application admission is not a local interrupted terminal');
+    return;
+  }
   if (!rejected.record.value.terminal && rejected.record.value.completion) {
     if (value.om.diagnostic !== null)
       fail('model_call_record_invalid', record.id, 'diagnostic', 'An already completed attempt is preserved, not completed again');
@@ -983,15 +1053,38 @@ function checkModelCompletion(store: Store, record: Revision<OmModelCall>, sourc
   }
 }
 
-/** Exact E4 provenance and physical usage, including the original terminal completion contract. */
-export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallPhysical>> {
+function checkedModelExchange(store: Store, request: ModelCallRequest, callRef: Ref, exchangeRef: Ref) {
+  const { wire } = modelAssignment(store, request);
+    const exchange = take(readRecord<ModelExchange>(store, exchangeRef,
+      { unit: 'E4', target: exchangeRef.id, id: exchangeId(request), kind: EXCHANGE_KIND }));
+    if (exchange.revision !== 1 || !object(exchange.value)
+      || !exactKeys(exchange.value, ['project', 'request', 'call', 'wire', 'process', 'launchError', 'admissionGuards'])
+      || exchange.value.project !== request.project || !same(exchange.value.request, request)
+      || !same(exchange.value.call, callRef) || !same(exchange.value.wire, wire)
+      || !Array.isArray(exchange.value.admissionGuards) || !exchange.value.admissionGuards.length
+      || !exchange.value.admissionGuards.every(isRef) || !same(refs(exchange.value.admissionGuards), exchange.value.admissionGuards)
+      || (exchange.value.process === null) === (exchange.value.launchError === null))
+      fail('model_call_record_invalid', exchangeRef.id, 'exchange', 'Transport evidence must belong to this exact request and original admission');
+    for (const guard of exchange.value.admissionGuards) {
+      const source = store.get(guard.id, guard.revision);
+      if (!source || !same(reference(source), guard))
+        fail('model_call_record_invalid', exchangeRef.id, 'admissionGuards', 'The received exchange retains exact dispatch sources');
+    }
+    return { exchange: exchange as Revision<ModelExchange>, transport: transportOf(exchange.value as ModelExchange) };
+}
+
+function requireModelCallRead(store: Store, request: { project: string; record: Ref }): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('record');
+}
+/** Exact E4 provenance and physical usage, including the original terminal completion contract. */
+export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallPhysical>> {
+  requireModelCallRead(store, request);
   return result<ModelCallPhysical>(() => {
     const record = take(readRecord<OmModelCall>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `model-call:${request.project}:om:`, kind: 'model-call' }));
     const value = record.value;
-    if (!object(value) || !object(value.om) || value.om.version !== 'om-model-call/v1' || !isRef(value.om.call))
+    if (!object(value) || Object.hasOwn(value, 'transport') || !object(value.om) || !['om-model-call/v1', 'om-model-call/managed-v1'].includes(value.om.version) || !isRef(value.om.call))
       fail('model_call_record_invalid', record.id, 'om', 'The runtime record needs explicit E4 provenance');
     requireModelRequest(store, value.om.request);
     if (value.om.request.project !== request.project) fail('model_call_record_invalid', record.id, 'project', 'A call belongs to this project');
@@ -1008,6 +1101,9 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
       || !same(admitted.value.goal, assignment.admission.goal) || admitted.value.purpose !== assignment.admission.purpose
       || !same(admitted.value.gaps, [...assignment.admission.gaps].sort(compareJson)))
       fail('model_call_record_invalid', record.id, 'call', 'The runtime call must reproduce its E1 admission');
+    const completion = checkedCompletionOwner(store, request.project, value.om.call, value.om.request.packet, value.om.completionOwner);
+    if (value.om.version !== (completion ? 'om-model-call/managed-v1' : 'om-model-call/v1'))
+      fail('completion_invalid', record.id, 'version', 'The physical contract must follow the independently proved attempt era');
     modelWorkAdmission(store, record as Revision<OmModelCall>, admitted.value.series);
     checkModelTerminal(store, record as Revision<OmModelCall>);
     if (value.om.application === 'running') {
@@ -1031,22 +1127,7 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
       return { record: record as Revision<OmModelCall>, call: value.om.call, packet: value.om.request.packet, transport: null };
     }
     if (!isRef(value.om.exchange)) fail('model_call_record_invalid', record.id, 'exchange', 'A completed runtime call needs immutable transport evidence');
-    const exchange = take(readRecord<ModelExchange>(store, value.om.exchange,
-      { unit: 'E4', target: record.id, id: exchangeId(value.om.request), kind: EXCHANGE_KIND }));
-    if (exchange.revision !== 1 || !object(exchange.value)
-      || !exactKeys(exchange.value, ['project', 'request', 'call', 'wire', 'process', 'launchError', 'admissionGuards'])
-      || exchange.value.project !== request.project || !same(exchange.value.request, value.om.request)
-      || !same(exchange.value.call, value.om.call) || !same(exchange.value.wire, wire)
-      || !Array.isArray(exchange.value.admissionGuards) || !exchange.value.admissionGuards.length
-      || !exchange.value.admissionGuards.every(isRef) || !same(refs(exchange.value.admissionGuards), exchange.value.admissionGuards)
-      || (exchange.value.process === null) === (exchange.value.launchError === null))
-      fail('model_call_record_invalid', record.id, 'exchange', 'Transport evidence must belong to this exact request and original admission');
-    for (const guard of exchange.value.admissionGuards) {
-      const source = store.get(guard.id, guard.revision);
-      if (!source || !same(reference(source), guard))
-        fail('model_call_record_invalid', record.id, 'admissionGuards', 'The received exchange retains exact dispatch sources');
-    }
-    const transport = transportOf(exchange.value as ModelExchange);
+    const { transport } = checkedModelExchange(store, value.om.request, value.om.call, value.om.exchange);
     if (!same(value.usage, transport.usage) || !same(value.confirmed, transport.confirmed)
       || value.usageSource !== (transport.usage === null ? 'unavailable' : 'adapter')
       || !Number.isSafeInteger(value.finishedAt) || value.finishedAt! < value.startedAt)
@@ -1070,7 +1151,8 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
 
 /** Historical playback additionally checks the saved product application through its original producer. */
 export function readModelCallState(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallState>> {
-  return result<ModelCallState>(() => {
+  requireModelCallRead(store, request);
+  return result<ModelCallState>(() => historicalRead(store, { reader: 'E4.model-call-state', project: request.project, ref: request.record }, () => {
     const physical = take(readModelCallPhysical(store, request));
     const record = physical.record as Revision<OmModelCall>, value = record.value;
     if (value.om.application === 'running') return { state: 'running', record };
@@ -1131,7 +1213,7 @@ export function readModelCallState(store: Store, request: { project: string; rec
     } else if (value.om.diagnostic !== null) fail('model_call_record_invalid', record.id, 'diagnostic', 'A substantive answer cannot manufacture an attempt refusal');
     return { state: 'applied', outcome: { record: record as Revision<OmModelCall>, packet: value.om.request.packet, call: value.om.call, response, outcome,
       part: value.om.part, diagnostic: value.om.diagnostic, repeated: true } };
-  });
+  }, () => fail('model_call_record_invalid', request.record.id, 'history', 'A physical outcome cannot derive through its own application')));
 }
 
 /** Product reads cannot mistake a durable receipt for a completed product result. */
@@ -1159,7 +1241,7 @@ function applyReceivedModelCall(store: Store, state: Extract<ModelCallState, { s
     const prepared = take(prepareQuestionPacket(store, assignment.packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet))
       fail('model_call_request_invalid', request.packet.id, 'packet', 'Application retains its exact currently admitted assignment');
-    guards.push(...prepared.guards);
+    guards.push(...prepared.guards); writes.push(...prepared.writes);
     const dispatch = take(prepareCallDispatch(store, request.project, call));
     guards.push(...dispatch.guards);
     let response: Ref | null = null, outcome: CheckedAnswerForm | null = null,
@@ -1210,6 +1292,12 @@ function applyReceivedModelCall(store: Store, state: Extract<ModelCallState, { s
       usage: transport.usage, usageSource: transport.usage === null ? 'unavailable' : 'adapter', error: failure?.code ?? null,
       om: { ...receiptRecord.value.om, application: 'applied', exchange: exchangeRef, part, input, diagnostic, failure } };
     writes.push({ id, kind: 'model-call', expected: receiptRecord.revision, value: finished });
+    if (finished.om.completionOwner) {
+      const terminal = writeRef(writes.at(-1)!);
+      const work = take(prepareCompletionProducts(pendingCallStore(store, writes), finished.om.completionOwner.binding,
+        [terminal, ...(diagnostic ? [diagnostic] : [])]));
+      writes.push(...work.writes as Write[]); guards.push(...work.guards.filter(isRef));
+    }
     const applicationGuards = externalGuards(guards, writes);
     const committed = writeGuarded<OmModelCall>(store, { unit: 'E4', target: id, writes, guards: applicationGuards });
     const record = take(committed).find(record => record.id === id)!;
@@ -1228,6 +1316,13 @@ function settlePhysicalCall(store: Store, record: Revision<ModelCall> | Sealed<R
   else take(settleCall(store, call, record.value.usage, record.value.status === 'succeeded' ? 'succeeded' : 'failed'));
 }
 function settleAppliedCall(store: Store, outcome: ModelCallOutcome): ModelCallOutcome {
+  const owner = outcome.record.value.om.completionOwner;
+  if (owner && outcome.record.value.om.application !== 'application-refused') {
+    const prepared = take(prepareCompletionProducts(store, owner.binding,
+      [reference(outcome.record), ...(outcome.diagnostic ? [outcome.diagnostic] : [])]));
+    if (prepared.writes.length) take(writeGuarded(store, { unit: 'E4', target: owner.binding.id,
+      writes: prepared.writes as Write[], guards: prepared.guards as TransactionGuard[] }));
+  }
   settlePhysicalCall(store, outcome.record, outcome.call);
   return outcome;
 }
@@ -1252,21 +1347,25 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
     const prepared = take(prepareQuestionPacket(store, packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet)) fail('model_call_request_invalid', request.packet.id, 'packet', 'Dispatch uses exactly the currently admitted E2 packet');
     const guarded = new Proxy(store, { get(target, key) {
-      if (key === 'writeMany') return (writes: Write[], guards: Ref[] = []) => target.writeMany(writes, refs([...guards, ...prepared.guards, ...admission.guards, request.packet]));
+      if (key === 'writeMany') return (writes: Write[], guards: Ref[] = []) => target.writeMany(writes, externalGuards([...guards, ...prepared.guards, ...admission.guards, request.packet], writes));
       const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
     } });
     const admitted = take(recordCall(guarded, request.project, assignment.admission));
     // E1 alone precedes the durable running claim. A repeat without that claim has not sent;
     // fresh dispatch admission plus expected=0 arbitrates concurrent resumptions.
     const call = reference(admitted.call), startedAt = Date.now();
+    const completion = take(prepareCompletionCall(store, request.project, assignment.admission));
+    const claimPacket = take(prepareQuestionPacket(store, packet.value.request as QuestionPacketRequest));
     const running: OmModelCall = { projectId: request.project, draftId: packet.id, purpose: payload.purpose as string,
       requestId: wire.requestId, startedAt, finishedAt: null, status: 'running', requested: binding,
       confirmed: unknownConfirmed(), request: { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(payload), record: request.packet },
       response: null, usage: null, usageSource: 'unavailable', error: null,
-      om: { version: 'om-model-call/v1', application: 'running', request, call, exchange: null, part: null, diagnostic: null, input: null, failure: null, rejection: null,
+      om: { version: completion.owner ? 'om-model-call/managed-v1' : 'om-model-call/v1',
+        ...(completion.owner ? { completionOwner: { ...completion.owner, call } } : {}), application: 'running', request, call, exchange: null, part: null, diagnostic: null, input: null, failure: null, rejection: null,
         admission: { contract: 'om-model-admission/v1', series: assignment.admission.series, pointer: admission.pointer } } };
     const physical = await startPhysicalTransport(store, { project: request.project, call, packet: payload as Json, role: request.role },
-      { id, kind: 'model-call', expected: 0, value: running }, [...prepared.guards, ...admission.guards, request.packet], signal);
+      { id, kind: 'model-call', expected: 0, value: running }, [...claimPacket.guards, ...admission.guards, request.packet], signal,
+      completion.guards as TransactionGuard[], completion.writes as Write[]);
     const runningRecord = physical.record as Revision<OmModelCall>;
     const exchange: ModelExchange = { project: request.project, request, call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError, admissionGuards: physical.guards };
@@ -1299,7 +1398,7 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
 export interface ModelTransportRequest { project: string; call: Ref; packet: Json; role: 'implementer' | 'reviewer' }
 interface TransportExchange extends Omit<ModelExchange, 'request' | 'admissionGuards'> { request: ModelTransportRequest }
 export interface TransportModelCall extends ModelCall {
-  transport: { version: 'om-model-transport/v1'; request: ModelTransportRequest; exchange: Ref | null };
+  transport: { version: 'om-model-transport/v1' | 'om-model-transport/managed-v1'; completionOwner?: CompletionCallOwner; request: ModelTransportRequest; exchange: Ref | null };
 }
 export interface ModelTransportOutcome { record: Revision<TransportModelCall>; call: Ref; exchange: Ref | null; result: AdapterResult; repeated: boolean }
 const DIRECT_TRANSPORT_PURPOSES: readonly string[] = Object.freeze(['fact-assessment', 'stop-analysis', 'origin-analysis']);
@@ -1361,7 +1460,7 @@ function assessmentTransportAdmission(store: Store, request: ModelTransportReque
 }
 /** Shared physical boundary: real body fingerprint, current purpose admission and durable claim before spawn. */
 async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal,
-  extraGuards: readonly TransactionGuard[] = []) {
+  extraGuards: readonly TransactionGuard[] = [], sourceWrites: readonly Write[] = []) {
   const assignment = transportAssignment(store, request), prepared = take(prepareCallDispatch(store, request.project, request.call));
   const assessmentGuards = assessmentTransportAdmission(store, request, assignment.call, assignment.binding, true);
   const line = 'om' in (running.value as ModelCall)
@@ -1373,11 +1472,12 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
     && counter.value.projectId === request.project && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0),
   'research_dispatch_invalid', 'Invalid project dispatch counter');
   let record = take(writeGuarded<ModelCall>(store, { unit: 'E4', target: running.id,
-    writes: [{ ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
+    writes: [...sourceWrites, { ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
       { id: counterId, kind: 'project-dispatch', expected: counter?.revision ?? 0,
         value: { projectId: request.project, serial: (counter?.value.serial ?? 0) + 1 } }],
     guards: uniqueTransactionGuards([...admissionGuards, ...assessmentGuards, ...extraGuards,
-      ...(counter ? [reference(counter)] : [])]) }))[0]!;
+      ...(counter ? [reference(counter)] : [])].filter(guard => !isRef(guard) || !sourceWrites.some(write => same(writeRef(write), guard)))) }))
+    .find(row => row.id === running.id)!;
   let processResult: ProcessResult | null = null, launchError: ModelExchange['launchError'] = null;
   try { processResult = await runProcess(assignment.binding.command, assignment.environment.workspace,
     canonical(assignment.wire), assignment.environment.timeoutMs, signal, true, pid => {
@@ -1400,7 +1500,7 @@ export function readModelTransport(store: Store, request: { project: string; rec
   return result(() => {
     const record = take(readRecord<TransportModelCall>(store, request.record,
       { unit: 'E4', target: request.record.id, idPrefix: `model-call:${request.project}:om:`, kind: 'model-call' }));
-    if (!object(record.value) || !object(record.value.transport) || record.value.transport.version !== 'om-model-transport/v1')
+    if (!object(record.value) || Object.hasOwn(record.value, 'om') || !object(record.value.transport) || !['om-model-transport/v1', 'om-model-transport/managed-v1'].includes(record.value.transport.version))
       fail('model_call_record_invalid', record.id, 'transport', 'Direct transport playback requires explicit transport provenance');
     const source = record.value.transport.request;
     requireTransport(store, source);
@@ -1409,6 +1509,11 @@ export function readModelTransport(store: Store, request: { project: string; rec
     if (!directTransportPurpose(call.value.purpose))
       fail('model_call_request_invalid', call.id, 'purpose', 'Ordinary dispatch is admitted through the E2/E3 orchestrator');
     assessmentTransportAdmission(store, source, call, binding, false);
+    const completion = checkedCompletionOwner(store, request.project, source.call,
+      call.value.basis?.kind === 'fact-assessment' && call.value.basis.assessment ? call.value.basis.assessment : source.call,
+      record.value.transport.completionOwner, history);
+    if (record.value.transport.version !== (completion ? 'om-model-transport/managed-v1' : 'om-model-transport/v1'))
+      fail('completion_invalid', record.id, 'version', 'Transport version follows its exact purpose and completion era');
     const value = record.value;
     if (record.id !== modelRecordId(request.project, wire.requestId) || value.projectId !== request.project
       || value.draftId !== call.id || value.requestId !== wire.requestId || value.purpose !== call.value.purpose
@@ -1468,12 +1573,16 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
       settlePhysicalCall(store, saved.record, request.call);
       return delivered(saved) as OmResult<Sealed<ModelTransportOutcome>>;
     }
+    const completion = take(prepareCompletionCall(store, request.project, { ...call.value, packet: request.packet } as AnyRecordCallRequest));
+    if (completion.writes.length) fail('completion_invalid', call.id, 'work', 'The assessor must be registered before its claim');
+    extraGuards = uniqueTransactionGuards([...extraGuards, ...completion.guards]);
     const startedAt = Date.now();
     const running: TransportModelCall = { projectId: request.project, draftId: call.id, purpose: call.value.purpose,
       requestId: call.value.call, startedAt, finishedAt: null, status: 'running', requested: binding, confirmed: unknownConfirmed(),
       request: { chars: wire.prompt.length, bytes: Buffer.byteLength(wire.prompt), hash: hashJson(request.packet) },
       response: null, usage: null, usageSource: 'unavailable', error: null,
-      transport: { version: 'om-model-transport/v1', request, exchange: null } };
+      transport: { version: completion.owner ? 'om-model-transport/managed-v1' : 'om-model-transport/v1',
+        ...(completion.owner ? { completionOwner: { ...completion.owner, call: request.call } } : {}), request, exchange: null } };
     const physical = await startPhysicalTransport(store, request, { id, kind: 'model-call', expected: 0, value: running }, [], signal, extraGuards);
     const exchange: TransportExchange = { project: request.project, request, call: request.call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError };
@@ -1668,7 +1777,7 @@ function saveRejectedModelApplication(store: Store, input: { request: ModelCallR
       kind: APPLICATION_REJECTION_KIND, expected: 0, value };
     const rejectionRef = writeRef(rejected), writes = [rejected];
     take(readModelApplicationRejection(pendingCallStore(store, writes), { project: request.project, record: rejectionRef }));
-    const finish = completion || terminal ? { diagnostic: null, writes: [], guards: terminal?.guards ?? [] }
+    const finish = running.value.om.completionOwner || completion || terminal ? { diagnostic: null, writes: [], guards: terminal?.guards ?? [] }
       : prepareModelFinish(pendingCallStore(store, writes), { project: request.project, packet: request.packet, call,
         response: null, code: failure.code, message: failure.message, reason: 'interrupted', evidence: [exchangeRef, rejectionRef] });
     writes.push(...finish.writes);
@@ -1721,7 +1830,7 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
       const completion = attempt.outcome ? reference(series) : null;
       const terminal = completion ? null : prepareModelTerminalWitness(store, record);
       const finish = completion || terminal ? { writes: [], guards: terminal?.guards ?? [], diagnostic: null }
-        : recoveryFinish(pendingCallStore(store, writes), record, incident);
+        : recoveryFinish(pendingCallStore(store, [...writes, prepared.writes[0]!]), record, incident);
       writes.push(...finish.writes); guards.push(reference(seriesHead), ...finish.guards);
       finished = { ...finished, om: { ...record.value.om, application: 'recovered', diagnostic: finish.diagnostic, completion,
         ...(terminal ? { terminal: terminal.witness } : {}) } } as OmModelCall;
@@ -1736,6 +1845,11 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
     const view = pendingCallStore(store, writes), terminal = writeRef(writes[writes.length - 1]!);
     if ('om' in original.value) take(readModelCall(view, { project, record: terminal }));
     else take(readModelTransport(view, { project, record: terminal }));
+    const managed = (finished as OmModelCall).om?.completionOwner;
+    if (managed) {
+      const update = take(prepareCompletionProducts(view, managed.binding, [terminal, ...((finished as OmModelCall).om.diagnostic ? [(finished as OmModelCall).om.diagnostic!] : [])]));
+      writes.push(...update.writes as Write[]); guards.push(...update.guards.filter(isRef));
+    }
     const committed = take(writeGuarded<ModelCall>(store, { unit: 'E4', target: ref.id, writes,
       guards: externalGuards(guards, writes) }));
     return committed.find(row => row.id === original.id)! as Revision<ModelCall>;
@@ -1759,4 +1873,533 @@ function preserveLateTransport(store: Store, project: string, dispatch: Revision
   const recovered = prepared.recovered.record;
   settlePhysicalCall(store, recovered, call);
   return recovered;
+}
+
+// G7 completion graph: immutable logical assignments, exact producer products and a CAS registry.
+// Readers of local products use only their immutable assignment, never this registry or its close proof.
+import { completionAssignmentId, completionRootAssignments, completionWorkId, COMPLETION_ASSIGNMENT_KIND,
+  COMPLETION_WORK_KIND, readCompletionBinding, readCompletionOwnerAt,
+  type CompletionAssignment, type CompletionOwner, type CompletionWork } from './series.js';
+import { readAssessmentTerminalAt,
+  readAssessmentRefusalAt, assessmentRefusalId } from './assessment.js';
+import { readJournal, readJournalAt } from './refusal-journal.js';
+export interface CompletionCallOwner {
+  contract: 'om-completion-call/v1'; binding: Ref; assignment: Ref; call: Ref; packetBasis: Ref;
+}
+export interface CompletionSnapshot {
+  binding: Revision<CompletionOwner>; work: Revision<CompletionWork>; assignments: Revision<CompletionAssignment>[];
+  products: Ref[]; complete: boolean; accepting: Ref[]; negative: Ref[]; refusals: { row: string; name: string; goal: string }[];
+  technical: { source: Ref; reason: 'off-form' | 'interrupted' }[]; waiting: Ref[]; guards: TransactionGuard[];
+}
+function completionRecord(value: CompletionAssignment): Revision<CompletionAssignment> {
+  return { id: completionAssignmentId(value.project, value.binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
+    revision: 1, hash: hashJson(value), value };
+}
+function completionRoot(binding: Revision<CompletionOwner>, batch: string): Revision<CompletionAssignment> {
+  const root = completionRootAssignments(binding).find(item => item.value.batch === batch);
+  if (!root) fail('completion_foreign', binding.id, 'batch', 'This packet is outside the original whole assignment');
+  return root;
+}
+function packetCompletionAssignments(store: Store, binding: Revision<CompletionOwner>, packetRef: Ref): {
+  records: Revision<CompletionAssignment>[]; selected: Revision<CompletionAssignment>; packet: Revision<QuestionPacketRecord>;
+} {
+  const project = binding.value.project;
+  const packet = take(readQuestionPacket(store, { project, record: packetRef })) as Revision<QuestionPacketRecord>;
+  const request = packet.value.request, attempt = request.attempt;
+  if (!attempt || attempt.series.id !== binding.value.series.id || attempt.ordinal !== binding.value.attempt
+    || !same(request.routes, binding.value.plan.routes) || !request.batch || packet.value.state !== 'ready')
+    fail('completion_foreign', packet.id, 'packet', 'The exact E2 must belong to this original managed root and attempt');
+  const line = take(readAnySeriesAt(store, project, attempt.series));
+  const cycle = line.value.attempts.find(item => item.ordinal === attempt.ordinal);
+  if (!cycle || !same(cycle.goal, binding.value.goal)) fail('completion_foreign', packet.id, 'goal', 'The packet must retain the full original goal');
+  const root = completionRoot(binding, request.batch);
+  let first = packet;
+  if (request.previous.length) first = take(readQuestionPacket(store, { project, record: request.previous[0]!.packet })) as Revision<QuestionPacketRecord>;
+  while (first.value.request.continuation)
+    first = take(readQuestionPacket(store, { project, record: first.value.request.continuation.packet })) as Revision<QuestionPacketRecord>;
+  if (!same(first.value.request.routes, request.routes) || first.value.request.batch !== request.batch
+    || !same(first.value.plan?.assignments ?? null, packet.value.plan?.assignments ?? null))
+    fail('completion_foreign', packet.id, 'plan', 'Parts and continuations preserve the first proved complete E2 plan');
+  const count = first.value.plan?.assignments.length ?? 1, position = packet.value.plan?.position ?? 0;
+  const records = Array.from({ length: count }, (_, index) => completionRecord({
+    contract: 'om-completion-assignment/v1', project, binding: reference(binding), key: `${root.value.key}:part:${index}`,
+    kind: 'part', parent: reference(root), source: reference(first), batch: request.batch!, position: index, question: null,
+  }));
+  let selected = records[position];
+  if (!selected) fail('completion_foreign', packet.id, 'position', 'The step must belong to the exact complete part plan');
+  if (request.continuation) {
+    const parent = packetCompletionAssignments(store, binding, request.continuation.packet);
+    const continuation = completionRecord({ contract: 'om-completion-assignment/v1', project, binding: reference(binding),
+      key: `${root.value.key}:continue:${hashJson(request.continuation)}`, kind: 'continuation', parent: reference(parent.selected),
+      source: packetRef, batch: request.batch, position, question: null });
+    records.push(...parent.records.filter(row => !records.some(own => own.id === row.id)), continuation);
+    selected = continuation;
+  }
+  return { records, selected, packet };
+}
+function factCompletionAssignments(store: Store, binding: Revision<CompletionOwner>, modelRef: Ref): Revision<CompletionAssignment>[] {
+  const state = take(readModelCallState(store, { project: binding.value.project, record: modelRef }));
+  if (state.state !== 'applied' || state.outcome.outcome?.kind !== 'fact-candidates')
+    fail('completion_foreign', modelRef.id, 'facts', 'Fact children derive only from the entire checked MC1 response');
+  const parent = packetCompletionAssignments(store, binding, state.outcome.packet).selected;
+  return state.outcome.outcome.facts.map(fact => completionRecord({ contract: 'om-completion-assignment/v1',
+    project: binding.value.project, binding: reference(binding), key: `${parent.value.key}:fact:${fact.questionId}`,
+    kind: 'fact', parent: reference(parent), source: modelRef, batch: parent.value.batch,
+    position: null, question: fact.questionId }));
+}
+export function readCompletionAssignmentAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionAssignment>>> {
+  return result(() => historicalRead(store, { reader: 'G7.completion-assignment', project, ref }, () => {
+    const record = take(readRecord<CompletionAssignment>(store, ref,
+      { unit: 'G7', target: ref.id, kind: COMPLETION_ASSIGNMENT_KIND, idPrefix: `${COMPLETION_ASSIGNMENT_KIND}:${project}:` }));
+    const value = record.value;
+    if (!object(value) || value.contract !== 'om-completion-assignment/v1' || value.project !== project
+      || !isRef(value.binding) || !isRef(value.source) || !text(value.key) || !text(value.batch)
+      || !['root', 'part', 'continuation', 'fact'].includes(value.kind)
+      || !(value.parent === null || isRef(value.parent)) || !(value.question === null || text(value.question))
+      || !(value.position === null || Number.isSafeInteger(value.position) && value.position >= 0)
+      || !exactKeys(value, ['contract', 'project', 'binding', 'key', 'kind', 'parent', 'source', 'batch', 'position', 'question']))
+      fail('completion_invalid', ref.id, 'assignment', 'The assignment retains the full exact producer request');
+    const binding = take(readCompletionOwnerAt(store, project, record.value.binding)) as Revision<CompletionOwner>;
+    const produced = record.value.kind === 'root' ? completionRootAssignments(binding)
+      : record.value.kind === 'fact' ? factCompletionAssignments(store, binding, record.value.source)
+      : packetCompletionAssignments(store, binding, record.value.source).records;
+    if (!produced.some(candidate => same(candidate, record)))
+      fail('completion_invalid', ref.id, 'assignment', 'The immutable assignment must equal its full producer derivation');
+    if (record.value.parent) take(readCompletionAssignmentAt(store, project, record.value.parent));
+    return record as Revision<CompletionAssignment>;
+  }, () => fail('completion_invalid', ref.id, 'parent', 'An assignment cannot descend from itself')));
+}
+function completionGraph(store: Store, binding: Revision<CompletionOwner>, products: readonly Ref[]) {
+  const assignments = new Map(completionRootAssignments(binding).map(item => [item.id, item]));
+  const packets = new Map<string, Revision<QuestionPacketRecord>>(), calls = new Map<string, ModelCallOutcome>();
+  const terminals: ReturnType<typeof readAssessmentTerminalAt>[] = [];
+  const add = (rows: Revision<CompletionAssignment>[]) => {
+    for (const row of rows) {
+      const old = assignments.get(row.id);
+      if (old && !same(old, row)) fail('completion_conflict', row.id, 'assignment', 'A logical step cannot change its original packet or parent');
+      assignments.set(row.id, row);
+    }
+  };
+  for (const ref of products) {
+    const record = store.get(ref.id, ref.revision);
+    if (!record || !same(reference(record), ref)) fail('completion_invalid', ref.id, 'product', 'Every product is exact immutable evidence');
+    if (record.kind === 'question-packet') {
+      const source = packetCompletionAssignments(store, binding, ref); add(source.records); packets.set(ref.id, source.packet);
+    } else if (record.kind === 'model-call') {
+      const state = take(readModelCallState(store, { project: binding.value.project, record: ref }));
+      const value = state.state === 'running' || state.state === 'received' ? state.record : state.outcome.record;
+      const source = packetCompletionAssignments(store, binding, value.value.om.request.packet); add(source.records);
+      packets.set(source.packet.id, source.packet);
+      if (state.state !== 'running' && state.state !== 'received') {
+        const old = calls.get(ref.id);
+        if (old && old.record.revision > ref.revision) continue;
+        calls.set(ref.id, state.outcome as ModelCallOutcome);
+        if (state.state === 'applied' && state.outcome.outcome?.kind === 'fact-candidates') add(factCompletionAssignments(store, binding, ref));
+      }
+    } else if (record.kind === 'om-assessment-result') {
+      const terminal = readAssessmentTerminalAt(store, binding.value.project, ref); const checked = take(terminal);
+      const intent = take(readAssessmentIntentAt(store, binding.value.project, checked.value.intent));
+      if (intent.originalSeries.id !== binding.value.series.id || intent.attempt !== binding.value.attempt
+        || !same(intent.goal, binding.value.goal)) fail('completion_foreign', ref.id, 'assessment', 'The assessed fact belongs to this exact managed attempt');
+      const facts = factCompletionAssignments(store, binding, intent.record.value.source.modelCall);
+      add(facts); terminals.push(terminal);
+    } else if (record.kind === MODEL_CYCLE_KIND) {
+      const cycle = take(readModelCycle(store, { project: binding.value.project, record: ref }));
+      packetCompletionAssignments(store, binding, cycle.record.value.request.packet);
+    } else if (record.kind === PART_ASSEMBLY_KIND) {
+      const assembly = take(readPartAssembly(store, { project: binding.value.project, record: ref }));
+      for (const partRef of assembly.record.value.results) {
+        const part = take(readPartResult(store, { project: binding.value.project, record: partRef }));
+        packetCompletionAssignments(store, binding, part.record.value.request.packet);
+      }
+    } else if (record.kind === UNIT_REFUSAL_KIND) {
+      if ((record.value as unknown as UnitRefusalRecord).gate === 'E5') {
+        const row = take(readAssessmentRefusalAt(store, binding.value.project, ref));
+        if (row.intent.originalSeries.id !== binding.value.series.id || row.intent.attempt !== binding.value.attempt
+          || !same(row.intent.goal, binding.value.goal)) fail('completion_foreign', ref.id, 'refusal', 'Every semantic diagnostic belongs to this exact managed attempt');
+      }
+      else take(readManagedModelDiagnostic(store, binding, ref));
+    } else fail('completion_invalid', ref.id, 'product', 'This record has no registered completion producer');
+  }
+  return { assignments: [...assignments.values()].sort((a, b) => a.id.localeCompare(b.id)), packets, calls,
+    terminals: terminals.map(item => take(item)) };
+}
+export function readCompletionWorkAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionSnapshot>> {
+  return result(() => historicalRead(store, { reader: 'G7.completion-work', project, ref }, () => {
+    const work = take(readRecord<CompletionWork>(store, ref, { unit: 'G7', target: ref.id,
+      kind: COMPLETION_WORK_KIND, idPrefix: `${COMPLETION_WORK_KIND}:${project}:` })) as Revision<CompletionWork>;
+    const value = work.value;
+    if (!object(value) || value.contract !== 'om-completion-work/v1' || value.project !== project
+      || !isRef(value.binding) || !Array.isArray(value.assignments) || !value.assignments.every(isRef)
+      || !Array.isArray(value.products) || !value.products.every(isRef)
+      || !(value.previous === null || isRef(value.previous)) || !(value.closed === null || isRef(value.closed))
+      || !(value.journal === null || isRef(value.journal))
+      || !exactKeys(value, ['contract', 'project', 'binding', 'previous', 'assignments', 'products', 'journal', 'closed']))
+      fail('completion_invalid', ref.id, 'work', 'The registry needs explicit exact assignments and products');
+    const binding = take(readCompletionOwnerAt(store, project, value.binding)) as Revision<CompletionOwner>;
+    if (work.id !== completionWorkId(project, binding.id) || !same(value.products, refs(value.products)))
+      fail('completion_invalid', ref.id, 'work', 'The registry is canonical and owned by one original attempt');
+    if (work.revision === 1) {
+      if (value.previous !== null || value.products.length || value.closed !== null || value.journal !== null)
+        fail('completion_invalid', ref.id, 'previous', 'The initial registry contains only the fixed root assignments');
+    } else {
+      if (!value.previous || value.previous.id !== work.id || value.previous.revision !== work.revision - 1)
+        fail('completion_invalid', ref.id, 'previous', 'Every registry revision retains its immediate exact predecessor');
+      const before = take(readCompletionWorkAt(store, project, value.previous));
+      if (before.work.value.closed || !same(before.work.value.binding, value.binding)
+        || before.products.some(product => !value.products.some(next => same(product, next))))
+        fail('completion_invalid', ref.id, 'previous', 'Work cannot erase products or mutate after closing');
+      if (value.closed) {
+        const close = take(readCompletionCloseAt(store, project, value.closed));
+        if (!same(close.binding, value.binding) || !same(close.work, value.previous)
+          || !same(value, { ...before.work.value, previous: value.previous, closed: value.closed }))
+          fail('completion_invalid', ref.id, 'closed', 'The closed registry must equal the exact G7 transition over its predecessor');
+      }
+    }
+    const graph = completionGraph(store, binding, value.products);
+    if (!same(refs(graph.assignments.map(reference)), value.assignments))
+      fail('completion_invalid', ref.id, 'assignments', 'All mandatory children follow from the exact full producer products');
+    for (const assignment of graph.assignments) take(readCompletionAssignmentAt(store, project, reference(assignment)));
+    return deriveCompletionSnapshot(store, binding, work, graph);
+  }, () => fail('completion_invalid', ref.id, 'history', 'A completion registry cannot derive through its own closure')));
+}
+export function prepareCompletionProducts(store: Store, bindingRef: Ref, products: readonly Ref[]): OmResult<Sealed<{ writes: Write[]; guards: TransactionGuard[]; work: Ref }>> {
+  return result(() => {
+    const project = bindingRef.id.split(':')[1]!;
+    const id = completionWorkId(project, bindingRef.id), head = store.get<CompletionWork>(id);
+    if (!head) fail('completion_invalid', id, 'work', 'Managed work cannot lose its registry');
+    const prior = take(readCompletionWorkAt(store, project, reference(head)));
+    const combined = refs([...prior.products, ...products]);
+    if (same(combined, prior.products)) return { writes: [], guards: [reference(head)], work: reference(head) };
+    if (head.value.closed) fail('completion_closed', id, 'work', 'Closed work accepts only exact historical repeats');
+    const graph = completionGraph(store, prior.binding as Revision<CompletionOwner>, combined);
+    const writes: Write[] = [];
+    for (const assignment of graph.assignments) {
+      const old = store.get(assignment.id);
+      if (old && !same(old, assignment)) fail('completion_conflict', assignment.id, 'assignment', 'The logical assignment cannot be rebound');
+      if (!old) writes.push({ id: assignment.id, kind: assignment.kind, expected: 0, value: assignment.value });
+    }
+    const journal = combined.some(ref => store.get(ref.id, ref.revision)?.kind === UNIT_REFUSAL_KIND)
+      ? reference(take(readJournal(store, { project }))) : null;
+    const value: CompletionWork = { ...head.value, previous: reference(head), products: combined, journal,
+      assignments: refs(graph.assignments.map(reference)) };
+    const write: Write = { id, kind: COMPLETION_WORK_KIND, expected: head.revision, value }; writes.push(write);
+    // The initial assignment/opening guards and current work close the registration-vs-G7 window.
+    const line = store.get(prior.binding.value.series.id);
+    if (!line) fail('completion_invalid', id, 'series', 'The current original line must exist');
+    const admitted = take(prepareSeriesLineAdmission(store, project, reference(line)));
+    return { writes, guards: [reference(head), bindingRef, ...admitted.guards], work: writeRef(write) };
+  });
+}
+function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwner>, work: Revision<CompletionWork>, graph: ReturnType<typeof completionGraph>): CompletionSnapshot {
+  const project = binding.value.project, completed = new Set<string>();
+  const accepting: Ref[] = [], negative: Ref[] = [], technical: CompletionSnapshot['technical'] = [], waiting: Ref[] = [];
+  const diagnostics: Ref[] = [], products = work.value.products;
+  for (const call of graph.calls.values()) {
+    const step = packetCompletionAssignments(store, binding, call.packet).selected;
+    if (call.record.value.om.application === 'application-refused') continue;
+    if (call.outcome?.kind === 'need-source') continue;
+    completed.add(step.id);
+    if (call.diagnostic) {
+      diagnostics.push(call.diagnostic);
+      const checked = take(readManagedModelDiagnostic(store, binding, call.diagnostic));
+      if (checked.reason === 'off-form' || checked.reason === 'interrupted') technical.push({ source: reference(call.record), reason: checked.reason });
+      if (checked.reason === 'awaiting-owner') waiting.push(call.diagnostic);
+    }
+  }
+  for (const terminal of graph.terminals) {
+    const intent = take(readAssessmentIntentAt(store, project, terminal.value.intent));
+    const fact = factCompletionAssignments(store, binding, intent.record.value.source.modelCall).find(row => row.value.question === intent.fact.questionId);
+    if (!fact) fail('completion_foreign', terminal.id, 'fact', 'A terminal must belong to an enumerated original fact');
+    const value = terminal.value;
+    if (value.verdict === 'supported') { accepting.push(value.accepted!); completed.add(fact.id); }
+    else if (value.verdict === 'off-form' || value.verdict === 'interrupted') {
+      technical.push({ source: reference(terminal), reason: value.verdict }); completed.add(fact.id);
+    } else {
+      negative.push(reference(terminal));
+      const row = products.find(ref => ref.id === assessmentRefusalId(project, reference(terminal)));
+      if (row) { take(readAssessmentRefusalAt(store, project, row)); diagnostics.push(row); completed.add(fact.id); }
+    }
+  }
+  const parentOf = new Map(graph.assignments.map(row => [row.id, row.value.parent?.id ?? null]));
+  const below = (child: string, parent: string): boolean => {
+    let id: string | null | undefined = child;
+    while (id) { if (id === parent) return true; id = parentOf.get(id); }
+    return false;
+  };
+  // Continuations discharge their exact parent's source request; they never skip sibling parts or facts.
+  let advanced = true;
+  while (advanced) {
+    advanced = false;
+    for (const row of graph.assignments) if (row.value.kind === 'continuation' && completed.has(row.id)
+      && !completed.has(row.value.parent!.id)) { completed.add(row.value.parent!.id); advanced = true; }
+  }
+  for (const root of completionRootAssignments(binding)) {
+    const parts = graph.assignments.filter(row => row.value.kind === 'part' && row.value.parent?.id === root.id);
+    if (!parts.length) continue;
+    let complete = parts.every(row => completed.has(row.id))
+      && graph.assignments.filter(row => row.value.kind === 'fact' && below(row.id, root.id)).every(row => completed.has(row.id));
+    const node = [...graph.packets.values()].some(packet => packet.value.plan && packet.value.request.batch === root.value.batch);
+    if (node) {
+      const assemblies = products.filter(ref => store.get(ref.id, ref.revision)?.kind === PART_ASSEMBLY_KIND);
+      const assembled = assemblies.some(ref => {
+        const assembly = take(readPartAssembly(store, { project, record: ref }));
+        const actual = [...graph.calls.values()].filter(call => call.part && below(packetCompletionAssignments(store, binding, call.packet).selected.id, root.id));
+        return same(refs(actual.map(call => call.part!.result)), refs(assembly.record.value.results));
+      });
+      complete &&= assembled;
+    }
+    for (const ref of products.filter(ref => store.get(ref.id, ref.revision)?.kind === MODEL_CYCLE_KIND)) {
+      const cycle = take(readModelCycle(store, { project, record: ref }));
+      if (packetCompletionAssignments(store, binding, cycle.record.value.request.packet).selected.value.batch !== root.value.batch) continue;
+      if (['blocked', 'research-no-progress', 'parts-invalid'].includes(cycle.record.value.terminal)
+        || cycle.record.value.terminal === 'outcome' && cycle.last.diagnostic !== null
+          && cycle.last.record.value.om.application !== 'application-refused') {
+        complete = true; if (cycle.record.value.diagnostic) diagnostics.push(cycle.record.value.diagnostic);
+      }
+    }
+    if (complete) completed.add(root.id);
+  }
+  const refusals: CompletionSnapshot['refusals'] = [];
+  if (diagnostics.length) {
+    if (!work.value.journal) fail('completion_invalid', work.id, 'journal', 'Work retains the exact journal cut for its diagnostics');
+    const journal = take(readJournalAt(store, project, work.value.journal));
+    for (const diagnostic of refs(diagnostics)) {
+      const matching = journal.value.rows.filter(row => same(row.source, diagnostic));
+      if (!matching.length) fail('completion_invalid', diagnostic.id, 'journal', 'A terminal diagnostic must retain its exact journal rows');
+      refusals.push(...matching.map(row => ({ row: row.id, name: row.code, goal: row.goal })));
+    }
+  }
+  return { binding, work, assignments: graph.assignments, products: [...products],
+    complete: completionRootAssignments(binding).every(root => completed.has(root.id)),
+    accepting: refs(accepting), negative: refs(negative), refusals: [...new Map(refusals.map(row => [row.row, row])).values()].sort((a,b) => a.row.localeCompare(b.row)),
+    technical, waiting: refs(waiting), guards: [reference(work), reference(binding)] };
+}
+/** E1 is a cross-check of the registered plan, never the plan itself. */
+export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionSnapshot>, ledger: Ref, journal: Ref | null = null): OmResult<Sealed<true>> {
+  return result(() => {
+    const owner = snapshot.binding.value, project = owner.project;
+    // Context selection is not proof: readCallLedgerAt still rederives every row and
+    // preceding revision. Mechanism analyses retain the close's exact journal cut.
+    const saved = take(readRecord<CallLedger>(store, ledger, { unit: 'G7', target: ledger.id,
+      kind: 'om-call-ledger', id: `om-call-ledger:${project}` }));
+    if (!object(saved.value) || !Array.isArray(saved.value.calls))
+      fail('ledger_invalid', ledger.id, 'calls', 'A saved ledger needs its complete call list');
+    const histories = journal ? saved.value.calls.filter(row => object(row) && Object.hasOwn(row, 'owner')
+      && row.purpose === 'origin-analysis' && isRef(row.call)).map(row => ({ call: row.call, journal })) : [];
+    const exact = take(readCallLedgerAt(store, project, ledger, histories));
+    for (const row of exact.value.calls) {
+      if (row.series.id !== owner.series.id || row.attempt !== owner.attempt) continue;
+      if (row.purpose === 'stop-analysis' || row.purpose === 'origin-analysis') continue;
+      const admitted = take(readCall(store, project, row.call));
+      if (!same(admitted.value.goal, owner.goal)) fail('completion_foreign', row.call.id, 'goal', 'E1 cannot change the whole managed goal');
+      if (row.purpose === 'fact-assessment') {
+        if (row.basis?.kind !== 'fact-assessment' || !row.basis.assessment)
+          fail('completion_foreign', row.call.id, 'assessment', 'Managed E1 must retain its original fact intent');
+        const intent = take(readAssessmentIntentAt(store, project, row.basis.assessment));
+        if (intent.call !== row.name || !snapshot.assignments.some(item => item.value.kind === 'fact'
+          && same(item.value.source, intent.record.value.source.modelCall) && item.value.question === intent.fact.questionId))
+          fail('completion_foreign', row.call.id, 'assignment', 'Every assessor E1 belongs to an original mandatory fact');
+      } else {
+        const packets = snapshot.products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'question-packet')
+          .map(ref => packetCompletionAssignments(store, snapshot.binding, ref));
+        const matched = packets.filter(({packet}) => object(packet.value.packet)
+          && packet.value.packet.requestId === row.name && packet.value.fingerprint !== null
+          && same({ hash: packet.value.fingerprint.hash, chars: packet.value.fingerprint.chars,
+            bytes: packet.value.fingerprint.utf8Bytes }, admitted.value.packet));
+        if (matched.length !== 1 || !snapshot.assignments.some(item => same(reference(item), reference(matched[0]!.selected))))
+          fail('completion_foreign', row.call.id, 'assignment', 'Every working E1 belongs to one exactly registered physical step');
+      }
+    }
+    return true as const;
+  });
+}
+/** Proves an E4 diagnostic by the same exact physical/continuation derivation used to produce it. */
+function deriveManagedModelDiagnostic(store: Store, binding: Revision<CompletionOwner>, ref: Ref): { reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest } {
+  const project = binding.value.project;
+  const record = take(readRecord<UnitRefusalRecord>(store, ref, { unit: 'E4', target: ref.id,
+    kind: UNIT_REFUSAL_KIND, idPrefix: `${unitRefusalNamespace(project)}e4:` }));
+  if (!object(record.value) || !Array.isArray(record.value.refusals))
+    fail('completion_invalid', ref.id, 'diagnostic', 'A diagnostic retains its full refusal rows');
+  const first = record.value.refusals[0], origin = first?.origin;
+  if (record.value.gate !== 'E4' || !object(origin) || typeof origin.stage !== 'string' || !origin.stage.startsWith('model-call:')
+    || !Array.isArray(origin.sources) || !origin.sources.every(row => object(row) && text(row.role) && isRef(row.ref)))
+    fail('completion_invalid', ref.id, 'diagnostic', 'An E4 diagnostic retains its full source roles');
+  const sources = origin.sources as {role:string;ref:Ref}[];
+  const named = (role: string) => sources.filter(source => source.role === role).map(source => source.ref);
+  const packets = named('packet'), calls = named('call'), responses = named('response');
+  if (packets.length !== 1 || calls.length !== 1 || responses.length > 1) fail('completion_invalid', ref.id, 'sources', 'One diagnostic belongs to one exact E1 and E2');
+  const request: FinishModelAttemptRequest = { project, packet: packets[0]!, call: calls[0]!, response: responses[0] ?? null,
+    code: first.code, message: first.remedy, reason: origin.stage.slice('model-call:'.length) as FinishModelAttemptRequest['reason'], evidence: named('evidence') };
+  const expected = modelFinishDiagnostic(store, request, binding);
+  if (record.revision !== 1 || ref.id !== expected.id || !same(record.value, expected.value))
+    fail('completion_invalid', ref.id, 'diagnostic', 'The complete diagnostic must reproduce its producer');
+  return { reason: request.reason, request };
+}
+export function readManagedModelDiagnostic(store: Store, binding: Revision<CompletionOwner>, ref: Ref):
+  OmResult<Sealed<{ reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest }>> {
+  return result(() => deriveManagedModelDiagnostic(store, binding, ref));
+}
+/** E1 producer and physical claim share this assignment resolver; the caller cannot select an era. */
+export function prepareCompletionCall(store: Store, project: string, request: AnyRecordCallRequest): OmResult<Sealed<{
+  owner: Omit<CompletionCallOwner, 'call'> | null; writes: Write[]; guards: TransactionGuard[];
+}>> {
+  return result(() => {
+    if (request.purpose === 'stop-analysis' || request.purpose === 'origin-analysis') return { owner: null, writes: [], guards: [] };
+    const binding = take(readCompletionBinding(store, project, request.series, request.attempt)) as Revision<CompletionOwner> | null;
+    if (!binding) return { owner: null, writes: [], guards: [] };
+    if (!same(request.goal, binding.value.goal)) fail('completion_foreign', binding.id, 'goal', 'The call retains the original whole goal');
+    let assignment: Revision<CompletionAssignment>, packetBasis: Ref, products: Ref[];
+    const sourceWrites: Write[] = [], sourceGuards: Ref[] = [];
+    if (request.purpose === 'fact-assessment') {
+      if (request.basis?.kind !== 'fact-assessment' || !request.basis.assessment)
+        fail('completion_foreign', binding.id, 'assessment', 'An assessor inherits ownership through its exact E5 intent');
+      const intent = take(readAssessmentIntentAt(store, project, request.basis.assessment));
+      if (request.call !== intent.call || !same(request.packet, intent.packet) || !same(request.basis, intent.basis))
+        fail('completion_foreign', binding.id, 'assessment', 'Assessor identity is derived from its original fact intent');
+      const children = factCompletionAssignments(store, binding, intent.record.value.source.modelCall);
+      const found = children.filter(row => row.value.question === intent.fact.questionId);
+      if (found.length !== 1) fail('completion_foreign', binding.id, 'assessment', 'The original response must contain this one fact');
+      assignment = found[0]!; packetBasis = intent.intent; products = [intent.record.value.source.modelCall];
+    } else {
+      const candidates = store.list<QuestionPacketRecord>('question-packet').filter(record => record.value.project === project
+        && record.value.packet !== null && same(record.value.packet, request.packet));
+      if (candidates.length !== 1) fail('completion_foreign', binding.id, 'packet', 'A new E1 must name one exact proved E2 packet, not just an ordinal');
+      const source = packetCompletionAssignments(store, binding, reference(candidates[0]!));
+      if (!object(source.packet.value.packet) || source.packet.value.packet.requestId !== request.call
+        || source.packet.value.packet.purpose !== request.purpose)
+        fail('completion_foreign', binding.id, 'call', 'An assignment cannot be renamed to create a second physical call');
+      const expected = modelAssignment(store, { project, packet: reference(source.packet), dispatch: request.dispatch, role: 'implementer' }).admission;
+      const normalized = (value: AnyRecordCallRequest) => ({ ...value, gaps: [...value.gaps].sort(compareJson),
+        goal: { ...value.goal, questions: [...value.goal.questions].sort() } });
+      if (!same(normalized(request), normalized(expected)))
+        fail('completion_foreign', binding.id, 'call', 'Every E1 field must reproduce this proved E2 assignment');
+      const admittedPacket = take(prepareQuestionPacket(store, source.packet.value.request as QuestionPacketRequest));
+      if (!same(admittedPacket.record, source.packet)) fail('completion_foreign', binding.id, 'packet', 'Current admission cannot replace the original packet');
+      sourceWrites.push(...admittedPacket.writes); sourceGuards.push(...admittedPacket.guards);
+      assignment = source.selected; packetBasis = reference(source.packet); products = [packetBasis];
+    }
+    const prepared = take(prepareCompletionProducts(store, reference(binding), products));
+    const view = pendingCallStore(store, prepared.writes as Write[]);
+    const work = take(readCompletionWorkAt(view, project, prepared.work));
+    if (work.work.value.closed || !work.assignments.some(row => same(reference(row), reference(assignment))))
+      fail('completion_closed', binding.id, 'assignment', 'A physical claim belongs to one registered open assignment');
+    return { owner: { contract: 'om-completion-call/v1', binding: reference(binding), assignment: reference(assignment), packetBasis },
+      writes: [...sourceWrites, ...prepared.writes as Write[]],
+      guards: uniqueTransactionGuards([...sourceGuards, ...prepared.guards].filter(guard => !isRef(guard)
+        || !sourceWrites.some(write => same(writeRef(write), guard)))) };
+  });
+}
+function checkedCompletionOwner(store: Store, project: string, call: Ref, packetBasis: Ref, marker: unknown, history?: CallHistory): CompletionCallOwner | null {
+  const admitted = take(readCall(store, project, call, history));
+  const purpose = admitted.value.purpose;
+  const binding = purpose === 'stop-analysis' || purpose === 'origin-analysis' ? null
+    : take(readCompletionBinding(store, project, admitted.value.series, admitted.value.attempt));
+  if (!binding) {
+    if (marker !== undefined) fail('completion_invalid', call.id, 'completionOwner', 'Standalone history cannot acquire managed provenance');
+    return null;
+  }
+  if (!object(marker) || marker.contract !== 'om-completion-call/v1' || !isRef(marker.assignment)
+    || !same(marker.binding, reference(binding)) || !same(marker.call, call) || !same(marker.packetBasis, packetBasis)
+    || !exactKeys(marker, ['contract', 'binding', 'assignment', 'call', 'packetBasis']))
+    fail('completion_invalid', call.id, 'completionOwner', 'Every managed physical step retains its exact proved ownership');
+  const assignment = take(readCompletionAssignmentAt(store, project, marker.assignment));
+  if (!same(assignment.value.binding, reference(binding))) fail('completion_foreign', call.id, 'binding', 'The assignment belongs to its own original owner');
+  if (purpose === 'fact-assessment') {
+    if (admitted.value.basis?.kind !== 'fact-assessment' || !same(admitted.value.basis.assessment, packetBasis))
+      fail('completion_foreign', call.id, 'intent', 'The assessor retains its exact originating intent');
+    const intent = take(readAssessmentIntentAt(store, project, packetBasis));
+    const children = factCompletionAssignments(store, binding as Revision<CompletionOwner>, intent.record.value.source.modelCall);
+    if (!children.some(row => same(reference(row), marker.assignment) && row.value.question === intent.fact.questionId))
+      fail('completion_foreign', call.id, 'fact', 'The assessor must be this original response child');
+  } else {
+    const source = packetCompletionAssignments(store, binding as Revision<CompletionOwner>, packetBasis);
+    if (!same(reference(source.selected), marker.assignment)) fail('completion_foreign', call.id, 'packet', 'The physical step must be exactly the selected E2 assignment');
+  }
+  return marker as unknown as CompletionCallOwner;
+}
+
+function modelFinishDiagnostic(store: Store, request: FinishModelAttemptRequest, binding: Revision<CompletionOwner> | null): Write {
+  const call = take(readCall(store, request.project, request.call));
+  if (binding) validateManagedFinish(store, request, binding);
+  const sources = refs([request.packet, request.call, ...(request.response ? [request.response] : []), ...(request.evidence ?? [])]);
+  for (const ref of sources) {
+    const record = store.get(ref.id, ref.revision);
+    if (!record || !same(reference(record), ref)) fail('model_call_request_invalid', ref.id, 'evidence', 'Completion evidence must exist at the exact reference');
+  }
+  const diagnosticValue: UnitRefusalRecord = { gate: 'E4', refusals: [...new Set(call.value.gaps.map(gap => gap.goal))].sort().map(goal =>
+    ({ code: request.code, goal, remedy: request.message, origin: { name: request.code, stage: `model-call:${request.reason}`, subject: call.value.call,
+      sources: sources.map(ref => ({ role: ref.id === request.packet.id ? 'packet' : ref.id === request.call.id ? 'call'
+        : ref.id === request.response?.id ? 'response' : 'evidence', ref })) } })) };
+  const diagnosticWrite: Write = { id: `${unitRefusalNamespace(request.project)}e4:${hashJson(diagnosticValue)}`,
+    kind: UNIT_REFUSAL_KIND, expected: 0, value: diagnosticValue };
+  return diagnosticWrite;
+}
+function validateManagedFinish(store: Store, request: FinishModelAttemptRequest, binding: Revision<CompletionOwner>): void {
+  packetCompletionAssignments(store, binding, request.packet);
+  const project = request.project, evidence = request.evidence ?? [];
+  const exchangeRef = evidence.find(ref => store.get(ref.id, ref.revision)?.kind === EXCHANGE_KIND);
+  if (exchangeRef) {
+    const source = take(readRecord<ModelExchange>(store, exchangeRef, { unit: 'E4', target: request.call.id, kind: EXCHANGE_KIND, id: exchangeRef.id }));
+    if (!object(source.value) || !object(source.value.request) || !same(source.value.request.packet, request.packet))
+      fail('completion_foreign', request.call.id, 'exchange', 'The terminal evidence must belong to this exact packet');
+    requireModelRequest(store, source.value.request);
+    const { transport } = checkedModelExchange(store, source.value.request, request.call, exchangeRef);
+    const form = transport.kind === 'answered'
+      ? checkAnswerForm(store, { project, packet: request.packet, raw: transport.raw }) : null;
+    const checked = form?.ok ? form.value as CheckedAnswerForm : null;
+    const failure = failureOf(transport, form), reason = finishReason(transport, checked, failure);
+    const detail = finishDetail(transport, checked, failure);
+    if (!reason || reason !== request.reason || !detail || detail.code !== request.code || detail.message !== request.message)
+      fail('completion_invalid', request.call.id, 'reason', 'The local reason and diagnostic must be derived from the physical response');
+    return;
+  }
+  if (request.code === 'process_lost' && request.reason === 'interrupted') {
+    const call = take(readCall(store, project, request.call));
+    const incidentRef = evidence.find(ref => store.get(ref.id, ref.revision)?.kind === 'model-call-recovery');
+    const incident = incidentRef ? store.get<{call:Ref}>(incidentRef.id, incidentRef.revision) : null;
+    const id = modelRecordId(project, call.value.call);
+    const head = incident && isRef(incident.value.call) && incident.value.call.id === id
+      ? store.get<ModelCall>(id, incident.value.call.revision + 1) : null;
+    if (!head?.value.recovery) fail('completion_invalid', request.call.id, 'incident', 'Physical loss requires its proved recovery record');
+    const recovery = readModelCallRecovery(store, project, reference(head));
+    if (!evidence.some(ref => same(ref, reference(recovery.incident)))) fail('completion_invalid', request.call.id, 'incident', 'The incident must belong to the exact original physical claim');
+    return;
+  }
+  if (request.reason === 'refused' && request.response) {
+    const source = take(readPacketResponse(store, { project, packet: request.packet, call: request.call, response: request.response }));
+    const checked = take(checkAnswerForm(store, { project, packet: request.packet, raw: source.record.value.raw }));
+    if (checked.kind === 'need-source') {
+      const reads = readContinuationEvidence(store, { project, packet: request.packet, call: request.call, response: request.response, deliveries: evidence });
+      if (reads.ok && !reads.value.novel && request.code === 'research_no_progress'
+        && request.message === 'The addressed reads add no information to this attempt') return;
+    }
+    for (const ref of evidence) if (store.get(ref.id, ref.revision)?.kind === 'question-packet') {
+      const next = take(readQuestionPacket(store, { project, record: ref }));
+      const parent = next.value.request.continuation;
+      const last = next.value.request.previous.at(-1);
+      if (next.value.state === 'blocked' && next.value.refusal?.code === request.code && next.value.refusal.message === request.message
+        && (parent && same(parent.packet, request.packet) && same(parent.call, request.call) && same(parent.response, request.response)
+          || last && same(last.packet, request.packet))) return;
+    }
+    if (evidence.length && evidence.every(ref => store.get(ref.id, ref.revision)?.kind === PART_RESULT_KIND)) {
+      // Diagnostic source roles are canonical sets; assembly input is an ordered
+      // plan. Recover that order from each proved E2, not from hash/id ordering.
+      const parts = evidence.map(ref => {
+        const part = take(readPartResult(store, { project, record: ref }));
+        const assigned = packetCompletionAssignments(store, binding, part.record.value.request.packet);
+        return { ref, part, packet: assigned.packet, position: assigned.packet.value.plan?.position ?? -1 };
+      }).sort((a,b) => a.position - b.position);
+      const last = parts.at(-1)!;
+      if (!last.packet.value.plan || parts.length !== last.packet.value.plan.assignments.length
+        || parts.some((part,index) => part.position !== index)
+        || !same(reference(last.packet), request.packet)
+        || !same(last.part.record.value.request.call, request.call)
+        || !same(last.part.record.value.request.response, request.response))
+        fail('completion_invalid', request.call.id, 'parts', 'A failed assembly retains the entire ordered plan and its exact final physical step');
+      const assembly = result(() => deriveAssembly(store, { project, results: parts.map(row => row.ref) }, false));
+      if (!assembly.ok && assembly.refusal.code === request.code && assembly.refusal.message === request.message) return;
+    }
+  }
+  fail('completion_invalid', request.call.id, 'reason', 'A local technical or cycle terminal needs its exact common producer proof');
 }

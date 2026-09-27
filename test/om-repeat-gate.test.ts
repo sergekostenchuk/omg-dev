@@ -3881,7 +3881,7 @@ test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 repeats a completed fact after a native D5 of another attempt represented the same key", async t => {
+async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
   const f = e51Fixture(t, false), first = await f.original();
   const intent = deliveredOf(writeAssessmentIntent(f.store, first));
   const admission = deliveredOf(readAssessmentIntentAt(f.store, f.project, reference(intent)));
@@ -3909,7 +3909,7 @@ test("E5.1 repeats a completed fact after a native D5 of another attempt represe
     attempt: { series: reference(f.series), attempt: 1 } }));
   const nativeRef = reference(native), at = { project: f.project, block: f.block, line: 1 };
   deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome({ accepting: [nativeRef] }) }));
-  const secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
+  let secondSeries = managed ? null : deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
 
   writeFileSync(join(f.root, "native-proof.txt"), "This evidence no longer supports the old encoding.");
   const oldRoutes = f.store.list<RoutesRecord>("route-result")[0]!;
@@ -3920,9 +3920,11 @@ test("E5.1 repeats a completed fact after a native D5 of another attempt represe
   const batch = routes.value.batches.find(row => row.model === "MC1"
     && row.items.some(item => item.gap === first.questionId));
   assert.ok(batch);
+  if (managed) secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt:2, goal:f.attemptGoal,
+    completion:{routes:reference(routes),batches:[batch.id]} }));
   const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
     batch: batch.id, environment: reference(f.config),
-    attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
+    attempt: { series: reference(secondSeries!), ordinal: 2 }, previous: [] })).record;
   writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, e51AssessorStep("supported"),
     f.originalStep, e51AssessorStep("supported")] }));
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet),
@@ -3934,7 +3936,10 @@ test("E5.1 repeats a completed fact after a native D5 of another attempt represe
       throw new Error("stop before cross-attempt G7 write");
     return originalWrite(writes, guards);
   }) as Store["writeMany"];
-  try { await assert.rejects(() => assessFact(f.store, second), /stop before cross-attempt G7 write/); }
+  try {
+    if (managed) deliveredOf(await assessFact(f.store, second));
+    else await assert.rejects(() => assessFact(f.store, second), /stop before cross-attempt G7 write/);
+  }
   finally { f.store.writeMany = originalWrite; }
   const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
   const e5 = terminal.value.accepted!;
@@ -3989,7 +3994,9 @@ test("E5.1 repeats a completed fact after a native D5 of another attempt represe
   assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, e5Fact.key);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, sends);
-});
+}
+test("E5.1 repeats a completed fact after a native D5 of another attempt represented the same key", t => crossProviderAttempt(t,false));
+test("C28 H1.0a managed E5 and D2 preserve the native representative of another attempt", t => crossProviderAttempt(t,true));
 
 test("E5.1 refuses an off-form claim with an admitted but unterminated MC1 set", async t => {
   const f = e51Fixture(t, false), original = await f.original();

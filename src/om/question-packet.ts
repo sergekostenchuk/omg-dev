@@ -17,10 +17,10 @@ import { Store, type Write, type Revision } from '../storage/store.js';
 import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Question, readMc1Question,
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
-import { prepareRoutes, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
+import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
-import { readSeries, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
+import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
@@ -208,8 +208,7 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   const proof = mechanism ? take(readMechanismAdmission(store, { project: request.project, series: ref,
     attempt: request.attempt.ordinal, admission: { routes: request.routes, batch: batch.id,
       gaps: { sources: gaps.sources, records: gaps.records.map(reference) } }, current })) : null;
-  const checked = proof?.series ?? take(readSeries(pinned(store, record), { project: request.project,
-    block: (value as RepairSeries).block, line: value.line }));
+  const checked = proof?.series ?? take(readAnySeriesAt(store, request.project, ref));
   if (proof) { guards.push(...proof.guards); references.push(...proof.references); }
   const attempt = checked.value.attempts.find(item => item.ordinal === request.attempt!.ordinal);
   if (!attempt || attempt.outcome !== null || checked.value.stop)
@@ -436,7 +435,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
       at: { unit: 'E2', target: request.batch!, field: 'continuation', ref: continuation.response }, route: 'producer' }
       : fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
   return { value, guards: unique(guards), references: unique([...priorDerived.references, continuation.packet,
-    ...capacity.references, ...evidence.references]), writes: [] as Write[] };
+    ...capacity.references, ...evidence.references]), writes: priorDerived.writes };
 }
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord): {
   value: QuestionPacketRecord; guards: Ref[]; references: Ref[]; writes: Write[];
@@ -449,18 +448,22 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     return deriveContinuation(store, request, current, contract);
   }
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
-  const references: Ref[] = [...routes.references, request.routes], guards: Ref[] = [];
-  if (current) {
-    head(store, request.routes);
-    const prepared = take(prepareRoutes(store, { ...routes.record.value.request,
-      tasks: routes.record.value.request.tasks.map(record => ({ record })) }));
-    if (!same(prepared.record, routes.record) || prepared.writes.length)
-      fail('route_stale', request.routes.id, 'routes', 'The saved route no longer describes the current complete sources');
-    guards.push(...prepared.guards);
-  }
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
   if (request.batch !== null && !batch || request.batch === null && routes.record.value.batches.length)
     fail('packet_batch_invalid', request.routes.id, 'batch', 'Name an exact routed model batch; absence is valid only without routed work');
+  const references: Ref[] = [...routes.references, request.routes], guards: Ref[] = [], routeWrites: Write[] = [];
+  if (current) {
+    head(store, request.routes);
+    const binding = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;
+    const prepared = binding
+      ? take(prepareManagedRouteBatch(store, { project: request.project, series: request.attempt!.series,
+        attempt: request.attempt!.ordinal, routes: request.routes, batch: request.batch! }))
+      : take(prepareRoutes(store, { ...routes.record.value.request,
+        tasks: routes.record.value.request.tasks.map(record => ({ record })) }));
+    if (!same(prepared.record, routes.record) || !binding && prepared.writes.length)
+      fail('route_stale', request.routes.id, 'routes', 'The saved route no longer describes the currently admitted assignment');
+    routeWrites.push(...prepared.writes); guards.push(...prepared.guards); references.push(...prepared.references);
+  }
   if (contract === WORKS_PACKET_CONTRACT && (batch?.task !== 'node-expansion' || batch.level !== 3))
     fail('packet_record_invalid', request.routes.id, 'packetContract', 'The work answer era belongs only to an L3 node assignment');
   if (contract !== WORKS_PACKET_CONTRACT && Object.hasOwn(request, 'works'))
@@ -470,7 +473,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
-    return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
+    return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
   }
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
   guards.push(...capacity.guards); references.push(...capacity.references);
@@ -522,7 +525,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       routes.record.value.request.gaps, current) : null;
     if (worksBasis) { guards.push(...worksBasis.guards); references.push(reference(worksBasis.producer), reference(worksBasis.record), ...worksBasis.inputs); }
     const works = worksBasis ? workAssignments(frame, batch.node, worksBasis) : null;
-    if (!open.length) return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
+    if (!open.length) return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
     const allIds = open.map(item => item.id).sort(order);
     const whole = { ...context, assigned: allIds, connections: connectionContext(frame.frame.upper, open) };
     packet = json({ ...common, expansion: whole, ...(works ? { works } : {}) });
@@ -539,7 +542,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       context.previous = previousParts(store, request, base.plan, references, protocol, contract);
       context.reserved = unique([...context.reserved, ...context.previous.flatMap(item => (item as unknown as {nodes: Graph['nodes']}).nodes.map(node => node.id))]);
       if (request.previous.length === assignments.length)
-        return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
+        return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
       const assignment = assignments[request.previous.length]!;
       const assigned = open.filter(item => assignment.obligations.includes(item.id));
       packet = json({ ...common, questions: questions.filter(item => assignment.obligations.includes(item.target)),
@@ -556,16 +559,16 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   const fingerprint = bounded(packet, capacity.maxRequestChars);
   if (!fingerprint) {
     base.state = 'blocked'; base.refusal = blocked(batch.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', batch.node ?? batch.id);
-    return { value: base, guards: unique(guards), references: unique(references), writes: [] as Write[] };
+    return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
   }
   base.state = 'ready'; base.packet = packet; base.fingerprint = fingerprint;
-  let writes: Write[] = [];
+  const writes: Write[] = [...routeWrites];
   if (batch.model === 'MC1') {
     if (saved) {
       references.push(...checkNative(store, request.project, tasks, saved.native, current, guards)); base.native = saved.native;
     } else {
       const issued = nativeQuestions(store, request.project, tasks, guards);
-      writes = issued.writes; base.native = issued.native;
+      writes.push(...issued.writes); base.native = issued.native;
       references.push(...issued.native.flatMap(item => [item.draft, item.engineQuestion, item.question]));
       guards.splice(0, guards.length, ...issued.guards);
     }

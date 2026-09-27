@@ -166,7 +166,7 @@ function physicalCall(store: Store, snapshot: SpendSnapshot, at: Ref): Physical 
   }
   const om = 'om' in body, transport = 'transport' in body;
   const producer = om ? body.om : body.transport;
-  if (om === transport || !object(producer) || producer.version !== (om ? 'om-model-call/v1' : 'om-model-transport/v1')
+  if (om === transport || !object(producer) || !(om ? ['om-model-call/v1', 'om-model-call/managed-v1'] : ['om-model-transport/v1', 'om-model-transport/managed-v1']).includes(producer.version as string)
     || !object(producer.request) || producer.request.project !== project || typeof body.requestId !== 'string'
     || at.id !== `${namespace(project)}${hashJson(body.requestId)}` || !CALL_PURPOSES.includes(body.purpose as CallPurpose))
     fail('spend_source_invalid', at.id, 'producer', 'An OM physical call requires its declared producer and exact request identity');

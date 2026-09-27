@@ -20,7 +20,7 @@ const confirmed = { model: "fixture-confirmed", effort: "high", speed: "fast" };
 const fixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 
 function valueOf<T>(result: OmResult<T>): T {
-  if (!result.ok) assert.fail(`Unexpected refusal: ${result.refusal.code}`);
+  if (!result.ok) assert.fail(`Unexpected refusal: ${result.refusal.code}: ${result.refusal.message} ${JSON.stringify(result.refusal.at)}`);
   return result.value;
 }
 
@@ -248,7 +248,7 @@ import { writeGuarded } from '../src/om/refs.js';
 import { prepareQuestionTasks, prepareQuestionPacket, readQuestionPacket, readPartResult, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord,
   type PartProposalBody } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt, seriesRequestOf } from '../src/om/series.js';
+import { openSeries, beginAttempt, seriesRequestOf, readCompletionBinding, completionWorkId } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import { prepareFrame, fillObligations, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
@@ -257,11 +257,14 @@ import { settleCandidate } from '../src/om/frame-accept.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, writeOmObligations } from '../src/om/obligations.js';
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
-import { runModelCall, readModelCall, readModelCallState, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
+import { runModelCall, readModelCall, readModelCallState, readManagedModelDiagnostic, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
 import { readCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
 
-function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000) {
+import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
+import { checkCompletionLedger, readCompletionWorkAt } from '../src/om/model-call.js';
+
+function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-dispatch-')), database = join(root, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -325,8 +328,9 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
     valueOf(completeAttempt(store, { ...address, attempt, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
   }
   const ordinal = priorNoProgress + 1;
-  const series = valueOf(beginAttempt(store, kind === 'field' ? { ...address, attempt: ordinal, goal, admission } as never
-    : { ...address, attempt: ordinal, goal } as never));
+  const opening = { ...address, attempt: ordinal, goal, ...(kind === 'field' ? { admission } : {}),
+    ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) };
+  const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal }, previous: [] };
   const packet = valueOf(writeQuestionPacket(store, packetRequest)).record;
@@ -849,7 +853,7 @@ test('E4 delivery reader rejects substituted data, response and source even when
 
 // E1 analysis admissions use the same physical boundary, without manufacturing E2 or A6 forms.
 import { Environments } from '../src/runtime/environment.js';
-import { completeAttempt, type RepairSeries } from '../src/om/series.js';
+import { completeAttempt, readSeries, type RepairSeries } from '../src/om/series.js';
 import { recordCall } from '../src/om/call-record.js';
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
@@ -1895,4 +1899,807 @@ test('E4 cycle replay accounts a late receipt once before or after the cycle is 
       assert.deepEqual(f.store.list(), afterSettlement); assert.equal(f.sent().length, 1);
     });
   }
+});
+
+
+test('3 H1.0a managed opening fixes the complete root before E1 and MC1 reveals unpaid fact children without closing A3', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1));
+  assert.ok(binding);
+  const id = completionWorkId(f.project, binding.id);
+  const initial = valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(id)!)));
+  assert.equal(initial.assignments.length, 1);
+  assert.equal(initial.complete, false);
+  await t.test('7 unpaid root is present and incomplete before E1',()=>{
+    assert.equal(f.store.list('om-call').length,0);assert.equal(initial.complete,false);
+  });
+  f.steps([{ research: e4Fact(f), usage }]);
+  const called = valueOf(await runModelCall(f.store, f.request));
+  await t.test('6 ordinary entry selects managed ownership from its exact sources',()=>{
+    assert.equal(called.record.value.om.version,'om-model-call/managed-v1');
+    assert.ok(called.record.value.om.completionOwner);
+  });
+  assert.equal(called.outcome?.kind, 'fact-candidates');
+  const work = valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(id)!)));
+  assert.equal(work.complete, false);
+  await t.test('17 all response facts are registered before any assessor intent or E1',()=>{
+    assert.equal(work.assignments.filter(row=>row.value.kind==='fact').length,1);
+    assert.equal(f.store.list('om-assessment-intent').length,0);
+    assert.equal(work.complete,false);
+  });
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  f.restart();
+  assert.equal(valueOf(readModelCall(f.store, { project: f.project, record: reference(called.record) })).outcome?.kind, 'fact-candidates');
+  assert.equal(valueOf(await runModelCall(f.store, f.request)).repeated, true);
+  assert.equal(f.sent().length, 1);
+});
+
+test('13 H1.0a local off-form stays open until G7; the exact complete close survives a new Store', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  f.steps([{ research: { nonsense: true }, usage }]);
+  const called = valueOf(await runModelCall(f.store, f.request));
+  assert.equal(called.record.value.om.failure?.code, 'part_answer_invalid');
+  assert.ok(called.diagnostic);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+  const work = valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+  assert.equal(work.complete, true);
+  const claim = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'off-form' as const, accepting: [], cancelling: [], refusals: work.refusals } };
+  const closed = valueOf(closeAttempt(f.store, claim));
+  assert.equal(closed.attempt, 1);
+  const saved = f.store.get(f.series.id)!;
+  f.restart();
+  assert.equal(valueOf(readSeries(f.store, seriesRequestOf(f.series.value))).value.attempts[0]!.outcome?.reason, 'off-form');
+  await t.test('30 exact close replays from its saved proof without another series revision',()=>{
+    valueOf(closeAttempt(f.store,claim));assert.deepEqual(f.store.get(f.series.id),saved);
+  });
+  assert.equal(valueOf(await runModelCall(f.store, f.request)).repeated, true);
+  assert.equal(f.sent().length, 1);
+});
+
+test('26 H1.0a raw A3 and empty G7 cannot close an unpaid managed root', t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const request = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] } };
+  const raw = completeAttempt(f.store, request as never);
+  assert.equal(raw.ok, false);
+  if (!raw.ok) assert.equal(raw.refusal.code, 'completion_required');
+  const gate = closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: [] } });
+  assert.equal(gate.ok, false);
+  assert.equal(f.store.get(f.series.id)!.revision, f.series.revision);
+});
+
+function completionSnapshot(f: ReturnType<typeof e4Fixture>) {
+  const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), f.packetRequest.attempt!.ordinal))!;
+  return valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+}
+
+test('32 H1.0a cycle cursor recovery after G7 uses only the exact closed products', async t => {
+  const { prepareCompletionProducts } = await import('../src/om/model-call.js');
+  for (const mode of ['off-form', 'interrupted', 'cannot-answer', 'assembly', 'parts-and-continuation'] as const) {
+    await t.test(mode, async child => {
+      const node = mode === 'assembly' || mode === 'parts-and-continuation';
+      const f = e4Fixture(child, node ? 'node' : 'fact', 100_000, 0, 5000, true);
+      let request = f.request;
+      if (node) {
+        const split = mode === 'parts-and-continuation';
+        const config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+        const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
+        const answers = packet.value.plan!.assignments.map((_, position) => ({ research: e4Node(f, { ...packet,
+          value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>), usage }));
+        const need = { ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
+          questionIds: (packet.value.packet as { questions: { id: string }[] }).questions.map(row => row.id) };
+        f.steps([...(split ? [{ research: need, usage }] : []), ...answers]);
+        request = { ...request, packet: reference(packet), dispatch: { ...request.dispatch, config: reference(config) } };
+      } else f.steps([{ research: mode === 'cannot-answer' ? e4CannotAnswer(f) : { bad: true }, usage,
+        ...(mode === 'interrupted' ? { exitCode: 7 } : {}) }]);
+      const write = f.store.writeMany.bind(f.store);
+      let cursor: Write | undefined;
+      f.store.writeMany = ((writes, guards) => {
+        const cycle = writes.find(row => row.kind === 'om-model-cycle');
+        if (cycle) { cursor = cycle; throw Error('stop before cycle cursor'); }
+        return write(writes, guards);
+      }) as Store['writeMany'];
+      try { await assert.rejects(runModelCycle(f.store, request), /stop before cycle cursor/); }
+      finally { f.store.writeMany = write; }
+      assert.ok(cursor);
+      assert.equal(f.store.list('om-model-cycle').length, 0);
+      const work = completionSnapshot(f);
+      assert.equal(work.complete, true);
+      let refusals = [...work.refusals];
+      if (node) {
+        // Assembly is ready, but it is not a C5 achievement. An independent G3 supplies reason.
+        const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}cycle-recovery`, kind: UNIT_REFUSAL_KIND, expected: 0,
+          value: { gate: 'G3', refusals: [{ code: 'unrecognized_fixture_refusal', goal: 'cycle-recovery', remedy: 'Review the assembly',
+            origin: { name: 'artifact_missing', stage: 'layer-check', subject: 'artifact:fixture', sources: [] } }] } });
+        const journal = valueOf(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+        const row = journal.value.rows.find(row => row.source.id === source.id)!;
+        refusals.push({ row: row.id, name: row.code, goal: row.goal });
+      }
+      const reason = mode === 'off-form' ? 'off-form' : mode === 'interrupted' ? 'interrupted' : 'refused';
+      const claim = { ...seriesRequestOf(f.series.value), attempt: 1,
+        outcome: { reason, accepting: [], cancelling: [], refusals } } as const;
+      const closed = valueOf(closeAttempt(f.store, claim));
+      const before = f.store.list(), sends = f.sent().length;
+      writeFileSync(join(f.root, 'e4-source.txt'), 'changed after completed work');
+      f.restart();
+      const resumed = valueOf(await runModelCycle(f.store, request));
+      assert.equal(resumed.record.id, cursor.id);
+      assert.deepEqual(resumed.record.value, cursor.value);
+      assert.equal(resumed.record.revision, 1);
+      assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(resumed.record) })).record, resumed.record);
+      assert.deepEqual(f.store.list().filter(row => row.kind !== 'om-model-cycle'), before,
+        'Recovery writes only the cycle cursor, never closed work, A3, E4, parts or accounting');
+      assert.equal(f.sent().length, sends);
+      const forbidden = prepareCompletionProducts(f.store, reference(work.binding), [reference(resumed.record)]);
+      assert.equal(forbidden.ok, false, 'Cursor recovery does not open a registration path into closed work');
+      if (!forbidden.ok) assert.equal(forbidden.refusal.code, 'completion_closed');
+      const after = f.store.list();
+      f.restart();
+      await child.test('31 completed cycle and each local part replay without further writes', async () => {
+        assert.equal(valueOf(await runModelCycle(f.store, request)).repeated, true);
+        for (const step of resumed.record.value.steps)
+          valueOf(await runModelCall(f.store, { ...request, packet: step.packet }));
+        if (resumed.assembly) valueOf(assembleModelParts(f.store, { project: f.project, results: [...resumed.record.value.results] }));
+        assert.deepEqual(valueOf(closeAttempt(f.store, claim)), closed);
+        assert.deepEqual(f.store.list(), after);
+        assert.equal(f.sent().length, sends);
+      });
+    });
+  }
+});
+
+test('C13 H1.0a G7 racing cycle registration retries as closed cursor recovery', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  f.steps([{ research: { bad: true }, usage }]);
+  valueOf(await runModelCall(f.store, f.request));
+  const work = completionSnapshot(f);
+  const claim = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'off-form' as const, accepting: [], cancelling: [], refusals: work.refusals } };
+  const write = f.store.writeMany.bind(f.store);
+  let closed = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!closed && writes.some(row => row.kind === 'om-model-cycle')) {
+      const second = new Store(f.database);
+      try { valueOf(closeAttempt(second, claim)); closed = true; } finally { second.close(); }
+    }
+    return write(writes, guards);
+  }) as Store['writeMany'];
+  try {
+    const raced = await runModelCycle(f.store, f.request);
+    assert.equal(raced.ok, false);
+    if (!raced.ok) assert.equal(raced.refusal.code, 'input_stale');
+  } finally { f.store.writeMany = write; }
+  assert.equal(closed, true);
+  assert.equal(f.store.list('om-model-cycle').length, 0);
+  const before = f.store.list(); f.restart();
+  valueOf(await runModelCycle(f.store, f.request));
+  assert.deepEqual(f.store.list().filter(row => row.kind !== 'om-model-cycle'), before);
+  assert.equal(f.sent().length, 1);
+});
+
+test('21 H1.0a MC2 complete parts require assembly, and assembly alone cannot impersonate an accepted achievement', async t => {
+  for (const split of [false, true]) await t.test(split ? 'split with source child' : 'single direct part', async t => {
+    const f = e4Fixture(t, 'node', 100_000, 0, 1000, true);
+    const config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+    const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
+    const count = packet.value.plan!.assignments.length;
+    const answers = Array.from({ length: count }, (_, position) => e4Node(f, { ...packet,
+      value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>));
+    const need = { ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
+      questionIds: (packet.value.packet as { questions: {id:string}[] }).questions.map(row => row.id) };
+    f.steps([...(split ? [{ research: need }] : []), ...answers.map(research => ({ research, usage }))]);
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    const first = valueOf(await runModelCall(f.store, request));
+    await t.test('27 physical terminal or source receipt without assembly remains incomplete',()=>{
+      assert.equal(completionSnapshot(f).complete,false);
+    });
+    assert.equal(completionSnapshot(f).assignments.filter(row => row.value.kind === 'part').length, count);
+    assert.equal(first.record.value.om.completionOwner!.call.id, first.call.id);
+    const cycle = valueOf(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, 'assembled');
+    assert.ok(cycle.assembly);
+    assert.equal(completionSnapshot(f).complete, true);
+    const owners = cycle.record.value.steps.map(step => valueOf(readModelCall(f.store, { project:f.project, record:step.record })).record.value.om.completionOwner!);
+    assert.equal(new Set(owners.map(row => row.call.id)).size, count + Number(split));
+    await t.test('22 source continuation keeps one binding and distinct exact steps',()=>{
+      assert.equal(new Set(owners.map(row=>row.binding.id)).size,1);
+      assert.equal(new Set(owners.map(row=>row.assignment.id)).size,count+Number(split));
+    });
+    await t.test('23 proved assembly discharges the logical MC2 root',()=>{assert.equal(completionSnapshot(f).complete,true);assert.ok(cycle.assembly);});
+    await t.test('28 ready assembly alone cannot claim an empty result',()=>{
+      assert.equal(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
+        outcome:{reason:'result',accepting:[],cancelling:[],refusals:[]}}).ok,false);
+    });
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    const before = f.store.list(); f.restart();
+    assert.equal(valueOf(await runModelCycle(f.store, request)).repeated, true);
+    assert.equal(completionSnapshot(f).complete, true);
+    assert.deepEqual(f.store.list(), before);
+    assert.equal(f.sent().length, count + Number(split));
+  });
+});
+
+test('15 H1.0a exact no-progress, blocked successor and invalid assembly discharge their root without local A3', async t => {
+  for (const terminal of ['research-no-progress', 'blocked', 'parts-invalid'] as const) await t.test(terminal, async t => {
+    const f = e4Fixture(t, terminal === 'parts-invalid' ? 'node' : 'fact', 100_000, 0, 1000, true);
+    let request = f.request;
+    if (terminal === 'parts-invalid') {
+      const config = f.environment(f.packet.value.fullChars! - 1);
+      const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+      const answers = packet.value.plan!.assignments.map((_,position) => e4Node(f, { ...packet,
+        value:{...packet.value,plan:{...packet.value.plan!,position}} } as Revision<QuestionPacketRecord>));
+      answers.at(-1)!.proposal.fills.pop();
+      f.steps(answers.map(research => ({ research, usage })));
+      request = { ...request, packet:reference(packet),dispatch:{...request.dispatch,config:reference(config)} };
+    } else {
+      const need = e4NeedSource(f, [{action:'read',path:'e4-source.txt',media:'text/plain'}]);
+      if (terminal === 'blocked') {
+        const config = f.environment(f.packet.value.fingerprint!.chars + 100);
+        const packet = valueOf(writeQuestionPacket(f.store, {...f.packetRequest, environment:reference(config)})).record;
+        request = {...request,packet:reference(packet),dispatch:{...request.dispatch,config:reference(config)}};
+        writeFileSync(join(f.root,'e4-source.txt'),'UTF-8 '.repeat(20_000));
+      }
+      f.steps([{research:need,usage},{research:need,usage}]);
+    }
+    const cycle = valueOf(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, terminal);
+    const work = completionSnapshot(f); assert.equal(work.complete, true);
+    assert.ok(work.refusals.length);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+    const claim = {...seriesRequestOf(f.series.value),attempt:1,
+      outcome:{reason:'refused' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+    const closed = valueOf(closeAttempt(f.store,claim)), sends=f.sent().length;
+    const saved=f.store.list(); f.restart();
+    for (const row of f.store.list<QuestionPacketRecord>('question-packet')) valueOf(readQuestionPacket(f.store,{project:f.project,record:reference(row)}));
+    assert.deepEqual(valueOf(closeAttempt(f.store,claim)),closed);
+    valueOf(await runModelCycle(f.store,request));
+    assert.deepEqual(f.store.list(),saved); assert.equal(f.sent().length,sends);
+  });
+});
+
+test('14 H1.0a physical technical and control terminals keep their own diagnostic through G7 and exact restart', async t => {
+  for (const kind of ['interrupted','awaiting-owner','refused','mechanism'] as const) await t.test(`${kind==='awaiting-owner'?'16':'14'} ${kind}`,async t => {
+    const f=e4Fixture(t,kind==='mechanism'?'field':'fact',100_000,0,1000,true);
+    const action=kind==='awaiting-owner'?'need_owner':'cannot_answer';
+    f.steps([kind==='interrupted' ? {exitCode:1,usage} : {research:{protocol:'omg-answer/v2',requestId:'$requestId',action,
+      questionIds:[f.batch.items[0]!.gap],reason:'A concrete external source is required',...(action==='need_owner'?{decision:'Choose the source'}:{})},usage}]);
+    const call=valueOf(await runModelCall(f.store,f.request));
+    assert.ok(call.diagnostic);
+    const work=completionSnapshot(f); assert.equal(work.complete,true);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+    const reason=kind==='mechanism'?'refused':kind;
+    const claim={...seriesRequestOf(f.series.value),attempt:1,outcome:{reason,accepting:[],cancelling:[],refusals:work.refusals}};
+    const closed=valueOf(closeAttempt(f.store,claim));
+    assert.equal(f.store.list('om-origin-hold').length,0);
+    assert.equal(work.waiting.length,Number(kind==='awaiting-owner'));
+    const before=f.store.list(); f.restart();
+    assert.deepEqual(valueOf(closeAttempt(f.store,claim)),closed);
+    valueOf(readModelCall(f.store,{project:f.project,record:reference(call.record)}));
+    assert.deepEqual(f.store.list(),before); assert.equal(f.sent().length,1);
+  });
+});
+
+function alteredRead(store: Store, replacement: (record: Revision<unknown> | null) => Revision<unknown> | null): Store {
+  return new Proxy(store, { get(target, key) {
+    if (key === 'get') return (id:string, revision?:number) => replacement(target.get(id, revision));
+    const value:unknown=Reflect.get(target,key,target); return typeof value==='function'?value.bind(target):value;
+  } });
+}
+
+test('5 H1.0a managed history rejects missing or counterfeit independent ownership instead of selecting legacy', async t => {
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);
+  f.steps([{research:e4Fact(f),usage}]);
+  const call=valueOf(await runModelCall(f.store,f.request)); f.restart();
+  for (const kind of ['om-completion-era','om-completion-owner','om-completion-assignment','om-completion-work']) {
+    for (const damage of ['missing','kind','body'] as const) {
+      const view=alteredRead(f.store, row => {
+        if (row?.kind!==kind) return row;
+        if (damage==='missing') return null;
+        if (damage==='kind') return {...row,kind:'unrelated'};
+        const body={...(row.value as object),contract:'fabricated'};
+        return {...row,value:body,hash:hashJson(body)};
+      });
+      assert.equal(readModelCallState(view,{project:f.project,record:reference(call.record)}).ok,false,`${kind}/${damage}`);
+    }
+  }
+  await t.test('36 foreign step and contradictory physical family cannot become a second assignment',()=>{
+  for (const damage of ['marker','version','both','other-family','foreign-assignment'] as const) {
+    const body=structuredClone(call.record.value) as OmModelCall;
+    if (damage==='marker'||damage==='both') delete body.om.completionOwner;
+    if (damage==='version'||damage==='both') body.om.version='om-model-call/v1';
+    if (damage==='other-family') Object.assign(body,{transport:{version:'om-model-transport/v1'}});
+    if (damage==='foreign-assignment') body.om.completionOwner!.assignment=body.om.completionOwner!.binding;
+    const forged={...call.record,value:body,hash:hashJson(body)};
+    const view=alteredRead(f.store,row => row?.id===forged.id&&row.revision===forged.revision?forged:row);
+    assert.equal(readModelCallState(view,{project:f.project,record:reference(forged)}).ok,false,damage);
+  }
+  });
+  assert.equal(f.sent().length,1);
+});
+
+test('33 H1.0a direct E1 cannot rename or replace the proved E2, and an unpaid admitted step resumes once',async t => {
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);
+  const payload=f.packet.value.packet as Record<string,Json> & {requestId:string;purpose:'model-research'};
+  const request={call:payload.requestId,purpose:payload.purpose,basis:null,block:'garden-consume-block',
+    series:reference(f.series),attempt:1,goal:f.series.value.attempts[0]!.goal,dispatch:f.request.dispatch,packet:payload,
+    gaps:f.batch.items.flatMap(item=>item.consumers.map(consumer=>({id:item.target,goal:item.target,field:item.field,consumer})))};
+  for (const changed of [{...request,call:'forged-call'}, {...request,packet:{...payload,extra:'forged'}},
+    {...request,purpose:'model-design' as const}]) {
+    const before=f.store.list(); assert.equal(recordCall(f.store,f.project,changed).ok,false);
+    assert.deepEqual(f.store.list(),before);
+  }
+  const admitted=valueOf(recordCall(f.store,f.project,request));
+  await t.test('8 E1 without physical claim still holds the barrier',()=>{
+    assert.equal(f.store.list('model-call').length,0);assert.equal(completionSnapshot(f).complete,false);
+  });
+  f.restart(); f.steps([{research:{nonsense:true},usage}]);
+  const call=valueOf(await runModelCall(f.store,f.request));
+  assert.deepEqual(call.call,reference(admitted.call)); assert.equal(f.sent().length,1);
+  const work=completionSnapshot(f);
+  valueOf(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
+    outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  const before=f.store.list();
+  assert.equal(recordCall(f.store,f.project,{...request,call:'new-after-close'}).ok,false);
+  assert.deepEqual(f.store.list(),before);
+});
+
+test('9 H1.0a durable running, received and unapplied work retain the barrier and reuse the original dispatch',async t => {
+  for (const phase of ['running','received','applied','missing-work'] as const) await t.test(`${({running:9,received:11,applied:12,'missing-work':32})[phase]} ${phase}`,async t => {
+    const f=e4Fixture(t,'fact',100_000,0,1000,true); f.steps([{research:{nonsense:true},usage}]);
+    const write=f.store.writeMany.bind(f.store); let stopped=false;
+    f.store.writeMany=((writes,guards)=>{
+      const reaches=writes.some(row=>row.kind==='model-call' && (row.value as OmModelCall).om?.application===(phase==='missing-work'?'applied':phase));
+      if (reaches && phase==='missing-work') {
+        assert.ok(writes.some(row=>row.kind==='om-completion-work'),'The real producer writes product and registry atomically');
+        // Model the specified recovered prefix: the paid terminal survives, its registry cursor does not.
+        const kept=writes.filter(row=>row.kind!=='om-completion-work');
+        const result=write(kept,guards); stopped=true; throw new Error(`managed durable ${result.length}`);
+      }
+      const result=write(writes,guards);
+      if (!stopped&&reaches) {stopped=true;throw new Error('managed durable stop');}
+      return result;
+    }) as Store['writeMany'];
+    try { await assert.rejects(runModelCall(f.store,f.request),/managed durable/); }
+    finally {f.store.writeMany=write;}
+    assert.ok(stopped);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+    if (phase!=='applied') assert.equal(completionSnapshot(f).complete,false);
+    f.restart();
+    if (phase==='running') {
+      const before=f.store.list(); const retry=await runModelCall(f.store,f.request);
+      assert.equal(retry.ok,false); if (!retry.ok) assert.equal(retry.refusal.code,'model_call_in_progress');
+      assert.deepEqual(f.store.list(),before); assert.equal(f.sent().length,0); return;
+    }
+    const resumed=valueOf(await runModelCall(f.store,f.request));
+    assert.equal(resumed.record.value.om.application,'applied'); assert.equal(completionSnapshot(f).complete,true);
+    const work=completionSnapshot(f); const claim={...seriesRequestOf(f.series.value),attempt:1,
+      outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+    valueOf(closeAttempt(f.store,claim)); const before=f.store.list(); f.restart();
+    valueOf(await runModelCall(f.store,f.request)); valueOf(closeAttempt(f.store,claim));
+    assert.deepEqual(f.store.list(),before); assert.equal(f.sent().length,1);
+  });
+});
+
+test('10 H1.0a recovery of a lost managed owner preserves unknown expense and closes only through explicit G7',async t => {
+  const f=e4Fixture(t,'fact',100_000,0,30_000,true), checkpoint=join(f.root,'managed-claimed.json');
+  ensureFixtureProject(f.store,f.project); f.steps([{research:e4Fact(f),usage}]);
+  const driver=fixtureDriver(t,f.database,f.root,'call',f.request,
+    {path:checkpoint,kind:'model-call',matches:[{path:['execution','phase'],value:'claimed'}]});
+  await fixtureCheckpoint(checkpoint,driver.child);
+  const claimed=f.store.list<ModelCall>('model-call')[0]!;
+  assert.equal(completionSnapshot(f).complete,false); refusesLiveRecovery(f.store,f.project,reference(claimed));
+  await killFixtureDriver(driver);
+  const recovered=publicRecovery(f.store,f.project,reference(claimed));
+  assert.equal(recovered.value.error,'process_lost'); assert.equal(recovered.value.usage,null);
+  assert.equal(completionSnapshot(f).complete,true);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+  const work=completionSnapshot(f), claim={...seriesRequestOf(f.series.value),attempt:1,
+    outcome:{reason:'interrupted' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+  valueOf(closeAttempt(f.store,claim)); const before=f.store.list(); f.restart();
+  valueOf(readModelCall(f.store,{project:f.project,record:reference(recovered)}));
+  valueOf(await runModelCall(f.store,f.request)); valueOf(closeAttempt(f.store,claim));
+  assert.deepEqual(f.store.list(),before); assert.equal(f.sent().length,0);
+  assert.equal(f.store.list('model-call-recovery').length,1);
+});
+
+test('1 H1.0a standalone physical history retains its original completion and never acquires an owner', async t => {
+  const f=e4Fixture(t); f.steps([{research:{wrong:true},usage}]);
+  const original=valueOf(await runModelCall(f.store,f.request));
+  assert.equal(original.record.value.om.version,'om-model-call/v1');
+  assert.equal(original.record.value.om.completionOwner,undefined);
+  assert.equal(f.store.list('om-completion-owner').length,0);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason,'off-form');
+  const saved=f.store.list();f.restart();
+  assert.equal(valueOf(await runModelCall(f.store,f.request)).repeated,true);
+  assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,1);
+});
+
+test('4 H1.0a an existing standalone opening cannot be adopted even before any physical call',t=>{
+  const f=e4Fixture(t), before=f.store.list();
+  const request={...seriesRequestOf(f.series.value),attempt:1,goal:f.series.value.attempts[0]!.goal,
+    completion:{routes:reference(f.routes),batches:[f.batch.id]}};
+  const result=managedOpenAttempt(f.store,request as never);
+  assert.equal(result.ok,false); if(!result.ok) assert.equal(result.refusal.code,'completion_conflict');
+  assert.deepEqual(f.store.list(),before);
+});
+
+test('C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads',async t=>{
+  const f=e4Fixture(t,'fact',100_000,2,1000,true);
+  assert.equal(valueOf(readCompletionBinding(f.store,f.project,reference(f.series),1)),null);
+  const address=seriesRequestOf(f.series.value),goal=f.series.value.attempts.at(-1)!.goal;
+  const routes=valueOf(writeRoutes(f.store,JSON.parse(canonical({...f.routes.value.request,tasks:f.routes.value.request.tasks.map(record=>({record})),previous:reference(f.routes)}))));
+  const before=f.store.list();
+  assert.deepEqual(valueOf(managedOpenAttempt(f.store,{...address,attempt:3,goal} as never)),f.series);
+  assert.equal(managedOpenAttempt(f.store,{...address,attempt:3,goal,
+    completion:{routes:reference(routes),batches:[f.batch.id]}} as never).ok,false);
+  assert.deepEqual(f.store.list(),before);
+  assert.equal(beginAttempt(f.store,{...address,attempt:4,goal} as never).ok,false);
+});
+
+test('34 H1.0a analysis of a stopped managed ordinal remains a separate transport and preserves its closed registry',async t=>{
+  const f=e4Fixture(t,'fact',100_000,2,1000,true);
+  f.steps([{research:{wrong:true},usage},{research:{cause:'fixture observation',hypothesis:true},usage}]);
+  valueOf(await runModelCall(f.store,f.request));
+  const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
+  valueOf(closeAttempt(f.store,{...address,attempt:3,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  const series=f.store.get<RepairSeries>(f.series.id)!;assert.ok(series.value.stop);
+  const closedWork=f.store.get(work.work.id),packet={task:'Diagnose this exact stop'};
+  const admitted=valueOf(recordCall(f.store,f.project,{call:'managed-stop-analysis',purpose:'stop-analysis',
+    basis:{kind:'series-stop',series:reference(series),attempt:3},block:series.value.block,
+    gaps:[{id:'stop-analysis',goal:'stop-analysis',field:'cause-and-change',consumer:'A6:stop-analysis'}],
+    series:reference(series),attempt:3,goal:{key:'stop-analysis',questions:['Why stopped?'],result:'Addressed change'},
+    dispatch:f.request.dispatch,packet}));
+  const request={project:f.project,call:reference(admitted.call),packet,role:'reviewer' as const};
+  const called=valueOf(await runModelTransport(f.store,request));
+  assert.equal(called.record.value.transport.version,'om-model-transport/v1');
+  assert.equal(called.record.value.transport.completionOwner,undefined);
+  f.restart();assert.equal(valueOf(await runModelTransport(f.store,request)).repeated,true);
+  assert.deepEqual(f.store.get(work.work.id),closedWork);assert.deepEqual(f.store.get(series.id),series);
+  assert.equal(f.sent().length,2);
+});
+
+test('35 H1.0a loss of current application admission preserves the paid answer and leaves its root incomplete',async t=>{
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:e4Fact(f),usage}]);
+  const original=f.store.writeMany.bind(f.store);let moved=false;
+  f.store.writeMany=((writes,guards)=>{
+    const result=original(writes,guards);
+    if(!moved && writes.some(row=>row.kind==='model-call' && (row.value as OmModelCall).om?.application==='received')){
+      moved=true; f.environment();
+    }
+    return result;
+  }) as Store['writeMany'];
+  const called=valueOf(await runModelCall(f.store,f.request)); f.store.writeMany=original;
+  assert.equal(moved,true);assert.equal(called.record.value.om.application,'application-refused');
+  assert.equal(called.diagnostic,null);assert.equal(completionSnapshot(f).complete,false);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+  const saved=f.store.list();f.restart();
+  assert.equal(valueOf(await runModelCall(f.store,f.request)).record.value.om.application,'application-refused');
+  assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,1);
+});
+
+test('37 H1.0a direct local finish proves its diagnostic and repeats without current journal or A3 mutation',async t=>{
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+  const called=valueOf(await runModelCall(f.store,f.request));
+  const binding=valueOf(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
+  const proof=valueOf(readManagedModelDiagnostic(f.store,binding,called.diagnostic!));
+  const finishRequest={...proof.request,evidence:[...(proof.request.evidence??[])]};
+  assert.equal(valueOf(prepareModelAttemptFinish(f.store,finishRequest)).writes.length,0);
+  assert.equal(prepareModelAttemptFinish(f.store,{...finishRequest,reason:'refused'}).ok,false);
+  const before=f.store.list();
+  assert.deepEqual(valueOf(finishModelAttempt(f.store,finishRequest)),{diagnostic:called.diagnostic});
+  assert.deepEqual(f.store.list(),before);assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+  f.restart();assert.equal(valueOf(prepareModelAttemptFinish(f.store,finishRequest)).writes.length,0);
+});
+
+test('C28 H1.0a retained completion producer addresses refuse lost B1 even for incomplete records',async t=>{
+  for(const kind of ['om-completion-owner','om-completion-era','om-completion-assignment','om-completion-work','om-completion-close']){
+    await t.test(kind,child=>{
+      const root=mkdtempSync(join(tmpdir(),'omg-h10a-era-')),path=join(root,'state.sqlite');let store=new Store(path);
+      child.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
+      new ProductEngine(store).execute({type:'create-project',project:'era',title:'Before B1'});
+      store.write({id:`${kind}:era:retained`,kind,expected:0,value:{}});
+      for(const restart of [false,true]){
+        if(restart){store.close();store=new Store(path);}
+        const before=store.list();
+        assert.throws(()=>new ProductEngine(store).projection('era'),(error:unknown)=>error instanceof EngineError && error.code==='record_missing');
+        assert.deepEqual(store.list(),before);
+      }
+    });
+  }
+});
+
+test('32 H1.0a direct assembly repeat restores a lost registry cursor without producing or paying twice',async t=>{
+  const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
+  const call=valueOf(await runModelCall(f.store,f.request));assert.ok(call.part);
+  const request={project:f.project,results:[call.part.result]},write=f.store.writeMany.bind(f.store);
+  let stopped=false;
+  f.store.writeMany=((writes,guards)=>{
+    if(!stopped&&writes.some(row=>row.kind==='om-part-assembly')){
+      stopped=true;assert.ok(writes.some(row=>row.kind==='om-completion-work'));
+      write(writes.filter(row=>row.kind!=='om-completion-work'),guards);throw Error('assembly cursor lost');
+    }
+    return write(writes,guards);
+  })as Store['writeMany'];
+  try{assert.throws(()=>assembleModelParts(f.store,request),/assembly cursor lost/);}finally{f.store.writeMany=write;}
+  assert.equal(stopped,true);assert.equal(completionSnapshot(f).complete,false);
+  const assembly=f.store.list('om-part-assembly')[0]!,physical=f.store.list('model-call');f.restart();
+  assert.deepEqual(valueOf(assembleModelParts(f.store,request)).record,assembly);assert.equal(completionSnapshot(f).complete,true);
+  const saved=f.store.list();f.restart();
+  assert.deepEqual(valueOf(assembleModelParts(f.store,request)).record,assembly);
+  assert.deepEqual(f.store.list(),saved);assert.deepEqual(f.store.list('model-call'),physical);assert.equal(f.sent().length,1);
+});
+
+test('C09 H1.0a a current-only assembly admission failure cannot manufacture a historical parts-invalid terminal',async t=>{
+  const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
+  valueOf(await runModelCall(f.store,f.request));
+  const graph=f.store.get<Graph>(`graph:${f.project}`)!;
+  new ProductEngine(f.store).graphs.save(f.project,graph.value,graph.revision,'fixture graph source refresh');
+  const before=f.store.list('om-unit-refusal'),failed=await runModelCycle(f.store,f.request);
+  assert.equal(failed.ok,false);assert.equal(completionSnapshot(f).complete,false);
+  assert.deepEqual(f.store.list('om-unit-refusal'),before);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+  f.restart();assert.equal((await runModelCycle(f.store,f.request)).ok,false);
+  assert.equal(completionSnapshot(f).complete,false);assert.equal(f.sent().length,1);
+});
+
+test('C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold',async t=>{
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
+  valueOf(closeAttempt(f.store,{...address,attempt:1,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  const closed=f.store.get<RepairSeries>(f.series.id)!;
+  const next=valueOf(openSeries(f.store,{project:f.project,block:closed.value.block,line:2,slice:'successor-subject',predecessor:reference(closed),
+    basis:{ground:'inputs-changed',text:'A separately recorded subject supersedes this legacy slice'}}));
+  assert.equal(next.value.inherited.length,1);
+  assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(next),1)),work.binding);
+  const goal=closed.value.attempts[0]!.goal;
+  const standalone=valueOf(beginAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:2,goal}));
+  assert.equal(valueOf(readCompletionBinding(f.store,f.project,reference(standalone),2)),null);
+  valueOf(completeAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:2,
+    outcome:{reason:'awaiting-owner',achieved:[],cancelled:[],refusals:[]}}));
+  const managed=valueOf(managedOpenAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:3,goal,
+    completion:{routes:reference(f.routes),batches:[f.batch.id]}}));
+  const binding=valueOf(readCompletionBinding(f.store,f.project,reference(managed),3))!;
+  assert.notEqual(binding.id,work.binding.id);assert.equal(binding.value.series.id,next.id);
+  assert.deepEqual(f.store.list<{firstManagedAttempt:number}>('om-completion-era').map(row=>row.value.firstManagedAttempt).sort(),[1,3]);
+  f.restart();assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(managed),1)),work.binding);
+  assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(managed),3)),binding);
+  assert.equal(f.sent().length,1);
+});
+
+test('C36 H1.0a a closed A3 needs the full exact close proof and cannot use an old terminal marker',async t=>{
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
+  valueOf(closeAttempt(f.store,{...address,attempt:1,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  f.restart();const closed=f.store.get(f.series.id)!;
+  for(const damage of ['missing','foreign-kind','false-claim','missing-work','legacy-terminal']){
+    const view=alteredRead(f.store,row=>{
+      if(row?.kind==='om-completion-close'){
+        if(damage==='missing')return null;
+        if(damage==='foreign-kind')return {...row,kind:'another-contract'};
+        if(damage==='false-claim'){
+          const value=structuredClone(row.value) as {claim:{accepting:Ref[];reason:string}};
+          value.claim.reason='result';return {...row,value,hash:hashJson(value)};
+        }
+      }
+      if(damage==='missing-work'&&row?.kind==='om-completion-work')return null;
+      if(damage==='legacy-terminal'&&row?.id===closed.id&&row.revision===closed.revision){
+        const value=structuredClone(row.value) as RepairSeries;
+        Object.assign(value.attempts[0]!,{terminal:{source:work.products[0],call:work.products[0]}});
+        return {...row,value,hash:hashJson(value)};
+      }
+      return row;
+    });
+    assert.equal(readSeries(view,address).ok,false,damage);
+  }
+  assert.equal(f.sent().length,1);
+});
+
+test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 decision can resume it',async t=>{
+  const {runStopAnalysis}=await import('../src/om/stop-analysis.js');
+  const {resumeSeries}=await import('../src/om/series.js');
+  const f=e4Fixture(t,'fact',100_000,2,1000,true);f.steps([{research:{wrong:true},usage}]);
+  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
+  valueOf(closeAttempt(f.store,{...address,attempt:3,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  const stopped=f.store.get<RepairSeries>(f.series.id)!,closedWork=f.store.get(work.work.id);assert.equal(stopped.value.stop?.attempt,3);
+  const research={protocol:'omg-stop-analysis/v1',cause:{kind:'hypothesis',text:'The response format needs an explicit instruction',sources:[]},
+    change:{text:'Clarify the requested answer contract',addresses:[{ref:reference(stopped),field:'attempts'}]},origin:null};
+  f.steps([{research:{wrong:true},usage},{research,usage}]);
+  const request={project:f.project,series:reference(stopped),hold:null,dispatch:f.request.dispatch};
+  const analysis=valueOf(await runStopAnalysis(f.store,request));assert.equal(analysis.value.state,'decided');
+  assert.equal(f.store.list('om-origin-hold').length,0);
+  const resumed=valueOf(resumeSeries(f.store,{...address,stop:3,ground:'review-record',text:'Use the exact reviewed change',review:{ref:reference(analysis)}}));
+  assert.equal(resumed.value.stop,null);assert.deepEqual(f.store.get(work.work.id),closedWork);
+  const opened=valueOf(managedOpenAttempt(f.store,{project:f.project,block:(f.series.value as RepairSeries).block,line:f.series.value.line,attempt:4,goal:f.series.value.attempts.at(-1)!.goal,
+    completion:{routes:reference(f.routes),batches:[f.batch.id]}}));
+  assert.equal(opened.value.attempts.at(-1)!.outcome,null);
+  const saved=f.store.list();f.restart();
+  assert.deepEqual(valueOf(await runStopAnalysis(f.store,request)),analysis);assert.deepEqual(f.store.list(),saved);
+  assert.equal(f.sent().length,2);
+});
+
+test('5 H1.0a exact completion readers reject missing source fields and a closed cursor without its whole G7 derivation',async t=>{
+  const {readCompletionOwnerAt}=await import('../src/om/series.js');
+  const {readCompletionAssignmentAt}=await import('../src/om/model-call.js');
+  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f);
+  valueOf(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
+    outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
+  const owner=work.binding,part=work.assignments.find(row=>row.value.kind==='part')!,closed=f.store.get(work.work.id)!;
+  for(const [row,field,reader]of [
+    [owner,'goal',readCompletionOwnerAt],[part,'source',readCompletionAssignmentAt],[part,'kind',readCompletionAssignmentAt],
+    [closed,'previous',readCompletionWorkAt],
+  ] as const){
+    const value={...row.value as object} as Record<string,unknown>;delete value[field];
+    const changed={...row,value,hash:hashJson(value)},view=alteredRead(f.store,r=>r?.id===changed.id&&r.revision===changed.revision?changed:r);
+    const result=reader(view,f.project,reference(changed));assert.equal(result.ok,false,field);
+    if(!result.ok)assert.equal(result.refusal.code,'completion_invalid');
+  }
+  const value={...closed.value as object,closed:reference(f.routes)},changed={...closed,value,hash:hashJson(value)};
+  assert.equal(readCompletionWorkAt(alteredRead(f.store,r=>r?.id===changed.id&&r.revision===changed.revision?changed:r),f.project,reference(changed)).ok,false);
+  f.restart();assert.equal(valueOf(readCompletionWorkAt(f.store,f.project,reference(closed))).complete,true);
+});
+
+test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its earlier claim guards',async t=>{
+  const {prepareCloseAttempt}=await import('../src/om/repeat-gate.js');
+  for(const first of ['E1','G7'] as const)await t.test(first,async child=>{
+    const f=e4Fixture(child,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+    valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f);
+    const address={project:f.project,block:'garden-produce-block',line:1};
+    valueOf(openSeries(f.store,{...address,slice:'independent-call',predecessor:null,basis:null}));
+    const goal={key:'independent',questions:['another-question'],result:'another-result'};
+    const other=valueOf(beginAttempt(f.store,{...address,attempt:1,goal}));
+    const request={call:'concurrent-unmanaged-call',purpose:'model-research' as const,basis:null,block:address.block,
+      series:reference(other),attempt:1,goal,dispatch:f.request.dispatch,packet:{question:'independent'},
+      gaps:[{id:'another-question',goal:'another-question',field:'value',consumer:address.block}]};
+    const claim={...seriesRequestOf(f.series.value),attempt:1,outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+    if(first==='E1'){
+      const prepared=valueOf(prepareCloseAttempt(f.store,claim));
+      const second=new Store(f.database);try{valueOf(recordCall(second,f.project,request));}finally{second.close();}
+      const stale=writeGuarded(f.store,{unit:'G7',target:f.series.id,writes:prepared.writes,guards:prepared.guards});
+      assert.equal(stale.ok,false);if(!stale.ok)assert.equal(stale.refusal.code,'input_stale');
+      assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
+      valueOf(closeAttempt(f.store,claim));
+    }else{
+      const {prepareCompletionCall}=await import('../src/om/model-call.js');
+      const oldCall=f.store.list<{call:string;purpose:'model-research';basis:null;block:string;gaps:never[];series:Ref;attempt:number;goal:RepairSeries['attempts'][number]['goal'];dispatch:typeof f.request.dispatch}>('call-record')[0]!.value;
+      const claimAdmission=valueOf(prepareCompletionCall(f.store,f.project,{call:oldCall.call,purpose:oldCall.purpose,basis:oldCall.basis,
+        block:oldCall.block,gaps:oldCall.gaps,series:oldCall.series,attempt:oldCall.attempt,goal:oldCall.goal,
+        dispatch:oldCall.dispatch,packet:f.packet.value.packet as Json}));
+      const write=f.store.writeMany.bind(f.store);let closed=false;
+      f.store.writeMany=((writes,guards)=>{
+        if(!closed&&writes.some(row=>row.kind==='call-record')){
+          closed=true;const second=new Store(f.database);try{valueOf(closeAttempt(second,claim));}finally{second.close();}
+        }
+        return write(writes,guards);
+      }) as Store['writeMany'];
+      try{valueOf(recordCall(f.store,f.project,request));}
+      finally{f.store.writeMany=write;}
+      assert.equal(closed,true);
+      const stale=writeGuarded(f.store,{unit:'E4',target:'old-claim',writes:[{id:'test:stale-claim',kind:'test',expected:0,value:{}}],guards:claimAdmission.guards});
+      assert.equal(stale.ok,false);if(!stale.ok)assert.equal(stale.refusal.code,'input_stale');
+      assert.equal(f.store.get('test:stale-claim'),null);
+    }
+    const saved=f.store.list();f.restart();valueOf(closeAttempt(f.store,claim));valueOf(recordCall(f.store,f.project,request));
+    assert.deepEqual(f.store.list(),saved);assert.equal(f.store.list('call-record').length,2);assert.equal(f.sent().length,1);
+  });
+});
+
+test('C03 H1.0a original managed opening protects all M6 sources in the same transaction',async t=>{
+  const {prepareManagedBeginAttempt}=await import('../src/om/series.js');
+  const f=e4Fixture(t);f.steps([{research:{wrong:true},usage}]);valueOf(await runModelCall(f.store,f.request));
+  const closed=f.store.get<RepairSeries>(f.series.id)!,goal=closed.value.attempts[0]!.goal;
+  valueOf(openSeries(f.store,{project:f.project,block:closed.value.block,line:2,slice:'next-line',predecessor:reference(closed),
+    basis:{ground:'inputs-changed',text:'The declared task was revised'}}));
+  const request={project:f.project,block:closed.value.block,line:2,attempt:2,goal,
+    completion:{routes:reference(f.routes),batches:[f.batch.id]}};
+  const prepared=valueOf(prepareManagedBeginAttempt(f.store,request));
+  assert.ok(prepared.writes.some(row=>row.kind==='om-completion-owner'));
+  assert.ok(prepared.writes.some(row=>row.kind==='om-completion-era'));
+  const second=new Store(f.database);try{
+    const graph=second.get<Graph>(`graph:${f.project}`)!;
+    new ProductEngine(second).graphs.save(f.project,graph.value,graph.revision,'concurrent shared source');
+  }finally{second.close();}
+  const result=writeGuarded(f.store,{unit:'G7',target:f.project,writes:prepared.writes,guards:prepared.guards});
+  assert.equal(result.ok,false);if(!result.ok)assert.equal(result.refusal.code,'input_stale');
+  assert.equal(f.store.list('om-completion-owner').length,0);assert.equal(f.store.list('om-completion-era').length,0);
+});
+
+test('10 H1.0a exact late paid bytes settle one recovered dispatch after G7 without changing its terminal or completion',async t=>{
+  const {spendReport}=await import('../src/om/spend-report.js');
+  const f=e4Fixture(t,'fact',100_000,0,30_000,true),checkpoint=join(f.root,'managed-late.json');
+  ensureFixtureProject(f.store,f.project);f.steps([{research:e4Fact(f),usage}]);
+  const driver=fixtureDriver(t,f.database,f.root,'call',f.request,{path:checkpoint,kind:'om-model-exchange',matches:[],when:'before'});
+  const pending=await fixtureCheckpoint(checkpoint,driver.child);
+  const exchange=pending.writes!.find(write=>write.kind==='om-model-exchange')!.value as unknown as {process:ProcessResult;launchError:null};
+  assert.equal(JSON.parse(exchange.process.stdout).usage.inputTokens,usage.inputTokens);assert.equal(f.sent().length,1);
+  const dispatch=f.store.list<ModelCall>('model-call')[0]!;await killFixtureDriver(driver);
+  const recovered=publicRecovery(f.store,f.project,reference(dispatch)),work=completionSnapshot(f);
+  const claim={...seriesRequestOf(f.series.value),attempt:1,outcome:{reason:'interrupted' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+  valueOf(closeAttempt(f.store,claim));const completed=f.store.get(f.series.id),closedWork=f.store.get(work.work.id);
+  const before=valueOf(spendReport(f.store,{project:f.project}));assert.equal(before.totals.calls,1);
+  assert.equal(before.totals.unmeasuredCalls,1);
+  const late=prepareLateModelReceipt(f.store,f.project,reference(dispatch),{process:exchange.process,launchError:exchange.launchError});
+  valueOf(writeGuarded(f.store,{unit:'E4',target:dispatch.id,writes:late.writes,guards:late.guards}));f.restart();
+  valueOf(await runModelCall(f.store,f.request));
+  const after=valueOf(spendReport(f.store,{project:f.project}));assert.equal(after.totals.calls,1);assert.equal(after.totals.unmeasuredCalls,0);
+  assert.deepEqual(f.store.get(f.series.id),completed);assert.deepEqual(f.store.get(work.work.id),closedWork);
+  assert.deepEqual(f.store.get(recovered.id),recovered);
+  const saved=f.store.list();f.restart();valueOf(await runModelCall(f.store,f.request));valueOf(closeAttempt(f.store,claim));
+  assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,1);
+});
+
+test('34 H1.0a a completion ledger retains the exact journal context of a genuine mechanism origin analysis',async t=>{
+  const f=e4Fixture(t,'field',100_000,0,1000,true);
+  f.steps([{research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'cannot_answer',
+    questionIds:[f.batch.items[0]!.gap],reason:'An external decision is required'},usage}]);
+  valueOf(await runModelCall(f.store,f.request));
+  const work=completionSnapshot(f);
+  const refusal=f.store.write({id:`${unitRefusalNamespace(f.project)}h10a-origin`,kind:UNIT_REFUSAL_KIND,expected:0,
+    value:{gate:'G3',refusals:[{code:'unrecognized_fixture_refusal',goal:'origin',remedy:'Identify this exact origin',
+      origin:{name:'artifact_missing',stage:'layer-check',subject:'artifact:fixture',sources:[]}}]}});
+  const journal=valueOf(recordRefusal(f.store,{project:f.project,source:reference(refusal)}));
+  const row=journal.value.rows.find(row=>row.source.id===refusal.id)!;
+  const claim={...seriesRequestOf(f.series.value),attempt:1,outcome:{reason:'refused' as const,accepting:[],cancelling:[],
+    refusals:[...work.refusals,{row:row.id,name:row.code,goal:row.goal}]}};
+  const closed=valueOf(closeAttempt(f.store,claim));assert.equal(closed.holds.length,1);
+  const owner={kind:'mechanism' as const,mechanism:'M5:addressing' as const};
+  const analysis=valueOf(recordCall(f.store,f.project,{call:'h10a:mechanism-origin',purpose:'origin-analysis',owner,
+    admission:{gaps:f.gapRequest,routes:reference(f.routes),batch:f.batch.id},
+    basis:{kind:'origin-hold',hold:closed.holds[0]!},series:reference(f.store.get(f.series.id)!),attempt:1,
+    gaps:[{id:'origin',goal:'origin',field:'cause-and-change',consumer:owner}],
+    goal:{key:'origin',questions:['What caused this exact refusal?'],result:'A proved origin or a hypothesis'},
+    dispatch:f.request.dispatch,packet:{origin:closed.holds[0]!} as unknown as Json}));
+  assert.equal(analysis.call.value.purpose,'origin-analysis');
+  const ledger=reference(f.store.get(`om-call-ledger:${f.project}`)!),cut=reference(f.store.get(`om-refusal-journal:${f.project}`)!);
+  assert.equal(checkCompletionLedger(f.store,work,ledger).ok,false,'Mechanism history cannot guess its journal');
+  assert.equal(valueOf(checkCompletionLedger(f.store,work,ledger,cut)),true);
+  // A different owner closes after this analysis is already in the project-wide E1 ledger.
+  const input=valueOf(writeAddressing(f.store,{project:f.project,input:reference(f.input),graph:reference(f.graph),
+    decisions:[{pending:structuredClone(inputDecisionWrite({project:f.project,input:reference(f.input),graph:reference(f.graph),layers:[],
+      decision:{target:'discovery:encoding',field:'address',value:{consumer:'garden-consume-block',kind:'repository-fact'}}})) as Write}]}));
+  const horizon=valueOf(writeHorizon(f.store,{project:f.project,input:reference(input),graph:reference(f.graph),refinement:null,available:{},
+    choice:{choiceVersion:'h10a-after-analysis',features:[{outcome:'garden-result'}],excluded:[]}}));
+  const gaps=valueOf(writeGaps(f.store,{project:f.project,input:reference(input),graph:reference(f.graph),horizon:reference(horizon.gate),
+    operations:{proposals:[],frame:{project:f.project,level:2,graph:reference(f.graph),horizon:reference(horizon.gate),layer:null,frame:null,upper:null}},
+    works:{state:'upper-not-accepted',layer:reference(f.store.get(`graph-layer:${f.project}:2`)!)}}));
+  const scope={sources:structuredClone(gaps.sources) as GapRequest,records:gaps.records.map(reference)};
+  const tasks=valueOf(prepareQuestionTasks(f.store,{project:f.project,gaps:scope,questions:gaps.records
+    .filter(row=>row.value.gap.kind==='repository-fact'&&row.value.gap.code!=='inventory_missing'&&!row.value.gap.deferral)
+    .map(row=>({gap:reference(row),requirements:[{pointer:'/contracts/0'}],resultForm:{type:'string'}}))}));
+  const routes=valueOf(writeRoutes(f.store,{project:f.project,gaps:scope,tasks:tasks.tasks.map(task=>({pending:structuredClone(task.writes[0]!) as Write})),
+    catalog:{paths:['e4-source.txt'],records:[]},previous:reference(f.routes)}));
+  const batch=routes.value.batches.find(row=>row.model==='MC1')!,address={project:f.project,block:'garden-consume-block',line:1};
+  valueOf(openSeries(f.store,{...address,slice:'after-mechanism-analysis',predecessor:null,basis:null}));
+  const series=valueOf(managedOpenAttempt(f.store,{...address,attempt:1,
+    goal:{key:'after-analysis',questions:batch.items.map(item=>gapLineKey(f.project,item.target,item.field)),result:'accepted-gap-fill'},
+    completion:{routes:reference(routes),batches:[batch.id]}}));
+  const packet=valueOf(writeQuestionPacket(f.store,{project:f.project,routes:reference(routes),batch:batch.id,environment:reference(f.configured),
+    attempt:{series:reference(series),ordinal:1},previous:[]})).record;
+  f.steps([{}, {research:{malformed:'a preserved technical outcome'},usage}]);
+  const called=valueOf(await runModelCall(f.store,{...f.request,packet:reference(packet)}));
+  assert.ok(called.diagnostic);
+  const binding=valueOf(readCompletionBinding(f.store,f.project,reference(series),1))!;
+  const remaining=valueOf(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
+  assert.equal(remaining.complete,true);
+  const secondClaim={...address,attempt:1,outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:remaining.refusals}};
+  const secondClosed=valueOf(closeAttempt(f.store,secondClaim));
+  const later=f.store.write({id:`${unitRefusalNamespace(f.project)}h10a-later`,kind:UNIT_REFUSAL_KIND,expected:0,
+    value:{gate:'G3',refusals:[{code:'later_refusal',goal:'later',remedy:'Later independent issue',
+      origin:{name:'artifact_missing',stage:'layer-check',subject:'artifact:later',sources:[]}}]}});
+  valueOf(recordRefusal(f.store,{project:f.project,source:reference(later)}));
+  const saved=f.store.list();f.restart();const get=f.store.get.bind(f.store);
+  f.store.get=((id:string,revision?:number)=>{
+    if(id===cut.id||id===ledger.id)assert.notEqual(revision,undefined,'Historical completion uses its exact ledger and journal');
+    return get(id,revision);
+  }) as Store['get'];
+  try{
+    assert.equal(valueOf(checkCompletionLedger(f.store,work,ledger,cut)),true);
+    assert.deepEqual(valueOf(closeAttempt(f.store,secondClaim)),secondClosed);
+  }
+  finally{f.store.get=get;}
+  assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,2);
+  assert.deepEqual(valueOf(closeAttempt(f.store,claim)),closed);
 });

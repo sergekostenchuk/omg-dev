@@ -3,7 +3,7 @@ import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
-import { readSeriesAt, type Achievement, type AttemptGoal, type ClaimedRefusal, type RepairSeries } from "./series.js";
+import { readSeriesAt, type Achievement, type AttemptGoal, type ClaimedRefusal, type ManagedClosure, type RepairSeries } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
 import { FRAME_ACCEPTANCE_CONTRACT, readAcceptedFrameLayer } from "./layer-basis.js";
@@ -46,6 +46,7 @@ export interface AcceptanceContext {
   readonly accepting?: readonly Ref[];
   /** The complete refusals being closed; E5 binds each negative verdict to its journal row. */
   readonly refusals?: readonly ClaimedRefusal[];
+  readonly managedClosure?: ManagedClosure;
 }
 
 /** What a provider answers about one record: the keys it derived from it, or why the record confirms nothing. */
@@ -104,6 +105,7 @@ export interface ConfirmRequest {
   readonly accepting: readonly Ref[];
   readonly cancelling: readonly Ref[];
   readonly refusals?: readonly ClaimedRefusal[];
+  readonly managedClosure?: ManagedClosure;
 }
 
 /** What the series may be told: each result under the key its provider derived, with the record that accepted it. */
@@ -189,7 +191,8 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
   }
   const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal,
     accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }),
-    ...(request.refusals === undefined ? {} : { refusals: request.refusals }) }, store);
+    ...(request.refusals === undefined ? {} : { refusals: request.refusals }),
+    ...(request.managedClosure === undefined ? {} : { managedClosure: request.managedClosure }) }, store);
   const confirmed = keysOf(answer);
   if (confirmed === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
   return confirmed;

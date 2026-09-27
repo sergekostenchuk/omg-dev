@@ -1,3 +1,4 @@
+import { readCompletionCloseAt } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -12,7 +13,7 @@ import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-jo
 import { readGaps, prepareCurrentGaps, type GapReadRequest } from "./gaps.js";
 import { readOmInput, withHistoricalReads, historicalRead } from "./input.js";
 import { readFrameBasis } from "./frame-obligations.js";
-import { readRoutes, prepareRoutes } from "./routes.js";
+import { readRoutes, prepareRoutes, prepareManagedRouteBatch } from "./routes.js";
 import { gapLineKey, gapLineExpectedResult } from "./gap-lines.js";
 import { inputDecisionNamespace } from "./addressing.js";
 
@@ -311,6 +312,7 @@ export interface OpenSeriesRequest extends SeriesRequest {
 export interface BeginAttemptRequest extends SeriesRequest {
   readonly attempt: number;
   readonly goal: AttemptGoal;
+  readonly completion?: CompletionPlan;
 }
 export interface CompleteAttemptRequest extends SeriesRequest {
   readonly terminal?: Ref;
@@ -332,7 +334,7 @@ export interface MechanismOpenSeriesRequest extends MechanismSeriesRequest {
   readonly scope: Sealed<GapReadRequest>; readonly predecessor: Ref | null; readonly basis: SeriesBasis | null;
 }
 export interface MechanismBeginAttemptRequest extends MechanismSeriesRequest {
-  readonly attempt: number; readonly goal: AttemptGoal; readonly admission: MechanismAdmission;
+  readonly attempt: number; readonly goal: AttemptGoal; readonly admission: MechanismAdmission; readonly completion?: CompletionPlan;
 }
 export type MechanismCompleteAttemptRequest = MechanismSeriesRequest & Pick<CompleteAttemptRequest, "attempt" | "outcome">;
 export type AnyOpenSeriesRequest = OpenSeriesRequest | MechanismOpenSeriesRequest;
@@ -808,7 +810,11 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult
     ...(membership?.record ? [reference(membership.record)] : [])], null, claim);
 }
 
-function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<Prepared> {
+function prepareBegin(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): OmResult<Prepared> {
+  try { return prepareBeginInner(store, request, managed); }
+  catch (error) { if (error instanceof CompletionFailure) return error.result; throw error; }
+}
+function requireBeginRequest(store: Store, request: AnyBeginAttemptRequest): Address {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "An attempt is begun through a request object");
   const address = requireAddress(request);
@@ -817,6 +823,10 @@ function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<P
     "series_request_invalid", "An attempt names the ordinal it opens, so that a late delivery finds its own attempt");
   requireCondition(goalProblem(request.goal) === null,
     "series_request_invalid", "An attempt names its goal beforehand: a lasting key, the question or package of questions, and the checkable result");
+  return address;
+}
+function prepareBeginInner(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): OmResult<Prepared> {
+  const address = requireBeginRequest(store, request);
   const goal = goalOf(request.goal);
 
   const current = currentSeries(store, address);
@@ -826,6 +836,17 @@ function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<P
   const context: Context = { target: address.id, ref: reference(head) };
   const held = head.value;
   const known = [...held.inherited, ...held.attempts].find(item => item.ordinal === request.attempt);
+  const completion = readCompletionBinding(store, address.project, reference(head), request.attempt);
+  if (!completion.ok) return completion;
+  const era = completionEra(store, address.project, address.id);
+  if (!known && !managed && (request.completion || era && request.attempt >= era.value.firstManagedAttempt))
+    return refused("completion_required", "This attempt must open through G7 with its complete managed work", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+  if (known && completion.value !== null) {
+    if (request.completion && canonical(normalizeCompletionPlan(request.completion)) !== canonical(completion.value.value.plan))
+      return refused("completion_conflict", "A repeated opening retains its original complete assignment", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+  } else if (known && managed)
+    return refused("completion_conflict", "An existing standalone attempt cannot acquire a completion owner", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+
   if (known) {
     // T5: an ordinal this series already holds is that attempt, whether it is still running or long closed. A
     // notification that arrives twice, or late, re-reaches the cycle it was about and opens nothing.
@@ -866,7 +887,7 @@ function prepareBegin(store: Store, request: AnyBeginAttemptRequest): OmResult<P
   return change(address, value, head.revision, [...lineAdmission.value.guards, ...(admission?.guards ?? [])], head);
 }
 
-function prepareComplete(store: Store, request: AnyCompleteAttemptRequest): OmResult<Prepared> {
+function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, managed?: Ref): OmResult<Prepared> {
   requireStore(store);
   requireCondition(isPlainObject(request), "series_request_invalid", "An outcome is recorded through a request object");
   const address = requireAddress(request);
@@ -896,6 +917,19 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest): OmRe
     return problem("outcome_conflict", `Attempt ${request.attempt} is closed already, and a later outcome does not replace the earlier one`, context, "outcome");
   }
 
+  const binding = readCompletionBinding(store, address.project, reference(head), request.attempt);
+  if (!binding.ok) return binding;
+  if (binding.value !== null) {
+    if (!managed) return refused('completion_required', 'Only G7 can close a managed attempt through its complete proof',
+      { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
+    const proof = readCompletionCloseAt(store, address.project, managed);
+    if (!proof.ok) return proof;
+    if (!sameRef(proof.value.binding, reference(binding.value)) || !sameRef(proof.value.series, reference(head))
+      || canonical(outcomeOf(proof.value.outcome)) !== canonical(outcome))
+      return refused('completion_invalid', 'The A3 outcome must equal the proved complete managed composition',
+        { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
+  } else if (managed) return refused('completion_invalid', 'A standalone attempt cannot acquire a managed close proof',
+    { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
   let completionGuards: readonly Ref[];
   const terminal = 'terminal' in request ? request.terminal : undefined;
   if (terminal !== undefined) {
@@ -1901,6 +1935,25 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   // activeBasis slices; a retained legacy label can equal the new hash without denoting the same subject.
   if (activation.value === 'legacy' && samePredecessorSlice)
     return problem("series_invalid", "A successor stands on a slice its predecessor did not hold", context, "slice");
+  if (context.ref) for (const attempt of draft.attempts) {
+    const binding = readCompletionBinding(store, address.project, context.ref, attempt.ordinal);
+    if (!binding.ok) return binding;
+    if (binding.value && attempt.outcome) {
+      const id = completionCloseId(address.project, binding.value.id), close = store.get(id);
+      if (!close) return refused('completion_invalid', 'A managed outcome needs its exact G7 close proof',
+        { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
+      const proof = readCompletionCloseAt(store, address.project, reference(close));
+      if (!proof.ok) return proof;
+      const work = store.get<CompletionWork>(completionWorkId(address.project, binding.value.id), proof.value.work.revision + 1);
+      const priorWork = store.get<CompletionWork>(proof.value.work.id, proof.value.work.revision);
+      if (!sameRef(proof.value.binding, reference(binding.value)) || canonical(outcomeOf(proof.value.outcome)) !== canonical(attempt.outcome)
+        || !work || work.kind !== COMPLETION_WORK_KIND || !work.value.closed || !sameRef(work.value.closed, reference(close))
+        || !work.value.previous || !sameRef(work.value.previous, proof.value.work) || !priorWork
+        || canonical(work.value) !== canonical({ ...priorWork.value, previous: proof.value.work, closed: reference(close) }) || attempt.terminal)
+        return refused('completion_invalid', 'The managed outcome, closed registry and proof must agree',
+          { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
+    }
+  }
   for (const attempt of draft.attempts) if (attempt.terminal !== undefined) {
     const witness = checkTerminalCompletion(store, address.project, address.id, attempt);
     if (!witness.ok) return witness;
@@ -2092,7 +2145,7 @@ export function projectMechanismSlice(store: Store, project: string, scope: Seal
   requireCondition(typeof current === 'boolean', 'series_request_invalid', 'The reading mode must be explicit');
   return mechanismResult(() => mechanismProjection(store, project, normalizedScope(scope), current));
 }
-function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission, current: boolean): SeriesAdmissionProof {
+function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission, current: boolean, managed?: { series: Ref; attempt: number }): SeriesAdmissionProof {
   const historical = historicalRead(store, { reader: 'A3.3.mechanism-admission', project: request.project, ref: admission.routes,
     parameters: { request, admission: normalizedAdmission(admission) } as unknown as Json },
     () => deriveMechanismAdmission(store, request, admission), () => {
@@ -2104,8 +2157,11 @@ function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admis
   if (obsolete) mechanismTake(obsolete);
   const scope = mechanismProjection(store, request.project, admission.gaps, true);
   const saved = mechanismTake(readRoutes(store, { project: request.project, record: admission.routes })).record.value.request;
-  const prepared = mechanismTake(prepareRoutes(store, { ...saved, gaps: normalizedScope(saved.gaps),
-    catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, tasks: saved.tasks.map(record => ({ record })) }));
+  const binding = managed ? mechanismTake(readCompletionBinding(store, request.project, managed.series, managed.attempt)) : null;
+  const prepared = binding
+    ? mechanismTake(prepareManagedRouteBatch(store, { project: request.project, ...managed!, routes: admission.routes, batch: admission.batch }))
+    : mechanismTake(prepareRoutes(store, { ...saved, gaps: normalizedScope(saved.gaps),
+      catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, tasks: saved.tasks.map(record => ({ record })) }));
   mechanismCheck(canonical(reference(prepared.record)) === canonical(admission.routes) && prepared.writes.length === 0,
     admission.routes.id, 'routes', 'New admission requires the saved current route, not an unrecorded replacement');
   return { ...historical, guards: refsUnique([...scope.guards, ...prepared.guards, admission.routes]),
@@ -2184,7 +2240,7 @@ function readMechanismAttemptAdmission(store: Store, request: MechanismAdmission
         references: refsUnique([...original.references, ...sources.references, request.series]),
         guards: request.current ? refsUnique([...line!.guards, ...(sameSources ? [] : sources.guards)]) : [] };
     }
-    const proof = mechanismAdmission(store, address, request.admission, request.current);
+    const proof = mechanismAdmission(store, address, request.admission, request.current, { series: request.series, attempt: request.attempt });
     const original = mechanismProjection(store, request.project, admitted.basis.gaps, false);
     mechanismCheck(proof.slice === original.slice, request.series.id, 'admission.scope', 'A refreshed admission must preserve the exact semantic task and consumer conditions');
     mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
@@ -2901,4 +2957,240 @@ function prepareEraWrite(store: Store, first: Revision<RepairSeries>, origin: Se
   }
   const value: SeriesEra = { contract: 'om-series-era/v1', project, seriesId: first.id, firstManaged: reference(first), origin };
   return { id: seriesEraId(project, first.id), kind: SERIES_ERA_KIND, expected: 0, value };
+}
+
+/** Completion ownership is independent of the B3 membership/revision era. */
+export interface CompletionPlan { routes: Ref; batches: readonly string[] }
+export const COMPLETION_OWNER_KIND = 'om-completion-owner';
+export const COMPLETION_ERA_KIND = 'om-completion-era';
+export const COMPLETION_ASSIGNMENT_KIND = 'om-completion-assignment';
+export const COMPLETION_WORK_KIND = 'om-completion-work';
+export const COMPLETION_CLOSE_KIND = 'om-completion-close';
+export interface CompletionOwner {
+  contract: 'om-completion-owner/v1'; project: string; series: Ref; previous: Ref;
+  attempt: number; owner: SeriesOwner; goal: AttemptGoal; plan: CompletionPlan; admission: MechanismAdmission | null;
+}
+export interface CompletionEra {
+  contract: 'om-completion-era/v1'; project: string; seriesId: string;
+  firstManagedAttempt: number; opening: Ref; binding: Ref;
+}
+export interface CompletionAssignment {
+  contract: 'om-completion-assignment/v1'; project: string; binding: Ref;
+  key: string; kind: 'root' | 'part' | 'continuation' | 'fact'; parent: Ref | null;
+  source: Ref; batch: string; position: number | null; question: string | null;
+}
+export interface CompletionWork {
+  contract: 'om-completion-work/v1'; project: string; binding: Ref; previous: Ref | null;
+  assignments: Ref[]; products: Ref[]; journal: Ref | null; closed: Ref | null;
+}
+export interface ManagedClosure { binding: Ref; work: Ref }
+export const completionOwnerId = (project: string, seriesId: string, attempt: number): string =>
+  `${COMPLETION_OWNER_KIND}:${project}:${hashJson({ seriesId, attempt })}`;
+export const completionEraId = (project: string, seriesId: string): string =>
+  `${COMPLETION_ERA_KIND}:${project}:${hashJson(seriesId)}`;
+export const completionWorkId = (project: string, bindingId: string): string =>
+  `${COMPLETION_WORK_KIND}:${project}:${hashJson(bindingId)}`;
+export const completionCloseId = (project: string, bindingId: string): string =>
+  `${COMPLETION_CLOSE_KIND}:${project}:${hashJson(bindingId)}`;
+export const completionAssignmentId = (project: string, bindingId: string, key: string): string =>
+  `${COMPLETION_ASSIGNMENT_KIND}:${project}:${hashJson({ binding: bindingId, key })}`;
+class CompletionFailure extends Error {
+  constructor(readonly result: Extract<OmResult<never>, { ok: false }>) { super(result.refusal.message); }
+}
+function completionFail(target: string, field: string, message: string, code = 'completion_invalid'): never {
+  const result = refused(code, message, { unit: 'G7', target, field }, 'producer');
+  if (!result.ok) throw new CompletionFailure(result);
+  throw new Error('Unreachable');
+}
+function completionTake<T>(result: OmResult<T>): T {
+  if (!result.ok) throw new CompletionFailure(result);
+  return result.value;
+}
+function completionResult<T>(read: () => T): OmResult<Sealed<T>> {
+  return withHistoricalReads(() => {
+    try { return delivered(read()); }
+    catch (error) { if (error instanceof CompletionFailure) return error.result; throw error; }
+  });
+}
+function completionExact<T>(store: Store, project: string, ref: Ref, kind: string, id = ref.id): Revision<T> {
+  if (!isRef(ref) || !ref.id.startsWith(`${kind}:${project}:`))
+    completionFail(id, 'record', 'Completion evidence must belong to this project and contract');
+  return completionTake(readRecord<T>(store, ref, { unit: 'G7', target: id, id, kind })) as Revision<T>;
+}
+function normalizeCompletionPlan(plan: CompletionPlan): CompletionPlan {
+  if (!isPlainObject(plan) || !isRef(plan.routes) || !Array.isArray(plan.batches) || !plan.batches.length
+    || !plan.batches.every(isText) || new Set(plan.batches).size !== plan.batches.length
+    || !exactKeys(plan, ['routes', 'batches']))
+    completionFail('completion', 'plan', 'Completion names an exact M6 and a nonempty unique batch set', 'completion_request_invalid');
+  return { routes: exactRef(plan.routes), batches: [...plan.batches].sort() };
+}
+function completionEra(store: Store, project: string, seriesId: string): Revision<CompletionEra> | null {
+  const id = completionEraId(project, seriesId), record = store.get<CompletionEra>(id, 1);
+  if (!record) return null;
+  const value = record.value;
+  if (record.kind !== COMPLETION_ERA_KIND || record.revision !== 1 || !isPlainObject(value)
+    || value.contract !== 'om-completion-era/v1' || value.project !== project || value.seriesId !== seriesId
+    || !Number.isSafeInteger(value.firstManagedAttempt) || value.firstManagedAttempt < 1
+    || !isRef(value.opening) || value.opening.id !== seriesId || !isRef(value.binding)
+    || value.binding.id !== completionOwnerId(project, seriesId, value.firstManagedAttempt)
+    || !exactKeys(value, ['contract', 'project', 'seriesId', 'firstManagedAttempt', 'opening', 'binding']))
+    completionFail(id, 'era', 'The independent immutable completion era is contradictory');
+  return record;
+}
+/** One derivation of the selected whole M6 batches, used at opening and historical binding reads. */
+function completionPlanSources(store: Store, before: Revision<AnyRepairSeries>, request: AnyBeginAttemptRequest, plan: CompletionPlan, current: boolean) {
+  const routes = completionTake(readRoutes(store, { project: request.project, record: plan.routes }));
+  const selected = plan.batches.map(id => {
+    const matches = routes.record.value.batches.filter(batch => batch.id === id);
+    if (matches.length !== 1) completionFail(id, 'batch', 'Each selected logical root is one complete proved M6 batch');
+    return matches[0]!;
+  });
+  const owner = seriesOwner(before.value), goal = goalOf(request.goal);
+  if ('owner' in request) {
+    if (!request.admission) completionFail(before.id, 'admission', 'A mechanism owner retains its full original admission');
+    if (!sameRef(plan.routes, request.admission.routes) || canonical(plan.batches) !== canonical([request.admission.batch]))
+      completionFail(before.id, 'admission', 'M5 completion retains its exact single admitted batch');
+  } else for (const batch of selected) {
+    if (batch.items.some(item => !item.consumers.includes(request.block))
+      || batch.task === 'node-expansion' && batch.level === 2 && batch.node !== request.block)
+      completionFail(before.id, 'batch', 'Every item in the selected whole batch belongs to this consumer');
+  }
+  const questions = [...new Set(selected.flatMap(batch => batch.items.map(item => gapLineKey(request.project, item.target, item.field))))].sort();
+  const results = [...new Set(selected.flatMap(batch => batch.items.map(item => gapLineExpectedResult(request.project, item.target, item.field))))];
+  if (canonical(questions) !== canonical(goal.questions) || results.length !== 1 || results[0] !== goal.result)
+    completionFail(before.id, 'goal', 'The initial work must cover exactly the complete recorded question set and result');
+  const guards: Ref[] = [reference(before)];
+  if (current) {
+    const fresh = completionTake(prepareRoutes(store, JSON.parse(canonical({ ...routes.record.value.request,
+      tasks: routes.record.value.request.tasks.map(record => ({ record })) }))));
+    if (fresh.writes.length || !sameRef(reference(fresh.record), plan.routes))
+      completionFail(before.id, 'routes', 'The new managed opening requires the exact current M6', 'input_stale');
+    guards.push(...fresh.guards);
+  }
+  return { owner, goal, guards };
+}
+function completionBindingBody(store: Store, project: string, value: CompletionOwner): CompletionOwner {
+  if (!isPlainObject(value) || value.contract !== 'om-completion-owner/v1' || value.project !== project
+    || !isRef(value.previous) || !isRef(value.series) || value.previous.id !== value.series.id
+    || value.series.revision !== value.previous.revision + 1 || !Number.isSafeInteger(value.attempt) || goalProblem(value.goal) !== null
+    || !exactKeys(value, ['contract', 'project', 'series', 'previous', 'attempt', 'owner', 'goal', 'plan', 'admission']))
+    completionFail(COMPLETION_OWNER_KIND, 'binding', 'The immutable owner needs its full original opening sources');
+  if (value.admission !== null) {
+    try { requireAdmission(value.admission); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'series_request_invalid')
+        completionFail(value.series.id, 'admission', 'The saved mechanism admission must be complete');
+      throw error;
+    }
+  }
+  // Descend only into the predecessor, never the S this binding creates.
+  const before = completionTake(readAnySeriesAt(store, project, value.previous)) as Revision<AnyRepairSeries>;
+  const request: AnyBeginAttemptRequest = { ...seriesRequestOf(before.value), attempt: value.attempt, goal: value.goal,
+    ...('owner' in before.value ? { admission: value.admission! } : {}) } as AnyBeginAttemptRequest;
+  const plan = normalizeCompletionPlan(value.plan), sources = completionPlanSources(store, before, request, plan, false);
+  if (value.attempt !== before.value.inherited.length + before.value.attempts.length + 1
+    || running(before.value) || before.value.stop) completionFail(value.series.id, 'attempt', 'The owner must originate at one lawful next opening');
+  const opened = settled({ ...plainSeries(before.value),
+    ...('owner' in before.value && 'owner' in request ? { admissions: [...before.value.admissions,
+      { attempt: value.attempt, basis: normalizedAdmission(request.admission) }] } : {}),
+    attempts: [...before.value.attempts.map(copyAttempt), { ordinal: value.attempt, goal: sources.goal, outcome: null, verdict: null }] });
+  if (value.series.hash !== hashJson(opened)) completionFail(value.series.id, 'opening', 'The opening S must follow from its exact predecessor and full assignment');
+  const exact = completionTake(readRecord<AnyRepairSeries>(store, value.series,
+    { unit: 'G7', target: value.series.id, kind: REPAIR_SERIES_KIND, id: before.id }));
+  if (canonical(exact.value) !== canonical(opened)) completionFail(value.series.id, 'opening', 'The original opening cannot be rewritten');
+  return { contract: 'om-completion-owner/v1', project, series: exactRef(value.series), previous: reference(before),
+    attempt: value.attempt, owner: sources.owner, goal: sources.goal, plan, admission: 'owner' in request ? normalizedAdmission(request.admission) : null };
+}
+export function readCompletionOwnerAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionOwner>>> {
+  return completionResult(() => historicalRead(store, { reader: 'G7.completion-owner', project, ref }, () => {
+    const record = completionExact<CompletionOwner>(store, project, ref, COMPLETION_OWNER_KIND);
+    const value = completionBindingBody(store, project, record.value);
+    if (record.revision !== 1 || record.id !== completionOwnerId(project, value.series.id, value.attempt)
+      || canonical(value) !== canonical(record.value)) completionFail(record.id, 'binding', 'The owner must equal its complete shared derivation');
+    return record;
+  }, () => completionFail(ref.id, 'history', 'A completion owner cannot derive from itself')));
+}
+/** Addressed selector. Missing a known managed ordinal is damage, never a legacy fallback. */
+export function readCompletionBinding(store: Store, project: string, series: Ref, ordinal: number): OmResult<Sealed<Revision<CompletionOwner> | null>> {
+  return completionResult(() => {
+    const source = completionTake(readRecord<AnyRepairSeries>(store, series,
+      { unit: 'G7', target: series.id, kind: REPAIR_SERIES_KIND, id: series.id }));
+    if (!isPlainObject(source.value) || !Array.isArray(source.value.inherited) || !Array.isArray(source.value.attempts))
+      completionFail(series.id, 'series', 'The completion selector needs a full exact original series');
+    const inherited = source.value.inherited.find(attempt => attempt.ordinal === ordinal);
+    if (inherited && source.value.predecessor)
+      return completionTake(readCompletionBinding(store, project, source.value.predecessor, ordinal)) as Revision<CompletionOwner> | null;
+    const id = completionOwnerId(project, series.id, ordinal), binding = store.get<CompletionOwner>(id, 1);
+    const era = completionEra(store, project, series.id);
+    if (!era) {
+      if (binding || store.get(completionWorkId(project, id), 1)) completionFail(id, 'era', 'Managed evidence has lost its independent era');
+      return null;
+    }
+    if (ordinal < era.value.firstManagedAttempt) {
+      if (binding) completionFail(id, 'era', 'A binding cannot precede its completion threshold');
+      return null;
+    }
+    const first = completionTake(readCompletionOwnerAt(store, project, era.value.binding));
+    if (!sameRef(first.value.series, era.value.opening) || first.value.attempt !== era.value.firstManagedAttempt)
+      completionFail(era.id, 'opening', 'The threshold must reproduce the first managed opening');
+    if (!source.value.attempts.some(attempt => attempt.ordinal === ordinal) && !binding) return null;
+    if (!binding) completionFail(id, 'binding', 'A managed attempt has lost its mandatory owner');
+    const checked = completionTake(readCompletionOwnerAt(store, project, reference(binding))) as Revision<CompletionOwner>;
+    const initial = store.get<CompletionWork>(completionWorkId(project, id), 1);
+    const expected: CompletionWork = { contract: 'om-completion-work/v1', project, binding: reference(checked),
+      previous: null, assignments: completionRootAssignments(checked).map(reference).sort((a,b) => canonical(a).localeCompare(canonical(b))),
+      products: [], journal: null, closed: null };
+    if (!initial || initial.kind !== COMPLETION_WORK_KIND || initial.hash !== hashJson(expected)
+      || canonical(initial.value) !== canonical(expected))
+      completionFail(id, 'work', 'A managed opening needs its initial registry');
+    for (const root of completionRootAssignments(checked)) {
+      const actual = completionExact<CompletionAssignment>(store, project, reference(root), COMPLETION_ASSIGNMENT_KIND);
+      if (canonical(actual) !== canonical(root)) completionFail(root.id, 'assignment', 'The initial root must retain its exact producer value');
+    }
+    return checked;
+  });
+}
+export function completionRootAssignments(binding: Revision<CompletionOwner>): Revision<CompletionAssignment>[] {
+  return binding.value.plan.batches.map(batch => {
+    const value: CompletionAssignment = { contract: 'om-completion-assignment/v1', project: binding.value.project,
+      binding: reference(binding), key: `batch:${batch}`, kind: 'root', parent: null,
+      source: binding.value.plan.routes, batch, position: null, question: null };
+    return { id: completionAssignmentId(value.project, binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
+      revision: 1, hash: hashJson(value), value };
+  });
+}
+/** G7's managed A3 preparer returns the indivisible opening bundle, never an unbacked S write. */
+export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> {
+  const address = requireBeginRequest(store, request);
+  return completionResult(() => {
+    const before = completionTake(readAnySeries(store, request)) as Revision<AnyRepairSeries>;
+    const binding = completionTake(readCompletionBinding(store, request.project, reference(before), request.attempt));
+    if (!request.completion) return completionTake(prepareBeginAttempt(store, request)) as AnySeriesTransition;
+    const plan = normalizeCompletionPlan(request.completion);
+    if (binding) return completionTake(prepareBeginAttempt(store, request)) as AnySeriesTransition;
+    const era = completionEra(store, request.project, address.id);
+    const sources = completionPlanSources(store, before, request, plan, true);
+    const begun = completionTake(prepareBegin(store, request, plan));
+    if (!begun.transition.writes.length) completionFail(address.id, 'attempt', 'A standalone attempt cannot acquire an owner', 'completion_conflict');
+    const opening = { id: address.id, revision: before.revision + 1, hash: hashJson(begun.transition.value) };
+    const value: CompletionOwner = { contract: 'om-completion-owner/v1', project: request.project,
+      series: opening, previous: reference(before), attempt: request.attempt, owner: sources.owner, goal: sources.goal, plan,
+      admission: 'owner' in request ? normalizedAdmission(request.admission) : null };
+    const owner: Revision<CompletionOwner> = { id: completionOwnerId(request.project, address.id, request.attempt),
+      kind: COMPLETION_OWNER_KIND, revision: 1, hash: hashJson(value), value };
+    const assignments = completionRootAssignments(owner);
+    const work: CompletionWork = { contract: 'om-completion-work/v1', project: request.project, binding: reference(owner),
+      previous: null, assignments: assignments.map(reference).sort((a,b) => canonical(a).localeCompare(canonical(b))), products: [], journal: null, closed: null };
+    const writes: PreparedWrite[] = [...begun.transition.writes, { id: owner.id, kind: owner.kind, expected: 0, value },
+      ...assignments.map(record => ({ id: record.id, kind: record.kind, expected: 0, value: record.value })),
+      { id: completionWorkId(request.project, owner.id), kind: COMPLETION_WORK_KIND, expected: 0, value: work }];
+    if (!era) writes.push({ id: completionEraId(request.project, address.id), kind: COMPLETION_ERA_KIND, expected: 0,
+      value: { contract: 'om-completion-era/v1', project: request.project, seriesId: address.id,
+        firstManagedAttempt: request.attempt, opening, binding: reference(owner) } satisfies CompletionEra });
+    return { writes, guards: [...begun.transition.guards, ...sources.guards, ...(era ? [reference(era)] : [])], value: begun.transition.value };
+  });
+}
+
+export function prepareManagedCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest, close: Ref): OmResult<Sealed<AnySeriesTransition>> {
+  return withHistoricalReads(() => handed(prepareComplete(store, request, close)));
 }
