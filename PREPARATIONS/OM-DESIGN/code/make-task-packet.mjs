@@ -1,6 +1,7 @@
 // Пакет задачи воркеру. Запуск из PREPARATIONS/OM-DESIGN:  node code/make-task-packet.mjs <id задачи>  →  code/packets/<id>.md
 // Тексты правил и карточек подставляются ДОСЛОВНО из источников (level2-rules.mjs, om-design.json) — не пересказ оркестратора. Задача с полем open не выдаётся, пока оно не снято (ключ --force — только для просмотра).
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { RULES } from "../level2-rules.mjs";
@@ -70,3 +71,5 @@ if (mine.size) { P.push("## Карточки единиц карты — дос�
 if (stores.length) { P.push("## Карточки записей-соседей — дословно", ""); for (const n of stores) if (!mine.has(n.id)) P.push(card(n), ""); }
 mkdirSync("code/packets", { recursive: true }); const out = `code/packets/${t.id}.md`; const text = P.join("\n"); writeFileSync(out, text);
 console.log(`пакет задачи ${t.id}: ${out} · ${text.length} знаков · правил ${t.rules.length} · единиц ${mine.size} · соседей: от ${from.size}, к ${to.size}`);
+// РИСК «задача без графа» (решение владельца 27.09.2026: все задачи воркерам — с таблицей исхода и графом пересечений до кода): документа графа нет — громкое предупреждение
+{ const gdir = `${homedir()}/REPORTS/review`; const key = `omg-code-${t.id.toLowerCase().replace(/\./g, "")}_intersection-graph_`; const has = existsSync(gdir) && readdirSync(gdir).some(f => f.startsWith(key)); if (!has) console.log(`ВНИМАНИЕ: графа пересечений для ${t.id} нет (${gdir}/${key}<дата>.md) — по решению владельца задача без графа не выдаётся`); }
