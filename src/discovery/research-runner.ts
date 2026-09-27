@@ -19,7 +19,8 @@ import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
 import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pilot.js";
 import { pilotContext, retainPilotRead } from "./pilot-context.js";
-import { readBundle } from "./reader.js";
+import { readBundle, readerResumeStep } from "./reader.js";
+import { captureResearchConsumerRetryPermits } from "./response-recovery.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead, addressedWorkspace } from "./research-continuation.js";
 import { addContextLookup } from './context-workspace.js';
@@ -51,6 +52,9 @@ export class Researcher {
     const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: effective.root };
     const sources = new ResearchSources(this.store, project, effective.root);
     const id = `research-run:${hashJson([project, draftId])}`;
+    // A child may use only the retry allowance visible at the external run
+    // boundary. A refusal produced inside this run cannot authorize g+1.
+    const readerRetryPermits = captureResearchConsumerRetryPermits(this.store, project);
     let run = this.store.get<ResearchRun>(id);
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
@@ -127,7 +131,19 @@ export class Researcher {
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
-        let pendingTurn = turns.find(item => item.value.status === "pending" && (!savedMaterials || !item.value.plannedBy) && (!item.value.question
+        // A queued child with a paid claim owns this position even if the question
+        // gained a new revision. Recover that exact child first; the reader then
+        // applies it or refuses the current admission without buying an analyst.
+        const paidTurn = turns.find(item => {
+          if (item.value.status !== 'pending'
+            || item.value.question?.id !== pending[0]!.id) return false;
+          const planned = item.value.action as ResearchAction;
+          if (planned.action !== 'read_bundle' || !item.value.question) return false;
+          const step = readerResumeStep(this.store, project, item.value.question,
+            planned.purpose, planned.inputs, { run: reference(run!), turn: reference(item) });
+          return step.kind !== 'none';
+        });
+        let pendingTurn = paidTurn ?? turns.find(item => item.value.status === "pending" && (!savedMaterials || !item.value.plannedBy) && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
         const recoveredPlan = !savedMaterials && !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
         if (recoveredPlan) {
@@ -185,7 +201,9 @@ export class Researcher {
             observation = { nextMode: action.action === "synthesize" ? "synthesis" : "planning" };
           } else if (action.action === "read_bundle") {
             requireCondition(pilot, "reader_pilot_required", "A source bundle needs the configured reader experiment");
-            const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs, signal);
+            const paidQuestion = paidTurn && pendingTurn.id === paidTurn.id ? paidTurn.value.question : null;
+            const result = await readBundle(this.store, dispatch, pilot, paidQuestion ?? reference(pending[0]!), action.purpose, action.inputs,
+              signal, { run: reference(run), turn: reference(pendingTurn) }, readerRetryPermits);
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
           } else if (action.action === "read_context") {
             try { observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page); }
@@ -262,7 +280,8 @@ export class Researcher {
           }
           if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
             "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
-            || ["pilot_", "budget_", "continuation_", "research_context_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
+            || (action.action === 'read_bundle' && !!paidTurn && failure.code === 'question_stale')
+            || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
             || failure.code.endsWith("_no_progress"))) throw failure;
           error = failure instanceof Error ? failure.message : "Research action failed";
           if (failure instanceof EngineError) observation = { code: failure.code, details: failure.details };

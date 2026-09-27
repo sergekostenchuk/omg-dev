@@ -1,10 +1,9 @@
-import { normalizeResearchAction } from './research-action-normalization.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
-import { interceptResearchPreview } from './research-preview.js';
+import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
@@ -14,82 +13,34 @@ import { budgetSegment, budgetUsage, budgetGroups, assertQuestionBudget, reserve
 import { planningForQuestion } from "./research-routing.js";
 import { researchScope } from "../graph/research-scope.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
-import type { ResearchAction } from "./research-model.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
-import { tokenUsage, type ModelCall } from "../runtime/model-usage.js";
+import type { ModelCall } from "../runtime/model-usage.js";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
-import { DELTA_COLLECTIONS } from "./layer-delta.js";
 import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
-import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery } from './response-recovery.js';
+import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
+  readResearchConsumerIntent, resumeResearchConsumerExecution,
+  refuseResearchConsumerIntent, prepareResearchConsumerReservation,
+  type ResearchConsumerIntent } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
+import { projectResearchPhysicalReply } from './research-consumer-transition.js';
 
-const object = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
-const text = { type: "string", minLength: 1 };
-const ref = object({ id: text, revision: { type: "integer", minimum: 1 }, hash: { type: "string", pattern: "^[a-f0-9]{64}$" } });
-const selector = { oneOf: [object({ kind: { const: "json-pointer" }, pointer: { type: "string" } }),
-  object({ kind: { const: "text-range" }, start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 1 } })] };
-const deltaCollections = (items: object) => ({ type: "object", additionalProperties: false,
-  properties: Object.fromEntries(DELTA_COLLECTIONS.map(key => [key, { type: "array", items }])) });
-const bundleItem = (properties: Record<string, unknown>) => {
-  const schema = object(properties);
-  schema.properties['range'] = object({ start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 0 } });
-  return schema;
-};
-const contextRead = object({ action: { const: "read_context" }, record: ref, pointer: { type: "string" } });
-contextRead.properties['purpose'] = text;
-contextRead.properties['page'] = object({ offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 } });
-const readSchemas = [
-  object({ action: { const: "read_bundle" }, purpose: text, inputs: { type: "array", minItems: 1, items: { oneOf: [
-    bundleItem({ path: text, media: { enum: ["text/plain", "application/json"] } }), bundleItem({ source: ref }),
-  ] } } }), contextRead,
-  object({ action: { const: "search" }, query: text }),
-  object({ action: { const: "read_source" }, source: ref, start: { type: "integer", minimum: 0 }, end: { type: "integer", minimum: 1 } }),
-  object({ action: { const: "read" }, path: text, media: { enum: ["text/plain", "application/json"] } }),
-];
-const answerDelta = object({ action: { const: "answer_delta" }, question: text, base: ref,
-  upserts: deltaCollections({ type: "object", required: ["id"], properties: { id: text } }), removes: deltaCollections(text),
-  citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } });
-answerDelta.properties['revises'] = ref;
-answerDelta.properties['horizon'] = { type: 'array', minItems: 1, uniqueItems: true, items: text };
-const validate = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
-  ...readSchemas,
-  object({ action: { const: "read_plan" }, question: text, reads: { type: "array", minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
-  object({ action: { const: "synthesize" }, question: text }),
-  object({ action: { const: "need_research" }, question: text, missing: { type: "array", minItems: 1, items: text } }),
-  answerDelta,
-  object({ action: { const: "checkpoint" }, question: text, value: {},
-    citations: { type: "array", items: object({ source: ref, selector }) }, unresolved: { type: "array", items: text } }),
-  object({ action: { const: "answer" }, question: text, value: {}, citations: { type: "array", minItems: 1, items: object({ source: ref, selector }) } }),
-  object({ action: { const: "need_owner" }, question: text, reason: text, searched: { type: "array", minItems: 1, items: ref } }),
-  object({ action: { const: "pause" }, reason: text }),
-] });
-export function researchAction(value: unknown): ResearchAction {
-  value = normalizeResearchAction(value);
-  if (!validate(value)) throw new EngineError("research_response_invalid", "Research action has missing or invalid fields", validate.errors);
-  if (value.action === 'checkpoint' && value.citations.length === 0) {
-    const note = value.value;
-    const meaningful = typeof note === 'string' ? note.trim().length > 0 : Array.isArray(note) ? note.length > 0
-      : note !== null && (typeof note !== 'object' || Object.keys(note).length > 0);
-    requireCondition(meaningful || value.unresolved.some(text => text.trim().length > 0),
-      'research_checkpoint_empty', 'An uncited checkpoint needs actual proposed content or an explicit unresolved question');
-  }
-  return value;
-}
+export { researchAction } from './research-consumer-transition.js';
+
 interface ResearchCallAudit {
   store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
   session?: Ref; onContext?: (context: Record<string, any>) => void;
   application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
+  consumerIntent?: Ref;
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
   kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
@@ -103,7 +54,8 @@ function applicationAuditInvalid(message: string): never {
  * The saved session selects the era before optional callback fields can do so. */
 function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleBinding, environment: Environment, context: unknown): AssessmentReservation | null {
   const namedSession = recordValue(context) ? context.assessmentSession : undefined;
-  const namesNewSession = typeof namedSession === 'string' && namedSession.startsWith('assessment-session:v1:');
+  const namesNewSession = typeof namedSession === 'string'
+    && (namedSession.startsWith('assessment-session:v1:') || namedSession.startsWith('assessment-session:v2:'));
   if (!audit) {
     if (namesNewSession) applicationAuditInvalid('A new assessment context needs its exact audited session');
     return null;
@@ -193,6 +145,39 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
+  let consumerIntent: Revision<ResearchConsumerIntent> | null = null;
+  // Preview bypasses only the unsaved intent it synthesized for a prospective
+  // request. A durable intent may already own a paid reply, which must be
+  // replayed before preview reaches the next provider boundary.
+  const durableConsumerIntent = audit?.consumerIntent
+    ? audit.store.get<ResearchConsumerIntent>(audit.consumerIntent.id, audit.consumerIntent.revision)
+    : null;
+  if (audit?.consumerIntent && (!isResearchPreview() || durableConsumerIntent)) {
+    if (audit.application || audit.prepareCall || !audit.store) applicationAuditInvalid('A consumer intent cannot share an assessment reservation callback');
+    const supplied = readResearchConsumerIntent(audit.store, audit.consumerIntent);
+    const head = audit.store.get<ResearchConsumerIntent>(supplied.id);
+    requireCondition(head, 'research_consumer_intent_invalid', 'The selected consumer intent disappeared');
+    consumerIntent = readResearchConsumerIntent(audit.store, reference(head));
+    requireCondition(consumerIntent.value.projectId === environment.projectId && consumerIntent.value.draft.id === audit.draftId
+      && consumerIntent.value.question.id === audit.questionId && canonical(consumerIntent.value.role) === canonical(role)
+      && canonical(consumerIntent.value.dispatch) === canonical(environment)
+      && canonical(consumerIntent.value.profile) === canonical(audit.pilot ? reference(audit.pilot) : null),
+    'research_consumer_intent_invalid', 'The saved consumer operation differs from the selected role, project, question or environment');
+    if (consumerIntent.value.state !== 'prepared' && !isResponseRecovery()) {
+      if (consumerIntent.value.state === 'applied') throw new EngineError('research_consumer_intent_applied', 'The completed consumer operation must return its saved output');
+      const paid = resumeResearchConsumerExecution(audit.store, environment.projectId, reference(consumerIntent));
+      if (paid.kind !== 'response') throw new EngineError('research_consumer_execution_refused', 'The saved physical result did not contain a research answer');
+      audit.onContext?.(paid.subject);
+      return paid.payload;
+    }
+    if (consumerIntent.value.state === 'prepared') {
+      const savedPrompt = consumerIntent.value.cursor.prompt ?? consumerIntent.value.cursor.instruction;
+      requireCondition(typeof savedPrompt === 'string' && canonical(savedPrompt) === canonical(prompt)
+        && Object.hasOwn(consumerIntent.value.cursor, 'context')
+        && canonical(consumerIntent.value.cursor.context) === canonical(context),
+      'research_consumer_intent_invalid', 'The unsent intent must preserve its exact original prompt and consumer context');
+    }
+  }
   const assessment = assessmentReservation(audit, role, environment, context);
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
@@ -223,6 +208,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor) : null;
   const requestId = randomUUID();
+  const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
@@ -248,7 +234,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
   interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
-  if (audit?.pilot && packetState) {
+  if (!consumerIntent && audit?.pilot && packetState) {
     const previous = audit.store.list<ModelCall>("model-call").filter(c => c.value.status === "failed" && c.value.error === "pilot_reply_limit"
       && c.value.questionId === audit.questionId && c.value.purpose === audit.purpose && c.value.requested.actor === role.actor
       && c.value.packet?.archive.hash === (subject as any).working.archive.hash && c.value.request.record);
@@ -260,17 +246,17 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       if (paid) { audit.onContext?.(JSON.parse(saved.value.text).subject); return paid.research; }
     }
   }
-  const replay = audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
+  const replay = !consumerIntent && audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
     audit.questionId, audit.purpose, input) : null;
   if (replay) return replay.research;
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
-  const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, `model-call:${requestId}`, input.length) : { writes: [], guards: [] };
+  const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
   if (segment && audit && estimate) {
     requireCondition(input.length <= requestLimit!, "pilot_request_limit", "Complete envelope exceeds its working limit");
-    const reserved = reserveResearchCall(audit.store, segment, `model-call:${requestId}`, groups, estimate);
+    const reserved = reserveResearchCall(audit.store, segment, callId, groups, estimate);
     reservation.writes.push(...reserved.writes);
     reservation.guards.push(...reserved.guards, reference(policy!), reference(audit.pilot!), reference(draft!), reference(protectedQuestion!), ...draft!.value.inputs);
   }
@@ -297,19 +283,20 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       value:{projectId:environment.projectId,question:audit!.questionId,serial:(questionCounter?.value.serial??0)+1}});
     if(questionCounter) reservation.guards.push(reference(questionCounter));
     if(audit!.session) reservation.guards.push(audit!.session);
-    const dispatch = continuationDispatch(packetState, `model-call:${requestId}`);
+    const dispatch = continuationDispatch(packetState, callId);
     reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]));
     reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
       value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
   }
   const ownership = audit ? physicalClaim() : null;
   consumeInvocationAllowance();
-  const callWrite: Write = { id: `model-call:${requestId}`, kind: "model-call", expected: 0,
+  const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
       ...(ownership ?? {}),
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
+      ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),
       profile: audit?.pilot ? reference(audit.pilot) : null,
       questionId: audit?.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
@@ -321,8 +308,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const originalCall = assessment ? canonical(callWrite) : '';
   const application = audit?.prepareCall?.(callWrite);
   preparedAssessmentCall(assessment, callWrite, originalCall, application);
-  let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([callWrite, ...reservation.writes, ...(application?.writes ?? [])],
-    [...reservation.guards, ...(application?.guards ?? [])])[0]! : null;
+  const consumerReservation = consumerIntent ? prepareResearchConsumerReservation(audit!.store, reference(consumerIntent), callWrite,
+    (callWrite.value as ModelCall).request.record!, (callWrite.value as ModelCall).packet!.archive) : null;
+  let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([callWrite, ...reservation.writes,
+    ...(application?.writes ?? []), ...(consumerReservation?.writes ?? [])],
+    [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? [])])[0]! : null;
   const claimed = call ? reference(call) : null;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
@@ -334,25 +324,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     physicalResult = result;
     rawResponse = result.stdout;
     patch.response = { chars: result.stdout.length, bytes: Buffer.byteLength(result.stdout) };
-    let response: { protocol?: unknown; requestId?: unknown; research?: unknown; usage?: unknown; confirmed?: unknown } | null = null;
-    try { response = JSON.parse(result.stdout); } catch { /* Exit status and envelope are checked below. */ }
-    if (response?.protocol === "omg-agent/v1" && response.requestId === requestId) {
-      patch.usage = tokenUsage(response.usage); patch.usageSource = patch.usage ? "adapter" : "unavailable";
-      const confirmed = response.confirmed as Record<string, unknown> | undefined;
-      if (confirmed) {
-        requireCondition(Object.keys(confirmed).sort().join(",") === "effort,model,speed"
-          && Object.values(confirmed).every(value => value === null || (typeof value === "string" && value.length > 0)),
-        "usage_invalid", "Confirmed runtime fields must be explicit strings or null");
-        patch.confirmed = confirmed as ModelCall['confirmed'];
-      }
-    }
-    requireCondition(result.exitCode === 0, "research_provider_failed", result.stderr.slice(-2000) || "Research provider failed");
-    requireCondition(response, "research_response_invalid", "Research adapter must return a protocol response");
-    requireCondition(response.protocol === "omg-agent/v1" && response.requestId === requestId && Object.hasOwn(response, "research"),
-      "research_response_foreign", "Research response is missing or belongs to another invocation");
-    requireCondition(!audit?.pilot?.value.physicalLimits || JSON.stringify(response.research).length <= audit.pilot.value.physicalLimits.maxReplyChars,
-      "budget_transport_limit", "Response exceeds the declared physical response capacity");
-    patch.status = "succeeded"; return response.research;
+    const outcome = projectResearchPhysicalReply(result.stdout, requestId, result.exitCode, result.stderr,
+      audit?.pilot?.value.physicalLimits?.maxReplyChars ?? null);
+    patch = { ...patch, status: outcome.status, error: outcome.error, usage: outcome.usage,
+      usageSource: outcome.usageSource, confirmed: outcome.confirmed };
+    if (outcome.error) throw new EngineError(outcome.error, outcome.message ?? 'Research call failed');
+    return outcome.payload;
   } catch (error) {
     patch.status = "failed"; patch.error = error instanceof EngineError ? error.code : "research_call_failed"; throw error;
   } finally {
@@ -364,6 +341,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
             ...(audit.application && physicalResult ? { assessmentExecution: { contract: 'assessment-execution/v1',
               call: claimed, dispatch: reference(call), process: { exitCode: physicalResult.exitCode,
                 signal: physicalResult.signal, stderr: physicalResult.stderr } } } : {}) } };
+        if (consumerIntent && physicalResult) (saved.value as Record<string, unknown>)['consumerExecution'] = {
+          contract: 'research-consumer-execution/v1', call: claimed, dispatch: reference(call),
+          process: { exitCode: physicalResult.exitCode, signal: physicalResult.signal, stderr: physicalResult.stderr } };
         responseWrites.push(saved);
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
@@ -379,6 +359,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         audit.store.writeMany(late.writes, late.guards);
         throw error;
       }
+      if (consumerIntent && patch.status === 'failed' && patch.error !== 'process_lost')
+        refuseResearchConsumerIntent(audit.store, reference(consumerIntent));
       if (segment && budgetUsage(audit.store, segment).measured > segment.value.limit) {
         audit.store.write({ id: `budget-incident:${requestId}`, kind: "budget-incident", expected: 0,
           value: { projectId: environment.projectId, segment: reference(segment), call: reference(call), reason: "Actual provider usage exceeded the experimental forecast and the owner budget; further calls are forbidden" } });

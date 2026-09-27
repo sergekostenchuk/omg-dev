@@ -36,6 +36,7 @@ import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-s
 import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
 import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
+import { readResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -755,19 +756,22 @@ test("grouped reads resume only the failed child and then switch to substantive 
   const command=join(root,'batch-provider.mjs');
   writeFileSync(join(root,'fail-b'),'once');
   writeFileSync(command,`import {readFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
-if(c.role==='reader'){research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};if(c.purpose==='b'&&existsSync('fail-b'))process.exitCode=1;}
+if(c.role==='reader'){if(c.purpose==='b'&&existsSync('fail-b'))process.exit(1);research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};}
 else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
 else {if(!c.question.schema||c.readings.length!==2)throw Error('Synthesis needs real content');if(req.prompt.includes('"action":"read"')||req.prompt.includes('prefer one related bundle'))throw Error('Synthesis cannot carry planning instructions');research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both groups read',facts:[],designs:[{id:'d',decision:'Respect both conditions',benefit:'Safe result',consumer:'compilation'}],gaps:[]},citations:c.readings.flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};}
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const cmd={executable:process.execPath,args:[command]};
-  configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
+  const active=configureReaderPilot(store,engine.environments,"p",{...settings,agentCommand:cmd,reader:{...settings.reader,command:cmd},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:3}},pilot.revision);
   const first=await engine.researcher.run("p",draft.id,10);
   assert.equal(first.value.pauseCode,'research_provider_failed');
   assert.equal(store.list('reader-result').length,1);
   const acceptedRead=store.list('reader-result')[0]!;
   assert.equal(store.list<ResearchTurn>('research-turn').filter(t=>t.value.plannedBy&&t.value.status==='pending').length,1);
   rmSync(join(root,'fail-b'));
+  const failed=store.list<ModelCall>('model-call').find(call=>call.value.purpose==='reader'&&call.value.status==='failed')!;
+  const {projectId:_projectId,...activeSettings}=active.value;
+  configureReaderPilot(store,engine.environments,'p',{...activeSettings,unknownReserves:[{call:reference(failed),tokens:130}]},active.revision);
   await engine.researcher.run("p",draft.id,2);
   assert.equal(store.get<Question>(question.id)!.value.status,'answered');
   assert.deepEqual(store.get(acceptedRead.id),acceptedRead);
@@ -776,6 +780,40 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   assert.equal(calls.filter(c=>c.value.purpose==='analyst').length,1);
   assert.equal(calls.filter(c=>c.value.purpose==='reader').length,3);
   assert.equal(calls.length,6);
+});
+
+test('a grouped child with a nonempty failed physical reply stays pending without repurchase after restart', async t => {
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  for (const path of ['a.txt', 'b.txt']) writeFileSync(join(root, path), `Header\n${path} condition\n${path} exception\n`);
+  const command = join(root, 'nonempty-failed-child.mjs');
+  writeFileSync(join(root, 'fail-b'), 'once');
+  writeFileSync(command, `import {readFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='reader'){research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};if(c.purpose==='b'&&existsSync('fail-b'))process.exitCode=1;}
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
+else throw Error('No further paid action is expected');
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd,
+    reader: { ...settings.reader, command: cmd },
+    planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const first = await engine.researcher.run('p', draft.id, 10);
+  assert.equal(first.value.pauseCode, 'research_provider_failed');
+  const accepted = store.list('reader-result')[0]!;
+  const calls = store.list<ModelCall>('model-call');
+  const responses = store.list('model-response');
+  const failed = calls.find(call => call.value.purpose === 'reader' && call.value.status === 'failed')!;
+  assert.ok(failed.value.response?.chars);
+  const intent = store.list<any>('research-consumer-intent').find(row => row.value.call?.id === failed.id)!;
+  assert.equal(readResearchConsumerIntent(store, reference(intent)).value.refusal?.kind, 'terminal');
+  assert.equal(store.list<ResearchTurn>('research-turn').filter(turn => turn.value.plannedBy && turn.value.status === 'pending').length, 1);
+  rmSync(join(root, 'fail-b'));
+  const reopened = new Store(join(root, 'state.sqlite')); t.after(() => reopened.close());
+  const repeated = await new ProductEngine(reopened).researcher.run('p', draft.id, 2);
+  assert.equal(repeated.value.pauseCode, 'research_consumer_execution_refused');
+  assert.deepEqual(reopened.list('model-call'), calls);
+  assert.deepEqual(reopened.list('model-response'), responses);
+  assert.deepEqual(reopened.get(accepted.id), accepted);
+  assert.equal(reopened.list<ResearchTurn>('research-turn').filter(turn => turn.value.plannedBy && turn.value.status === 'pending').length, 1);
 });
 
 test("the permanent source catalogue retains every inventory field without retaining duplicate navigation payload", t => {

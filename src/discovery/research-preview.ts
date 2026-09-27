@@ -4,9 +4,11 @@ import { EngineError, requireCondition } from '../errors.js';
 
 export interface ResearchPreview { input: string; chars: number; bytes: number; hash: string; limit: number; draft: string; question: string; purpose: string }
 const currentPreview=new AsyncLocalStorage<{captured:ResearchPreview|null}>();
+/** A preview computes the real envelope but leaves no consumer reservation. */
+export function isResearchPreview():boolean{return currentPreview.getStore()!==undefined;}
 
-/** Intercepts the real serialized envelope before replay, reservation or provider
- * dispatch. Every attempted call remains intercepted throughout the callback. */
+/** Intercepts a new serialized envelope before reservation or provider dispatch.
+ * A previously paid durable intent is resumed before reaching this boundary. */
 export function interceptResearchPreview(input:string,metadata:Omit<ResearchPreview,'input'|'chars'|'bytes'|'hash'>):void{
   const state=currentPreview.getStore();if(!state)return;
   requireCondition(metadata.draft&&metadata.question&&metadata.purpose,'research_preview_unbound','Preview requires an audited question-bound request');
