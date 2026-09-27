@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { RULES } from "../level2-rules.mjs";
 import { SLICES, TASKS, COMMON_TESTS, MILESTONE } from "./task-plan.mjs";
 const map = JSON.parse(readFileSync("om-design.json", "utf8")); const found = []; const ruleIds = new Set(RULES.map(r => r.id)); const nodeIds = new Set(map.nodes.map(n => n.id)); const byId = new Map(TASKS.map(t => [t.id, t]));
+const FROZEN_IDS = new Set("A1 A2 A3 A3.1 A3.2 A3.3 A4 A5 A6 B0 B1 B1.1 B2 B3.0a B3.0b B3 P1 P2 P3 C1 C2 C3 C4 C5 C5.1a C5.1b C5.2 D1 D2 D3 D4 D5 D3.1 D6 D7 D8.0 D8 D8.1 D8.3 D8.4a D8.4b D8.4c D8.4d D8.4e D8.3.1 D8.4.1 D8.4.2 D8.5 D8.2 V1 E1 E2 V3 E3 E4 E5.0 E5 E6 F1 F2 E2.1 F3 F4 V2 F5 S1 G1 G1.1 G1.2 G1.3 G1.4 G2 G3 H1.0a H1.0b H1.0c H1.0d H1 Q1 Q2 Q3 Q2.1 Q4 Q5 E5.1 H2.0 H2".split(" "));
 const nodeName = id => { const n = map.nodes.find(x => x.id === id); return n ? String(n.fields["название"] ?? n.fields["запись"] ?? n.fields["стадия"] ?? n.id).split(" — ")[0] : id; };
 
 if (byId.size !== TASKS.length) found.push("повторяющийся id задачи");
@@ -19,6 +20,9 @@ for (const t of TASKS) {
   for (const p of t.paths ?? []) if (/[*?]|\/$/.test(p)) found.push(`${t.id}: путь «${p}» — каталог или шаблон; нужны точные пути файлов`);
   // UI не трогаем; исключение — только по явному разрешению владельца, записанному в задаче полем uiAllowed (основание)
   for (const p of t.paths ?? []) if (/^ui\//.test(p) && !(typeof t.uiAllowed === "string" && t.uiAllowed.trim())) found.push(`${t.id}: путь в ui/ — UI не трогаем (исключение — поле uiAllowed с разрешением владельца)`);
+  // РИСК «план растёт быстрее кода» (решение владельца 27.09.2026: код прежде всего, план заморожен на 87 задачах): новая задача — только с доказательством
+  // в поле admission: воспроизведённый законными вызовами сбой (проба/лог), который блокирует живой прогон и не укладывается в существующую задачу
+  if (!FROZEN_IDS.has(t.id) && !(typeof t.admission === "string" && t.admission.trim())) found.push(`${t.id}: новая задача вне замороженного плана — нужно поле admission с доказательством (воспроизведённый сбой, блокирует прогон, не укладывается в существующую задачу)`);
 }
 // покрытие карты: каждая единица и запись уровня 1–2 должна быть в units хотя бы одной задачи
 const covered = new Set(TASKS.flatMap(t => t.units ?? [])); const mustCover = map.nodes.filter(n => ["mechanism", "gate", "model", "store"].includes(n.type)).map(n => n.id);
