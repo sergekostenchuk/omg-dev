@@ -3,7 +3,7 @@ import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { readCompletionWorkAt } from './model-call.js';
+import { readCompletionWorkAt, checkCompletionDisposition } from './model-call.js';
 import { completionWorkId, prepareSeriesLineAdmission, readCompletionBinding } from './series.js';
 import { historicalRead, readOmInput, withHistoricalReads } from './input.js';
 import { collectGaps, gateGaps, readGaps, prepareCurrentGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
@@ -356,7 +356,7 @@ export function prepareManagedRouteBatch(store: Store, request: {
     const workHead = store.get(completionWorkId(request.project, binding.id));
     if (!workHead) fail('completion_invalid', binding.id, 'work', 'The current managed registry is mandatory');
     const work = take(readCompletionWorkAt(store, request.project, reference(workHead)));
-    if (work.work.value.closed) fail('completion_closed', binding.id, 'work', 'A completed attempt cannot prepare a new action');
+    take(checkCompletionDisposition(store, work, { batch: request.batch, action: 'materialize' }));
     const historical = loadRoutes(store, { project: request.project, record: request.routes });
     const batch = historical.record.value.batches.find(row => row.id === request.batch)!;
     const sourceRequest = normalized(requestForHistory(historical.record.value.request));
@@ -367,7 +367,7 @@ export function prepareManagedRouteBatch(store: Store, request: {
       fail('route_stale', request.batch, 'searches', 'A target item now has an applicable answer; the original whole batch cannot be sent again');
     head(store, request.routes);
     return { record: historical.record, batch, writes: mergedWrites([...source.writes, ...selection.writes]),
-      guards: unique([reference(binding), request.routes, ...line.guards, ...source.guards, ...selection.guards]),
+      guards: unique([reference(binding), reference(workHead), request.routes, ...line.guards, ...source.guards, ...selection.guards]),
       references: unique([...historical.references, reference(binding), ...line.references, ...source.references, ...selection.references]) };
   });
 }

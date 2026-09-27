@@ -947,6 +947,10 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, manag
       || (admission.value.pointer.revision === witness.value.change.currentPointer.revision && !sameRef(admission.value.pointer, witness.value.change.currentPointer)))
       return problem("series_conflict", "The terminal witness must name the current applied change", context, "terminal");
     completionGuards = admission.value.guards;
+  } else if (managed && binding.value) {
+    const admission = prepareCompletionAdmission(store, address.project, reference(binding.value));
+    if (!admission.ok) return admission;
+    completionGuards = admission.value.guards;
   } else {
     const admission = mutationAdmission(store, head);
     if (!admission.ok) return admission;
@@ -3193,4 +3197,47 @@ export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemp
 
 export function prepareManagedCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest, close: Ref): OmResult<Sealed<AnySeriesTransition>> {
   return withHistoricalReads(() => handed(prepareComplete(store, request, close)));
+}
+
+
+/** The completion door belongs only to the original open attempt; it grants no new work admission. */
+export function prepareCompletionAdmission(store: Store, project: string, bindingRef: Ref): OmResult<Sealed<{ guards: Ref[] }>> {
+  return completionResult(() => {
+    const binding = completionTake(readCompletionOwnerAt(store, project, bindingRef));
+    const head = store.get(binding.value.series.id);
+    if (!head) completionFail(binding.id, 'series', 'Completion needs its current original series');
+    const series = completionTake(readAnySeriesAt(store, project, reference(head)));
+    const attempt = series.value.attempts.find(row => row.ordinal === binding.value.attempt);
+    if (!attempt || attempt.outcome !== null || canonical(attempt.goal) !== canonical(binding.value.goal))
+      completionFail(binding.id, 'attempt', 'Only the own open attempt with the full original goal can complete');
+    const line = completionTake(prepareSeriesParticipantAdmission(store, project, reference(head)));
+    if (line.participation === 'unactivated') completionFail(binding.id, 'series', 'An unactivated block has no completion admission');
+    if ('owner' in series.value) {
+      const original = completionTake(readAnySeriesAt(store, project, binding.value.series));
+      if (!('owner' in original.value)) completionFail(binding.id, 'owner', 'The original mechanism owner is mandatory');
+      const admission = original.value.admissions.find(row => row.attempt === binding.value.attempt);
+      if (!admission) completionFail(binding.id, 'admission', 'The original typed mechanism admission is mandatory');
+      completionTake(readMechanismAdmission(store, { project, series: binding.value.series, attempt: binding.value.attempt,
+        admission: admission.basis, current: false }));
+    }
+    return { guards: refsUnique([bindingRef, reference(head), ...line.guards]) };
+  });
+}
+
+
+/** Reconstruct the exact opening work admission; no present-day pointer participates in this proof. */
+export function readCompletionOriginalAdmission(store: Store, project: string, bindingRef: Ref): OmResult<Sealed<{
+  series: Ref; pointer: Ref | null; references: Ref[];
+}>> {
+  return completionResult(() => {
+    const binding = completionTake(readCompletionOwnerAt(store, project, bindingRef));
+    const series = completionTake(readAnySeriesAt(store, project, binding.value.series));
+    let pointer: Ref | null = null;
+    if ('block' in series.value && series.value.activation?.state === 'activated') {
+      const applied = checkedApplied(store, project, series.value.activation.applied);
+      pointer = reference(revisionOfWrite(currentAfter(store, applied, activationWrites(store, applied))));
+    }
+    const original = completionTake(readSeriesWorkAdmission(store, { project, series: binding.value.series, pointer }));
+    return { series: binding.value.series, pointer, references: original.references as Ref[] };
+  });
 }

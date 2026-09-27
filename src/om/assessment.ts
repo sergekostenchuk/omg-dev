@@ -7,6 +7,7 @@ import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal,
 import { readRecord, writeGuarded } from './refs.js';
 import { readJournal, recordRefusal, prepareRecordRefusal, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { historicalRead, withHistoricalReads } from './input.js';
+import type { Source } from '../evidence/evidence.js';
 import { checkAnswerForm } from './answer-form.js';
 import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5AcceptedAnswer,
   readAcceptedAnswer, readAnswerSearch, acceptedAnswerNamespace, acceptedAnswerRepresents, answerIndexId,
@@ -15,16 +16,21 @@ import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5A
 import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recordCall,
   type AddressedGap, type CallLedger, type DispatchContract, type FactAssessmentBasis,
   type RecordCallRequest } from './call-record.js';
-import { readModelCallState, readModelTransport, runModelTransport, prepareCompletionProducts, pendingCallStore, type TransportModelCall } from './model-call.js';
+import { readApplicationSources, captureApplicationFileObservation, readApplicationFileObservation, type ApplicationFileObservation,
+  readModelCallState, readModelTransport, runModelTransport, prepareCompletionProducts, pendingCallStore,
+  prepareApplicationEnvironment, prepareAssessmentDisposition, readAssessmentCessation, readCompletionWorkAt, readCompletionDispositionContext, prepareCompletionCause, readCompletionCause,
+  type CompletionCause, type TransportModelCall } from './model-call.js';
 import { readPacketResponse } from './question-packet.js';
-import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, seriesCurrentId,
-  seriesId, readCompletionBinding, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
+import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, readSeriesAdmissionChange, readCurrentSeriesPointer,
+  type SeriesAdmissionChange, seriesCurrentId,
+  seriesId, readCompletionBinding, completionWorkId, prepareCompletionAdmission, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt } from './repeat-gate.js';
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
 export const ASSESSMENT_RESULT_KIND = 'om-assessment-result';
 const INTENT_CONTRACT = 'om-assessment-intent/v1';
 const RESULT_CONTRACT = 'om-assessment-result/v1';
+const TERMINATION_CONTRACT = 'om-assessment-application-termination/v1';
 const CALL_PREFIX = 'e5-assessor/v1:';
 
 type SourceBasis = Omit<FactAssessmentBasis, 'assessment'>;
@@ -53,9 +59,21 @@ export interface PreparedAssessmentIntent {
   record: Revision<AssessmentIntentRecord>; writes: Write[]; guards: TransactionGuard[];
 }
 export type AssessmentVerdict = 'supported' | 'insufficient' | 'conflicting' | 'off-form' | 'interrupted';
-export interface AssessmentResultRecord {
+interface AppliedAssessmentResultRecord {
   contract: typeof RESULT_CONTRACT; project: string; intent: Ref; assessor: Ref;
   verdict: AssessmentVerdict; reasons: string[]; accepted: Ref | null; index: Ref | null;
+}
+export interface AssessmentApplicationTermination {
+  contract: typeof TERMINATION_CONTRACT; project: string; intent: Ref; assessor: Ref;
+  verdict: 'application-terminated'; reasons: string[]; accepted: null; index: null;
+  binding: Ref; assignment: Ref; work: Ref; call: Ref; receipt: Ref; cause: CompletionCause;
+}
+export type AssessmentResultRecord = AppliedAssessmentResultRecord | AssessmentApplicationTermination;
+export interface AssessmentFileTerminationCause {
+  kind: 'file-observation'; source: Ref; observation: ApplicationFileObservation;
+}
+export interface AssessmentSeriesTerminationCause {
+  kind: 'series-admission-change'; condition: 'same-line' | 'active-participation'; change: SeriesAdmissionChange;
 }
 export interface AssessmentClosureClaim {
   series: Ref; attempt: number; block: string; goal: AttemptGoal;
@@ -140,7 +158,11 @@ export function isAssessmentCallName(name: string): boolean {
 export function assessmentCallName(project: string, intent: Ref): string {
   if (!text(project) || project.includes(':') || !isRef(intent)
     || !intent.id.startsWith(`${ASSESSMENT_INTENT_KIND}:${project}:`)) invalid('intent');
-  return `${CALL_PREFIX}${hashJson({ project, intent: intent.id })}`;
+  return assessmentCallNameForId(project, intent.id);
+}
+export function assessmentCallNameForId(project: string, id: string): string {
+  if (!text(project) || project.includes(':') || !id.startsWith(`${ASSESSMENT_INTENT_KIND}:${project}:`)) invalid('intent');
+  return `${CALL_PREFIX}${hashJson({ project, intent: id })}`;
 }
 function sourceBasis(store: Store, project: string, modelCall: Ref, questionId: string): SourceBasis {
   const state = take(readModelCallState(store, { project, record: modelCall }));
@@ -300,6 +322,98 @@ export function readAssessmentIntentAt(store: Store, project: string, ref: Ref):
     return checkedIntent(record as unknown as Revision<AssessmentIntentRecord>);
   }, () => fail('assessment_intent_invalid', ref.id, 'history', 'An intent cannot depend on itself', ref)));
 }
+/** Required evidence is derived from the exact fact and B1's already applied facts, never from caller-supplied guards. */
+function assessmentFilePrerequisites(store: Store, project: string, intentRef: Ref) {
+  const intent = take(readAssessmentIntentAt(store, project, intentRef));
+  const question = take(readMc1Question(store, { project, record: intent.question.record }));
+  const original = take(readApplicationSources(store, project, question.record.value.request.input, intent.fact.grounds));
+  return { sources: original.sources.filter(source => source.value.origin.kind === 'file'),
+    references: refs([intentRef, ...question.references, ...original.references]) };
+}
+function deriveAssessmentFileCause(store: Store, project: string, intent: Ref, cause: AssessmentFileTerminationCause) {
+  if (!object(cause) || !same(Object.keys(cause).sort(), ['kind', 'observation', 'source'])
+    || cause.kind !== 'file-observation' || !isRef(cause.source) || !object(cause.observation)
+    || !same(Object.keys(cause.observation).sort(), cause.observation.kind === 'read' ? ['bytes', 'kind'] : ['code', 'kind']))
+    fail('assessment_cause_invalid', intent.id, 'cause', 'A termination needs one closed, exact file observation', intent);
+  const original = assessmentFilePrerequisites(store, project, intent);
+  const source = original.sources.find(row => same(reference(row), cause.source));
+  if (!source) fail('assessment_cause_invalid', cause.source.id, 'source', 'The observed file must be required by the exact fact or an applied B1 fact', cause.source);
+  const observation = take(readApplicationFileObservation(source.value as Source, cause.observation));
+  if (!observation.changed)
+    fail('assessment_cause_unproved', source.id, 'observation', 'Unchanged file bytes do not terminate application', cause.source);
+  return { cause, references: original.references };
+}
+/** Historical proof uses the original source and saved observation, including after the file is restored. */
+export function readAssessmentFileTerminationCause(store: Store, request: {
+  project: string; intent: Ref; cause: AssessmentFileTerminationCause;
+}): OmResult<Sealed<{ cause: AssessmentFileTerminationCause; references: Ref[] }>> {
+  requireIntentRef(store, request.project, request.intent);
+  return checked(() => deriveAssessmentFileCause(store, request.project, request.intent, request.cause));
+}
+/** A missing cause means the required files were unchanged; unreadable original history is a refusal, not absence. */
+export function prepareAssessmentFileTerminationCause(store: Store, request: { project: string; intent: Ref }):
+  OmResult<Sealed<{ cause: AssessmentFileTerminationCause | null; references: Ref[] }>> {
+  requireIntentRef(store, request.project, request.intent);
+  return checked(() => {
+    const original = assessmentFilePrerequisites(store, request.project, request.intent);
+    for (const source of original.sources) {
+      let observation: ApplicationFileObservation;
+      try { observation = captureApplicationFileObservation(source.value as Source); }
+      catch (error) {
+        if (!(error instanceof Error)) throw error;
+        fail('assessment_cause_unproved', source.id, 'observation', 'An unknown file-read failure cannot prove application termination', reference(source));
+      }
+      if (!take(readApplicationFileObservation(source.value as Source, observation)).changed) continue;
+      return deriveAssessmentFileCause(store, request.project, request.intent,
+        { kind: 'file-observation', source: reference(source), observation });
+    }
+    return { cause: null, references: original.references };
+  });
+}
+function assessmentSeriesCause(store: Store, project: string, intent: Sealed<CheckedAssessmentIntent>, pointer: Ref) {
+  const originalPointer = intent.record.value.originalGuards.find(ref => ref.id === seriesCurrentId(project)) ?? null;
+  const change = take(readSeriesAdmissionChange(store, { project, series: intent.series, pointer: originalPointer, currentPointer: pointer }));
+  const current = take(readCurrentSeriesPointer(store, { project, record: pointer }));
+  const line = current.value.series.find(row => row.block === intent.block);
+  if (!line) fail('assessment_cause_invalid', pointer.id, 'series', 'A valid participation change retains the addressed block', pointer);
+  const condition = line.activation.id !== intent.series.id ? 'same-line'
+    : line.participation !== 'active' ? 'active-participation' : null;
+  return { cause: condition ? { kind: 'series-admission-change', condition, change: change.proof } as AssessmentSeriesTerminationCause : null,
+    references: refs([intent.intent, ...change.references]) };
+}
+/** An applied transition is a cause only when it actually removes this exact line's work admission. */
+export function readAssessmentSeriesTerminationCause(store: Store, request: {
+  project: string; intent: Ref; cause: AssessmentSeriesTerminationCause;
+}): OmResult<Sealed<{ cause: AssessmentSeriesTerminationCause; references: Ref[] }>> {
+  requireIntentRef(store, request.project, request.intent);
+  return checked(() => {
+    const { cause } = request;
+    if (!object(cause) || cause.kind !== 'series-admission-change' || !object(cause.change) || !isRef(cause.change.currentPointer))
+      fail('assessment_cause_invalid', request.intent.id, 'cause', 'An admission change retains its exact applied pointer');
+    const intent = take(readAssessmentIntentAt(store, request.project, request.intent));
+    const derived = assessmentSeriesCause(store, request.project, intent, cause.change.currentPointer);
+    if (!derived.cause || !same(cause, derived.cause))
+      fail('assessment_cause_unproved', request.intent.id, 'cause', "The applied transition must violate this assignment's original admission");
+    return { cause: derived.cause, references: derived.references };
+  });
+}
+export function prepareAssessmentSeriesTerminationCause(store: Store, request: { project: string; intent: Ref }):
+  OmResult<Sealed<{ cause: AssessmentSeriesTerminationCause | null; references: Ref[] }>> {
+  requireIntentRef(store, request.project, request.intent);
+  return checked(() => {
+    const intent = take(readAssessmentIntentAt(store, request.project, request.intent));
+    const original = intent.record.value.originalGuards.find(ref => ref.id === seriesCurrentId(request.project)) ?? null;
+    const head = store.get(seriesCurrentId(request.project));
+    if (!head) {
+      if (original) fail('assessment_cause_invalid', original.id, 'pointer', 'A lost required pointer is not a proved admission change', original);
+      return { cause: null, references: [request.intent] };
+    }
+    const pointer = reference(take(readCurrentSeriesPointer(store, { project: request.project, record: reference(head) })));
+    if (original && same(original, pointer)) return { cause: null, references: [request.intent, pointer] };
+    const derived = assessmentSeriesCause(store, request.project, intent, pointer);
+    return derived.cause ? take(readAssessmentSeriesTerminationCause(store, { ...request, cause: derived.cause })) : derived;
+  });
+}
 function originalGuardHeads(store: Store, intent: Sealed<CheckedAssessmentIntent>): Ref[] {
   const original = intent.record.value.originalGuards;
   for (const guard of original) {
@@ -400,6 +514,25 @@ function terminalValue(store: Store, project: string, intent: Ref, assessor: Ref
   return { contract: RESULT_CONTRACT, project, intent, assessor, verdict: actual.verdict,
     reasons: [...actual.reasons], accepted, index };
 }
+/** Both production and historical reading derive the entire termination, including its physical receipt. */
+function terminationValue(store: Store, project: string, request: {
+  intent: Ref; assessor: Ref; binding: Ref; assignment: Ref; work: Ref; cause: CompletionCause;
+}): AssessmentApplicationTermination {
+  const actual = take(readAssessmentResultAt(store, project, request.intent, request.assessor));
+  const context = take(readCompletionDispositionContext(store, project, request));
+  const assignment = context.assignment.value;
+  if (assignment.kind !== 'fact' || !same(assignment.source, actual.intent.record.value.source.modelCall)
+    || assignment.question !== actual.intent.fact.questionId
+    || !['supported', 'insufficient', 'conflicting'].includes(actual.verdict))
+    fail('assessment_result_invalid', request.assignment.id, 'assignment', 'Only the received semantic verdict of this exact fact can cease application');
+  const receipt = actual.assessor.value.transport.exchange;
+  if (!receipt) fail('assessment_result_invalid', request.assessor.id, 'receipt', 'A received semantic verdict retains its exact exchange');
+  take(readCompletionCause(store, project, request.assignment, request.cause));
+  return { contract: TERMINATION_CONTRACT, project, intent: request.intent, assessor: request.assessor,
+    verdict: 'application-terminated', reasons: [...actual.reasons], accepted: null, index: null,
+    binding: request.binding, assignment: request.assignment, work: request.work, call: actual.call,
+    receipt, cause: request.cause };
+}
 /** A terminal result never replaces the physical receipt or charges the model again. */
 export function applyAssessmentResult(store: Store, request: { project: string; intent: Ref; assessor: Ref }):
   OmResult<Sealed<Revision<AssessmentResultRecord>>> {
@@ -417,12 +550,21 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
         writes: completion.writes, guards: completion.guards }));
       return historical;
     }
+    const disposition = take(prepareAssessmentDisposition(store, request.project, request.intent));
     const outcome = take(readAssessmentResultAt(store, request.project, request.intent, request.assessor));
-    const admissionGuards = applicationGuards(store, outcome.intent);
+    const technical = outcome.verdict === 'off-form' || outcome.verdict === 'interrupted';
+    const cause = disposition && !technical ? take(prepareCompletionCause(store, request.project, disposition.assignment)) : null;
+    const termination = disposition && cause?.cause ? terminationValue(store, request.project,
+      { ...disposition, ...request, cause: cause.cause }) : null;
+    const environment = disposition && !technical && !termination
+      ? take(prepareApplicationEnvironment(store, request.project, outcome.intent.dispatch.config, 'reviewer')) : null;
+    const admissionGuards = disposition && (technical || termination)
+      ? take(prepareCompletionAdmission(store, request.project, disposition.binding)).guards
+      : environment ? environment.remap(applicationGuards(environment.store, outcome.intent)) : applicationGuards(store, outcome.intent);
     const writes: Write[] = [];
     let accepted: Ref | null = null, index: Ref | null = null;
-    let guards: TransactionGuard[] = [...admissionGuards];
-    if (outcome.verdict === 'supported') {
+    let guards: TransactionGuard[] = [...admissionGuards, ...(disposition?.guards ?? []), ...(cause?.guards ?? [])];
+    if (outcome.verdict === 'supported' && !termination) {
       const prepared = take(prepareE5AcceptedAnswer(store,
         { project: request.project, intent: request.intent, assessor: request.assessor }));
       writes.push(...prepared.writes as Write[]);
@@ -436,7 +578,12 @@ export function applyAssessmentResult(store: Store, request: { project: string; 
       }
       guards = uniqueTransactionGuards([...guards, ...prepared.guards]);
     }
-    const value = terminalValue(store, request.project, request.intent, request.assessor, accepted, index);
+    if (termination) {
+      const answer = `${acceptedAnswerNamespace(request.project)}e5:${hashJson(request)}`;
+      if (store.get(answer)) fail('assessment_result_invalid', answer, 'accepted', 'A fact already accepted without its terminal cannot be terminated');
+      guards.push({ absent: true, id: answer });
+    }
+    const value = termination ?? terminalValue(store, request.project, request.intent, request.assessor, accepted, index);
     const write: Write = { id, kind: ASSESSMENT_RESULT_KIND, expected: 0, value };
     const result: Revision<AssessmentResultRecord> = { id, kind: ASSESSMENT_RESULT_KIND,
       revision: 1, hash: hashJson(value), value };
@@ -489,6 +636,13 @@ export function readAssessmentTerminalBasisAt(store: Store, project: string, ref
     const record = take(readRecord<AssessmentResultRecord>(store, ref, { unit: 'E5', target: ref.id,
       kind: ASSESSMENT_RESULT_KIND, idPrefix: `${ASSESSMENT_RESULT_KIND}:${project}:` }));
     const value = record.value;
+    if (object(value) && value.contract === TERMINATION_CONTRACT) {
+      if (record.revision !== 1 || !isRef(value.intent) || !isRef(value.assessor) || !isRef(value.binding)
+        || !isRef(value.assignment) || !isRef(value.work) || record.id !== assessmentResultId(project, value.intent)
+        || !same(value, terminationValue(store, project, value)))
+        fail('assessment_result_invalid', ref.id, 'termination', 'The complete termination must equal its exact common derivation', ref);
+      return record;
+    }
     if (record.revision !== 1 || !object(value) || value.contract !== RESULT_CONTRACT || value.project !== project
       || !isRef(value.intent) || !isRef(value.assessor) || !Array.isArray(value.reasons)
       || !value.reasons.every(text) || !(value.accepted === null || isRef(value.accepted))
@@ -646,6 +800,7 @@ function assessmentComponents(store: Store, project: string, results: readonly R
       case 'supported': accepting.push(result.value.accepted!); break;
       case 'insufficient': case 'conflicting': negatives.push(ref); break;
       case 'off-form': case 'interrupted': technical.push({ result: ref, verdict: result.value.verdict }); break;
+      case 'application-terminated': technical.push({ result: ref, verdict: 'interrupted' }); break;
     }
   }
   return { accepting: refs(accepting), negatives: refs(negatives), technical: sorted(technical) };
@@ -934,8 +1089,15 @@ export function finishAssessmentAttempt(store: Store, project: string, intent: R
       if (!head) fail('assessment_set_invalid', intent.id, 'series', 'A managed result retains its original line');
       const series = take(readAnySeriesAt(store, project, reference(head)));
       const attempt = series.value.attempts.find(row => row.ordinal === set.attempt);
-      return { complete: set.complete, closed: attempt?.outcome !== null && attempt?.outcome !== undefined,
-        results: [...set.results] };
+      const work = store.get(completionWorkId(project, managed.id));
+      if (!work) fail('assessment_set_invalid', intent.id, 'work', 'The complete managed set retains its registry');
+      const snapshot = take(readCompletionWorkAt(store, project, reference(work)));
+      const original = take(readAssessmentIntentAt(store, project, intent));
+      const facts = snapshot.assignments.filter(row => row.value.kind === 'fact'
+        && same(row.value.source, original.record.value.source.modelCall));
+      const complete = facts.length === original.candidates.length
+        && facts.every(row => snapshot.resolved.some(ref => same(ref, reference(row))));
+      return { complete, closed: attempt?.outcome !== null && attempt?.outcome !== undefined, results: [...set.results] };
     }
     const line = take(readAnySeriesAt(store, project, set.originalSeries));
     if (!('block' in line.value) || line.value.block !== set.block)
@@ -1034,6 +1196,10 @@ export async function assessFact(store: Store, request: AssessmentIntentRequest,
   Promise<OmResult<Sealed<Revision<AssessmentResultRecord>>>> {
   requireIntentRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  const ceased = readAssessmentCessation(store, request.project, request.modelCall, request.questionId);
+  if (!ceased.ok) return ceased;
+  if (ceased.value) return refused('completion_ceased', 'The exact mandatory assessor remains ceased without another intent or physical call',
+    { unit: 'E5', target: ceased.value.value.assignment.id, field: 'disposition', ref: reference(ceased.value) }, 'producer');
   const intent = writeAssessmentIntent(store, request);
   if (!intent.ok) return intent;
   const intentRef = reference(intent.value), history = readAssessmentIntentAt(store, request.project, intentRef);

@@ -1,4 +1,4 @@
-import { prepareCompletionCall } from './model-call.js';
+import { prepareCompletionCall, prepareManagedCallEnvironment } from './model-call.js';
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -398,6 +398,15 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
     return problem("call_purpose_invalid", "The reserved E5 call identity belongs to a fact assessment",
       id, "purpose", "producer");
   }
+  // E1 owns the refusal for an unreadable series before selecting managed work. Analysis keeps its own admission.
+  if (checked.value.purpose !== "stop-analysis" && checked.value.purpose !== "origin-analysis") {
+    const sourceSeries = readAnySeriesAt(store, project, checked.value.series);
+    if (!sourceSeries.ok) return problem("call_series_unresolved", "The call requires its exact valid series in this project",
+      id, "series", "producer", checked.value.series);
+  }
+  const compatibility = prepareManagedCallEnvironment(store, project, request);
+  if (!compatibility.ok) return compatibility;
+  const environment = compatibility.value, admittedStore = environment?.store ?? store;
   let assessmentGuards: readonly TransactionGuard[] = [];
   if (checked.value.purpose === "fact-assessment") {
     const basis = checked.value.basis as FactAssessmentBasis;
@@ -405,7 +414,7 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
       return problem("call_basis_unresolved", "A new fact assessment requires its exact prepared E5 intent",
         id, "basis.assessment", "producer");
     }
-    const admission = prepareAssessmentAdmission(store, project, basis.assessment);
+    const admission = prepareAssessmentAdmission(admittedStore, project, basis.assessment);
     if (!admission.ok) return admission;
     if (!assessmentIdentityMatches(project, checked.value, admission.value)) {
       return problem("call_basis_unresolved", "The assessor call must reproduce its prepared intent and one exact fact",
@@ -414,14 +423,14 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
     assessmentGuards = admission.value.guards;
   }
 
-  const dispatch = resolveDispatch(store, checked.value.dispatch, id);
+  const dispatch = resolveDispatch(admittedStore, checked.value.dispatch, id);
   if (!dispatch.ok) return dispatch;
-  const series = resolveSeries(store, project, checked.value, id);
+  const series = resolveSeries(admittedStore, project, checked.value, id);
   if (!series.ok) return series;
   const ledger = checkedLedger(store, project);
   if (!ledger.ok) return ledger;
 
-  const completion = prepareCompletionCall(store, project, request);
+  const completion = prepareCompletionCall(admittedStore, project, request);
   if (!completion.ok) return completion;
   const openedAt = Date.now();
   const value: AnyCallRecord = {
@@ -447,10 +456,10 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
       { id, kind: CALL_RECORD_KIND, expected: 0, value },
       { id: callLedgerId(project), kind: CALL_LEDGER_KIND, expected: ledger.value?.record.revision ?? 0, value: ledgerValue },
     ],
-    guards: uniqueTransactionGuards([
-      checked.value.series, checked.value.dispatch.adapter, checked.value.dispatch.config,
+    guards: uniqueTransactionGuards((environment ? environment.remap : (guards: readonly TransactionGuard[]) => guards)([
+      ...(environment?.guards ?? []), checked.value.series, checked.value.dispatch.adapter, checked.value.dispatch.config,
       ...ledgerGuards, ...dispatchGuards, ...seriesGuards, ...assessmentGuards, ...extraGuards, ...completion.value.guards,
-    ]),
+    ])),
   });
   if (!written.ok) return written;
   const call = written.value.find(record => record.id === id);

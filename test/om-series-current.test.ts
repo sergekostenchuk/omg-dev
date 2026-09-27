@@ -1,3 +1,7 @@
+import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
+import { readCompletionBinding, completionWorkId } from '../src/om/series.js';
+import { readCompletionWorkAt, writeCompletionCessation, readCompletionCessationAt } from '../src/om/model-call.js';
+import { writeAssessmentIntent, prepareAssessmentSeriesTerminationCause, readAssessmentSeriesTerminationCause } from '../src/om/assessment.js';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, watch, mkdirSync, symlinkSync, copyFileSync } from 'node:fs';
@@ -81,7 +85,7 @@ function rewrite<T>(store: Store, record: Revision<T>, value: T): Revision<T> {
   } finally { database.close(); }
   return { ...record, hash, value };
 }
-function fixture(t: TestContext, includeLater = true) {
+function fixture(t: TestContext, includeLater = true, questions = 1) {
   const root = mkdtempSync(join(tmpdir(), "omg-series-transition-")), path = join(root, "state.sqlite");
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -93,9 +97,9 @@ function fixture(t: TestContext, includeLater = true) {
   }
   preparedFeatures(engine, project, upper as Graph, field => {
     const value = preparedField(project, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding",
-      question: "What encoding is supported?", consumer: block, moment: "om-pass", blocksCurrentStage: false,
-      resolution: "Read repository facts during OM" }];
+    if (field === "preparation") (value as Record<string, Json>).unknowns = Array.from({ length: questions }, (_, i) => ({ id: i ? `encoding-${i}` : "encoding",
+      question: questions === 1 ? "What encoding is supported?" : `What encoding is supported for channel ${i}?`, consumer: block, moment: "om-pass", blocksCurrentStage: false,
+      resolution: "Read repository facts during OM" }));
     if (includeLater && field === "preparation") {
       const rows = (value as Record<string, Json>).outcomes as Record<string, Json>[];
       rows.push({ ...clone(rows[0]!), id: "garden-later", result: "The later result" });
@@ -123,9 +127,9 @@ function fixture(t: TestContext, includeLater = true) {
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
     reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
-  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: Array.from({ length: questions }, (_, i) => ({ pending:
     clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write }] }));
+      decision: { target: i ? `discovery:encoding-${i}` : 'discovery:encoding', field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write })) }));
   const horizon = (version: string, extra: Partial<HorizonRequest['choice']> = {}) => ok(writeHorizon(store, {
     project, input: reference(store.get(input.id)!), graph: reference(store.get(graph.id)!), refinement: null, available: {},
     choice: { choiceVersion: version, features: [{ outcome: "garden-result" }], excluded: [], ...extra },
@@ -1725,4 +1729,287 @@ test('B3 real managed A to B to A creates successors but never rediscovers the o
   assert.deepEqual(ok(prepareSeriesLineAdmission(store, project, reference(returned))).pointer, reference(appliedReturn.pointer));
   assert.deepEqual(ok(applySeriesActivation(store, pairReturn)).writes, []);
   assert.deepEqual(snapshot(store), beforeRestart);
+});
+
+
+test('29 H1.0b another block participation change is not a cause; the own exclusion is proved historically', async t => {
+  const original = fixture(t); original.series(independent);
+  const f = product(original), { request } = ready(f);
+  f.steps([{ research: fact(f), usage }]);
+  const model = ok(await runModelCall(f.store, request));
+  assert.equal(model.outcome?.kind, 'fact-candidates');
+  const intent = ok(writeAssessmentIntent(f.store, { project, modelCall: reference(model.record),
+    questionId: f.batch.items[0]!.gap, dispatch: request.dispatch }));
+  const input = { project, intent: reference(intent) };
+  assert.equal(ok(prepareAssessmentSeriesTerminationCause(f.store, input)).cause, null);
+  const continued = ok(applySeriesActivation(f.store, transition(f, 'h10b-neighbour-admitted',
+    { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] }).request));
+  assert.equal(continued.pointer.value.series.find(row => row.block === independent)!.participation, 'active');
+  assert.equal(continued.pointer.value.series.find(row => row.block === block)!.participation, 'active');
+  assert.equal(ok(prepareAssessmentSeriesTerminationCause(f.store, input)).cause, null);
+  const excluded = exclude(f, 'h10b-exclusion');
+  const checked = ok(prepareAssessmentSeriesTerminationCause(f.store, input));
+  assert.ok(checked.cause); assert.equal(checked.cause.condition, 'active-participation');
+  assert.deepEqual(checked.cause.change.currentPointer, reference(excluded.pointer));
+  assert.deepEqual(ok(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: checked.cause })), checked);
+  assert.equal(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: { ...checked.cause,
+    change: { ...checked.cause.change, currentPointer: reference(continued.pointer) } } }).ok, false);
+  activate(f, 'h10b-reactivation'); f.restart();
+  assert.deepEqual(ok(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: checked.cause })), checked);
+  assert.equal(ok(prepareAssessmentSeriesTerminationCause(f.store, input)).cause, null);
+  assert.equal(f.sent().length, 1);
+});
+
+
+test('25 H1.0b an excluded managed root closes before any E1, with historical null-ledger proof', async t => {
+  const f = product(fixture(t), true, false);
+  const series = ok(managedOpenAttempt(f.store, { project, block, line: 1, attempt: 1, goal: f.goal,
+    completion: { routes: reference(f.routes), batches: [f.batch.id] } }));
+  const binding = ok(readCompletionBinding(f.store, project, reference(series), 1))!;
+  const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+  const root = work.assignments.find(row => row.value.kind === 'root')!;
+  exclude(f, 'h10b-root-excluded');
+  const cessation = ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(root) }));
+  assert.equal(cessation.value.disposition, 'branch-ceased'); assert.equal(cessation.value.remainder, 'expansion');
+  assert.equal(cessation.value.ledger, null); assert.equal(cessation.value.physicalId, null);
+  const claim = { project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
+  await t.test('45 complete managed work does not authorize raw A3 or a caller force flag', () => {
+    assert.equal(completeAttempt(f.store, { project, block, line: 1, attempt: 1,
+      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }).ok, false);
+  });
+  const closed = ok(closeAttempt(f.store, claim));
+  assert.equal(head(f).value.attempts[0]!.outcome!.reason, 'interrupted');
+  const saved = snapshot(f.store); f.restart();
+  await t.test('40 saved cessation close repeats after restart', () => { assert.deepEqual(ok(closeAttempt(f.store, claim)), closed); });
+  assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(cessation))), cessation);
+  assert.deepEqual(snapshot(f.store), saved); assert.equal(f.sent().length, 0);
+});
+
+function managedProduct(t: TestContext, count = 1) {
+  const f = product(fixture(t, true, count), true, false);
+  const series = ok(managedOpenAttempt(f.store, { project, block, line: 1, attempt: 1, goal: f.goal,
+    completion: { routes: reference(f.routes), batches: [f.batch.id] } }));
+  f.running = series;
+  f.packetRequest.attempt = { series: reference(series), ordinal: 1 };
+  return f;
+}
+test('23 H1.0b standalone physical terminal passes through G7 without weakening raw A3 history', async t => {
+  const f = product(fixture(t)), { request } = ready(f);
+  await received(f, request); exclude(f);
+  const runtime = ok(await runModelCall(f.store, request)).record;
+  const claim = { project, block, line: 1, attempt: 1, terminal: reference(runtime),
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
+  const closed = ok(closeAttempt(f.store, claim));
+  assert.deepEqual(head(f).value.attempts[0]!.terminal, reference(runtime));
+  assert.equal(head(f).value.withoutProgress, 1);
+  assert.equal(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, reason: 'off-form' } }).ok, false);
+  f.restart(); const prior = snapshot(f.store);
+  assert.deepEqual(ok(closeAttempt(f.store, claim)), closed);
+  assert.deepEqual(snapshot(f.store), prior); assert.equal(f.sent().length, 1);
+});
+test('19 H1.0b paid ordinary receipt ceases application on exclusion without rewriting its physical evidence', async t => {
+  const { runModelCycle } = await import('../src/om/model-call.js');
+  const f = managedProduct(t), { request } = ready(f), receipt = await received(f, request);
+  const before = f.store.history(receipt.id); exclude(f); f.restart();
+  const denied = await runModelCall(f.store, request); assert.equal(denied.ok, false);
+  if (!denied.ok) assert.equal(denied.refusal.code, 'completion_ceased');
+  const cessation = f.store.list('om-completion-cessation')[0]!;
+  const checked = ok(readCompletionCessationAt(f.store, project, reference(cessation)));
+  assert.equal(checked.value.remainder, 'application'); assert.deepEqual(checked.value.physical, reference(receipt));
+  assert.deepEqual(checked.value.exchange, receipt.value.om.exchange); assert.equal(checked.value.rejection, null);
+  assert.deepEqual(f.store.history(receipt.id), before);
+  const binding = ok(readCompletionBinding(f.store, project, reference(f.running), 1))!;
+  assert.equal(ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!))).complete, true);
+  const close = { project, block, line: 1, attempt: 1,
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
+  const closed = ok(closeAttempt(f.store, close));
+  activate(f, 'restored-after-cessation'); f.restart(); const prior = snapshot(f.store);
+  await t.test('27 reactivation retains the terminal application cessation', () => {
+    assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(cessation))).value, checked.value);
+  });
+  for (const result of [await runModelCall(f.store, request), await runModelCycle(f.store, request)]) {
+    assert.equal(result.ok, false); if (!result.ok) { assert.equal(result.refusal.code, 'completion_ceased'); assert.deepEqual(result.refusal.at.ref, reference(cessation)); }
+  }
+  assert.deepEqual(ok(closeAttempt(f.store, close)), closed);
+  assert.deepEqual(snapshot(f.store), prior); assert.equal(f.store.list('om-model-cycle').length, 0); assert.equal(f.sent().length, 1);
+});
+test('14 H1.0b inactive composition preserves S N and a stopped application in one complete G7 result', async t => {
+  const { assessFact, applyAssessmentResult, readAssessmentIntentAt, readAssessmentTerminalAt } = await import('../src/om/assessment.js');
+  const { runModelTransport } = await import('../src/om/model-call.js');
+  const f = managedProduct(t, 3), { request } = ready(f); assert.equal(f.batch.items.length, 3);
+  const answer = { ...fact(f), results: f.batch.items.map(item => ({ ...fact(f).results[0]!, questionId: item.gap })) };
+  f.steps([{ research: answer, usage }, { research: { verdict: 'supported', reasons: [] }, usage },
+    { research: { verdict: 'conflicting', reasons: ['Contradictory original evidence'] }, usage },
+    { research: { verdict: 'supported', reasons: [] }, usage }]);
+  const model = ok(await runModelCall(f.store, request));
+  const requests = f.batch.items.map(item => ({ project, modelCall: reference(model.record), questionId: item.gap, dispatch: request.dispatch }));
+  const accepted = ok(await assessFact(f.store, requests[0]!)), negative = ok(await assessFact(f.store, requests[1]!));
+  const intent = ok(writeAssessmentIntent(f.store, requests[2]!)), admission = ok(readAssessmentIntentAt(f.store, project, reference(intent)));
+  const e1 = ok(recordCall(f.store, project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis, block: admission.block,
+    gaps: admission.gaps, series: admission.series, attempt: admission.attempt, goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
+  const physical = ok(await runModelTransport(f.store, { project, call: reference(e1.call), packet: admission.packet as Json, role: 'reviewer' }));
+  exclude(f, 'inactive-mixed');
+  const stopped = ok(applyAssessmentResult(f.store, { project, intent: reference(intent), assessor: reference(physical.record) }));
+  assert.equal(stopped.value.verdict, 'application-terminated');
+  const binding = ok(readCompletionBinding(f.store, project, reference(f.running), 1))!;
+  const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+  assert.equal(work.complete, true); assert.equal(work.accepting.length, 1); assert.equal(work.refusals.length, 1);
+  const claim = { project, block, line: 1, attempt: 1,
+    outcome: { reason: 'result' as const, accepting: work.accepting, cancelling: [], refusals: work.refusals } };
+  await t.test('15 existing N retains its exact A2 row in an inactive mixed outcome', () => {
+    assert.ok(work.negative.some(ref => ref.id === negative.id)); assert.equal(work.refusals.length, 1);
+  });
+  await t.test('24 a technical contribution cannot erase neighbouring S and N', () => {
+    assert.equal(closeAttempt(f.store, { ...claim, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+  });
+  await t.test('44 direct G7 cannot hide saved products behind empty claims', () => {
+    assert.equal(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, accepting: [], refusals: [] } }).ok, false);
+  });
+  const closed = ok(closeAttempt(f.store, claim)); const rows = [accepted, negative, stopped];
+  assert.deepEqual(head(f).value.attempts[0]!.outcome!.achieved.map(x => x.basis), [accepted.value.accepted]);
+  f.restart(); const prior = snapshot(f.store);
+  for (const [i, row] of rows.entries()) await t.test(`41 local ${i} repeats the whole mixed outcome`, async () => {
+    assert.deepEqual(ok(readAssessmentTerminalAt(f.store, project, reference(row))), row);
+    assert.deepEqual(ok(await assessFact(f.store, requests[i]!)), row);
+  });
+  assert.deepEqual(ok(closeAttempt(f.store, claim)), closed);
+  assert.deepEqual(snapshot(f.store), prior); assert.equal(f.sent().length, 4);
+});
+
+test('12 H1.0b physical assessor T is recorded on an inactive line by its own contract', async t => {
+  const { applyAssessmentResult, readAssessmentIntentAt, assessFact } = await import('../src/om/assessment.js');
+  const { runModelTransport } = await import('../src/om/model-call.js');
+  for (const mode of ['off-form', 'interrupted', 'awaiting-owner'] as const) await t.test(mode === 'awaiting-owner' ? '13 awaiting-owner remains off-form' : `12 ${mode}`, async child => {
+    const f = managedProduct(child), { request } = ready(f);
+    f.steps([{ research: fact(f), usage }, { research: { verdict: mode, reasons: [] }, usage,
+      ...(mode === 'interrupted' ? { exitCode: 1 } : {}) }]);
+    const model = ok(await runModelCall(f.store, request));
+    const asked = { project, modelCall: reference(model.record), questionId: f.batch.items[0]!.gap, dispatch: request.dispatch };
+    const intent = ok(writeAssessmentIntent(f.store, asked)), admission = ok(readAssessmentIntentAt(f.store, project, reference(intent)));
+    const e1 = ok(recordCall(f.store, project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis, block: admission.block,
+      gaps: admission.gaps, series: admission.series, attempt: admission.attempt, goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
+    const physical = ok(await runModelTransport(f.store, { project, call: reference(e1.call), packet: admission.packet as Json, role: 'reviewer' }));
+    exclude(f);
+    const terminal = ok(applyAssessmentResult(f.store, { project, intent: reference(intent), assessor: reference(physical.record) }));
+    const reason = mode === 'interrupted' ? 'interrupted' : 'off-form';
+    assert.equal(terminal.value.verdict, reason); assert.equal(terminal.value.contract, 'om-assessment-result/v1');
+    assert.equal(head(f).value.attempts[0]!.outcome, null);
+    const close = { project, block, line: 1, attempt: 1, outcome: { reason, accepting: [], cancelling: [], refusals: [] } } as const;
+    const closed = ok(closeAttempt(f.store, close)); f.restart(); const prior = snapshot(f.store);
+    assert.deepEqual(ok(await assessFact(f.store, asked)), terminal); assert.deepEqual(ok(closeAttempt(f.store, close)), closed);
+    assert.deepEqual(snapshot(f.store), prior); assert.equal(f.sent().length, 2);
+  });
+});
+
+async function inactivePhysicalRecovery(t: TestContext, paid: boolean) {
+  const { prepareCompletionCessation } = await import('../src/om/model-call.js');
+  const f = managedProduct(t), { request } = ready(f), checkpoint = join(f.root, 'managed-claimed.json');
+  f.steps([{ research: fact(f), usage }]);
+  const spec = join(f.root, 'managed-driver.json');
+  writeFileSync(spec, JSON.stringify({ database: f.path, output: join(f.root, 'driver-out.json'), operation: 'call', request,
+    checkpoint: paid ? { path: checkpoint, kind: 'om-model-exchange', matches: [], when: 'before' }
+      : { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'claimed' }] } }));
+  const child = spawn(process.execPath, [fixturePath, '--driver', spec], { cwd: f.root, stdio: ['ignore', 'ignore', 'pipe'] });
+  const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; });
+  await driverCheckpoint(checkpoint, child);
+  const checkpointData = JSON.parse(readFileSync(checkpoint, 'utf8')) as { writes: Write[] };
+  const claimed = f.store.list<OmModelCall>('model-call')[0]!, owner = claimed.value.om.completionOwner!;
+  exclude(f);
+  await t.test('7 a claim keeps its assignment open while its owner is still alive', () => {
+    assert.equal(f.store.list('om-completion-cessation').length, 0);
+    assert.equal(ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, owner.binding.id))!))).complete, false);
+  });
+  const cannot = prepareCompletionCessation(f.store, { project, binding: owner.binding, assignment: owner.assignment });
+  assert.equal(cannot.ok, false); if (!cannot.ok) assert.equal(cannot.refusal.code, 'completion_claim_exists');
+  assert.equal(ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, owner.binding.id))!))).complete, false);
+  await t.test('26 inactive I cannot be closed by G7', () => {
+    assert.equal(closeAttempt(f.store, { project, block, line: 1, attempt: 1,
+      outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+  });
+  assert.equal(child.kill('SIGKILL'), true); await exited; f.restart();
+  const recovered = f.engine.execute({ type: 'recover-model-call', project, call: reference(claimed) }) as Revision<OmModelCall>;
+  await t.test('9 recovery preserves interrupted with unmeasured expenditure', () => {
+    assert.equal(recovered.value.usage, null); assert.ok(recovered.value.recovery);
+  });
+  assert.equal(recovered.value.om.application, 'recovered'); assert.equal(recovered.value.usage, null);
+  const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, owner.binding.id))!)));
+  assert.equal(work.complete, true); assert.ok(work.products.some(ref => canonical(ref) === canonical(reference(recovered))));
+  const close = { project, block, line: 1, attempt: 1,
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: work.refusals } };
+  const closed = ok(closeAttempt(f.store, close));
+  if (paid) {
+    const { prepareLateModelReceipt } = await import('../src/discovery/model-call-recovery.js');
+    const evidence = checkpointData.writes.find(row => row.kind === 'om-model-exchange')!.value as unknown as
+      { process: import('../src/runtime/process.js').ProcessResult; launchError: null };
+    const priorSeries = f.store.get(f.running.id), priorWork = f.store.get(work.work.id);
+    const late = prepareLateModelReceipt(f.store, project, reference(claimed), { process: evidence.process, launchError: evidence.launchError });
+    ok(writeGuarded(f.store, { unit: 'E4', target: late.record.id, writes: late.writes, guards: late.guards }));
+    f.restart(); ok(await runModelCall(f.store, request));
+    assert.deepEqual(f.store.get(f.running.id), priorSeries); assert.deepEqual(f.store.get(work.work.id), priorWork);
+    assert.deepEqual(f.store.get(recovered.id), recovered);
+    const e1 = ok(readCall(f.store, project, reference(f.store.get(recovered.value.om.call.id)!)));
+    assert.deepEqual(e1.value.usage, usage); assert.equal(f.store.list('model-late-receipt').length, 1);
+  }
+  f.restart(); const before = snapshot(f.store);
+  assert.deepEqual((ok(await runModelCall(f.store, request))).record, recovered);
+  assert.deepEqual(ok(closeAttempt(f.store, close)), closed); assert.deepEqual(snapshot(f.store), before);
+  assert.equal(f.sent().length, paid ? 1 : 0);
+}
+
+test('8 H1.0b real unreceived claim survives exclusion as I until atomic physical recovery and completion', t => inactivePhysicalRecovery(t, false));
+test('38 H1.0b exact late paid receipt after inactive recovery and G7 never reopens work', t => inactivePhysicalRecovery(t, true));
+
+test('28 H1.0b completion-only rejects missing current admission and altered attempt membership', async t => {
+  const { prepareCompletionAdmission } = await import('../src/om/series.js');
+  const f = managedProduct(t), binding = ok(readCompletionBinding(f.store, project, reference(f.running), 1))!;
+  exclude(f);
+  assert.equal(prepareCompletionAdmission(f.store, project, reference(binding)).ok, true);
+  for (const field of ['pointer', 'ordinal', 'goal', 'kind']) await t.test(field, () => {
+    const original = f.store.get(f.running.id)!;
+    const body = structuredClone(original.value) as unknown as { attempts: { ordinal: number; goal: { key: string } }[] };
+    if (field === 'ordinal') body.attempts[0]!.ordinal++;
+    if (field === 'goal') body.attempts[0]!.goal.key = 'foreign';
+    const altered = { ...original, value: body, hash: hashJson(body), ...(field === 'kind' ? { kind: 'foreign' } : {}) };
+    const view = new Proxy(f.store, { get(target, property) {
+      if (property === 'get') return (id: string, revision?: number) => {
+        if (field === 'pointer' && id === seriesCurrentId(project) && !revision) return null;
+        if (field !== 'pointer' && id === original.id && (!revision || revision === original.revision)) return altered;
+        return target.get(id, revision);
+      };
+      const v: unknown = Reflect.get(target, property, target); return typeof v === 'function' ? v.bind(target) : v;
+    } });
+    assert.equal(prepareCompletionAdmission(view, project, reference(binding)).ok, false);
+  });
+  assert.equal(f.sent().length, 0);
+});
+
+
+test('35 H1.0b root cessation retains all unchosen E2 candidates and defeats a pending materialization', async t => {
+  const f = managedProduct(t), first = ready(f);
+  const { projectId: _project, ...config } = structuredClone(f.environment.value);
+  const changed = f.engine.environments.configure(project, { ...config, requestCapacityChars: 90_000 }, f.environment.revision);
+  const alternate = { ...f.packetRequest, environment: reference(changed) };
+  const second = ok(writeQuestionPacket(f.store, alternate)).record;
+  const anotherConfig = f.engine.environments.configure(project, { ...config, requestCapacityChars: 80_000 }, changed.revision);
+  const pending = ok(prepareQuestionPacket(f.store, { ...alternate, environment: reference(anotherConfig) }));
+  const binding = ok(readCompletionBinding(f.store, project, reference(f.running), 1))!;
+  const before = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+  assert.equal(before.assignments.length, 1); assert.equal(before.complete, false);
+  exclude(f, 'root-with-candidates');
+  const root = before.assignments[0]!;
+  const ceased = ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(root) }));
+  assert.equal(ceased.value.remainder, 'expansion'); assert.equal(ceased.value.ledger, null);
+  assert.equal(commit(f.store, pending).ok, false);
+  assert.equal(f.store.list('om-completion-packet').length, 2); assert.equal(f.store.list('call-record').length, 0);
+  const after = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+  assert.equal(after.complete, true); assert.equal(after.assignments.length, 1);
+  ok(closeAttempt(f.store, { project, block, line: 1, attempt: 1,
+    outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
+  f.restart(); const history = snapshot(f.store);
+  assert.deepEqual(ok(writeQuestionPacket(f.store, f.packetRequest)).record, first.packet);
+  assert.deepEqual(ok(writeQuestionPacket(f.store, alternate)).record, second);
+  assert.equal((await runModelCall(f.store, first.request)).ok, false);
+  assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(ceased))), ceased);
+  assert.deepEqual(snapshot(f.store), history); assert.equal(f.sent().length, 0);
 });

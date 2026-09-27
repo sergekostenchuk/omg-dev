@@ -349,6 +349,7 @@ export interface GateOutcome {
 }
 
 export interface CloseAttemptRequest extends SeriesRequest {
+  readonly terminal?: Ref;
   readonly attempt: number;
   readonly outcome: GateOutcome;
 }
@@ -736,6 +737,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
   // The series decides the verdict, the count, the stop and the rung, from the results as they were confirmed.
   const completion = {
     ...at, attempt: request.attempt,
+    ...('terminal' in request && request.terminal !== undefined ? { terminal: request.terminal } : {}),
     outcome: { reason, achieved: results.achieved, cancelled: results.cancelled, refusals: claimed },
   };
   const series = prepareCompleteAttempt(store, completion);
@@ -1695,8 +1697,14 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
   if (series.id !== owner.series.id || !attempt || attempt.outcome !== null || canonical(attempt.goal) !== canonical(owner.goal))
     managedFail(series.id, 'attempt', 'The close retains its exact open original attempt');
   if (input.ledger) managedTake(checkCompletionLedger(store, snapshot as CompletionSnapshot, input.ledger, input.journal));
-  // A ready registry has physical products, hence an E1 ledger. Absence cannot erase them.
-  else managedFail(series.id, 'ledger', 'Completed managed work requires its exact E1 ledger');
+  else {
+    // Null is historical evidence only for a complete never-dispatched composition.
+    // Every product is already proved by the work reader; no present-day enumeration is used here.
+    if (snapshot.products.some(ref => !['question-packet', 'om-completion-packet', 'om-completion-cessation'].includes(store.get(ref.id, ref.revision)!.kind))
+      || !snapshot.cessations.length || snapshot.cessations.some(row => row.value.call !== null
+        || row.value.ledger !== null || row.value.physical !== null))
+      managedFail(series.id, 'ledger', 'Physical/E1 work cannot omit its exact ledger');
+  }
   const journal = input.journal ? managedTake(readJournalAt(store, input.project, input.journal)) : null;
   const rows = new Map(journal?.value.rows.map(row => [row.id, row]) ?? []);
   const routed: RoutedRefusal[] = [], classifications: RefusalClassification[] = [];
@@ -1814,10 +1822,10 @@ function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest):
     const journalHead = journalRead.ok ? journalRead.value : null;
     if (!workHead) managedFail(id, 'work', 'The managed registry is mandatory');
     const ledger = managedTake(readCallLedger(store, request.project));
-    if (!ledger || !ledgerHead || !sameRef(reference(ledger), reference(ledgerHead)))
-      managedFail(id, 'ledger', 'Managed closure must retain the captured lawful E1 head');
+    if (canonical(ledger ? reference(ledger) : null) !== canonical(ledgerHead ? reference(ledgerHead) : null))
+      managedFail(id, 'ledger', 'Managed closure must retain the captured lawful E1 head or proved absence');
     const derived = deriveManagedClose(store, { project: request.project, binding: reference(binding), work: reference(workHead),
-      series: reference(seriesHead), ledger: reference(ledgerHead), journal: journalHead ? reference(journalHead) : null,
+      series: reference(seriesHead), ledger: ledgerHead ? reference(ledgerHead) : null, journal: journalHead ? reference(journalHead) : null,
       claim: completionClaim(request.outcome) });
     const closeWrite = { id, kind: COMPLETION_CLOSE_KIND, expected: 0, value: derived.value };
     const closeRef = { id, revision: 1, hash: hashJson(derived.value) };
@@ -1825,7 +1833,8 @@ function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest):
     const completed = managedTake(prepareManagedCompleteAttempt(view, { ...request,
       outcome: derived.value.outcome }, closeRef));
     const writes: GateWrite[] = [closeWrite, ...completed.writes];
-    const guards: TransactionGuard[] = [reference(seriesHead), reference(workHead), reference(ledgerHead),
+    const guards: TransactionGuard[] = [reference(seriesHead), reference(workHead),
+      ledgerHead ? reference(ledgerHead) : { id: callLedgerId(request.project), absent: true },
       ...productHeads.values(), ...completed.guards, ...derived.guards];
     let decided: readonly RefusalClassification[] = [];
     if (derived.classifications.length) {

@@ -1,3 +1,4 @@
+import { prepareAssessmentDisposition } from './model-call.js';
 import { checkManagedCompletionClaims } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
@@ -833,13 +834,14 @@ export function prepareE5AcceptedAnswer(store: Store, request: E5AnswerRequest):
     const history = deriveE5Answer(store, request, false), record = predicted(history.value), old = store.get(record.id);
     check(!old || same(old, record), 'answer_record_invalid', record.id, 'record',
       'An assessed fact cannot be overwritten under the same exact outcome');
+    const disposition = old ? null : take(prepareAssessmentDisposition(store, request.project, request.intent));
     const checked = deriveE5Answer(store, request, true, !old);
     const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
     const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target,
       field: checked.gap.field, pending: old ? [] : [write] }));
     const attempt = { series: checked.attempt.series, attempt: checked.attempt.ordinal };
     return { record, writes: search.writes as Write[],
-      guards: unique([...checked.guards, ...search.guards]),
+      guards: unique([...checked.guards, ...search.guards, ...(disposition?.guards ?? [])]),
       references: unique([...checked.references, ...search.references]),
       closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record),
         acceptance: null, attempt, answer: old ? { record: reference(record) } : { pending: write } } };

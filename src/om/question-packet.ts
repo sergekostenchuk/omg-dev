@@ -2,7 +2,7 @@ import { Ajv } from 'ajv';
 import type { Selector } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall, type AnyCallRecord } from './call-record.js';
-import { readContinuationEvidence, prepareModelAttemptFinish } from './model-call.js';
+import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore } from './model-call.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { boundedContext } from '../compiler/context.js';
 import { Discovery } from '../discovery/discovery.js';
@@ -625,15 +625,35 @@ export function prepareQuestionPacket(store: Store, request: QuestionPacketReque
     if (checked?.value.refusal?.code === 'research_no_progress') {
       return { record: checked, existing: true, writes: [], guards: [], references: [reference(checked)] };
     }
-    const derived = derivePacket(store, request, true, checked?.value);
+    // Prove a candidate historically before granting current compatibility. This invokes the
+    // same complete E2 derivation as its exact reader, not a second test of batch membership.
+    let environment: NonNullable<Extract<ReturnType<typeof prepareManagedEnvironment>, { ok: true }>['value']> | null = null;
+    const config = store.get(request.environment.id);
+    if (!config || !same(reference(config), request.environment)) {
+      const historical = checked ?? (() => {
+        const value = derivePacket(store, request, false).value;
+        return { id: packetId(request, PACKET_ANSWER_PROTOCOL, contract), kind: QUESTION_PACKET_KIND,
+          revision: 1, hash: hashJson(value), value };
+      })();
+      const proof = pendingCallStore(store, checked ? [] : [{ id: historical.id, kind: historical.kind, expected: 0, value: historical.value }]);
+      environment = take(prepareManagedEnvironment(proof, request.project, { packet: reference(historical) }));
+    }
+    const admittedStore = environment?.store ?? store;
+    const derived = derivePacket(admittedStore, request, true, checked?.value);
     if (checked && !same(checked.value, derived.value))
       fail('packet_record_invalid', checked.id, 'value', 'An existing packet cannot change without a new source request');
     const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, PACKET_ANSWER_PROTOCOL, contract), kind: QUESTION_PACKET_KIND,
       revision: 1, hash: hashJson(derived.value), value: derived.value };
     const finished = continuationFinish(store, record.value);
+    const writes: Write[] = [...derived.writes, ...(finished?.writes ?? []),
+      ...(checked ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }])];
+    const completion = checked ? { writes: [], guards: [] } : take(prepareCompletionPacket(pendingCallStore(admittedStore, writes), reference(record)));
+    writes.push(...completion.writes);
+    const pending = new Set(writes.map(write => canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) })));
     return { record, existing: Boolean(checked), references: derived.references,
-      guards: unique([...derived.guards, ...(finished?.guards ?? []), ...(checked ? [reference(checked)] : [])]),
-      writes: [...derived.writes, ...(finished?.writes ?? []), ...(checked ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }])] };
+      guards: unique((environment ? environment.remap : (guards: readonly Ref[]) => guards)([...derived.guards, ...(finished?.guards ?? []), ...completion.guards,
+        ...(environment?.guards ?? []), ...(checked ? [reference(checked)] : [])]).filter(isRef)
+        .filter(ref => !pending.has(canonical(ref)))), writes };
   });
 }
 export function writeQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
@@ -641,7 +661,8 @@ export function writeQuestionPacket(store: Store, request: QuestionPacketRequest
   return result(() => {
     // Replaying a saved delivery transition does not admit another physical call.
     // Dispatch still requires prepareQuestionPacket's fresh current admission.
-    const old = request.continuation || request.previous.length > 0
+    const managed = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;
+    const old = managed || request.continuation || request.previous.length > 0
       ? store.get(packetId(request, PACKET_ANSWER_PROTOCOL, currentPacketContract(store, request))) : null;
     if (old) {
       const record = loadPacket(store, request.project, reference(old));

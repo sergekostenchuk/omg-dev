@@ -264,7 +264,7 @@ import { checkAnswerForm } from '../src/om/answer-form.js';
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { checkCompletionLedger, readCompletionWorkAt } from '../src/om/model-call.js';
 
-function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false) {
+function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-dispatch-')), database = join(root, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -278,7 +278,7 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'What encoding is supported?',
-      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }];
+      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }, ...(extraQuestion ? [{ id: 'spare', question: 'Which optional format?', consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Address during OM' }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -333,11 +333,11 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
   const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal }, previous: [] };
-  const packet = valueOf(writeQuestionPacket(store, packetRequest)).record;
+  const packet = valueOf((materialize ? writeQuestionPacket : prepareQuestionPacket)(store, packetRequest)).record;
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
   const frame = valueOf(prepareFrameProposals(store, sources.operations));
   const obligations = frame.frame.result.obligations.filter(item => item.upper.node === batch.node);
-  return { root, database, project, graph, input, source, routes, gaps, gapRequest, batch, packet, request, packetRequest,
+  return { root, database, project, graph, fullGraph: graphData, input, source, routes, gaps, gapRequest, batch, packet, request, packetRequest,
     configured, adapter, series, obligations, scenario, trace, environment,
     get store() { return store; }, get engine() { return engine; },
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
@@ -1908,6 +1908,9 @@ test('3 H1.0a managed opening fixes the complete root before E1 and MC1 reveals 
   assert.ok(binding);
   const id = completionWorkId(f.project, binding.id);
   const initial = valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(id)!)));
+  assert.equal(initial.work.revision, 2);
+  assert.equal(initial.products.length, 1);
+  assert.equal(f.store.get(initial.products[0]!.id)!.kind, 'om-completion-packet');
   assert.equal(initial.assignments.length, 1);
   assert.equal(initial.complete, false);
   await t.test('7 unpaid root is present and incomplete before E1',()=>{
@@ -2361,7 +2364,7 @@ test('34 H1.0a analysis of a stopped managed ordinal remains a separate transpor
   assert.equal(f.sent().length,2);
 });
 
-test('35 H1.0a loss of current application admission preserves the paid answer and leaves its root incomplete',async t=>{
+test('33 H1.0b equivalent reconfiguration after receipt applies the same answer with a fresh environment guard',async t=>{
   const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:e4Fact(f),usage}]);
   const original=f.store.writeMany.bind(f.store);let moved=false;
   f.store.writeMany=((writes,guards)=>{
@@ -2372,11 +2375,11 @@ test('35 H1.0a loss of current application admission preserves the paid answer a
     return result;
   }) as Store['writeMany'];
   const called=valueOf(await runModelCall(f.store,f.request)); f.store.writeMany=original;
-  assert.equal(moved,true);assert.equal(called.record.value.om.application,'application-refused');
+  assert.equal(moved,true);assert.equal(called.record.value.om.application,'applied');
   assert.equal(called.diagnostic,null);assert.equal(completionSnapshot(f).complete,false);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
   const saved=f.store.list();f.restart();
-  assert.equal(valueOf(await runModelCall(f.store,f.request)).record.value.om.application,'application-refused');
+  assert.equal(valueOf(await runModelCall(f.store,f.request)).record.value.om.application,'applied');
   assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,1);
 });
 
@@ -2702,4 +2705,679 @@ test('34 H1.0a a completion ledger retains the exact journal context of a genuin
   finally{f.store.get=get;}
   assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,2);
   assert.deepEqual(valueOf(closeAttempt(f.store,claim)),closed);
+});
+
+
+test('2 H1.0b a retained cessation address cannot downgrade the project after losing B1', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-h10b-era-')), path = join(root, 'state.sqlite');
+  let store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  new ProductEngine(store).execute({ type: 'create-project', project: 'era', title: 'Before B1' });
+  store.write({ id: 'om-completion-cessation:era:retained', kind: 'om-completion-cessation', expected: 0, value: {} });
+  for (const restart of [false, true]) {
+    if (restart) { store.close(); store = new Store(path); }
+    const before = store.list();
+    assert.throws(() => new ProductEngine(store).projection('era'),
+      (error: unknown) => error instanceof EngineError && error.code === 'record_missing');
+    assert.deepEqual(store.list(), before);
+  }
+});
+
+test('20 H1.0b exact MC2 remainder cessation preserves produced parts and blocks materialization without hiding siblings', async t => {
+  const { prepareCompletionCessation, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, false, true, true), f = e4Fixture(t, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true, true, true);
+  assert.ok(f.packet.value.plan!.assignments.length > 1);
+  f.steps([{ research: e4Node(f), usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
+  const nextRequest = { ...f.packetRequest, previous: [{ packet: reference(f.packet), ...first.part! }] };
+  const prepared = valueOf(prepareQuestionPacket(f.store, nextRequest));
+  assert.equal(prepared.record.value.state, 'ready'); assert.equal(f.store.get(prepared.record.id), null);
+  const originalPart = f.store.get(first.part!.result.id);
+  const before = completionSnapshot(f), future = before.assignments.filter(row => row.value.kind === 'part' && row.value.position !== 0);
+  const root = before.assignments.find(row => row.value.kind === 'root')!;
+  valueOf(writeAddressing(f.store, { project: f.project, input: reference(f.input), graph: reference(f.graph),
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project: f.project, input: reference(f.input), graph: reference(f.graph), layers: [],
+      decision: { target: 'discovery:spare', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const rootCessation = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(before.binding), assignment: reference(root) }));
+  assert.equal(rootCessation.value.remainder, 'assembly'); assert.equal(completionSnapshot(f).complete, false);
+  const obsolete = writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards });
+  assert.equal(obsolete.ok, false); assert.equal(f.store.get(prepared.record.id), null);
+  const cessations = [rootCessation];
+  for (const [i, part] of future.entries()) {
+    const stopped = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(before.binding), assignment: reference(part) }));
+    assert.equal(stopped.value.remainder, 'expansion'); assert.equal(stopped.value.packet, null); assert.equal(stopped.value.physicalId, null);
+    assert.equal(completionSnapshot(f).complete, i + 1 === future.length); cessations.push(stopped);
+  }
+  assert.deepEqual(f.store.get(first.part!.result.id), originalPart); assert.equal(f.store.list('om-part-assembly').length, 0);
+  assert.equal(prepareCompletionCessation(f.store, { project: f.project, binding: reference(before.binding),
+    assignment: reference(before.assignments.find(row => row.value.kind === 'part' && row.value.position === 0)!) }).ok, false);
+  const closed = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
+  valueOf(closeAttempt(f.store, closed)); f.restart(); const history = f.store.list();
+  assert.deepEqual(valueOf(await runModelCall(f.store, f.request)).part, first.part);
+  const cycle = await runModelCycle(f.store, f.request); assert.equal(cycle.ok, false);
+  if (!cycle.ok) assert.equal(cycle.refusal.code, 'completion_ceased');
+  assert.equal(writeQuestionPacket(f.store, nextRequest).ok, false);
+  for (const row of cessations) assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(row))), row);
+  valueOf(closeAttempt(f.store, closed)); assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
+});
+
+test('33 H1.0b CAS loss leaves a received response retryable without irreversible refusal or another physical expense', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
+  const write = f.store.writeMany.bind(f.store); let conflict = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!conflict && writes.some(row => row.kind === 'model-call' && (row.value as OmModelCall).om?.application === 'applied')) {
+      conflict = true;
+      // A legal configure in the other Store changes the guarded head, without changing the assignment.
+      const other = new Store(f.database);
+      try {
+        const old = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+        const { projectId: _project, ...config } = structuredClone(old.value);
+        new ProductEngine(other).environments.configure(f.project, config, old.revision);
+      } finally { other.close(); }
+    }
+    return write(writes, guards);
+  }) as Store['writeMany'];
+  const refused = await runModelCall(f.store, f.request); f.store.writeMany = write;
+  assert.equal(conflict, true); assert.equal(refused.ok, false);
+  if (!refused.ok) assert.equal(refused.refusal.code, 'input_stale');
+  const received = f.store.list<OmModelCall>('model-call')[0]!;
+  assert.equal(received.value.om.application, 'received'); assert.equal(f.store.list('om-completion-cessation').length, 0);
+  await t.test('10 received ordinary output is still I until its application transaction', () => {
+    assert.equal(completionSnapshot(f).complete, false);
+    assert.equal(f.store.list('om-completion-close').length, 0);
+    assert.equal(f.store.list('om-assessment-result').length, 0);
+  });
+  const exchange = f.store.get(received.value.om.exchange!.id), e1 = f.store.history(received.value.om.call.id);
+  f.restart(); const applied = valueOf(await runModelCall(f.store, f.request));
+  assert.equal(applied.record.value.om.application, 'applied'); assert.deepEqual(f.store.get(received.value.om.exchange!.id), exchange);
+  assert.deepEqual(f.store.history(received.value.om.call.id), e1); assert.equal(f.sent().length, 1);
+  f.restart(); const history = f.store.list(); valueOf(await runModelCall(f.store, f.request)); assert.deepEqual(f.store.list(), history);
+});
+
+test('16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement', async t => {
+  const { pathToFileURL } = await import('node:url');
+  const { execFile } = await import('node:child_process');
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, false); f.steps([{ research: e4Fact(f), usage }]);
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(f.root, 'h10a-loader.mjs'), producer = join(f.root, 'h10a-producer.mjs'), spec = join(f.root, 'h10a.json');
+  writeFileSync(loader, String.raw`import{execFileSync}from'node:child_process';import{fileURLToPath}from'node:url';
+let root,ts;export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
+export async function load(url,context,next){const prefix=new URL('dist/src/',root).href;
+if(url.startsWith(prefix)&&/\.js$/.test(url)){const relative='src/'+url.slice(prefix.length).replace(/\.js$/,'.ts');
+const source=execFileSync('git',['show','7aa19cc95adc5c94152c17425d17b6e88d64617f:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
+return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}return next(url,context);}`);
+  writeFileSync(spec, JSON.stringify({ database: f.database, request: f.request, packet: f.packetRequest, repo: pathToFileURL(repo + '/').href }));
+  writeFileSync(producer, String.raw`import{readFileSync}from'node:fs';
+const spec=JSON.parse(readFileSync(process.argv[2],'utf8')),src=p=>new URL('dist/src/'+p,spec.repo).href;
+const{Store}=await import(src('storage/store.js'));const{Environments}=await import(src('runtime/environment.js'));
+const{runModelCall}=await import(src('om/model-call.js'));const{writeQuestionPacket}=await import(src('om/question-packet.js'));
+const store=new Store(spec.database);const packet=writeQuestionPacket(store,spec.packet);if(!packet.ok)throw Error(JSON.stringify(packet));spec.request.packet={id:packet.value.record.id,revision:packet.value.record.revision,hash:packet.value.record.hash};
+const write=store.writeMany.bind(store);let moved=false;
+store.writeMany=(writes,guards)=>{const saved=write(writes,guards);
+ if(!moved&&writes.some(w=>w.kind==='model-call'&&w.value.om?.application==='received')){moved=true;
+ const old=store.get('environment:'+spec.request.project),{projectId,...config}=old.value;new Environments(store).configure(projectId,config,old.revision);}return saved;};
+try{const result=await runModelCall(store,spec.request);if(!result.ok||result.value.record.value.om.application!=='application-refused')throw Error(JSON.stringify(result));}
+finally{store.close();}`);
+  const registration = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)}, {data:${JSON.stringify({
+    root: pathToFileURL(repo + '/').href, typescript: pathToFileURL(join(repo, 'node_modules/typescript/lib/typescript.js')).href })}});`;
+  await new Promise<void>((resolve, reject) => execFile(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(registration)}`, producer, spec],
+    { cwd: repo, timeout: 90000, maxBuffer: 1000000 }, (error, _out, stderr) => error ? reject(new Error(stderr || error.message)) : resolve()));
+  const old = f.store.list<OmModelCall>('model-call')[0]!;
+  f.request.packet = reference(f.store.get(f.request.packet.id)!);
+  assert.equal(old.value.om.application, 'application-refused');
+  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(old) })).state, 'application-refused');
+  const e1 = f.store.history(old.value.om.call.id), physical = f.store.history(old.id), exchange = f.store.get(old.value.om.exchange!.id);
+  f.restart(); const applied = valueOf(await runModelCall(f.store, f.request));
+  assert.equal(applied.record.value.om.application, 'applied');
+  assert.deepEqual(applied.record.value.om.resume, { contract: 'om-model-application-resume/v1', previous: reference(old) });
+  assert.deepEqual(f.store.history(old.id).slice(0, -1), physical); assert.deepEqual(f.store.history(old.value.om.call.id), e1);
+  assert.deepEqual(f.store.get(old.value.om.exchange!.id), exchange);
+  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(old) })).state, 'application-refused');
+  f.restart(); const history = f.store.list();
+  assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), valueOf(readModelCall(f.store, { project: f.project, record: reference(applied.record) })));
+  assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
+});
+
+function completionE1(f: ReturnType<typeof e4Fixture>, packet = f.packet, config = f.configured) {
+  const payload = packet.value.packet as Record<string, Json> & { requestId: string; purpose: 'model-research' | 'model-design' };
+  return { call: payload.requestId, purpose: payload.purpose, basis: null, block: f.series.value.block!,
+    series: reference(f.series), attempt: 1, goal: f.series.value.attempts[0]!.goal,
+    dispatch: { adapter: reference(f.adapter), config: reference(config) }, packet: payload,
+    gaps: f.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))) };
+}
+
+test('35 H1.0b candidate E2 materializations preserve one executable plan selected atomically with E1', async t => {
+  const { readCompletionPacketAt } = await import('../src/om/model-call.js');
+  for (const kind of ['fact', 'node'] as const) await t.test(kind, async child => {
+    const f = e4Fixture(child, kind, 100_000, 0, 5000, true), initial = completionSnapshot(f);
+    assert.equal(initial.assignments.length, 1); assert.equal(initial.complete, false);
+    const configured = f.environment(90_000), packet = valueOf(writeQuestionPacket(f.store,
+      { ...f.packetRequest, environment: reference(configured) })).record;
+    const candidates = f.store.list('om-completion-packet'), unselected = completionSnapshot(f);
+    assert.equal(candidates.length, 2); assert.equal(unselected.assignments.length, 1);
+    assert.equal(unselected.complete, false); assert.equal(f.store.list('call-record').length, 0);
+    assert.equal(recordCall(f.store, f.project, completionE1(f)).ok, false);
+    const admitted = valueOf(recordCall(f.store, f.project, completionE1(f, packet, configured)));
+    const selected = completionSnapshot(f), plan = selected.assignments.map(reference);
+    assert.equal(selected.assignments.filter(row => row.value.kind === 'part').length, packet.value.plan?.assignments.length ?? 1);
+    assert.equal(selected.complete, false); assert.equal(f.store.list('model-call').length, 0);
+    const before = f.store.list();
+    valueOf(writeQuestionPacket(f.store, f.packetRequest));
+    assert.deepEqual(f.store.list(), before, 'An exact old candidate repeats historically without changing the choice');
+    const thirdConfig = f.environment(80_000);
+    assert.equal(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(thirdConfig) }).ok, false);
+    assert.deepEqual(completionSnapshot(f).assignments.map(reference), plan);
+    f.restart();
+    for (const row of candidates) valueOf(readCompletionPacketAt(f.store, f.project, reference(row)));
+    assert.deepEqual(valueOf(recordCall(f.store, f.project, completionE1(f, packet, configured))).call, admitted.call);
+    assert.equal((await runModelCall(f.store, f.request)).ok, false);
+    assert.equal(f.sent().length, 0);
+  });
+});
+
+test('35 H1.0b a racing different E1 choice writes exactly one plan and one unpaid call', t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), write = f.store.writeMany.bind(f.store);
+  let raced = false, winning: ReturnType<typeof completionE1> | null = null;
+  f.store.writeMany = ((writes, guards) => {
+    if (!raced && writes.some(row => row.kind === 'call-record')) {
+      raced = true;
+      const config = f.environment(90_000), other = new Store(f.database);
+      try {
+        const packet = valueOf(writeQuestionPacket(other, { ...f.packetRequest, environment: reference(config) })).record;
+        winning = completionE1(f, packet, config);
+        valueOf(recordCall(other, f.project, winning));
+      } finally { other.close(); }
+    }
+    return write(writes, guards);
+  }) as Store['writeMany'];
+  const losing = recordCall(f.store, f.project, completionE1(f)); f.store.writeMany = write;
+  assert.equal(raced, true); assert.equal(losing.ok, false);
+  assert.equal(f.store.list('call-record').length, 1); assert.equal(f.store.list('model-call').length, 0);
+  assert.equal(completionSnapshot(f).assignments.filter(row => row.value.kind === 'part').length, 1);
+  f.restart(); const history = f.store.list(); valueOf(recordCall(f.store, f.project, winning!));
+  assert.equal(recordCall(f.store, f.project, completionE1(f)).ok, false);
+  assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 0);
+});
+
+test('32 H1.0b exact accepted frame ends a required absence and ceases only the selected unclaimed assignment', async t => {
+  const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  valueOf(recordCall(f.store, f.project, completionE1(f)));
+  const before = completionSnapshot(f), assignment = before.assignments.find(row => row.value.kind === 'part')!;
+  const frameRequest = structuredClone(f.gapRequest.sources.operations.frame);
+  const frame = valueOf(prepareFrame(f.store, frameRequest)), graph = structuredClone(f.fullGraph);
+  graph.nodes.find(row => row.id === 'garden-produce-operation')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
+  graph.nodes.find(row => row.id === 'garden-consume-operation')!.ports.push({ id: 'in-side', direction: 'in', contract: 'garden-contract' });
+  graph.connectors.find(row => row.id === 'garden-side-flow')!.bindings.push({ level: 2, producer: { node: 'garden-produce-operation', port: 'out-side' }, consumers: [{ node: 'garden-consume-operation', port: 'in-side' }], anchor: null });
+  const projected = projectGraph(graph, 2);
+  const fills = valueOf(fillObligations(frame.upper as Graph, frame.scope as FrameScope,
+    { graph, reference: { ...reference(f.graph), hash: hashJson(graph) }, frame: null }, frame.upperRef, 2));
+  const proposal = f.store.write({ id: `om-proposal:${f.project}:h10b-frame`, kind: 'layer-proposal', expected: 0, value: {
+    base: { graph: reference(f.graph), frame: null }, level: 2, source: 'decision', status: 'proposed',
+    nodes: projected.nodes.filter(row => row.kind === 'operation'),
+    fills: fills.fills.map(row => ({ obligation: row.obligation, node: row.node, ...(row.port === undefined ? {} : { port: row.port }) })),
+    localConnectors: projected.connectors.map(row => ({ ...row, bindings: row.bindings.filter(binding => binding.level === 2) })).filter(row => row.bindings.length),
+    artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins, anchors: projected.anchors, tests: projected.tests,
+    edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+    removes: [], replaces: [], redefines: [] } });
+  const candidate = valueOf(writeCandidate(f.store, { frame: frameRequest, proposals: [reference(proposal)] }));
+  assert.equal(candidate.state, 'candidate'); if (candidate.state !== 'candidate') assert.fail('Full frame must be proposed');
+  const accepted = valueOf(settleCandidate(f.store, { project: f.project, level: 2, candidate: reference(candidate.record),
+    outcome: { gate: 'G3', candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
+  assert.equal(accepted.state, 'accepted');
+  const cause = valueOf(prepareCompletionCause(f.store, f.project, reference(assignment))).cause!;
+  assert.equal(cause.kind, 'required-absence-ended');
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(before.binding), assignment: reference(assignment) }));
+  assert.equal(ceased.value.disposition, 'not-dispatched'); assert.equal(completionSnapshot(f).complete, true);
+  f.restart(); const history = f.store.list();
+  valueOf(readCompletionCause(f.store, f.project, reference(assignment), cause));
+  assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased);
+  assert.equal((await runModelCall(f.store, f.request)).ok, false); assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 0);
+});
+
+test('C47 H1.0b managed M5 completes its own ceased remainder without inventing block participation', async t => {
+  const { writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'field', 100_000, 0, 5000, true), before = completionSnapshot(f);
+  const root = before.assignments.find(row => row.value.kind === 'root')!;
+  valueOf(writeAddressing(f.store, { project: f.project, input: reference(f.input), graph: reference(f.graph),
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project: f.project, input: reference(f.input), graph: reference(f.graph), layers: [],
+      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(before.binding), assignment: reference(root) }));
+  assert.equal(ceased.value.cause.kind, 'required-record-replaced'); assert.equal(completionSnapshot(f).complete, true);
+  const close = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
+  const closed = valueOf(closeAttempt(f.store, close)); f.restart(); const history = f.store.list();
+  assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased);
+  assert.deepEqual(valueOf(closeAttempt(f.store, close)), closed);
+  assert.equal((await runModelCall(f.store, f.request)).ok, false); assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 0);
+});
+
+test('C31 H1.0b an applied source request can cease its continuation without a synthetic cycle terminal', async t => {
+  const { writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request)); assert.equal(first.outcome?.kind, 'need-source');
+  const before = completionSnapshot(f), marker = first.record.value.om.completionOwner!;
+  f.environment(90_000);
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: marker.binding, assignment: marker.assignment }));
+  assert.equal(ceased.value.disposition, 'branch-ceased'); assert.equal(ceased.value.remainder, 'continuation');
+  assert.equal(ceased.value.physical, null); assert.equal(completionSnapshot(f).complete, true);
+  const close = { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: before.refusals } };
+  valueOf(closeAttempt(f.store, close)); f.restart(); const history = f.store.list();
+  assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased);
+  assert.deepEqual(valueOf(await runModelCall(f.store, f.request)).record, first.record);
+  const cycle = await runModelCycle(f.store, f.request); assert.equal(cycle.ok, false);
+  if (!cycle.ok) { assert.equal(cycle.refusal.code, 'completion_ceased'); assert.deepEqual(cycle.refusal.at.ref, reference(ceased)); }
+  assert.deepEqual(f.store.list(), history); assert.equal(f.store.list('om-model-cycle').length, 0); assert.equal(f.sent().length, 1);
+});
+
+
+test('3 H1.0b ordinary paid reviewer output binds only its own role when Environment changes', async t => {
+  const { readCompletionCessationAt } = await import('../src/om/model-call.js');
+  for (const changed of ['implementer', 'reviewer'] as const) await t.test(changed, async t => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
+    const request = { ...f.request, role: 'reviewer' as const };
+    const write = f.store.writeMany.bind(f.store); let moved = false;
+    f.store.writeMany = ((writes, guards) => {
+      const rows = write(writes, guards);
+      if (!moved && writes.some(row => row.kind === 'model-call' && (row.value as OmModelCall).om?.application === 'received')) {
+        moved = true;
+        const { projectId: _project, ...config } = structuredClone(f.configured.value);
+        config[changed].model = 'changed-binding';
+        new ProductEngine(f.store).environments.configure(f.project, config, f.configured.revision);
+      }
+      return rows;
+    }) as Store['writeMany'];
+    const result = await runModelCall(f.store, request); f.store.writeMany = write;
+    assert.equal(moved, true);
+    if (changed === 'implementer') {
+      assert.equal(valueOf(result).record.value.om.application, 'applied');
+      assert.equal(f.store.list('om-completion-cessation').length, 0);
+    } else {
+      assert.equal(result.ok, false); if (!result.ok) assert.equal(result.refusal.code, 'completion_ceased');
+      const cessation = f.store.list('om-completion-cessation')[0]!;
+      valueOf(readCompletionCessationAt(f.store, f.project, reference(cessation)));
+    }
+    const history = f.store.list(); f.restart();
+    const repeat = await runModelCall(f.store, request); assert.equal(repeat.ok, result.ok);
+    assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
+  });
+});
+
+test('3 H1.0b equivalent configure after selected E1 preserves ordinary, cycle and continuation first claim', async t => {
+  const { prepareCompletionCause, prepareCompletionCessation } = await import('../src/om/model-call.js');
+  for (const mode of ['call', 'cycle', 'continuation'] as const) await t.test(mode, async child => {
+    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    let packet = f.packet;
+    if (mode === 'continuation') {
+      f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage },
+        { research: e4Fact(f), usage }]);
+      const first = valueOf(await runModelCall(f.store, f.request));
+      const basis = { project: f.project, packet: f.request.packet, call: first.call, response: first.response! };
+      const delivery = valueOf(deliverModelSources(f.store, basis));
+      packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest,
+        continuation: { packet: basis.packet, call: basis.call, response: basis.response, deliveries: [...delivery.deliveries] } })).record;
+    } else f.steps([{ research: e4Fact(f), usage }]);
+    const e1 = completionE1(f, packet), selected = valueOf(recordCall(f.store, f.project, e1));
+    const work = completionSnapshot(f), assignments = work.assignments.map(reference);
+    const part = work.assignments.find(row => row.value.kind === (mode === 'continuation' ? 'continuation' : 'part'))!;
+    const current = f.environment(); f.restart();
+    const before = f.store.list();
+    assert.equal(valueOf(recordCall(f.store, f.project, e1)).repeated, true);
+    assert.deepEqual(f.store.list(), before, 'Direct E1 replay retains the exact chosen plan');
+    assert.equal(valueOf(prepareCompletionCause(f.store, f.project, reference(part))).cause, null);
+    const refused = prepareCompletionCessation(f.store, { project: f.project, binding: reference(work.binding), assignment: reference(part) });
+    assert.equal(refused.ok, false); if (!refused.ok) assert.equal(refused.refusal.code, 'completion_cause_unproved');
+    const request = { ...f.request, packet: reference(packet) };
+    const outcome = mode === 'cycle' ? valueOf(await runModelCycle(f.store, request)).last : valueOf(await runModelCall(f.store, request));
+    assert.equal(outcome.outcome?.kind, 'fact-candidates');
+    assert.deepEqual(outcome.call, reference(selected.call));
+    assert.deepEqual(outcome.record.value.om.request, request);
+    assert.deepEqual(f.store.get(selected.call.id, 1), selected.call);
+    assert.ok(assignments.every(ref => completionSnapshot(f).assignments.some(row => canonical(reference(row)) === canonical(ref))));
+    const exchange = f.store.get<{ admissionGuards: Ref[] }>(outcome.record.value.om.exchange!.id)!;
+    assert.ok(exchange.value.admissionGuards.some(ref => canonical(ref) === canonical(reference(current))));
+    f.restart(); const history = f.store.list();
+    const replay = mode === 'cycle' ? valueOf(await runModelCycle(f.store, request)).last : valueOf(await runModelCall(f.store, request));
+    assert.deepEqual(replay.record, outcome.record); assert.deepEqual(f.store.list(), history);
+    assert.equal(f.sent().length, mode === 'continuation' ? 2 : 1);
+  });
+});
+
+test('34 H1.0b equivalent preclaim admission guards the current Environment against a second Store', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const selected = valueOf(recordCall(f.store, f.project, completionE1(f)));
+  f.environment(); f.steps([{ research: e4Fact(f), usage }]);
+  const write = f.store.writeMany.bind(f.store); let raced = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!raced && writes.some(row => row.kind === 'model-call' && (row.value as OmModelCall).status === 'running')) {
+      raced = true;
+      const other = new Store(f.database);
+      try {
+        const head = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+        const { projectId: _project, ...config } = structuredClone(head.value);
+        new ProductEngine(other).environments.configure(f.project, config, head.revision);
+      } finally { other.close(); }
+    }
+    return write(writes, guards);
+  }) as Store['writeMany'];
+  const first = await runModelCall(f.store, f.request); f.store.writeMany = write;
+  assert.equal(raced, true); assert.equal(first.ok, false); if (!first.ok) assert.equal(first.refusal.code, 'input_stale');
+  assert.equal(f.sent().length, 0); assert.equal(f.store.list('model-call').length, 0);
+  assert.deepEqual(f.store.get(selected.call.id), selected.call);
+  assert.equal(f.store.list('om-completion-cessation').length, 0);
+  f.restart(); assert.equal(valueOf(await runModelCall(f.store, f.request)).outcome?.kind, 'fact-candidates');
+  assert.equal(f.sent().length, 1);
+});
+
+test('4 H1.0b changed preclaim Environment is a proved cause while corrupt replacement is an integrity refusal', async t => {
+  const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
+  for (const kind of ['changed', 'corrupt'] as const) await t.test(kind, async child => {
+    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    const selected = valueOf(recordCall(f.store, f.project, completionE1(f))), work = completionSnapshot(f);
+    const part = work.assignments.find(row => row.value.kind === 'part')!;
+    if (kind === 'changed') f.environment(90_000);
+    else f.store.write({ id: f.configured.id, kind: 'environment', expected: f.configured.revision,
+      value: { ...structuredClone(f.configured.value), reviewer: { ...f.configured.value.reviewer, effort: 'invalid' } } });
+    const before = f.store.list(), sent = await runModelCall(f.store, f.request);
+    assert.equal(sent.ok, false); assert.equal(f.sent().length, 0); assert.deepEqual(f.store.list(), before);
+    const cause = prepareCompletionCause(f.store, f.project, reference(part));
+    const cease = writeCompletionCessation(f.store, { project: f.project, binding: reference(work.binding), assignment: reference(part) });
+    if (kind === 'changed') {
+      assert.equal(valueOf(cause).cause?.kind, 'required-record-replaced');
+      assert.equal(valueOf(cease).value.disposition, 'not-dispatched');
+    } else { assert.equal(cause.ok, false); assert.equal(cease.ok, false); }
+    assert.deepEqual(f.store.get(selected.call.id), selected.call);
+    f.restart(); assert.equal((await runModelCall(f.store, f.request)).ok, false); assert.equal(f.sent().length, 0);
+  });
+});
+
+test('C28 H1.0b selected continuation uses one compatible admission before E2, direct E1 and cycle', async t => {
+  for (const stage of ['before-E2', 'before-E1', 'cycle', 'E2-race', 'E1-race'] as const) await t.test(stage, async child => {
+    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage },
+      { research: e4Fact(f), usage }]);
+    const first = valueOf(await runModelCall(f.store, f.request));
+    const basis = { project: f.project, packet: f.request.packet, call: first.call, response: first.response! };
+    const delivery = valueOf(deliverModelSources(f.store, basis));
+    const nextRequest: QuestionPacketRequest = { ...f.packetRequest,
+      continuation: { packet: basis.packet, call: basis.call, response: basis.response, deliveries: [...delivery.deliveries] } };
+    if (stage === 'before-E1') valueOf(writeQuestionPacket(f.store, nextRequest));
+    f.environment(); f.restart();
+    const write = f.store.writeMany.bind(f.store); let raced = false;
+    if (stage.endsWith('-race')) f.store.writeMany = ((writes, guards) => {
+      if (!raced && writes.some(row => row.kind === (stage === 'E2-race' ? 'question-packet' : 'call-record'))) {
+        raced = true; const other = new Store(f.database);
+        try {
+          const head = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+          const { projectId: _project, ...config } = structuredClone(head.value);
+          new ProductEngine(other).environments.configure(f.project, config, head.revision);
+        } finally { other.close(); }
+      }
+      return write(writes, guards);
+    }) as Store['writeMany'];
+    if (stage === 'cycle') {
+      const cycle = valueOf(await runModelCycle(f.store, f.request));
+      assert.equal(cycle.record.value.steps.length, 2); assert.equal(cycle.last.outcome?.kind, 'fact-candidates');
+    } else {
+      const prepared = prepareQuestionPacket(f.store, nextRequest);
+      assert.equal(prepared.ok, true);
+      let materialized = writeQuestionPacket(f.store, nextRequest);
+      if (stage === 'E2-race') {
+        assert.equal(raced, true); assert.equal(materialized.ok, false);
+        if (!materialized.ok) assert.equal(materialized.refusal.code, 'input_stale');
+        assert.equal(f.store.get(valueOf(prepared).record.id), null); assert.equal(f.sent().length, 1);
+        f.store.writeMany = write; materialized = writeQuestionPacket(f.store, nextRequest);
+      }
+      const packet = valueOf(materialized).record;
+      assert.deepEqual(packet.value.request.environment, reference(f.configured));
+      const e1 = completionE1(f, packet);
+      let admitted = recordCall(f.store, f.project, e1);
+      if (stage === 'E1-race') {
+        assert.equal(raced, true); assert.equal(admitted.ok, false);
+        if (!admitted.ok) assert.equal(admitted.refusal.code, 'input_stale');
+        assert.equal(f.store.list('call-record').length, 1); assert.equal(f.sent().length, 1);
+        f.store.writeMany = write; admitted = recordCall(f.store, f.project, e1);
+      }
+      const registered = valueOf(admitted); assert.notEqual(registered.call.id, first.call.id);
+      const before = f.store.list(); assert.equal(valueOf(recordCall(f.store, f.project, e1)).repeated, true);
+      assert.deepEqual(f.store.list(), before);
+      const last = valueOf(await runModelCall(f.store, { ...f.request, packet: reference(packet) }));
+      assert.equal(last.outcome?.kind, 'fact-candidates');
+    }
+    f.store.writeMany = write;
+    assert.equal(f.sent().length, 2); assert.equal(f.store.list('call-record').length, 2);
+    f.restart(); const cycle = valueOf(await runModelCycle(f.store, f.request));
+    const history = f.store.list(); f.restart();
+    assert.deepEqual(valueOf(await runModelCycle(f.store, f.request)).record, cycle.record);
+    assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
+  });
+});
+
+test('C31 H1.0b equivalent configuration preserves the next exact MC2 part before its E1', async t => {
+  const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
+  const f = e4Fixture(t, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true);
+  assert.ok(f.packet.value.plan!.assignments.length > 1);
+  const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
+  const nextRequest = { ...f.packetRequest, previous: [{ packet: f.request.packet, ...first.part! }] };
+  f.environment(); f.restart();
+  const next = valueOf(writeQuestionPacket(f.store, nextRequest)).record;
+  assert.deepEqual(next.value.plan!.assignments, f.packet.value.plan!.assignments);
+  assert.equal(next.value.plan!.position, 1);
+  const e1 = completionE1(f, next);
+  const questionIds = new Set(((next.value.packet as Record<string, Json>).questions as { id: string }[]).map(row => row.id));
+  e1.gaps = f.batch.items.filter(item => questionIds.has(item.gap)).flatMap(item => item.consumers.map(consumer =>
+    ({ id: item.target, goal: item.target, field: item.field, consumer })));
+  const admitted = valueOf(recordCall(f.store, f.project, e1));
+  f.steps([{ research: firstBody, usage }, { research: e4Node(f, next as Revision<QuestionPacketRecord>), usage }]);
+  const second = valueOf(await runModelCall(f.store, { ...f.request, packet: reference(next) }));
+  assert.ok(second.part); assert.notEqual(second.call.id, first.call.id); assert.deepEqual(second.call, reference(admitted.call));
+  f.restart(); const history = f.store.list();
+  valueOf(await runModelCall(f.store, { ...f.request, packet: reference(next) }));
+  assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
+});
+
+test('C49 H1.0b ordinary E1 compatibility does not authorize a changed reviewer role at claim', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request));
+  const delivery = valueOf(deliverModelSources(f.store, { project: f.project, packet: f.request.packet, call: first.call, response: first.response! }));
+  const nextRequest = { ...f.packetRequest, continuation: { packet: f.request.packet, call: first.call,
+    response: first.response!, deliveries: [...delivery.deliveries] } };
+  const { projectId: _project, ...config } = structuredClone(f.configured.value);
+  config.reviewer.model = 'changed-reviewer';
+  new Environments(f.store).configure(f.project, config, f.configured.revision);
+  const next = valueOf(writeQuestionPacket(f.store, nextRequest)).record;
+  valueOf(recordCall(f.store, f.project, completionE1(f, next)));
+  const wrong = await runModelCall(f.store, { ...f.request, packet: reference(next), role: 'reviewer' });
+  assert.equal(wrong.ok, false); if (!wrong.ok) assert.equal(wrong.refusal.code, 'input_stale');
+  assert.equal(f.sent().length, 1); assert.equal(f.store.list('model-call').length, 1);
+  assert.equal(valueOf(await runModelCall(f.store, { ...f.request, packet: reference(next) })).outcome?.kind, 'fact-candidates');
+  assert.equal(f.sent().length, 2);
+});
+
+test('35 H1.0b equivalent configuration grants no privilege to an unselected old candidate', t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), configured = f.environment();
+  const next = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(configured) })).record;
+  const chosen = valueOf(recordCall(f.store, f.project, completionE1(f, next, configured)));
+  f.environment(); f.restart(); const history = f.store.list();
+  const other = recordCall(f.store, f.project, completionE1(f));
+  assert.equal(other.ok, false); if (!other.ok) assert.equal(other.refusal.code, 'completion_conflict');
+  assert.deepEqual(f.store.list(), history); assert.deepEqual(f.store.get(chosen.call.id), chosen.call);
+  assert.equal(f.sent().length, 0);
+});
+
+test('C31 H1.0b restored compatible environment cannot materialize or register a ceased continuation', async t => {
+  const { writeCompletionCessation } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request));
+  const delivery = valueOf(deliverModelSources(f.store, { project: f.project, packet: f.request.packet, call: first.call, response: first.response! }));
+  const nextRequest = { ...f.packetRequest, continuation: { packet: f.request.packet, call: first.call,
+    response: first.response!, deliveries: [...delivery.deliveries] } };
+  const next = valueOf(writeQuestionPacket(f.store, nextRequest)).record, marker = first.record.value.om.completionOwner!;
+  f.environment(90_000);
+  valueOf(writeCompletionCessation(f.store, { project: f.project, binding: marker.binding, assignment: marker.assignment }));
+  f.environment(); f.restart();
+  for (const closed of [false, true]) {
+    if (closed) valueOf(closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+      outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
+    const history = f.store.list();
+    assert.equal(valueOf(writeQuestionPacket(f.store, nextRequest)).existing, true);
+    assert.equal(prepareQuestionPacket(f.store, nextRequest).ok, false);
+    assert.equal(recordCall(f.store, f.project, completionE1(f, next)).ok, false);
+    assert.equal((await runModelCycle(f.store, f.request)).ok, false);
+    assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
+  }
+});
+
+// №1601: the role is a set before claim, and exact physical evidence selects one role afterwards.
+test('3 H1.0b staged ordinary roles agree at cessation, historical reading and physical entry', async t => {
+  const { prepareCompletionCause, readCompletionCause, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  for (const kind of ['fact', 'node'] as const) for (const stage of ['E2', 'E1', 'claim', 'received'] as const)
+    for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const)
+      for (const selected of (stage === 'claim' || stage === 'received' ? ['implementer', 'reviewer'] as const : [changed === 'implementer' ? 'reviewer' : 'implementer'] as const))
+        await t.test(`${kind}/${stage}/${changed}/${selected}`, async child => {
+          const f = e4Fixture(child, kind, 100_000, 0, 5000, true);
+          f.steps([{ research: kind === 'fact' ? e4Fact(f) : e4Node(f), usage }]);
+          const request = { ...f.request, role: selected };
+          if (stage !== 'E2') valueOf(recordCall(f.store, f.project, completionE1(f)));
+          if (stage === 'claim' || stage === 'received') {
+            const write = f.store.writeMany.bind(f.store); let stopped = false;
+            f.store.writeMany = ((writes, guards) => {
+              const rows = write(writes, guards);
+              if (!stopped && writes.some(row => row.kind === 'model-call'
+                && (row.value as OmModelCall).om?.application === (stage === 'claim' ? 'running' : 'received'))) {
+                stopped = true; throw new Error('role matrix durable boundary');
+              }
+              return rows;
+            }) as Store['writeMany'];
+            try { await assert.rejects(runModelCall(f.store, request), /role matrix durable boundary/); }
+            finally { f.store.writeMany = write; }
+            assert.equal(stopped, true);
+          }
+          const work = completionSnapshot(f), assignment = work.assignments.find(row => row.value.kind === (stage === 'E2' ? 'root' : 'part'))!;
+          const { projectId: _project, ...config } = structuredClone(f.configured.value);
+          if (changed === 'implementer' || changed === 'both') config.implementer.model = 'changed-implementer';
+          if (changed === 'reviewer' || changed === 'both') config.reviewer.model = 'changed-reviewer';
+          if (changed === 'common') config.timeoutMs += 1000;
+          if (changed === 'none') config.fullCheck.args = ['-v'];
+          const replacement = f.engine.environments.configure(f.project, config, f.configured.revision);
+          const blocks = stage !== 'E2' && (changed === 'common' || changed === 'both'
+            || ((stage === 'claim' || stage === 'received') && changed === selected));
+          f.restart();
+          const proof = valueOf(prepareCompletionCause(f.store, f.project, reference(assignment))).cause;
+          assert.equal(proof !== null, blocks);
+          if (proof) {
+            assert.equal(proof.kind, 'required-record-replaced');
+            if (proof.kind !== 'required-record-replaced' || proof.prerequisite.kind !== 'environment') assert.fail('Environment cause');
+            assert.equal(proof.prerequisite.role, stage === 'E1' ? null : selected);
+            valueOf(readCompletionCause(f.store, f.project, reference(assignment), proof));
+            assert.equal(readCompletionCause(f.store, f.project, reference(assignment), {
+              ...proof, prerequisite: { ...proof.prerequisite, role: stage === 'E1' ? 'implementer' : null },
+            }).ok, false, 'A caller cannot select another stage for the saved cause');
+          } else if (stage !== 'E2') {
+            const physical = f.store.list<OmModelCall>('model-call')[0];
+            const falseCause = { kind: 'required-record-replaced' as const, prerequisite: { kind: 'environment' as const,
+              source: reference(f.configured), context: assignment.value.source,
+              physical: physical ? reference(f.store.get(physical.id, 1)!) : null,
+              role: stage === 'E1' ? null : selected }, replacement: reference(replacement), proof: null };
+            assert.equal(readCompletionCause(f.store, f.project, reference(assignment), falseCause).ok, false);
+            if (stage === 'E1' && (changed === 'implementer' || changed === 'reviewer'))
+              assert.equal(readCompletionCause(f.store, f.project, reference(assignment), {
+                ...falseCause, prerequisite: { ...falseCause.prerequisite, role: changed },
+              }).ok, false, 'The previous assumed-role proof must fail at historical reading too');
+          }
+          const before = f.store.list(), ceaseRequest = { project: f.project, binding: reference(work.binding), assignment: reference(assignment) };
+          const ceased = writeCompletionCessation(f.store, ceaseRequest);
+          assert.equal(ceased.ok, blocks && stage !== 'claim');
+          if (ceased.ok) {
+            assert.equal(ceased.value.value.disposition, stage === 'received' ? 'branch-ceased' : 'not-dispatched');
+            f.environment(); f.restart();
+            valueOf(readCompletionCause(f.store, f.project, reference(assignment), proof!));
+            assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased.value))), ceased.value);
+            if (stage === 'E1') {
+              const closed = closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+                outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
+              if (kind === 'fact') valueOf(closed);
+              else assert.equal(closed.ok, false, 'A stopped MC2 part does not manufacture the still-missing assembly disposition');
+            }
+            const closedWork = f.store.get(work.work.id), closedSeries = f.store.get(f.series.id);
+            const repeated = await runModelCall(f.store, request); assert.equal(repeated.ok, false);
+            if (!repeated.ok) assert.equal(repeated.refusal.code, 'completion_ceased');
+            assert.deepEqual(f.store.get(work.work.id), closedWork); assert.deepEqual(f.store.get(f.series.id), closedSeries);
+            // The first replay may settle the exact paid receipt after the simulated stop; subsequent reads are inert.
+            const history = f.store.list(); f.restart();
+            assert.equal((await runModelCall(f.store, request)).ok, false); assert.deepEqual(f.store.list(), history);
+            assert.equal(f.sent().length, stage === 'received' ? 1 : 0);
+          } else {
+            assert.deepEqual(f.store.list(), before);
+            if (stage === 'claim') {
+              assert.equal(ceased.refusal.code, blocks ? 'completion_claim_exists' : 'completion_cause_unproved');
+              assert.equal((await runModelCall(f.store, request)).ok, false); assert.equal(f.sent().length, 0);
+              if (proof) { f.environment(); f.restart(); valueOf(readCompletionCause(f.store, f.project, reference(assignment), proof)); }
+            } else {
+              assert.equal(ceased.refusal.code, 'completion_cause_unproved');
+              let executable = request;
+              if (stage === 'E2') {
+                // Before the first E1 this is still a candidate, not an immutable selected plan.
+                const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(replacement) })).record;
+                executable = { ...request, packet: reference(packet), dispatch: { ...request.dispatch, config: reference(replacement) } };
+              } else if (stage === 'E1') {
+                assert.equal(closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+                  outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+              }
+              const result = valueOf(await runModelCall(f.store, executable));
+              assert.equal(result.record.value.om.application, 'applied');
+              if (kind === 'fact') assert.equal(result.outcome?.kind, 'fact-candidates'); else assert.ok(result.part);
+              assert.equal(f.store.list('om-completion-cessation').length, 0); assert.equal(f.sent().length, 1);
+              const history = f.store.list(); f.restart();
+              assert.deepEqual(valueOf(await runModelCall(f.store, executable)).record, result.record);
+              assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
+            }
+          }
+        });
+});
+
+test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', async t => {
+  const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
+  for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const) await t.test(changed, async child => {
+    const f = e4Fixture(child, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true);
+    const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
+    const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
+    const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, previous: [{ packet: f.request.packet, ...first.part! }] })).record;
+    assert.equal(packet.value.plan!.position, 1);
+    const work = completionSnapshot(f), assignment = work.assignments.find(row => row.value.kind === 'part' && row.value.position === 1)!;
+    assert.equal(f.store.list('call-record').length, 1, 'The second E2 is materialized, but its E1 does not exist');
+    const { projectId: _project, ...config } = structuredClone(f.configured.value);
+    if (changed === 'implementer' || changed === 'both') config.implementer.model = 'changed-implementer';
+    if (changed === 'reviewer' || changed === 'both') config.reviewer.model = 'changed-reviewer';
+    if (changed === 'common') config.timeoutMs += 1000;
+    if (changed === 'none') config.fullCheck.args = ['-v'];
+    f.engine.environments.configure(f.project, config, f.configured.revision); f.restart();
+    const proof = valueOf(prepareCompletionCause(f.store, f.project, reference(assignment))).cause;
+    const blocks = changed === 'both' || changed === 'common'; assert.equal(proof !== null, blocks);
+    const ceased = writeCompletionCessation(f.store, { project: f.project, binding: reference(work.binding), assignment: reference(assignment) });
+    assert.equal(ceased.ok, blocks);
+    const request = { ...f.request, packet: reference(packet), role: changed === 'implementer' ? 'reviewer' as const : 'implementer' as const };
+    if (ceased.ok) {
+      assert.equal(ceased.value.value.disposition, 'not-dispatched'); f.environment(); f.restart();
+      valueOf(readCompletionCause(f.store, f.project, reference(assignment), proof!));
+      valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased.value)));
+      assert.equal((await runModelCall(f.store, request)).ok, false); assert.equal(f.sent().length, 1);
+    } else {
+      assert.equal(ceased.refusal.code, 'completion_cause_unproved');
+      f.steps([{ research: firstBody, usage }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>), usage }]);
+      const second = valueOf(await runModelCall(f.store, request)); assert.ok(second.part);
+      assert.equal(f.store.list('call-record').length, 2); assert.equal(f.sent().length, 2);
+      f.restart(); const history = f.store.list();
+      assert.deepEqual(valueOf(await runModelCall(f.store, request)).record, second.record);
+      assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
+    }
+  });
 });

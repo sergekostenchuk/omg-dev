@@ -3,10 +3,10 @@ import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { requireCondition, EngineError } from "../errors.js";
-import { digest } from "../canonical.js";
+import { digest, hashJson } from "../canonical.js";
 import type { Command, Graph } from "../graph/model.js";
 import { safeRelativePath } from "../graph/topology.js";
-import { reference, type Ref, type Finding } from "../pipeline/contracts.js";
+import { reference, isRef, type Ref, type Finding } from "../pipeline/contracts.js";
 
 export interface RoleBinding { actor: string; model: string; effort: string; command: Command; speed?: "fast" | "inherited" }
 export interface Environment {
@@ -63,9 +63,12 @@ export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffe
   if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });
   return result.stdout;
 }
-export function executablePath(command: Command, cwd: string): string {
+function requireCommand(command: Command): void {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
     && Array.isArray(command.args) && command.args.every(arg => typeof arg === "string"), "command_unavailable", "Executable and argument array are required");
+}
+export function executablePath(command: Command, cwd: string): string {
+  requireCommand(command);
   const candidates = isAbsolute(command.executable) || /[\\/]/.test(command.executable)
     ? [resolve(cwd, command.executable)] : (process.env['PATH'] ?? "").split(delimiter).map(path => resolve(cwd, path || '.', command.executable));
   for (const candidate of candidates) {
@@ -118,27 +121,54 @@ export function inspectRepository(environment: Environment, graph: Graph): { sta
     return { state: { root, head, tree, files: [...files].map(([path, hash]) => ({ path, hash })).sort((a, b) => a.path.localeCompare(b.path)) }, findings };
   } catch (error) { findings.push({ code: "repository_unavailable", target: environment.workspace, message: error instanceof Error ? error.message : "Repository unavailable" }); return { state: null, findings }; }
 }
+function requireEnvironmentCapacity(project: string, value: { requestCapacityChars?: unknown }): void {
+  if (Object.hasOwn(value, "requestCapacityChars") && !isRequestCapacityChars(value.requestCapacityChars))
+    throw new EngineError("environment_invalid", "Request capacity must be a positive safe integer measured in characters",
+      { target: `environment:${project}`, field: "requestCapacityChars" });
+}
+/** The saved contract is pure: historical reads never recheck PATH, files or repository heads. */
+function requireSavedEnvironment(project: string, value: Environment): void {
+  requireCondition(value && value.projectId === project && typeof value.workspace === "string"
+    && isAbsolute(value.workspace) && resolve(value.workspace) === value.workspace
+    && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 100 && value.timeoutMs <= 3_600_000,
+    "environment_invalid", "A saved environment has its project, normalized absolute workspace and bounded timeout");
+  requireEnvironmentCapacity(project, value);
+  for (const role of [value.implementer, value.reviewer]) {
+    requireCondition(role && typeof role.actor === "string" && role.actor.trim()
+      && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)
+      && (role.speed === undefined || ["inherited", "fast"].includes(role.speed)),
+      "role_invalid", "Each role needs an identity, model and supported effort");
+    requireCommand(role.command);
+  }
+  requireCommand(value.fullCheck);
+  requireCondition(value.implementer.actor !== value.reviewer.actor, "reviewer_not_independent", "Implementer and reviewer must differ");
+}
+export function readEnvironmentAt(store: Store, project: string, ref: Ref): Revision<Environment> {
+  requireCondition(store instanceof Store && typeof project === "string" && project.length > 0 && isRef(ref),
+    "environment_invalid", "Environment history needs a project and full reference");
+  const record = store.get<Environment>(ref.id, ref.revision);
+  requireCondition(record && record.id === `environment:${project}` && record.kind === "environment"
+    && record.revision === ref.revision && record.hash === ref.hash && hashJson(record.value) === ref.hash,
+    "environment_invalid", "The exact historical environment must retain its complete identity and contents");
+  requireSavedEnvironment(project, record.value);
+  return record;
+}
+
 export class Environments {
   constructor(private readonly store: Store) {}
   configure(projectId: string, value: Omit<Environment, "projectId">, expected: number): Revision<Environment> {
     requireCondition(value && typeof value.workspace === "string" && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 100 && value.timeoutMs <= 3_600_000,
       "environment_invalid", "Workspace and a bounded timeout are required");
-    // Absence belongs to the previous era; never materialize a default in saved environments.
-    if (Object.hasOwn(value, "requestCapacityChars") && !isRequestCapacityChars(value.requestCapacityChars))
-      throw new EngineError("environment_invalid", "Request capacity must be a positive safe integer measured in characters",
-        { target: `environment:${projectId}`, field: "requestCapacityChars" });
+    requireEnvironmentCapacity(projectId, value);
     const workspace = realpathSync(value.workspace);
     const root = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
     requireCondition(!root || root.value.sourceRoot === workspace, "workspace_in_use", "Create a new project to use another repository after execution has begun");
-    for (const role of [value.implementer, value.reviewer]) requireCondition(role && typeof role.actor === "string" && role.actor.trim()
-      && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)
-      && (role.speed === undefined || ["inherited", "fast"].includes(role.speed)),
-    "role_invalid", "Each role needs an identity, model and supported effort");
+    const saved: Environment = { ...value, workspace, projectId };
+    requireSavedEnvironment(projectId, saved);
     executablePath(value.implementer.command, workspace); executablePath(value.reviewer.command, workspace); executablePath(value.fullCheck, workspace);
-    requireCondition(value.implementer.actor !== value.reviewer.actor, "reviewer_not_independent", "Implementer and reviewer must differ");
     const selected = this.store.get<{ path: string }>(`workspace:${projectId}`);
     const writes: { id: string; kind: string; expected: number; value: unknown }[] = [
-      { id: `environment:${projectId}`, kind: "environment", expected, value: { ...value, workspace, projectId } },
+      { id: `environment:${projectId}`, kind: "environment", expected, value: saved },
     ];
     if (!selected || selected.value.path !== workspace) writes.push({ id: `workspace:${projectId}`, kind: "workspace", expected: selected?.revision ?? 0, value: { path: workspace } });
     return this.store.writeMany<Environment>(writes)[0]!;
