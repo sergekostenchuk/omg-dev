@@ -1,0 +1,982 @@
+import test, { type TestContext } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { canonical, hashJson, type Json } from '../src/canonical.js';
+import { EngineError } from '../src/errors.js';
+import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
+import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { captureView, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import type { OmResult } from '../src/om/refusal.js';
+import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
+import { Discovery, type Question } from '../src/discovery/discovery.js';
+import { assessAnswer } from '../src/discovery/research-assessment.js';
+import type { Selector } from '../src/evidence/evidence.js';
+import type { Graph } from '../src/graph/model.js';
+import { projectGraph } from '../src/graph/project.js';
+import { writeOmInput } from '../src/om/input.js';
+import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
+import { writeHorizon } from '../src/om/horizon.js';
+import { writeGaps, type GapRequest } from '../src/om/gaps.js';
+import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
+import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
+import { recordCall } from '../src/om/call-record.js';
+import { writeGuarded } from '../src/om/refs.js';
+import { writeRoutes } from '../src/om/routes.js';
+import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, prepareAnswerInvalidation, readAnswerInvalidation,
+  type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
+import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
+  type QuestionTaskRequest, type QuestionPacketRequest } from '../src/om/question-packet.js';
+import { runModelCall, type ModelCallRequest } from '../src/om/model-call.js';
+import { readLegacyOperation, recoverLegacyOperation } from '../src/product/preparation-run.js';
+import { acquire, release } from '../src/execution/lock.js';
+import type { ExecutionLock } from '../src/execution/model.js';
+import type { ParkedCandidate } from '../src/execution/park.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { gardenGraph } from './om-fixture.js';
+import { preparedFeatures } from './product-fixture.js';
+import { preparedField } from './preparation-fixture.js';
+import { executionFixture } from './execution-fixture.js';
+
+const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
+
+function fixture(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-store-view-'));
+  const store = new Store(join(root, 'live.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, store };
+}
+
+/** A guard-mode view whose policy adds one view guard and records every pass. */
+function guardView(store: Store, viewGuards: TransactionGuard[], hits?: { inputs: Write[]; guards: TransactionGuard[] }[]) {
+  const passes = hits ?? [];
+  const policy: StoreViewPolicy = { write: (inputs, guards) => {
+    passes.push({ inputs, guards });
+    return store.writeMany(inputs, [...guards, ...viewGuards]);
+  } };
+  return { view: storeView(store, policy), passes };
+}
+
+const w = (id: string, expected = 0, kind = 'concept'): Write => ({ id, kind, expected, value: { id } });
+
+test('1 write(w) and writeMany([w], []) are one identical policy pass in both modes; target.write is never reached', t => {
+  const { store } = fixture(t);
+  // Guard mode: exactly one policy pass per public call, same Revision, same error.
+  const { view, passes } = guardView(store, []);
+  const viaWrite = view.write(w('a'));
+  assert.equal(passes.length, 1); assert.deepEqual(passes[0]!.inputs, [w('a')]); assert.deepEqual(passes[0]!.guards, []);
+  const viaMany = view.writeMany([w('b')], []);
+  assert.equal(passes.length, 2); assert.deepEqual(passes[1]!.inputs, [w('b')]); assert.deepEqual(passes[1]!.guards, []);
+  assert.equal(viaWrite.revision, 1); assert.equal(viaMany[0]!.revision, 1);
+  assert.equal(viaWrite.hash, store.get('a')!.hash);
+  // Same refusal from both forms: a stale view guard refuses write and writeMany alike.
+  const stale: TransactionGuard = { id: 'a', revision: 1, hash: '0'.repeat(64) };
+  const refusing = guardView(store, [stale]);
+  assert.throws(() => refusing.view.write(w('c')), code('input_stale'));
+  assert.throws(() => refusing.view.writeMany([w('d')], []), code('input_stale'));
+  assert.throws(() => refusing.view.write(w('d2')), code('input_stale'));
+  assert.equal(store.get('c'), null); assert.equal(store.get('d'), null); assert.equal(store.get('d2'), null);
+  // Capture mode: one pass, synthetic Revision, nothing durable.
+  const captured = captureView(store, {});
+  const synthetic = captured.view.write(w('cap'));
+  assert.equal(synthetic.revision, 1); assert.equal(store.get('cap'), null);
+  assert.equal(captured.writes.length, 1);
+  const syntheticMany = captured.view.writeMany([w('cap2')], []);
+  assert.equal(syntheticMany[0]!.revision, 1); assert.equal(store.get('cap2'), null);
+  assert.equal(captured.writes.length, 2);
+});
+
+test('2 capture validates the whole batch before publishing any element; success keeps order and count', t => {
+  const { store } = fixture(t);
+  const rows = new Map<string, Revision>();
+  const captured = captureView(store, { rows });
+  // Second element invalid (expected != 0 on a fresh id): nothing accumulated.
+  assert.throws(() => captured.view.writeMany([w('x'), w('y', 3)], []), code('revision_conflict'));
+  assert.equal(captured.writes.length, 0); assert.equal(rows.size, 0); assert.equal(captured.guards.length, 0);
+  assert.equal(store.get('x'), null);
+  // Duplicate id inside one batch.
+  assert.throws(() => captured.view.writeMany([w('x'), w('x')], []), code('duplicate_write'));
+  assert.equal(captured.writes.length, 0);
+  // Success: order and count preserved.
+  const result = captured.view.writeMany([w('x'), w('y')], []);
+  assert.equal(result.length, 2); assert.deepEqual(result.map(r => r.id), ['x', 'y']);
+  assert.equal(captured.writes.length, 2); assert.equal(rows.size, 2);
+});
+
+test('3 capture keeps every caller guard with the batch for the final commit', t => {
+  const { store } = fixture(t);
+  const head = store.write(w('watched'));
+  const captured = captureView(store, {});
+  const refGuard: TransactionGuard = reference(head);
+  const absentGuard: TransactionGuard = { id: 'never', absent: true };
+  captured.view.writeMany([w('kept')], [refGuard, absentGuard]);
+  assert.deepEqual(captured.guards, [refGuard, absentGuard]);
+  // A plain write has no caller guards; the consumer's own carried set is untouched.
+  captured.view.write(w('plain'));
+  assert.deepEqual(captured.guards, [refGuard, absentGuard]);
+  // The final commit replays writes AND the captured guards through Store.writeMany.
+  store.writeMany(captured.writes, captured.guards);
+  assert.ok(store.get('kept'));
+  // And a moved guarded head refuses the whole captured pack then.
+  const second = captureView(store, {});
+  second.view.writeMany([w('late')], [refGuard]);
+  store.write({ id: 'watched', kind: 'concept', expected: 1, value: { id: 'watched', moved: true } });
+  assert.throws(() => store.writeMany(second.writes, second.guards), code('input_stale'));
+  assert.equal(store.get('late'), null);
+});
+
+test('4 the returned Revision, the accumulated write and the caller input share no mutable cell', t => {
+  const { store } = fixture(t);
+  const captured = captureView(store, {});
+  const input: Write = { id: 'm', kind: 'concept', expected: 0, value: { mutable: 'before' } };
+  const revision = captured.view.write(input);
+  assert.equal(revision.hash, hashJson(input.value));
+  (input.value as Record<string, unknown>).mutable = 'after';
+  assert.equal((captured.writes[0]!.value as Record<string, unknown>).mutable, 'before');
+  assert.equal((revision.value as Record<string, unknown>).mutable, 'before');
+  assert.equal(revision.hash, hashJson(captured.writes[0]!.value));
+  (revision.value as Record<string, unknown>).mutable = 'mutated-after';
+  assert.equal((captured.writes[0]!.value as Record<string, unknown>).mutable, 'before');
+});
+
+test('5 the capture overlay reads pending rows first and exact older revisions from the target', t => {
+  const { store } = fixture(t);
+  const old = store.write(w('base'));
+  store.write({ id: 'base', kind: 'concept', expected: 1, value: { id: 'base', v: 2 } });
+  const rows = new Map<string, Revision>();
+  const captured = captureView(store, { rows });
+  captured.view.write(w('pending-row'));
+  assert.equal(captured.view.get('pending-row')!.revision, 1, 'pending row visible at its synthetic revision');
+  assert.deepEqual(captured.view.get('base', 1), old, 'exact older revision reads the target');
+  assert.equal(captured.view.get('base')!.revision, 2, 'current head reads through');
+  // Native issuance constraints are the producer's admit rule and run before Store-level checks.
+  const issuance = captureView(store, { rows: new Map<string, Revision>(), admit: write => {
+    if (write.expected !== 0) throw new EngineError('packet_record_invalid', 'native issuance writes new records only');
+  } });
+  assert.throws(() => issuance.view.write({ id: 'base', kind: 'concept', expected: 2, value: {} }), code('packet_record_invalid'),
+    'the producer rule fires before revision checks and is not displaced by them');
+  assert.throws(() => issuance.view.write({ id: 'base', kind: 'concept', expected: 1, value: {} }), code('packet_record_invalid'),
+    'a double violation (stale expected AND non-zero expected) still yields the producer rule first');
+  assert.throws(() => issuance.view.writeMany([{ id: 'base', kind: 'other', expected: 0, value: {} }]), code('kind_mismatch'));
+  assert.throws(() => captured.view.writeMany([w('pending-row')]), code('duplicate_write'));
+});
+
+test('6 a producer failure after a captured write leaves nothing durable and flushes nothing', t => {
+  const { store } = fixture(t);
+  const captured = captureView(store, {});
+  assert.throws(() => {
+    captured.view.write(w('half'));
+    throw new EngineError('producer_failed', 'the producer stops mid-pack');
+  }, code('producer_failed'));
+  assert.equal(store.get('half'), null, 'no durable record before the final commit');
+  assert.equal(captured.writes.length, 1, 'the buffer is local to the abandoned preparation');
+  // The next capture starts with its own empty set (no leak between captures).
+  const fresh = captureView(store, {});
+  assert.equal(fresh.writes.length, 0);
+});
+
+test('7 the final commit re-decides guards and conflicts after preparation; a stale pack is refused whole', t => {
+  const { store, root } = fixture(t);
+  const watched = store.write(w('watched'));
+  const captured = captureView(store, {});
+  captured.view.writeMany([w('packed')], [reference(watched)]);
+  // A second Store moves the guarded head between preparation and commit.
+  const second = new Store(join(root, 'live.sqlite'));
+  try {
+    second.write({ id: 'watched', kind: 'concept', expected: 1, value: { id: 'watched', moved: true } });
+    assert.throws(() => store.writeMany(captured.writes, captured.guards), code('input_stale'));
+    assert.equal(store.get('packed'), null);
+  } finally { second.close(); }
+  // The synthetic Revision never meant committed.
+  assert.equal(store.history('packed').length, 0);
+});
+
+test('8 guard mode sends caller guards plus view guards to one writeMany of the nearest target, unsplit', t => {
+  const { store } = fixture(t);
+  const watched = store.write(w('watched'));
+  const absent: TransactionGuard = { id: 'absent-lock', absent: true };
+  const calls: { inputs: Write[]; guards: TransactionGuard[] }[] = [];
+  const original = store.writeMany.bind(store);
+  (store as { writeMany: Store['writeMany'] }).writeMany = (inputs, guards = []) => { calls.push({ inputs, guards }); return original(inputs, guards); };
+  const { view } = guardView(store, [reference(watched), absent]);
+  const callerGuard = reference(store.get('watched')!);
+  view.writeMany([w('g1'), w('g2')], [callerGuard]);
+  assert.equal(calls.length, 1, 'the batch is never split into separate writes');
+  assert.deepEqual(calls[0]!.inputs.map(write => write.id), ['g1', 'g2']);
+  assert.ok(calls[0]!.guards.some(guard => canonical(guard) === canonical(callerGuard)));
+  assert.ok(calls[0]!.guards.some(guard => 'absent' in guard && guard.id === 'absent-lock'), 'the absent guard is kept, never dropped as not-a-Ref');
+  assert.ok(calls[0]!.guards.some(guard => isRef(guard) && guard.id === 'watched'));
+});
+
+test('9 a violated guard refuses the whole pack with zero writes and no retry through the raw Store', t => {
+  const { store } = fixture(t);
+  const watched = store.write(w('watched'));
+  store.write({ id: 'watched', kind: 'concept', expected: 1, value: { id: 'watched', moved: true } });
+  const { view } = guardView(store, [{ id: 'watched', revision: 1, hash: watched.hash }]);
+  assert.throws(() => view.writeMany([w('n1'), w('n2')], []), code('input_stale'));
+  assert.equal(store.get('n1'), null); assert.equal(store.get('n2'), null);
+  assert.throws(() => view.write(w('n3')), code('input_stale'));
+  assert.equal(store.get('n3'), null);
+});
+
+test('10 only Refs exactly equal to a pending writeRef drop out; absent and same-id-other-hash stay', t => {
+  const { store } = fixture(t);
+  const pendingWrite: Write = w('pending-target');
+  const pendingRef: TransactionGuard = { id: pendingWrite.id, revision: 1, hash: hashJson(pendingWrite.value) };
+  const absent: TransactionGuard = { id: 'never-present', absent: true };
+  const kept = reference(store.write(w('other')));
+  const seen: TransactionGuard[][] = [];
+  // The consumer's remap rule (model-call): drop only Refs exactly equal to a pending writeRef.
+  const view = storeView(store, { write: (inputs, guards) => {
+    const keptGuards = guards.filter(guard => !isRef(guard) || !inputs.some(write =>
+      canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }) === canonical(guard)));
+    seen.push(keptGuards);
+    return store.writeMany(inputs, keptGuards);
+  } });
+  view.writeMany([pendingWrite], [pendingRef, absent, kept]);
+  const delivered = seen[0]!;
+  assert.ok(!delivered.some(guard => isRef(guard) && canonical(guard) === canonical(pendingRef)), 'the exact pending writeRef drops out');
+  assert.ok(delivered.some(guard => 'absent' in guard && guard.id === 'never-present'), 'absent is never dropped as not-a-Ref');
+  assert.ok(delivered.some(guard => canonical(guard) === canonical(kept)));
+  // A same-id different-hash Ref is not dropped by id alone: it reaches the target and refuses there.
+  const pending2 = w('pending-2');
+  const exact2: TransactionGuard = { id: 'pending-2', revision: 1, hash: hashJson(pending2.value) };
+  const otherHash: TransactionGuard = { id: 'pending-2', revision: 1, hash: '0'.repeat(64) };
+  assert.throws(() => view.writeMany([pending2], [exact2, otherHash]), code('input_stale'),
+    'the surviving contradictory Ref refuses the commit at the target');
+  assert.ok(seen[1]!.some(guard => isRef(guard) && guard.id === 'pending-2' && guard.hash === '0'.repeat(64)),
+    'same-id different-hash Ref survived the filter');
+  assert.ok(!seen[1]!.some(guard => isRef(guard) && guard.hash === exact2.hash), 'the exact writeRef of pending-2 dropped out');
+  assert.equal(store.get('pending-2'), null);
+});
+
+test('11 an empty writeMany keeps guard behavior and captures dependencies without a synthetic commit', t => {
+  const { store } = fixture(t);
+  const watched = store.write(w('watched'));
+  const { view } = guardView(store, []);
+  assert.deepEqual(view.writeMany([], [reference(watched)]), []);
+  assert.throws(() => view.writeMany([], [{ id: 'watched', revision: 1, hash: '0'.repeat(64) }]), code('input_stale'),
+    'an empty batch still checks its conditions');
+  const captured = captureView(store, {});
+  assert.deepEqual(captured.view.writeMany([], [reference(watched)]), [], 'no synthetic Revision for an empty pack');
+  assert.deepEqual(captured.guards, [reference(watched)], 'the dependencies are kept for the final pack');
+  assert.equal(captured.writes.length, 0);
+});
+
+test('12 a new or side method is refused before it runs in either mode, with zero writes and no accumulator change', t => {
+  const { store } = fixture(t);
+  const { view } = guardView(store, []);
+  const captured = captureView(store, {});
+  for (const candidate of [view, captured.view]) {
+    assert.equal(typeof candidate.close, 'function');
+    assert.throws(() => candidate.close(), code('store_view_method_unsupported'));
+    assert.equal(typeof candidate.snapshot, 'function');
+    assert.throws(() => void candidate.snapshot('anywhere'), code('store_view_method_unsupported'));
+    assert.throws(() => new (candidate.constructor as new (p: string) => Store)('x'), code('store_view_method_unsupported'),
+      'the real constructor is neither handed out nor callable through the view');
+  }
+  // A method added to Store.prototype later is not auto-resolved either.
+  (Store.prototype as unknown as Record<string, unknown>)['writesViaThis'] = function (this: Store) { return this.write(w('smuggled')); };
+  try {
+    assert.equal(typeof (view as unknown as Record<string, unknown>)['writesViaThis'], 'function');
+    assert.throws(() => (view as unknown as { writesViaThis: () => void }).writesViaThis(), code('store_view_method_unsupported'));
+    assert.equal(store.get('smuggled'), null, 'no durable write through a side method');
+  } finally { delete (Store.prototype as unknown as Record<string, unknown>)['writesViaThis']; }
+  // Capture accumulator untouched by refused calls.
+  captured.view.write(w('kept'));
+  assert.throws(() => captured.view.close(), code('store_view_method_unsupported'));
+  assert.equal(captured.writes.length, 1);
+  assert.equal(captured.guards.length, 0);
+  // The Store itself is not closed by view.close().
+  store.write(w('alive'));
+  assert.ok(store.get('alive'));
+});
+
+test('13 a read projection over a guarded inner view keeps interception: neither bind nor const write = view.write reaches the raw Store', t => {
+  const { store } = fixture(t);
+  const inner = guardView(store, []);
+  const overlay = new Map<string, Revision>();
+  const projection = storeView(inner.view, {
+    write: (inputs, guards) => inner.view.writeMany(inputs, guards),
+    get: (id, revision) => {
+      const own = overlay.get(id);
+      return own && (revision === undefined || revision === own.revision) ? own : undefined;
+    },
+  });
+  // Extracted write references still pass the inner interception.
+  const detachedWrite = projection.write;
+  const detachedMany = projection.writeMany;
+  detachedWrite(w('via-write'));
+  detachedMany([w('via-many')], []);
+  assert.deepEqual(inner.passes.map(pass => pass.inputs.map(write => write.id)), [['via-write'], ['via-many']],
+    'both extracted forms passed the inner policy exactly once each');
+  assert.equal(inner.passes[0]!.guards.length, 0);
+  // Read overlay first, then the nearest target's own get (bound, private fields reachable).
+  overlay.set('shadow', { id: 'shadow', kind: 'concept', revision: 9, hash: '9'.repeat(64), value: { id: 'shadow' } });
+  assert.equal(projection.get('shadow')!.revision, 9);
+  assert.equal(projection.get('via-write')!.revision, 1, 'non-overlay reads fall through to the inner view');
+  assert.equal(inner.view.get('via-write')!.revision, 1);
+  assert.ok(projection.list().some(row => row.id === 'via-many'));
+  assert.equal(projection.history('via-write').length, 1);
+  assert.ok(projection instanceof Store);
+  // An explicit null from the overlay is the projection's own answer "no record in this view":
+  // only undefined delegates to the nearest target, and the lower get is not consulted (№1760-2).
+  const getCalls: string[] = [];
+  const rawGet = store.get.bind(store);
+  (store as { get: Store['get'] }).get = (id, revision?) => { getCalls.push(id); return rawGet(id, revision); };
+  try {
+    const hidden = storeView(store, { write: (inputs, guards) => store.writeMany(inputs, guards),
+      get: id => id === 'via-write' ? null : undefined });
+    assert.equal(hidden.get('via-write'), null, 'an explicit null is not replaced by the stored revision');
+    assert.deepEqual(getCalls, [], 'the lower get is never consulted for an explicit null');
+    assert.equal(hidden.get('via-many')!.revision, 1, 'undefined still delegates to the nearest target');
+    assert.deepEqual(getCalls, ['via-many']);
+  } finally { (store as { get: Store['get'] }).get = rawGet; }
+});
+
+test('14 guard over guard: one final pack carries caller guards plus both view guards, each policy once, in nesting order; a refusal of either layer forbids the write', t => {
+  const { store } = fixture(t);
+  const innerHead = store.write(w('inner-watched'));
+  const outerHead = store.write(w('outer-watched'));
+  const innerGuard = reference(innerHead);
+  const outerGuard = reference(outerHead);
+  const calls: { inputs: Write[]; guards: TransactionGuard[] }[] = [];
+  const original = store.writeMany.bind(store);
+  (store as { writeMany: Store['writeMany'] }).writeMany = (inputs, guards = []) => { calls.push({ inputs, guards }); return original(inputs, guards); };
+  const inner = guardView(store, [innerGuard]);
+  const outerPasses: { inputs: Write[]; guards: TransactionGuard[] }[] = [];
+  const outer = storeView(inner.view, { write: (inputs, guards) => {
+    outerPasses.push({ inputs, guards });
+    return inner.view.writeMany(inputs, [...guards, outerGuard]);
+  } });
+  const callerGuard = reference(store.get('inner-watched')!);
+  outer.writeMany([w('gg')], [callerGuard]);
+  assert.equal(outerPasses.length, 1, 'the outer policy ran exactly once');
+  assert.equal(inner.passes.length, 1, 'the inner policy ran exactly once');
+  assert.equal(calls.length, 1, 'one final Store.writeMany pack');
+  const finalGuards = calls[0]!.guards;
+  assert.deepEqual(finalGuards.map(guard => canonical(guard)),
+    [callerGuard, outerGuard, innerGuard].map(guard => canonical(guard)),
+    'caller, outer, inner — the nesting order of the subject remap is preserved');
+  // A stale guard at either layer refuses the whole pack with zero writes.
+  const staleInner = guardView(store, [{ id: 'inner-watched', revision: 1, hash: '0'.repeat(64) }]);
+  const overStaleInner = storeView(staleInner.view, { write: (inputs, guards) => staleInner.view.writeMany(inputs, [...guards, outerGuard]) });
+  assert.throws(() => overStaleInner.writeMany([w('r1')], []), code('input_stale'));
+  assert.equal(store.get('r1'), null);
+  const staleOuter = storeView(inner.view, { write: (inputs, guards) =>
+    inner.view.writeMany(inputs, [...guards, { id: 'outer-watched', revision: 1, hash: '0'.repeat(64) }]) });
+  assert.throws(() => staleOuter.write(w('r2')), code('input_stale'));
+  assert.equal(store.get('r2'), null);
+});
+
+test('15 capture with guard in either order: the base stays untouched until the final commit, both layers of guards reach it, and no flush bypassing them exists', t => {
+  const { store } = fixture(t);
+  const watched = store.write(w('watched'));
+  const layerGuard = reference(watched);
+  // Capture over guard.
+  const guarded = guardView(store, [layerGuard]);
+  const overGuard = captureView(guarded.view, {});
+  const callerGuard = reference(store.write(w('caller-watched')));
+  overGuard.view.writeMany([w('cg')], [callerGuard]);
+  assert.equal(store.get('cg'), null, 'nothing durable before the final commit');
+  assert.equal(guarded.passes.length, 0, 'accumulation never invokes the lower write path');
+  // The consumer's final commit explicitly carries both layers of conditions.
+  store.writeMany(overGuard.writes, [...overGuard.guards, layerGuard]);
+  assert.ok(store.get('cg'));
+  // Guard over capture: the guard layer's condition lands in the captured set.
+  const capture = captureView(store, {});
+  const layer2 = reference(store.write(w('second-watched')));
+  const guardOver = storeView(capture.view, { write: (inputs, guards) => capture.view.writeMany(inputs, [...guards, layer2]) });
+  guardOver.writeMany([w('gc')], [callerGuard]);
+  assert.equal(store.get('gc'), null);
+  assert.deepEqual(capture.guards.map(guard => canonical(guard)), [callerGuard, layer2].map(guard => canonical(guard)),
+    'caller guards plus the guard layer condition are kept for the final transaction');
+  // A moved guarded head refuses the whole flush; there is no condition-less flush to the raw Store.
+  store.write({ id: 'second-watched', kind: 'concept', expected: 1, value: { moved: true } });
+  assert.throws(() => store.writeMany(capture.writes, capture.guards), code('input_stale'));
+  assert.equal(store.get('gc'), null);
+  const asRecord = capture.view as unknown as Record<string, unknown>;
+  assert.equal(asRecord['flush'], undefined); assert.equal(asRecord['commit'], undefined);
+});
+
+test('16 capture over capture is refused before any accumulation; sequential captures stay lawful', t => {
+  const { store } = fixture(t);
+  const first = captureView(store, {});
+  first.view.write(w('held'));
+  assert.throws(() => captureView(first.view, {}), code('store_view_composition_unsupported'));
+  assert.equal(first.writes.length, 1, 'the existing accumulator is unchanged by the refused composition');
+  assert.equal(store.get('held'), null);
+  // A capture over a guard/read projection is not a composition of two captures.
+  const projected = guardView(store, []);
+  const lawful = captureView(projected.view, {});
+  lawful.view.write(w('fine'));
+  assert.equal(lawful.writes.length, 1);
+  // A sequential independent capture over the same Store keeps its own empty set.
+  const second = captureView(store, {});
+  assert.equal(second.writes.length, 0);
+  second.view.write(w('own'));
+  assert.deepEqual(second.writes.map(write => write.id), ['own']);
+  assert.deepEqual(first.writes.map(write => write.id), ['held']);
+  // The ban survives helper-built guard/read projections (№1760-3, reviewer probe capture-guard-capture):
+  // a projection does not launder an existing capture owner.
+  const firstCapture = captureView(store, { rows: new Map<string, Revision>() });
+  const middle = storeView(firstCapture.view, { write: (inputs, guards) => firstCapture.view.writeMany(inputs, guards) });
+  assert.throws(() => captureView(middle, { rows: new Map<string, Revision>() }), code('store_view_composition_unsupported'));
+  assert.equal(firstCapture.writes.length, 0, 'nothing accumulated before the refusal');
+  firstCapture.view.write(w('still-fine'));
+  assert.equal(firstCapture.writes.length, 1, 'the existing capture keeps working after the refused nesting');
+});
+
+test('17 lower-layer errors keep their identity: closed Store, read failure and unsupported method are not masked as input_stale', t => {
+  const { store } = fixture(t);
+  store.write(w('before-close'));
+  const { view } = guardView(store, []);
+  const captured = captureView(store, {});
+  store.close();
+  assert.throws(() => view.write(w('late')), code('store_busy'), 'the original store refusal keeps its code');
+  assert.throws(() => view.writeMany([w('late2')], []), code('store_busy'));
+  // Capture preparation does not peek at a private closed flag: the read it needs fails as-is.
+  assert.throws(() => captured.view.write(w('late3')), (error: unknown) =>
+    !(error instanceof EngineError) || (error.code !== 'input_stale' && error.code !== 'store_view_method_unsupported'));
+  assert.throws(() => view.list(), (error: unknown) => !(error instanceof EngineError),
+    'a real read surfaces the original error, not an EngineError disguise');
+  // The unsupported-method error is exactly itself.
+  assert.throws(() => view.snapshot('x'), code('store_view_method_unsupported'));
+  assert.throws(() => store.get('before-close'), (error: unknown) => !(error instanceof EngineError),
+    'a closed store read fails with the original error rather than a disguised code');
+});
+
+test('X4 refusal timing: a forbidden function throws at call, a forbidden accessor at property-get before its getter runs, instanceof Store preserved', t => {
+  const { store } = fixture(t);
+  const { view } = guardView(store, []);
+  assert.ok(view instanceof Store);
+  assert.ok(captureView(store, {}).view instanceof Store);
+  // Function-valued member: get returns a function; the refusal fires at call time.
+  const closeMember: unknown = view.close;
+  assert.equal(typeof closeMember, 'function');
+  assert.throws(() => view.close(), code('store_view_method_unsupported'));
+  store.write(w('still-open'));
+  // Undeclared accessor: refused at property-get; the getter never runs.
+  let getterRan = false;
+  Object.defineProperty(Store.prototype, 'rogueAccessor', { configurable: true, get() { getterRan = true; return 1; } });
+  try {
+    assert.throws(() => (view as unknown as Record<string, unknown>)['rogueAccessor'], code('store_view_method_unsupported'));
+    assert.equal(getterRan, false, 'the refusal fires before the getter runs');
+  } finally { delete (Store.prototype as unknown as Record<string, unknown>)['rogueAccessor']; }
+  // Declared members stay readable; an absent property reads as undefined.
+  assert.equal(view.path, store.path);
+  assert.equal(view.databaseId, store.databaseId);
+  assert.equal((view as unknown as Record<string, unknown>)['neverDeclared'], undefined);
+});
+
+test('X10 a well-formed absent guard at a refusing capture boundary is a typed refusal before publication; a malformed guard is invalid_guard', t => {
+  const { store } = fixture(t);
+  const head = store.write(w('carried'));
+  const captured = captureView(store, { absentGuards: 'refuse' });
+  const absent: TransactionGuard = { id: 'ghost', absent: true };
+  let refusal: unknown;
+  try { captured.view.writeMany([w('x')], [absent]); } catch (error) { refusal = error; }
+  assert.ok(refusal instanceof EngineError && refusal.code === 'store_view_guard_unsupported');
+  assert.deepEqual((refusal as EngineError).details, { id: 'ghost' });
+  assert.equal(captured.writes.length, 0, 'nothing was published into the accumulator');
+  assert.equal(captured.guards.length, 0, 'no guard was carried by the refused pack');
+  assert.equal(store.get('x'), null, 'no durable record');
+  // Malformed guards keep their own code.
+  assert.throws(() => captured.view.writeMany([w('y')], [{ id: '', absent: true } as unknown as TransactionGuard]), code('invalid_guard'));
+  assert.throws(() => captured.view.writeMany([w('y')], [{ id: 'g', revision: 0, hash: 'not-a-hash' } as unknown as TransactionGuard]), code('invalid_guard'));
+  assert.throws(() => captured.view.writeMany([w('y')], [{ id: 'g', absent: true, revision: 1 } as unknown as TransactionGuard]), code('invalid_guard'));
+  assert.equal(captured.writes.length, 0);
+  // A well-formed Ref guard is fully carried by the same boundary.
+  captured.view.writeMany([w('z')], [reference(head)]);
+  assert.equal(captured.writes.length, 1);
+  assert.deepEqual(captured.guards, [reference(head)]);
+});
+
+test('X43 every helper call builds a new Proxy with its own state; two views over one Store with different pending sets never share a read proof', t => {
+  const { store } = fixture(t);
+  const a = captureView(store, { rows: new Map<string, Revision>() });
+  const b = captureView(store, { rows: new Map<string, Revision>() });
+  assert.notEqual(a.view, b.view);
+  assert.notEqual(a.view, store as Store);
+  assert.ok(a.view instanceof Store && b.view instanceof Store);
+  a.view.write(w('only-a'));
+  assert.equal(a.view.get('only-a')!.revision, 1, 'the first view reads its own pending row');
+  assert.equal(b.view.get('only-a'), null, 'the second view has its own pending set — no shared proof through the common Store');
+  assert.equal(store.get('only-a'), null, 'nothing durable');
+  b.view.write(w('only-b'));
+  assert.equal(a.view.get('only-b'), null);
+  assert.equal(b.view.get('only-b')!.revision, 1);
+  // Guard views likewise: independent passes, no per-target cache.
+  const g1 = guardView(store, []);
+  const g2 = guardView(store, []);
+  assert.notEqual(g1.view, g2.view);
+  g1.view.write(w('g1-write'));
+  assert.equal(g1.passes.length, 1);
+  assert.equal(g2.passes.length, 0);
+});
+
+// ── Real producer connections (№1734-8: helper checks alone are not enough) ──
+
+function ok<T>(result: OmResult<T>): T {
+  if (!result.ok) assert.fail(`Unexpected refusal: ${result.refusal.code}: ${result.refusal.message} ${JSON.stringify(result.refusal.at)}`);
+  return result.value;
+}
+const storeSnapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
+const cloneJson = structuredClone;
+
+/** The D5 fact fixture reduced to the invalidation path: one accepted repository-fact answer grounded on a file source. */
+function factQ(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-q1-fact-'));
+  const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden', block = 'garden-produce-block', target = 'discovery:output-format';
+  const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'output-format',
+      question: 'Which output format does the repository support?', consumer: block,
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
+    cloneJson(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target, field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write }] }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: 'q1-fact', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const gapSources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(store, gapSources)), gap = gaps.records.find(row => row.value.gap.target === target)!;
+  const sources = structuredClone(gaps.sources) as GapRequest, records = gaps.records.map(reference);
+  const command = { executable: process.execPath, args: ['-e',
+    `const req=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{verdict:'supported',reasons:[]}}));`] };
+  const environment = engine.environments.configure(project, { workspace: root,
+    implementer: { actor: 'fact-researcher', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'fact-assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, 0);
+  writeFileSync(join(root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
+  const source = engine.discovery.evidence.file(project, 'answer-source', root, 'answer.json', 'application/json', 0);
+  function issue() {
+    const requestContract: AnswerQuestionContract = { establishes: input.value.input.questions[0]!.question,
+      consumer: { blocks: [...gap.value.gap.consumers] }, requirements: [cloneJson(input.value.input.contracts[0]) as unknown as Json],
+      resultForm: { type: 'string' } };
+    const draft = engine.discovery.create(project, 'om-g2', 'R1', block,
+      [mc1FieldSpec({ input: sources.input, gap: reference(gap), contract: requestContract })], [sources.input, reference(gap)]);
+    const issued = store.get<Question>(draft.value.questions[0]!)!;
+    const request: Mc1QuestionRequest = { project, input: sources.input, gaps: { sources, records },
+      gap: reference(gap), contract: requestContract, requirements: [{ pointer: '/contracts/0' }],
+      engineQuestion: reference(issued), draft: reference(draft) };
+    const question = ok(writeMc1Question(store, request));
+    return { request, question, issued };
+  }
+  async function answer(q = issue()) {
+    const citation: { source: Ref; selector: Selector } = { source: reference(store.get(source.id)!), selector: { kind: 'json-pointer', pointer: '/answer' } };
+    const assessment = await assessAnswer(store, q.issued, { action: 'answer', question: q.issued.id, value: 'JSON', citations: [citation] }, environment, root);
+    const draft = engine.discovery.researched(q.issued.id, q.issued.revision, reference(assessment)), answered = store.get<Question>(q.issued.id)!;
+    const request: AnswerRequest = { project, question: reference(q.question), answer: answered.value.answer!,
+      answeredQuestion: reference(answered), draft: reference(draft), attempt: null };
+    return { ...q, request };
+  }
+  return { root, project, target, input, graph, gaps: { sources, records, gap }, source, environment, store, engine, issue, answer };
+}
+
+test('18 evidence.file capture inside prepareAnswerInvalidation writes nothing before the consumer B1 commit and delivers the exact successor write with its guards', async t => {
+  const f = factQ(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted) };
+  const unchanged = ok(prepareAnswerInvalidation(f.store, request));
+  assert.equal(unchanged.invalidation, null); assert.deepEqual(unchanged.writes, []);
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const writeMany = f.store.writeMany.bind(f.store); let lowerWrites = 0;
+  f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => { lowerWrites++; return writeMany(writes, guards); }) as Store['writeMany'];
+  const before = storeSnapshot(f.store);
+  const prepared = ok(prepareAnswerInvalidation(f.store, request));
+  f.store.writeMany = writeMany;
+  assert.equal(lowerWrites, 0, 'the capture never invokes the lower write path, not even for validation');
+  assert.deepEqual(storeSnapshot(f.store), before, 'nothing durable before B1');
+  assert.equal(f.store.get(f.source.id)!.revision, f.source.revision, 'the source head is untouched');
+  assert.equal(prepared.writes.length, 1);
+  assert.equal(prepared.writes[0]!.id, f.source.id);
+  assert.equal(prepared.writes[0]!.kind, 'source');
+  assert.equal(prepared.writes[0]!.expected, f.source.revision, 'the captured write is the exact successor of the changed file source');
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.source))), 'the evidence condition reaches B1');
+  const written = ok(writeGuarded(f.store, { unit: 'Q1-test', target: f.target, guards: prepared.guards, writes: prepared.writes }));
+  assert.deepEqual(reference(written[0]!), prepared.invalidation!.sources[0]!.after);
+  const history = ok(readAnswerInvalidation(f.store, { project: f.project, invalidation: prepared.invalidation! }));
+  assert.ok(history.references.some(ref => ref.id === f.source.id));
+});
+
+test('X37 two independent captures of the same successor Source produce the canonically identical Write; a late second commit meets the plain conflict, never last-write-wins', async t => {
+  const f = factQ(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const request = { project: f.project, record: reference(accepted) };
+  writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+  const first = ok(prepareAnswerInvalidation(f.store, request));
+  const second = ok(prepareAnswerInvalidation(f.store, request));
+  assert.equal(first.writes.length, 1); assert.equal(second.writes.length, 1);
+  assert.equal(canonical(first.writes[0]!), canonical(second.writes[0]!),
+    'no helper instance label, capture time or buffer number inside the successor write');
+  ok(writeGuarded(f.store, { unit: 'Q1-test', target: f.target, guards: first.guards, writes: first.writes }));
+  const late = writeGuarded(f.store, { unit: 'Q1-test', target: f.target, guards: second.guards, writes: second.writes });
+  assert.equal(late.ok, false);
+  if (!late.ok) assert.ok(['input_stale', 'revision_conflict'].includes(late.refusal.code), late.refusal.code);
+  assert.equal(f.store.get(f.source.id)!.revision, f.source.revision + 1, 'one successor revision, written once');
+});
+
+/** The E2 packet fixture: two active fact gaps routed to one MC1 batch with a configured environment. */
+function packetQ(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-q1-packet-'));
+  const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden';
+  const descriptors = [
+    { id: 'output-format', consumer: 'garden-produce-block', kind: 'repository-fact' },
+    { id: 'encoding', consumer: 'garden-consume-block', kind: 'repository-fact' },
+  ] as const;
+  const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = descriptors.map(item => ({
+      id: item.id, question: `What is the supported ${item.id}?`, consumer: item.consumer,
+      moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }));
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
+    decisions: descriptors.map(item => ({ pending: cloneJson(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: `discovery:${item.id}`, field: 'address', value: { consumer: item.consumer, kind: item.kind } } })) as Write })) }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: 'q1-packet', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const gapSources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(store, gapSources));
+  const active = gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral);
+  const taskRequest: QuestionTaskRequest = { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
+    questions: active.map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) };
+  const tasks = ok(prepareQuestionTasks(store, taskRequest));
+  const routes = ok(writeRoutes(store, { project, gaps: taskRequest.gaps,
+    tasks: tasks.tasks.map(task => ({ pending: cloneJson(task.writes[0]!) as Write })), catalog: { paths: ['src/format.ts'], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(batch => batch.model === 'MC1' && batch.items.some(item => item.target === 'discovery:encoding'))!;
+  assert.ok(batch);
+  const command = { executable: process.execPath, args: ['--version'] };
+  function environment(amount: number) {
+    return engine.environments.configure(project, { workspace: root,
+      implementer: { actor: 'packet-researcher', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'packet-assessor', model: 'fixture', effort: 'high', command },
+      fullCheck: command, timeoutMs: 5000, requestCapacityChars: amount },
+    store.get(`environment:${project}`)?.revision ?? 0);
+  }
+  const configured = environment(100_000), block = 'garden-consume-block';
+  const goal: AttemptGoal = { key: 'packet:repository-facts',
+    questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  ok(openSeries(store, { project, block, line: 1, slice: 'packet-facts', predecessor: null, basis: null }));
+  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  const request: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id,
+    environment: reference(configured), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+  return { root, project, store, engine, tasks, routes, batch, configured, goal, series, request, environment };
+}
+
+test('X44 environment change: the discarded historical capture leaks nothing into a later one (A), and the managed replay reads through the Environment projection with remapped guards (B)', async t => {
+  // A: unmanaged MC1, no committed packet, stale environment. The historical derivation runs and is
+  // discarded; on 90daf6b this path then refuses in the managed-environment proof (record_missing) —
+  // Q1 keeps that boundary byte-identical and leaves zero durable effect, and the next capture is clean.
+  {
+    const p = packetQ(t), { store } = p;
+    p.environment(100_000); // equivalent change: identical settings, new revision — the request ref is stale
+    const writeMany = store.writeMany.bind(store); let lowerWrites = 0;
+    store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => { lowerWrites++; return writeMany(writes, guards); }) as Store['writeMany'];
+    const before = storeSnapshot(store);
+    const refused = prepareQuestionPacket(store, p.request);
+    assert.equal(lowerWrites, 0, 'the historical capture never calls the lower write path, not even for validation');
+    assert.deepEqual(storeSnapshot(store), before, 'a discarded capture leaves nothing durable and no leaked guards');
+    store.writeMany = writeMany;
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.refusal.code, 'record_missing', 'the pre-existing managed-proof boundary is unchanged');
+    // The next, independent capture starts from its own empty accumulator: one issuance set, one commit.
+    const currentEnvironment = reference(store.get(`environment:${p.project}`)!);
+    const prepared = ok(prepareQuestionPacket(store, { ...p.request, environment: currentEnvironment }));
+    assert.equal(prepared.existing, false);
+    assert.equal(prepared.writes.filter(write => write.kind === 'question').length, p.batch.items.length,
+      'no write leaked from the discarded capture duplicates the issuance');
+    assert.equal(prepared.writes.filter(write => write.kind === 'discovery-draft').length, p.batch.items.length);
+    assert.equal(prepared.writes.filter(write => write.kind === 'mc1-question').length, p.batch.items.length);
+    assert.equal(new Set(prepared.writes.map(write => write.id)).size, prepared.writes.length);
+    // Only exact Refs backed by this pack's own writes drop out; the observed conditions stay.
+    const pending = new Set(prepared.writes.map(write => canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) })));
+    assert.ok(!prepared.guards.some(guard => isRef(guard) && pending.has(canonical(guard))));
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(currentEnvironment)));
+    ok(writeGuarded(store, { unit: 'E2-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+    assert.equal(store.get(prepared.record.id)!.revision, 1);
+    assert.deepEqual(ok(readQuestionPacket(store, { project: p.project, record: reference(prepared.record) })), prepared.record);
+  }
+  // B: managed attempt, packet committed, E1 selected, then an equivalent environment change. The replay
+  // prepares through the Environment projection over the pending facade: the stale ref is remapped to the
+  // current head, no write runs, and the saved packet decides the result.
+  {
+    const f = e4q(t, true);
+    const payload = f.packet.value.packet as Record<string, Json> & { requestId: string; purpose: 'model-research' };
+    const e1 = { call: payload.requestId, purpose: payload.purpose, basis: null, block: 'garden-consume-block',
+      series: reference(f.series), attempt: 1, goal: f.series.value.attempts[0]!.goal,
+      dispatch: { adapter: reference(f.adapter), config: reference(f.configured) }, packet: payload as Json,
+      gaps: f.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))) };
+    const selected = ok(recordCall(f.store, f.project, e1));
+    assert.equal(selected.repeated, false);
+    const current = f.reconfigure();
+    assert.ok(current.revision > f.configured.revision);
+    const writeMany = f.store.writeMany.bind(f.store); let lowerWrites = 0;
+    f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => { lowerWrites++; return writeMany(writes, guards); }) as Store['writeMany'];
+    const before = storeSnapshot(f.store);
+    const prepared = ok(prepareQuestionPacket(f.store, f.packetRequest));
+    f.store.writeMany = writeMany;
+    assert.equal(lowerWrites, 0, 'the replay preparation writes nothing');
+    assert.deepEqual(storeSnapshot(f.store), before);
+    assert.equal(prepared.existing, true);
+    assert.deepEqual(prepared.writes, []);
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(current))),
+      'the projection remapped the stale environment condition to the current head');
+    assert.ok(!prepared.guards.some(guard => isRef(guard) && guard.id === f.configured.id && guard.revision === f.configured.revision),
+      'the stale environment ref does not survive the remap');
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(f.packet))));
+    const replay = ok(writeQuestionPacket(f.store, f.packetRequest));
+    assert.equal(replay.existing, true);
+    assert.deepEqual(replay.record, f.packet);
+    assert.deepEqual(replay.writes, []);
+  }
+});
+
+test('X14 every guard the native producer attaches during the capture rides to the final E2; a moved dependency refuses the whole pack (№1760-1, reviewer probe native-dependency)', t => {
+  const p = packetQ(t), { store } = p;
+  const watched = store.write(w('q1-native-dependency'));
+  const required = reference(watched);
+  // Attach an extra well-formed Ref guard at the producer's own writeMany point (test-side, restored).
+  const create = Discovery.prototype.create;
+  Discovery.prototype.create = function (this: Discovery, ...args: Parameters<Discovery['create']>) {
+    const bound: Store = (this as unknown as { store: Store }).store;
+    (this as unknown as { store: Store }).store = new Proxy(bound, { get(target, key) {
+      if (key === 'writeMany') return (writes: Write[], guards: TransactionGuard[] = []) => target.writeMany(writes, [...guards, required]);
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === 'function' ? (value as (...a: never[]) => unknown).bind(target) : value;
+    } });
+    try { return create.apply(this, args) as ReturnType<Discovery['create']>; }
+    finally { (this as unknown as { store: Store }).store = bound; }
+  } as Discovery['create'];
+  let result: ReturnType<typeof prepareQuestionPacket>;
+  try { result = prepareQuestionPacket(store, p.request); }
+  finally { Discovery.prototype.create = create; }
+  const prepared = ok(result);
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(required)),
+    'the producer-attached condition is carried in the final E2 set, not dropped by the connection');
+  // A second Store moves that dependency between preparation and commit: the whole pack refuses.
+  const nativeBefore = store.list('question').length;
+  const second = new Store(store.path); t.after(() => second.close());
+  second.write({ id: watched.id, kind: watched.kind, expected: watched.revision, value: { id: watched.id, moved: true } });
+  const commit = writeGuarded(store, { unit: 'E2-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards });
+  assert.equal(commit.ok, false);
+  if (!commit.ok) assert.equal(commit.refusal.code, 'input_stale');
+  assert.equal(store.get(prepared.record.id), null, 'no packet prefix survives the refused commit');
+  assert.equal(store.list('question').length, nativeBefore, 'no native question became durable');
+});
+
+/** The E4 dispatch fixture reduced to one MC1 fact batch with a scenario-driven adapter. */
+const q1Adapter = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+const q1Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+const q1Confirmed = { model: 'fixture-confirmed', effort: 'high', speed: 'fast' };
+function e4q(t: TestContext, managed = false) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-q1-e4-')), database = join(root, 'state.sqlite');
+  const store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden';
+  const { level: _level, ...l1 } = projectGraph(gardenGraph('cross'), 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'What encoding is supported?',
+      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }];
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
+    decisions: [{ pending: cloneJson(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: 'q1-e4', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const gapSources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(store, gapSources));
+  const gapRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const tasks = ok(prepareQuestionTasks(store, { project, gaps: gapRequest,
+    questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
+      .map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
+  const source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const routes = ok(writeRoutes(store, { project, gaps: gapRequest,
+    tasks: tasks.tasks.map(task => ({ pending: cloneJson(task.writes[0]!) as Write })),
+    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }));
+  writeFileSync(join(root, 'e4-source.txt'), 'UTF-8 is the supported encoding.');
+  const batch = routes.value.batches.find(batch => batch.model === 'MC1' && batch.items.some(item => item.target === 'discovery:encoding'))!;
+  assert.ok(batch);
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
+  const command = { executable: process.execPath, args: [q1Adapter, '--scenario', scenario, '--trace', trace] };
+  const configured = engine.environments.configure(project, { workspace: root,
+    implementer: { actor: 'e4-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: { actor: 'e4-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 1000, requestCapacityChars: 100_000 }, 0);
+  /** Equivalent reconfigure: identical settings, new revision — the lawful Environment change of №1734-10. */
+  const reconfigure = () => engine.environments.configure(project, { workspace: root,
+    implementer: { actor: 'e4-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: { actor: 'e4-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 1000, requestCapacityChars: 100_000 },
+  store.get(`environment:${project}`)?.revision ?? 0);
+  const adapter = store.write({ id: `adapter:${project}:e4`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } });
+  const goal: AttemptGoal = { key: 'e4:fact', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  const address = { project, block: 'garden-consume-block', line: 1 };
+  ok(openSeries(store, { ...address, slice: 'e4-fixture', predecessor: null, basis: null } as never));
+  const series = managed
+    ? ok(managedOpenAttempt(store, { ...address, attempt: 1, goal, completion: { routes: reference(routes), batches: [batch.id] } } as never))
+    : ok(beginAttempt(store, { ...address, attempt: 1, goal } as never));
+  const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
+    attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+  const packet = ok(writeQuestionPacket(store, packetRequest)).record;
+  const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
+  return { root, database, project, source, batch, packet, request, scenario, trace, store, engine,
+    adapter, configured, series, packetRequest, reconfigure,
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
+}
+function e4qFact(f: ReturnType<typeof e4q>) {
+  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+    results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
+      citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
+}
+
+test('X41 recordCall over the intercepted view writes E1 as exactly one guarded pack; a guard race refuses it whole with zero sends', async t => {
+  for (const race of [false, true]) {
+    const f = e4q(t);
+    f.steps([{ research: e4qFact(f), usage: q1Usage, confirmed: q1Confirmed }]);
+    const other = new Store(f.database); t.after(() => other.close());
+    const writeMany = f.store.writeMany.bind(f.store);
+    const packs: { writes: Write[]; guards: TransactionGuard[] }[] = [];
+    let raced = false;
+    f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => {
+      packs.push({ writes, guards });
+      if (race && !raced && writes.some(write => write.kind === 'call-record' && write.expected === 0)) {
+        raced = true;
+        // A concurrent admission moves the packet head between preparation and this commit.
+        const current = other.get(f.packet.id)!;
+        other.write({ id: current.id, kind: current.kind, expected: current.revision, value: current.value });
+      }
+      return writeMany(writes, guards);
+    }) as Store['writeMany'];
+    try {
+      const actual = await runModelCall(f.store, f.request);
+      if (!race) {
+        const outcome = ok(actual);
+        assert.equal(outcome.outcome?.kind, 'fact-candidates');
+        assert.equal(outcome.record.value.status, 'succeeded');
+        assert.deepEqual(outcome.record.value.usage, q1Usage);
+        assert.equal(f.sent().length, 1);
+      } else {
+        assert.ok(raced, 'the racing run reached the E1 commit');
+        assert.equal(actual.ok, false);
+        if (!actual.ok) assert.equal(actual.refusal.code, 'input_stale');
+        assert.equal(f.store.list('call-record').length, 0, 'the refused pack left no E1 prefix');
+        assert.equal(f.sent().length, 0, 'a refused E1 never spawns the adapter');
+      }
+    } finally { f.store.writeMany = writeMany; }
+    const e1 = packs.filter(pack => pack.writes.some(write => write.kind === 'call-record' && write.expected === 0));
+    if (!race) {
+      assert.equal(e1.length, 1, 'E1 registration is one pack, never split into separate writes');
+      assert.ok(e1[0]!.writes.some(write => write.kind === 'om-call-ledger'), 'the call and its ledger commit atomically');
+      assert.ok(e1[0]!.guards.some(guard => canonical(guard) === canonical(reference(f.packet))),
+        'the exact E2 packet condition rides the E1 pack through the interception');
+      const e1Index = packs.findIndex(pack => pack.writes.some(write => write.kind === 'call-record' && write.expected === 0));
+      const claimIndex = packs.findIndex(pack => pack.writes.some(write => write.kind === 'model-call'));
+      assert.ok(claimIndex > e1Index, 'E1 alone precedes the durable running claim');
+    }
+  }
+});
+
+/** Minimal park-intent driver: a real owner process that dies right after its preparing intent is durable. */
+function startParkDriver(directory: string, database: string, run: Ref) {
+  const path = join(directory, 'driver-park.mjs'), mark = join(directory, 'driver-park.json');
+  writeFileSync(path, `import{writeFileSync}from'node:fs';
+import{Store}from${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
+import{ProductEngine}from${JSON.stringify(new URL('../src/product/engine.js', import.meta.url).href)};
+const store=new Store(${JSON.stringify(database)}),engine=new ProductEngine(store);
+const original=store.writeMany.bind(store);let stopped=false;
+store.writeMany=(writes,guards=[])=>{
+ const saved=original(writes,guards);
+ if(!stopped&&writes.some(w=>w.kind==='parked-candidate'&&w.value.state==='preparing')){stopped=true;
+  writeFileSync(${JSON.stringify(mark)},JSON.stringify({pid:process.pid}));process.exit(71);}
+ return saved;};
+try{await engine.repairs.prepare('p',${JSON.stringify(run)});}catch(error){console.error(error?.stack??String(error));process.exitCode=72;}finally{store.close();}`);
+  const child = spawn(process.execPath, [path], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = ''; child.stderr!.on('data', data => { stderr += String(data); }); child.stdout!.resume();
+  const exit = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', code => resolve(code)); });
+  return { child, exit, stderr: () => stderr, checkpoint: mark };
+}
+async function parkCheckpoint(path: string, driver: { child: ChildProcess; exit: Promise<number | null>; stderr: () => string }) {
+  if (!existsSync(path)) await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (error?: Error) => { clearTimeout(timer); watcher.close(); driver.child.off('exit', ended); if (error) reject(error); else resolve(); };
+    const ended = () => finish(existsSync(path) ? undefined : new Error(`Driver exited before checkpoint: ${driver.stderr()}`));
+    const watcher = watch(dirname(path), () => { if (existsSync(path)) finish(); });
+    timer = setTimeout(() => finish(new Error(`Checkpoint timeout: ${driver.stderr()}`)), 20_000);
+    driver.child.once('exit', ended);
+    if (existsSync(path)) finish(); else if (driver.child.exitCode !== null && driver.child.signalCode !== null) ended();
+  });
+}
+
+test('X19 two recoveries that read one basis before acquire cannot both acquire: one commits, the other is refused whole without a prefix', async t => {
+  const f = executionFixture(t, 'plan-defect');
+  const failed = (await f.engine.executor.run('p', reference(f.plan), f.options))[0]!;
+  assert.equal(failed.value.state, 'needs_plan');
+  const driver = startParkDriver(f.directory, f.store.path, reference(failed));
+  t.after(async () => { if (driver.child.exitCode === null && driver.child.signalCode === null) driver.child.kill('SIGKILL'); await driver.exit; });
+  await parkCheckpoint(driver.checkpoint, driver);
+  assert.equal(await driver.exit, 71, driver.stderr());
+  const lease = readLegacyOperation(f.store, 'p')!;
+  assert.equal(lease.value.operation, 'repair');
+  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'preparing');
+  f.reopen();
+  const other = new Store(f.store.path); t.after(() => other.close());
+  const markerHistory = f.store.history('legacy-operation:p').length;
+  const lockHistory = f.store.history('execution-lock:p').length;
+  // The raced recovery computed its basis (operation head and absent-or-exact lock) before this commit.
+  const writeMany = f.store.writeMany.bind(f.store); let raced = false; let competing: Revision<ExecutionLock> | undefined;
+  const acquirePacks: { writes: Write[]; guards: TransactionGuard[] }[] = [];
+  f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => {
+    if (writes.some(write => write.id === 'execution-lock:p')) acquirePacks.push({ writes, guards });
+    if (!raced && writes.some(write => write.id === 'execution-lock:p')) { raced = true; competing = acquire(other, 'p'); }
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  await assert.rejects(
+    recoverLegacyOperation(f.engine, { project: 'p', operation: reference(lease), token: lease.value.token }),
+    (error: unknown) => error instanceof EngineError && ['input_stale', 'revision_conflict'].includes(error.code));
+  f.store.writeMany = writeMany;
+  assert.ok(raced, 'the recovery reached the guarded acquire');
+  // The acquire pack carried the operation head and the lock condition — a bypassed view would drop them.
+  assert.equal(acquirePacks.length, 1);
+  const operationHead = f.store.get('legacy-operation:p')!;
+  assert.ok(acquirePacks[0]!.guards.some(guard => canonical(guard) === canonical(reference(operationHead))),
+    'the acquire commit is guarded by the exact operation head observed at basis read');
+  assert.ok(acquirePacks[0]!.guards.some(guard => guard.id === 'execution-lock:p'),
+    'the acquire commit is guarded by the lock condition observed at basis read');
+  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'preparing', 'no separate prefix of the refused recovery');
+  assert.equal(f.store.history('legacy-operation:p').length, markerHistory, 'no second acquire or release record');
+  assert.equal(f.store.history('execution-lock:p').length, lockHistory + 1, 'only the competing acquire landed');
+  release(other, competing!);
+  // After the refused racer the lawful recovery completes the exact parking once.
+  const released = await recoverLegacyOperation(f.engine, { project: 'p', operation: reference(lease), token: lease.value.token });
+  assert.equal(released.value.state, 'released');
+  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'parked');
+});

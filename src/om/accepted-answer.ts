@@ -10,6 +10,7 @@ import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-m
 import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
+import { captureView } from '../storage/store-view.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
@@ -974,18 +975,14 @@ export function answerSourceGuards(store: Store, request: AnswerReadRequest): Om
   return result(() => currentAnswerSources(store, request.project, loadAnswer(store, request)));
 }
 /** Capture through the native producer while leaving its write for B1's atomic transition. */
-function captureChangedFile(store: Store, project: string, source: Revision<Source>): { record: Revision<Source>; write: Write } {
-  const writes: Write[] = [];
-  const view = new Proxy(store, { get(target, prop) {
-    if (prop === 'write') return (write: Write) => {
-      writes.push(copy(write));
-      return { id: write.id, kind: write.kind, value: write.value, revision: write.expected + 1, hash: hashJson(write.value) };
-    };
-    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
+function captureChangedFile(store: Store, project: string, source: Revision<Source>): { record: Revision<Source>; write: Write; guards: Ref[] } {
+  // The view intercepts write AND writeMany identically (Q1): a producer switch
+  // cannot bypass the capture. Guards are carried to B1; a well-formed absent
+  // guard is a typed refusal, never silently dropped (№1734-1).
+  const captured = captureView(store, { absentGuards: 'refuse' });
   let record: Revision<Source>;
   try {
-    record = new Evidence(view).file(project, source.id.slice(`source:${project}:`.length), dirname(source.value.origin.location),
+    record = new Evidence(captured.view).file(project, source.id.slice(`source:${project}:`.length), dirname(source.value.origin.location),
       basename(source.value.origin.location), source.value.mediaType, source.revision);
   } catch (error) {
     if (error instanceof SyntaxError
@@ -994,9 +991,9 @@ function captureChangedFile(store: Store, project: string, source: Revision<Sour
       fail('answer_inapplicable', source.id, 'invalidation.source', 'The changed evidence file cannot supply a valid durable source revision');
     throw error;
   }
-  check(writes.length === 1 && record.id === source.id && record.revision === source.revision + 1,
+  check(captured.writes.length === 1 && record.id === source.id && record.revision === source.revision + 1,
     'answer_unconfirmed', source.id, 'invalidation.source', 'The native source producer must capture one successor of the current source');
-  return { record, write: writes[0]! };
+  return { record, write: captured.writes[0]!, guards: captured.guards.filter(isRef) };
 }
 export function prepareAnswerInvalidation(store: Store, request: AnswerReadRequest): OmResult<Sealed<{
   invalidation: AnswerInvalidation | null; writes: Write[]; guards: Ref[]; references: Ref[];
@@ -1016,7 +1013,7 @@ export function prepareAnswerInvalidation(store: Store, request: AnswerReadReque
         check(current.value.origin.kind === 'file', 'answer_inapplicable', current.id, 'invalidation.source',
           'The source cannot establish a current replacement');
         const captured = captureChangedFile(store, request.project, current);
-        after = captured.record; writes.push(captured.write);
+        after = captured.record; writes.push(captured.write); guards.push(...captured.guards);
       }
       if (!same(before, reference(after))) {
         check(after.revision > before.revision, 'answer_unconfirmed', before.id, 'invalidation.source', 'Invalidation must identify a later source revision');

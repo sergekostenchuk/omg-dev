@@ -14,6 +14,7 @@ import type { CarriedObligation } from '../graph/obligation-policy.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Write, type Revision, type TransactionGuard } from '../storage/store.js';
+import { captureView } from '../storage/store-view.js';
 import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Question, readMc1Question,
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
@@ -196,7 +197,7 @@ function pinned(store: Store, record: Revision<unknown>): Store {
   } });
 }
 function previousRefusals(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, gaps: GapRecords, current: boolean,
-  savedJournal: Ref | null | undefined, guards: Ref[], references: Ref[], contract: QuestionPacketRecord['packetContract']) {
+  savedJournal: Ref | null | undefined, guards: TransactionGuard[], references: Ref[], contract: QuestionPacketRecord['packetContract']) {
   if (!request.attempt) fail('packet_attempt_invalid', batch.id, 'attempt', 'A model packet needs the attempt declared before assembly');
   const ref = request.attempt.series;
   const record = take(readRecord<AnyRepairSeries>(store, ref, { unit: 'E2', target: batch.id,
@@ -258,45 +259,45 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
 }
 
 /** Capture the native producer's writes. The real Store sees them only in E2's guarded transaction. */
-function nativeQuestions(store: Store, project: string, tasks: CheckedAnswerTask[], guards: Ref[]) {
-  const writes: Write[] = [], rows = new Map<string, Revision>();
-  const view = new Proxy(store, { get(target, key) {
-    if (key === 'get') return (id: string, revision?: number) => {
+function nativeQuestions(store: Store, project: string, tasks: CheckedAnswerTask[], guards: TransactionGuard[]) {
+  // Q1 + №1734-13: both write methods are intercepted by one batch helper; the
+  // additions to the caller's guard set stay LOCAL until the whole pack is
+  // accepted — a failure leaves no observed dependencies behind.
+  const localGuards: TransactionGuard[] = [];
+  const rows = new Map<string, Revision>();
+  const captured = captureView(store, {
+    rows,
+    admit: write => {
+      if (write.expected !== 0) fail('packet_record_invalid', write.id, 'native', 'Native issuance must create distinct records');
+    },
+    get: (id, revision) => {
       const pending = rows.get(id);
       if (pending && (revision === undefined || revision === pending.revision)) return pending;
-      const record = target.get(id, revision);
-      if (revision === undefined && record) guards.push(reference(record));
+      const record = store.get(id, revision);
+      if (revision === undefined && record) localGuards.push(reference(record));
       return record;
-    };
-    if (key === 'writeMany') return (pending: Write[], dependencies: Ref[] = []) => {
-      guards.push(...dependencies);
-      return pending.map(write => {
-        if (write.expected !== 0 || rows.has(write.id) || target.get(write.id))
-          fail('packet_record_invalid', write.id, 'native', 'Native issuance must create distinct records');
-        const record: Revision = { id: write.id, kind: write.kind, revision: 1, hash: hashJson(write.value), value: json(write.value) };
-        rows.set(write.id, record); writes.push(write); return record;
-      });
-    };
-    const member: unknown = Reflect.get(target, key, target);
-    return typeof member === 'function' ? member.bind(target) : member;
-  } });
+    },
+  });
   const native: QuestionPacketRecord['native'] = [];
   for (const task of tasks) {
-    const draft = new Discovery(view).create(project, 'om-g2', 'R1', task.gap.consumers[0]!,
+    const draft = new Discovery(captured.view).create(project, 'om-g2', 'R1', task.gap.consumers[0]!,
       [mc1FieldSpec({ input: task.request.input, gap: task.request.gap, contract: task.contract })],
       [task.request.input, task.request.gap, reference(task.record)]);
     const engineQuestion = reference(rows.get(draft.value.questions[0]!)!);
     const { resultForm: _resultForm, ...sources } = task.request;
-    const question = take(prepareMc1Question(view, { ...sources, contract: task.contract,
+    const question = take(prepareMc1Question(captured.view, { ...sources, contract: task.contract,
       engineQuestion, draft: reference(draft), task: reference(task.record) }));
-    writes.push(...question.writes); guards.push(...question.guards);
+    captured.writes.push(...question.writes); localGuards.push(...question.guards);
     native.push({ gap: task.request.gap, draft: reference(draft), engineQuestion, question: reference(question.record) });
   }
   // Guards on captured rows are fulfilled by these expected=0 writes; real dependencies remain protected.
-  const pendingRefs = new Set(writes.map(write => canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) })));
-  return { native, writes, guards: guards.filter(ref => !pendingRefs.has(canonical(ref))) };
+  // Every guard the producers attached during the capture rides to the final E2 (№1760-1): the
+  // helper accepted them, the connection must not drop them. Ref and absent are both kept.
+  const pendingRefs = new Set(captured.writes.map(write => canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) })));
+  return { native, writes: captured.writes,
+    guards: [...guards, ...localGuards, ...captured.guards].filter(ref => !pendingRefs.has(canonical(ref))) };
 }
-function checkNative(store: Store, project: string, tasks: CheckedAnswerTask[], native: QuestionPacketRecord['native'], current: boolean, guards: Ref[]) {
+function checkNative(store: Store, project: string, tasks: CheckedAnswerTask[], native: QuestionPacketRecord['native'], current: boolean, guards: TransactionGuard[]) {
   if (!Array.isArray(native) || native.length !== tasks.length)
     fail('packet_record_invalid', project, 'native', 'Each fact in the packet needs its complete native question');
   return native.flatMap((item, index) => {
@@ -451,7 +452,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
   if (request.batch !== null && !batch || request.batch === null && routes.record.value.batches.length)
     fail('packet_batch_invalid', request.routes.id, 'batch', 'Name an exact routed model batch; absence is valid only without routed work');
-  const references: Ref[] = [...routes.references, request.routes], guards: Ref[] = [], routeWrites: Write[] = [];
+  const references: Ref[] = [...routes.references, request.routes], guards: TransactionGuard[] = [], routeWrites: Write[] = [];
   if (current) {
     head(store, request.routes);
     const binding = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;

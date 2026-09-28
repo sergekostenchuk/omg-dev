@@ -10,6 +10,7 @@ import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readMo
   prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
+import { storeView } from '../storage/store-view.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
 import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
@@ -1465,13 +1466,14 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
     const admission = take(prepareSeriesLineAdmission(admittedStore, request.project, assignment.admission.series));
     const prepared = take(prepareQuestionPacket(admittedStore, packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet)) fail('model_call_request_invalid', request.packet.id, 'packet', 'Dispatch uses exactly the currently admitted E2 packet');
-    const guarded = new Proxy(store, { get(target, key) {
-      if (key === 'writeMany') return (writes: Write[], guards: TransactionGuard[] = []) => {
-        const all = [...guards, ...prepared.guards, ...admission.guards, request.packet, ...(environment?.guards ?? [])];
-        return target.writeMany(writes, (environment ? environment.remap(all) : all)
-          .filter(guard => !isRef(guard) || !writes.some(write => same(writeRef(write), guard))));
-      };
-      const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+    const guarded = storeView(store, { write(inputs, guards) {
+      // Q1: one interception for write and writeMany; caller guards plus the
+      // four groups are concatenated first, then environment.remap, then only
+      // Refs exactly equal to a pending writeRef drop out (№1734, C20) — the
+      // absent guards of H1.0d are kept, nothing is dropped by id alone.
+      const all = [...guards, ...prepared.guards, ...admission.guards, request.packet, ...(environment?.guards ?? [])];
+      return store.writeMany(inputs, (environment ? environment.remap(all) : all)
+        .filter(guard => !isRef(guard) || !inputs.some(write => same(writeRef(write), guard))));
     } });
     const admitted = take(recordCall(guarded, request.project, assignment.admission));
     // E1 alone precedes the durable running claim. A repeat without that claim has not sent;

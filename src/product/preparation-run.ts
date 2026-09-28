@@ -3,6 +3,7 @@ import type { DiscoveryDraft } from '../discovery/discovery.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import type { Feasibility } from '../graph/refinement.js';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
+import { storeView } from '../storage/store-view.js';
 import { reference, isRef, stageId, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { processStart } from '../runtime/process-identity.js';
 import { assertPilotBoundary } from '../discovery/reader-pilot.js';
@@ -254,10 +255,9 @@ export async function recoverLegacyOperation(engine:ProductEngine,request:{proje
   if(currentLock?.value.active)requireIdentityGone({pid:currentLock.value.pid,started:currentLock.value.processStart},'The parking executor is still alive');
   const lockGuard:TransactionGuard=currentLock?reference(currentLock):{id:lockId,absent:true};
   // The common acquire must commit against the identity observed above, even if its own read sees a later lock.
-  const guarded=new Proxy(store,{get(target,key){
-   if(key==='write')return <T>(write:Write)=>target.writeMany<T>([write],[reference(head),lockGuard])[0]!;
-   const member=Reflect.get(target,key,target);return typeof member==='function'?member.bind(target):member;
-  }});
+  // Q1: write and writeMany go through the same interception — a producer
+  // switching methods cannot bypass the lock guards (№1728, C17/C18).
+  const guarded=storeView(store,{write:(inputs,guards)=>store.writeMany(inputs,[...guards,reference(head),lockGuard])});
   const lock=acquire(guarded,project);
   try{await parkCandidate(store,engine.compiler,project,head.value.basis);}finally{release(store,lock);}
  }
