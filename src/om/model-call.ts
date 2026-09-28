@@ -1,6 +1,6 @@
 import type { AnswerGround } from './accepted-answer.js';
 import { readAcceptedFrameLayer, readLayerAcceptance, readLayerEnvelope, readUnacceptedLayer } from './layer-basis.js';
-import { readCompletionCloseAt } from './repeat-gate.js';
+import { readCompletionCloseAt, mechanismAttemptResults, prepareFinishClose } from './repeat-gate.js';
 import { isProxy } from 'node:util/types';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
@@ -207,7 +207,7 @@ function deliveryData(store: Store, project: string, environment: Environment, r
 }
 
 /** One historical proof for E2 continuations and E4 delivery/replay. Current adds freshness, never a different derivation. */
-export function readContinuationEvidence(store: Store, request: ContinuationEvidenceRequest, current = false): OmResult<Sealed<{ data: Json[]; novel: boolean; references: Ref[]; guards: Ref[] }>> {
+export function readContinuationEvidence(store: Store, request: ContinuationEvidenceRequest, current = false): OmResult<Sealed<{ data: Json[]; novel: boolean; references: Ref[]; guards: TransactionGuard[] }>> {
   requireDeliveryRequest(store, request, true); if (typeof current !== 'boolean') invalid('current');
   request = sealed(request) as ContinuationEvidenceRequest;
   const derive = () => result(() => {
@@ -220,7 +220,7 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
       fail('model_delivery_invalid', request.response.id, 'deliveries', 'Every addressed read has exactly one checked delivery');
     const envRef = response.packet.value.request.environment;
     const environment = take(readRecord<Environment>(store, envRef, { unit: 'E4', target: envRef.id, id: `environment:${request.project}`, kind: 'environment' }));
-    const references: Ref[] = [...response.references, envRef], guards: Ref[] = prepared ? [...prepared.guards] : [];
+    const references: Ref[] = [...response.references, envRef], guards: TransactionGuard[] = prepared ? [...prepared.guards] : [];
     const data = request.deliveries.map((ref, index) => {
       const record = take(readRecord<ReadDeliveryRecord>(store, ref, { unit: 'E4', target: ref.id, idPrefix: `om-read-delivery:${request.project}:`, kind: READ_DELIVERY_KIND }));
       const value = record.value;
@@ -235,7 +235,7 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
       return { delivery: ref, questionIds: value.questionIds, read: value.read, sources: value.sources, data: value.data } as unknown as Json;
     });
     return { data, novel: addsKnowledge(store, response.packet.value as QuestionPacketRecord, data),
-      references: refs(references), guards: refs(guards) };
+      references: refs(references), guards: externalGuards(guards, []) };
   });
   return current ? derive() : historicalRead(store, { reader: 'E4.continuation', project: request.project, ref: request.response,
     parameters: request as unknown as Json }, derive,
@@ -262,7 +262,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
     const envRef = response.packet.value.request.environment;
     const environment = take(readRecord<Environment>(store, envRef, { unit: 'E4', target: envRef.id, id: `environment:${request.project}`, kind: 'environment' }));
     const capture = new ResearchSources(store, request.project, environment.value.workspace);
-    const writes: Write[] = [], deliveries: Ref[] = [], guards: Ref[] = [...checked.guards, request.response];
+    const writes: Write[] = [], deliveries: Ref[] = [], guards: TransactionGuard[] = [...checked.guards, request.response];
     for (const read of checked.reads) {
       let sources: Ref[];
       try {
@@ -298,7 +298,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
       else if (!writes.some(write => write.id === id)) writes.push({ id, kind: READ_DELIVERY_KIND, expected: 0, value });
     }
     writes.push({ id: setId, kind: DELIVERY_SET_KIND, expected: 0, value: { ...request, deliveries } });
-    take(writeGuarded(store, { unit: 'E4', target: request.response.id, writes, guards: refs(guards) }));
+    take(writeGuarded(store, { unit: 'E4', target: request.response.id, writes, guards: externalGuards(guards, []) }));
     const proof = take(readContinuationEvidence(store, { ...request, deliveries }));
     return { deliveries, references: proof.references as Ref[] };
   });
@@ -386,8 +386,8 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   if (packetAdmission && (packetAdmission.writes.length || !same(packetAdmission.record, last)))
     fail('model_parts_invalid', last.id, 'works', 'Assembly requires the current saved assignment and handoff, without producing another packet', reference(last));
   return { record, proposal, references: refs([...parts.flatMap(part => part.references), ...historical.references,
-    ...packets.map(reference)]), guards: prepared ? refs([...prepared.guards.filter(ref => ref.id !== proposal.id),
-      ...(packetAdmission?.guards ?? [])]) : [] };
+    ...packets.map(reference)]), guards: prepared ? externalGuards([...prepared.guards.filter(ref => ref.id !== proposal.id),
+      ...(packetAdmission?.guards ?? [])], []) : [] };
 }
 export function readPartAssembly(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
   record: Revision<PartAssemblyRecord>; proposal: Revision<LayerProposal>; references: Ref[];
@@ -711,7 +711,7 @@ import { prepareQuestionPacket, preparePartResult, partResponseId,
   PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
 import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, prepareSeriesLineAdmission,
   readSeriesWorkAdmission, readSeriesAdmissionChange, readCurrentSeriesPointer, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
-import { prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
+import { prepareJournalBatch, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
 import { prepareAddressing, deriveInputDecisions } from './addressing.js';
 import { readOmInput, type OmInputRecord } from './input.js';
 import type { CheckedAnswerForm } from './answer-form.js';
@@ -752,6 +752,8 @@ export interface FinishModelAttemptRequest {
 }
 const EXCHANGE_KIND = 'om-model-exchange';
 const modelRecordId = (project: string, requestId: string) => `model-call:${project}:om:${hashJson(requestId)}`;
+/** H1.0d (C15, C43): G7 finds the runtime record of an E1 row of its own attempt. */
+export function modelCallRecordId(project: string, name: string): string { return modelRecordId(project, name); }
 const exchangeId = (request: ModelCallRequest) => `${EXCHANGE_KIND}:${request.project}:${hashJson(request)}`;
 const writeRef = (write: Write): Ref => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) });
 export function pendingCallStore(store: Store, writes: readonly Write[]): Store {
@@ -786,9 +788,13 @@ export function pendingCallStore(store: Store, writes: readonly Write[]): Store 
     return typeof member === 'function' ? member.bind(target) : member;
   } });
 }
-function externalGuards(guards: readonly Ref[], writes: readonly Write[]): Ref[] {
+function externalGuards(guards: readonly Ref[], writes: readonly Write[]): Ref[];
+function externalGuards(guards: readonly TransactionGuard[], writes: readonly Write[]): TransactionGuard[];
+function externalGuards(guards: readonly TransactionGuard[], writes: readonly Write[]): TransactionGuard[] {
   const pending = new Set(writes.map(write => canonical(writeRef(write))));
-  return refs(guards.filter(ref => !pending.has(canonical(ref))));
+  // H1.0d (C15): an absence the outcome relied on is carried to the final transaction, never cast away.
+  const absent = [...new Map(guards.filter(guard => !isRef(guard)).map(guard => [guard.id, guard])).values()];
+  return [...refs(guards.filter(isRef).filter(ref => !pending.has(canonical(ref)))), ...absent];
 }
 function requireModelRequest(store: Store, request: unknown): asserts request is ModelCallRequest {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.packet)
@@ -942,22 +948,38 @@ function prepareModelFinish(store: Store, request: FinishModelAttemptRequest) {
   const diagnostic = writeRef(diagnosticWrite), old = store.get(diagnostic.id);
   if (old && (old.kind !== UNIT_REFUSAL_KIND || old.revision !== 1 || !same(old.value, diagnosticWrite.value)))
     fail('model_call_record_invalid', diagnostic.id, 'diagnostic', 'The immutable diagnostic cannot be replaced');
-  if (binding && old) return { diagnostic, writes: [] as Write[], guards: [reference(old)] };
+  if (binding && old) return { diagnostic, writes: [] as Write[], guards: [reference(old)] as TransactionGuard[] };
+  const series = binding ? null : take(readAnySeriesAt(store, request.project, call.value.series));
+  if (series && 'owner' in series.value) {
+    // H1.0d (№1688-8, C43): a standalone M5 finish closes through the same G7 transition as a direct close — the
+    // addressings its other calls already applied (never this call), the classes of this diagnostic and A3 in one
+    // batch — so a later repeat, through here or G7, derives the same outcome and writes nothing.
+    const staged: Write[] = old ? [] : [diagnosticWrite];
+    const own = take(mechanismAttemptResults(pendingCallStore(store, staged), { project: request.project,
+      owner: series.value.owner, series: call.value.series, attempt: call.value.attempt, goal: call.value.goal, except: request.call }));
+    const rows = take(prepareJournalBatch(store, { project: request.project, sources: old ? [] : [diagnostic], pending: staged, classifications: [] })).value.rows;
+    const claims = rows.filter(row => same(row.source, diagnostic)).map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+    const close = take(prepareFinishClose(store, { ...seriesRequestOf(series.value), attempt: call.value.attempt,
+      outcome: { reason: own.results.achieved.length ? 'result' : request.reason, accepting: [...own.accepting], cancelling: [], refusals: claims } },
+      old ? null : diagnosticWrite));
+    const writes = [...close.writes] as Write[];
+    return { diagnostic, writes, guards: externalGuards([...close.guards, ...(old ? [reference(old)] : [])], writes) };
+  }
   const writes: Write[] = old ? [] : [diagnosticWrite];
   const journal = take(prepareRecordRefusal(pendingCallStore(store, writes), { project: request.project, source: diagnostic }));
   writes.push(...journal.writes);
   const claims = journal.value.rows.filter(row => same(row.source, diagnostic)).map(row => ({ row: row.id, name: row.code, goal: row.goal }));
-  if (binding) return { diagnostic, writes, guards: externalGuards([...journal.guards, ...(old ? [reference(old)] : [])], writes) };
-  const series = take(readAnySeriesAt(store, request.project, call.value.series));
+  if (binding || !series) return { diagnostic, writes, guards: externalGuards([...journal.guards, ...(old ? [reference(old)] : [])] as TransactionGuard[], writes) };
   const completion = take(prepareCompleteAttempt(pendingCallStore(store, writes), { ...seriesRequestOf(series.value),
     attempt: call.value.attempt, outcome: { reason: request.reason, achieved: [], cancelled: [], refusals: claims } }));
   writes.push(...completion.writes);
   return { diagnostic, writes, guards: externalGuards([...journal.guards, ...completion.guards,
-    ...(old ? [reference(old)] : [])], writes) };
+    ...(old ? [reference(old)] : [])] as TransactionGuard[], writes) };
 }
 /** Shared prepared completion; neighbours can atomically persist their result and the single A3 outcome. */
-export function prepareModelAttemptFinish(store: Store, request: FinishModelAttemptRequest): OmResult<Sealed<{ diagnostic: Ref; writes: Write[]; guards: Ref[] }>> {
+export function prepareModelAttemptFinish(store: Store, request: FinishModelAttemptRequest): OmResult<Sealed<{ diagnostic: Ref; writes: Write[]; guards: TransactionGuard[] }>> {
   requireFinish(store, request); request = sealed(request) as FinishModelAttemptRequest;
+  // H1.0d (№1715, C15): the guards include the absences the outcome relied on; the caller carries them to its write.
   return result(() => prepareModelFinish(store, request));
 }
 /** Records one addressed failure/control outcome through the common journal and A3 transition. */
@@ -1280,7 +1302,7 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
   const exchangeRef = reference(exchange), wire = exchange.value.wire;
   const exchangeWrite: Write = { id: exchange.id, kind: exchange.kind, expected: 0, value: exchange.value };
   const owner = receiptRecord.value.om.completionOwner;
-  const writes: Write[] = [], guards: Ref[] = refs([reference(receiptRecord),
+  const writes: Write[] = [], guards: TransactionGuard[] = refs([reference(receiptRecord),
     ...(owner ? [] : [call, ...exchange.value.admissionGuards]), request.packet]);
   let environment: { store: Store; guards: Ref[]; remap: (guards: readonly TransactionGuard[]) => TransactionGuard[] } | null = null;
   try {
@@ -1321,7 +1343,7 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
     }
     let response: Ref | null = null, outcome: CheckedAnswerForm | null = null,
       part: ModelCallOutcome['part'] = null, input: Ref | null = null;
-    let checked: OmResult<Sealed<CheckedAnswerForm & { guards: Ref[] }>> | null = null;
+    let checked: OmResult<Sealed<CheckedAnswerForm & { guards: TransactionGuard[] }>> | null = null;
     if (transport.kind === 'answered') {
       const responseWrite: Write = { id: partResponseId(request.project, call), kind: PART_RESPONSE_KIND, expected: 0,
         value: { project: request.project, packet: request.packet, call, requestId: wire.requestId, raw: transport.raw } satisfies PartResponseRecord };
@@ -1375,7 +1397,8 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
         [terminal, ...(diagnostic ? [diagnostic] : [])]));
       writes.push(...work.writes as Write[]); guards.push(...work.guards.filter(isRef));
     }
-    const applicationGuards = externalGuards((environment ? environment.remap([...guards, ...environment.guards]) : guards).filter(isRef), writes);
+    // H1.0d (C15): absences the finish relied on reach this transaction; only exact references are remapped.
+    const applicationGuards = externalGuards(environment ? environment.remap([...guards, ...environment.guards]) : guards, writes);
     const committed = writeGuarded<OmModelCall>(store, { unit: 'E4', target: id, writes, guards: applicationGuards });
     const record = take(committed).find(record => record.id === id)!;
     return delivered({ record, packet: request.packet, call, response, outcome, part, diagnostic, repeated: false }) as OmResult<Sealed<ModelCallOutcome>>;
@@ -1390,7 +1413,7 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
     // A second race may leave received intact. No settlement or product result is invented;
     // another invocation resumes this same transition from its immutable exchange.
     return saveRejectedModelApplication(store, { request, call, running: receiptRecord, exchange: exchangeWrite,
-      transport, writes, guards: externalGuards(guards, writes), failure: error.refusal });
+      transport, writes, guards: externalGuards(guards.filter(isRef), writes), failure: error.refusal });
   }
 }
 /** Accounting belongs to the mutating operation, never to a historical reader. */
@@ -1468,8 +1491,10 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
         ...(completion.owner ? { completionOwner: { ...completion.owner, call } } : {}), application: 'running', request, call, exchange: null, part: null, diagnostic: null, input: null, failure: null, rejection: null,
         admission: { contract: 'om-model-admission/v1', series: assignment.admission.series, pointer: claimAdmission.pointer } } };
     const physical = await startPhysicalTransport(store, { project: request.project, call, packet: payload as Json, role: request.role },
-      { id, kind: 'model-call', expected: 0, value: running }, [...claimPacket.guards, ...claimAdmission.guards, request.packet], signal,
-      claimEnvironment ? claimEnvironment.remap([...completion.guards, ...claimEnvironment.guards]) : completion.guards as TransactionGuard[],
+      // H1.0d (№1715): the saved admission keeps exact references; an absence the packet relied on travels as a condition.
+      { id, kind: 'model-call', expected: 0, value: running }, [...claimPacket.guards.filter(isRef), ...claimAdmission.guards, request.packet], signal,
+      [...claimPacket.guards.filter(guard => !isRef(guard)),
+        ...(claimEnvironment ? claimEnvironment.remap([...completion.guards, ...claimEnvironment.guards]) : completion.guards as TransactionGuard[])],
       completion.writes as Write[]);
     const runningRecord = physical.record as Revision<OmModelCall>;
     const exchange: ModelExchange = { project: request.project, request, call, wire: wire as AdapterRequest,
@@ -1954,7 +1979,7 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
     const prepared = prepareModelCallRecovery(store, project, ref);
     const original = prepared.call, incident = reference(prepared.incident);
     let finished = prepared.writes[0]!.value as ModelCall;
-    const writes = [...prepared.writes.slice(1)], guards = [...prepared.guards];
+    const writes = [...prepared.writes.slice(1)], guards: TransactionGuard[] = [...prepared.guards];
     if ('om' in original.value) {
       const state = take(readModelCallState(store, { project, record: ref }));
       if (state.state !== 'running') fail('model_call_not_running', ref.id, 'application', 'Only an unreceived physical call needs loss recovery');
@@ -2600,7 +2625,7 @@ export function prepareCompletionCall(store: Store, project: string, request: An
     if (!binding) return { owner: null, writes: [], guards: [] };
     if (!same(request.goal, binding.value.goal)) fail('completion_foreign', binding.id, 'goal', 'The call retains the original whole goal');
     let assignment: Revision<CompletionAssignment>, packetBasis: Ref, products: Ref[];
-    const sourceWrites: Write[] = [], sourceGuards: Ref[] = [];
+    const sourceWrites: Write[] = [], sourceGuards: TransactionGuard[] = [];
     if (request.purpose === 'fact-assessment') {
       if (request.basis?.kind !== 'fact-assessment' || !request.basis.assessment)
         fail('completion_foreign', binding.id, 'assessment', 'An assessor inherits ownership through its exact E5 intent');

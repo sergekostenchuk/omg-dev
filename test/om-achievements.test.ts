@@ -76,9 +76,10 @@ const request = (over: Partial<ConfirmRequest> = {}): ConfirmRequest =>
 const written = (store: Store, kind: string, value: Record<string, unknown> = { accepted: true, keys: ["line:cart:price"] }): Ref =>
   reference(store.write({ id: `${kind}:${PROJECT}:${next()}`, kind, expected: 0, value: value as Json }));
 
-test("the D2, D5 and C5 acceptance providers and empty cancellation table are frozen and closed to callers", () => {
+test("the D2, D5, C5 and M5 acceptance providers and empty cancellation table are frozen and closed to callers", () => {
   for (const table of [ACCEPTANCE_PROVIDERS, CANCELLATION_PROVIDERS]) {
-    const expected = table === ACCEPTANCE_PROVIDERS ? ["gap-line", "accepted-answer", "connection-frame"] : [];
+    // H1.0d adds the applied E4 (model-call) provider of M5 addressing; it confirms for a mechanism owner only.
+    const expected = table === ACCEPTANCE_PROVIDERS ? ["gap-line", "accepted-answer", "connection-frame", "model-call"] : [];
     assert.deepEqual(Object.keys(table), expected);
     assert.ok(Object.isFrozen(table));
     for (const provider of Object.values(table)) assert.ok(Object.isFrozen(provider));
@@ -96,6 +97,10 @@ test("the D2, D5 and C5 acceptance providers and empty cancellation table are fr
   }
   const provider = ACCEPTANCE_PROVIDERS["gap-line"]!;
   assert.equal(provider.namespace(PROJECT), gapLinesNamespace(PROJECT));
+  const m5 = ACCEPTANCE_PROVIDERS["model-call"]!;
+  assert.equal(m5.namespace(PROJECT), `model-call:${PROJECT}:om:`);
+  assert.equal(m5.confirm, undefined); assert.equal(typeof m5.confirmMechanism, "function");
+  assert.equal(provider.confirmMechanism, undefined);
   assert.throws(() => { (provider as unknown as Record<string, unknown>)["confirm"] = () => ({ keys: ["forged"] }); }, TypeError);
   assert.ok(Object.isFrozen(ACCEPTANCE_CODES));
   assert.throws(() => { (ACCEPTANCE_CODES as unknown as string[]).push("invented"); }, TypeError);
@@ -502,7 +507,7 @@ test("C5.1b malformed new context fails before storage while missing saved bindi
     for (const attempt of malformed) assert.throws(() => confirmResults(f.store, { ...accepted.confirmation, attempt } as ConfirmRequest), code("acceptance_request_invalid"));
     const provider = ACCEPTANCE_PROVIDERS["connection-frame"]!;
     for (const goal of [{ ...f.goal, questions: sparse }, { ...f.goal, extra: "not-a-goal-field" }])
-      assert.throws(() => provider.confirm(accepted.saved.frame as unknown as Revision<Json>,
+      assert.throws(() => provider.confirm!(accepted.saved.frame as unknown as Revision<Json>,
         { project: f.project, block: f.block, goal, attempt: accepted.confirmation.attempt! }, f.store), code("acceptance_request_invalid"));
     assert.equal(reads, 0);
   } finally { f.store.get = original; }

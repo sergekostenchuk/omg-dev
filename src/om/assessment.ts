@@ -10,7 +10,7 @@ import { historicalRead, withHistoricalReads } from './input.js';
 import type { Source } from '../evidence/evidence.js';
 import { checkAnswerForm } from './answer-form.js';
 import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5AcceptedAnswer,
-  readAcceptedAnswer, readAnswerSearch, acceptedAnswerNamespace, acceptedAnswerRepresents, answerIndexId,
+  readAcceptedAnswer, readAnswerSearch, acceptedAnswerNamespace, answerIndexId,
   ANSWER_INDEX_KIND,
   type AnswerGround, type AnswerQuestionContract, type Mc1QuestionRequest } from './accepted-answer.js';
 import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recordCall,
@@ -25,6 +25,7 @@ import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, r
   type SeriesAdmissionChange, seriesCurrentId,
   seriesId, readCompletionBinding, completionWorkId, prepareCompletionAdmission, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt } from './repeat-gate.js';
+import { acceptanceRepresents } from './achievements.js';
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
 export const ASSESSMENT_RESULT_KIND = 'om-assessment-result';
@@ -1138,8 +1139,9 @@ export function finishAssessmentAttempt(store: Store, project: string, intent: R
         ref, answer: take(readAcceptedAnswer(store, { project, record: ref })),
       }));
       const compatible = localSupported.every(({ answer }) => saved.achieved.some(item => {
-        if (item.key !== answer.key || !item.basis.id.startsWith(acceptedAnswerNamespace(project))) return false;
-        return answer.attempt !== null && acceptedAnswerRepresents(store,
+        // №1688-13: the representative is proved by its own provider (D2 or D5), not by the local D5 namespace.
+        if (item.key !== answer.key) return false;
+        return answer.attempt !== null && acceptanceRepresents(store,
           { project, block: set.block, goal: set.goal,
             attempt: { series: reference(current), ordinal: set.attempt }, accepting: [item.basis] },
           item.basis, answer.key);

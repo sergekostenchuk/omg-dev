@@ -30,7 +30,7 @@ import { observeCandidate } from "./frame-candidate.js";
 import { assessmentAttemptReason, checkCurrentAssessmentAttemptClosure, isAssessmentCallName,
   readAssessmentRefusalAt } from "./assessment.js";
 import { acceptedAnswerNamespace } from "./accepted-answer.js";
-import { callLedgerId, readCallLedger, type CallLedger } from "./call-record.js";
+import { callLedgerId, readCall, readCallLedger, type CallLedger } from "./call-record.js";
 
 /**
  * The gate of repetition. It stands on EVERY return path — the refusal of the layer check (G3), of atomicity (G5), of
@@ -651,6 +651,20 @@ function prepareClose(store: Store, request: AnyCloseAttemptRequest): OmResult<R
   const address = requireCloseRequest(store, request);
   return withHistoricalReads(() => prepareManagedGateClose(store, request) ?? prepareCloseInScope(store, request, address));
 }
+/**
+ * H1.0d (№1688-8, C43): the standalone finish of an E4 call of a mechanism attempt closes through this same G7
+ * transition — the accepted M5 results it derives, the classes of its refusals and the A3 outcome — with the call's
+ * diagnostic still pending (`null` once it is saved). An exact repeat therefore writes nothing, however it is entered.
+ */
+export function prepareFinishClose(store: Store, request: AnyCloseAttemptRequest, pending: JournalWrite | null): OmResult<Sealed<RepeatTransition>> {
+  const address = requireCloseRequest(store, request);
+  requireCondition(address.owner.kind === "mechanism" && (pending === null || isPlainObject(pending) && isText(pending.id)),
+    "repeat_request_invalid", "Only the finish of a mechanism attempt closes through G7 with its pending diagnostic");
+  return withHistoricalReads(() => {
+    const prepared = prepareCloseInScope(store, request, address, pending);
+    return prepared.ok ? delivered(prepared.value) : prepared;
+  });
+}
 function requireCloseRequest(store: Store, request: AnyCloseAttemptRequest): Address {
   requireStore(store);
   requireCondition(isPlainObject(request), "repeat_request_invalid", "A cycle is closed at this gate through a request object");
@@ -674,7 +688,13 @@ function requireCloseRequest(store: Store, request: AnyCloseAttemptRequest): Add
   }
   return requireAddress(request);
 }
-function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, address: Address): OmResult<RepeatTransition> {
+function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, address: Address,
+  pending: JournalWrite | null = null): OmResult<RepeatTransition> {
+  // H1.0d (№1688-8): a finishing E4 call hands its not yet written diagnostic here; its row and its class are then
+  // written by ONE batch of the journal together with the close, so the finish and a later direct repeat of G7
+  // derive and hold the same classes. Reads see the pending source; only the final batch writes it.
+  const source = pending ? { id: pending.id, revision: pending.expected + 1, hash: hashJson(pending.value) } : null;
+  const view = pending ? pendingCallStore(store, [pending as Write]) : store;
   const { reason, accepting, cancelling, refusals: claimed } = request.outcome;
   const at = requestOf(address);
   const assessmentGuards: TransactionGuard[] = [];
@@ -685,17 +705,15 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
   // What the cycle achieved and cancelled, as the providers of acceptance confirm it, never as the caller says it.
   let results: ConfirmedResults = { achieved: [], cancelled: [] };
   if (accepting.length + cancelling.length > 0) {
-    if (address.owner.kind === "mechanism") return refused(accepting.length ? "acceptance_unconfirmed" : "cancellation_unconfirmed",
-      "No acceptance provider confirms a mechanism addressing result yet",
-      { unit: UNIT, target: address.id, field: accepting.length ? "outcome.accepting" : "outcome.cancelling" }, "producer");
     const standing = readAnySeries(store, at);
     if (!standing.ok) return standing;
     const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts].find(item => item.ordinal === request.attempt);
-    const confirmed = confirmResults(store, {
-      project: address.project, block: address.owner.block, target: address.id,
+    // H1.0d: a mechanism is confirmed under its typed owner (the M5 provider), a block under its block.
+    const common = { project: address.project, target: address.id,
       attempt: { series: reference(standing.value), ordinal: request.attempt },
-      goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling, refusals: claimed,
-    });
+      goal: attempt === undefined ? null : attempt.goal as AttemptGoal, accepting, cancelling, refusals: claimed };
+    const confirmed = confirmResults(store, address.owner.kind === "mechanism" ? { ...common, owner: address.owner }
+      : { ...common, block: address.owner.block });
     if (!confirmed.ok) return confirmed;
     results = confirmed.value as ConfirmedResults;
   }
@@ -711,12 +729,20 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
   let independentRefusal = false;
   if (results.guards) assessmentGuards.push(...results.guards);
   const rows = new Map<string, JournalRow>();
-  if (wanted.length > 0) {
-    const journal = readJournal(store, { project: address.project });
-    if (!journal.ok) return unlinked(address, journal.refusal.code, "outcome.refusals");
-    // The head the classes were derived from guards the transaction as well: no window between reading and writing.
-    guards.push(reference(journal.value));
-    for (const row of journal.value.value.rows) rows.set(row.id, row as JournalRow);
+  let preview: Sealed<{ writes: readonly JournalWrite[]; guards: readonly TransactionGuard[] }> | null = null;
+  if (wanted.length > 0 || source) {
+    if (source) {
+      const staged = prepareJournalBatch(store, { project: address.project, sources: [source], pending: [pending!], classifications: [] });
+      if (!staged.ok) return unlinked(address, staged.refusal.code, "outcome.refusals");
+      preview = staged.value;
+      for (const row of staged.value.value.rows) rows.set(row.id, row as JournalRow);
+    } else {
+      const journal = readJournal(store, { project: address.project });
+      if (!journal.ok) return unlinked(address, journal.refusal.code, "outcome.refusals");
+      // The head the classes were derived from guards the transaction as well: no window between reading and writing.
+      guards.push(reference(journal.value));
+      for (const row of journal.value.value.rows) rows.set(row.id, row as JournalRow);
+    }
     for (const named of wanted) {
       const index = placed.get(named)!;
       const row = rows.get(named);
@@ -724,7 +750,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
         return refused("refusal_unknown", "No refusal stands in the journal of this project under that row",
           { unit: UNIT, target: address.id, field: `outcome.refusals.${index}.row` }, "producer");
       }
-      const derived = derive(store, row, address, request.attempt, `outcome.refusals.${index}.origin`);
+      const derived = derive(view, row, address, request.attempt, `outcome.refusals.${index}.origin`);
       if ("ok" in derived) return derived;
       routed.push({ row: row.id, class: derived.class, addressee: derived.addressee, toModel: TO_MODEL[derived.class], basis: derived.basis });
       classifications.push({ row: row.id, class: derived.class, addressee: derived.addressee, basis: derived.basis });
@@ -740,7 +766,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
     ...('terminal' in request && request.terminal !== undefined ? { terminal: request.terminal } : {}),
     outcome: { reason, achieved: results.achieved, cancelled: results.cancelled, refusals: claimed },
   };
-  const series = prepareCompleteAttempt(store, completion);
+  const series = prepareCompleteAttempt(preview ? pendingCallStore(store, preview.writes as Write[]) : store, completion);
   if (!series.ok) return series;
   if (address.owner.kind === "block" && series.value.writes.length > 0) {
     // The first E1 head was captured before the checks above; its guard closes the admission race even when the
@@ -786,11 +812,38 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
       assessmentGuards.push(...closure.value.guards);
     }
   }
+  if (address.owner.kind === "mechanism" && series.value.writes.length > 0) {
+    // H1.0d (C15): a new close of a mechanism attempt names every accepted M5 result G7 derives for it from its own
+    // E1 rows; an empty claim does not skip that check. A completed repeat never consults today's ledger.
+    const standing = readAnySeries(store, at);
+    if (!standing.ok) return standing;
+    const attempt = [...standing.value.value.inherited, ...standing.value.value.attempts].find(item => item.ordinal === request.attempt);
+    if (!attempt) return refused("input_stale", "The mechanism attempt changed before its new G7 close",
+      { unit: UNIT, target: address.id, field: "attempt", ref: reference(standing.value) }, "producer");
+    const own = mechanismAttemptResults(store, { project: address.project, owner: address.owner,
+      series: reference(standing.value), attempt: request.attempt, goal: attempt.goal as AttemptGoal, except: null });
+    if (!own.ok) return own;
+    const missing = own.value.accepting.find(ref => !accepting.some(item => sameRef(item, ref)));
+    if (missing) return refused("origin_unreadable", "The close must name every accepted M5 addressing result of this attempt",
+      { unit: UNIT, target: address.id, field: "outcome.accepting", ref: missing }, "producer");
+    if (results.achieved.length + results.cancelled.length > 0 && reason !== "result")
+      return refused("origin_unreadable", "An attempt with confirmed results closes with the result reason",
+        { unit: UNIT, target: address.id, field: "outcome.reason" }, "producer");
+    assessmentGuards.push(...own.value.guards);
+  }
   const writes: GateWrite[] = [...series.value.writes];
-  guards.push(...series.value.guards);
+  // Guards read through the pending view name revisions this very batch writes; the batch guards their real heads.
+  const staged = new Set(preview?.writes.map(write => write.id) ?? []);
+  guards.push(...series.value.guards.filter(guard => !staged.has(guard.id)));
 
   let decided: readonly RefusalClassification[] = [];
-  if (classifications.length > 0) {
+  if (source) {
+    const journal = prepareJournalBatch(store, { project: address.project, sources: [source], pending: [pending!], classifications });
+    if (!journal.ok) return journal;
+    writes.push(...journal.value.writes as GateWrite[]);
+    assessmentGuards.push(...journal.value.guards);
+    decided = journal.value.value.classifications as readonly RefusalClassification[];
+  } else if (classifications.length > 0) {
     const journal = prepareClassifyRefusal(store, { project: address.project, classifications });
     if (!journal.ok) return journal;
     writes.push(...journal.value.writes);
@@ -893,6 +946,24 @@ const derive = (store: Store, row: JournalRow, address: Address, ordinal: number
   if (answersRowMarks(address.project, row).any) return refused("origin_unreadable",
     "A G4b observation belongs to the registered check of a managed attempt, never to a refusal of this cycle",
     { unit: UNIT, target: address.id, field: `${path}.completion`, ref: row.source }, "producer");
+  // H1.0d (№1688-8, C43): the own diagnostic of an E4 call of a mechanism attempt is classified from its exact E1 and
+  // producer stage, as the managed branch does — the class its finish derives, never unknown on a repeat of that outcome.
+  if (address.owner.kind === "mechanism" && (row.gate === "E4" || row.source.id.startsWith(`${unitRefusalNamespace(address.project)}e4:`))) {
+    const bad = (field: string, message: string): OmResult<never> => refused("origin_unreadable", message,
+      { unit: UNIT, target: address.id, field: `${path}.${field}`, ref: row.source }, "producer");
+    const source = store.get(row.source.id, row.source.revision);
+    const reason = /^model-call:(refused|off-form|interrupted|awaiting-owner)$/.exec(row.origin.stage)?.[1];
+    const call = row.origin.sources.find(item => item.role === "call");
+    if (row.gate !== "E4" || !row.source.id.startsWith(`${unitRefusalNamespace(address.project)}e4:`) || !source
+      || source.kind !== UNIT_REFUSAL_KIND || !sameRef(reference(source), row.source) || !reason || !call)
+      return bad("source", "An E4 diagnostic needs its exact source, producer stage and admitted call");
+    const admitted = readCall(store, address.project, call.ref);
+    if (!admitted.ok || admitted.value.value.series.id !== address.id || admitted.value.value.attempt !== ordinal
+      || admitted.value.value.call !== row.origin.subject)
+      return bad("call", "An E4 diagnostic belongs to a call admitted for this exact attempt");
+    return reason === "refused" ? { class: "proposal", addressee: `node:${row.goal}`, basis: row.origin.sources }
+      : { class: "conditions", addressee: `owner:${address.id}`, basis: row.origin.sources };
+  }
   const e5 = row.gate === "E5" || row.origin.stage === "fact-assessment"
     || row.source.id.startsWith(`om-unit-refusal:${address.project}:e5:`)
     || row.origin.sources.some(source => source.role === "assessment");
@@ -1647,8 +1718,9 @@ import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_
   readCompletionBinding, prepareManagedCompleteAttempt,
   type CompletionWork, type ManagedClosure, type ClaimedOutcome } from './series.js';
 import { readCompletionEffectiveAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
-  completionClosedWork, prepareCompletionProducts, type CompletionSnapshot } from './model-call.js';
-import { prepareJournalBatch } from './refusal-journal.js';
+  completionClosedWork, prepareCompletionProducts, readModelCallState, modelCallRecordId, type CompletionSnapshot } from './model-call.js';
+import type { MechanismOwner } from './series.js';
+import { prepareJournalBatch, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalWrite } from './refusal-journal.js';
 import type { Write } from '../storage/store.js';
 import { answersProduct, readAnswersGateRefusalAt } from './answers-gate.js';
 /**
@@ -1692,6 +1764,65 @@ function refuseAnswersClaim(store: Store, project: string, row: JournalRow, targ
   managedFail(target, 'refusals', 'A G4b observation is never a counted refusal: its own producer grounds or its wait stand instead',
     'completion_refusal_uncounted', row.source);
 }
+/** An applied E4 whose own D3 applied field decisions: the only record that can accept an M5 addressing result. */
+function appliedAddressing(store: Store, project: string, ref: Ref): OmResult<boolean> {
+  const state = readModelCallState(store, { project, record: ref });
+  if (!state.ok) return state;
+  const read = state.value;
+  return { ok: true, value: read.state === 'applied' && read.outcome.outcome?.kind === 'input-decisions' && read.outcome.diagnostic === null };
+}
+/**
+ * H1.0d (№1688-4, -8; C15, C43): the accepted M5 addressings of one standalone attempt, derived by G7 from the E1 rows
+ * of that attempt — never from the claim. The ledger head is read before the rows are enumerated and every E4 head is
+ * guarded, so a result applied or changed before the write fails the transaction; a call dispatched and settled in that
+ * window moves the guarded ledger. A closed attempt is read from its saved outcome instead: today's ledger is never a
+ * condition of a completed repeat. The finishing call itself is `except`: it is never its own ground.
+ */
+export function mechanismAttemptResults(store: Store, request: { project: string; owner: MechanismOwner; series: Ref; attempt: number;
+  goal: AttemptGoal; except: Ref | null }): OmResult<Sealed<{ accepting: Ref[]; results: ConfirmedResults; guards: TransactionGuard[]; unstarted: Ref[] }>> {
+  requireStore(store);
+  requireCondition(isPlainObject(request) && isText(request.project) && isPlainObject(request.owner) && isRef(request.series)
+    && Number.isSafeInteger(request.attempt) && request.attempt > 0 && isPlainObject(request.goal)
+    && (request.except === null || isRef(request.except)),
+  "repeat_request_invalid", "The accepted results of a mechanism attempt are derived for its exact series, attempt and goal");
+  return withHistoricalReads(() => {
+    const target = request.series.id, accepting: Ref[] = [], guards: TransactionGuard[] = [], unstarted: Ref[] = [];
+    const head = store.get<AnyRepairSeries>(target);
+    const saved = head ? [...head.value.inherited, ...head.value.attempts].find(item => item.ordinal === request.attempt) : undefined;
+    if (saved?.outcome) {
+      for (const item of saved.outcome.achieved) if (!accepting.some(ref => sameRef(ref, item.basis))) accepting.push(item.basis);
+    } else {
+      // An absent ledger or E4 is a ground too (C15): a first E1, or an E4 created and applied with unknown usage
+      // (which settles nothing in the ledger), must fail a close that was derived without it.
+      const ledger = store.get<CallLedger>(callLedgerId(request.project));
+      guards.push(ledger ? reference(ledger) : { id: callLedgerId(request.project), absent: true });
+      for (const row of ledger?.value.calls ?? []) {
+        if (row.series.id !== target || row.attempt !== request.attempt || row.purpose !== 'model-design'
+          || request.except !== null && sameRef(row.call, request.except)) continue;
+        const id = modelCallRecordId(request.project, row.name), e4 = store.get(id);
+        if (!e4) { guards.push({ id, absent: true }); unstarted.push(row.call); continue; }
+        guards.push(reference(e4));
+        const applied = appliedAddressing(store, request.project, reference(e4));
+        if (!applied.ok) return refused('origin_unreadable', applied.refusal.message,
+          { unit: UNIT, target, field: 'ledger', ref: reference(e4) }, 'producer');
+        if (!applied.value) continue;
+        // An applied E4 that its provider does not confirm (a decision outside its subset) accepted nothing.
+        const own = confirmResults(store, { project: request.project, owner: request.owner, target, goal: request.goal,
+          attempt: { series: request.series, ordinal: request.attempt }, accepting: [reference(e4)], cancelling: [] });
+        if (own.ok) accepting.push(reference(e4));
+      }
+    }
+    let results: ConfirmedResults = { achieved: [], cancelled: [] };
+    if (accepting.length) {
+      const confirmed = confirmResults(store, { project: request.project, owner: request.owner, target, goal: request.goal,
+        attempt: { series: request.series, ordinal: request.attempt }, accepting, cancelling: [] });
+      if (!confirmed.ok) return confirmed;
+      results = confirmed.value as ConfirmedResults;
+      guards.push(...(results.guards ?? []));
+    }
+    return delivered({ accepting, results, guards: uniqueTransactionGuards(guards), unstarted });
+  });
+}
 const CLOSURE_SHAPE = 'additions,binding,journal,work';
 /** Exact registry context for the D5 supplier. It is evidence to rederive, never a completeness flag. */
 export function checkManagedCompletionClaims(store: Store, project: string, context: ManagedClosure,
@@ -1714,6 +1845,24 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
     const ordered = (values: readonly Ref[]) => [...values].sort((a,b) => canonical(a).localeCompare(canonical(b)));
     if (canonical(ordered(accepting.filter(e5))) !== canonical(ordered(snapshot.accepting)))
       managedFail(context.work.id, 'accepting', 'The close must retain every exact supported E5 basis');
+    const binding = snapshot.binding.value;
+    if (binding.owner.kind === 'mechanism') {
+      // H1.0d (№1688-3, C13, C14, C46): every applied M5 addressing of the effective registry — each runtime id at its
+      // latest revision — is required before reduction by key; an empty claim does not skip it, and a call outside
+      // the registry cannot hide behind an equal key.
+      const e4 = (ref: Ref) => ref.id.startsWith(`model-call:${project}:om:`);
+      const latest = new Map<string, Ref>();
+      for (const ref of snapshot.products) if (e4(ref) && (latest.get(ref.id)?.revision ?? 0) < ref.revision) latest.set(ref.id, ref);
+      const required: Ref[] = [];
+      for (const ref of latest.values()) {
+        if (!managedTake(appliedAddressing(store, project, ref))) continue;
+        const own = confirmResults(store, { project, owner: binding.owner, target: binding.series.id, goal: binding.goal,
+          attempt: { series: binding.series, ordinal: binding.attempt }, accepting: [ref], cancelling: [], managedClosure: context });
+        if (own.ok) required.push(ref);
+      }
+      if (canonical(ordered(accepting.filter(e4))) !== canonical(ordered(required)))
+        managedFail(context.work.id, 'accepting', 'The close must retain every applied M5 addressing of its registry, at its effective revision');
+    }
     const required = new Set(snapshot.refusals.map(row => row.row));
     // Rows beyond the required set are looked up in the final journal the closure presents.
     const extra = refusals.filter(item => !required.has(item.row));
@@ -1789,15 +1938,12 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
     classifications.push(classified);
     routed.push({ ...classified, toModel: TO_MODEL[classified.class as RefusalClass] } as RoutedRefusal);
   }
-  let confirmed: ConfirmedResults = { achieved: [], cancelled: [] };
-  if (owner.owner.kind === 'block') confirmed = managedTake(confirmResults(store, {
-    project: input.project, target: owner.series.id, block: owner.owner.block, goal: owner.goal,
+  // H1.0d: the provider sees the ORIGINAL open series of the binding, so no provider reads through this close.
+  const common = { project: input.project, target: owner.series.id, goal: owner.goal,
     attempt: { series: owner.series, ordinal: owner.attempt }, accepting: input.claim.accepting,
-    cancelling: input.claim.cancelling, refusals: input.claim.refusals,
-    managedClosure: closure,
-  }));
-  else if (input.claim.accepting.length || input.claim.cancelling.length)
-    managedFail(owner.series.id, 'accepting', 'No mechanism acceptance provider is registered yet', 'acceptance_unconfirmed');
+    cancelling: input.claim.cancelling, refusals: input.claim.refusals, managedClosure: closure };
+  const confirmed: ConfirmedResults = managedTake(confirmResults(store, owner.owner.kind === 'block'
+    ? { ...common, block: owner.owner.block } : { ...common, owner: owner.owner }));
   const reason: CompletionReason | null = confirmed.achieved.length || confirmed.cancelled.length ? 'result'
     : subject ? 'refused' : snapshot.technical.some(row => row.reason === 'interrupted') ? 'interrupted'
     : snapshot.technical.some(row => row.reason === 'off-form') ? 'off-form' : snapshot.waiting.length ? 'awaiting-owner' : null;

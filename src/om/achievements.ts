@@ -1,14 +1,18 @@
-import { canonical, type Json } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
-import { readSeriesAt, type Achievement, type AttemptGoal, type ClaimedRefusal, type ManagedClosure, type RepairSeries } from "./series.js";
+import { readAnySeriesAt, readCompletionOwnerAt, readMechanismAdmission, readSeriesAt, type Achievement, type AnyRepairSeries,
+  type AttemptGoal, type ClaimedRefusal, type ManagedClosure, type MechanismOwner, type MechanismRepairSeries, type RepairSeries } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
 import { FRAME_ACCEPTANCE_CONTRACT, readAcceptedFrameLayer } from "./layer-basis.js";
 import { readResultIdentity } from "./result-identity.js";
-import { withHistoricalReads } from "./input.js";
+import { readOmInput, withHistoricalReads, type OmInputRecord } from "./input.js";
+import { readModelCallState, type OmModelCall } from "./model-call.js";
+import { readCall, type MechanismCallRecord } from "./call-record.js";
+import { INPUT_DECISION_KIND, type InputDecisionProposal } from "./addressing.js";
 
 /**
  * The contract of the PROVIDERS OF ACCEPTANCE: who may say that a result was accepted, and what its lasting key is.
@@ -49,6 +53,20 @@ export interface AcceptanceContext {
   readonly managedClosure?: ManagedClosure;
 }
 
+/**
+ * What a provider is told about a cycle of a MECHANISM series (H1.0d). A mechanism has no block, and none is invented
+ * for it; its exact attempt is always named, because the M5 provider binds a result to one series, ordinal and goal.
+ */
+export interface MechanismAcceptanceContext {
+  readonly project: string;
+  readonly owner: MechanismOwner;
+  readonly goal: AttemptGoal;
+  readonly attempt: { readonly series: Ref; readonly ordinal: number };
+  readonly accepting?: readonly Ref[];
+  readonly refusals?: readonly ClaimedRefusal[];
+  readonly managedClosure?: ManagedClosure;
+}
+
 /** What a provider answers about one record: the keys it derived from it, or why the record confirms nothing. */
 export type Confirmation =
   | { readonly keys: readonly string[]; readonly guards?: readonly TransactionGuard[] }
@@ -61,7 +79,10 @@ export type Confirmation =
  */
 export interface AcceptanceProvider {
   readonly namespace: (project: string) => string;
-  readonly confirm: (record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store) => Confirmation;
+  /** Confirms for a block owner; absent when records of this kind accept nothing a block owns. */
+  readonly confirm?: (record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store) => Confirmation;
+  /** Confirms for a typed mechanism owner; a provider without it is never handed a mechanism context. */
+  readonly confirmMechanism?: (record: Sealed<Revision<Json>>, context: MechanismAcceptanceContext, store: Store) => Confirmation;
 }
 
 // A table keyed by kinds that come out of the store. It has no prototype, so a record whose kind is "constructor" or
@@ -70,7 +91,8 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
   const table = Object.create(null) as Record<string, AcceptanceProvider>;
   for (const [kind, provider] of Object.entries(entries)) {
     Object.defineProperty(table, kind, {
-      value: Object.freeze({ namespace: provider.namespace, confirm: provider.confirm }), enumerable: true,
+      value: Object.freeze({ namespace: provider.namespace, ...(provider.confirm ? { confirm: provider.confirm } : {}),
+        ...(provider.confirmMechanism ? { confirmMechanism: provider.confirmMechanism } : {}) }), enumerable: true,
     });
   }
   return Object.freeze(table);
@@ -79,10 +101,12 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
 /**
  * Kind of an ACCEPTING record → the provider written by its producing unit.
  * Historical grounds and semantic result identity are interpreted by that provider, never by this table.
+ * The applied E4 (model-call) confirms only M5 addressing, and only for its mechanism owner (H1.0d).
  */
 export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult },
   "accepted-answer": { namespace: acceptedAnswerNamespace, confirm: confirmAcceptedAnswerResult },
-  "connection-frame": { namespace: project => `om-frame:${project}:`, confirm: confirmAcceptedFrameResult } });
+  "connection-frame": { namespace: project => `om-frame:${project}:`, confirm: confirmAcceptedFrameResult },
+  "model-call": { namespace: project => `model-call:${project}:om:`, confirmMechanism: confirmModelCallAddressing } });
 
 /**
  * Kind of a TRANSITION that cancelled an earlier result → its provider, which derives the keys of the results it
@@ -107,6 +131,11 @@ export interface ConfirmRequest {
   readonly refusals?: readonly ClaimedRefusal[];
   readonly managedClosure?: ManagedClosure;
 }
+/** The same request for a typed mechanism owner: no block, and its exact attempt is always named. */
+export interface MechanismConfirmRequest extends Omit<ConfirmRequest, "block" | "attempt"> {
+  readonly owner: MechanismOwner;
+  readonly attempt: NonNullable<AcceptanceContext["attempt"]>;
+}
 
 /** What the series may be told: each result under the key its provider derived, with the record that accepted it. */
 export interface ConfirmedResults {
@@ -128,11 +157,16 @@ const CANCELLING: Side = { table: CANCELLATION_PROVIDERS, code: "cancellation_un
  * Confirms every result and every cancellation a cycle names, through the providers and nothing else.
  * One unconfirmed record refuses the whole outcome: a cycle is recorded with what it really achieved, or not at all.
  */
-export function confirmResults(store: Store, request: ConfirmRequest): OmResult<Sealed<ConfirmedResults>> {
+export function confirmResults(store: Store, request: ConfirmRequest | MechanismConfirmRequest): OmResult<Sealed<ConfirmedResults>> {
   requireCondition(store instanceof Store, "acceptance_request_invalid", "Results are confirmed through a store");
   requireCondition(isPlainObject(request), "acceptance_request_invalid", "Results are confirmed through a request object");
-  requireCondition(isText(request.project) && isText(request.block) && isText(request.target),
-    "acceptance_request_invalid", "A confirmation names the project, the block and the series it is for");
+  // The owner is typed: a block owner names its block, a mechanism names itself. A missing block never means a
+  // mechanism, and naming both is a contradiction rather than a choice between two providers.
+  const mechanism = Object.hasOwn(request, "owner");
+  requireCondition(mechanism !== Object.hasOwn(request, "block") && isText(request.project) && isText(request.target)
+    && (mechanism ? isMechanismOwner((request as MechanismConfirmRequest).owner) && validAttempt(request.attempt)
+      : isText((request as ConfirmRequest).block)),
+    "acceptance_request_invalid", "A confirmation names the project, either the block or the typed mechanism with its exact attempt, and the series it is for");
   requireCondition(request.goal === null || isPlainObject(request.goal),
     "acceptance_request_invalid", "A confirmation names the goal of the attempt, or says that no such attempt stands");
   requireCondition(!Object.hasOwn(request, "attempt") || validAttempt(request.attempt),
@@ -169,7 +203,7 @@ export function confirmResults(store: Store, request: ConfirmRequest): OmResult<
     cancelled, ...(guards.length ? { guards } : {}) });
 }
 
-function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, index: number):
+function confirmed(store: Store, request: ConfirmRequest | MechanismConfirmRequest, ref: Ref, side: Side, index: number):
   { keys: readonly string[]; guards: readonly TransactionGuard[] } | OmResult<never> {
   const field = `${side.field}.${index}`;
   const found = store.get<Json>(ref.id, ref.revision);
@@ -189,10 +223,19 @@ function confirmed(store: Store, request: ConfirmRequest, ref: Ref, side: Side, 
   if (request.goal === null) {
     return problem(side.code, "No attempt of that ordinal stands, so nothing it accepted can be confirmed for it", request.target, "attempt", ref);
   }
-  const answer = provider.confirm(sealed(found), { project: request.project, block: request.block, goal: request.goal,
-    accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }),
-    ...(request.refusals === undefined ? {} : { refusals: request.refusals }),
-    ...(request.managedClosure === undefined ? {} : { managedClosure: request.managedClosure }) }, store);
+  // Only a provider that confirms for this owner is asked: an older block provider is never handed a mechanism
+  // context, and the M5 provider never answers for a block.
+  const optional = { ...(request.refusals === undefined ? {} : { refusals: request.refusals }),
+    ...(request.managedClosure === undefined ? {} : { managedClosure: request.managedClosure }) };
+  const answer = "owner" in request
+    ? provider.confirmMechanism?.(sealed(found), { project: request.project, owner: request.owner, goal: request.goal,
+      attempt: request.attempt, accepting: request.accepting, ...optional }, store)
+    : provider.confirm?.(sealed(found), { project: request.project, block: request.block, goal: request.goal,
+      accepting: request.accepting, ...(request.attempt === undefined ? {} : { attempt: request.attempt }), ...optional }, store);
+  if (answer === undefined) {
+    return problem(side.code, `Records of kind ${found.kind} confirm no ${side.what} of a ${"owner" in request ? "mechanism" : "block"} owner`,
+      request.target, `${field}.kind`, ref);
+  }
   const confirmed = keysOf(answer);
   if (confirmed === null) return problem(side.code, (answer as { readonly unconfirmed: string }).unconfirmed, request.target, field, ref);
   return confirmed;
@@ -205,6 +248,127 @@ function validAttempt(value: unknown): value is NonNullable<AcceptanceContext["a
 }
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const goalOf = (goal: AttemptGoal) => ({ ...goal, questions: [...goal.questions].sort() });
+function isMechanismOwner(value: unknown): value is MechanismOwner {
+  return object(value) && Object.keys(value).length === 2 && value['kind'] === "mechanism" && value['mechanism'] === "M5:addressing";
+}
+function isGoal(value: unknown): value is AttemptGoal {
+  return object(value) && Object.keys(value).length === 3 && isText(value['key']) && isText(value['result'])
+    && Array.isArray(value['questions']) && value['questions'].every(isText);
+}
+
+class Unconfirmed extends Error {}
+function need<T>(result: OmResult<T>): T {
+  if (!result.ok) throw new Unconfirmed(`${result.refusal.code}: ${result.refusal.message}`);
+  return result.value;
+}
+function hold(condition: unknown, message: string): asserts condition { if (!condition) throw new Unconfirmed(message); }
+
+/**
+ * M5 addressing (H1.0d, №1449 §1–§2, №1688). The ground of the result is the exact APPLIED E4 whose own D3 transition
+ * addressed the assigned questions — never a proposal, a bare response or a vanished gap. Every decision of that E4 must
+ * belong to its assigned address subset, name its accepted question through addressedBy and choose a consumer the
+ * admission allows; one that does not refuses the whole record instead of being dropped. The key is the semantic
+ * addressing of the admitted task: revisions, call names, ordinals and packaging stay grounds, not identity.
+ */
+export function confirmModelCallAddressing(record: Sealed<Revision<Json>>, context: MechanismAcceptanceContext, store: Store): Confirmation {
+  requireCondition(store instanceof Store && isPlainObject(record) && isRef(record) && isPlainObject(context)
+    && isText(context.project) && isMechanismOwner(context.owner) && isGoal(context.goal) && validAttempt(context.attempt),
+  "acceptance_request_invalid", "M5 confirmation needs its exact record, the typed mechanism owner, the full goal and the exact attempt");
+  return withHistoricalReads(() => {
+    try {
+      const project = context.project;
+      const state = need(readModelCallState(store, { project, record: reference(record) }));
+      hold(state.state === "applied", "Only an applied E4 accepts an addressing result");
+      const applied = state.outcome, form = applied.outcome;
+      hold(form?.kind === "input-decisions" && applied.diagnostic === null,
+        "An addressing result is an applied field decision without a diagnostic");
+      const e4 = applied.record.value as OmModelCall;
+      const call = need(readCall(store, project, e4.om.call)).value;
+      hold("owner" in call && same(call.owner, context.owner) && call.purpose === "model-design",
+        "The call was admitted for the M5 addressing mechanism");
+      const e1 = call as MechanismCallRecord;
+      // The exact own attempt: a later revision of the same series may close it, another line or ordinal may not.
+      hold(e1.series.id === context.attempt.series.id && e1.attempt === context.attempt.ordinal
+        && same(goalOf(e1.goal), goalOf(context.goal)), "The result belongs to another series, attempt or full goal");
+      if (!same(e1.series, context.attempt.series)) {
+        const lineage = (series: Sealed<Revision<AnyRepairSeries>>) => {
+          hold("owner" in series.value, "An addressing attempt belongs to a mechanism series");
+          const value = series.value as Sealed<MechanismRepairSeries>;
+          return { project: value.projectId, owner: value.owner, line: value.line, slice: value.slice,
+            predecessor: value.predecessor, basis: value.basis, inherited: value.inherited,
+            earlier: value.attempts.filter(item => item.ordinal < e1.attempt),
+            goal: value.attempts.find(item => item.ordinal === e1.attempt)?.goal ?? null,
+            admission: value.admissions.find(row => row.attempt === e1.attempt) ?? null };
+        };
+        hold(same(lineage(need(readAnySeriesAt(store, project, e1.series))), lineage(need(readAnySeriesAt(store, project, context.attempt.series)))),
+          "The named series revision must preserve the original line, prior history, attempt and admission");
+      }
+      // The admitted slice of THIS attempt: a refreshed E1 admission is tied to it by the common reader.
+      const admitted = need(readMechanismAdmission(store, { project, series: e1.series, attempt: e1.attempt, admission: e1.admission, current: false }));
+      const binding = e4.om.completionOwner;
+      if (context.managedClosure !== undefined)
+        hold(binding !== undefined && same(binding.binding, context.managedClosure.binding), "The result belongs to another completion binding");
+      if (binding !== undefined) {
+        const owner = need(readCompletionOwnerAt(store, project, binding.binding)).value;
+        hold(owner.series.id === e1.series.id && owner.attempt === e1.attempt && same(goalOf(owner.goal), goalOf(e1.goal))
+          && same(owner.owner, context.owner) && owner.admission !== null && same(owner.admission.routes, e1.admission.routes)
+          && owner.admission.batch === e1.admission.batch && same(owner.plan.routes, e1.admission.routes)
+          && owner.plan.batches.includes(e1.admission.batch), "The managed call belongs to the binding of this exact attempt and plan");
+      }
+      // The accepted B1 is exactly this E4's own D3 transition.
+      hold(e4.om.input !== null, "Input decisions need their applied D3 result");
+      const accepted = need(readOmInput(store, project, e4.om.input)).value as Sealed<OmInputRecord>;
+      const ordered = (refs: readonly Ref[]) => [...refs].map(ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash }))
+        .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+      const derivation: unknown = accepted.derivation;
+      hold(object(derivation) && !Object.hasOwn(derivation, "kind") && Object.keys(derivation).length === 3
+        && same(derivation['previous'], form.input) && same(derivation['graph'], form.graph)
+        && Array.isArray(derivation['decisions']) && same(ordered(derivation['decisions'] as Ref[]), ordered(form.decisions)),
+      "The accepted input must derive from the previous input, graph and complete decisions of this E4");
+      const assigned = new Set(e1.gaps.map(gap => gap.goal));
+      const questions = accepted.input.questions as readonly { id: string; consumer?: unknown; kind?: unknown; addressedBy?: Ref }[];
+      const keys: string[] = [];
+      for (const ref of form.decisions) {
+        const found = store.get<InputDecisionProposal>(ref.id, ref.revision);
+        hold(found && found.kind === INPUT_DECISION_KIND && same(reference(found), ref), "Every decision stands at its exact reference");
+        const decision = found.value.decision;
+        hold(decision.field === "address" && assigned.has(decision.target), "Every decision belongs to the assigned address subset");
+        const question = questions.find(item => item.id === decision.target);
+        hold(question && isText(question.consumer) && isText(question.kind) && same(question.addressedBy, ref)
+          && same(decision.value, { consumer: question.consumer, kind: question.kind }),
+        "The accepted question is addressed by this exact decision");
+        hold(admitted.value.consumers.some(item => item.id === question.consumer), "The accepted consumer is outside the admitted catalog");
+        const row = admitted.value.questions.find(item => item.target === decision.target && item.field === "address");
+        hold(row, "The decision addresses a question outside the admitted task");
+        const key = `om-result:${hashJson({ kind: "addressing", project, target: row.target, field: "address", task: row.task,
+          producer: row.producer, protected: row.protected, accepted: { consumer: question.consumer, kind: question.kind } } as Json)}`;
+        if (!keys.includes(key)) keys.push(key);
+      }
+      hold(keys.length > 0, "An applied E4 that addressed nothing accepts no result");
+      return { keys };
+    } catch (error) {
+      if (error instanceof Unconfirmed) return { unconfirmed: error.message };
+      throw error;
+    }
+  });
+}
+
+/**
+ * №1688-13: a saved representative of a key is proved by ITS OWN provider, whatever kind it is — not filtered by the
+ * namespace of the local result that shares the key. The local result is proved separately by its caller.
+ */
+export function acceptanceRepresents(store: Store, context: AcceptanceContext | MechanismAcceptanceContext, basis: Ref, key: string): boolean {
+  requireCondition(store instanceof Store && isPlainObject(context) && isText(context.project) && isRef(basis) && isText(key),
+    "acceptance_request_invalid", "A representative is checked against its exact basis, key and attempt context");
+  const record = store.get<Json>(basis.id, basis.revision);
+  if (!record || !same(reference(record), basis)) return false;
+  const provider = Object.hasOwn(ACCEPTANCE_PROVIDERS, record.kind) ? ACCEPTANCE_PROVIDERS[record.kind] : undefined;
+  if (!provider || !basis.id.startsWith(provider.namespace(context.project))) return false;
+  const answer = "owner" in context ? provider.confirmMechanism?.(sealed(record), context, store)
+    : provider.confirm?.(sealed(record), context, store);
+  const keys = answer === undefined ? null : keysOf(answer);
+  return keys !== null && keys.keys.includes(key);
+}
 
 /** C5 proves acceptance and its one bound attempt; the shared identity reader alone defines the result keys. */
 export function confirmAcceptedFrameResult(record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store): Confirmation {

@@ -16,7 +16,7 @@ import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInpu
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
 import { readAnySeriesAt, readSeriesAt, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
-import type { AcceptanceContext, Confirmation } from './achievements.js';
+import { acceptanceRepresents, type AcceptanceContext, type Confirmation } from './achievements.js';
 import { assessmentResultId, checkCurrentAssessmentAttemptClosure,
   readAssessmentOutcomeAt, readAssessmentTerminalBasisAt } from './assessment.js';
 
@@ -631,8 +631,9 @@ function currentAcceptedAttempt(store: Store, project: string, attempt: AnswerAt
       || fact.attempt.series.id !== attempt.series.id || fact.attempt.ordinal !== attempt.ordinal
       || fact.attempt.block !== attempt.block || !same(fact.attempt.goal, attempt.goal)) return false;
     return running.outcome.achieved.some(item => {
-      if (item.key !== fact.key || !item.basis.id.startsWith(acceptedAnswerNamespace(project))) return false;
-      return acceptedAnswerRepresents(store, { project, block: attempt.block, goal: attempt.goal,
+      // №1688-13: any representative of the key is proved by its own provider; the current line guards remain.
+      if (item.key !== fact.key) return false;
+      return acceptanceRepresents(store, { project, block: attempt.block, goal: attempt.goal,
         attempt: { series: reference(head), ordinal: attempt.ordinal }, accepting: [item.basis] },
       item.basis, fact.key);
     });

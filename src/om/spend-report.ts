@@ -271,10 +271,11 @@ function attemptResult(store: Store, project: string, call: AnyCallLedgerEntry, 
     fail('spend_basis_invalid', call.call.id, 'goal', 'The ordinary call belongs to this attempt goal');
   const achieved = attempt.outcome?.achieved ?? [];
   if (achieved.length) {
-    if ('owner' in series.value) fail('achievement_unconfirmed', at.id, 'achieved', 'No mechanism acceptance provider is declared');
-    const confirmed = take(confirmResults(store, { project, block: series.value.block, target: at.id,
-      attempt: { series: reference(series), ordinal: call.attempt },
-      goal: attempt.goal, accepting: refs(achieved.map(item => item.basis)), cancelling: [] }));
+    // H1.0d: a mechanism attempt is confirmed through the same providers under its typed owner, never a block.
+    const common = { project, target: at.id, attempt: { series: reference(series), ordinal: call.attempt },
+      goal: attempt.goal, accepting: refs(achieved.map(item => item.basis)), cancelling: [] };
+    const confirmed = take(confirmResults(store, 'owner' in series.value ? { ...common, owner: series.value.owner }
+      : { ...common, block: series.value.block }));
     const ordered = (items: readonly Achievement[]) => [...items].sort(compare);
     if (!same(ordered(confirmed.achieved), ordered(achieved))) fail('spend_basis_invalid', at.id, 'achieved', 'Every saved achievement is derived by its acceptance provider');
   }

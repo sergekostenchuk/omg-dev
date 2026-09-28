@@ -2,7 +2,7 @@ import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { readMc1Question, readAnswerCitations, prepareAnswerCitations, type AnswerGround, type AnswerCitation } from './accepted-answer.js';
 import { contextValue } from '../discovery/working-context.js';
 import { safeRelativePath } from '../graph/topology.js';
@@ -41,6 +41,9 @@ const text = (value: unknown): value is string => typeof value === 'string' && v
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const references = (refs: readonly Ref[]) => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
+// H1.0d (№1715): transaction conditions of the current admission, including absences; provenance stays Ref[].
+const conditions = (guards: readonly TransactionGuard[]): TransactionGuard[] => [...references(guards.filter(isRef)),
+  ...new Map(guards.filter(guard => !isRef(guard)).map(guard => [guard.id, guard])).values()];
 class FormFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
 function invalid(field: string): never {
   throw new EngineError('answer_form_request_invalid', 'Answer form checks require an exact task and explicit reply',
@@ -131,7 +134,7 @@ export type CheckedAnswerForm = PacketOutcomeBase & (
   | { kind: 'no-result'; action: 'cannot_answer' | 'pause'; questionIds: string[]; reason: string; questions: AssignedQuestion[] }
 );
 
-function fieldForm(store: Store, request: InputFieldAnswerRequest, current: boolean): InputDecisionsForm & { guards: Ref[] } {
+function fieldForm(store: Store, request: InputFieldAnswerRequest, current: boolean): InputDecisionsForm & { guards: TransactionGuard[] } {
   const routes = take(readRoutes(store, { project: request.project, record: request.routes }));
   const batch = routes.record.value.batches.find(item => item.id === request.batch);
   if (!batch || batch.model !== 'MC2' || batch.task !== 'input-field')
@@ -178,7 +181,7 @@ function fieldForm(store: Store, request: InputFieldAnswerRequest, current: bool
   } });
   const decisions = [...pending.values()].map(reference);
   const derived = take(deriveInputDecisions(view, { project: request.project, previous: base as Revision<OmInputRecord>, graph: source.graph, decisions }));
-  const guards: Ref[] = [], refs = [request.routes, ...routes.references, ...derived.references];
+  const guards: TransactionGuard[] = [], refs = [request.routes, ...routes.references, ...derived.references];
   if (current) {
     const preparedRoutes = take(prepareRoutes(store, { ...routes.record.value.request,
       tasks: routes.record.value.request.tasks.map(record => ({ record })) } as RoutesRequest));
@@ -197,7 +200,7 @@ function fieldForm(store: Store, request: InputFieldAnswerRequest, current: bool
     return !saved;
   }) : writes;
   return { kind: 'input-decisions', unanswered: batch.items.filter(item => !seen.has(canonical([item.target, item.field]))).map(item => item.gap).sort(order), input: source.input, graph: source.graph, decisions, writes: missing,
-    references: references(refs), guards: references(guards) };
+    references: references(refs), guards: conditions(guards) };
 }
 function requireFieldRequest(store: Store, request: unknown): asserts request is InputFieldAnswerRequest {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.routes)
@@ -209,7 +212,7 @@ export function checkInputFieldAnswer(store: Store, request: InputFieldAnswerReq
   requireFieldRequest(store, request); request = copyRequest(request);
   return result(() => { const { guards: _guards, ...form } = fieldForm(store, request, false); return form; });
 }
-export function prepareInputFieldAnswer(store: Store, request: InputFieldAnswerRequest): OmResult<Sealed<InputDecisionsForm & { guards: Ref[] }>> {
+export function prepareInputFieldAnswer(store: Store, request: InputFieldAnswerRequest): OmResult<Sealed<InputDecisionsForm & { guards: TransactionGuard[] }>> {
   requireFieldRequest(store, request); request = copyRequest(request);
   return result(() => fieldForm(store, request, true));
 }
@@ -263,10 +266,10 @@ function checkReads(store: Store, request: PacketAnswerRequest, packet: Revision
   }
   return refs;
 }
-function answerForm(store: Store, request: PacketAnswerRequest, current: boolean): CheckedAnswerForm & { guards: Ref[] } {
+function answerForm(store: Store, request: PacketAnswerRequest, current: boolean): CheckedAnswerForm & { guards: TransactionGuard[] } {
   const checked = take(readPacketAnswer(store, request));
   const packet = checked.packet, answer = checked.answer, payload = packet.value.packet as Record<string, Json>;
-  const guards: Ref[] = [], refs = [...checked.references];
+  const guards: TransactionGuard[] = [], refs = [...checked.references];
   if (current) {
     const prepared = take(prepareQuestionPacket(store, packet.value.request as QuestionPacketRequest));
     if (canonical(reference(prepared.record)) !== canonical(request.packet))
@@ -277,7 +280,7 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
   if (answer.action !== 'answer') {
     const questions = (payload.questions as unknown as AssignedQuestion[]).filter(q => answer.questionIds.includes(q.id))
       .map(q => ({ id: q.id, target: q.target, field: q.field, consumers: [...q.consumers] }));
-    const common = { task, unanswered: (payload.questions as unknown as AssignedQuestion[]).map(q => q.id).sort(order), questionIds: [...answer.questionIds], questions, guards: references(guards) };
+    const common = { task, unanswered: (payload.questions as unknown as AssignedQuestion[]).map(q => q.id).sort(order), questionIds: [...answer.questionIds], questions, guards: conditions(guards) };
     if (answer.action === 'need_source') {
       refs.push(...checkReads(store, request, packet as Revision<QuestionPacketRecord>, answer.reads as PacketRead[], current));
       return { ...common, kind: 'need-source', missing: answer.missing, reads: answer.reads as PacketRead[], references: references(refs) };
@@ -292,7 +295,7 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
     return { task, unanswered: (payload.questions as unknown as AssignedQuestion[]).filter(q => !filled.has(q.target)).map(q => q.id).sort(order),
       kind: 'node-proposal', proposal: derived.proposal as LayerProposal,
       ...(derived.works ? { works: derived.works as WorksPartBindings } : {}),
-      references: references([...refs, ...derived.references]), guards: references(guards) };
+      references: references([...refs, ...derived.references]), guards: conditions(guards) };
   }
   if (payload.model === 'MC1') {
     const seen = new Set<string>(), facts: Extract<CheckedAnswerForm, { kind: 'fact-candidates' }>['facts'] = [];
@@ -313,11 +316,11 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
       refs.push(...value.references, ...citations.references);
       facts.push({ questionId: row.questionId, question: native.question, value: row.value as Json, grounds: citations.grounds as AnswerGround[] });
     }
-    return { task, unanswered: questions.filter(q => !seen.has(q.id)).map(q => q.id).sort(order), kind: 'fact-candidates', facts, references: references(refs), guards: references(guards) };
+    return { task, unanswered: questions.filter(q => !seen.has(q.id)).map(q => q.id).sort(order), kind: 'fact-candidates', facts, references: references(refs), guards: conditions(guards) };
   }
   const fields = fieldForm(store, { project: request.project, routes: packet.value.request.routes,
     batch: packet.value.request.batch!, raw: canonical({ results: answer.results }) }, current);
-  return { ...fields, task, references: references([...refs, ...fields.references]), guards: references([...guards, ...fields.guards]) };
+  return { ...fields, task, references: references([...refs, ...fields.references]), guards: conditions([...guards, ...fields.guards]) };
 }
 /** Historical content checking. E4 must independently bind it to a saved adapter response and admitted call. */
 export function checkAnswerForm(store: Store, request: PacketAnswerRequest): OmResult<Sealed<CheckedAnswerForm>> {
@@ -325,7 +328,7 @@ export function checkAnswerForm(store: Store, request: PacketAnswerRequest): OmR
   return result(() => { const { guards: _guards, ...checked } = answerForm(store, request, false); return checked; });
 }
 /** Current preparation supplies guards, without delivery, acceptance, series changes or call settlement. */
-export function prepareAnswerForm(store: Store, request: PacketAnswerRequest): OmResult<Sealed<CheckedAnswerForm & { guards: Ref[] }>> {
+export function prepareAnswerForm(store: Store, request: PacketAnswerRequest): OmResult<Sealed<CheckedAnswerForm & { guards: TransactionGuard[] }>> {
   requireRequest(store, request, 'node'); request = copyRequest(request);
   return result(() => answerForm(store, request, true));
 }

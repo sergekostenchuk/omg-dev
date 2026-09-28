@@ -13,7 +13,7 @@ import { checkTaskObligationBinding, taskBindingId, taskObligations } from '../g
 import type { CarriedObligation } from '../graph/obligation-policy.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Write, type Revision } from '../storage/store.js';
+import { Store, type Write, type Revision, type TransactionGuard } from '../storage/store.js';
 import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Question, readMc1Question,
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
@@ -148,7 +148,7 @@ export interface QuestionPacketRecord {
   fullChars: number | null; refusal: Refusal | null; journal: Ref | null;
 }
 export interface PreparedQuestionPacket {
-  record: Revision<QuestionPacketRecord>; writes: Write[]; guards: Ref[]; references: Ref[]; existing: boolean;
+  record: Revision<QuestionPacketRecord>; writes: Write[]; guards: TransactionGuard[]; references: Ref[]; existing: boolean;
 }
 export const QUESTION_PACKET_KIND = 'question-packet';
 const packetNamespace = (project: string) => `om-question-packet:${project}:`;
@@ -438,7 +438,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
     ...capacity.references, ...evidence.references]), writes: priorDerived.writes };
 }
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord): {
-  value: QuestionPacketRecord; guards: Ref[]; references: Ref[]; writes: Write[];
+  value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[];
 } {
   const protocol = saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL;
   const contract = saved ? saved.packetContract : currentPacketContract(store, request);
@@ -651,9 +651,11 @@ export function prepareQuestionPacket(store: Store, request: QuestionPacketReque
     writes.push(...completion.writes);
     const pending = new Set(writes.map(write => canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) })));
     return { record, existing: Boolean(checked), references: derived.references,
-      guards: unique((environment ? environment.remap : (guards: readonly Ref[]) => guards)([...derived.guards, ...(finished?.guards ?? []), ...completion.guards,
-        ...(environment?.guards ?? []), ...(checked ? [reference(checked)] : [])]).filter(isRef)
-        .filter(ref => !pending.has(canonical(ref)))), writes };
+      // H1.0d (№1715): the finish may rely on an absence (an admitted call without its E4); it stays a condition of
+      // this write. Only exact references of records written here are dropped.
+      guards: unique((environment ? environment.remap : (guards: readonly TransactionGuard[]) => guards)([...derived.guards, ...(finished?.guards ?? []), ...completion.guards,
+        ...(environment?.guards ?? []), ...(checked ? [reference(checked)] : [])])
+        .filter(guard => !isRef(guard) || !pending.has(canonical(guard)))), writes };
   });
 }
 export function writeQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
@@ -1043,7 +1045,7 @@ export function readPartResult(store: Store, request: { project: string; record:
   return result(() => checkedPart(store, request.project, request.record));
 }
 /** E4 owns persistence. An unsaved response and its derived pair share one guarded transaction. */
-export function preparePartResult(store: Store, request: PreparePartResultRequest): OmResult<Sealed<CheckedPartResult & { writes: Write[]; guards: Ref[] }>> {
+export function preparePartResult(store: Store, request: PreparePartResultRequest): OmResult<Sealed<CheckedPartResult & { writes: Write[]; guards: TransactionGuard[] }>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || ![request.packet, request.call].every(isRef)
     || !(isRef(request.response) || object(request.response) && Object.keys(request.response).length === 1
       && object(request.response.pending) && text(request.response.pending.id) && text(request.response.pending.kind)

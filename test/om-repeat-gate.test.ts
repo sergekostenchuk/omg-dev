@@ -2432,7 +2432,7 @@ test("A3.3 G7 closes the saved mechanism goal after D3 has removed its gaps with
   const filled = f.addressQuestions(["format-a", "format-b"]);
   assert.equal(filled.batch, undefined);
   const before = mechanismSnapshot(f.store);
-  for (const [field, code] of [["accepting", "acceptance_unconfirmed"], ["cancelling", "cancellation_unconfirmed"]] as const) {
+  for (const [field, code] of [["accepting", "achievement_unconfirmed"], ["cancelling", "cancellation_unconfirmed"]] as const) {
     const rejection = refusalOf(closeAttempt(f.store, { ...f.address(), attempt: 1,
       outcome: outcome({ [field]: [reference(f.input)] }) }));
     assert.equal(rejection.code, code); assert.ok(rejection.at.target);
@@ -4017,4 +4017,455 @@ test("E5.1 refuses an off-form claim with an admitted but unterminated MC1 set",
   if (!repeated.ok) assert.equal(repeated.refusal.code, "origin_unreadable");
   assert.deepEqual(f.store.get<RepairSeries>(f.series.id), before);
   assert.equal(f.sent().length, sends);
+});
+
+// ---- H1.0d: the M5 addressing provider through real producers (№1449, №1688) ----
+import { readModelCallState, prepareModelAttemptFinish, finishModelAttempt, type ModelCallRequest } from "../src/om/model-call.js";
+import { confirmResults, acceptanceRepresents } from "../src/om/achievements.js";
+import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
+import { readMechanismAdmission } from "../src/om/series.js";
+import { spendReport, readSpendReport } from "../src/om/spend-report.js";
+
+const m5Adapter = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
+const m5Owner = { kind: "mechanism", mechanism: "M5:addressing" } as const;
+function m5Fixture(t: test.TestContext, managed = false) {
+  const root = mkdtempSync(join(tmpdir(), "omg-h10d-m5-")), database = join(root, "state.sqlite"), project = "garden";
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const { level: _level, ...upper } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(engine, project, upper as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns = ["encoding", "spare"].map(id => ({ id,
+      question: `Which ${id} is supported?`, consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false,
+      resolution: "Address this question during OM" }));
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const input = deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
+  const graph = reference(store.get(`graph:${project}`)!);
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph, refinement: null,
+    choice: { choiceVersion: "h10d-m5", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
+  const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = deliveredOf(writeGaps(store, sources));
+  const scope: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const routes = deliveredOf(writeRoutes(store, { project, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(item => item.model === "MC2" && item.task === "input-field"
+    && item.items.some(gap => gap.target === "discovery:encoding"))!;
+  assert.ok(batch && batch.items.length === 2, "one real MC2 input-field batch addresses both questions");
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [m5Adapter, "--scenario", scenario, "--trace", trace] };
+  const environment = (amount = 100_000) => engine.environments.configure(project, { workspace: root,
+    implementer: { actor: "m5-implementer", model: "fixture", effort: "high", speed: "fast", command },
+    reviewer: { actor: "m5-reviewer", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: amount },
+  store.get(`environment:${project}`)?.revision ?? 0);
+  const configured = environment();
+  const adapter = store.write({ id: `adapter:${project}:m5`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
+  const goal: AttemptGoal = { key: "h10d-m5", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  const address = { project, owner: m5Owner, line: 1 };
+  const admission = { gaps: scope, routes: reference(routes), batch: batch.id };
+  deliveredOf(openSeries(store, { ...address, scope, predecessor: null, basis: null }));
+  const series = deliveredOf(openAttempt(store, { ...address, attempt: 1, goal, admission,
+    ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) } as never));
+  const call = (config = configured): ModelCallRequest => {
+    const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+      environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+    return { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(config) }, role: "implementer" };
+  };
+  const answer = (targets = batch.items.map(item => item.target), kind = "repository-fact") => ({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+    results: batch.items.filter(item => targets.includes(item.target)).map(item => ({ target: item.target, field: item.field, basis: item.record,
+      value: { consumer: "garden-consume-block", kind } })) } });
+  return { root, database, project, address, admission, goal, batch, routes, series, environment, call, answer,
+    get store() { return store; },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
+}
+/** The key formula of №1449 §2, over the admitted slice row and the accepted consumer/kind. */
+function m5Key(f: ReturnType<typeof m5Fixture>, target: string): string {
+  const proof = deliveredOf(readMechanismAdmission(f.store, { project: f.project, series: reference(f.series), attempt: 1,
+    admission: f.admission as never, current: false }));
+  const row = proof.value.questions.find(item => item.target === target && item.field === "address")!;
+  return `om-result:${hashJson({ kind: "addressing", project: f.project, target: row.target, field: "address", task: row.task,
+    producer: row.producer, protected: row.protected, accepted: { consumer: "garden-consume-block", kind: "repository-fact" } } as Json)}`;
+}
+const m5Context = (f: ReturnType<typeof m5Fixture>, series: Ref = reference(f.series)) => ({ project: f.project, owner: m5Owner,
+  target: f.series.id, goal: f.goal, attempt: { series, ordinal: 1 }, cancelling: [] as Ref[] });
+
+test("O1 O2 O4 O11 C1 C3 C6 C11 E1 E2 E5 X8 H1.0d an applied M5 E4 confirms every addressing of its batch under the typed owner, and G7 closes with them", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer()]);
+  const sent = deliveredOf(await runModelCall(f.store, f.call()));
+  assert.equal(sent.outcome?.kind, "input-decisions");
+  const e4 = reference(sent.record);
+  const keys = f.batch.items.map(item => m5Key(f, item.target));
+  const confirmed = deliveredOf(confirmResults(f.store, { ...m5Context(f), accepting: [e4] }));
+  assert.deepEqual(confirmed.achieved.map(item => item.key).sort(), [...keys].sort());
+  assert.ok(confirmed.achieved.every(item => canonical(item.basis) === canonical(e4)));
+  const closing = { ...f.address, attempt: 1, outcome: outcome({ accepting: [e4] }) };
+  const closed = deliveredOf(closeAttempt(f.store, closing));
+  assert.equal(closed.verdict, "progress");
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+  assert.equal(saved.reason, "result");
+  assert.deepEqual(saved.achieved.map(item => item.key).sort(), [...keys].sort());
+  // O4, C3: the exact repeat names no new result; the same E4 twice is one ground.
+  const before = mechanismSnapshot(f.store);
+  assert.deepEqual(deliveredOf(prepareCloseAttempt(f.store, closing)).writes, []);
+  assert.equal(deliveredOf(confirmResults(f.store, { ...m5Context(f), accepting: [e4, e4] })).achieved.length, 2);
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, closing)), closed);
+  // C11: a later revision of the same series names the same attempt; the provider still reads only its E1 lineage.
+  const later = reference(f.store.get(f.series.id)!);
+  assert.deepEqual(deliveredOf(confirmResults(f.store, { ...m5Context(f, later), accepting: [e4] })).achieved, confirmed.achieved);
+  assert.equal(acceptanceRepresents(f.store, { project: f.project, owner: m5Owner, goal: f.goal, attempt: { series: later, ordinal: 1 } }, e4, keys[0]!), true);
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+});
+
+test("O3 C28 H1.0d a partial applied answer accepts only its addressed question; the unanswered one is neither accepted nor refused", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer(["discovery:encoding"])]);
+  const sent = deliveredOf(await runModelCall(f.store, f.call()));
+  assert.equal(sent.outcome?.kind, "input-decisions");
+  if (sent.outcome?.kind === "input-decisions") assert.equal(sent.outcome.unanswered.length, 1);
+  const e4 = reference(sent.record);
+  const confirmed = deliveredOf(confirmResults(f.store, { ...m5Context(f), accepting: [e4] }));
+  assert.deepEqual(confirmed.achieved.map(item => item.key), [m5Key(f, "discovery:encoding")]);
+  const closed = deliveredOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome({ accepting: [e4] }) }));
+  assert.equal(closed.verdict, "progress");
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+  assert.deepEqual(saved.achieved.map(item => item.key), [m5Key(f, "discovery:encoding")]);
+  assert.deepEqual(saved.refusals, []);
+});
+
+test("C15 X3 H1.0d a new standalone close cannot omit an accepted M5 result, nor hide its results behind another reason", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer()]);
+  const e4 = reference(deliveredOf(await runModelCall(f.store, f.call())).record);
+  const before = mechanismSnapshot(f.store);
+  const omitted = refusalOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
+  assert.deepEqual([omitted.code, omitted.at.field, omitted.at.ref], ["origin_unreadable", "outcome.accepting", e4]);
+  const hidden = refusalOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome({ reason: "interrupted", accepting: [e4] }) }));
+  assert.deepEqual([hidden.code, hidden.at.field], ["origin_unreadable", "outcome.reason"]);
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+});
+
+test("C01 O6 C8 C13 O13 H1.0d owners select their providers: no block provider reads a mechanism, no M5 result serves a block or another attempt", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer()]);
+  const e4 = reference(deliveredOf(await runModelCall(f.store, f.call())).record);
+  const input = reference(f.store.list("om-input").at(-1)!);
+  const foreignKind = refusalOf(confirmResults(f.store, { ...m5Context(f), accepting: [input] }));
+  assert.deepEqual([foreignKind.code, foreignKind.at.field], ["achievement_unconfirmed", "outcome.accepting.0.kind"]);
+  const asBlock = refusalOf(confirmResults(f.store, { project: f.project, block: "garden-consume-block", target: f.series.id,
+    goal: f.goal, attempt: { series: reference(f.series), ordinal: 1 }, accepting: [e4], cancelling: [] }));
+  assert.deepEqual([asBlock.code, asBlock.at.field], ["achievement_unconfirmed", "outcome.accepting.0.kind"]);
+  for (const other of [{ ...m5Context(f), goal: { ...f.goal, key: "another-goal" } },
+    { ...m5Context(f), attempt: { series: reference(f.series), ordinal: 2 } }]) {
+    const refused = refusalOf(confirmResults(f.store, { ...other, accepting: [e4] }));
+    assert.deepEqual([refused.code, refused.at.field], ["achievement_unconfirmed", "outcome.accepting.0"]);
+  }
+  assert.throws(() => confirmResults(f.store, { ...m5Context(f), block: "garden-consume-block", accepting: [e4] } as never),
+    (error: unknown) => error instanceof EngineError && error.code === "acceptance_request_invalid");
+  const { attempt: _attempt, ...unbound } = m5Context(f);
+  assert.throws(() => confirmResults(f.store, { ...unbound, accepting: [e4] } as never),
+    (error: unknown) => error instanceof EngineError && error.code === "acceptance_request_invalid");
+  const standing = deliveredOf(readModelCallState(f.store, { project: f.project, record: e4 }));
+  assert.equal(standing.state, "applied");
+});
+
+test("C43 O7 O8 O10 C15 E6 X13 X14 H1.0d a standalone finish of another call keeps the addressings its attempt already applied", async t => {
+  const f = m5Fixture(t);
+  const second = f.call(f.environment(90_000));
+  f.steps([f.answer(), f.answer()]);
+  // The second call is answered first, but stops after its receipt and before its application (lesson 39).
+  const original = f.store.writeMany.bind(f.store);
+  let stopped = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!stopped && writes.some(write => write.kind === "model-call"
+      && (write.value as { om?: { application?: string } }).om?.application === "applied")) {
+      stopped = true; throw new Error("stop before application");
+    }
+    return original(writes, guards);
+  }) as Store["writeMany"];
+  try { await assert.rejects(() => runModelCall(f.store, second), /stop before application/); }
+  finally { f.store.writeMany = original; }
+  // O7: a saved but unapplied answer accepts nothing.
+  const received = reference(f.store.list("model-call")[0]!);
+  assert.equal(deliveredOf(readModelCallState(f.store, { project: f.project, record: received })).state, "received");
+  assert.equal(refusalOf(confirmResults(f.store, { ...m5Context(f), accepting: [received] })).code, "achievement_unconfirmed");
+  const first = f.call(f.environment(80_000));
+  const applied = deliveredOf(await runModelCall(f.store, first));
+  assert.equal(applied.outcome?.kind, "input-decisions");
+  const e4 = reference(f.store.get(applied.record.id)!);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  // C15 window: a G7 close prepared while the other call is only received fails once that call is applied.
+  const prepared = deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome({ accepting: [e4] }) }));
+  assert.ok(prepared.guards.some(guard => "revision" in guard && guard.id === received.id && guard.revision === received.revision));
+  // After D3 of the first call the second one can only end without its own result; the attempt keeps the first's.
+  const late = await runModelCall(f.store, second);
+  const stale = writeGuarded(f.store, { unit: "G7", target: f.series.id, writes: [...prepared.writes], guards: [...prepared.guards] });
+  assert.equal(stale.ok, false);
+  // O8, O10: the other call ends with its own diagnostic or refused application, and accepts no result.
+  const ended = reference(f.store.get(received.id)!);
+  assert.equal(refusalOf(confirmResults(f.store, { ...m5Context(f), accepting: [ended] })).code, "achievement_unconfirmed");
+  const series = f.store.get<RepairSeries>(f.series.id)!;
+  const saved = series.value.attempts[0]!.outcome!;
+  assert.ok(saved, `the finishing call closes the standalone attempt (${late.ok ? "applied" : late.refusal.code})`);
+  assert.equal(saved.reason, "result");
+  assert.deepEqual(saved.achieved.map(item => item.key).sort(), f.batch.items.map(item => m5Key(f, item.target)).sort());
+  assert.ok(saved.achieved.every(item => canonical(item.basis) === canonical(e4)));
+  assert.ok(saved.refusals.length > 0, "the local diagnostic of the other call is kept");
+  const before = mechanismSnapshot(f.store), sends = readFileSync(join(f.root, "trace.jsonl"), "utf8").trim().split("\n").length;
+  f.restart();
+  for (const record of f.store.list("model-call")) assert.ok(readModelCallState(f.store, { project: f.project, record: reference(record) }).ok);
+  assert.deepEqual(deliveredOf(confirmResults(f.store, { ...m5Context(f, reference(series)), accepting: [e4] })).achieved.map(item => item.key).sort(),
+    saved.achieved.map(item => item.key).sort());
+  const report = deliveredOf(spendReport(f.store, { project: f.project }));
+  const results = report.rows.filter(row => row.result !== null);
+  assert.ok(results.length >= 1 && results.every(row => canonical(row.result!.achieved) === canonical(saved.achieved)));
+  assert.deepEqual(deliveredOf(readSpendReport(f.store, report.snapshot)), report);
+  // №1688-8: the finish and a direct G7 repeat of the same outcome are one transition: the E4 diagnostics were classified
+  // by the finish (never unknown), and the repeat writes nothing — no class, no origin hold.
+  const journal = f.store.get<RefusalJournal>(journalId(f.project))!;
+  const claims = saved.refusals.map(({ row }) => { const entry = journal.value.rows.find(item => item.id === row)!;
+    return { row, name: entry.code, goal: entry.goal }; });
+  const classes = journal.value.classifications.filter(item => claims.some(claim => claim.row === item.row));
+  assert.equal(classes.length, claims.length);
+  assert.ok(classes.every(item => item.class !== "unknown"), JSON.stringify(classes));
+  assert.deepEqual(deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1,
+    outcome: { reason: saved.reason, accepting: [e4], cancelling: [], refusals: claims } })).writes, []);
+  assert.equal(f.store.list(ORIGIN_HOLD_KIND).length, 0);
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+  assert.equal(readFileSync(join(f.root, "trace.jsonl"), "utf8").trim().split("\n").length, sends);
+});
+
+test("C13 C14 C45 E3 E7 X3 E10 E11 E12 X15 H1.0d a managed M5 close retains every applied addressing of its registry and E6 re-derives it", async t => {
+  const f = m5Fixture(t, true);
+  f.steps([f.answer()]);
+  const applied = deliveredOf(await runModelCall(f.store, f.call()));
+  const e4 = reference(f.store.get(applied.record.id)!);
+  // The managed finalizer never closes A3 itself (E7).
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const before = mechanismSnapshot(f.store);
+  const omitted = refusalOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
+  assert.deepEqual([omitted.code, omitted.at.field], ["completion_invalid", "accepting"]);
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+  const closed = deliveredOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome({ accepting: [e4] }) }));
+  assert.equal(closed.verdict, "progress");
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+  const keys = f.batch.items.map(item => m5Key(f, item.target)).sort();
+  assert.deepEqual(saved.achieved.map(item => item.key).sort(), keys);
+  const close = f.store.list().find(record => record.kind === "om-completion-close")!;
+  const report = deliveredOf(spendReport(f.store, { project: f.project }));
+  f.restart();
+  const byKey = (items: readonly { key: string; basis: Ref }[]) => [...items].map(item => canonical(item)).sort();
+  assert.deepEqual(byKey(deliveredOf(readCompletionCloseAt(f.store, f.project, reference(close))).outcome.achieved), byKey(saved.achieved));
+  const row = report.rows.find(item => item.result !== null)!;
+  assert.deepEqual(row.result!.achieved.map(item => item.key).sort(), keys);
+  assert.deepEqual(deliveredOf(readSpendReport(f.store, report.snapshot)), report);
+});
+
+/**
+ * №1449 §7, №1688-13 (C10, C22, E8, E9): supported E5 with its D5 stops before G7; D3 and D2 then close its line while
+ * the attempt is open; G7 confirms both and keeps one canonical representative of the shared key. Whichever of D2 or
+ * D5 represents it, the E5 repeat and the later consumption prove it through its own provider.
+ */
+async function d2RepresentedAttempt(t: test.TestContext, choice: string): Promise<"D2" | "D5"> {
+  const f = e51Fixture(t, false), first = await f.original();
+  const at = { project: f.project, block: f.block, line: 1 };
+  deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome() }));
+  const secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
+  const oldRoutes = f.store.list<RoutesRecord>("route-result")[0]!;
+  const priorRoutes = oldRoutes.value.request;
+  const routes = deliveredOf(writeRoutes(f.store, { project: f.project, gaps: priorRoutes.gaps,
+    tasks: priorRoutes.tasks.map(record => ({ record })), catalog: priorRoutes.catalog, previous: reference(oldRoutes) }));
+  const batch = routes.value.batches.find(row => row.model === "MC1" && row.items.some(item => item.gap === first.questionId));
+  assert.ok(batch);
+  const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
+    batch: batch.id, environment: reference(f.config), attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
+  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
+  const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: "implementer" }));
+  const second = { ...first, modelCall: reference(model.record) };
+  const originalWrite = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes, guards) => {
+    if (writes.some(write => write.kind === "repair-series" && write.id === f.series.id && write.expected > 0))
+      throw new Error("stop before G7");
+    return originalWrite(writes, guards);
+  }) as Store["writeMany"];
+  try { await assert.rejects(() => assessFact(f.store, second), /stop before G7/); }
+  finally { f.store.writeMany = originalWrite; }
+  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
+  const e5 = terminal.value.accepted!;
+  const e5Fact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 }));
+  // O12: an applied E4 of another kind (this MC1 call) is no M5 addressing, whatever owner names it.
+  assert.equal(refusalOf(confirmResults(f.store, { project: f.project, owner: m5Owner, target: f.series.id, goal: f.attemptGoal,
+    attempt: { series: reference(secondSeries), ordinal: 2 }, accepting: [reference(model.record)], cancelling: [] })).code, "achievement_unconfirmed");
+  // D3 and D2 consume the supported E5 while its attempt is still open.
+  const mc1 = f.store.get<Mc1QuestionRecord>(deliveredOf(readAssessmentIntentAt(f.store, f.project, terminal.value.intent)).question.record.id)!;
+  const prior = mc1.value.request.gaps;
+  const initial = deliveredOf(writeGapLines(f.store, { project: f.project, previous: null, pass: 1, gaps: prior, closures: [] }));
+  const applied = deliveredOf(writeApplyAnswer(f.store, { project: f.project, input: mc1.value.request.input, answer: e5, question: reference(mc1) }));
+  const horizon = deliveredOf(writeHorizon(f.store, { project: f.project, input: reference(applied), graph: prior.sources.graph,
+    refinement: null, available: {}, choice: { choiceVersion: choice, features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const sources: GapRequest = { ...structuredClone(prior.sources), input: reference(applied), horizon: reference(horizon.gate),
+    operations: { ...structuredClone(prior.sources.operations), frame: { ...structuredClone(prior.sources.operations.frame), horizon: reference(horizon.gate) } } };
+  const gaps = deliveredOf(writeGaps(f.store, sources));
+  const current: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const answerAttempt = { series: e5Fact.attempt!.series, attempt: e5Fact.attempt!.ordinal };
+  const closure = { id: e5Fact.gap.id, reason: "filled" as const, basis: e5, acceptance: null, attempt: answerAttempt, answer: { record: e5 } };
+  const lines = deliveredOf(writeGapLines(f.store, { project: f.project, previous: reference(initial), pass: 2, gaps: current, closures: [closure] }));
+  const d2 = reference(lines);
+  // G7 confirms both through their providers; the canonical minimum of the full Ref represents the shared key.
+  const closing = { ...at, attempt: 2, outcome: outcome({ accepting: [e5, d2] }) };
+  deliveredOf(closeAttempt(f.store, closing));
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[1]!.outcome!;
+  assert.deepEqual(saved.achieved.map(item => item.key), [e5Fact.key]);
+  const representative = saved.achieved[0]!.basis.id.startsWith("om-gap-line") ? "D2" : "D5";
+  assert.equal(canonical(saved.achieved[0]!.basis), [canonical(e5), canonical(d2)].sort()[0]);
+  const context = { project: f.project, block: f.block, goal: f.attemptGoal,
+    attempt: { series: reference(f.store.get<RepairSeries>(f.series.id)!), ordinal: 2 }, accepting: [e5, d2] };
+  assert.equal(acceptanceRepresents(f.store, context, saved.achieved[0]!.basis, e5Fact.key), true);
+  const confirmation = { project: f.project, basis: { record: e5 }, target: e5Fact.gap.target, field: e5Fact.gap.field,
+    prior, current, attempt: answerAttempt, currentOnly: true };
+  const repeat = async () => {
+    assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent)),
+      { complete: true, closed: true, results: [reference(terminal)] });
+    assert.deepEqual(deliveredOf(await assessFact(f.store, second)), terminal);
+    assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, e5Fact.key);
+  };
+  await repeat();
+  const before = f.store.list().map(reference), sends = f.sent().length;
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, closing)).attempt, 2);
+  await repeat();
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.sent().length, sends);
+  return representative;
+}
+test("C22 C2 C10 C12 O12 E8 E9 H1.0d the E5 repeat and its consumption accept a D2 or a D5 representative of the equal key, after restart too", async t => {
+  const seen = new Set<string>();
+  for (const choice of ["h10d-a", "h10d-b", "h10d-c", "h10d-d", "h10d-e", "h10d-f"]) {
+    if (seen.size === 2) break;
+    await t.test(choice, async child => { seen.add(await d2RepresentedAttempt(child, choice)); });
+  }
+  assert.deepEqual([...seen].sort(), ["D2", "D5"], "both real permutations of the canonical representative are exercised");
+});
+
+test("C6 C7 H1.0d the key is the semantic addressing: another accepted kind is another result, the call and revisions are not", async t => {
+  const keys: string[][] = [];
+  for (const kind of ["repository-fact", "owner-decision"]) await t.test(kind, async child => {
+    const f = m5Fixture(child);
+    f.steps([f.answer(undefined, kind)]);
+    const e4 = reference(deliveredOf(await runModelCall(f.store, f.call())).record);
+    keys.push(deliveredOf(confirmResults(f.store, { ...m5Context(f), accepting: [e4] })).achieved.map(item => item.key).sort());
+  });
+  assert.equal(keys.length, 2);
+  assert.equal(keys[0]!.length, 2); assert.equal(keys[1]!.length, 2);
+  assert.ok(keys[0]!.every(key => !keys[1]!.includes(key)), "a different accepted kind is a different addressing result");
+});
+
+test("O9 O17 H1.0d owner control accepts no addressing: the standalone finish keeps its own reason when no call of the attempt applied one", async t => {
+  const f = m5Fixture(t);
+  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: [f.batch.items[0]!.gap],
+    action: "need_owner", reason: "The consumer is the owner's choice", decision: "Choose the consumer" } }]);
+  const sent = await runModelCall(f.store, f.call());
+  const e4 = reference(f.store.list("model-call")[0]!);
+  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+  assert.ok(saved, `the owner-control finish closes the standalone attempt (${sent.ok ? "applied" : sent.refusal.code})`);
+  assert.deepEqual([saved.reason, saved.achieved], ["awaiting-owner", []]);
+  assert.equal(refusalOf(confirmResults(f.store, { ...m5Context(f), accepting: [e4] })).code, "achievement_unconfirmed");
+  f.restart();
+  assert.ok(readModelCallState(f.store, { project: f.project, record: e4 }).ok);
+});
+
+/** Stops a real dispatch after its E1 and before its E4 claim (the review probe of №1704). */
+async function m5CallWithoutE4(f: ReturnType<typeof m5Fixture>, request: ModelCallRequest): Promise<void> {
+  const original = f.store.writeMany.bind(f.store);
+  let stop = true;
+  f.store.writeMany = ((writes, guards) => {
+    if (stop && writes.some(write => write.kind === "model-call")) { stop = false; throw new Error("stop before E4 claim"); }
+    return original(writes, guards);
+  }) as Store["writeMany"];
+  try { await assert.rejects(() => runModelCall(f.store, request), /stop before E4 claim/); }
+  finally { f.store.writeMany = original; }
+}
+test("C15 H1.0d a close prepared before the first E1 guards the absent ledger: the later applied M5 result fails it", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer()]);
+  const request = f.call();
+  const prepared = deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
+  assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id === callLedgerId(f.project)));
+  assert.equal(deliveredOf(await runModelCall(f.store, request)).outcome?.kind, "input-decisions");
+  const second = new Store(f.database); t.after(() => second.close());
+  const written = writeGuarded(second, { unit: "G7", target: f.series.id, writes: [...prepared.writes], guards: [...prepared.guards] });
+  assert.equal(written.ok, false, "the prepared no-result close must not erase a subsequently applied M5 result");
+  assert.equal(second.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+});
+test("C15 H1.0d an E1 without E4 guards the absence of its E4, which unknown usage never settles in the ledger", async t => {
+  const f = m5Fixture(t);
+  f.steps([f.answer()]);
+  const request = f.call();
+  await m5CallWithoutE4(f, request);
+  assert.equal(f.store.list("model-call").length, 0); assert.equal(f.store.list("call-record").length, 1);
+  const prepared = deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
+  assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id.startsWith(`model-call:${f.project}:om:`)));
+  const ledgerBefore = reference(f.store.list(CALL_LEDGER_KIND)[0]!);
+  assert.equal(deliveredOf(await runModelCall(f.store, request)).outcome?.kind, "input-decisions");
+  assert.deepEqual(reference(f.store.list(CALL_LEDGER_KIND)[0]!), ledgerBefore, "unknown usage leaves the E1 ledger unchanged");
+  const second = new Store(f.database); t.after(() => second.close());
+  const written = writeGuarded(second, { unit: "G7", target: f.series.id, writes: [...prepared.writes], guards: [...prepared.guards] });
+  assert.equal(written.ok, false, "the exact absence of the E4 guards the close");
+});
+test("C15 C43 H1.0d the public finish entry carries the absence of another admitted E4: it finishes without that call, fails in the window, keeps its later K", async t => {
+  const finishOf = (f: ReturnType<typeof m5Fixture>, request: ModelCallRequest) => {
+    const requestId = f.store.get<{ packet: { requestId: string } }>(request.packet.id, request.packet.revision)!.value.packet.requestId;
+    const call = f.store.list<{ call: string }>("call-record").find(record => record.value.call === requestId)!;
+    return { project: f.project, packet: request.packet, call: reference(call), response: null,
+      code: "model_no_progress", message: "The addressed reads add no information to this attempt", reason: "refused" as const };
+  };
+  // The finishing call B was admitted on the older environment; the other call A on the current one, both before E4.
+  const scenario = async (child: test.TestContext) => {
+    const f = m5Fixture(child);
+    f.steps([f.answer()]);
+    const b = f.call();
+    await m5CallWithoutE4(f, b);
+    const a = f.call(f.environment(90_000));
+    await m5CallWithoutE4(f, a);
+    return { f, a, finish: finishOf(f, b) };
+  };
+  await t.test("without a competing write the finish completes and never dispatches the other call", async child => {
+    const { f, finish } = await scenario(child);
+    const prepared = deliveredOf(prepareModelAttemptFinish(f.store, finish));
+    assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id.startsWith(`model-call:${f.project}:om:`)));
+    deliveredOf(finishModelAttempt(f.store, finish));
+    const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+    assert.deepEqual([saved.reason, saved.achieved], ["refused", []]);
+    assert.equal(f.store.list("model-call").length, 0);
+    const before = mechanismSnapshot(f.store);
+    f.restart();
+    assert.deepEqual(deliveredOf(prepareModelAttemptFinish(f.store, finish)).writes, [], "the repeat does not depend on today's absence");
+    assert.deepEqual(mechanismSnapshot(f.store), before);
+  });
+  await t.test("an E4 applied with unknown usage in the window fails the prepared finish atomically; a fresh finish keeps its K", async child => {
+    const { f, a, finish } = await scenario(child);
+    const prepared = deliveredOf(prepareModelAttemptFinish(f.store, finish));
+    const ledger = reference(f.store.list(CALL_LEDGER_KIND)[0]!);
+    const applied = deliveredOf(await runModelCall(f.store, a));
+    assert.equal(applied.outcome?.kind, "input-decisions");
+    assert.deepEqual(reference(f.store.list(CALL_LEDGER_KIND)[0]!), ledger, "unknown usage settles nothing in the E1 ledger");
+    const before = mechanismSnapshot(f.store);
+    const second = new Store(f.database); child.after(() => second.close());
+    assert.equal(writeGuarded(second, { unit: "E4", target: finish.call.id, writes: [...prepared.writes], guards: [...prepared.guards] }).ok, false);
+    assert.deepEqual(mechanismSnapshot(f.store), before, "no partial diagnostic, journal or A3");
+    deliveredOf(finishModelAttempt(f.store, finish));
+    const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
+    assert.equal(saved.reason, "result");
+    assert.deepEqual(saved.achieved.map(item => item.key).sort(), f.batch.items.map(item => m5Key(f, item.target)).sort());
+    const closed = mechanismSnapshot(f.store);
+    f.restart();
+    assert.deepEqual(deliveredOf(prepareModelAttemptFinish(f.store, finish)).writes, []);
+    assert.deepEqual(mechanismSnapshot(f.store), closed);
+  });
 });
