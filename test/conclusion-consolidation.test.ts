@@ -4,11 +4,11 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture } from './synthesis-session-fixture.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
-import { checkpoint } from '../src/discovery/research-continuation.js';
 import { researchAction } from '../src/discovery/research-protocol.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
 import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
 import { activeSynthesisNotes, consolidatedProposal, consolidationNeeded } from '../src/discovery/conclusion-consolidation.js';
+import { compactConclusions } from '../src/discovery/continuation-packet.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import type { Question } from '../src/discovery/discovery.js';
@@ -18,7 +18,7 @@ test('growing notes consolidate once with exact citations and unresolved items, 
   const f = await fixture(t, 18000, 100000, 0.35, 0, {}, 45000);
   await assert.rejects(withInvocationAllowance(1, f.invoke), { code: 'research_call_allowance' });
   const after = f.store.get<any>(f.before.id)!;
-  assert.equal(after.value.offset, f.before.value.offset); assert.equal(after.value.materialOffset, 5);
+  assert.equal(after.value.offset, f.before.value.offset); assert.equal(after.value.materialOffset, f.before.value.materialOffset);
   assert.deepEqual(after.value.notes.slice(0, 3), f.notes); assert.equal(after.value.notes.length, 4);
   assert.deepEqual(f.store.get(f.before.id, f.before.revision), f.before);
   const active = activeSynthesisNotes(after.value.notes); assert.equal(active.length, 1);
@@ -28,17 +28,17 @@ test('growing notes consolidate once with exact citations and unresolved items, 
   assert.deepEqual(summary.proposal.unresolved, ['Keep unresolved-0', 'Keep unresolved-1', 'Keep unresolved-2', 'New conflict remains open']);
   const saved = f.store.get<any>(summary.checkpoint.id)!;
   assert.equal(saved.value.status, 'unassessed'); assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'open');
-  const wire = f.wires()[1]; assert.equal(wire.subject.dispatchMode, 'consolidation'); assert.equal(wire.subject.continuation.kind, 'continuation');
+  const wire = f.wires().find(w => w.subject.dispatchMode === 'consolidation')!; assert.equal(wire.subject.continuation.kind, 'continuation');
   assert.ok(JSON.stringify(wire).length <= f.pilot.value.maxContinuationChars!);
   assert.equal(wire.subject.materialPage, undefined); assert.equal(wire.subject.core, undefined);
   assert.equal(wire.subject.contextWorkspace, undefined); assert.equal(wire.subject.synthesisMaterials, undefined);
   assert.ok(wire.prompt.includes('citationIds'));
-  const calls = f.store.list<ModelCall>('model-call'); assert.equal(calls.length, 2);
+  const calls = f.store.list<ModelCall>('model-call'); assert.equal(calls.length, f.setupCalls + 1);
   assert.ok(calls.every(c => c.value.purpose === 'analyst' && c.value.usage?.inputTokens === 10));
   const next = JSON.parse((await previewResearch(f.invoke)).input).subject;
-  assert.equal(next.dispatchMode, 'synthesis'); assert.equal(next.materialPage.offset, 5);
-  assert.equal(next.materialPage.text, JSON.stringify(f.material).slice(5, next.materialPage.end));
-  assert.ok(next.materialPage.end > 5); assert.equal(next.conclusions.length, 1);
+  assert.equal(next.dispatchMode, 'synthesis'); assert.equal(next.materialPage.offset, f.before.value.materialOffset);
+  assert.equal(next.materialPage.text, JSON.stringify(f.material).slice(f.before.value.materialOffset, next.materialPage.end));
+  assert.ok(next.materialPage.end > f.before.value.materialOffset); assert.equal(next.conclusions.length, 1);
   assert.ok(!JSON.stringify(next.conclusions).includes('0'.repeat(500)));
   assert.equal(consolidationNeeded(after.value.notes, { ...f.pilot.value, conclusionShare: 0.001 }), false, 'No new page means no second paid consolidation');
 });
@@ -60,7 +60,7 @@ test('coverage, missing fields, foreign note indexes and citation substitution f
     assert.throws(() => consolidatedProposal(researchAction({ ...good, value: { ...good.value, citationIds: ids } }), f.question.id, f.notes),
       { code: 'consolidation_citations_invalid' });
   }
-  assert.equal(f.store.get<any>(f.before.id)!.value.notes.length, 3); assert.equal(f.store.list('model-call').length, 1);
+  assert.equal(f.store.get<any>(f.before.id)!.value.notes.length, 3); assert.equal(f.store.list('model-call').length, f.setupCalls);
 });
 
 test('an unfit next fragment triggers consolidation even below the configurable share, without raising any ceiling', async t => {
@@ -79,37 +79,38 @@ test('an unfit next fragment triggers consolidation even below the configurable 
   assert.ok(found, 'The actual packer must reach the fragment-not-fit path');
   await assert.rejects(withInvocationAllowance(1, f.invoke), { code: 'research_call_allowance' });
   const packet = JSON.parse((await previewResearch(f.invoke)).input).subject;
-  assert.equal(packet.dispatchMode, 'synthesis'); assert.ok(packet.materialPage.end > 5);
+  assert.equal(packet.dispatchMode, 'synthesis'); assert.ok(packet.materialPage.end > f.before.value.materialOffset);
   assert.equal(f.store.get(f.pilot.id)!.revision, f.pilot.revision); assert.equal(f.store.list('research-limit').length, 0);
 });
 
 test('a paid summary that misses its goal but fits the actual packet continues without another compaction', async t => {
-  const f=await fixture(t,20),proposal={action:'checkpoint' as const,question:f.question.id,value:{finding:'x'.repeat(3000)},citations:[],unresolved:['Preserve this uncertainty']};
-  const saved=checkpoint(f.store,f.draft,f.question,{...proposal,value:proposal as unknown as import('../src/canonical.js').Json});
-  const paid={checkpoint:reference(saved),proposal,page:{offset:0,end:0},consolidated:{replaces:f.notes.map(note=>note.checkpoint),format:2 as const,targetChars:10,fullTargetChars:100}};
-  const session=f.store.get<any>(f.before.id)!;f.store.write({id:session.id,kind:session.kind,expected:session.revision,value:{...session.value,notes:[...session.value.notes,paid]}});
-  const consolidations=f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length;
-  assert.equal((await f.invoke()).action,'pause');
-  const after=f.store.get<any>(f.before.id)!;
-  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,consolidations);
-  assert.equal(f.store.list('model-call').length,2);
-  assert.deepEqual(after.value.notes.slice(0,4),[...f.notes,paid]);
-  const active=activeSynthesisNotes(after.value.notes);assert.equal(active.length,1);
-  assert.ok(active[0]!.consolidated!.targetChars!<JSON.stringify(active[0]!.proposal).length);
-  const packet=JSON.parse((await previewResearch(f.invoke)).input);
-  assert.equal(packet.subject.dispatchMode,'synthesis');assert.ok(JSON.stringify(packet).length<=100000);
-  assert.equal(after.value.notices.length,1);assert.equal(after.value.notices[0].code,'consolidation_target_exceeded');
+  // The summary is produced by a real paid consolidation whose text overshoots
+  // the capacity goal, yet the next synthesis packet still fits (№1555 X30).
+  const f = await fixture(t, 18000, 100000, 0.35, 12000, {}, 45000);
+  assert.equal((await f.invoke()).action, 'pause');
+  const calls = f.store.list('model-call').length;
+  assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'consolidation').length, 1);
+  const after = f.store.get<any>(f.before.id)!;
+  assert.deepEqual(after.value.notes.slice(0, 3), f.notes); assert.equal(after.value.notes.length, 4);
+  const active = activeSynthesisNotes(after.value.notes); assert.equal(active.length, 1);
+  assert.ok(active[0]!.consolidated!.targetChars! < JSON.stringify(compactConclusions(active).items).length);
+  assert.equal(after.value.notices.length, 1); assert.equal(after.value.notices[0].code, 'consolidation_target_exceeded');
+  assert.equal((await f.invoke()).action, 'pause');
+  assert.equal(f.store.list('model-call').length, calls + 1, 'the fitting packet never buys a second compaction');
+  assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'consolidation').length, 1);
+  const packet = JSON.parse((await previewResearch(f.invoke)).input);
+  assert.equal(packet.subject.dispatchMode, 'synthesis'); assert.ok(JSON.stringify(packet).length <= 100000);
 });
 
 test('a non-fitting paid summary gets one tightening and then the fitting material packet continues', async t => {
-  const f=await fixture(t,5000,60000,0.2,0,{},30000);
+  const f=await fixture(t,12000,60000,0.35,0,{},9000);
   writeFileSync(f.path,`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
 appendFileSync(${JSON.stringify(join(f.root,'wire.ndjson'))},JSON.stringify(r)+'\\n');
 const chars=c.consolidation.tightening?14000:42000,research=c.dispatchMode==='consolidation'?{action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'X'.repeat(chars)}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]}:{action:'pause',reason:'Tightened packet fits'};
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   await assert.rejects(withInvocationAllowance(2,f.invoke),{code:'research_call_allowance'});
   const session=f.store.get<any>(f.before.id)!;
-  assert.equal(f.store.list('model-call').length,3);
+  assert.equal(f.store.list('model-call').length,f.setupCalls+2);
   assert.deepEqual(session.value.notes.slice(0,3),f.notes);
   const active=activeSynthesisNotes(session.value.notes);assert.equal(active.length,1);
   assert.deepEqual(active[0]!.consolidated!.tightenedFrom,session.value.notes[3].checkpoint);
@@ -122,7 +123,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
 test('an oversized notes-only input stops before payment and never increases transport limits', async t => {
   const f = await fixture(t, 40000);
   await assert.rejects(f.invoke(), { code: 'consolidation_input_limit' });
-  assert.equal(f.store.list('model-call').length, 1); assert.deepEqual(f.store.get(f.before.id), f.before);
+  assert.equal(f.store.list('model-call').length, f.setupCalls); assert.deepEqual(f.store.get(f.before.id), f.before);
 });
 
 test('paid consolidation has the same explicit recovery door across the checkpoint/session write window', async t => {
@@ -139,10 +140,11 @@ test('paid consolidation has the same explicit recovery door across the checkpoi
   const command = { type: 'recover-research-response' as const, project: 'p', call: reference(call), session: reference(before) };
   const receipt = await f.engine.execute(command) as any;
   assert.equal(receipt.value.state, 'applied'); assert.deepEqual(await f.engine.execute(command), receipt);
-  assert.equal(f.store.list('model-call').length, 2); assert.equal(f.store.get<any>(before.id)!.value.materialOffset, 5);
+  assert.equal(f.store.list('model-call').length, f.setupCalls + 1);
+  assert.equal(f.store.get<any>(before.id)!.value.materialOffset, before.value.materialOffset);
   assert.equal(f.store.get<any>(before.id)!.value.notes.length, 4);
   const next = JSON.parse((await previewResearch(f.invoke)).input).subject;
-  assert.equal(next.dispatchMode, 'synthesis'); assert.equal(next.materialPage.offset, 5);
+  assert.equal(next.dispatchMode, 'synthesis'); assert.equal(next.materialPage.offset, before.value.materialOffset);
 });
 
 test('conclusionShare must be a proper fraction and cannot masquerade as a transport ceiling', async t => {

@@ -877,8 +877,8 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   assert.equal(pendingSynthesis(store,draft,question,environment,context),false);
   const count=store.list('model-call').length;
   writeFileSync(join(root,'first.txt'),'Changed after partial synthesis');
-  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'synthesis_evidence_stale'});
-  assert.equal(store.list('model-call').length,count,'Stale notes must fail before another model call');
+  assert.deepEqual(await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),result);
+  assert.equal(store.list('model-call').length,count,'The finished direct task replays its saved answer by the saved bases, without another model call');
 });
 
 test("an explicit synthesis pause does not become an unresumable cached result", async t => {
@@ -895,11 +895,12 @@ test("an explicit synthesis pause does not become an unresumable cached result",
   assert.equal((await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON')).action,'need_research');
   assert.equal(store.list('model-call').length,2);
   writeFileSync(join(root,'README.md'),'Changed directly-read source');
-  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'synthesis_evidence_stale'});
-  writeFileSync(join(root,'README.md'),source.value.content);
+  assert.equal((await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON')).action,'need_research',
+    'the finished need_research outcome replays by its saved bases, without a current file check');
   store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'A changed question'}}});
-  await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'input_stale'});
-  assert.equal(store.list('model-call').length,2,'Cached answers cannot bypass changed inputs');
+  assert.equal((await synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON')).action,'need_research',
+    'the exact repeat of the final outcome is historical even under a moved head');
+  assert.equal(store.list('model-call').length,2,'the finished direct task replays its saved outcome — exactly two payments');
 });
 
 test("synthesis combines recent selections with older paid readings without duplicate evidence", async t => {

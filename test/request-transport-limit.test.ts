@@ -37,5 +37,5 @@ test('above maxRequestChars the existing capacity refusal still stops before pay
   const f=await fixture(t,20,100000,0.35,0,{maxContinuationChars:500000});
   f.context.request={required:'x'.repeat(110000)};
   await assert.rejects(f.invoke(),{code:'research_context_capacity'});
-  assert.equal(f.store.list('model-call').length,1);assert.deepEqual(f.store.get(f.pilot.id),f.pilot);
+  assert.equal(f.store.list('model-call').length,f.setupCalls);assert.deepEqual(f.store.get(f.pilot.id),f.pilot);
 });

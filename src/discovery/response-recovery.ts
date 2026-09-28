@@ -19,8 +19,11 @@ import { Evidence, type Source } from '../evidence/evidence.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
 import { isResearchPreview } from './research-preview.js';
-import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply } from './research-consumer-transition.js';
-import { derivePaidReaderResult, readerApplicationAdmission } from './reader.js';
+import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
+  isReservationOnlySessionStep,
+  projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
+  type SynthesisSessionState, type SynthesisTransitionInput } from './research-consumer-transition.js';
+import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 
 export interface ResponseRecovery {
   projectId: string; declaredBy: string; call: Ref; request: Ref; response: Ref; archive: Ref;
@@ -67,8 +70,9 @@ export function operatorReplayedResponse(role: RoleBinding, input: string,
 }
 
 /** Commit the ordinary consumer's state and its recovery receipt together.
- * A crash cannot advance a cursor without preserving the applied identity. */
-export function recoverySessionWrites(write: Write): { writes: Write[]; guards: TransactionGuard[] } {
+ * A crash cannot advance a cursor without preserving the applied identity.
+ * extraWrites carries the transition's checkpoint into the same transaction. */
+export function recoverySessionWrites(write: Write, extraWrites: Write[] = []): { writes: Write[]; guards: TransactionGuard[] } {
   const scope = current.getStore(); if (!scope) return { writes: [], guards: [] };
   requireCondition(scope.delivered && !scope.applied && write.id === scope.session.id && write.expected === scope.session.revision,
     'response_recovery_context_changed', 'An operator replay may update only its exact unconsumed session');
@@ -84,7 +88,7 @@ export function recoverySessionWrites(write: Write): { writes: Write[]; guards: 
   const head = scope.store.get<ResearchConsumerIntent>(original.id);
   requireCondition(head, 'response_recovery_context_changed', 'The original consumer intent disappeared');
   const application = prepareResearchConsumerApplication(scope.store, reference(head), scope.origin.call,
-    [write], [scope.session, ...scope.guards]);
+    [write, ...extraWrites], [scope.session, ...scope.guards]);
   return { writes: [receipt, ...application.writes.slice(1)],
     guards: uniqueTransactionGuards([...scope.guards, ...application.guards]) };
 }
@@ -93,6 +97,13 @@ export function markRecoveredSessionWritten(additions: { writes: Write[] }): voi
 }
 
 function responseSessionBinding(session: Revision<RecoverableContextSession>) {
+  // The v2 synthesis session parses through the shared producer contract
+  // (№1555 X52); legacy and assessment sessions keep their own checks.
+  if (session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:')) {
+    const parsed = parseSynthesisSessionV2(session.value);
+    requireCondition(parsed, 'response_recovery_binding_missing', 'The v2 session must retain its complete research binding');
+    return parsed.binding;
+  }
   const binding = session.value.binding;
   requireCondition(binding && isRef(binding.draft) && isRef(binding.question) && isRef(binding.environment)
     && Array.isArray(binding.inputs) && binding.inputs.every(isRef) && Array.isArray(session.value['notes'])
@@ -111,7 +122,7 @@ export interface ResearchConsumerIntent {
   cursor: Record<string, any>; basis: Ref[]; guards: TransactionGuard[];
   state: 'prepared' | 'running' | 'applied' | 'refused';
   call: Ref | null; request: Ref | null; archive: Ref | null; outputs: Ref[] | null;
-  refusal: { code: string; kind: 'provider-failed' | 'terminal' | 'reader-invalid';
+  refusal: { code: string; kind: 'provider-failed' | 'terminal' | 'reader-invalid' | 'consumer-invalid';
     call: Ref; request: Ref; response: Ref | null; archive: Ref } | null;
 }
 export type ResearchConsumerIntentInput = Omit<ResearchConsumerIntent,
@@ -166,7 +177,7 @@ function consumerShape(value: unknown, id: string): asserts value is ResearchCon
     || !(value.archive === null || isRef(value.archive))
     || !(value.outputs === null || Array.isArray(value.outputs) && value.outputs.every(isRef))
     || !(value.refusal === null || object(value.refusal) && Object.keys(value.refusal).sort().join(',') === 'archive,call,code,kind,request,response'
-      && ['provider-failed', 'terminal', 'reader-invalid'].includes(value.refusal.kind)
+      && ['provider-failed', 'terminal', 'reader-invalid', 'consumer-invalid'].includes(value.refusal.kind)
       && typeof value.refusal.code === 'string' && !!value.refusal.code
       && isRef(value.refusal.call) && isRef(value.refusal.request)
       && (value.refusal.response === null || isRef(value.refusal.response)) && isRef(value.refusal.archive)))
@@ -292,17 +303,23 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   if (saved.value.state === 'refused') {
     const paid = readResearchConsumerExecutionFromIntent(store, saved.value.projectId, saved);
     const refusal = saved.value.refusal!;
+    const synthesisFamily = saved.value.kind === 'synthesis' || saved.value.kind === 'consolidation';
     const expectedKind = paid.kind === 'provider-failed' ? 'provider-failed'
-      : paid.kind === 'terminal' ? 'terminal' : 'reader-invalid';
+      : paid.kind === 'terminal' ? 'terminal'
+      : saved.value.kind === 'reader' ? 'reader-invalid' : 'consumer-invalid';
     if (refusal.kind !== expectedKind
       || refusal.code !== (paid.kind === 'response' ? refusal.code : paid.code)
-      || paid.kind === 'response' && saved.value.kind !== 'reader'
+      || paid.kind === 'response' && saved.value.kind !== 'reader' && !synthesisFamily
       || canonical([refusal.call, refusal.request, refusal.response, refusal.archive]) !== canonical([
         reference(paid.call), paid.request, paid.response, paid.archive]))
       consumerInvalid(saved.id, 'The terminal refusal lacks its exact no-response physical proof');
-    if (paid.kind === 'response') {
+    if (paid.kind === 'response' && saved.value.kind === 'reader') {
       if (readerRefusalCode(saved, paid.payload) !== refusal.code)
         consumerInvalid(saved.id, 'The refused reader code differs from the original paid selection');
+    }
+    if (paid.kind === 'response' && synthesisFamily) {
+      if (synthesisTransitionRefusalCode(store, saved, paid) !== refusal.code)
+        consumerInvalid(saved.id, 'The refused synthesis step code differs from the exact paid transition');
     }
   }
   return saved;
@@ -762,9 +779,11 @@ export function readResearchConsumerExecution(store: Store, projectId: string, i
   return readResearchConsumerExecutionFromIntent(store, projectId, intent);
 }
 /** Terminalize the exact physical outcome. Only a proved empty provider
- * failure is eligible for a later external generation permit. */
+ * failure is eligible for a later external generation permit. A received but
+ * unlawful reply is saved as an unresumable refusal with the exact code the
+ * common transition throws on it. */
 export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
-  readerCode?: 'reader_response_invalid' | 'reader_response_empty' | 'reader_selection_foreign' | 'reader_output_limit'): Revision<ResearchConsumerIntent> {
+  expectedCode?: string): Revision<ResearchConsumerIntent> {
   const supplied = readResearchConsumerIntent(store, intentRef);
   const current = store.get<ResearchConsumerIntent>(supplied.id);
   if (!current) consumerInvalid(supplied.id, 'The selected consumer intent disappeared');
@@ -773,15 +792,31 @@ export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
   if (intent.value.state !== 'running')
     consumerInvalid(intent.id, 'Only a running paid operation can close as no-response refused');
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
-  if (paid.kind === 'response' && (!readerCode || intent.value.kind !== 'reader'))
+  const synthesisFamily = intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation';
+  if (paid.kind === 'response' && intent.value.kind !== 'reader' && !synthesisFamily)
     consumerInvalid(intent.id, 'A received response needs its proved reader refusal');
-  if (paid.kind !== 'response' && readerCode)
-    consumerInvalid(intent.id, 'A physical refusal cannot claim a reader selection failure');
-  if (paid.kind === 'response' && readerRefusalCode(intent, paid.payload) !== readerCode)
-    consumerInvalid(intent.id, 'The claimed reader refusal differs from the exact paid selection');
+  if (paid.kind !== 'response' && expectedCode)
+    consumerInvalid(intent.id, 'A physical refusal cannot claim a semantic selection failure');
+  let refusalKind: NonNullable<ResearchConsumerIntent['refusal']>['kind'];
+  let refusalCode: string;
+  if (paid.kind === 'response' && intent.value.kind === 'reader') {
+    if (expectedCode !== 'reader_response_invalid' && expectedCode !== 'reader_response_empty'
+      && expectedCode !== 'reader_selection_foreign' && expectedCode !== 'reader_output_limit')
+      consumerInvalid(intent.id, 'A received response needs its proved reader refusal');
+    if (readerRefusalCode(intent, paid.payload) !== expectedCode)
+      consumerInvalid(intent.id, 'The claimed reader refusal differs from the exact paid selection');
+    refusalKind = 'reader-invalid'; refusalCode = expectedCode;
+  } else if (paid.kind === 'response' && synthesisFamily) {
+    const proved = synthesisTransitionRefusalCode(store, intent, paid);
+    if (!proved) consumerInvalid(intent.id, 'A cleanly applying synthesis response cannot become a refusal');
+    if (expectedCode !== undefined && expectedCode !== proved)
+      consumerInvalid(intent.id, 'The claimed synthesis refusal differs from the exact paid transition');
+    refusalKind = 'consumer-invalid'; refusalCode = proved;
+  } else if (paid.kind === 'response') {
+    consumerInvalid(intent.id, 'A received response needs its proved reader refusal');
+  } else { refusalKind = paid.kind; refusalCode = paid.code; }
   const refusal: NonNullable<ResearchConsumerIntent['refusal']> = {
-    kind: paid.kind === 'response' ? 'reader-invalid' : paid.kind,
-    code: paid.kind === 'response' ? readerCode! : paid.code,
+    kind: refusalKind, code: refusalCode,
     call: reference(paid.call), request: paid.request, response: paid.response, archive: paid.archive };
   return store.writeMany<ResearchConsumerIntent>([{ id: intent.id, kind: intent.kind,
     expected: intent.revision, value: { ...intent.value, state: 'refused', refusal } }],
@@ -991,8 +1026,114 @@ function readerRefusalCode(intent: Revision<ResearchConsumerIntent>, payload: un
   } catch (error) { if (error instanceof EngineError) return error.code; throw error; }
 }
 
+/** Rebuild the synthesis transition inputs from the exact intent and its
+ * proved physical execution. Used by both the refusal proof and the
+ * application validator; the transition itself never reads a mutable head. */
+function synthesisTransitionProofInput(store: Store, intent: Revision<ResearchConsumerIntent>,
+  paid: ResearchConsumerExecution, beforeRevision?: number): SynthesisTransitionInput {
+  const cursor = intent.value.cursor;
+  const session = store.get<SynthesisSessionState>(intent.value.owner.id, beforeRevision ?? intent.value.owner.revision);
+  if (!session || session.kind !== 'synthesis-session' || !object(session.value)
+    || hashJson(session.value) !== session.hash
+    || (beforeRevision === undefined && canonical(reference(session)) !== canonical(intent.value.owner))
+    || session.value.contract !== 'synthesis-session/v2')
+    consumerInvalid(intent.id, 'The synthesis step lost its exact original session state');
+  const archive = store.get<Record<string, any>>(paid.archive.id, paid.archive.revision);
+  if (!archive || archive.kind !== 'research-context' || !object(archive.value) || !object(archive.value.body)
+    || canonical(reference(archive)) !== canonical(paid.archive) || hashJson(archive.value) !== archive.hash)
+    consumerInvalid(intent.id, 'The synthesis step lost its exact archived context');
+  const pilot = intent.value.profile
+    ? store.get<import('./reader-pilot.js').ReaderPilot>(intent.value.profile.id, intent.value.profile.revision) : null;
+  if (intent.value.profile && (!pilot || pilot.kind !== 'reader-pilot'
+    || canonical(reference(pilot)) !== canonical(intent.value.profile)))
+    consumerInvalid(intent.id, 'The synthesis step lost its exact reader profile');
+  return { store, projectId: intent.value.projectId,
+    kind: intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis',
+    sessionId: intent.value.owner.id, before: session.value, draft: intent.value.draft, question: intent.value.question,
+    delivery: object(cursor.delivery) && typeof cursor.delivery.run === 'string' && Number.isSafeInteger(cursor.delivery.turn)
+      ? { run: cursor.delivery.run, turn: cursor.delivery.turn } : null,
+    subject: paid.subject, payload: paid.kind === 'response' ? paid.payload : null, archive: archive.value.body,
+    readLimit: pilot?.value.maxRequestChars ?? 300000,
+    // Origin proof is mandatory on every path through this proof input:
+    // the write validator, the refusal proof and the historical reader alike.
+    proveRecord: record => { readReaderResultAt(store, intent.value.projectId, reference(record)); } };
+}
+
+/** The saved refusal of a received synthesis reply is lawful only when the
+ * common transition actually throws that typed refusal on the exact inputs. */
+function synthesisTransitionRefusalCode(store: Store, intent: Revision<ResearchConsumerIntent>,
+  paid: ResearchConsumerExecution): string | null {
+  try {
+    projectSynthesisTransition(synthesisTransitionProofInput(store, intent, paid));
+    return null;
+  } catch (error) {
+    if (error instanceof EngineError && SYNTHESIS_TRANSITION_REFUSAL_CODES.has(error.code)) return error.code;
+    throw error;
+  }
+}
+
+/** The exact transition a paid synthesis-family step produced, re-derived for
+ * the session chain reader and the application validator from one formula.
+ * Proven history also proves every lookup record by its own general reader:
+ * a session chain never stands on a record that reader rejects. */
+export function projectPaidSynthesisTransition(store: Store, intent: Revision<ResearchConsumerIntent>) {
+  const paid = readResearchConsumerExecution(store, intent.value.projectId, reference(intent));
+  if (paid.kind !== 'response')
+    consumerInvalid(intent.id, 'The applied synthesis step has no proved received response');
+  // The transition was derived on the exact predecessor of the produced
+  // revision — reservation-only steps in between belong to the same task.
+  const produced = (intent.value.outputs ?? []).find(output => output.id === intent.value.owner.id);
+  return projectSynthesisTransition(synthesisTransitionProofInput(store, intent, paid,
+    produced ? produced.revision - 1 : undefined));
+}
+
 function validateConsumerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>, writes: Write[],
   physical?: ResearchConsumerExecution): void {
+  if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
+    const paid = physical ?? readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+    if (paid.kind !== 'response') consumerInvalid(intent.id, 'An applied synthesis step needs the paid response');
+    let transition: ReturnType<typeof projectSynthesisTransition>;
+    try { transition = projectSynthesisTransition(synthesisTransitionProofInput(store, intent, paid)); }
+    catch (error) {
+      if (error instanceof EngineError) consumerInvalid(intent.id,
+        `The applied synthesis session does not derive from its paid response: ${error.code}`);
+      throw error;
+    }
+    const sessionWrite = writes.find(write => write.id === intent.value.owner.id);
+    const rest = writes.filter(write => write.id !== intent.value.owner.id);
+    if (!sessionWrite || sessionWrite.kind !== 'synthesis-session')
+      consumerInvalid(intent.id, 'The session write does not derive from the exact paid response and cursor');
+    // Reservation-only steps may sit between the step's owner and the applied
+    // head (№1658 К2): the transition is then re-derived on the proven head.
+    let beforeRevision = intent.value.owner.revision;
+    for (let revision = intent.value.owner.revision + 1; revision <= sessionWrite!.expected; revision += 1) {
+      const step = store.get<SynthesisSessionState>(intent.value.owner.id, revision);
+      const prior = store.get<SynthesisSessionState>(intent.value.owner.id, revision - 1);
+      if (!step || !prior || !isReservationOnlySessionStep(step.value, prior.value))
+        consumerInvalid(intent.id, 'The session write does not derive from the exact paid response and cursor');
+      beforeRevision = revision;
+    }
+    if (beforeRevision !== intent.value.owner.revision) {
+      transition = projectSynthesisTransition(synthesisTransitionProofInput(store, intent, paid, beforeRevision));
+    }
+    if (canonical(sessionWrite!.value) !== canonical(transition.session))
+      consumerInvalid(intent.id, 'The session write does not derive from the exact paid response and cursor');
+    if (transition.checkpoint) {
+      const checkpointWrite = rest.find(write => write.id === transition.checkpoint!.id);
+      if (checkpointWrite) {
+        if (checkpointWrite.kind !== 'research-checkpoint' || checkpointWrite.expected !== 0
+          || canonical(checkpointWrite.value) !== canonical(transition.checkpoint.value))
+          consumerInvalid(intent.id, 'The checkpoint write does not derive from the exact paid response');
+      } else {
+        const existing = store.get(transition.checkpoint.id);
+        if (!existing || existing.kind !== 'research-checkpoint' || hashJson(existing.value) !== existing.hash
+          || canonical(existing.value) !== canonical(transition.checkpoint.value))
+          consumerInvalid(intent.id, 'The applied checkpoint is missing its exact saved record');
+      }
+      if (rest.length !== (checkpointWrite ? 1 : 0)) consumerInvalid(intent.id, 'The application carried foreign writes');
+    } else if (rest.length) consumerInvalid(intent.id, 'The application carried foreign writes');
+    return;
+  }
   if (intent.value.kind !== 'reader' || writes.length !== 1 || writes[0]?.kind !== 'reader-result'
     || writes[0].expected !== 0 || !object(writes[0].value))
     consumerInvalid(intent.id, 'Only the exact reader result can be applied by this family');
@@ -1024,6 +1165,9 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
     consumerInvalid(intent.id, 'Application must guard the exact current consumer state');
   const currentReaderGuards = intent.value.kind === 'reader' ? readerApplicationAdmission(store, intent) : [];
   const refreshed = new Set(currentReaderGuards.map(guard => guard.id));
+  // The dispatch-time basis stays immutable inside the intent, but the
+  // application transaction takes today's admission heads for the same ids.
+  for (const guard of guards) if (!('absent' in guard)) refreshed.add(guard.id);
   const original = intent.value.guards.filter(guard => guard.id !== intent.value.owner.id && !refreshed.has(guard.id));
   const required = uniqueTransactionGuards([...original, ...currentReaderGuards, ...guards, reference(intent), reference(paid.call),
     paid.request, paid.response, paid.archive]);
@@ -1260,9 +1404,39 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
     return previous;
   }
   const session = store.get<RecoverableContextSession>(sessionRef.id), call = store.get<ModelCall>(callRef.id);
+  const isV2Synthesis = !!session && session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:');
   requireCondition(session && ['synthesis-session', 'assessment-session'].includes(session.kind) && object(session.value)
-    && session.value.projectId === project && canonical(reference(session)) === canonical(sessionRef),
+    && session.value.projectId === project
+    && (isV2Synthesis || canonical(reference(session)) === canonical(sessionRef)),
   'response_recovery_session_stale', 'Recovery requires the current exact supported session');
+  if (isV2Synthesis) {
+    // №1555 X27: v2 recovery is the exact restoration of the selected paid
+    // step; sessionRef must name the proven pre-application state of that
+    // step, never an arbitrary current head. An already lawful A is confirmed
+    // once by a receipt-link to the proven sessionBefore/sessionAfter — never
+    // a second application; a later session revision never stalemates it.
+    const parsed = parseSynthesisSessionV2(session!.value);
+    requireCondition(parsed, 'response_recovery_binding_missing', 'The v2 session must retain its producer contract');
+    const bound = listResearchConsumerIntents(store, project, parsed.binding.draft.id)
+      .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind)
+        && intent.value.owner.id === session!.id && intent.value.call?.id === callRef.id);
+    requireCondition(bound.length === 1, 'response_recovery_call_foreign',
+      'The selected call is not bound to exactly one step of this session');
+    const intent = bound[0]!;
+    requireCondition(canonical(sessionRef) === canonical(intent.value.owner),
+      'response_recovery_session_stale', 'The v2 recovery names the exact pre-application session of the selected step');
+    if (intent.value.state === 'applied') {
+      const sessionAfter = intent.value.outputs?.find(output => output.id === session!.id);
+      requireCondition(sessionAfter, 'response_recovery_invalid', 'The applied step lost its exact session output');
+      const paid = readResearchConsumerExecution(store, project, reference(intent));
+      requireCondition(paid.kind === 'response' && paid.response,
+        'response_recovery_call_foreign', 'The applied step lost its proven paid response');
+      return store.writeMany<ResponseRecovery>([{ id, kind: 'research-response-recovery', expected: 0,
+        value: { projectId: project, declaredBy, call: callRef, request: paid.request, response: paid.response,
+          archive: paid.archive, sessionBefore: intent.value.owner, sessionAfter, state: 'applied' } satisfies ResponseRecovery }],
+        uniqueTransactionGuards([reference(intent), reference(session!), callRef, paid.request, paid.response, paid.archive]))[0]!;
+    }
+  }
   const binding = responseSessionBinding(session);
   const draft = store.get<DiscoveryDraft>(binding.draft.id), question = store.get<Question>(binding.question.id);
   const inputs = uniqueRefs([binding.draft, binding.question, binding.environment, ...binding.inputs]);

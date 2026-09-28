@@ -1,7 +1,7 @@
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type Write } from "../storage/store.js";
 import { Environments } from "../runtime/environment.js";
 import { reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { canonical, hashJson } from "../canonical.js";
@@ -26,7 +26,8 @@ import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSele
 import { addContextLookup } from './context-workspace.js';
 import { dispatchMode, queueReadingPlan, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
-import { pendingSynthesis, synthesisSession } from "./synthesis-session.js";
+import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, synthesisOutcomeDelivery,
+  synthesisDeliveryMarks } from "./synthesis-session.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available. To correct it, set revises to context.previousProposalRef and send only the entities/fields that change; the engine applies these changes to the saved proposal, not to an empty layer. Keep base equal to context.graphBase. Provide citations for the assembled result. Omit revises only when intentionally replacing the entire previous proposal.`;
@@ -39,6 +40,31 @@ const INSTRUCTION = `Resolve the internal research questions yourself using exis
 {"action":"need_owner","question":"question ID","reason":"specific unavailable information and why it blocks this consumer","searched":[{"id":"...","revision":1,"hash":"..."}]}
 {"action":"pause","reason":"technical limitation"}
 Use read/search tools before concluding information is unavailable. A failed provider or exhausted turn budget is a technical pause, never a reason to ask the owner a subject-matter question. Do not mutate files or invoke external paid actions. Citations must point to source refs from inventory, not stage or graph refs; use json-pointer selectors for JSON when appropriate. File inventory entries contain metadata only: use read_source or search to obtain their exact contents. A history answer with valuePointer references the identical value already present in the current context fields; the original action remains stored unchanged.`;
+
+/** dispatchMode with the X50 proviso: a failed planned child guards the
+ * planning phase only. When a synthesis-phase turn of this same question is
+ * newer than that failure, the question has lawfully moved past the blocked
+ * plan (a saved response was resumed and delivered); the ordinary dispatch of
+ * such a state is dispatchMode's own last-activity rule without the stale
+ * planning guard. The child keeps its own explicit restore path. */
+function dispatchModeAfterRecovery(turns: Revision<ResearchTurn>[], question: Revision<Question>): "planning" | "synthesis" {
+  try { return dispatchMode(turns, question); }
+  catch (error) {
+    if (!(error instanceof EngineError) || error.code !== 'reading_plan_blocked') throw error;
+    const questionRef = canonical(reference(question));
+    const parent = [...turns].reverse().find(t => canonical(t.value.question) === questionRef
+      && (t.value.action as ResearchAction).action === 'read_plan' && t.value.status === 'completed' && !t.value.error);
+    const failed = parent ? turns.find(t => t.value.plannedBy?.id === parent.id && t.value.status === 'completed'
+      && !!t.value.error && canonical(t.value.question) === questionRef) : null;
+    const laterSynthesis = failed ? turns.some(t => t.value.number > failed.value.number
+      && t.value.question?.id === question.id && t.value.dispatchMode === 'synthesis') : false;
+    if (!laterSynthesis) throw error;
+    const last = [...turns].reverse().find(t => t.value.question?.id === question.id);
+    if (!last) return "planning";
+    if (last.value.error && last.value.dispatchMode === "planning") return "planning";
+    return (last.value.action as ResearchAction).action === "need_research" ? "planning" : "synthesis";
+  }
+}
 
 export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
@@ -82,6 +108,16 @@ export class Researcher {
         const unresolved = draft.value.questions.map(id => this.store.get<Question>(id)!).filter(question => question.value.status !== "answered");
         const pending = unresolved.slice(0, 1);
         requireCondition(pending.length > 0, "research_answers_stale", "Existing answers need targeted reopening before research can continue");
+        // An unfinished synthesis/consolidation operation of this draft is
+        // resumed before any new question selection or context packing; its
+        // result goes to the original reserved turn position.
+        const synthesisOp = pilot ? findUnfinishedSynthesisSession(this.store, project, draft.id) : null;
+        if (synthesisOp) {
+          const operationQuestion = this.store.get<Question>(synthesisOp.questionId);
+          requireCondition(operationQuestion?.kind === "question", "research_synthesis_ambiguous",
+            "The unfinished synthesis operation lost its exact question");
+          pending[0] = operationQuestion;
+        }
         requireDocumentarySources(this.store,project,pending[0]!.value.spec);
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
           .sort((a, b) => a.value.number - b.value.number);
@@ -100,7 +136,11 @@ export class Researcher {
         const savedMaterials = savedSynthesisMaterials(this.store, draft, pending[0]!);
         requireCondition(!savedMaterials || pilot, "reader_pilot_required", "Saved synthesis requires its active bounded continuation preset");
         const planning = planningForQuestion(this.store, draft, pending[0]!, pilot);
-        let mode = savedMaterials ? "synthesis" as const : planning ? dispatchMode(turns, pending[0]!) : null;
+        // The unfinished synthesis/consolidation operation is resumed before
+        // dispatchMode/planning/packing (№1555 X50): a blocked plan can never
+        // shadow a saved response or provoke a new planner payment.
+        let mode = savedMaterials ? "synthesis" as const : synthesisOp ? "synthesis" as const
+          : planning ? dispatchModeAfterRecovery(turns, pending[0]!) : null;
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
@@ -169,20 +209,46 @@ export class Researcher {
         let sent:Record<string,any>|undefined;
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
-          run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
+          // The reserved position and the logical budget of a synthesis task
+          // are charged once and atomically with the session record that
+          // carries the reservation (№1658 К2): the runner never increments
+          // its counters apart from that guarded transition.
+          const recordedTurn = synthesisOp ? synthesisOp.deliveryTurn : null;
+          const synthesisEntry = mode === "synthesis" && pilot;
+          let reserve: { write: Write; guards: Ref[] } | undefined;
+          let reservedTurn: number | null = recordedTurn ?? null;
+          if (synthesisEntry && reservedTurn === null) {
+            reservedTurn = run.value.turns + 1;
+            reserve = { write: { id: run.id, kind: run.kind, expected: run.revision,
+                value: { ...run.value, turns: reservedTurn, requestChars: run.value.requestChars + canonical(context).length } },
+              guards: [reference(run)] };
+          } else if (!synthesisEntry && (!synthesisOp || recordedTurn === null))
+            run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
           const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign"
             ? (draft.value.level === "R2" ? DELTA_INSTRUCTION.replaceAll("L2", "L3").replace("preserve L1", "preserve L1/L2").replace("and do not add L3", "and provide the nonempty horizon array of atomic result IDs") : DELTA_INSTRUCTION) : "";
           const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
             : INSTRUCTION + (pilot ? PILOT_INSTRUCTION + deltaInstruction : "");
-          action = mode === "synthesis" && pilot ? await synthesisSession(this.store, draft, pending[0]!, environment,
-            dispatch, pilot, context, instruction, signal)
+          action = synthesisEntry ? await synthesisSession(this.store, draft, pending[0]!, environment,
+            dispatch, pilot, context, instruction, signal,
+            { retryPermits: readerRetryPermits, delivery: { run: id, turn: reservedTurn! }, ...(reserve ? { reserve } : {}) })
             : researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
               { store: this.store, draftId, questionId: pending[0]!.id, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot } : {}),onContext:packet=>{sent=packet;} }));
+          if (synthesisEntry) run = this.store.get<ResearchRun>(id)!; // the atomic reservation moved the shared run record
           const questionId = "question" in action ? action.question : null;
           const question = questionId ? pending.find(item => item.id === questionId) : pending[0];
-          pendingTurn = this.store.write<ResearchTurn>({ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
-            value: { run: id, number: run.value.turns, action, assessment: null, observation: null, error: null,
-              status: "pending", question: question ? reference(question) : null, ...(mode ? { dispatchMode: mode } : {}) } });
+          const delivery = mode === "synthesis" && pilot
+            ? synthesisOutcomeDelivery(this.store, project, draft.id) : null;
+          const turnNumber = delivery?.turn ?? (reservedTurn ?? run.value.turns);
+          const turnWrite: Write = { id: `research-turn:${hashJson([id, turnNumber])}`, kind: "research-turn", expected: 0,
+            value: { run: id, number: turnNumber, action, assessment: null, observation: null, error: null,
+              status: "pending", question: question ? reference(question) : null, ...(mode ? { dispatchMode: mode } : {}) } };
+          if (delivery) {
+            // Y and the pending turn bind atomically (№1499-38).
+            const mark = synthesisDeliveryMarks(delivery.session, turnWrite);
+            pendingTurn = this.store.writeMany<ResearchTurn>([turnWrite, mark.write], mark.guards)[0]!;
+          } else {
+            pendingTurn = this.store.write<ResearchTurn>(turnWrite);
+          }
         }
         let observation: unknown = null; let assessment: Ref | null = null; let error: string | null = null;
         let stop: Partial<ResearchRun> | null = null;
@@ -296,6 +362,7 @@ export class Researcher {
       return this.save(run, this.discovery.gate(project, reference(draft)).findings.length === 0 ? { status: "completed" }
         : { status: "paused", error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
     } catch (error) {
+      run = this.store.get<ResearchRun>(id) ?? run; // the synthesis reservation may have moved the shared record
       return this.save(run, { status: "paused", error: error instanceof Error ? error.message : "Research was interrupted",
         pauseCode: error instanceof EngineError ? error.code : "research_interrupted" });
     }

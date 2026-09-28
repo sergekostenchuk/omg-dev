@@ -34,9 +34,11 @@ test('structured missing facts enter the ordinary planner and the complete origi
   configureReaderPilot(f.store,f.engine.environments,'p',{...settings,maxReplyChars:128,planning:{fields:[f.question.value.spec.field],maxRounds:1,maxRequestChars:1000}},f.pilot.revision);
   const rich={action:'need_research',question:f.question.id,reason:'Required basis is absent',missingFacts:[{id:'consumer-proof',required:'Establish the actual consumer',savedLocations:['src/example.ts:10–20']}],preservation:{unresolved:'The obligation remains open'}};
   provider(f.path,`const research=c.dispatchMode==='planning'?((c.researchMissing??c.missing)?.length?{action:'pause',reason:'Planner received canonical missing facts'}:{action:'synthesize',question:c.question.id}):${JSON.stringify(rich)};`);
+  const firstRun = await f.engine.researcher.run('p',f.draft.id,4);
+  assert.equal(firstRun.value.status,'paused','the saved pause of the unfinished session is delivered to its reserved turn and stops the call (№1658 К2/поправка 6)');
   await f.engine.researcher.run('p',f.draft.id,4);
   const calls=f.store.list<any>('model-call');
-  const planner=calls.filter(call=>call.value.purpose==='reading-planner').sort((a,b)=>a.value.startedAt-b.value.startedAt);assert.equal(planner.length,2,'Legacy maxRounds1 does not block a new request');
+  const planner=calls.filter(call=>call.value.purpose==='reading-planner').sort((a,b)=>a.value.startedAt-b.value.startedAt);assert.equal(planner.length,1,'The early resume of the saved synthesis response precedes planning; maxRounds1 does not block its request');
   const last=JSON.parse(f.store.get<any>(planner.at(-1)!.value.request.record.id)!.value.text);
   const missing=last.subject.researchMissing??last.subject.missing;
   assert.equal(missing.length,1);assert.ok(missing[0].includes('src/example.ts:10–20'));assert.ok(missing[0].includes('The obligation remains open'));

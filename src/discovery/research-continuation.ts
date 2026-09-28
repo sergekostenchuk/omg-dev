@@ -1,14 +1,15 @@
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAction, ResearchTurn } from "./research-model.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical } from "../canonical.js";
 import { reference, isRef } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent } from "./reader.js";
 import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
+import { projectCheckpointValue } from './research-consumer-transition.js';
 
 /** Keep one latest proposal even after many reads push its turn out of the
  * compact conversation history. Its identity also stabilizes synthesis resume. */
@@ -17,15 +18,34 @@ export function latestProposal(turns: Revision<ResearchTurn>[], questionId: stri
     && ["answer", "answer_delta"].includes(String((turn.value.action as { action?: string })?.action)))?.value.action ?? null;
 }
 
+export interface PreparedCheckpoint {
+  id: string; value: Record<string, any>;
+  writes: Write[]; guards: TransactionGuard[]; existing: Revision | null;
+}
+
+/** Preparation is separate from the write: the synthesis application includes
+ * the prepared checkpoint in its own atomic transaction (№1188-3). The live
+ * observation here is the producer's current admission; the shared value
+ * formula lives in the transition leaf. */
+export function prepareCheckpoint(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  action: Extract<ResearchAction, { action: "checkpoint" }>): PreparedCheckpoint {
+  requireCondition(action.question === question.id && question.value.draftId === draft.id,
+    "research_question_foreign", "Checkpoint belongs to another question");
+  const projected = projectCheckpointValue(draft.value.projectId, reference(draft), reference(question),
+    { question: action.question, value: action.value, citations: action.citations, unresolved: action.unresolved },
+    (source, selector) => new Evidence(store).observe(draft.value.projectId, source, selector));
+  const existing = store.get(projected.id);
+  if (existing) return { ...projected, writes: [], guards: [reference(existing)], existing };
+  return { ...projected, existing: null,
+    writes: [{ id: projected.id, kind: "research-checkpoint", expected: 0, value: projected.value }],
+    guards: [reference(draft), reference(question), ...draft.value.inputs,
+      ...projected.value.observations.map((observation: any) => observation.source)] };
+}
+
 export function checkpoint(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   action: Extract<ResearchAction, { action: "checkpoint" }>) {
-  requireCondition(action.question === question.id && question.value.draftId === draft.id, "research_question_foreign", "Checkpoint belongs to another question");
-  const observations = action.citations.map(c => new Evidence(store).observe(draft.value.projectId, c.source, c.selector));
-  const value = { projectId: draft.value.projectId, draft: reference(draft), question: reference(question),
-    status: "unassessed", proposal: action.value, observations, unresolved: action.unresolved };
-  const id = `research-checkpoint:${hashJson(value)}`;
-  return store.get(id) ?? store.writeMany([{ id, kind: "research-checkpoint", expected: 0, value }],
-    [reference(draft), reference(question), ...draft.value.inputs, ...observations.map(o => o.source)])[0]!;
+  const prepared = prepareCheckpoint(store, draft, question, action);
+  return prepared.existing ?? store.writeMany(prepared.writes, prepared.guards)[0]!;
 }
 
 export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>) {
