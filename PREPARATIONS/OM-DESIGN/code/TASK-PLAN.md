@@ -2158,7 +2158,7 @@
 - После: H1, Q1
 - **Изменение движка:** объявленное изменение: настройка отправки OM в командном API
 - Тесты сверх обязательных:
-  - ДОГОВОР И ТАБЛИЦА ИСХОДА — у ревьюера ДО выдачи (урок 46); граф пересечений на фактической базе; предложение №1837-2 — основа, не договор
+  - ДОГОВОР И ТАБЛИЦА №1843 + ДОПОЛНЕНИЕ №1853 (~/REPORTS/review/omg-code-e41_contract-1843.md — читать ЦЕЛИКОМ; строки R1–R9): configure с необязательным requestCapacityChars (поле добавить в схему ПОСЛЕ object(), как role.speed — иначе все прежние configure дают command_invalid); новая команда configure-om-dispatch {project, protocol:'codex-stdio'} → общий производитель в dispatch.ts, адрес adapter:<project>:codex-stdio, тело {projectId, protocol}; отказ производителя в execute → EngineError(code, message, at) (HTTP 400, ненулевой exit CLI), не {ok:false} как успех; команда законна до и после B1, адаптер НЕ признак эры OM; результат — dispatch:{adapter,config} ровно двумя Ref {id,revision,hash}, guards/references снаружи; environment_missing — своя проверка головы, наличная запись — readEnvironmentAt, затем readCapacity (порядок кодов не менять); собственный каталог dispatch.ts — только свои эмиссии, передачи readCapacity/readRecord/writeGuarded/readEnvironmentAt — не копировать (Q2 №1849); граф — ~/REPORTS/review/omg-code-e41_intersection-graph_290926.md
   - результат: configure с capacity → общий производитель адаптера → допустимые основания E2/E4/E5/A6, повтор без лишних ревизий; вместимость, команды, модели и роли — из настройки, не из имени модели; declare-adapter-lineage не заменяет dispatch-adapter; существующий валидатор Environment переиспользовать
 
 ### H1.1 · Машинная сборка и обновление оснований прохода
