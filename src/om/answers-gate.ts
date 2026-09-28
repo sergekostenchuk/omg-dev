@@ -12,10 +12,11 @@ import { prepareFrameProposals, readFrameProposals } from './frame-proposals.js'
 import { readGaps, prepareCurrentGaps, type GapReadRequest, type Gap, type GapKind, type GapMoment } from './gaps.js';
 import { gapLineKey } from './gap-lines.js';
 import { historicalRead, readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
-import { readPartAssembly, readModelCallState, readModelTransport, readCompletionWorkAt, prepareCompletionProducts,
+import { readPartAssembly, readModelCallState, readModelTransport, readCompletionWorkAt, prepareCompletionProducts, readModelCycle,
+  readManagedModelDiagnostic,
   pendingCallStore, readCompletionCause, prepareCompletionCause, readCompletionCessationAt, completionCessationId,
   COMPLETION_CESSATION_KIND, type CompletionCause, type CompletionCessation, type CompletionSnapshot } from './model-call.js';
-import { answersGateAssignment, completionWorkId, readCompletionOwnerAt, readAnswersGateAssignmentAt, type AnswersGateAssignment,
+import { answersGateAssignment, completionWorkId, readCompletionBinding, readCompletionOwnerAt, readAnswersGateAssignmentAt, type AnswersGateAssignment,
   type AttemptGoal, type CompletionOwner, type CompletionWork } from './series.js';
 import { UNIT_REFUSAL_KIND, answersSourceMarks, journalId, prepareJournalBatch, readJournalAt, registerAnswersSourceReader,
   unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
@@ -64,6 +65,7 @@ export const ANSWERS_GATE_EMISSIONS = sealed([
   'transport-foreign', 'legacy-question-foreign', 'assessment-question-foreign', 'assessment-task-foreign',
   'assessment-supported', 'assessment-transport-managed', 'assessment-insufficient', 'assessment-conflicting',
   'assessment-off-form', 'assessment-interrupted', 'assessment-terminated', 'assessment-legacy-transport',
+  'mc2-terminal', 'mc2-terminal-foreign',
 ] as const);
 export type AnswersGateEmission = typeof ANSWERS_GATE_EMISSIONS[number];
 export const ANSWERS_GATE_SOURCE_ROLES = sealed([
@@ -71,7 +73,7 @@ export const ANSWERS_GATE_SOURCE_ROLES = sealed([
   'model-call', 'call', 'packet-routes', 'response', 'diagnostic', 'transport', 'terminal', 'intent', 'question',
   'accepted', 'binding', 'assignment', 'work', 'receipt', 'observed-source', 'prerequisite', 'replacement',
   'replacement-proof', 'appeared', 'appeared-graph', 'admission-series', 'admission-pointer', 'admission-applied',
-  'admission-current',
+  'admission-current', 'cycle',
 ] as const);
 export type AnswersGateSourceRole = typeof ANSWERS_GATE_SOURCE_ROLES[number];
 // Every violated condition of a composite emission point, so one emitted finding keeps all of its checked causes.
@@ -79,6 +81,7 @@ export const ANSWERS_GATE_MISMATCHES = sealed([
   'call-purpose', 'call-basis', 'source-batch-absent', 'current-batch-absent', 'batch-model', 'batch-task',
   'batch-changed', 'item-absent', 'route-task-absent', 'gap-unassigned', 'gap-kind', 'question-gap', 'question-task',
   'question-address', 'task-address', 'task-contract', 'graph-hash', 'level', 'proposal',
+  'cycle-terminal', 'cycle-binding', 'cycle-candidate',
 ] as const);
 export type AnswersGateMismatch = typeof ANSWERS_GATE_MISMATCHES[number];
 export interface AnswersGateSource { role: AnswersGateSourceRole; ref: Ref }
@@ -436,6 +439,8 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
     return traced('part-not-assembly', finding('route_result_missing', target, 'assembly',
       'A part is not proof of the complete MC2 node', row.result), [cite('part', row.result)]);
   }
+  if (row.result.id.startsWith(`om-model-cycle:${request.project}:`))
+    return mc2Terminal(store, request, row, gap, current, guards, references, traced);
   if (!row.result.id.startsWith(`om-part-assembly:${request.project}:`)) {
     const known = proveOfferedRecord(store, request.project, row.result);
     return traced(known ? 'design-known-foreign' : 'design-unrecognized', finding(known ? 'record_foreign' : 'route_result_unsupported',
@@ -519,6 +524,50 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
   } else return traced('batch-level-foreign', finding('answer_route_foreign', target, 'batch',
     'A node proposal needs a level-two or level-three MC2 batch'), assembled, { level: batch.level });
   return null;
+}
+/**
+ * №1770: the negative outcome of an MC2 node root — a completed cycle without assembly (cannot_answer, research without
+ * progress, a blocked successor, invalid parts), whose final diagnostic the cycle itself proves. It never fills the gap:
+ * the full G4b keeps a negative finding and no C5 is admitted. The exact root belongs to the checked gap by the same
+ * rules as a positive assembly (the exact current and source batch, the gap assigned to one of its packets), and to the
+ * attempt that opened it (its binding and that binding's own E4 diagnostic).
+ */
+function mc2Terminal(store: Store, request: AnswersGateRequest, row: AnswerRouteResult, gap: Gap, current: boolean,
+  guards: TransactionGuard[], references: Ref[], traced: Traced): AnswersGateTraceEntry {
+  const project = request.project, ref = row.result!, target = gap.target;
+  const cycle = take(readModelCycle(store, { project, record: ref })).record.value;
+  const packet = take(readQuestionPacket(store, { project, record: cycle.request.packet }));
+  const sources = [cite('cycle', ref), cite('packet', cycle.request.packet), ...cycle.steps.map(step => cite('model-call', step.record)),
+    ...(cycle.diagnostic ? [cite('diagnostic', cycle.diagnostic)] : []), cite('packet-routes', packet.value.request.routes)];
+  const routeRecord = take(readRoutes(store, { project, record: request.routes }));
+  const batch = routeRecord.record.value.batches.find(item => item.id === packet.value.request.batch);
+  const sourceRoutes = take(readRoutes(store, { project, record: packet.value.request.routes }));
+  const sourceBatch = sourceRoutes.record.value.batches.find(item => item.id === packet.value.request.batch);
+  const assigned = cycle.steps.flatMap(step => {
+    const source = take(readQuestionPacket(store, { project, record: step.packet }));
+    if (!object(source.value.packet) || !Array.isArray(source.value.packet.questions))
+      fail('route_result_missing', source.id, 'questions', 'An MC2 result needs its exact assigned questions');
+    return source.value.packet.questions.map(question => object(question) && text(question.id) ? question.id : '');
+  });
+  const attempt = packet.value.request.attempt;
+  const binding = attempt ? take(readCompletionBinding(store, project, attempt.series, attempt.ordinal)) : null;
+  const terminal = cycle.terminal !== 'assembled' && cycle.diagnostic !== null;
+  const mismatch = violated([['cycle-candidate', row.candidate !== null], ['cycle-terminal', !terminal],
+    ['current-batch-absent', !batch], ['source-batch-absent', !sourceBatch],
+    ['batch-changed', !!batch && !!sourceBatch && !same(batch, sourceBatch)],
+    ['batch-task', !!batch && batch.task !== 'node-expansion'], ['gap-unassigned', !assigned.includes(gap.id)],
+    ['item-absent', !!batch && !batch.items.some(item => item.gap === gap.id && same(item.record, row.gap))],
+    ['cycle-binding', !binding]]);
+  if (mismatch.length) return traced('mc2-terminal-foreign', finding('record_foreign', target, 'result',
+    'Only the proved terminal of the exact MC2 root of this routed gap stands for it', ref), sources,
+  { state: cycle.terminal, mismatch, level: batch?.level ?? null });
+  // The final diagnostic is the one its binding's own E4 producer derives; its reason is E4's, not G4b's.
+  const diagnostic = take(readManagedModelDiagnostic(store, binding! as Revision<CompletionOwner>, cycle.diagnostic!));
+  references.push(ref, cycle.request.packet, cycle.diagnostic!, packet.value.request.routes, ...cycle.steps.map(step => step.record));
+  if (current) guards.push(ref);
+  return traced('mc2-terminal', finding('answer_missing_for_blocking_gap', target, 'result',
+    'A proved MC2 terminal without assembly does not fill this gap', ref), sources,
+  { state: cycle.terminal, outcome: diagnostic.reason, level: batch!.level });
 }
 function derive(store: Store, request: AnswersGateRequest, current: boolean): DerivedAnswersGate {
   requireRequest(store, request); request = normalized(request);
@@ -816,7 +865,7 @@ export type AnswersWait = 'work' | 'submission' | 'producer';
 /** A finding of G4b is either journal-only diagnostics or points at the ground of an existing producer (№1628 Q1). */
 export type AnswersContribution =
   | { kind: 'journal-only'; wait: AnswersWait; barrier: boolean }
-  | { kind: 'existing'; producer: 'E5-N' | 'E5-T' | 'E4-T' | 'cessation'; basis: Ref[] };
+  | { kind: 'existing'; producer: 'E5-N' | 'E5-T' | 'E4-T' | 'E4-terminal' | 'cessation'; basis: Ref[] };
 export interface AnswersFinding {
   contract: typeof ANSWERS_FINDING_CONTRACT; project: string; evaluation: Ref; finding: Refusal; cause: AnswersGateCause;
   scope: AnswersGroupScope; occurrences: number[]; contribution: AnswersContribution;
@@ -858,7 +907,7 @@ export const answersRefusalId = (project: string, proof: Ref): string =>
  * H1.0b cessation of the area turns any other point into that existing ground (row 14, C56). candidate-gate-negative
  * is unreachable (CandidateGate.passed is true, STALE-4): a stored one is refused, never invented as a G3 outcome.
  */
-type ContributionRule = 'E5-N' | 'E5-T' | 'E4-T' | AnswersWait | 'unreachable';
+type ContributionRule = 'E5-N' | 'E5-T' | 'E4-T' | 'E4-terminal' | AnswersWait | 'unreachable';
 const CONTRIBUTION_RULES: Readonly<Record<AnswersGateEmission, ContributionRule>> = Object.freeze({
   'gap-revision-stale': 'submission', 'gap-ref-inexact': 'submission', 'gap-unknown': 'submission',
   'gap-unrouted': 'producer', 'deferral-declared': 'submission', 'deferral-inherited': 'submission',
@@ -880,6 +929,7 @@ const CONTRIBUTION_RULES: Readonly<Record<AnswersGateEmission, ContributionRule>
   'assessment-supported': 'submission', 'assessment-transport-managed': 'work', 'assessment-insufficient': 'E5-N',
   'assessment-conflicting': 'E5-N', 'assessment-off-form': 'E5-T', 'assessment-interrupted': 'E5-T',
   'assessment-terminated': 'E5-T', 'assessment-legacy-transport': 'submission',
+  'mc2-terminal': 'E4-terminal', 'mc2-terminal-foreign': 'submission',
 });
 function evaluationFail(target: string, field: string, message: string, ref?: Ref): never {
   return fail('answers_evaluation_invalid', target, field, message, ref);
@@ -1011,6 +1061,12 @@ function contributionOf(store: Store, before: Sealed<CompletionSnapshot>, cause:
   if (rule === 'E4-T') {
     const call = cited('model-call'), diagnostic = cited('diagnostic');
     if (own(call) && diagnostic) return { kind: 'existing', producer: 'E4-T', basis: [call, diagnostic] };
+  }
+  // №1770: a proved terminal of this attempt's own MC2 root (its cycle and that cycle's diagnostic, both products of
+  // the work) is the existing E4 ground of the check; another attempt's terminal stays a wrong submission.
+  if (rule === 'E4-terminal') {
+    const cycle = cited('cycle'), diagnostic = cited('diagnostic');
+    if (own(cycle) && own(diagnostic)) return { kind: 'existing', producer: 'E4-terminal', basis: [cycle, diagnostic] };
   }
   const ceased = item ? coveringCessation(store, before, item) : null;
   if (ceased) return { kind: 'existing', producer: 'cessation', basis: [ceased] };

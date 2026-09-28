@@ -57,7 +57,8 @@ import { ANSWERS_GATE_CODES, answersRegistrationId, prepareAnswersRegistration, 
 import { answersGateAssignment, completionAssignmentId, completionCloseId, completionRootAssignments, completionWorkId,
   readAnswersGateAssignmentAt, readCompletionBinding, type CompletionWork } from '../src/om/series.js';
 import { readCompletionAssignmentAt, readCompletionWorkAt } from '../src/om/model-call.js';
-import { closeAttempt } from '../src/om/repeat-gate.js';
+import { closeAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
+import { runModelCycle } from '../src/om/model-call.js';
 import { ANSWERS_EVALUATION_KIND, ANSWERS_FINDING_KIND, answersEvaluationId, answersFindingId, answersRefusalId,
   prepareAnswersDelivery, prepareAnswersEvaluation, readAnswersEvaluationAt, readAnswersFindingAt, readAnswersGateRefusalAt,
   writeAnswersDelivery, writeAnswersEvaluation, type AnswersFinding,
@@ -4081,4 +4082,118 @@ out({ ceased, works, cessation, close });`, { project: f.project, binding: opene
       assert.deepEqual(rest, saved);
     }
   });
+});
+
+// ---- №1770: the negative terminal of an MC2 root in G4b (a completed cycle without assembly) ----
+type NodeEnd = 'cannot_answer' | 'off-form' | 'need_owner' | 'interrupted' | 'research-no-progress';
+/** A managed MC2 node root of the block paid through the real producers and ended by the scripted answer. */
+async function nodeTerminal(f: ReturnType<typeof fixture>, block: string, end: NodeEnd, slice: string) {
+  const batch = nodeBatch(f, block), m = managedOn(f, block, [batch.id], 1, slice);
+  const scenario = join(f.root, `${slice}-scenario.json`), trace = join(f.root, `${slice}-trace.jsonl`);
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
+  const configure = (capacity: number) => f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'answers-designer', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'answers-reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: capacity },
+  f.store.get(`environment:${f.project}`)?.revision ?? 0);
+  const environment = configure(200_000);
+  const adapter = f.store.write({ id: `adapter:${f.project}:${slice}`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const request = (config: Ref) => ({ project: f.project, routes: reference(f.route), batch: batch.id, environment: config,
+    attempt: { series: reference(m.series), ordinal: 1 }, previous: [] });
+  const packet = ok(writeQuestionPacket(f.store, request(reference(environment)))).record;
+  const questions = (packet.value.packet as unknown as { questions: { id: string }[] }).questions.map(row => row.id);
+  let steps: unknown[];
+  if (end === 'research-no-progress') {
+    // The model asks twice for the same source: the repeated read adds nothing, so the cycle ends without an answer.
+    const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
+    const need = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source', questionIds: questions,
+      missing: 'Need the addressed source data', reads: [{ action: 'read_source', source: reference(source),
+        selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] }, usage: traceUsage };
+    steps = [need, need];
+  } else steps = [end === 'off-form' ? { research: { invalid: true }, usage: traceUsage }
+    : end === 'interrupted' ? { rawStdout: '{broken', exitCode: 7 }
+    : { research: { protocol: 'omg-answer/v2', requestId: '$requestId', questionIds: questions, action: end,
+      reason: 'The requested design is not available', ...(end === 'need_owner' ? { decision: 'Name the operation' } : {}) }, usage: traceUsage }];
+  writeFileSync(scenario, JSON.stringify({ steps }));
+  const cycle = ok(await runModelCycle(f.store, { project: f.project, packet: reference(packet),
+    dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' }));
+  const offers = (ref: Ref) => batch.items.map(item => ({ gap: item.record, result: ref, candidate: null }));
+  return { m, batch, cycle, packet, offers };
+}
+const ownTerminal = (f: ReturnType<typeof fixture>, evaluation: Ref) => ok(readAnswersEvaluationAt(f.store, f.project, evaluation)).groups
+  .filter(group => group.proof.value.cause.emission === 'mc2-terminal' && group.proof.value.contribution.kind === 'existing');
+
+test('R2 R6 R7 №1770 H1.0c an own MC2 terminal is the existing E4 ground of the check; the full G4b stays negative; its exact reading holds', async t => {
+  for (const [end, reason] of [['cannot_answer', 'refused'], ['off-form', 'off-form'], ['interrupted', 'interrupted'],
+    ['need_owner', 'awaiting-owner']] as const) await t.test(end, async child => {
+    const f = fixture(child), n = await nodeTerminal(f, f.block, end, `negative-${end}`);
+    const cycle = n.cycle.record.value;
+    assert.notEqual(cycle.terminal, 'assembled'); assert.ok(cycle.diagnostic);
+    const saved = ok(evaluate(f, n.m, n.offers(reference(n.cycle.record))));
+    const own = ownTerminal(f, reference(saved.evaluation));
+    assert.equal(own.length, n.batch.items.length);
+    for (const group of own) {
+      assert.deepEqual(group.proof.value.contribution, { kind: 'existing', producer: 'E4-terminal',
+        basis: [reference(n.cycle.record), cycle.diagnostic] });
+      assert.equal(group.proof.value.finding.code, 'answer_missing_for_blocking_gap');
+      assert.equal(group.proof.value.cause.detail.outcome, reason, 'The reason is the E4 diagnostic\'s, not G4b\'s');
+    }
+    const gate = ok(readAnswersGate(f.store, { project: f.project, record: saved.evaluation.value.gate }));
+    assert.equal(gate.value.result.passed, false, 'A negative MC2 never fills the gap: no C5 is admitted');
+    const work = n.m.work();
+    assert.equal(work.answers?.complete, true, 'The own terminal completes the check');
+    assert.deepEqual(work.accepting, []);
+    const read = ok(readAnswersEvaluationAt(f.store, f.project, reference(saved.evaluation)));
+    f.restart();
+    assert.deepEqual(ok(readAnswersEvaluationAt(f.store, f.project, reference(saved.evaluation))), read, 'The saved evaluation reads exactly');
+    assert.deepEqual(ok(evaluate(f, n.m, n.offers(reference(n.cycle.record)))).evaluation, saved.evaluation, 'An exact repeat adds nothing');
+  });
+});
+
+test('R8 №1770 H1.0c a cycle that ends without progress after source reads: the exact completed cycle, not its last call, stands for the root', async t => {
+  const f = fixture(t), n = await nodeTerminal(f, f.block, 'research-no-progress', 'negative-reads');
+  assert.equal(n.cycle.record.value.terminal, 'research-no-progress');
+  assert.equal(n.cycle.record.value.steps.length, 2, 'Both source requests were paid before the root ended');
+  const saved = ok(evaluate(f, n.m, n.offers(reference(n.cycle.record))));
+  assert.ok(ownTerminal(f, reference(saved.evaluation)).length);
+  assert.equal(n.m.work().answers?.complete, true);
+});
+
+test('R9 R1 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own ground; a neighbour\'s terminal stays the neighbour\'s', async t => {
+  const f = fixture(t);
+  const a = await nodeTerminal(f, 'garden-produce-block', 'cannot_answer', 'negative-a');
+  const b = await nodeTerminal(f, 'garden-consume-block', 'cannot_answer', 'negative-b');
+  // Another block's genuine terminal offered for this attempt's own gaps: a wrong submission, the check stays open.
+  const foreign = ok(evaluate(f, a.m, a.offers(reference(b.cycle.record))));
+  const groups = ok(readAnswersEvaluationAt(f.store, f.project, reference(foreign.evaluation))).groups;
+  assert.ok(groups.some(group => group.proof.value.cause.emission === 'mc2-terminal-foreign'
+    && group.proof.value.finding.code === 'record_foreign'));
+  assert.equal(ownTerminal(f, reference(foreign.evaluation)).length, 0);
+  assert.equal(a.m.work().answers?.complete, false);
+  // The bare physical call is not the terminal of the root: no existing ground by the absence of an assembly (R1).
+  const call = a.cycle.record.value.steps[0]!.record;
+  const bare = ok(evaluate(f, a.m, a.offers({ id: call.id, revision: call.revision, hash: call.hash })));
+  assert.equal(ownTerminal(f, reference(bare.evaluation)).length, 0);
+  assert.equal(a.m.work().answers?.complete, false);
+  // The neighbour's genuine terminal for its own gaps, with the own one: only the own gaps get the existing ground.
+  const both = ok(evaluate(f, a.m, [...a.offers(reference(a.cycle.record)), ...b.offers(reference(b.cycle.record))]));
+  const own = ownTerminal(f, reference(both.evaluation));
+  assert.equal(own.length, a.batch.items.length);
+  assert.ok(own.every(group => a.batch.items.some(item => same(item.record, group.proof.value.cause.gap))));
+  assert.equal(a.m.work().answers?.complete, true);
+});
+
+test('R3 №1770 H1.0c two blocks\' negative MC2 attempts each close by their own G7 as refused, with no candidate and no wait for each other', async t => {
+  const f = fixture(t);
+  const a = await nodeTerminal(f, 'garden-produce-block', 'cannot_answer', 'negative-both-a');
+  const b = await nodeTerminal(f, 'garden-consume-block', 'cannot_answer', 'negative-both-b');
+  for (const [n, block] of [[a, 'garden-produce-block'], [b, 'garden-consume-block']] as const) {
+    ok(evaluate(f, n.m, [...a.offers(reference(a.cycle.record)), ...b.offers(reference(b.cycle.record))]));
+    const address = { project: f.project, block, line: 1, attempt: 1 };
+    const claim = ok(prepareManagedClaim(f.store, { ...address, outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } }));
+    assert.equal(claim.outcome.reason, 'refused', block);
+    ok(closeAttempt(f.store, { ...address, outcome: claim.outcome }));
+  }
+  for (const n of [a, b]) assert.equal(f.store.get<{ attempts: { outcome: { reason: string } | null }[] }>(n.m.series.id)!.value.attempts[0]!.outcome!.reason, 'refused');
 });

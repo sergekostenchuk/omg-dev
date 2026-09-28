@@ -64,7 +64,9 @@ const B1_PRODUCERS = Object.freeze([
   'om-model-application-rejection', 'om-neighbors', 'om-atomic-gate', 'om-works-acceptance', 'om-work-rejection',
 ]);
 function b1Address(project: string, id: unknown): boolean {
+  // H1: the one pass of a project starts from its exact first B1, so its record is B1-born even when incomplete.
   return typeof id === 'string' && (id === `om-input:${project}` || id === `om-feasibility:${project}` || id === `om-series-current:${project}`
+    || id === `om-run:${project}`
     || B1_PRODUCERS.some(namespace => id.startsWith(`${namespace}:${project}:`))
     || [2, 3].some(level => id === `om-frame:${project}:${level}`)
     || ['part', 'assembly'].some(source => id.startsWith(`om-proposal:${project}:${source}:`))

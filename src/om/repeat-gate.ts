@@ -1841,31 +1841,15 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
       { work: context.work, additions: [...context.additions], journal }));
     if (!sameRef(reference(snapshot.binding), context.binding) || !snapshot.complete || snapshot.work.value.closed)
       managedFail(context.work.id, 'work', 'The close must use one complete exact pre-close registry', 'completion_incomplete');
-    const e5 = (ref: Ref) => ref.id.startsWith(`${acceptedAnswerNamespace(project)}e5:`);
     const ordered = (values: readonly Ref[]) => [...values].sort((a,b) => canonical(a).localeCompare(canonical(b)));
-    if (canonical(ordered(accepting.filter(e5))) !== canonical(ordered(snapshot.accepting)))
+    const required = requiredManagedAccepting(store, project, context, snapshot as CompletionSnapshot);
+    if (canonical(ordered(accepting.filter(required.e5Of))) !== canonical(ordered(required.e5)))
       managedFail(context.work.id, 'accepting', 'The close must retain every exact supported E5 basis');
-    const binding = snapshot.binding.value;
-    if (binding.owner.kind === 'mechanism') {
-      // H1.0d (№1688-3, C13, C14, C46): every applied M5 addressing of the effective registry — each runtime id at its
-      // latest revision — is required before reduction by key; an empty claim does not skip it, and a call outside
-      // the registry cannot hide behind an equal key.
-      const e4 = (ref: Ref) => ref.id.startsWith(`model-call:${project}:om:`);
-      const latest = new Map<string, Ref>();
-      for (const ref of snapshot.products) if (e4(ref) && (latest.get(ref.id)?.revision ?? 0) < ref.revision) latest.set(ref.id, ref);
-      const required: Ref[] = [];
-      for (const ref of latest.values()) {
-        if (!managedTake(appliedAddressing(store, project, ref))) continue;
-        const own = confirmResults(store, { project, owner: binding.owner, target: binding.series.id, goal: binding.goal,
-          attempt: { series: binding.series, ordinal: binding.attempt }, accepting: [ref], cancelling: [], managedClosure: context });
-        if (own.ok) required.push(ref);
-      }
-      if (canonical(ordered(accepting.filter(e4))) !== canonical(ordered(required)))
-        managedFail(context.work.id, 'accepting', 'The close must retain every applied M5 addressing of its registry, at its effective revision');
-    }
-    const required = new Set(snapshot.refusals.map(row => row.row));
+    if (canonical(ordered(accepting.filter(required.e4Of))) !== canonical(ordered(required.e4)))
+      managedFail(context.work.id, 'accepting', 'The close must retain every applied M5 addressing of its registry, at its effective revision');
+    const requiredRows = new Set(snapshot.refusals.map(row => row.row));
     // Rows beyond the required set are looked up in the final journal the closure presents.
-    const extra = refusals.filter(item => !required.has(item.row));
+    const extra = refusals.filter(item => !requiredRows.has(item.row));
     if (extra.length && journal) {
       const rows = new Map(managedTake(readJournalAt(store, project, journal)).value.rows.map(row => [row.id, row as JournalRow]));
       for (const item of extra) {
@@ -1875,17 +1859,57 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
     }
     if (snapshot.refusals.some(row => !refusals.some(item => canonical(item) === canonical(row))))
       managedFail(context.work.id, 'refusals', 'The close must retain every semantic, technical and control diagnostic');
-    if (refusals.some(row => row.name.startsWith('fact_assessment_') && !required.has(row.row)))
+    if (refusals.some(row => row.name.startsWith('fact_assessment_') && !requiredRows.has(row.row)))
       managedFail(context.work.id, 'refusals', 'A foreign assessment refusal cannot be added to this complete set');
     return snapshot as CompletionSnapshot;
   });
+}
+/**
+ * The accepting bases the effective registry itself requires: every supported E5 basis and, for M5, every applied
+ * addressing at its effective revision (H1.0d №1688-3). One function for the claim check and the claim preparer (H1).
+ */
+function requiredManagedAccepting(store: Store, project: string, context: ManagedClosure, snapshot: CompletionSnapshot) {
+  const e5Of = (ref: Ref) => ref.id.startsWith(`${acceptedAnswerNamespace(project)}e5:`);
+  const e4Of = (ref: Ref) => ref.id.startsWith(`model-call:${project}:om:`);
+  const binding = snapshot.binding.value, e4: Ref[] = [];
+  if (binding.owner.kind === 'mechanism') {
+    // H1.0d (№1688-3, C13, C14, C46): every applied M5 addressing of the effective registry — each runtime id at its
+    // latest revision — is required before reduction by key; an empty claim does not skip it, and a call outside
+    // the registry cannot hide behind an equal key.
+    const latest = new Map<string, Ref>();
+    for (const ref of snapshot.products) if (e4Of(ref) && (latest.get(ref.id)?.revision ?? 0) < ref.revision) latest.set(ref.id, ref);
+    for (const ref of latest.values()) {
+      if (!managedTake(appliedAddressing(store, project, ref))) continue;
+      const own = confirmResults(store, { project, owner: binding.owner, target: binding.series.id, goal: binding.goal,
+        attempt: { series: binding.series, ordinal: binding.attempt }, accepting: [ref], cancelling: [], managedClosure: context });
+      if (own.ok) e4.push(ref);
+    }
+  }
+  return { e5: [...snapshot.accepting], e4, e5Of, e4Of };
 }
 /**
  * The single managed outcome table: prove the entire work with its additions, collect source classes, then derive the
  * reason. A saved close (`final`) also shows that its final journal holds exactly the classes derived here; the producer
  * derives them first over the rows alone, before that journal exists.
  */
+type ManagedOutcomeInput = Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting' | 'claim'> & { claim: Omit<GateOutcome, 'reason'> };
 function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'>, final = true) {
+  const derived = deriveManagedOutcome(store, input), { reason, confirmed, classifications, journal, series, owner, snapshot } = derived;
+  if (reason === null || input.claim.reason !== reason)
+    managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
+  if (final) for (const row of classifications) {
+    const saved = journal?.value.classifications.find(item => item.row === row.row);
+    if (!saved || canonical(saved) !== canonical(row))
+      managedFail(input.journal?.id ?? series.id, 'journal', 'The final journal of the close holds exactly the classes the close derives', 'completion_invalid', input.journal ?? undefined);
+  }
+  const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals };
+  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', project: input.project, binding: input.binding,
+    work: input.work, additions: [...input.additions], series: input.series, ledger: input.ledger, journal: input.journal,
+    claim: completionClaim(input.claim), outcome, waiting: [...snapshot.waiting] };
+  return { value, snapshot, routed: derived.routed, classifications, rows: derived.rows, address: derived.address, guards: confirmed.guards ?? [] };
+}
+/** Everything a managed close derives before its reason is compared: the one formula for the close and the claim preparer (H1). */
+function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
   const closure = { binding: input.binding, work: input.work, additions: input.additions, journal: input.journal };
   const snapshot = managedTake(checkManagedCompletionClaims(store, input.project, closure, input.claim.accepting, input.claim.refusals));
   const owner = snapshot.binding.value, series = managedTake(readAnySeriesAt(store, input.project, input.series));
@@ -1947,18 +1971,7 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
   const reason: CompletionReason | null = confirmed.achieved.length || confirmed.cancelled.length ? 'result'
     : subject ? 'refused' : snapshot.technical.some(row => row.reason === 'interrupted') ? 'interrupted'
     : snapshot.technical.some(row => row.reason === 'off-form') ? 'off-form' : snapshot.waiting.length ? 'awaiting-owner' : null;
-  if (reason === null || input.claim.reason !== reason)
-    managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
-  if (final) for (const row of classifications) {
-    const saved = journal?.value.classifications.find(item => item.row === row.row);
-    if (!saved || canonical(saved) !== canonical(row))
-      managedFail(input.journal?.id ?? series.id, 'journal', 'The final journal of the close holds exactly the classes the close derives', 'completion_invalid', input.journal ?? undefined);
-  }
-  const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals };
-  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', project: input.project, binding: input.binding,
-    work: input.work, additions: [...input.additions], series: input.series, ledger: input.ledger, journal: input.journal,
-    claim: completionClaim(input.claim), outcome, waiting: [...snapshot.waiting] };
-  return { value, snapshot, routed, classifications, rows, address, guards: confirmed.guards ?? [] };
+  return { reason, confirmed, snapshot, routed, classifications, rows, address, journal, series, owner };
 }
 export function readCompletionCloseAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionCloseRecord>> {
   return managedResult(() => historicalRead(store, { reader: 'G7.completion-close', project, ref }, () => {
@@ -2065,6 +2078,45 @@ export function captureManagedCloseHeads(store: Store, request: AnyCloseAttemptR
     return managedResult(() => {
       if (!seriesHead || !selected?.value) managedFail(seriesAddress(request).id, 'completion', 'A linked close needs a managed attempt', 'completion_required');
       return closeHeads(store, request, selected.value, seriesHead);
+    });
+  });
+}
+/** The claim a managed attempt can be closed with, and the heads it stands on (H1 №1737 п.5). */
+export interface PreparedManagedClaim { outcome: GateOutcome; guards: TransactionGuard[] }
+/**
+ * H1 (№1737 п.5–6): the full claim of a managed attempt, derived — never guessed — by the same outcome table as a
+ * direct or linked close and its historical reader. The registry names what it requires (every supported E5 basis,
+ * every applied M5 addressing, every diagnostic row); the caller adds only the independent results of its own steps
+ * (an accepted frame, a gap line) and lawful cancellations, which the providers still confirm. It writes nothing. An
+ * unfinished composition keeps its typed incompleteness; a finished one without a proved ground is a pause of its
+ * producer or control, never an invented reason.
+ */
+export function prepareManagedClaim(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<PreparedManagedClaim>> {
+  requireCloseRequest(store, request);
+  return withHistoricalReads(() => {
+    const seriesHead = store.get<AnyRepairSeries>(seriesAddress(request).id);
+    const selected = seriesHead ? readCompletionBinding(store, request.project, reference(seriesHead), request.attempt) : null;
+    if (selected && !selected.ok) return selected;
+    return managedResult(() => {
+      if (!seriesHead || !selected?.value) managedFail(seriesAddress(request).id, 'completion', 'A derived claim belongs to a managed attempt', 'completion_required');
+      const heads = closeHeads(store, request, selected.value, seriesHead);
+      const closure: ManagedClosure = { binding: heads.binding, work: reference(heads.work), additions: [], journal: heads.journal };
+      const snapshot = managedTake(readCompletionEffectiveAt(store, request.project, { work: closure.work, additions: [], journal: closure.journal }));
+      if (!snapshot.complete || snapshot.work.value.closed)
+        managedFail(closure.work.id, 'work', 'The close must use one complete exact pre-close registry', 'completion_incomplete');
+      const required = requiredManagedAccepting(store, request.project, closure, snapshot as CompletionSnapshot);
+      const unique = <T>(values: readonly T[], key: (value: T) => string) => [...new Map(values.map(value => [key(value), value])).values()];
+      const accepting = unique([...required.e5, ...required.e4, ...request.outcome.accepting], ref => canonical(ref));
+      const refusals = unique([...snapshot.refusals, ...request.outcome.refusals], row => row.row);
+      const claim = { accepting, cancelling: [...request.outcome.cancelling], refusals };
+      const derived = deriveManagedOutcome(store, { project: request.project, binding: heads.binding, work: closure.work, additions: [],
+        series: reference(heads.series), ledger: heads.ledger, journal: heads.journal, claim });
+      if (derived.reason === null) managedFail(heads.series.id, 'reason',
+        'The composition is complete but no proved ground closes it yet: the pause stands with its producer or control', 'completion_reason_invalid');
+      return { outcome: completionClaim({ reason: derived.reason, ...claim }),
+        guards: uniqueTransactionGuards([reference(heads.series), reference(heads.work), ...heads.products,
+          heads.ledger ?? { id: callLedgerId(request.project), absent: true },
+          heads.journal ?? { id: journalId(request.project), absent: true }, ...(derived.confirmed.guards ?? [])]) };
     });
   });
 }
