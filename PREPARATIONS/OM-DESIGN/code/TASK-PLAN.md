@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 95. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0c → D8.5 → H1.0d → Q1 → H1 → Q2 → H1.1 → Q2b → E4.1 → H1.2 → H1.3 → Q2c → D8.4.2 → V3 → S1.1 → E2.2 → Q3 → Q2.1 → H2 → Q4 → Q5 → H2.0.
+Задач: 95. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0c → D8.5 → H1.0d → Q1 → H1 → S1.1 → Q2 → H1.1 → Q2b → E4.1 → H1.2 → H1.3 → Q2c → D8.4.2 → V3 → E2.2 → Q3 → Q2.1 → H2 → Q4 → Q5 → H2.0.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -1273,7 +1273,7 @@
 - Отдаёт: —
 - Читает записи: журнал отказов, строки G4b, evaluation, completion-work, пакеты E2
 - Пишет записи: —
-- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`
+- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `src/om/model-call.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
 - Из движка как есть: withHistoricalReads / historicalRead / historicalProof — src/om/input.ts (урок 36, S1); readJournalAt — src/om/refusal-journal.ts; разбор ревьюера №1753 — ~/REPORTS/review/omg-code-s11_contract.md
 - После: S1, H1.0c, H1.0d, Q1, H1
 - Тесты сверх обязательных:
@@ -1869,7 +1869,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/om/refusal.ts`, `src/om/horizon.ts`, `src/om/model-call.ts`, `src/om/input.ts`, `test/om-refusal-codes.test.ts`
 - Из движка как есть: refused / REFUSAL_ROUTES — src/om/refusal.ts; наблюдение №21 — code/OBSERVATIONS.md
-- После: H1, Q1
+- После: H1, Q1, S1.1
 - Тесты сверх обязательных:
   - ДОГОВОР №1822 (~/REPORTS/review/omg-code-q2_contract-1822.md — читать ЦЕЛИКОМ): ЧАСТЬ 1 из 3 — общий механизм и три исходных производителя. Статическая проверка TypeScript AST в test/om-refusal-codes.test.ts обходит ВСЕ src/om/*.ts; четыре канала (собственный Refusal / общий-заимствованный код по явно подключённой группе / передача результата зависимости с названным источником / исключение и код данных-исхода — свои классы); декларативные правила классов и общих групп — в refusal.ts БЕЗ импорта производителей (циклы загрузки); разрешение псевдонимов, констант, локальных помощников, позиции параметра кода, default и conditional; неразрешённое выражение — падение, не пропуск; запрещены исключения «весь файл»/«любой error.code»/«любой *_invalid»; ожидаемый каталог НЕ выводить из найденных эмиссий. Модули частей Q2b/Q2c — явным списком ещё не подключённых (не постоянное исключение). Runtime-фильтр к readJournalAt/readRun/G4b/E4 не подключать. Таблица №1822-5 (8 строк) и регрессии №1822-5. Опись ревьюера /tmp/omg-q2-inventory.json (+ скрипт .cjs) — исходная, не приёмочная.
   - ДОПОЛНЕНИЕ №1849 (в том же файле договора, читать ЦЕЛИКОМ): пять путей; ВСЕ декларации для модулей вне путей — чистые данные в refusal.ts (модуль, экспорт/символ, выбранные коды либо именованный выход производителя и канал; без runtime-импортов), тест разрешает их по AST и падает на битой ссылке; HORIZON_REFUSAL_CODES/INPUT_REFUSAL_CODES НЕ расширять — отдельные экспорты доп. каталогов в horizon.ts и input.ts; completion-группа (14 кодов) создаётся В ЧАСТИ 1 с подмножествами по модулям (model-call, answers-gate, repeat-gate, routes только completion_invalid, assessment, series; completion_request_invalid в series — Refusal); группа Ref сверяется с REFS_REFUSAL_CODES; заимствования — конкретными кодами, не каталогом целиком; неизменённая передача (return x, take(dep), {...refusal}) — не новая эмиссия; динамики deliveries/frame-candidate/neighbors/stop-analysis/E4 transport — источники в refusal.ts; список остатка — только assessment, atomic-gate, feasibility, handoff, series-transition, series, run; регрессии на синтетических исходниках в памяти; кто сливается вторым (S1.1, E2.2, E4.1, H1.1…) — проходит общий тест. Адреса на 9201fab: candidate_gaps run.ts:239, answers_not_passed :850/:868, model_call_foreign model-call.ts:1975, model_call_not_running :1987 (номера строк — подсказки, не ключи анализатора)
