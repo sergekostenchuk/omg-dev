@@ -4,7 +4,7 @@ import type { ModelCall } from "../runtime/model-usage.js";
 import type { RoleBinding } from "../runtime/environment.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, digest, hashJson } from "../canonical.js";
-import { reference, isRef } from "../pipeline/contracts.js";
+import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { archivedContext } from "./working-context.js";
 
@@ -15,7 +15,12 @@ export function replayLimitedResponse(store: Store, pilot: Revision<ReaderPilot>
   draftId: string, questionId: string | undefined, purpose: string, input: string) {
   const request = JSON.parse(input);
   if (!isRef(request.subject?.working?.archive)) return null;
+  // C51 era boundary: a managed consumer call is recovered only through its
+  // own intent chain; replaying its bytes here would reuse the operation key
+  // without the intent binding. This path serves pre-intent calls only.
   const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
+    && !call.id.startsWith("model-call:consumer:v1:")
+    && !(call.value as { consumerIntent?: unknown }).consumerIntent
     && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id
     && call.value.projectId === pilot.value.projectId && call.value.draftId === draftId
     && call.value.questionId === (questionId ?? null) && call.value.purpose === purpose
@@ -51,7 +56,39 @@ export function replayLimitedResponse(store: Store, pilot: Revision<ReaderPilot>
       const current = store.get(ref.id); return current?.revision === ref.revision && current.hash === ref.hash;
     }), "input_stale", "A replay input changed");
     if (!store.get(id)) store.writeMany([{ id, kind: "research-response-replay", expected: 0, value }], guards);
-    return { research: payload.research };
+    return { research: payload.research, call: reference(call), response: reference(response) };
   }
   return null;
+}
+
+/** C51 door: before a managed intent is paid, a byte-identical pre-intent
+ * `pilot_reply_limit` call that already received its response is recovered
+ * instead — the same logical step is never sent twice. Candidates are the
+ * saved legacy calls for this exact pilot/draft/question/purpose/actor whose
+ * stored request bytes still verify against their own recorded digest. Every
+ * candidate replays through the same common validation; several
+ * indistinguishable matches end in a typed refusal, never a silent pick. */
+export function replayableLegacyCall(store: Store, pilot: Revision<ReaderPilot>, role: RoleBinding,
+  draftId: string, questionId: string, purpose: string):
+  { research: unknown; call: Ref; response: Ref } | null {
+  const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
+    && !call.id.startsWith("model-call:consumer:v1:")
+    && !(call.value as { consumerIntent?: unknown }).consumerIntent
+    && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id
+    && call.value.projectId === pilot.value.projectId && call.value.draftId === draftId
+    && call.value.questionId === questionId && call.value.purpose === purpose
+    && call.value.requested.actor === role.actor && isRef(call.value.request.record))
+    .sort((a, b) => b.value.startedAt - a.value.startedAt || a.id.localeCompare(b.id));
+  const matches: { research: unknown; call: Ref; response: Ref }[] = [];
+  for (const call of calls) {
+    const ref = call.value.request.record!;
+    const saved = store.get<{ text: string }>(ref.id, ref.revision);
+    requireCondition(saved?.kind === "model-request" && saved.hash === ref.hash,
+      "research_replay_invalid", "Saved request bytes are unavailable");
+    const result = replayLimitedResponse(store, pilot, role, draftId, questionId, purpose, saved.value.text);
+    if (result) matches.push(result);
+  }
+  requireCondition(matches.length <= 1, "research_replay_invalid",
+    "Several saved paid calls match this exact request");
+  return matches[0] ?? null;
 }

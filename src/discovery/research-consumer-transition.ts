@@ -2,10 +2,10 @@ import { Ajv } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
-import { isRef, reference, type Ref } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref, type Finding } from '../pipeline/contracts.js';
 import { normalizeResearchAction } from './research-action-normalization.js';
 import type { ReaderResult } from './reader.js';
-import type { ResearchAction } from './research-model.js';
+import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
 import type { Observation, Selector, Source } from '../evidence/evidence.js';
 import type { ReaderSelection } from './reader.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
@@ -15,6 +15,7 @@ import { activeSynthesisNotes, consolidationNotice, consolidatedProposal,
 import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace,
   type ContextLookup, type ContextWorkspace } from './context-workspace.js';
 import { archivedContext, contextPage, contextValue, type ContextPage } from './working-context.js';
+import type { Graph } from '../graph/model.js';
 import type { Json } from '../canonical.js';
 
 /* This module is the dependency leaf for paid consumer transitions. Its inputs
@@ -547,7 +548,8 @@ export function parseSynthesisSessionV2(value: unknown): {
 export function synthesisReservationConsumed(value: { delivery?: { run: string; turn: number } | null;
   delivered?: Ref | null }): boolean {
   return value.delivery != null && value.delivered != null
-    && value.delivered.id === `research-turn:${hashJson([value.delivery.run, value.delivery.turn])}`;
+    && (value.delivered.id === `research-turn:${hashJson([value.delivery.run, value.delivery.turn])}`
+      || value.delivered.id === managedTurnId(value.delivery.run, value.delivery.turn));
 }
 
 /** A reservation-only session step (№1658 К2): the same task, unfinished, with
@@ -607,4 +609,820 @@ export function projectContextRecoveryTransition(input: ContextRecoveryTransitio
   return { key, session: { ...before, finalization,
     workspace: { ...unblocked, entries: [...unblocked.entries, { key, result: input.result }], sinceProgress: 0 },
     recoveries: [...(before.recoveries ?? []), recovery] } };
+}
+
+/* ==== D8.4c: managed consumer turns ====
+ * The paid analyst/planner/escalation families below share the dependency-leaf
+ * rule above: every projection consumes exact checked records, never a mutable
+ * HEAD or a caller-supplied error. */
+
+export interface ContextReadPage { offset: number; limit: number }
+export interface ProjectedContextRead {
+  record: Ref; pointer: string; value: unknown;
+  page?: { offset: number; end: number; total: number; unit: 'utf16' | 'items'; next: number | null };
+}
+
+/** Selects a value from an already checked exact record, for both live writing
+ * and historical proof. The record's provenance is checked by the caller. */
+export function projectResearchContextRead(recordValue: unknown, record: Ref, pointer: string,
+  page: ContextReadPage | undefined, maxChars: number): ProjectedContextRead {
+  requireCondition(typeof pointer === 'string' && (pointer === '' || pointer.startsWith('/')),
+    'selector_invalid', 'Use a JSON pointer');
+  let value = recordValue;
+  for (const part of pointer === '' ? [] : pointer.slice(1).split('/')) {
+    requireCondition(!/~(?![01])/.test(part), 'selector_invalid', 'Invalid pointer escape');
+    const key = part.replaceAll('~1', '/').replaceAll('~0', '~');
+    requireCondition(value !== null && typeof value === 'object' && Object.hasOwn(value, key),
+      'context_missing', 'Context pointer does not exist');
+    value = (value as Record<string, unknown>)[key];
+  }
+  let result: ProjectedContextRead = { record, pointer, value };
+  if (page) {
+    requireCondition(Number.isSafeInteger(page.offset) && page.offset >= 0
+      && Number.isSafeInteger(page.limit) && page.limit > 0
+      && (typeof value === 'string' || Array.isArray(value)),
+    'context_page_invalid', 'Page a string or array with nonnegative offset and positive limit');
+    requireCondition(page.offset <= value.length,
+      'context_page_invalid', 'Page offset exceeds the original value');
+    const end = Math.min(value.length, page.offset + page.limit);
+    result = { record, pointer, value: value.slice(page.offset, end),
+      page: { offset: page.offset, end, total: value.length,
+        unit: typeof value === 'string' ? 'utf16' : 'items',
+        next: end < value.length ? end : null } };
+  }
+  requireCondition(Number.isSafeInteger(maxChars) && maxChars > 0,
+    'context_read_limit', 'Addressed context needs a positive character limit');
+  requireCondition(canonical(result).length <= maxChars,
+    'context_read_limit', 'Use a smaller addressed context page');
+  return result;
+}
+
+export interface ContextReadIdentityInput {
+  projectId: string;
+  action: Extract<ResearchAction, { action: 'read_context' }>;
+  observation: ProjectedContextRead;
+  recordKind: string;
+  recordValue: unknown;
+  question: Ref;
+  /** Supplied only when the projected value itself points to a reader result. */
+  readerResult?: { ref: Ref; value: ReaderResult };
+}
+
+/** A repeat compares the exact addressed original. Archives may be rebuilt
+ * around the same underlying source, so their wrapper Ref is not the key. */
+export function contextReadIdentity(input: ContextReadIdentityInput): string {
+  const { action, observation, recordKind, recordValue, question } = input;
+  requireCondition(action.action === 'read_context' && isRef(action.record)
+    && typeof input.projectId === 'string' && input.projectId.length > 0
+    && isRef(question) && canonical(observation) === canonical(projectResearchContextRead(
+      recordValue, action.record, action.pointer, action.page, Number.MAX_SAFE_INTEGER)),
+  'research_consumer_intent_invalid', 'The repeated context is not its exact addressed result');
+  const view = observation.value && typeof observation.value === 'object'
+    && !Array.isArray(observation.value) && isRef((observation.value as Record<string, unknown>).ref)
+    ? observation.value as Record<string, unknown> : observation as unknown as Record<string, unknown>;
+  const viewRef = view.ref;
+  if (isRef(viewRef) && viewRef.id.startsWith('reader-result:')) {
+    const reader = input.readerResult;
+    requireCondition(reader && canonical(reader.ref) === canonical(viewRef)
+      && reader.value.projectId === input.projectId
+      && reader.value.question.id === question.id
+      && canonical(view.observations) === canonical(reader.value.observations),
+    'research_consumer_intent_invalid', 'The repeated reader selection lacks its exact result');
+    return canonical(reader.ref);
+  }
+  const page = observation.page ?? null;
+  if (recordKind !== 'research-context') return canonical([action.record, action.pointer, page]);
+  requireCondition(recordValue && typeof recordValue === 'object' && !Array.isArray(recordValue)
+    && (recordValue as Record<string, unknown>).projectId === input.projectId
+    && isRef((recordValue as Record<string, unknown>).draft)
+    && isRef((recordValue as Record<string, unknown>).question)
+    && (recordValue as { question: Ref }).question.id === question.id,
+  'research_consumer_intent_invalid', 'The repeated archive lost its exact draft and question');
+  const parts = action.pointer.split('/');
+  for (let end = parts.length; end > 1; end -= 1) {
+    const parent = projectResearchContextRead(recordValue, action.record,
+      parts.slice(0, end).join('/'), undefined, Number.MAX_SAFE_INTEGER).value;
+    const candidate = parent && typeof parent === 'object' && !Array.isArray(parent)
+      ? parent as Record<string, unknown> : null;
+    const origin = candidate?.source ?? candidate?.ref;
+    if (isRef(origin)) return canonical([origin, parts.slice(end), page, observation.value]);
+  }
+  const archive = recordValue as { draft: Ref; question: Ref };
+  return canonical([archive.draft.id, archive.question.id, action.pointer, page, observation.value]);
+}
+
+/** №1745-2: the exact records that made up this turn's accepted paid answer.
+ * Persisted on the completed managed turn so historical readers consume the
+ * named chain instead of rescanning a draft that may have moved on. */
+export interface AcceptedAnswerChain {
+  draftBefore: Ref; draftAfter: Ref; questionBefore: Ref; questionAfter: Ref;
+  answer: Ref; assessment: Ref;
+}
+export type ManagedResearchTurn = ResearchTurn & { contract: 'research-consumer-turn/v1'; consumerIntent: Ref; acceptance?: AcceptedAnswerChain };
+/** Payload-level failures of a saved paid action/escalation response that
+ * terminate as a typed `consumer-invalid` outcome instead of a fabricated
+ * action or a transport refusal (C13/C62). Context-level failures that occur
+ * after the turn was written keep completing that turn with their typed error. */
+export const ACTION_RESPONSE_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  'research_response_invalid', 'research_checkpoint_empty', 'escalation_assessment_invalid']);
+
+export const managedTurnId = (run: string, number: number) =>
+  `research-turn:v1:${hashJson([run, number])}`;
+const exactRef = (record: Revision<unknown>): Ref => ({ id: record.id,
+  revision: record.revision, hash: record.hash });
+
+export interface ContextTurnHistoryProof {
+  turn: Revision<ResearchTurn>;
+  /** Required for a completed, successful read_context in this run. */
+  context?: Omit<ContextReadIdentityInput, 'action' | 'observation' | 'question'>;
+}
+
+/** Rebuild the addressed workspace from complete exact turn history. Current
+ * Source heads and today's file contents are not historical inputs. */
+export function projectAddressedWorkspace(before: ManagedResearchTurn,
+  history: ContextTurnHistoryProof[], question: Ref): ContextWorkspace {
+  requireCondition(before.status === 'pending' && isRef(question)
+    && canonical(before.question) === canonical(question)
+    && Number.isSafeInteger(before.number) && before.number > 0
+    && Array.isArray(history) && history.length === before.number - 1,
+  'research_consumer_intent_invalid',
+  'An addressed workspace needs the complete original run history');
+  let workspace: ContextWorkspace = { entries: [], sinceProgress: 0 };
+  for (let index = 0; index < history.length; index += 1) {
+    const entry = history[index]!, turn = entry.turn;
+    requireCondition(turn.kind === 'research-turn' && hashJson(turn.value) === turn.hash
+      && turn.value.run === before.run && turn.value.number === index + 1,
+    'research_consumer_intent_invalid',
+    'An addressed workspace omitted or substituted an earlier run turn');
+    const prior = turn.value;
+    if (prior.question?.id !== question.id || prior.status !== 'completed' || prior.error) continue;
+    const kind = (prior.action as { action?: unknown } | null)?.action;
+    if (['checkpoint', 'answer', 'answer_delta', 'read_bundle', 'read_source'].includes(String(kind)))
+      workspace = contextProgress(workspace);
+    if (kind !== 'read_context' || canonical(prior.question) !== canonical(question)) continue;
+    requireCondition(entry.context,
+      'research_consumer_intent_invalid',
+      'An earlier addressed read lost its exact checked original');
+    const action = researchAction(prior.action);
+    requireCondition(action.action === 'read_context',
+      'research_consumer_intent_invalid', 'The original addressed action is invalid');
+    const result = prior.observation as ProjectedContextRead;
+    contextReadIdentity({ ...entry.context, action, observation: result, question });
+    const key = contextLookupKey(result);
+    workspace = { ...workspace,
+      entries: [...workspace.entries.filter(item => item.key !== key), { key, result }],
+      sinceProgress: workspace.sinceProgress + 1 };
+  }
+  return workspace;
+}
+
+/** Return null only when a complete, checked run history contains no earlier
+ * delivery of this addressed original. Malformed history is never absence. */
+export function projectRepeatedContextRead(before: ManagedResearchTurn,
+  current: ContextReadIdentityInput,
+  history: ContextTurnHistoryProof[]): { previous: Ref; history: Ref[] } | null {
+  const action = researchAction(before.action);
+  requireCondition(action.action === 'read_context' && isRef(before.question)
+    && canonical(action) === canonical(current.action)
+    && canonical(before.question) === canonical(current.question)
+    && Number.isSafeInteger(before.number) && before.number > 0
+    && Array.isArray(history) && history.length === before.number - 1,
+  'research_consumer_intent_invalid',
+  'A repeated context page needs its complete original turn history');
+  const key = contextReadIdentity(current);
+  for (let index = 0; index < history.length; index += 1) {
+    const prior = history[index]!.turn;
+    requireCondition(prior.kind === 'research-turn' && hashJson(prior.value) === prior.hash
+      && prior.value.run === before.run && prior.value.number === index + 1,
+    'research_consumer_intent_invalid', 'The repeat omitted or substituted a prior run turn');
+  }
+  let previous: Ref | null = null;
+  for (const entry of [...history].reverse()) {
+    const prior = entry.turn.value;
+    if (prior.question?.id !== before.question.id) continue;
+    const priorAction = researchAction(prior.action);
+    if (priorAction.action === 'checkpoint' || priorAction.action === 'answer'
+      || priorAction.action === 'answer_delta') break;
+    if (prior.error || prior.status !== 'completed' || priorAction.action !== 'read_context') continue;
+    requireCondition(entry.context,
+      'research_consumer_intent_invalid', 'A prior completed context read lost its checked original');
+    const priorKey = contextReadIdentity({ ...entry.context, action: priorAction,
+      observation: prior.observation as ProjectedContextRead,
+      question: before.question });
+    if (key === priorKey) { previous = exactRef(entry.turn); break; }
+  }
+  return previous ? { previous, history: history.map(entry => exactRef(entry.turn)) } : null;
+}
+
+export interface ResearchSearchProcess {
+  stdout: string | null; status: number | null; signal: string | null;
+  error: { name: string; message: string; code: string | null } | null;
+}
+export interface ResearchSearchObservation {
+  sources: { source: Ref; offset: number; excerpt: string }[];
+  repositoryMatches: string;
+  repositoryStatus: 'matches' | 'no_matches' | 'unavailable_or_truncated';
+}
+export interface ResearchSearchCaptureInput {
+  projectId: string; turn: Revision<ResearchTurn>;
+  /** Required when a read_plan child inherits its paid action from a parent. */
+  parent?: { original: Revision<ResearchTurn>; queued: Revision<ResearchTurn> };
+  query: string; workspace: string;
+  sources: { ref: Ref; value: Source }[];
+  process: ResearchSearchProcess;
+}
+export interface ResearchSearchCaptureValue {
+  contract: 'research-search-capture/v1'; projectId: string;
+  turn: Ref; run: string; question: Ref | null; consumerIntent: Ref;
+  plannedBy: Ref | null; query: string; workspace: string;
+  sources: Ref[]; process: ResearchSearchProcess;
+  observation: ResearchSearchObservation;
+}
+
+/** Shared query admission for the ordinary search and managed capture. */
+export function requireSearchQuery(query: unknown): asserts query is string {
+  requireCondition(typeof query === 'string' && query.trim().length > 0 && query.length <= 1000,
+    'research_query_invalid', 'Use a nonempty bounded search query');
+}
+
+export function projectResearchSearchObservation(query: string,
+  sources: readonly { ref: Ref; value: Source }[], process: ResearchSearchProcess): ResearchSearchObservation {
+  requireSearchQuery(query);
+  requireCondition(Array.isArray(sources) && sources.every(source => isRef(source.ref)
+      && typeof source.value.content === 'string'
+      && digest(source.value.content) === source.value.sha256
+      && hashJson(source.value) === source.ref.hash)
+    && process && (typeof process.stdout === 'string' || process.stdout === null)
+    && (Number.isSafeInteger(process.status) || process.status === null)
+    && (typeof process.signal === 'string' || process.signal === null)
+    && (process.error === null || process.error && typeof process.error.name === 'string'
+      && typeof process.error.message === 'string'
+      && (typeof process.error.code === 'string' || process.error.code === null)),
+  'research_search_capture_invalid', 'The search lost its exact query, Source bytes or process result');
+  return { sources: sources.flatMap(source => {
+      const offset = source.value.content.toLowerCase().indexOf(query.toLowerCase());
+      return offset < 0 ? [] : [{ source: source.ref, offset,
+        excerpt: source.value.content.slice(Math.max(0, offset - 200), offset + 1200) }];
+    }),
+    repositoryMatches: (process.stdout ?? '').slice(0, 20_000),
+    repositoryStatus: process.status === 0 ? 'matches' : process.status === 1
+      ? 'no_matches' : 'unavailable_or_truncated' };
+}
+
+/** One search projection for the original producer and exact historical read.
+ * Repository matches remain a navigation hint, never accepted Source evidence. */
+export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
+  { id: string; ref: Ref; value: ResearchSearchCaptureValue } {
+  const { projectId, turn, parent, query, workspace, sources, process } = input;
+  requireSearchQuery(query);
+  const action = researchAction(turn.value.action);
+  requireCondition(turn.kind === 'research-turn' && hashJson(turn.value) === turn.hash
+    && turn.value.status === 'pending' && action.action === 'search'
+    && action.query === query && typeof projectId === 'string' && projectId.length > 0
+    && typeof workspace === 'string' && workspace.length > 0
+    && Array.isArray(sources) && sources.every(source => isRef(source.ref)
+      && source.ref.id.startsWith(`source:${projectId}:`)
+      && source.value.projectId === projectId && typeof source.value.content === 'string'
+      && digest(source.value.content) === source.value.sha256
+      && hashJson(source.value) === source.ref.hash)
+    && new Set(sources.map(source => source.ref.id)).size === sources.length,
+  'research_search_capture_invalid', 'The search capture lost exact action, sources or process facts');
+  let consumerIntent: Ref;
+  let plannedBy: Ref | null = null;
+  if (isRef(turn.value.plannedBy)) {
+    const parentRef = turn.value.plannedBy;
+    const original = parent?.original, queued = parent?.queued;
+    const parentAction = original ? researchAction(original.value.action) : null;
+    const rawChildren = queued?.value.observation && typeof queued.value.observation === 'object'
+      ? (queued.value.observation as { children?: unknown }).children : null;
+    const children: unknown[] | null = Array.isArray(rawChildren) ? rawChildren : null;
+    const index = children ? children.findIndex(child =>
+      canonical(child) === canonical(exactRef(turn))) : -1;
+    const parentIntent = (original?.value as ManagedResearchTurn | undefined)?.consumerIntent;
+    requireCondition(original && queued && canonical(exactRef(original)) === canonical(parentRef)
+      && original.kind === 'research-turn' && hashJson(original.value) === original.hash
+      && original.value.status === 'pending' && parentAction?.action === 'read_plan'
+      && queued.kind === 'research-turn' && queued.id === original.id
+      && queued.revision === original.revision + 1 && hashJson(queued.value) === queued.hash
+      && queued.value.status === 'completed'
+      && canonical(queued.value.action) === canonical(original.value.action)
+      && canonical(queued.value.question) === canonical(original.value.question)
+      && queued.value.run === original.value.run
+      && original.value.run === turn.value.run
+      && index >= 0 && parentAction.reads.length === children!.length
+      && turn.id === `research-turn:${hashJson([original.id, 'read', index])}`
+      && turn.value.number === original.value.number + index + 1
+      && canonical(turn.value.question) === canonical(original.value.question)
+      && canonical(action) === canonical(parentAction.reads[index])
+      && (original.value as ManagedResearchTurn).contract === 'research-consumer-turn/v1'
+      && isRef(parentIntent),
+    'research_search_capture_invalid', 'The planned search is not an exact child of its paid queue');
+    consumerIntent = parentIntent;
+    plannedBy = parentRef;
+  } else {
+    const managed = turn.value as ManagedResearchTurn;
+    requireCondition(!parent && managed.contract === 'research-consumer-turn/v1'
+      && isRef(managed.consumerIntent),
+    'research_search_capture_invalid', 'The search has no paid consumer origin');
+    consumerIntent = managed.consumerIntent;
+  }
+  const observation = projectResearchSearchObservation(query, sources, process);
+  const value: ResearchSearchCaptureValue = { contract: 'research-search-capture/v1',
+    projectId, turn: exactRef(turn), run: turn.value.run, question: turn.value.question,
+    consumerIntent, plannedBy, query, workspace,
+    sources: sources.map(source => source.ref), process, observation };
+  const hash = hashJson(value), id = `research-search-capture:v1:${hash}`;
+  return { id, ref: { id, revision: 1, hash }, value };
+}
+
+/** A search completion always points at the exact immutable capture. The
+ * planned child has no managed marker of its own, but inherits the checked
+ * parent queue's paid intent in the capture projection above. */
+export function projectSearchTurnCompletion(input: ResearchSearchCaptureInput):
+  { turn: ResearchTurn; capture: ReturnType<typeof projectResearchSearchCapture> } {
+  const capture = projectResearchSearchCapture(input);
+  return { capture, turn: { ...input.turn.value, status: 'completed',
+    assessment: null, error: null,
+    observation: { ...capture.value.observation, capture: capture.ref } } };
+}
+
+const correctableLayerDesignCodes = new Set([
+  'answer_invalid', 'graph_invalid', 'layer_design_missing', 'layer_design_invalid',
+  'derived_field_conflict', 'layer_delta_required',
+  'layer_delta_ambiguous', 'layer_delta_missing', 'layer_connector_ref_invalid',
+  'layer_counterfactual_ref_invalid', 'layer_requirement_invalid',
+  'layer_join_inputs_invalid', 'layer_join_design_required', 'layer_detail_invalid',
+  'horizon_empty', 'upper_layer_drift', 'layer_outcome_uncovered',
+  'layer_connector_uncovered', 'layer_port_unbound', 'task_obligation_bindings_invalid'
+]);
+export function isCorrectableLayerDesignFailure(error: EngineError): boolean {
+  return correctableLayerDesignCodes.has(error.code);
+}
+export interface LayerDesignRefusalProof {
+  kind: 'layer-design-refusal'; projectId: string;
+  draft: Revision<DiscoveryDraft>; question: Revision<Question>; graph: Revision<Graph>;
+  failure: { code: string; message: string; details: unknown };
+}
+export type PaidLocalRefusalKind = 'mode-refusal' | 'reading-plan-refusal'
+  | 'reading-mode-refusal' | 'search-query-refusal';
+type PaidLocalRefusalReason = { kind: PaidLocalRefusalKind; code: string; message: string };
+
+/** The order matches the paid consumer's local admission: dispatch mode is
+ * checked before a plan, mode transition or search can run. A failure outside
+ * this finite set stays pending instead of acquiring an invented completion. */
+function paidLocalRefusalReason(before: ManagedResearchTurn,
+  action: ResearchAction): PaidLocalRefusalReason | null {
+  const mode = before.dispatchMode;
+  if (!before.plannedBy && (mode === 'planning' || mode === 'synthesis')) {
+    const allowed = mode === 'planning'
+      ? ['read_plan', 'synthesize', 'pause']
+      : ['answer', 'answer_delta', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause'];
+    if (!allowed.includes(action.action)) return { kind: 'mode-refusal',
+      code: 'research_mode_invalid',
+      message: 'Planning only selects reads; synthesis answers or identifies explicit missing information' };
+  }
+  if (action.action === 'read_plan' && mode === 'planning'
+    && (!isRef(before.question) || action.question !== before.question.id
+      || new Set(action.reads.map(canonical)).size !== action.reads.length))
+    return { kind: 'reading-plan-refusal', code: 'reading_plan_invalid',
+      message: 'Reading plan must target this question without duplicate requests' };
+  if ((action.action === 'synthesize' || action.action === 'need_research')
+    && (mode !== 'planning' && mode !== 'synthesis'
+      || !isRef(before.question) || action.question !== before.question.id))
+    return { kind: 'reading-mode-refusal', code: 'research_question_foreign',
+      message: 'Mode transition must target the current question' };
+  if (action.action === 'search'
+    && (action.query.trim().length === 0 || action.query.length > 1000))
+    return { kind: 'search-query-refusal', code: 'research_query_invalid',
+      message: 'Use a nonempty bounded search query' };
+  return null;
+}
+
+export function projectPaidLocalRefusal(before: ManagedResearchTurn): {
+  proof: { kind: PaidLocalRefusalKind }; turn: ManagedResearchTurn; failure: EngineError;
+} | null {
+  const reason = paidLocalRefusalReason(before, researchAction(before.action));
+  if (!reason) return null;
+  const proof = { kind: reason.kind };
+  return { proof, turn: projectResearchTurnRevision(before, proof),
+    failure: new EngineError(reason.code, reason.message) };
+}
+
+export interface PaidTurnAdmission {
+  runId: string; intent: Ref; response: unknown; question: Ref | null;
+  owner: ResearchRun['owner']; limit: number; context: unknown;
+  mode?: 'planning' | 'synthesis';
+}
+
+export interface AcceptedPaidAnswerInputs {
+  projectId: string;
+  draftBefore: Revision<DiscoveryDraft>; draftAfter: Revision<DiscoveryDraft>;
+  questionBefore: Revision<Question>; questionAfter: Revision<Question>;
+  answer: Revision<ResearchAnswer>; assessment: Revision<ResearchAssessment>;
+  action: unknown;
+  /** Required only for answer_delta; derived with the checked original graph. */
+  expandedProposal?: unknown;
+}
+
+/** The exact historical acceptance pair is independent of today's draft HEAD.
+ * Callers load adjacent revisions from the acceptance's own sources, and may
+ * separately check current admission before starting subsequent work. */
+export function matchAcceptedPaidAnswer(input: AcceptedPaidAnswerInputs):
+  { assessment: Ref; observation: { verdict: 'supported'; reasons: string[] } } | null {
+  const { projectId, draftBefore, draftAfter, questionBefore, questionAfter, answer, assessment } = input;
+  const action = researchAction(input.action);
+  if (action.action !== 'answer' && action.action !== 'answer_delta') return null;
+  const field = questionBefore.value.spec.field;
+  const proposal = action.action === 'answer' ? action.value : input.expandedProposal;
+  if (proposal === undefined || draftBefore.kind !== 'discovery-draft' || draftAfter.kind !== 'discovery-draft'
+    || questionBefore.kind !== 'question' || questionAfter.kind !== 'question'
+    || answer.kind !== 'research-answer' || assessment.kind !== 'research-assessment'
+    || draftAfter.id !== draftBefore.id || draftAfter.revision !== draftBefore.revision + 1
+    || questionAfter.id !== questionBefore.id || questionAfter.revision !== questionBefore.revision + 1
+    || draftBefore.value.projectId !== projectId || draftAfter.value.projectId !== projectId
+    || questionBefore.value.projectId !== projectId || questionAfter.value.projectId !== projectId
+    || questionBefore.value.draftId !== draftBefore.id || questionAfter.value.draftId !== draftBefore.id
+    || !draftBefore.value.questions.includes(questionBefore.id)
+    || canonical({ ...questionBefore.value, status: 'answered', answer: exactRef(answer) })
+      !== canonical(questionAfter.value)
+    || questionBefore.value.status === 'answered' || questionBefore.value.answer !== null
+    || answer.value.projectId !== projectId || answer.value.question !== questionBefore.id
+    || canonical(questionAfter.value.answer) !== canonical(exactRef(answer))
+    || canonical(answer.value.assessment) !== canonical(exactRef(assessment))
+    || canonical(answer.value.value) !== canonical(assessment.value.value)
+    || assessment.value.projectId !== projectId || assessment.value.verdict !== 'supported'
+    || assessment.value.researcher === assessment.value.assessor
+    || !Array.isArray(assessment.value.observations) || assessment.value.observations.length === 0
+    || !Array.isArray(assessment.value.reasons)
+    || canonical(assessment.value.question) !== canonical(exactRef(questionBefore))
+    || !Object.hasOwn(draftBefore.value.fields, field)
+    || hashJson(draftBefore.value.fields[field]) !== questionBefore.value.beforeHash
+    || canonical(draftAfter.value) !== canonical({ ...draftBefore.value,
+      fields: { ...draftBefore.value.fields, [field]: answer.value.value } })
+    || canonical(action.citations) !== canonical(assessment.value.observations.map(item =>
+      ({ source: item.source, selector: item.selector })))
+    || canonical(proposal) !== canonical(assessment.value.value)) return null;
+  return { assessment: exactRef(assessment),
+    observation: { verdict: 'supported', reasons: assessment.value.reasons } };
+}
+
+/** Analyst/planner application writes this run and pending turn together. The
+ * number and request charge derive from the exact prior run and saved context. */
+export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdmission):
+  { run: ResearchRun; turn: ManagedResearchTurn } {
+  requireCondition(typeof input.runId === 'string' && input.runId && Number.isSafeInteger(before.turns)
+    && before.turns >= 0 && Number.isSafeInteger(before.requestChars) && before.requestChars >= 0
+    && Number.isSafeInteger(input.limit) && input.limit > 0 && input.intent.revision === 1,
+  'research_consumer_intent_invalid', 'A paid turn needs its exact prior run and original intent');
+  const action = researchAction(input.response);
+  const next = before.turns + 1;
+  const run: ResearchRun = { ...before, status: 'running', turns: next,
+    limit: input.limit, owner: input.owner,
+    requestChars: before.requestChars + canonical(input.context).length,
+    error: null, pauseCode: null };
+  const turn: ManagedResearchTurn = { contract: 'research-consumer-turn/v1',
+    consumerIntent: input.intent, run: input.runId, number: next,
+    action, assessment: null, observation: null, error: null,
+    status: 'pending', question: input.question,
+    ...(input.mode ? { dispatchMode: input.mode } : {}) };
+  return { run, turn };
+}
+
+export type TurnTransitionProof =
+  | { kind: 'pause' }
+  | { kind: PaidLocalRefusalKind }
+  | LayerDesignRefusalProof
+  | { kind: 'technical-refusal'; result: { ref: Ref; value: {
+      contract: 'research-proposal-refusal/v1'; projectId: string; turn: Ref;
+      pending: Ref; question: Ref; findings: Finding[] } } }
+  | { kind: 'read-context'; recordValue: unknown; record: Ref; maxChars: number }
+  | { kind: 'context-refusal'; recordValue: unknown; record: Ref; maxChars: number }
+  | { kind: 'delivery-refusal'; recordValue: unknown; record: Ref; maxChars: number;
+      workspace: ContextWorkspace; delivered: ContextLookup[]; maxLookups?: number }
+  | { kind: 'read-bundle'; result: { ref: Ref; value: ReaderResult } }
+  | { kind: 'checkpoint'; checkpoint: { ref: Ref; value: {
+      projectId: string; draft: Ref; question: Ref; status: 'unassessed';
+      proposal: unknown; observations: Observation[];
+      unresolved: string[] } } }
+  | { kind: 'source-excerpt'; projectId: string; source: { ref: Ref; value: Source } }
+  | { kind: 'source-read'; projectId: string; source: { ref: Ref; value: Source } }
+  | { kind: 'reading-plan-queued'; children: Ref[] }
+  | { kind: 'reading-mode' }
+  | { kind: 'premature-owner'; consulted: readonly Ref[]; hadPriorRead: boolean }
+  | { kind: 'owner-review'; verdict: { necessary: boolean; reason: string; [key: string]: unknown } }
+  | { kind: 'assessed-answer'; question: Revision<Question>;
+      assessment: Revision<ResearchAssessment>; expandedProposal?: unknown }
+  | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs }
+  | { kind: 'question-reopened'; original: Revision<Question>;
+      reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
+  | { kind: 'repeat-context'; current: ContextReadIdentityInput;
+      history: ContextTurnHistoryProof[] };
+
+/** Pure producer projection. Callers must first prove each supplied record by
+ * its exact historical reader; no code/message supplied by the caller is used
+ * as an authority for a local refusal. */
+export function projectResearchTurnRevision(before: ManagedResearchTurn,
+  proof: TurnTransitionProof): ManagedResearchTurn {
+  requireCondition(before.status === 'pending' && before.error === null
+    && before.contract === 'research-consumer-turn/v1',
+  'research_consumer_intent_invalid', 'Only a pending paid turn can be completed');
+  const action = researchAction(before.action);
+  if (proof.kind === 'mode-refusal' || proof.kind === 'reading-plan-refusal'
+    || proof.kind === 'reading-mode-refusal' || proof.kind === 'search-query-refusal') {
+    const reason = paidLocalRefusalReason(before, action);
+    requireCondition(reason?.kind === proof.kind, 'research_consumer_intent_invalid',
+      'The original paid action does not produce this local refusal');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: reason.code, details: null }, error: reason.message };
+  }
+  if (proof.kind === 'layer-design-refusal') {
+    const { draft, question, graph, failure, projectId } = proof;
+    requireCondition((action.action === 'answer' || action.action === 'answer_delta')
+      && isRef(before.question) && action.question === before.question.id
+      && canonical(before.question) === canonical(exactRef(question))
+      && draft.kind === 'discovery-draft' && question.kind === 'question' && graph.kind === 'graph'
+      && hashJson(draft.value) === draft.hash && hashJson(question.value) === question.hash
+      && hashJson(graph.value) === graph.hash
+      && draft.value.projectId === projectId && question.value.projectId === projectId
+      && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
+      && draft.value.stage === 'om-g2' && ['R1', 'R2'].includes(draft.value.level)
+      && question.value.spec.field === 'layerDesign'
+      && (action.action === 'answer_delta' || draft.value.level === 'R2'
+        || failure.code === 'layer_delta_required')
+      && graph.id === `graph:${projectId}`
+      && (action.action !== 'answer_delta' || canonical(action.base) === canonical(exactRef(graph)))
+      && typeof failure.message === 'string' && failure.message.length > 0
+      && isCorrectableLayerDesignFailure(new EngineError(failure.code, failure.message, failure.details)),
+    'research_consumer_intent_invalid', 'A layer refusal needs its exact paid draft, question, graph and correctable design failure');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: failure.code, details: failure.details }, error: failure.message };
+  }
+  if (proof.kind === 'technical-refusal') {
+    const result = proof.result;
+    requireCondition((action.action === 'answer' || action.action === 'answer_delta')
+      && result.value.contract === 'research-proposal-refusal/v1'
+      && result.value.projectId.length > 0
+      && isRef(result.ref) && result.ref.revision === 1
+      && result.ref.id === `research-proposal-refusal:v1:${hashJson({
+        projectId: result.value.projectId,
+        turnId: `research-turn:v1:${hashJson([before.run, before.number])}` })}`
+      && result.ref.hash === hashJson(result.value)
+      && isRef(result.value.turn) && result.value.turn.revision === 1
+      && result.value.turn.id === `research-turn:v1:${hashJson([before.run, before.number])}`
+      && isRef(result.value.pending) && result.value.pending.id === result.value.turn.id
+      && canonical(result.value.question) === canonical(before.question)
+      && action.question === result.value.question.id
+      && Array.isArray(result.value.findings) && result.value.findings.length > 0,
+    'research_consumer_intent_invalid', 'A technical refusal needs the checked exact original paid answer');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: 'research_proposal_invalid', details: result.value.findings,
+        refusal: result.ref },
+      error: 'Correct the typed proposal findings before model assessment' };
+  }
+  if (proof.kind === 'pause') {
+    requireCondition(action.action === 'pause', 'research_consumer_intent_invalid',
+      'Only a paid pause can produce a paused run');
+    return { ...before, status: 'completed', error: null, observation: null };
+  }
+  if (proof.kind === 'read-context') {
+    requireCondition(action.action === 'read_context'
+      && canonical(action.record) === canonical(proof.record),
+    'research_consumer_intent_invalid', 'The addressed read changed its exact paid request');
+    return { ...before, status: 'completed', error: null, observation:
+      projectResearchContextRead(proof.recordValue, proof.record, action.pointer,
+        action.page, proof.maxChars) };
+  }
+  if (proof.kind === 'context-refusal') {
+    requireCondition(action.action === 'read_context'
+      && canonical(action.record) === canonical(proof.record),
+    'research_consumer_intent_invalid', 'The refused context read changed its exact paid request');
+    let failure: EngineError | null = null;
+    try {
+      projectResearchContextRead(proof.recordValue, proof.record, action.pointer,
+        action.page, proof.maxChars);
+    } catch (error) {
+      if (error instanceof EngineError) failure = error;
+      else throw error;
+    }
+    requireCondition(failure, 'research_consumer_intent_invalid',
+      'A successful context projection cannot be saved as a refusal');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: failure.code, details: failure.details }, error: failure.message };
+  }
+  if (proof.kind === 'delivery-refusal') {
+    requireCondition(action.action === 'read_context'
+      && canonical(action.record) === canonical(proof.record),
+    'research_consumer_intent_invalid', 'The refused delivery changed its paid context request');
+    const result = projectResearchContextRead(proof.recordValue, proof.record,
+      action.pointer, action.page, proof.maxChars);
+    let failure: EngineError | null = null;
+    try { addContextLookup(proof.workspace, result, proof.delivered, proof.maxLookups); }
+    catch (error) { if (error instanceof EngineError) failure = error; else throw error; }
+    requireCondition(failure, 'research_consumer_intent_invalid',
+      'A deliverable context result cannot be saved as a local refusal');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: failure.code, requested: result }, error: failure.message };
+  }
+  if (proof.kind === 'read-bundle') {
+    requireCondition(action.action === 'read_bundle'
+      && canonical(before.question) === canonical(proof.result.value.question)
+      && proof.result.value.purpose === action.purpose,
+    'research_consumer_intent_invalid', 'The checked reader result belongs to another paid bundle');
+    const value = proof.result.value;
+    return { ...before, status: 'completed', error: null,
+      observation: { ref: proof.result.ref, observations: value.observations,
+        coverage: value.coverage, unresolved: value.unresolved } };
+  }
+  if (proof.kind === 'checkpoint') {
+    requireCondition(action.action === 'checkpoint'
+      && proof.checkpoint.value.status === 'unassessed'
+      && proof.checkpoint.value.question.id === action.question
+      && canonical(before.question) === canonical(proof.checkpoint.value.question)
+      && canonical(proof.checkpoint.value.proposal) === canonical(action.value)
+      && canonical(proof.checkpoint.value.unresolved) === canonical(action.unresolved)
+      && canonical(proof.checkpoint.value.observations.map(item =>
+        ({ source: item.source, selector: item.selector }))) === canonical(action.citations),
+    'research_consumer_intent_invalid', 'The checked checkpoint differs from the paid proposal');
+    return { ...before, status: 'completed', error: null,
+      observation: { ref: proof.checkpoint.ref, ...proof.checkpoint.value } };
+  }
+  if (proof.kind === 'source-excerpt') {
+    requireCondition(action.action === 'read_source'
+      && canonical(action.source) === canonical(proof.source.ref)
+      && proof.source.value.projectId === proof.projectId
+      && proof.source.ref.id.startsWith(`source:${proof.projectId}:`)
+      && digest(proof.source.value.content) === proof.source.value.sha256
+      && action.end - action.start <= 50_000
+      && action.end <= proof.source.value.content.length,
+    'research_consumer_intent_invalid', 'The source excerpt differs from its checked paid source');
+    return { ...before, status: 'completed', error: null,
+      observation: { projectId: proof.source.value.projectId,
+        source: proof.source.ref,
+        selector: { kind: 'text-range', start: action.start, end: action.end },
+        value: proof.source.value.content.slice(action.start, action.end) } };
+  }
+  if (proof.kind === 'source-read') {
+    requireCondition(action.action === 'read'
+      && proof.source.value.projectId === proof.projectId
+      && proof.source.ref.id === `source:${proof.projectId}:research-${digest(action.path).slice(0, 32)}`
+      && proof.source.value.origin.kind === 'file'
+      && action.media === proof.source.value.mediaType
+      && digest(proof.source.value.content) === proof.source.value.sha256,
+    'research_consumer_intent_invalid', 'The source read differs from its checked paid source');
+    const content = proof.source.value.content;
+    return { ...before, status: 'completed', error: null,
+      observation: { ref: proof.source.ref, length: content.length,
+        excerpt: content.slice(0, 3000), truncated: content.length > 3000 } };
+  }
+  if (proof.kind === 'reading-plan-queued') {
+    requireCondition(action.action === 'read_plan' && proof.children.length === action.reads.length,
+      'research_consumer_intent_invalid', 'The checked child queue differs from the paid plan');
+    return { ...before, status: 'completed', error: null,
+      observation: { state: 'queued', children: proof.children } };
+  }
+  if (proof.kind === 'reading-mode') {
+    requireCondition(action.action === 'synthesize' || action.action === 'need_research',
+      'research_consumer_intent_invalid', 'Only a paid planning action can select a reading mode');
+    return { ...before, status: 'completed', error: null,
+      observation: { nextMode: action.action === 'synthesize' ? 'synthesis' : 'planning' } };
+  }
+  if (proof.kind === 'premature-owner') {
+    requireCondition(action.action === 'need_owner', 'research_consumer_intent_invalid',
+      'A local owner refusal needs the paid need_owner action');
+    const covered = action.searched.every(searched => proof.consulted.some(source => canonical(source) === canonical(searched)));
+    requireCondition(!covered || !proof.hadPriorRead, 'research_consumer_intent_invalid',
+      'A sourced owner request must proceed to the reviewer');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: 'owner_escalation_premature' },
+      error: 'Research must consult actual sources before involving the owner' };
+  }
+  if (proof.kind === 'owner-review') {
+    requireCondition(action.action === 'need_owner' && typeof proof.verdict.necessary === 'boolean'
+      && typeof proof.verdict.reason === 'string' && proof.verdict.reason.trim().length > 0,
+    'research_consumer_intent_invalid',
+    'The owner verdict needs the paid request and checked reviewer reason');
+    return { ...before, status: 'completed', assessment: null,
+      observation: proof.verdict, error: null };
+  }
+  if (proof.kind === 'assessed-answer') {
+    const assessment = proof.assessment, question = proof.question;
+    const proposal = action.action === 'answer' ? action.value
+      : action.action === 'answer_delta' ? proof.expandedProposal : undefined;
+    requireCondition((action.action === 'answer' || action.action === 'answer_delta')
+      && proposal !== undefined && action.question === question.id
+      && canonical(before.question) === canonical(exactRef(question))
+      && question.kind === 'question' && hashJson(question.value) === question.hash
+      && assessment.kind === 'research-assessment' && assessment.revision === 1
+      && assessment.id === `research-assessment:${hashJson(assessment.value)}`
+      && assessment.hash === hashJson(assessment.value)
+      && assessment.value.projectId === question.value.projectId
+      && canonical(assessment.value.question) === canonical(exactRef(question))
+      && (assessment.value.verdict === 'insufficient' || assessment.value.verdict === 'conflicting')
+      && Array.isArray(assessment.value.reasons) && assessment.value.reasons.length > 0
+      && assessment.value.reasons.every(reason => typeof reason === 'string')
+      && assessment.value.researcher !== assessment.value.assessor
+      && canonical(assessment.value.value) === canonical(proposal)
+      && canonical(assessment.value.observations.map(item =>
+        ({ source: item.source, selector: item.selector }))) === canonical(action.citations),
+    'research_consumer_intent_invalid',
+    'The checked assessment does not classify the original paid answer');
+    // The caller proves this exact assessment's producer before supplying it.
+    return { ...before, status: 'completed', assessment: exactRef(assessment),
+      observation: { verdict: assessment.value.verdict, reasons: assessment.value.reasons }, error: null };
+  }
+  if (proof.kind === 'accepted-answer') {
+    requireCondition(canonical(proof.inputs.action) === canonical(before.action)
+      && canonical(before.question) === canonical(exactRef(proof.inputs.questionBefore))
+      && (action.action === 'answer' || action.action === 'answer_delta')
+      && action.question === proof.inputs.questionBefore.id,
+    'research_consumer_intent_invalid',
+    'The accepted result does not belong to the original paid action');
+    // The caller supplies the acceptance's own exact source pair, not a pair
+    // guessed from today's draft head or a neighbouring revision number.
+    const matched = matchAcceptedPaidAnswer(proof.inputs);
+    requireCondition(matched, 'research_consumer_intent_invalid',
+      'The checked acceptance does not derive from the paid answer');
+    // Persist the exact chain: later readers consume these references instead
+    // of rescanning a draft that may have accepted further answers since.
+    return { ...before, status: 'completed', assessment: matched.assessment,
+      observation: matched.observation, error: null,
+      acceptance: {
+        draftBefore: exactRef(proof.inputs.draftBefore), draftAfter: exactRef(proof.inputs.draftAfter),
+        questionBefore: exactRef(proof.inputs.questionBefore), questionAfter: exactRef(proof.inputs.questionAfter),
+        answer: exactRef(proof.inputs.answer), assessment: exactRef(proof.inputs.assessment) } };
+  }
+  if (proof.kind === 'question-reopened') {
+    const { original, reopened, draft } = proof;
+    const field = original.value.spec.field;
+    requireCondition(original.kind === 'question' && reopened.kind === 'question'
+      && draft.kind === 'discovery-draft'
+      && hashJson(original.value) === original.hash
+      && hashJson(reopened.value) === reopened.hash
+      && hashJson(draft.value) === draft.hash
+      && canonical(before.question) === canonical(exactRef(original))
+      && (!('question' in action) || action.question === original.id)
+      && reopened.id === original.id && reopened.revision === original.revision + 1
+      && draft.id === original.value.draftId
+      && draft.value.projectId === original.value.projectId
+      && draft.value.questions.includes(original.id)
+      && Object.hasOwn(draft.value.fields, field)
+      && canonical(reopened.value) === canonical({ ...original.value,
+        beforeHash: hashJson(draft.value.fields[field]), status: 'open', answer: null }),
+    'research_consumer_intent_invalid',
+    'The reopened question does not derive from its exact original and draft');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: 'research_question_reopened', question: exactRef(reopened),
+        draft: exactRef(draft) },
+      error: 'The original question was reopened before this paid turn completed' };
+  }
+  if (proof.kind === 'repeat-context') {
+    const repeated = projectRepeatedContextRead(before, proof.current, proof.history);
+    requireCondition(repeated, 'research_consumer_intent_invalid',
+      'The addressed page is not a repeat of an earlier completed read');
+    return { ...before, status: 'pending',
+      observation: { code: 'research_no_progress', ...repeated } };
+  }
+  throw new EngineError('research_consumer_intent_invalid',
+    'The paid turn has no checked transition for its result');
+}
+
+/** Compare the complete requested transition, including unchanged paid action
+ * and binding. The caller re-derives `proof` from exact records, not a saved
+ * observation or caller-provided error code. */
+export function assertResearchTurnTransition(before: ManagedResearchTurn,
+  after: ManagedResearchTurn, proof: TurnTransitionProof): void {
+  const expected = projectResearchTurnRevision(before, proof);
+  requireCondition(canonical(after) === canonical(expected),
+    'research_consumer_intent_invalid', 'The saved turn differs from its exact checked transition');
+}
+
+/** The paid pause is a terminal turn and a paused run in the same transaction. */
+export function projectPaidPause(beforeRun: ResearchRun, beforeTurn: ManagedResearchTurn):
+  { run: ResearchRun; turn: ManagedResearchTurn } {
+  const action = researchAction(beforeTurn.action);
+  requireCondition(action.action === 'pause', 'research_consumer_intent_invalid',
+    'Only the exact paid pause can pause its run');
+  return { run: { ...beforeRun, status: 'paused', error: action.reason, pauseCode: null },
+    turn: projectResearchTurnRevision(beforeTurn, { kind: 'pause' }) };
+}
+
+/** A paid reviewer verdict completes the original need_owner turn and changes
+ * the run together; neither outcome is inferred from a caller-supplied status. */
+export function projectPaidOwnerReview(beforeRun: ResearchRun, beforeTurn: ManagedResearchTurn,
+  verdict: { necessary: boolean; reason: string; [key: string]: unknown },
+  owner: ResearchRun['owner'], limit: number):
+  { run: ResearchRun; turn: ManagedResearchTurn } {
+  const action = researchAction(beforeTurn.action);
+  requireCondition(action.action === 'need_owner' && typeof verdict.necessary === 'boolean'
+    && typeof verdict.reason === 'string' && verdict.reason.trim().length > 0
+    && beforeTurn.question !== null && beforeTurn.question.id === action.question
+    && Number.isSafeInteger(limit) && limit > 0,
+  'escalation_assessment_invalid', 'An owner review needs the exact paid request and verdict');
+  const turn = projectResearchTurnRevision(beforeTurn, { kind: 'owner-review', verdict });
+  return { turn, run: { ...beforeRun,
+    status: verdict.necessary ? 'needs_owner' : 'running',
+    ownerQuestion: verdict.necessary
+      ? { question: beforeTurn.question.id, reason: verdict.reason, searched: action.searched }
+      : null,
+    limit, owner, error: null, pauseCode: null } };
 }

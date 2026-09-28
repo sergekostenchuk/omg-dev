@@ -1,12 +1,14 @@
 import { realpathSync } from 'node:fs';
-import { relative } from 'node:path';
+import { isAbsolute, normalize, relative } from 'node:path';
 import { canonical, type Json } from '../canonical.js';
 import { Evidence, type Observation, type Source, type Selector } from '../evidence/evidence.js';
 import type { Store } from '../storage/store.js';
 import type { FieldSpec } from '../discovery/discovery.js';
-import type { Finding, Ref } from '../pipeline/contracts.js';
+import { reference, type Finding, type Ref } from '../pipeline/contracts.js';
+import { requireCondition } from '../errors.js';
 import { workspacePath } from '../runtime/environment.js';
 import type { TechnicalReport } from './research-contracts.js';
+import { safeRelativePath } from './topology.js';
 
 const text: Json = { type: 'string', minLength: 1 };
 const object = (properties: Record<string, Json>): Json => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties });
@@ -32,18 +34,44 @@ export interface ResolvedResearchBasis {
   quote: string | null; designs: string[]; gaps: string[];
 }
 
+export type ResearchPathMode = 'current' | 'historical';
+
+/** Historical origin checks use the exact canonical path captured with the
+ * paid assessment. They do not consult today's symlinks or file existence. */
+export function repositoryCitationPath(root: string, location: string, mode: ResearchPathMode = 'current'): string {
+  if (mode === 'historical') {
+    requireCondition(typeof root === 'string' && isAbsolute(root) && normalize(root) === root
+      && typeof location === 'string' && isAbsolute(location) && normalize(location) === location,
+    'research_source_foreign', 'Historical repository paths must be canonical absolute paths');
+    const path = relative(root, location);
+    requireCondition(safeRelativePath(path) && !path.split('/').some(part => part.toLowerCase() === '.git'),
+      'research_source_foreign', 'Historical citation escapes the captured repository or enters Git metadata');
+    return path;
+  }
+  const base = realpathSync(root);
+  const path = relative(base, location);
+  requireCondition(realpathSync(workspacePath(base, path)) === location,
+    'research_source_foreign', 'Repository citation must belong to the actual research workspace');
+  return path;
+}
+
 /** Indices address the answer's ordered, exact citations, never a mutable global catalogue. */
 export function resolveResearchBasis(store: Store, project: string, report: TechnicalReport, observations: Observation[], root: string,
-  field: string): { bases: ResolvedResearchBasis[]; findings: Finding[] } {
+  field: string, mode: ResearchPathMode = 'current'): { bases: ResolvedResearchBasis[]; findings: Finding[] } {
   const bases: ResolvedResearchBasis[] = [], findings: Finding[] = [], evidence = new Evidence(store);
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, field, message });
   const used = new Set<string>();
   const observed = (id: string, index: number) => {
     const observation = Number.isSafeInteger(index) && index >= 0 ? observations[index] : undefined;
     if (!observation || observation.projectId !== project || !evidence.verify(observation)) {
-      fail('research_basis_invalid', id, 'Basis must select an exact current citation of this project'); return null;
+      fail('research_basis_invalid', id, 'Basis must select an exact captured citation of this project'); return null;
     }
-    return { observation, source: store.get<Source>(observation.source.id, observation.source.revision)! };
+    const source = store.get<Source>(observation.source.id, observation.source.revision);
+    if (source?.kind !== 'source' || canonical(reference(source)) !== canonical(observation.source)
+      || source.value.projectId !== project) {
+      fail('research_basis_invalid', id, 'Basis must retain the original exact Source'); return null;
+    }
+    return { observation, source };
   };
   for (const entry of [...report.facts, ...report.designs, ...report.gaps, ...(report.documents ?? [])]) {
     if (used.has(entry.id)) fail('research_basis_duplicate', entry.id, 'Report identifiers must be unique across facts, designs, gaps and documents');
@@ -60,8 +88,7 @@ export function resolveResearchBasis(store: Store, project: string, report: Tech
       fail('repository_evidence_required', fact.id, 'A document cannot be promoted to a repository fact'); continue;
     }
     try {
-      const path = relative(realpathSync(root), source.value.origin.location);
-      if (realpathSync(workspacePath(root, path)) !== source.value.origin.location) throw Error('Different source path');
+      const path = repositoryCitationPath(root, source.value.origin.location, mode);
       bases.push({ id: fact.id, kind: 'repository-file', source: observation.source, selector: observation.selector,
         repositoryPath: path, proofLimit: 'repository-observation', quote: null, designs: [], gaps: [] });
     } catch { fail('research_source_foreign', fact.id, 'Repository citation must belong to the actual research workspace'); }

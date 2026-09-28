@@ -1,15 +1,19 @@
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
+import type { ConsumerFeedback } from "./consumer-feedback.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ResearchAction, ResearchTurn } from "./research-model.js";
+import type { Ref } from "../pipeline/contracts.js";
+import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchTurn } from "./research-model.js";
 import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
-import { canonical } from "../canonical.js";
+import { canonical, hashJson } from "../canonical.js";
 import { reference, isRef } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent } from "./reader.js";
 import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
-import { projectCheckpointValue } from './research-consumer-transition.js';
+import { projectCheckpointValue, researchAction, matchAcceptedPaidAnswer,
+  type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
+import { expandLayerDelta } from './layer-delta.js';
 
 /** Keep one latest proposal even after many reads push its turn out of the
  * compact conversation history. Its identity also stabilizes synthesis resume. */
@@ -155,6 +159,86 @@ export function repeatedContextRead(store: Store, turns: Revision<ResearchTurn>[
     if (key === previous) return reference(turn);
   }
   return null;
+}
+
+/** №1745-2: the revision scan is only candidate search. The proof is a single
+ * complete chain of exact references — question pending turn → adjacent
+ * answered revision → research-answer → supported assessment (same value,
+ * citations, question) → adjacent draft pair differing exactly by the
+ * application — validated by the shared matchAcceptedPaidAnswer formula.
+ * Zero or several chains produce no proof: the paid turn stays pending for
+ * lawful recovery instead of being completed on ambiguity. Shared by the
+ * writer (right after Discovery.researched) and the historical reader. */
+export function findAcceptedPaidAnswerChain(store: Store, projectId: string,
+  turn: Revision<ResearchTurn>, original: Revision<Question>, answered: Revision<Question>,
+  deltaStore?: Store, pair?: { before: number; after: number }): { proof: { assessment: Ref; observation: { verdict: 'supported'; reasons: string[] } };
+    inputs: AcceptedPaidAnswerInputs; answer: Revision<ResearchAnswer>; assessment: Revision<ResearchAssessment> } | null {
+  const action = researchAction(turn.value.action);
+  if (action.action !== 'answer' && action.action !== 'answer_delta') return null;
+  const answerRef = answered.value.answer;
+  const answer = isRef(answerRef) ? store.get<ResearchAnswer>(answerRef.id, answerRef.revision) : null;
+  const assessmentRef = answer?.value.assessment;
+  const assessment = isRef(assessmentRef)
+    ? store.get<ResearchAssessment>(assessmentRef.id, assessmentRef.revision) : null;
+  if (canonical(turn.value.question) !== canonical(reference(original))
+    || !answer || answer.kind !== 'research-answer'
+    || canonical(reference(answer)) !== canonical(answerRef)
+    || !assessment || canonical(reference(assessment)) !== canonical(assessmentRef)) return null;
+  // The acceptance's own exact pair may precede an unrelated later draft
+  // revision; scan every adjacent pair, then require exactly one derivation.
+  // A reopened question is written atomically with the research-feedback
+  // record that pins the draft head at rejection time; pairs below that
+  // floor belong to earlier answered revisions and cannot be this
+  // acceptance, even when a repeated proposal keeps the field value
+  // identical and the transitions look alike.
+  const head = store.get<DiscoveryDraft>(original.value.draftId);
+  const floor = reopenedDraftFloor(store, original);
+  const matches: { inputs: AcceptedPaidAnswerInputs;
+    proof: NonNullable<ReturnType<typeof matchAcceptedPaidAnswer>> }[] = [];
+  const upper = head?.kind === 'discovery-draft' ? head.revision : 0;
+  // A caller that just wrote the acceptance names its exact pair; scanning is
+  // only the lawful fallback for an acceptance recovered after the fact.
+  if (pair && (pair.before !== pair.after - 1 || pair.after < 2)) return null;
+  const candidates = pair ? [pair.after]
+    : Array.from({ length: Math.max(0, upper - Math.max(2, floor + 1) + 1) },
+      (_, index) => Math.max(2, floor + 1) + index);
+  for (const revision of candidates) {
+    const before = store.get<DiscoveryDraft>(original.value.draftId, revision - 1);
+    const after = store.get<DiscoveryDraft>(original.value.draftId, revision);
+    if (before?.kind !== 'discovery-draft' || after?.kind !== 'discovery-draft'
+      || hashJson(before.value) !== before.hash || hashJson(after.value) !== after.hash
+      || before.value.projectId !== projectId || after.value.projectId !== projectId) continue;
+    let expandedProposal: unknown;
+    if (action.action === 'answer_delta') {
+      try { expandedProposal = expandLayerDelta(deltaStore ?? store, before, original, action); }
+      catch { continue; }
+    }
+    const inputs: AcceptedPaidAnswerInputs = { projectId,
+      draftBefore: before, draftAfter: after, questionBefore: original, questionAfter: answered,
+      answer, assessment, action,
+      ...(action.action === 'answer_delta' ? { expandedProposal } : {}) };
+    const proof = matchAcceptedPaidAnswer(inputs);
+    if (proof) matches.push({ inputs, proof });
+  }
+  if (matches.length !== 1) return null;
+  return { proof: matches[0]!.proof, inputs: matches[0]!.inputs, answer, assessment };
+}
+/** The feedback record that reopened `original` carries the exact draft head
+ * at rejection time; the acceptance pair being proven cannot start below it.
+ * The link is exact: the feedback names the immediate predecessor revision
+ * of `original` by full Ref, and the stored predecessor must match its hash. */
+function reopenedDraftFloor(store: Store, original: Revision<Question>): number {
+  const predecessor = original.revision > 1
+    ? store.get<Question>(original.id, original.revision - 1) : null;
+  let floor = 1;
+  for (const item of store.list<ConsumerFeedback>("research-feedback")) {
+    if (item.value.projectId === original.value.projectId
+      && item.value.questions.some(ref => ref.id === original.id
+        && ref.revision === original.revision - 1
+        && predecessor !== null && ref.hash === predecessor.hash))
+      floor = Math.max(floor, item.value.draft.revision);
+  }
+  return floor;
 }
 
 /** Compatibility for the saved pre-fix authority answer: append a replay, never

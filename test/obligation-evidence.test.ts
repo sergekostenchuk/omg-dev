@@ -92,8 +92,8 @@ test('the real researcher pauses after one proposal and unchanged resume makes n
  assert.equal(first.value.ownerQuestion,null);assert.match(first.value.error!,/required/);
  assert.equal(f.store.list('model-call').length,1);
  const turn=f.store.list<any>('research-turn')[0]!;
- assert.equal(turn.value.status,'pending');assert.equal(turn.value.observation.code,'environment_confirmation_required');
- assert.equal(turn.value.observation.details[0].target,'required');
+ assert.equal(turn.value.status,'pending');assert.equal(turn.value.observation,null);
+ assert.match(first.value.error!,/\[required\]/);
  const second=await f.engine.researcher.run('p',f.draft.id,10);
  assert.equal(second.value.pauseCode,'environment_confirmation_required');assert.equal(f.store.list('model-call').length,1);
  assert.equal(f.store.list('research-assessment').length,0);

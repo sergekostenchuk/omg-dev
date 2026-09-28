@@ -1,16 +1,28 @@
 import { researchGapDeferred } from "./research-scope.js";
 import { realpathSync } from "node:fs";
-import { relative } from "node:path";
+import { isAbsolute, normalize } from "node:path";
 import { Store, type TransactionGuard } from "../storage/store.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { STAGES, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
+import { STAGES, reference, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
 import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath, uniqueTransactionGuards } from "../runtime/environment.js";
+import { requireCondition } from '../errors.js';
+import { canonical } from '../canonical.js';
 import type { Graph } from "./model.js";
 import type { TechnicalReport } from "./research-contracts.js";
-import { resolveResearchBasis } from './research-basis.js';
+import { repositoryCitationPath, resolveResearchBasis, type ResearchPathMode } from './research-basis.js';
 import { obligationEvidenceFindings } from './obligation-evidence.js';
 import { collectRuntimeEvidence } from './runtime-evidence.js';
+import { safeRelativePath } from './topology.js';
+
+/** The physical resolution of a legacy facts.path is captured before paid
+ * dispatch. Historical validation reuses that exact result, not a symlink's
+ * present-day destination. Entries follow the proposal's facts order. */
+export interface LegacyPathResolution { path: string; resolved: string }
+export interface TechnicalProposalOptions {
+  mode?: ResearchPathMode;
+  legacyPaths?: LegacyPathResolution[];
+}
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
@@ -22,27 +34,55 @@ export function researchConsumerIds(store: Store, project: string, graph: Pick<G
  * by the final consumer; an accepted model verdict cannot bypass them. */
 export function technicalProposalFindings(store: Store, project: string, level: string, questionId: string, field: string,
   report: TechnicalReport, observations: Observation[], graph: Graph, root: string,
-  runtime?:ReturnType<typeof collectRuntimeEvidence>): Finding[] {
-  root = realpathSync(root);
+  runtime?:Pick<ReturnType<typeof collectRuntimeEvidence>, 'proofs'>,
+  options: TechnicalProposalOptions = {}): Finding[] {
+  const mode = options.mode ?? 'current';
+  if (mode === 'current') {
+    requireCondition(!options.legacyPaths?.length, 'research_context_read_proof_invalid',
+      'A new precheck must capture its own legacy path resolutions');
+    root = realpathSync(root);
+  }
+  else {
+    requireCondition(mode === 'historical' && typeof root === 'string' && isAbsolute(root) && normalize(root) === root,
+      'research_context_read_proof_invalid', 'Historical research needs its captured canonical workspace');
+    requireCondition(runtime !== undefined, 'research_context_read_proof_invalid',
+      'Historical proposal findings need the checked original runtime result');
+  }
   const findings: Finding[] = [];
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, message, field });
   const initial = store.get<StageArtifact>(stageId(project, "discovery"));
   const actors = (initial?.value.content as unknown as { fields?: { preparation?: { actors?: { id: string }[] } } })?.fields?.preparation?.actors ?? [];
   const consumers = new Set(researchConsumerIds(store, project, graph));
-  const files = observations.map(observation => store.get<Source>(observation.source.id)).filter((source): source is NonNullable<typeof source> => source?.value.origin.kind === "file");
+  const files = observations.flatMap(observation => {
+    // Evidence.observe reads the Source head (and, in a captured assessment
+    // view, proves the file snapshot). The exact read below retains its real
+    // origin rather than the view's temporary owner-document projection.
+    const head = store.get<Source>(observation.source.id);
+    const source = store.get<Source>(observation.source.id, observation.source.revision);
+    if (!head || !source || head.kind !== 'source' || source.kind !== 'source'
+      || canonical(reference(head)) !== canonical(observation.source)
+      || canonical(reference(source)) !== canonical(observation.source)
+      || source.value.projectId !== project) {
+      fail('research_basis_invalid', questionId, 'Every citation needs its original exact Source');
+      return [];
+    }
+    return source.value.origin.kind === 'file' ? [source] : [];
+  });
   const question = store.get<Question>(questionId);
   const draft = question?.value.draftId ? store.get<DiscoveryDraft>(question.value.draftId) : null;
+  if (mode === 'historical' && (!question || !draft))
+    fail('research_context_read_proof_invalid', questionId, 'Historical precheck lost its original question or draft');
   const typed = question?.value.spec.basisContract === 'typed-v1';
   if (typed !== (draft?.value.basisContract === 'typed-v1')) fail('research_contract_mismatch', questionId, 'Question and draft must retain the same basis contract');
   if (question?.value.spec.obligationContract !== draft?.value.obligationContract)
     fail('research_contract_mismatch',questionId,'Question and draft must retain the same obligation evidence contract');
-  if (typed) findings.push(...resolveResearchBasis(store, project, report, observations, root, field).findings);
+  if (typed) findings.push(...resolveResearchBasis(store, project, report, observations, root, field, mode).findings);
   if (question) findings.push(...obligationEvidenceFindings(question.value.spec,report,observations,
     (runtime??collectRuntimeEvidence(store,project,question.value.spec,report,observations)).proofs));
   if (report.applicability === "applicable" && !report.facts.length && !report.designs.length) fail("research_report_empty", questionId, "An applicable domain needs concrete facts or explicit design decisions");
   if (report.applicability === "not_applicable" && (report.facts.length || report.designs.length || report.gaps.length || report.documents?.length)) fail("research_applicability_conflict", questionId, "An inapplicable domain cannot conceal facts, decisions or unresolved gaps");
   if (field.startsWith("gap_") && report.applicability !== "applicable") fail("research_gap_unresolved", questionId, "An inherited gap needs a concrete resolution, including when research disproves its premise");
-  const obligations = store.get<Question>(questionId)?.value.spec.obligations;
+  const obligations = question?.value.spec.obligations;
   if (obligations?.length) {
     const coverage = report.coverage;
     if (!Array.isArray(coverage) || coverage.length !== obligations.length || new Set(coverage.map(c => c.obligation)).size !== obligations.length)
@@ -59,14 +99,34 @@ export function technicalProposalFindings(store: Store, project: string, level: 
         fail("research_group_coverage_missing", obligation.id, "Group member lacks an attributable resolution; applicability alone cannot close it");
     }
   }
+  let legacyIndex = 0;
   for (const fact of typed ? [] : report.facts) {
     try {
-      const path = realpathSync(workspacePath(root, fact.path ?? ''));
-      if (!files.some(source => source.value.origin.location === path)) fail("repository_evidence_required", fact.id, "A repository fact must cite its actual source file");
+      const named = fact.path ?? '';
+      let resolved: string;
+      if (mode === 'historical') {
+        // A failed current resolution has no path witness. Leave the next
+        // witness available for the next fact so a saved refusal replays from
+        // its original source view even if the file appears later.
+        const captured = options.legacyPaths?.[legacyIndex];
+        if (captured?.path === named) legacyIndex++;
+        requireCondition(safeRelativePath(named) && !named.split('/').some(part => part.toLowerCase() === '.git')
+          && captured?.path === named && typeof captured.resolved === 'string',
+        'research_basis_invalid', 'Legacy fact path lost its original physical resolution');
+        repositoryCitationPath(root, captured.resolved, 'historical');
+        resolved = captured.resolved;
+      } else {
+        resolved = realpathSync(workspacePath(root, named));
+        options.legacyPaths?.push({ path: named, resolved });
+      }
+      if (!files.some(source => source.value.origin.location === resolved))
+        fail("repository_evidence_required", fact.id, "A repository fact must cite its actual source file");
     } catch { fail("repository_evidence_required", fact.id, "The factual source path is unavailable or outside the repository"); }
   }
+  if (mode === 'historical' && (options.legacyPaths?.length ?? 0) !== legacyIndex)
+    fail('research_basis_invalid', questionId, 'Historical path proof has surplus or mismatched legacy facts');
   for (const file of files) {
-    try { workspacePath(root, relative(root, file.value.origin.location)); }
+    try { repositoryCitationPath(root, file.value.origin.location, mode); }
     catch { fail("research_source_foreign", questionId, "A cited repository file belongs to a different workspace"); }
   }
   for (const design of report.designs) if (!consumers.has(design.consumer)) fail("research_consumer_missing", design.id, "Design must identify a real downstream consumer");
