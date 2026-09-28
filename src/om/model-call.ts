@@ -2012,6 +2012,9 @@ import { completionAssignmentId, completionRootAssignments, completionWorkId, CO
 import { readAssessmentTerminalAt,
   readAssessmentRefusalAt, assessmentRefusalId, assessmentIntentId, assessmentCallNameForId } from './assessment.js';
 import { readJournal, readJournalAt } from './refusal-journal.js';
+import { answersProduct, answersCheckState, checkAnswersTransition, readAnswersParticipant, answersCheckCessationValue,
+  type AnswersCheckState } from './answers-gate.js';
+import { readAnswersGateAssignmentAt, ANSWERS_GATE_ASSIGNMENT_CONTRACT } from './series.js';
 export interface CompletionCallOwner {
   contract: 'om-completion-call/v1'; binding: Ref; assignment: Ref; call: Ref; packetBasis: Ref;
 }
@@ -2019,6 +2022,7 @@ export interface CompletionSnapshot {
   binding: Revision<CompletionOwner>; work: Revision<CompletionWork>; assignments: Revision<CompletionAssignment>[];
   products: Ref[]; resolved: Ref[]; cessations: Revision<CompletionCessation>[]; complete: boolean; accepting: Ref[]; negative: Ref[]; refusals: { row: string; name: string; goal: string }[];
   technical: { source: Ref; reason: 'off-form' | 'interrupted' }[]; waiting: Ref[]; guards: TransactionGuard[];
+  answers: AnswersCheckState | null;
 }
 function completionRecord(value: CompletionAssignment): Revision<CompletionAssignment> {
   return { id: completionAssignmentId(value.project, value.binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
@@ -2104,6 +2108,7 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
   const packets = new Map<string, Revision<QuestionPacketRecord>>(), calls = new Map<string, ModelCallOutcome>();
   const terminals: ReturnType<typeof readAssessmentTerminalAt>[] = [];
   const cessations: Revision<CompletionCessation>[] = [];
+  const answers: Ref[] = [];
   const add = (rows: Revision<CompletionAssignment>[]) => {
     for (const row of rows) {
       const old = assignments.get(row.id);
@@ -2140,7 +2145,9 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
     } else if (record.kind === COMPLETION_CESSATION_KIND) {
       const cessation = take(readCompletionCessationAt(store, binding.value.project, ref));
       if (!same(cessation.value.binding, reference(binding))) fail('completion_foreign', ref.id, 'binding', 'A cessation belongs to this owner');
-      cessations.push(cessation as Revision<CompletionCessation>);
+      // H1.0c: the ceased check is a participant of its own; physical readers never see a non-physical assignment.
+      if (cessation.value.disposition === 'check-ceased') answers.push(ref);
+      else cessations.push(cessation as Revision<CompletionCessation>);
     } else if (record.kind === MODEL_CYCLE_KIND) {
       const cycle = take(readModelCycle(store, { project: binding.value.project, record: ref }));
       packetCompletionAssignments(store, binding, cycle.record.value.request.packet);
@@ -2150,7 +2157,8 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
         const part = take(readPartResult(store, { project: binding.value.project, record: partRef }));
         packetCompletionAssignments(store, binding, part.record.value.request.packet);
       }
-    } else if (record.kind === UNIT_REFUSAL_KIND) {
+    } else if (answersProduct(binding.value.project, ref, record)) answers.push(ref);
+    else if (record.kind === UNIT_REFUSAL_KIND) {
       if ((record.value as unknown as UnitRefusalRecord).gate === 'E5') {
         const row = take(readAssessmentRefusalAt(store, binding.value.project, ref));
         if (row.intent.originalSeries.id !== binding.value.series.id || row.intent.attempt !== binding.value.attempt
@@ -2160,8 +2168,11 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
     } else fail('completion_invalid', ref.id, 'product', 'This record has no registered completion producer');
   }
   return { assignments: [...assignments.values()].sort((a, b) => a.id.localeCompare(b.id)), packets, calls,
-    terminals: terminals.map(item => take(item)), cessations };
+    terminals: terminals.map(item => take(item)), cessations, answers: take(readAnswersParticipant(store, binding, answers)) };
 }
+/** The registered answers-gate check is one more logical assignment of the same work (H1.0c). */
+const completionAssignmentRefs = (graph: ReturnType<typeof completionGraph>): Ref[] =>
+  refs([...graph.assignments, ...(graph.answers.check ? [graph.answers.check] : [])].map(reference));
 export function readCompletionWorkAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionSnapshot>> {
   return result(() => historicalRead(store, { reader: 'G7.completion-work', project, ref }, () => {
     const work = take(readRecord<CompletionWork>(store, ref, { unit: 'G7', target: ref.id,
@@ -2191,16 +2202,62 @@ export function readCompletionWorkAt(store: Store, project: string, ref: Ref): O
       if (value.closed) {
         const close = take(readCompletionCloseAt(store, project, value.closed));
         if (!same(close.binding, value.binding) || !same(close.work, value.previous)
-          || !same(value, { ...before.work.value, previous: value.previous, closed: value.closed }))
+          || !same(value, take(completionClosedWork(store, project, before.work, close, value.closed))))
           fail('completion_invalid', ref.id, 'closed', 'The closed registry must equal the exact G7 transition over its predecessor');
       }
     }
     const graph = completionGraph(store, binding, value.products);
-    if (!same(refs(graph.assignments.map(reference)), value.assignments))
+    if (!same(completionAssignmentRefs(graph), value.assignments))
       fail('completion_invalid', ref.id, 'assignments', 'All mandatory children follow from the exact full producer products');
     for (const assignment of graph.assignments) take(readCompletionAssignmentAt(store, project, reference(assignment)));
+    if (graph.answers.check) take(readAnswersGateAssignmentAt(store, project, reference(graph.answers.check)));
     return deriveCompletionSnapshot(store, binding, work, graph);
   }, () => fail('completion_invalid', ref.id, 'history', 'A completion registry cannot derive through its own closure')));
+}
+/** H1.0c: exact open work plus exact additions, by the formula of its next revision; nothing is written or guessed. */
+export function readCompletionEffectiveAt(store: Store, project: string, closure: { work: Ref; additions: readonly Ref[]; journal: Ref | null }): OmResult<Sealed<CompletionSnapshot>> {
+  if (!(store instanceof Store) || !text(project)) invalid('store');
+  if (!object(closure) || !exactKeys(closure, ['work', 'additions', 'journal']) || !isRef(closure.work) || !Array.isArray(closure.additions)
+    || !closure.additions.every(isRef) || !(closure.journal === null || isRef(closure.journal))) invalid('closure');
+  return result(() => {
+    const prior = take(readCompletionWorkAt(store, project, closure.work)), cut = prior.work.value.journal;
+    // The final journal of a close is the work's own cut or a later revision of it, never an older or another one.
+    if (cut && !(closure.journal && closure.journal.id === cut.id && closure.journal.revision >= cut.revision))
+      fail('completion_invalid', closure.work.id, 'journal', 'The final journal is the exact work cut or a later revision of it');
+    if (!closure.additions.length) return prior;
+    if (prior.work.value.closed) fail('completion_closed', closure.work.id, 'work', 'Closed work accepts only exact historical repeats');
+    const added = refs(closure.additions), binding = prior.binding as Revision<CompletionOwner>;
+    if (!same(added, closure.additions) || added.some(ref => prior.products.some(old => same(old, ref))))
+      fail('completion_invalid', closure.work.id, 'additions', 'Additions are distinct exact products in canonical order the work does not hold yet');
+    checkCompletionTransition(store, prior, added);
+    const { graph, value } = completionNext(store, binding, prior.work, refs([...prior.products, ...added]), () => closure.journal
+      ?? fail('completion_invalid', closure.work.id, 'journal', 'Unit refusal products keep their exact final journal'));
+    const effective = deriveCompletionSnapshot(store, binding, { id: prior.work.id, kind: COMPLETION_WORK_KIND,
+      revision: prior.work.revision + 1, hash: hashJson(value as unknown as Json), value }, graph);
+    // The view is of the next revision; the snapshot names only the real work it stands on (no Ref of a revision to be).
+    return { ...effective, work: prior.work, guards: prior.guards };
+  });
+}
+/** H1.0c: the one formula of every next work revision: the exact predecessor, the full products, their journal cut. */
+function completionNext(store: Store, binding: Revision<CompletionOwner>, prior: Sealed<Revision<CompletionWork>>, products: Ref[],
+  journal: () => Ref | null): { graph: ReturnType<typeof completionGraph>; value: CompletionWork } {
+  const graph = completionGraph(store, binding, products);
+  const unit = products.some(ref => store.get(ref.id, ref.revision)?.kind === UNIT_REFUSAL_KIND);
+  return { graph, value: { ...prior.value as CompletionWork, previous: reference(prior), products, journal: unit ? journal() : null,
+    assignments: completionAssignmentRefs(graph) } };
+}
+/** H1.0c: the single closed revision: the next revision over the close's additions and final journal, plus the proof. */
+export function completionClosedWork(store: Store, project: string, prior: Sealed<Revision<CompletionWork>>,
+  close: { additions: readonly Ref[]; journal: Ref | null }, closed: Ref): OmResult<Sealed<CompletionWork>> {
+  if (!(store instanceof Store) || !text(project)) invalid('store');
+  if (!object(prior) || !isRef(reference(prior)) || !object(prior.value) || !isRef(prior.value.binding) || !Array.isArray(prior.value.products)
+    || !object(close) || !Array.isArray(close.additions) || !close.additions.every(isRef)
+    || !(close.journal === null || isRef(close.journal)) || !isRef(closed)) invalid('closure');
+  return result(() => {
+    const binding = take(readCompletionOwnerAt(store, project, prior.value.binding)) as Revision<CompletionOwner>;
+    const { value } = completionNext(store, binding, prior, refs([...prior.value.products, ...close.additions]), () => close.journal);
+    return { ...value, closed };
+  });
 }
 export function prepareCompletionProducts(store: Store, bindingRef: Ref, products: readonly Ref[]): OmResult<Sealed<{ writes: Write[]; guards: Ref[]; work: Ref }>> {
   return result(() => {
@@ -2212,18 +2269,16 @@ export function prepareCompletionProducts(store: Store, bindingRef: Ref, product
     if (same(combined, prior.products)) return { writes: [], guards: [reference(head)], work: reference(head) };
     if (head.value.closed) fail('completion_closed', id, 'work', 'Closed work accepts only exact historical repeats');
     checkCompletionTransition(store, prior, combined.filter(ref => !prior.products.some(old => same(old, ref))));
-    const graph = completionGraph(store, prior.binding as Revision<CompletionOwner>, combined);
+    const { graph, value } = completionNext(store, prior.binding as Revision<CompletionOwner>, head, combined,
+      () => reference(take(readJournal(store, { project }))));
     const writes: Write[] = [];
-    for (const assignment of graph.assignments) {
+    for (const assignment of [...graph.assignments, ...(graph.answers.check ? [graph.answers.check] : [])]) {
       const old = store.get(assignment.id);
       if (old && !same(old, assignment)) fail('completion_conflict', assignment.id, 'assignment', 'The logical assignment cannot be rebound');
       if (!old) writes.push({ id: assignment.id, kind: assignment.kind, expected: 0, value: assignment.value });
     }
-    const journal = combined.some(ref => store.get(ref.id, ref.revision)?.kind === UNIT_REFUSAL_KIND)
-      ? reference(take(readJournal(store, { project }))) : null;
-    const value: CompletionWork = { ...head.value, previous: reference(head), products: combined, journal,
-      assignments: refs(graph.assignments.map(reference)) };
     const write: Write = { id, kind: COMPLETION_WORK_KIND, expected: head.revision, value }; writes.push(write);
+    take(answersCheckState(store, prior.binding as Revision<CompletionOwner>, { ...head, revision: head.revision + 1, value }, graph.answers));
     // The initial assignment/opening guards and current work close the registration-vs-G7 window.
     const line = store.get(prior.binding.value.series.id);
     if (!line) fail('completion_invalid', id, 'series', 'The current original line must exist');
@@ -2374,11 +2429,13 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
       refusals.push(...matching.map(row => ({ row: row.id, name: row.code, goal: row.goal })));
     }
   }
+  const answers = take(answersCheckState(store, binding, work, graph.answers)) as AnswersCheckState | null;
+  if (answers?.ceased) technical.push({ source: answers.ceased, reason: 'interrupted' });
   return { binding, work, assignments: graph.assignments, products: [...products],
     resolved: graph.assignments.filter(row => completed.has(row.id)).map(reference), cessations: graph.cessations,
-    complete: completionRootAssignments(binding).every(root => completed.has(root.id)),
+    complete: completionRootAssignments(binding).every(root => completed.has(root.id)) && (answers?.complete ?? true),
     accepting: refs(accepting), negative: refs(negative), refusals: [...new Map(refusals.map(row => [row.row, row])).values()].sort((a,b) => a.row.localeCompare(b.row)),
-    technical, waiting: refs(waiting), guards: [reference(work), reference(binding)] };
+    technical, waiting: refs(waiting), guards: [reference(work), reference(binding)], answers };
 }
 /** E1 is a cross-check of the registered plan, never the plan itself. */
 export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionSnapshot>, ledger: Ref, journal: Ref | null = null): OmResult<Sealed<true>> {
@@ -2748,12 +2805,21 @@ function completionSources(store: Store, binding: Revision<CompletionOwner>, ass
   }
   return take(readApplicationSources(store, project, routes.record.value.request.gaps.sources.input, grounds)).sources;
 }
+/** H1.0c: a saved assignment is read by the reader of its own contract; neither reader accepts the other kind. */
+function readAnyCompletionAssignmentAt(store: Store, project: string, ref: Ref): { assignment: Revision<CompletionAssignment>; check: boolean } {
+  const row = store.get(ref.id, ref.revision);
+  if (row && object(row.value) && row.value.contract === ANSWERS_GATE_ASSIGNMENT_CONTRACT)
+    return { assignment: take(readAnswersGateAssignmentAt(store, project, ref)) as unknown as Revision<CompletionAssignment>, check: true };
+  return { assignment: take(readCompletionAssignmentAt(store, project, ref)) as Revision<CompletionAssignment>, check: false };
+}
 /** One derivation proves a cause for both its producer and all historical disposition readers. */
 export function readCompletionCause(store: Store, project: string, assignmentRef: Ref, cause: CompletionCause): OmResult<Sealed<{ references: Ref[] }>> {
   return result(() => {
-    const assignment = take(readCompletionAssignmentAt(store, project, assignmentRef)) as Revision<CompletionAssignment>;
+    const { assignment, check } = readAnyCompletionAssignmentAt(store, project, assignmentRef);
     const binding = take(readCompletionOwnerAt(store, project, assignment.value.binding)) as Revision<CompletionOwner>;
     if (!object(cause)) fail('completion_cause_invalid', assignment.id, 'cause', 'A disposition requires a closed proof of a necessary condition');
+    if (check && cause.kind !== 'series-admission-change')
+      fail('completion_cause_invalid', assignment.id, 'cause', 'The answers-gate check ends only by its proved admission change');
     if (cause.kind === 'file-observation') {
       if (!exactKeys(cause, ['kind', 'source', 'observation']) || !isRef(cause.source) || !object(cause.observation)
         || !exactKeys(cause.observation, cause.observation.kind === 'read' ? ['kind', 'bytes'] : ['kind', 'code']))
@@ -2806,7 +2872,7 @@ export function prepareCompletionCause(store: Store, project: string, assignment
   cause: CompletionCause | null; guards: Ref[];
 }>> {
   return result(() => {
-    const assignment = take(readCompletionAssignmentAt(store, project, assignmentRef)) as Revision<CompletionAssignment>;
+    const { assignment, check } = readAnyCompletionAssignmentAt(store, project, assignmentRef);
     const binding = take(readCompletionOwnerAt(store, project, assignment.value.binding)) as Revision<CompletionOwner>;
     if (binding.value.owner.kind === 'block') {
       const original = take(readCompletionOriginalAdmission(store, project, reference(binding)));
@@ -2826,6 +2892,8 @@ export function prepareCompletionCause(store: Store, project: string, assignment
         }
       }
     }
+    // H1.0c: movement of D1/M6 or of physical inputs does not prove that the check ended.
+    if (check) return { cause: null, guards: [] };
     let context: Ref | null = null;
     if (assignment.value.kind === 'fact') {
       const physical = take(readModelCallState(store, { project, record: assignment.value.source }));
@@ -2921,8 +2989,8 @@ export function prepareCompletionCause(store: Store, project: string, assignment
 export const COMPLETION_CESSATION_KIND = 'om-completion-cessation';
 export interface CompletionCessation {
   contract: 'om-completion-cessation/v1'; project: string; binding: Ref; assignment: Ref; work: Ref;
-  cause: CompletionCause; disposition: 'not-dispatched' | 'branch-ceased';
-  remainder: 'expansion' | 'continuation' | 'assembly' | 'application' | null;
+  cause: CompletionCause; disposition: 'not-dispatched' | 'branch-ceased' | 'check-ceased';
+  remainder: 'expansion' | 'continuation' | 'assembly' | 'application' | 'answers-gate' | null;
   packet: Ref | null; callId: string | null; physicalId: string | null; call: Ref | null; ledger: Ref | null;
   physical: Ref | null; exchange: Ref | null; rejection: Ref | null;
 }
@@ -3057,7 +3125,8 @@ export function readCompletionCessationAt(store: Store, project: string, ref: Re
       || !(value.packet === null || isRef(value.packet)) || !(value.ledger === null || isRef(value.ledger))
       || !(value.physical === null || isRef(value.physical))
       || record.id !== completionCessationId(project, value.binding.id, value.assignment.id)
-      || !same(value, cessationValue(store, project, value)))
+      || !same(value, value.disposition === 'check-ceased' ? take(answersCheckCessationValue(store, project, value))
+        : cessationValue(store, project, value)))
       fail('completion_invalid', ref.id, 'cessation', 'The complete cessation must equal the common exact derivation');
     return record as Revision<CompletionCessation>;
   }, () => fail('completion_invalid', ref.id, 'history', 'A cessation cannot prove itself')));
@@ -3390,4 +3459,5 @@ function checkCompletionTransition(store: Store, before: Sealed<CompletionSnapsh
       take(checkCompletionDisposition(store, before, { batch: step.value.batch, action: 'cycle' }));
     }
   }
+  take(checkAnswersTransition(store, before, added));
 }

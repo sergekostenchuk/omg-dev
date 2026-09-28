@@ -9,7 +9,7 @@ import {
 } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import {
-  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal, readJournalAt, journalId,
+  normalizeOriginSource, originSourceKey, prepareClassifyRefusal, readJournal, readJournalAt, journalId, answersRowMarks,
   type JournalRow, type OriginSource, type OriginSourceContext, type RefusalClassification, type RefusalJournal, type RefusalOrigin,
 } from "./refusal-journal.js";
 import {
@@ -888,6 +888,11 @@ function raise(
  * at those exact revisions then determine the class, without trusting their own status or class claims.
  */
 const derive = (store: Store, row: JournalRow, address: Address, ordinal: number, path: string): OmResult<never> | Derived => {
+  // H1.0c (C21, C22): any one mark of G4b names the check of a managed attempt, which this path has no binding for; a
+  // contradiction of marks is not read as another gate either. Never unknown, a hold or a fallback to placeOrigin.
+  if (answersRowMarks(address.project, row).any) return refused("origin_unreadable",
+    "A G4b observation belongs to the registered check of a managed attempt, never to a refusal of this cycle",
+    { unit: UNIT, target: address.id, field: `${path}.completion`, ref: row.source }, "producer");
   const e5 = row.gate === "E5" || row.origin.stage === "fact-assessment"
     || row.source.id.startsWith(`om-unit-refusal:${address.project}:e5:`)
     || row.origin.sources.some(source => source.role === "assessment");
@@ -1641,18 +1646,26 @@ function requestOf(address: Address): AnySeriesRequest {
 import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_WORK_KIND,
   readCompletionBinding, prepareManagedCompleteAttempt,
   type CompletionWork, type ManagedClosure, type ClaimedOutcome } from './series.js';
-import { readCompletionWorkAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
-  type CompletionSnapshot } from './model-call.js';
+import { readCompletionEffectiveAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
+  completionClosedWork, prepareCompletionProducts, type CompletionSnapshot } from './model-call.js';
+import { prepareJournalBatch } from './refusal-journal.js';
+import type { Write } from '../storage/store.js';
+import { answersProduct, readAnswersGateRefusalAt } from './answers-gate.js';
+/**
+ * The one close form (owner decision 28.09, №1637): the real pre-close work, the exact additions this close brings into
+ * it (explicitly empty for a direct G7), the final journal holding their rows and the classes of this close, the other
+ * pre-close sources, and the derived outcome. One derivation reads every close; there is no second version.
+ */
 export interface CompletionCloseRecord {
-  contract: 'om-completion-close/v1'; project: string; binding: Ref; work: Ref; series: Ref;
+  contract: 'om-completion-close/v1'; project: string; binding: Ref; work: Ref; additions: readonly Ref[]; series: Ref;
   ledger: Ref | null; journal: Ref | null; claim: GateOutcome; outcome: ClaimedOutcome; waiting: Ref[];
 }
 class ManagedCloseFailure extends Error {
   constructor(readonly refusal: Refusal) { super(refusal.message); }
 }
 function managedTake<T>(result: OmResult<T>): T { if (!result.ok) throw new ManagedCloseFailure(result.refusal); return result.value; }
-function managedFail(id: string, field: string, message: string, code = 'completion_invalid'): never {
-  const result = refused(code, message, { unit: UNIT, target: id, field }, 'producer');
+function managedFail(id: string, field: string, message: string, code = 'completion_invalid', ref?: Ref): never {
+  const result = refused(code, message, { unit: UNIT, target: id, field, ...(ref ? { ref } : {}) }, 'producer');
   if (!result.ok) throw new ManagedCloseFailure(result.refusal);
   throw new Error('Unreachable');
 }
@@ -1668,11 +1681,33 @@ function completionClaim(claim: GateOutcome): GateOutcome {
     cancelling: [...new Map(claim.cancelling.map(ref => [canonical(ref), ref])).values()].sort((a,b) => canonical(a).localeCompare(canonical(b))),
     refusals: [...new Map(claim.refusals.map(row => [row.row, row])).values()].sort((a,b) => a.row.localeCompare(b.row)) };
 }
+/**
+ * H1.0c (№1628 Q1; rows 37, C21, C23, C24): a G4b row is an observation of the check, journal-only or pointing at the
+ * ground of an existing producer, and never a counted refusal; one whose marks or typed source do not hold is forged.
+ */
+function refuseAnswersClaim(store: Store, project: string, row: JournalRow, target: string): never {
+  const read = answersRowMarks(project, row).exact ? readAnswersGateRefusalAt(store, project, row.source) : null;
+  if (!read?.ok) managedFail(target, 'refusals', `A G4b row needs every mark and its typed source: ${read ? read.refusal.code : 'marks'}`,
+    'origin_unreadable', row.source);
+  managedFail(target, 'refusals', 'A G4b observation is never a counted refusal: its own producer grounds or its wait stand instead',
+    'completion_refusal_uncounted', row.source);
+}
+const CLOSURE_SHAPE = 'additions,binding,journal,work';
 /** Exact registry context for the D5 supplier. It is evidence to rederive, never a completeness flag. */
 export function checkManagedCompletionClaims(store: Store, project: string, context: ManagedClosure,
   accepting: readonly Ref[], refusals: readonly ClaimedRefusal[]): OmResult<Sealed<CompletionSnapshot>> {
+  requireStore(store); requireProject(project);
+  requireCondition(isPlainObject(context) && Object.keys(context).sort().join(',') === CLOSURE_SHAPE
+    && isRef(context.binding) && isRef(context.work) && Array.isArray(context.additions) && context.additions.every(isRef)
+    && (context.journal === null || isRef(context.journal)),
+  "repeat_request_invalid", "A managed closure names its exact binding, work, additions (explicitly none) and final journal");
+  requireCondition(Array.isArray(accepting) && accepting.every(isRef) && Array.isArray(refusals)
+    && refusals.every(row => isPlainObject(row) && isText(row.row) && isText(row.name) && isText(row.goal)),
+  "repeat_request_invalid", "A managed closure is checked against exact accepting references and claimed refusal rows");
   return managedResult(() => {
-    const snapshot = managedTake(readCompletionWorkAt(store, project, context.work));
+    const journal = context.journal;
+    const snapshot = managedTake(readCompletionEffectiveAt(store, project,
+      { work: context.work, additions: [...context.additions], journal }));
     if (!sameRef(reference(snapshot.binding), context.binding) || !snapshot.complete || snapshot.work.value.closed)
       managedFail(context.work.id, 'work', 'The close must use one complete exact pre-close registry', 'completion_incomplete');
     const e5 = (ref: Ref) => ref.id.startsWith(`${acceptedAnswerNamespace(project)}e5:`);
@@ -1680,6 +1715,15 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
     if (canonical(ordered(accepting.filter(e5))) !== canonical(ordered(snapshot.accepting)))
       managedFail(context.work.id, 'accepting', 'The close must retain every exact supported E5 basis');
     const required = new Set(snapshot.refusals.map(row => row.row));
+    // Rows beyond the required set are looked up in the final journal the closure presents.
+    const extra = refusals.filter(item => !required.has(item.row));
+    if (extra.length && journal) {
+      const rows = new Map(managedTake(readJournalAt(store, project, journal)).value.rows.map(row => [row.id, row as JournalRow]));
+      for (const item of extra) {
+        const row = rows.get(item.row);
+        if (row && answersRowMarks(project, row).any) refuseAnswersClaim(store, project, row, context.work.id);
+      }
+    }
     if (snapshot.refusals.some(row => !refusals.some(item => canonical(item) === canonical(row))))
       managedFail(context.work.id, 'refusals', 'The close must retain every semantic, technical and control diagnostic');
     if (refusals.some(row => row.name.startsWith('fact_assessment_') && !required.has(row.row)))
@@ -1687,10 +1731,14 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
     return snapshot as CompletionSnapshot;
   });
 }
-/** The single managed outcome table: prove the entire work, collect source classes, then derive the reason. */
-function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'>) {
-  const snapshot = managedTake(checkManagedCompletionClaims(store, input.project,
-    { binding: input.binding, work: input.work }, input.claim.accepting, input.claim.refusals));
+/**
+ * The single managed outcome table: prove the entire work with its additions, collect source classes, then derive the
+ * reason. A saved close (`final`) also shows that its final journal holds exactly the classes derived here; the producer
+ * derives them first over the rows alone, before that journal exists.
+ */
+function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'>, final = true) {
+  const closure = { binding: input.binding, work: input.work, additions: input.additions, journal: input.journal };
+  const snapshot = managedTake(checkManagedCompletionClaims(store, input.project, closure, input.claim.accepting, input.claim.refusals));
   const owner = snapshot.binding.value, series = managedTake(readAnySeriesAt(store, input.project, input.series));
   const address = seriesAddress(seriesRequestOf(series.value));
   const attempt = series.value.attempts.find(row => row.ordinal === owner.attempt);
@@ -1700,7 +1748,10 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
   else {
     // Null is historical evidence only for a complete never-dispatched composition.
     // Every product is already proved by the work reader; no present-day enumeration is used here.
-    if (snapshot.products.some(ref => !['question-packet', 'om-completion-packet', 'om-completion-cessation'].includes(store.get(ref.id, ref.revision)!.kind))
+    // The registered check and its G4b records are non-physical products (№1616 п.3): they need no E1 row.
+    if (snapshot.products.some(ref => { const record = store.get(ref.id, ref.revision)!;
+      return !['question-packet', 'om-completion-packet', 'om-completion-cessation'].includes(record.kind)
+        && !answersProduct(input.project, ref, record); })
       || !snapshot.cessations.length || snapshot.cessations.some(row => row.value.call !== null
         || row.value.ledger !== null || row.value.physical !== null))
       managedFail(series.id, 'ledger', 'Physical/E1 work cannot omit its exact ledger');
@@ -1713,6 +1764,8 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
     const row = rows.get(claim.row);
     if (!row || row.code !== claim.name || row.goal !== claim.goal) managedFail(series.id, 'refusals', 'Every claim needs its exact checked journal row');
     let classified: RefusalClassification;
+    // C23: the G4b branch comes first; no G4b row is a subject, whatever gate or stage the rest of it names.
+    if (answersRowMarks(input.project, row as JournalRow).any) refuseAnswersClaim(store, input.project, row as JournalRow, series.id);
     if (row.gate === 'E5') {
       const proof = managedTake(readAssessmentRefusalAt(store, input.project, row.source));
       if (proof.intent.originalSeries.id !== owner.series.id || proof.intent.attempt !== owner.attempt
@@ -1740,7 +1793,8 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
   if (owner.owner.kind === 'block') confirmed = managedTake(confirmResults(store, {
     project: input.project, target: owner.series.id, block: owner.owner.block, goal: owner.goal,
     attempt: { series: owner.series, ordinal: owner.attempt }, accepting: input.claim.accepting,
-    cancelling: input.claim.cancelling, refusals: input.claim.refusals, managedClosure: { binding: input.binding, work: input.work },
+    cancelling: input.claim.cancelling, refusals: input.claim.refusals,
+    managedClosure: closure,
   }));
   else if (input.claim.accepting.length || input.claim.cancelling.length)
     managedFail(owner.series.id, 'accepting', 'No mechanism acceptance provider is registered yet', 'acceptance_unconfirmed');
@@ -1749,8 +1803,14 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
     : snapshot.technical.some(row => row.reason === 'off-form') ? 'off-form' : snapshot.waiting.length ? 'awaiting-owner' : null;
   if (reason === null || input.claim.reason !== reason)
     managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
+  if (final) for (const row of classifications) {
+    const saved = journal?.value.classifications.find(item => item.row === row.row);
+    if (!saved || canonical(saved) !== canonical(row))
+      managedFail(input.journal?.id ?? series.id, 'journal', 'The final journal of the close holds exactly the classes the close derives', 'completion_invalid', input.journal ?? undefined);
+  }
   const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals };
-  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', ...input,
+  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', project: input.project, binding: input.binding,
+    work: input.work, additions: [...input.additions], series: input.series, ledger: input.ledger, journal: input.journal,
     claim: completionClaim(input.claim), outcome, waiting: [...snapshot.waiting] };
   return { value, snapshot, routed, classifications, rows, address, guards: confirmed.guards ?? [] };
 }
@@ -1760,7 +1820,8 @@ export function readCompletionCloseAt(store: Store, project: string, ref: Ref): 
       kind: COMPLETION_CLOSE_KIND, idPrefix: `${COMPLETION_CLOSE_KIND}:${project}:` }));
     const value = record.value;
     if (!isPlainObject(value) || value.contract !== 'om-completion-close/v1' || value.project !== project
-      || !isRef(value.binding) || !isRef(value.work) || !isRef(value.series) || !isPlainObject(value.claim)
+      || !isRef(value.binding) || !isRef(value.work) || !Array.isArray(value.additions) || !value.additions.every(isRef)
+      || !isRef(value.series) || !isPlainObject(value.claim)
       || !Array.isArray(value.claim.accepting) || !value.claim.accepting.every(isRef)
       || !Array.isArray(value.claim.cancelling) || !value.claim.cancelling.every(isRef)
       || !Array.isArray(value.claim.refusals) || !value.claim.refusals.every(row => isPlainObject(row)
@@ -1768,7 +1829,7 @@ export function readCompletionCloseAt(store: Store, project: string, ref: Ref): 
       || !['result', 'refused', 'off-form', 'interrupted', 'awaiting-owner'].includes(value.claim.reason)
       || ![value.ledger, value.journal].every(item => item === null || isRef(item)))
       managedFail(ref.id, 'record', 'The immutable close proof retains all exact pre-close sources');
-    const derived = deriveManagedClose(store, { project, binding: value.binding, work: value.work,
+    const derived = deriveManagedClose(store, { project, binding: value.binding, work: value.work, additions: value.additions,
       series: value.series, ledger: value.ledger, journal: value.journal, claim: value.claim });
     if (record.revision !== 1 || record.id !== completionCloseId(project, value.binding.id) || canonical(value) !== canonical(derived.value))
       managedFail(ref.id, 'record', 'The close proof must equal the single full managed outcome derivation');
@@ -1805,56 +1866,138 @@ function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest):
       return { writes: [], guards: [], value: reported(seriesAddress(request), series.value as AnyRepairSeries,
         request.attempt, derived.routed, raised, decided) };
     }
-    // Capture every mutable head before traversing any supplier or product.
-    const workHead = store.get<CompletionWork>(completionWorkId(request.project, binding.id));
-    const ledgerHead = store.get(callLedgerId(request.project));
-    // Capture mutable product cursors before the historical walk. Their exact old
-    // revisions remain evidence; moving a cursor during this close must still lose CAS.
-    const productHeads = new Map<string, Ref>();
-    if (workHead && Array.isArray(workHead.value.products) && Array.isArray(workHead.value.assignments)) {
-      for (const ref of [...workHead.value.products, ...workHead.value.assignments]) if (isRef(ref)) {
-        const head = store.get(ref.id);
-        if (head) productHeads.set(ref.id, reference(head));
-      }
-    }
-    const journalRead = readJournal(store, { project: request.project });
-    if (!journalRead.ok && journalRead.refusal.code !== 'journal_missing') managedTake(journalRead);
-    const journalHead = journalRead.ok ? journalRead.value : null;
-    if (!workHead) managedFail(id, 'work', 'The managed registry is mandatory');
-    const ledger = managedTake(readCallLedger(store, request.project));
-    if (canonical(ledger ? reference(ledger) : null) !== canonical(ledgerHead ? reference(ledgerHead) : null))
-      managedFail(id, 'ledger', 'Managed closure must retain the captured lawful E1 head or proved absence');
-    const derived = deriveManagedClose(store, { project: request.project, binding: reference(binding), work: reference(workHead),
-      series: reference(seriesHead), ledger: ledgerHead ? reference(ledgerHead) : null, journal: journalHead ? reference(journalHead) : null,
-      claim: completionClaim(request.outcome) });
-    const closeWrite = { id, kind: COMPLETION_CLOSE_KIND, expected: 0, value: derived.value };
-    const closeRef = { id, revision: 1, hash: hashJson(derived.value) };
-    const view = pendingCallStore(store, [closeWrite]);
-    const completed = managedTake(prepareManagedCompleteAttempt(view, { ...request,
-      outcome: derived.value.outcome }, closeRef));
-    const writes: GateWrite[] = [closeWrite, ...completed.writes];
-    const guards: TransactionGuard[] = [reference(seriesHead), reference(workHead),
-      ledgerHead ? reference(ledgerHead) : { id: callLedgerId(request.project), absent: true },
-      ...productHeads.values(), ...completed.guards, ...derived.guards];
-    let decided: readonly RefusalClassification[] = [];
-    if (derived.classifications.length) {
-      const classified = managedTake(prepareClassifyRefusal(store, { project: request.project, classifications: derived.classifications }));
-      writes.push(...classified.writes); guards.push(...classified.guards); decided = classified.value.classifications;
-    }
-    guards.push(journalHead ? reference(journalHead) : { id: journalId(request.project), absent: true });
-    const raised: HoldContext[] = [];
-    const recorded = { id: seriesHead.id, revision: seriesHead.revision + 1, hash: hashJson(completed.value) };
-    for (const row of derived.routed.filter(row => row.class === 'unknown')) {
-      const hold = raise(store, derived.address, request.attempt, row, recorded, derived.rows.get(row.row)!.origin);
-      if ('ok' in hold) managedTake(hold);
-      const checked = hold as Exclude<typeof hold, OmResult<never>>;
-      if (checked.write) writes.push(checked.write);
-      if (checked.guard) guards.push(checked.guard);
-      if (checked.standing) raised.push(checked.standing);
-    }
-    writes.push({ id: workHead.id, kind: COMPLETION_WORK_KIND, expected: workHead.revision,
-      value: { ...workHead.value, previous: reference(workHead), closed: closeRef } satisfies CompletionWork });
-    return { writes, guards: uniqueTransactionGuards(guards),
-      value: reported(derived.address, completed.value as AnyRepairSeries, request.attempt, derived.routed, raised, decided) };
+    return managedCloseBundle(store, request, closeHeads(store, request, binding, seriesHead), null);
   });
+}
+/** The mutable heads a managed close stands on, captured before any supplier or product is traversed. */
+export interface ManagedCloseHeads {
+  binding: Ref; series: Revision<AnyRepairSeries>; work: Revision<CompletionWork>; ledger: Ref | null; products: Ref[]; journal: Ref | null;
+}
+/**
+ * The evaluation half of a linked close (H1.0c, №1616 п.3): its records written before the rows (gate, evaluation,
+ * proofs), their guards, the G4b sources and their pending writes, which the journal batch hands back itself, and the
+ * exact additions of the work: the evaluation and those sources.
+ */
+export interface LinkedCloseParts {
+  heads: Sealed<ManagedCloseHeads>; writes: readonly Write[]; guards: readonly TransactionGuard[];
+  sources: readonly Ref[]; pending: readonly Write[]; additions: readonly Ref[];
+}
+function closeHeads(store: Store, request: AnyCloseAttemptRequest, binding: Revision<unknown>, seriesHead: Revision<unknown>): ManagedCloseHeads {
+  const id = completionCloseId(request.project, binding.id);
+  const workHead = store.get<CompletionWork>(completionWorkId(request.project, binding.id));
+  const ledgerHead = store.get(callLedgerId(request.project));
+  // Capture mutable product cursors before the historical walk. Their exact old
+  // revisions remain evidence; moving a cursor during this close must still lose CAS.
+  const productHeads = new Map<string, Ref>();
+  if (workHead && Array.isArray(workHead.value.products) && Array.isArray(workHead.value.assignments)) {
+    for (const ref of [...workHead.value.products, ...workHead.value.assignments]) if (isRef(ref)) {
+      const head = store.get(ref.id);
+      if (head) productHeads.set(ref.id, reference(head));
+    }
+  }
+  const journalRead = readJournal(store, { project: request.project });
+  if (!journalRead.ok && journalRead.refusal.code !== 'journal_missing') managedTake(journalRead);
+  const journalHead = journalRead.ok ? journalRead.value : null;
+  if (!workHead) managedFail(id, 'work', 'The managed registry is mandatory');
+  const ledger = managedTake(readCallLedger(store, request.project));
+  if (canonical(ledger ? reference(ledger) : null) !== canonical(ledgerHead ? reference(ledgerHead) : null))
+    managedFail(id, 'ledger', 'Managed closure must retain the captured lawful E1 head or proved absence');
+  return { binding: reference(binding), series: seriesHead as Revision<AnyRepairSeries>, work: workHead,
+    ledger: ledgerHead ? reference(ledgerHead) : null, products: [...productHeads.values()], journal: journalHead ? reference(journalHead) : null };
+}
+/** The whole shape of a close request, for a caller that names one and must refuse it before any read (lesson 1). */
+export function requireCloseRequestShape(store: Store, request: AnyCloseAttemptRequest): void {
+  requireCloseRequest(store, request);
+}
+/** Captures the heads of a managed close for a caller that prepares more records into the same bundle. */
+export function captureManagedCloseHeads(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<ManagedCloseHeads>> {
+  requireCloseRequest(store, request);
+  return withHistoricalReads(() => {
+    const seriesHead = store.get<AnyRepairSeries>(seriesAddress(request).id);
+    const selected = seriesHead ? readCompletionBinding(store, request.project, reference(seriesHead), request.attempt) : null;
+    if (selected && !selected.ok) return selected;
+    return managedResult(() => {
+      if (!seriesHead || !selected?.value) managedFail(seriesAddress(request).id, 'completion', 'A linked close needs a managed attempt', 'completion_required');
+      return closeHeads(store, request, selected.value, seriesHead);
+    });
+  });
+}
+/**
+ * H1.0c linked close: the evaluation half and the close in ONE bundle over the heads captured before either was
+ * prepared. The same producer as a direct G7 (whose additions are empty): rows of the additions, then the classes
+ * derived over them, then one final journal, the close citing it, A3, holds and one closed work revision.
+ */
+export function prepareLinkedClose(store: Store, request: AnyCloseAttemptRequest, linked: LinkedCloseParts): OmResult<Sealed<RepeatTransition>> {
+  requireCloseRequest(store, request);
+  requireCondition(isPlainObject(linked) && isPlainObject(linked.heads) && isRef(linked.heads.binding) && isRef(linked.heads.series)
+    && isRef(linked.heads.work) && [linked.writes, linked.pending].every(list => Array.isArray(list) && list.every(write =>
+      isPlainObject(write) && isText(write.id) && isText(write.kind) && Number.isSafeInteger(write.expected)))
+    && Array.isArray(linked.guards) && [linked.sources, linked.additions].every(list => Array.isArray(list) && list.every(isRef)),
+  "repeat_request_invalid", "A linked close names its captured heads, its pending records and its exact additions");
+  return managedResult(() => {
+    const heads = linked.heads, selected = managedTake(readCompletionBinding(store, request.project, reference(heads.series), request.attempt));
+    if (!selected || !sameRef(reference(selected), heads.binding) || heads.series.id !== seriesAddress(request).id
+      || heads.work.id !== completionWorkId(request.project, heads.binding.id))
+      managedFail(completionCloseId(request.project, heads.binding.id), 'binding', 'The captured heads belong to the attempt this close names', 'completion_foreign');
+    if (store.get(completionCloseId(request.project, linked.heads.binding.id)))
+      managedFail(linked.heads.work.id, 'work', 'A closed attempt takes no linked additions; only exact repeats', 'completion_closed');
+    return managedCloseBundle(store, request, linked.heads, linked);
+  });
+}
+function managedCloseBundle(store: Store, request: AnyCloseAttemptRequest, heads: Sealed<ManagedCloseHeads>,
+  linked: LinkedCloseParts | null): RepeatTransition {
+  const project = request.project, id = completionCloseId(project, heads.binding.id), workHead = heads.work;
+  const journalGuard = heads.journal ?? { id: journalId(project), absent: true as const };
+  const base = linked ? pendingCallStore(store, linked.writes) : store;
+  const additions = linked ? [...linked.additions] : [], sources = linked ? [...linked.sources] : [];
+  const pending = linked ? [...linked.pending] : [];
+  const extra: GateWrite[] = [], extraGuards: TransactionGuard[] = [];
+  // Rows of the additions first (in memory only), so the classes are derived over the rows the final journal holds.
+  const rows = sources.length ? managedTake(prepareJournalBatch(base, { project, sources, pending, classifications: [] })) : null;
+  const rowsView = rows ? pendingCallStore(base, rows.writes as Write[]) : base;
+  if (linked) {
+    // The general work transition admits the additions (the line admission for a new evaluation, C13); its own work
+    // revision is dropped: the close writes the one final revision of the work itself.
+    const admitted = managedTake(prepareCompletionProducts(rowsView, heads.binding, additions));
+    extra.push(...admitted.writes.filter(write => write.id !== workHead.id));
+    extraGuards.push(...linked.guards, ...admitted.guards);
+  }
+  const input = { project, binding: heads.binding, work: reference(workHead), additions, series: reference(heads.series),
+    ledger: heads.ledger, claim: completionClaim(request.outcome) };
+  const first = deriveManagedClose(rowsView, { ...input, journal: rows ? rows.result : heads.journal }, false);
+  // One final A2 write: the rows of the additions and the classes of this close; no intermediate journal revision.
+  const batch = sources.length || first.classifications.length ? managedTake(prepareJournalBatch(base,
+    { project, sources, pending, classifications: first.classifications })) : null;
+  const journal = batch ? batch.result : heads.journal;
+  const view = batch ? pendingCallStore(base, batch.writes as Write[]) : base;
+  const value: CompletionCloseRecord = { ...first.value, journal };
+  const closeWrite = { id, kind: COMPLETION_CLOSE_KIND, expected: 0, value };
+  const closeRef = { id, revision: 1, hash: hashJson(value as unknown as Json) };
+  // The series reads the close through the full reader, over the final journal of this same view (C67).
+  const completed = managedTake(prepareManagedCompleteAttempt(pendingCallStore(view, [closeWrite]), { ...request,
+    outcome: value.outcome }, closeRef));
+  const writes: GateWrite[] = [...(linked?.writes ?? []), ...extra, closeWrite, ...completed.writes];
+  const guards: TransactionGuard[] = [reference(heads.series), reference(workHead),
+    heads.ledger ?? { id: callLedgerId(project), absent: true }, ...heads.products, ...completed.guards, ...first.guards, ...extraGuards];
+  const decided: readonly RefusalClassification[] = first.classifications.length && batch ? batch.value.classifications : [];
+  if (batch) { writes.push(...batch.writes); guards.push(...batch.guards); }
+  guards.push(journalGuard);
+  const raised: HoldContext[] = [];
+  const recorded = { id: heads.series.id, revision: heads.series.revision + 1, hash: hashJson(completed.value) };
+  for (const row of first.routed.filter(row => row.class === 'unknown')) {
+    const hold = raise(store, first.address, request.attempt, row, recorded, first.rows.get(row.row)!.origin);
+    if ('ok' in hold) managedTake(hold);
+    const checked = hold as Exclude<typeof hold, OmResult<never>>;
+    if (checked.write) writes.push(checked.write);
+    if (checked.guard) guards.push(checked.guard);
+    if (checked.standing) raised.push(checked.standing);
+  }
+  writes.push({ id: workHead.id, kind: COMPLETION_WORK_KIND, expected: workHead.revision,
+    value: managedTake(completionClosedWork(view, project, workHead, value, closeRef)) });
+  if (new Set(writes.map(write => write.id)).size !== writes.length)
+    managedFail(id, 'writes', 'One transaction writes one record once', 'revision_conflict');
+  // Guards name what stood before the bundle, never a revision the same bundle writes.
+  const written = new Set(writes.map(write => `${write.id}@${write.expected + 1}`));
+  return { writes, guards: uniqueTransactionGuards(guards.filter(guard => !('revision' in guard) || !written.has(`${guard.id}@${guard.revision}`))),
+    value: reported(first.address, completed.value as AnyRepairSeries, request.attempt, first.routed, raised, decided) };
 }

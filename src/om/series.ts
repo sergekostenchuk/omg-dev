@@ -6,7 +6,7 @@ import { Store, type Revision, type TransactionGuard, type Write } from "../stor
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readPreparedSeriesTransition, prepareSeriesTransition, comparePreparedSeriesSlices, type PreparedSeriesDecision } from "./series-transition.js";
 import { readHorizonIssuance, prepareHorizonIssuance } from "./horizon.js";
-import { readModelTerminalWitness } from "./model-call.js";
+import { readModelTerminalWitness, completionClosedWork } from "./model-call.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type RefusalRoute, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
 import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
@@ -1950,10 +1950,13 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
       if (!proof.ok) return proof;
       const work = store.get<CompletionWork>(completionWorkId(address.project, binding.value.id), proof.value.work.revision + 1);
       const priorWork = store.get<CompletionWork>(proof.value.work.id, proof.value.work.revision);
+      // H1.0c: one closed-work formula for every close, over its exact additions and final journal.
+      const closedWork = priorWork ? completionClosedWork(store, address.project, priorWork, proof.value, reference(close)) : null;
+      if (closedWork && !closedWork.ok) return closedWork;
       if (!sameRef(proof.value.binding, reference(binding.value)) || canonical(outcomeOf(proof.value.outcome)) !== canonical(attempt.outcome)
         || !work || work.kind !== COMPLETION_WORK_KIND || !work.value.closed || !sameRef(work.value.closed, reference(close))
         || !work.value.previous || !sameRef(work.value.previous, proof.value.work) || !priorWork
-        || canonical(work.value) !== canonical({ ...priorWork.value, previous: proof.value.work, closed: reference(close) }) || attempt.terminal)
+        || canonical(work.value) !== canonical(closedWork!.value) || attempt.terminal)
         return refused('completion_invalid', 'The managed outcome, closed registry and proof must agree',
           { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
     }
@@ -2987,7 +2990,8 @@ export interface CompletionWork {
   contract: 'om-completion-work/v1'; project: string; binding: Ref; previous: Ref | null;
   assignments: Ref[]; products: Ref[]; journal: Ref | null; closed: Ref | null;
 }
-export interface ManagedClosure { binding: Ref; work: Ref }
+/** H1.0c: the exact pre-close work, the additions of the close (explicitly none) and its final journal, to rederive. */
+export interface ManagedClosure { binding: Ref; work: Ref; additions: readonly Ref[]; journal: Ref | null }
 export const completionOwnerId = (project: string, seriesId: string, attempt: number): string =>
   `${COMPLETION_OWNER_KIND}:${project}:${hashJson({ seriesId, attempt })}`;
 export const completionEraId = (project: string, seriesId: string): string =>
@@ -3162,6 +3166,40 @@ export function completionRootAssignments(binding: Revision<CompletionOwner>): R
     return { id: completionAssignmentId(value.project, binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
       revision: 1, hash: hashJson(value), value };
   });
+}
+/** H1.0c: the one non-physical check of the whole selected goal; no batch, packet or E1 field is invented for it. */
+export const ANSWERS_GATE_ASSIGNMENT_KEY = 'answers-gate' as const;
+export const ANSWERS_GATE_ASSIGNMENT_CONTRACT = 'om-answers-gate-assignment/v1' as const;
+export interface AnswersGateAssignment {
+  contract: typeof ANSWERS_GATE_ASSIGNMENT_CONTRACT; project: string; binding: Ref;
+  key: typeof ANSWERS_GATE_ASSIGNMENT_KEY; kind: 'answers-gate'; owner: SeriesOwner; goal: AttemptGoal; plan: CompletionPlan;
+}
+export function answersGateAssignment(binding: Revision<CompletionOwner>): Revision<AnswersGateAssignment> {
+  requireCondition(isPlainObject(binding) && isText(binding.id) && isPlainObject(binding.value) && isText(binding.value.project)
+    && isPlainObject(binding.value.owner) && isPlainObject(binding.value.goal) && isPlainObject(binding.value.plan)
+    && isRef(reference(binding)), 'series_request_invalid', 'The answers-gate check derives from one exact completion binding');
+  const value: AnswersGateAssignment = { contract: ANSWERS_GATE_ASSIGNMENT_CONTRACT, project: binding.value.project,
+    binding: reference(binding), key: ANSWERS_GATE_ASSIGNMENT_KEY, kind: 'answers-gate', owner: binding.value.owner,
+    goal: binding.value.goal, plan: binding.value.plan };
+  return { id: completionAssignmentId(value.project, binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
+    revision: 1, hash: hashJson(value), value };
+}
+/** The saved check equals its derivation from the exact binding; only a block owner has one (№1628 Q2). */
+export function readAnswersGateAssignmentAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnswersGateAssignment>>> {
+  requireStore(store); requireProject(project);
+  requireCondition(isRef(ref), 'series_request_invalid', 'An answers-gate assignment is read by an exact reference');
+  return completionResult(() => historicalRead(store, { reader: 'G7.answers-assignment', project, ref }, () => {
+    const record = completionExact<AnswersGateAssignment>(store, project, ref, COMPLETION_ASSIGNMENT_KIND);
+    const value = record.value;
+    if (!isPlainObject(value) || value.contract !== ANSWERS_GATE_ASSIGNMENT_CONTRACT || value.project !== project
+      || !isRef(value.binding) || !exactKeys(value, ['contract', 'project', 'binding', 'key', 'kind', 'owner', 'goal', 'plan']))
+      completionFail(ref.id, 'assignment', 'The answers-gate assignment retains its full exact contract');
+    const binding = completionTake(readCompletionOwnerAt(store, project, value.binding));
+    if (binding.value.owner.kind !== 'block') completionFail(ref.id, 'owner', 'Only a block owner has an answers-gate check');
+    if (canonical(record) !== canonical(answersGateAssignment(binding)))
+      completionFail(ref.id, 'assignment', 'The answers-gate assignment must equal its derivation from the exact binding');
+    return record;
+  }, () => completionFail(ref.id, 'history', 'An answers-gate assignment cannot derive from itself')));
 }
 /** G7's managed A3 preparer returns the indivisible opening bundle, never an unbacked S write. */
 export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> {
