@@ -1872,7 +1872,8 @@
 - После: H1, Q1
 - Тесты сверх обязательных:
   - ДОГОВОР №1822 (~/REPORTS/review/omg-code-q2_contract-1822.md — читать ЦЕЛИКОМ): ЧАСТЬ 1 из 3 — общий механизм и три исходных производителя. Статическая проверка TypeScript AST в test/om-refusal-codes.test.ts обходит ВСЕ src/om/*.ts; четыре канала (собственный Refusal / общий-заимствованный код по явно подключённой группе / передача результата зависимости с названным источником / исключение и код данных-исхода — свои классы); декларативные правила классов и общих групп — в refusal.ts БЕЗ импорта производителей (циклы загрузки); разрешение псевдонимов, констант, локальных помощников, позиции параметра кода, default и conditional; неразрешённое выражение — падение, не пропуск; запрещены исключения «весь файл»/«любой error.code»/«любой *_invalid»; ожидаемый каталог НЕ выводить из найденных эмиссий. Модули частей Q2b/Q2c — явным списком ещё не подключённых (не постоянное исключение). Runtime-фильтр к readJournalAt/readRun/G4b/E4 не подключать. Таблица №1822-5 (8 строк) и регрессии №1822-5. Опись ревьюера /tmp/omg-q2-inventory.json (+ скрипт .cjs) — исходная, не приёмочная.
-  - найдено 25.09.2026 (eb90700): типизированные отказы вне своих списков — horizon_choice_conflict (horizon.ts:441), model_call_foreign и model_call_not_running (model-call.ts:1534–1565), legacy_operation_active (input.ts:532), om_admission_guard_unsupported (input.ts:91); исключения неверного вызова *_request_invalid/*_internal*, общие коды input_stale/record_missing/record_forged и коды наблюдений/исходов (file_alias, process_lost, model_need_owner) — другие классы, объявить явно, где каждый описан
+  - ДОПОЛНЕНИЕ №1849 (в том же файле договора, читать ЦЕЛИКОМ): пять путей; ВСЕ декларации для модулей вне путей — чистые данные в refusal.ts (модуль, экспорт/символ, выбранные коды либо именованный выход производителя и канал; без runtime-импортов), тест разрешает их по AST и падает на битой ссылке; HORIZON_REFUSAL_CODES/INPUT_REFUSAL_CODES НЕ расширять — отдельные экспорты доп. каталогов в horizon.ts и input.ts; completion-группа (14 кодов) создаётся В ЧАСТИ 1 с подмножествами по модулям (model-call, answers-gate, repeat-gate, routes только completion_invalid, assessment, series; completion_request_invalid в series — Refusal); группа Ref сверяется с REFS_REFUSAL_CODES; заимствования — конкретными кодами, не каталогом целиком; неизменённая передача (return x, take(dep), {...refusal}) — не новая эмиссия; динамики deliveries/frame-candidate/neighbors/stop-analysis/E4 transport — источники в refusal.ts; список остатка — только assessment, atomic-gate, feasibility, handoff, series-transition, series, run; регрессии на синтетических исходниках в памяти; кто сливается вторым (S1.1, E2.2, E4.1, H1.1…) — проходит общий тест. Адреса на 9201fab: candidate_gaps run.ts:239, answers_not_passed :850/:868, model_call_foreign model-call.ts:1975, model_call_not_running :1987 (номера строк — подсказки, не ключи анализатора)
+  - найдено 25.09.2026 (eb90700): типизированные отказы вне своих списков — horizon_choice_conflict (horizon.ts:441), model_call_foreign и model_call_not_running (на 9201fab — model-call.ts:1975/:1987), legacy_operation_active (input.ts:532), om_admission_guard_unsupported (input.ts:91); исключения неверного вызова *_request_invalid/*_internal*, общие коды input_stale/record_missing/record_forged и коды наблюдений/исходов (file_alias, process_lost, model_need_owner) — другие классы, объявить явно, где каждый описан
   - ДО КОДА — опись всех модулей OM и выбор механизма (типизация кода refused по списку юнита либо общая проверка) — ревьюеру; если механизм затрагивает больше путей — разбить по ширине
   - регрессия: новый отказ, не внесённый в список своего юнита, не проходит проверку
 
@@ -1886,7 +1887,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/om/assessment.ts`, `src/om/atomic-gate.ts`, `src/om/feasibility.ts`, `src/om/handoff.ts`, `test/om-refusal-codes.test.ts`
+- Разрешённые пути: `src/om/refusal.ts`, `src/om/assessment.ts`, `src/om/atomic-gate.ts`, `src/om/feasibility.ts`, `src/om/handoff.ts`, `test/om-refusal-codes.test.ts`
 - Из движка как есть: общая AST-проверка и декларации классов — Q2 (test/om-refusal-codes.test.ts, src/om/refusal.ts); договор №1822 — ~/REPORTS/review/omg-code-q2_contract-1822.md
 - После: Q2
 - Тесты сверх обязательных:
@@ -1903,11 +1904,11 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/om/series-transition.ts`, `src/om/series.ts`, `src/om/run.ts`, `test/om-refusal-codes.test.ts`
+- Разрешённые пути: `src/om/refusal.ts`, `src/om/series-transition.ts`, `src/om/series.ts`, `src/om/run.ts`, `test/om-refusal-codes.test.ts`
 - Из движка как есть: общая AST-проверка и декларации классов — Q2; договор №1822 — ~/REPORTS/review/omg-code-q2_contract-1822.md
 - После: Q2b, H1.3
 - Тесты сверх обязательных:
-  - ДОГОВОР №1822 (читать ЦЕЛИКОМ), ЧАСТЬ 3 из 3: series-transition.ts (fail — код четвёртым аргументом с default), series.ts:2488 series_transition_refused вне SERIES_CODES, run.ts candidate_gaps/answers_not_passed вне RUN_CODES; общие completion-коды (E4/E5/G4b/G7/M6/series) — одной конечной группой общего протокола завершения, не независимыми списками; answers-gate.ts — в описи, покрывается общей completion-группой и зависимостью от E4 без правки логики; в конце список неподключённых модулей в тесте ПУСТ
+  - ДОГОВОР №1822 (читать ЦЕЛИКОМ), ЧАСТЬ 3 из 3: series-transition.ts (fail — код четвёртым аргументом с default), series.ts:2488 series_transition_refused вне SERIES_CODES, run.ts candidate_gaps/answers_not_passed вне RUN_CODES; completion-группа уже создана в части 1 (№1849-4) — Q2c подключает оставшихся производителей и закрывает остаток; refusal.ts — только для своих деклараций зависимостей/групп (№1849-12); answers-gate.ts — в описи, покрывается общей completion-группой и зависимостью от E4 без правки логики; в конце список неподключённых модулей в тесте ПУСТ
   - только объявления кодов/классов и типы; предметные ветви не менять; было → стало
 
 ### Q3 · Однозначные составные ключи сортировки и явные пустые максимумы
