@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, watch } from 'node:fs';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -32,7 +32,17 @@ import { writeOmInput, readOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, readGaps, type GapRequest, type GapMoment } from '../src/om/gaps.js';
-import { writeGapLines } from '../src/om/gap-lines.js';
+import { writeGapLines, gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest } from '../src/om/question-packet.js';
+import { writeRoutes } from '../src/om/routes.js';
+import { openSeries, beginAttempt, completeAttempt, type RepairSeries } from '../src/om/series.js';
+import { recordCall } from '../src/om/call-record.js';
+import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
+import type { ModelCallRequest, ModelTransportRequest } from '../src/om/model-call.js';
+import { processStopRefusal, writeProcessStopWitness } from '../src/runtime/process-identity.js';
+import { readLateModelReceipt } from '../src/discovery/model-call-recovery.js';
+import type { ModelCall } from '../src/runtime/model-usage.js';
+import type { ProcessResult } from '../src/runtime/process.js';
 import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment,
   writeOmObligations, readOmObligationLedger, type OwnerGapAssignment, type ObligationRequest, type OmObligationHandoff, type OmObligationRecord } from '../src/om/obligations.js';
 import type { OmResult } from '../src/om/refusal.js';
@@ -670,7 +680,7 @@ test('D8 later failed and interrupted attempts cannot resurrect an earlier succe
   const good = await f.observe(obligation, 'new-success'); assert.ok(findObligationConfirmation(f.store, f.project, obligation));
   const pending = f.store.write<RuntimeObservation>({ id: 'runtime-observation:interrupted-om-fixture', kind: 'runtime-observation', expected: 0,
     value: { ...good.observation.value, key: 'interrupted', startedAt: good.observation.value.startedAt + 1, status: 'running', result: null,
-      owner: { pid: 2147483647, started: 'ended-fixture-owner' }, child: null } });
+      owner: { pid: 99998, started: 'ended-fixture-owner' }, child: null } });
   assert.equal(findObligationConfirmation(f.store, f.project, obligation), null);
   const recovered = f.engine.execute({ type: 'recover-runtime-observation', project: f.project, observation: reference(pending) }) as Revision<RuntimeObservation>;
   assert.equal(recovered.value.status, 'failed'); assert.equal(findObligationConfirmation(f.store, f.project, obligation), null);
@@ -705,11 +715,36 @@ await new ProductEngine(store).execute(${JSON.stringify(request)});throw Error('
     f.reopen(); const persisted = f.store.list<RuntimeObservation>('runtime-observation')[0]!;
     assert.ok(persisted); if (persisted.value.snapshot) t.after(() => rmSync(persisted.value.snapshot!, { recursive: true, force: true }));
     const before = existsSync(f.marker) ? readFileSync(f.marker, 'utf8') : '';
-    const recovered = f.engine.execute({ type: 'recover-runtime-observation', project: f.project, observation: reference(persisted) }) as Revision<RuntimeObservation>;
+    const recoverOnce = () => f.engine.execute({ type: 'recover-runtime-observation', project: f.project, observation: reference(persisted) }) as Revision<RuntimeObservation>;
+    let recovered: Revision<RuntimeObservation>;
     if (boundary === 'observed') {
+      recovered = recoverOnce();
       assert.deepEqual(recovered, persisted); assert.equal(recovered.value.result!.exitCode, 0);
       assert.ok(f.store.list<Source>('source').find(source => source.value.provenance?.record.id === recovered.id));
-    } else { assert.equal(recovered.value.status, 'failed'); assert.equal(recovered.value.child, null); }
+    } else if (boundary === 'child') {
+      // The real check child may still be alive or a zombie: a deferred refusal
+      // leaves record, dispatch counter and marker untouched; bounded explicit
+      // repeats after event-loop yields must close it. Unresolved at the bound is a failure.
+      let closed: Revision<RuntimeObservation> | null = null;
+      for (let i = 0; i < 40 && !closed; i++) {
+        try { closed = recoverOnce(); }
+        catch (error) {
+          assert.ok(error instanceof EngineError && ['process_stop_unconfirmed', 'process_stop_denied', 'process_stop_failed'].includes(error.code),
+            `expected a typed deferred refusal, got ${String(error)}`);
+          const kept = f.store.get<RuntimeObservation>(persisted.id)!;
+          assert.equal(kept.value.status, 'running'); assert.deepEqual(kept.value.child, persisted.value.child);
+          assert.equal(existsSync(f.marker) ? readFileSync(f.marker, 'utf8') : '', before);
+          assert.equal(f.store.get<{ serial: number }>(`project-dispatch:${hashJson(f.project)}`)!.value.serial, 1);
+          await new Promise(r => setImmediate(r));
+        }
+      }
+      assert.ok(closed, 'bounded explicit retry must close once the child provably ends');
+      recovered = closed;
+      assert.equal(recovered.value.status, 'failed'); assert.equal(recovered.value.child, null);
+    } else {
+      recovered = recoverOnce();
+      assert.equal(recovered.value.status, 'failed'); assert.equal(recovered.value.child, null);
+    }
     const replay = await f.engine.execute(request) as RuntimeObservationResult;
     assert.deepEqual(replay.observation, recovered);
     assert.equal(existsSync(f.marker) ? readFileSync(f.marker, 'utf8') : '', before);
@@ -1220,3 +1255,180 @@ try {
     } finally { store.close(); }
   }
 });
+
+// ---------------------------------------------------------------------------
+// D8.5 round 3: OM late-receipt boundary. A complete physical result preserved
+// in a process-stop/v1 witness is paid evidence; the receipt must name the
+// recovery body that is actually persisted — including the fields the OM layer
+// appends — inside the same guarded write set. Fixtures are the local shape of
+// the e4 dispatch fixture, trimmed to the kinds this boundary exercises.
+
+const e4Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+const e4AdapterPath = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+
+function e4RecoveryFixture(t: TestContext, managed: boolean) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e4-recovery-')), database = join(root, 'state.sqlite');
+  const store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden', graphData = gardenGraph('cross');
+  graphData.nodes.find(node => node.id === 'garden-produce-block')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
+  graphData.nodes.find(node => node.id === 'garden-consume-block')!.ports.push({ id: 'in-side', direction: 'in', contract: 'garden-contract' });
+  graphData.connectors.push({ id: 'garden-side-flow', artifact: 'garden-data', returnsTo: 'garden-produce-block', wakeTest: null,
+    bindings: [{ level: 1, producer: { node: 'garden-produce-block', port: 'out-side' },
+      consumers: [{ node: 'garden-consume-block', port: 'in-side' }], anchor: null }] });
+  const { level: _level, ...l1 } = projectGraph(graphData, 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'What encoding is supported?',
+      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }];
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: 'e4-fixture', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(store, sources));
+  const gapRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const tasks = ok(prepareQuestionTasks(store, { project, gaps: gapRequest,
+    questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
+      .map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
+  const source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const routes = ok(writeRoutes(store, { project, gaps: gapRequest,
+    tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
+    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }));
+  writeFileSync(join(root, 'e4-source.txt'), 'UTF-8 is the supported encoding.');
+  const batch = routes.value.batches.find(batch => batch.model === 'MC1' && batch.items.some(item => item.target === 'discovery:encoding'))!;
+  assert.ok(batch);
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
+  const command = { executable: process.execPath, args: [e4AdapterPath, '--scenario', scenario, '--trace', trace] };
+  const configured = engine.environments.configure(project, { workspace: root,
+    implementer: { actor: 'e4-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: { actor: 'e4-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 30_000, requestCapacityChars: 100_000 }, 0);
+  const adapter = store.write({ id: `adapter:${project}:e4`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } });
+  const goal = { key: 'e4:fact', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  const address = { project, block: 'garden-consume-block', line: 1 };
+  ok(openSeries(store, { ...address, slice: 'e4-fixture', predecessor: null, basis: null } as never));
+  const opening = { ...address, attempt: 1, goal, ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) };
+  const series = ok((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
+  const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
+    attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+  const packet = ok(writeQuestionPacket(store, packetRequest)).record;
+  const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
+  return { root, database, project, graph, input, source, routes, gaps, batch, packet, request, series, scenario, trace, store, engine };
+}
+
+function e4AnalysisRecoveryFixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-e4-analysis-recovery-')), database = join(root, 'state.sqlite');
+  const store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'analysis', block = 'analyzed-block', address = { project, block, line: 1 };
+  const goal = { key: 'analysis-fixture-goal', questions: ['Address one contract'], result: 'A supported contract' };
+  ok(openSeries(store, { ...address, slice: 'analysis-slice', predecessor: null, basis: null } as never));
+  let series = ok(beginAttempt(store, { ...address, attempt: 1, goal })) as Revision<RepairSeries>;
+  for (const attempt of [1, 2, 3]) {
+    if (attempt > 1) ok(beginAttempt(store, { ...address, attempt, goal }));
+    series = ok(completeAttempt(store, { ...address, attempt,
+      outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } })) as Revision<RepairSeries>;
+  }
+  const basis = { kind: 'series-stop' as const, series: reference(series), attempt: 3 };
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
+  const command = { executable: process.execPath, args: [e4AdapterPath, '--scenario', scenario, '--trace', trace] };
+  const environment = new Environments(store).configure(project, { workspace: root,
+    implementer: { actor: 'analysis-executor', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 30_000 }, 0);
+  const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0, value: { protocol: 'codex-stdio' } });
+  const packet = { task: 'Diagnose the named ground', note: 'No fabricated A6 protocol', basis } as unknown as Json;
+  const reviewGoal = { key: 'stop-analysis', questions: ['What caused this ground?'], result: 'A cause or explicit hypothesis with an addressed change' };
+  const admitted = ok(recordCall(store, project, { call: 'e4:stop-analysis', purpose: 'stop-analysis', basis, block,
+    gaps: [{ id: 'stop-analysis', goal: 'stop-analysis', field: 'cause-and-change', consumer: 'A6:stop-analysis' }],
+    series: reference(series), attempt: 3, goal: reviewGoal,
+    dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
+  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: 'reviewer' };
+  return { root, database, project, packet, request, series, scenario, trace, store };
+}
+
+function e4Fact(f: ReturnType<typeof e4RecoveryFixture>) {
+  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+    results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
+      citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
+}
+
+type E4Checkpoint = { pid: number; parent: number; writes?: Write[] };
+function e4Driver(t: TestContext, database: string, root: string, operation: 'call' | 'transport',
+  request: ModelCallRequest | ModelTransportRequest, checkpointPath: string) {
+  const spec = join(root, 'driver.json'), output = join(root, 'driver-output.json');
+  writeFileSync(spec, JSON.stringify({ database, output, operation, request,
+    checkpoint: { path: checkpointPath, kind: 'om-model-exchange', matches: [], when: 'before' } }));
+  const child = spawn(process.execPath, [e4AdapterPath, '--driver', spec], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = ''; child.stderr!.on('data', data => { stderr += data.toString(); }); child.stdout!.resume();
+  const exit = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exit; });
+  return { child, exit, output, errors: () => stderr };
+}
+async function e4Checkpoint(path: string, child: ChildProcess): Promise<E4Checkpoint> {
+  if (!existsSync(path)) await new Promise<void>((resolve, reject) => {
+    const stop = () => { clearTimeout(deadline); watcher.close(); child.off('exit', ended); };
+    const ended = () => { stop(); reject(new Error(`Fixture driver exited before checkpoint ${path}`)); };
+    const watcher = watch(dirname(path), () => { if (existsSync(path)) { stop(); resolve(); } });
+    const deadline = setTimeout(() => { stop(); reject(new Error(`Fixture checkpoint was not reached: ${path}`)); }, 20_000);
+    child.once('exit', ended);
+    if (existsSync(path)) { stop(); resolve(); }
+  });
+  return JSON.parse(readFileSync(path, 'utf8')) as E4Checkpoint;
+}
+async function killE4Driver(driver: ReturnType<typeof e4Driver>) {
+  assert.equal(driver.child.exitCode, null); assert.equal(driver.child.signalCode, null);
+  assert.equal(driver.child.kill('SIGKILL'), true); await driver.exit;
+}
+function e4PublicRecovery(store: Store, project: string, record: Ref): Revision<ModelCall> {
+  return new ProductEngine(store).execute({ type: 'recover-model-call', project, call: record }) as Revision<ModelCall>;
+}
+function e4EnsureProject(store: Store, project: string) {
+  if (!store.get(`project:${project}`)) store.write({ id: `project:${project}`, kind: 'project', expected: 0,
+    value: { id: project, title: 'Local physical recovery fixture' } });
+}
+
+// Reviewer probe review-om-boundaries (verdict №1643, remark 1): the late
+// receipt's recovered ref must be built from the FINAL persisted recovery
+// body — after the OM layer appended its product fields — in the same guarded
+// write set. Ordinary and managed E4 calls mutate the body; the transport path
+// is the control that does not.
+for (const kind of ['ordinary', 'managed', 'transport'] as const) {
+  test(`D8.5 r3 remark 1: paid witness evidence binds the final OM recovery body (${kind})`, async t => {
+    const product = kind !== 'transport';
+    const f = product ? e4RecoveryFixture(t, kind === 'managed') : e4AnalysisRecoveryFixture(t);
+    e4EnsureProject(f.store, f.project);
+    const research = product ? e4Fact(f as ReturnType<typeof e4RecoveryFixture>)
+      : { cause: 'Received local analysis evidence', hypothesis: true };
+    writeFileSync(f.scenario, JSON.stringify({ steps: [{ research, usage: e4Usage }] }));
+    const checkpoint = join(f.root, 'paid-exchange.json');
+    const driver = e4Driver(t, f.database, f.root, product ? 'call' : 'transport', f.request, checkpoint);
+    const pending = await e4Checkpoint(checkpoint, driver.child);
+    const exchange = pending.writes!.find(write => write.kind === 'om-model-exchange')!.value as unknown as {
+      process: ProcessResult; launchError: null };
+    const dispatch = f.store.list<ModelCall>('model-call')[0]!;
+    assert.equal(dispatch.value.execution?.phase, 'authorized');
+    await killE4Driver(driver);
+    const provider = dispatch.value.providerProcess!;
+    const failure = processStopRefusal({ outcome: 'denied', stage: 'group-sweep', target: 'group', pid: provider.pid,
+      expectedStarted: provider.started, observedStarted: null, errno: 'EPERM' }, 'injected cleanup refusal', null,
+      { ...exchange.process, complete: true });
+    writeProcessStopWitness(f.store, reference(dispatch), { owner: dispatch.value.ownerProcess ?? null, child: provider }, failure);
+    const recovered = e4PublicRecovery(f.store, f.project, reference(dispatch));
+    assert.equal(recovered.value.status, 'failed'); assert.equal(recovered.value.error, 'process_lost');
+    assert.equal(recovered.value.response, null, 'paid evidence is preserved, never auto-applied');
+    const late = readLateModelReceipt(f.store, f.project, reference(recovered));
+    assert.ok(late, `${kind}: the late receipt must resolve against the saved recovery body`);
+    assert.deepEqual(late.value.recovered, reference(recovered));
+    assert.equal(late.value.evidence.process!.stdout, exchange.process.stdout);
+  });
+}

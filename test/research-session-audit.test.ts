@@ -10,10 +10,14 @@ import {synthesisSession} from '../src/discovery/synthesis-session.js';
 import {assessmentSession} from '../src/discovery/assessment-session.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {withInvocationAllowance} from '../src/discovery/invocation-progress.js';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
 import {reference} from '../src/pipeline/contracts.js';
 import type {Question} from '../src/discovery/discovery.js';
 import type {ModelCall} from '../src/runtime/model-usage.js';
-import {processStart} from '../src/runtime/process-identity.js';
+import {processStart,probeProcessIdentity,writeProcessStopWitness,processStopWitnesses,type ProcessStopWitness} from '../src/runtime/process-identity.js';
+import {readLateModelReceipt,recoverModelCall} from '../src/discovery/model-call-recovery.js';
+import {EngineError} from '../src/errors.js';
 
 function fixture(t:test.TestContext,role:'analyst'|'assessor',scenario='combine'){
  const root=mkdtempSync(join(tmpdir(),'omg-session-audit-')),store=new Store(join(root,'db.sqlite')),engine=new ProductEngine(store);
@@ -111,10 +115,26 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
  assert.equal((result as any).value.result,'ABC');assert.equal(f.store.list('model-call').length,4);
 });
 
-test('lost-call recovery rejects live/unknown/foreign/stale identities and preserves unknown usage',t=>{
+// A proven-absent identity: our own short-lived child exits by itself, then
+// the strict probe (status=1, empty stdout/stderr, no observation error) must
+// confirm absence. Anything else is a diagnostic failure, never a skip.
+async function provenAbsentIdentity(){
+ const child=spawn(process.execPath,['-e','setTimeout(()=>{},300)'],{stdio:'ignore'});
+ const pid=child.pid;if(!pid)throw new Error('fixture child did not start');
+ const started=processStart(pid);if(!started)throw new Error(`could not record fixture child ${pid} identity`);
+ await new Promise<void>((resolve,reject)=>{child.once('error',reject);child.once('close',()=>resolve());});
+ for(let i=0;i<50;i++){
+  const probe=probeProcessIdentity(pid);
+  if(probe.state==='absent'||(probe.state==='present'&&probe.started!==started))return{pid,started};
+  await new Promise(r=>setTimeout(r,40));
+ }
+ throw new Error(`could not prove absence of fixture pid ${pid}`);
+}
+
+test('lost-call recovery rejects live/unknown/foreign/stale identities and preserves unknown usage',async t=>{
  const f=fixture(t,'analyst');
  const seed=(suffix:string,owner:any,provider:any)=>f.store.write<ModelCall>({id:'model-call:'+suffix,kind:'model-call',expected:0,value:{projectId:'p',draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',requestId:suffix,startedAt:1,finishedAt:null,status:'running',requested:f.env.value.implementer,confirmed:{model:null,effort:null,speed:null},request:{chars:20,bytes:20,hash:'0'.repeat(64)},response:null,usage:null,usageSource:'unavailable',error:null,...(owner?{ownerProcess:owner}:{}),...(provider?{providerProcess:provider}:{})}});
- const live={pid:process.pid,started:processStart(process.pid)},gone={pid:2147483647,started:'recorded dead process'};
+ const live={pid:process.pid,started:processStart(process.pid)},gone=await provenAbsentIdentity();
  const recover=(call:any,project='p')=>new ProductEngine(f.store).execute({type:'recover-model-call',project,call:reference(call)});
  for(const [name,owner,provider,code] of [['owner',live,gone,'model_call_still_running'],['provider',gone,live,'model_call_still_running'],['legacy',null,null,'model_call_identity_missing'],['spawn-window',gone,null,'model_call_identity_missing']] as const){
   const call=seed(name,owner,provider);assert.throws(()=>recover(call),{code});assert.deepEqual(f.store.get(call.id),call);
@@ -124,6 +144,139 @@ test('lost-call recovery rejects live/unknown/foreign/stale identities and prese
  const recovered=recover(call) as any;assert.equal(recovered.value.status,'failed');assert.equal(recovered.value.usage,null);
  assert.equal(recovered.value.error,'process_lost');assert.equal(f.store.list('model-call-recovery').length,1);
  assert.throws(()=>recover(call),{code:'model_call_foreign'});
+});
+
+// A pid whose group is provably still executing. The fixture child idles until
+// the test kills its own group in t.after.
+async function liveSpawnedIdentity(){
+ const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+ await once(child,'spawn');const pid=child.pid;if(!pid)throw new Error('fixture child did not start');
+ for(let i=0;i<50;i++){const probe=probeProcessIdentity(pid);if(probe.state==='present')return{pid,started:probe.started,child};
+  if(probe.state==='unavailable')await new Promise(r=>setTimeout(r,40));else throw new Error('fixture child died early');}
+ throw new Error(`could not observe fixture pid ${pid}`);
+}
+async function provenAbsent(pid:number){for(let i=0;i<80;i++){if(probeProcessIdentity(pid).state==='absent')return;await new Promise(r=>setTimeout(r,40));}
+ throw new Error(`pid ${pid} is still provably present`);}
+
+test('№1631-2 C18/C46: a claimed call with a live witness pid stays running until its end is proven',async t=>{
+ const f=fixture(t,'analyst');
+ const gone=await provenAbsentIdentity(),spawned=await liveSpawnedIdentity();
+ t.after(()=>{try{process.kill(-spawned.pid,'SIGKILL')}catch(e){if((e as NodeJS.ErrnoException).code!=='ESRCH')throw e}});
+ const call=f.store.write<ModelCall>({id:'model-call:claimed-wit',kind:'model-call',expected:0,
+  value:{projectId:'p',draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',requestId:'claimed-wit',startedAt:1,finishedAt:null,
+   status:'running',requested:f.env.value.implementer,confirmed:{model:null,effort:null,speed:null},
+   request:{chars:20,bytes:20,hash:'0'.repeat(64)},response:null,usage:null,usageSource:'unavailable',error:null,
+   ownerProcess:gone,execution:{version:'model-execution/v1',phase:'claimed',owner:gone,provider:null}}});
+ // The refused authorization left a spawned provider the record never learned:
+ // child:null on the witness, only the raw pid.
+ writeProcessStopWitness(f.store,reference(call),{owner:gone,child:null,pid:spawned.pid},
+  new EngineError('process_stop_denied','denied',{outcome:'denied',stage:'signal',target:'group',pid:spawned.pid,errno:'EPERM',cause:null}));
+ const recover=(c:typeof call)=>new ProductEngine(f.store).execute({type:'recover-model-call',project:'p',call:reference(c)});
+ // The claimed phase does not prove the spawned process is gone: recovery must
+ // refuse while its pid is present, and the claim must stay running.
+ assert.throws(()=>recover(call),{code:'model_call_process_uncertain'});
+ assert.equal(f.store.get<ModelCall>(call.id)!.value.status,'running');
+ assert.equal(probeProcessIdentity(spawned.pid).state,'present');
+ // A witness of a FOREIGN subject id must not leak into this call's check:
+ // it neither blocks nor authorizes anything here.
+ writeProcessStopWitness(f.store,{id:'model-call:other',revision:1,hash:'e'.repeat(64)},{child:null,pid:spawned.pid},
+  new EngineError('process_stop_denied','denied',{outcome:'denied',stage:'signal',target:'group',pid:spawned.pid,errno:'EPERM',cause:null}));
+ assert.equal(processStopWitnesses(f.store,call.id).length,1,'the foreign witness is not attached to this call');
+ process.kill(-spawned.pid,'SIGKILL');await provenAbsent(spawned.pid);
+ const closed=recover(call) as any;
+ assert.equal(closed.value.status,'failed');assert.equal(closed.value.error,'process_lost');
+});
+
+test('№1631-3 C24/C46/C47: a complete paid result in the stop witness becomes a late receipt on proved recovery',async t=>{
+ const f=fixture(t,'analyst');
+ const owner=await provenAbsentIdentity(),provider=await provenAbsentIdentity();
+ const call=f.store.write<ModelCall>({id:'model-call:paid-wit',kind:'model-call',expected:0,
+  value:{projectId:'p',draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',requestId:'paid-wit',startedAt:1,finishedAt:null,
+   status:'running',requested:f.env.value.implementer,confirmed:{model:null,effort:null,speed:null},
+   request:{chars:20,bytes:20,hash:'0'.repeat(64)},response:null,usage:null,usageSource:'unavailable',error:null,
+   ownerProcess:owner,providerProcess:{pid:provider.pid,started:provider.started},
+   execution:{version:'model-execution/v1',phase:'authorized',owner,provider:{pid:provider.pid,started:provider.started,group:provider.pid}}}});
+ const physical=(complete:boolean)=>Object.defineProperty(
+  new EngineError('process_stop_denied','denied',{outcome:'denied',stage:'group-sweep',target:'group',pid:provider.pid,errno:'EPERM',cause:null}),
+  'physical',{value:{exitCode:0,signal:null,stdout:'{"research":{"answer":"paid-saved-result"}}',stderr:'',complete},enumerable:false}) as EngineError;
+ writeProcessStopWitness(f.store,reference(call),{owner,child:provider,pid:provider.pid},physical(true));
+ const recovered=recoverModelCall(f.store,'p',reference(call));
+ assert.equal(recovered.value.status,'failed');assert.equal(recovered.value.error,'process_lost');
+ assert.equal(recovered.value.response,null,'the saved bytes are evidence, never an auto-applied response');
+ const late=readLateModelReceipt(f.store,'p',reference(recovered));
+ assert.ok(late);assert.equal(late!.value.evidence.process!.stdout,'{"research":{"answer":"paid-saved-result"}}');
+ assert.deepEqual(late!.value.dispatch,reference(call));assert.equal(late!.value.evidence.launchError,null);
+ // A partial stream is not a complete result: it stays in the witness only.
+ const owner2=await provenAbsentIdentity(),provider2=await provenAbsentIdentity();
+ const partial=f.store.write<ModelCall>({id:'model-call:partial-wit',kind:'model-call',expected:0,
+  value:{projectId:'p',draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',requestId:'partial-wit',startedAt:1,finishedAt:null,
+   status:'running',requested:f.env.value.implementer,confirmed:{model:null,effort:null,speed:null},
+   request:{chars:20,bytes:20,hash:'0'.repeat(64)},response:null,usage:null,usageSource:'unavailable',error:null,
+   ownerProcess:owner2,providerProcess:{pid:provider2.pid,started:provider2.started},
+   execution:{version:'model-execution/v1',phase:'authorized',owner:owner2,provider:{pid:provider2.pid,started:provider2.started,group:provider2.pid}}}});
+ writeProcessStopWitness(f.store,reference(partial),{owner:owner2,child:provider2,pid:provider2.pid},physical(false));
+ const closedPartial=recoverModelCall(f.store,'p',reference(partial));
+ assert.equal(closedPartial.value.error,'process_lost');
+ assert.equal(readLateModelReceipt(f.store,'p',reference(closedPartial)),null);
+});
+
+test('D8.5 r3 rows 3/9: paid evidence is accepted only from the exact dispatch subject',async t=>{
+ const f=fixture(t,'analyst');
+ const owner=await provenAbsentIdentity(),provider=await provenAbsentIdentity();
+ const call=f.store.write<ModelCall>({id:'model-call:bound-wit',kind:'model-call',expected:0,
+  value:{projectId:'p',draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',requestId:'bound-wit',startedAt:1,finishedAt:null,
+   status:'running',requested:f.env.value.implementer,confirmed:{model:null,effort:null,speed:null},
+   request:{chars:20,bytes:20,hash:'0'.repeat(64)},response:null,usage:null,usageSource:'unavailable',error:null,
+   ownerProcess:owner,providerProcess:{pid:provider.pid,started:provider.started},
+   execution:{version:'model-execution/v1',phase:'authorized',owner,provider:{pid:provider.pid,started:provider.started,group:provider.pid}}}});
+ const physical=Object.defineProperty(
+  new EngineError('process_stop_denied','denied',{outcome:'denied',stage:'group-sweep',target:'group',pid:provider.pid,errno:'EPERM',cause:null}),
+  'physical',{value:{exitCode:0,signal:null,stdout:'{"research":{"answer":"paid-saved-result"}}',stderr:'',complete:true},enumerable:false}) as EngineError;
+ writeProcessStopWitness(f.store,reference(call),{owner,child:provider,pid:provider.pid},physical);
+ const wid=`process-stop:${call.id}:${call.revision}`;
+ // Row 3: a tampered subject hash is foreign — it cannot release the claim or
+ // pay this recovery. The call stays running; no receipt is created.
+ const witness=f.store.get<ProcessStopWitness>(wid)!;
+ f.store.write({id:witness.id,kind:witness.kind,expected:witness.revision,
+  value:{...witness.value,subject:{...witness.value.subject,hash:'0'.repeat(64)}}});
+ assert.throws(()=>recoverModelCall(f.store,'p',reference(call)),{code:'process_stop_witness_foreign'});
+ assert.equal(f.store.get<ModelCall>(call.id)!.value.status,'running');
+ assert.equal(f.store.list('model-late-receipt').length,0);
+ // A well-formed witness of an OLDER revision of this call is real evidence —
+ // but row 9: it is not THIS dispatch, so it may end the claim yet never pay.
+ const current=f.store.get(wid)!;
+ f.store.write({id:witness.id,kind:witness.kind,expected:current.revision,value:witness.value});
+ const advanced=f.store.write<ModelCall>({id:call.id,kind:call.kind,expected:call.revision,
+  value:{...call.value,requestId:'bound-wit-again'}});
+ const closed=recoverModelCall(f.store,'p',reference(advanced));
+ assert.equal(closed.value.status,'failed');assert.equal(closed.value.error,'process_lost');
+ assert.equal(readLateModelReceipt(f.store,'p',reference(closed)),null,'paid evidence must name the exact dispatch revision');
+});
+
+test('№1631-4 C28: an identity refusal before authorization keeps a recoverable running claim',async t=>{
+ const f=fixture(t,'analyst');
+ const writeMany=f.store.writeMany.bind(f.store);let injected=false;
+ (f.store as {writeMany:unknown}).writeMany=(writes:{kind:string;value:{execution?:{phase?:string}}}[],guards:unknown[] = [])=>{
+  if(!injected&&writes.some(w=>w.kind==='model-call'&&w.value.execution?.phase==='authorized')){
+   injected=true;throw new EngineError('process_identity_unavailable','injected unavailable provider identity before authorization');}
+  return writeMany(writes as never,guards as never);};
+ let failure:EngineError|null=null;
+ try{await researchCall(f.env.value.implementer,f.env.value,'fixture',f.context,undefined,
+  {store:f.store,draftId:f.draft.id,questionId:f.q.id,purpose:'analyst',pilot:f.pilot});}
+ catch(e){failure=e as EngineError;}
+ (f.store as {writeMany:unknown}).writeMany=writeMany;
+ assert.equal(failure?.code,'process_identity_unavailable');
+ const call=f.store.list<ModelCall>('model-call')[0]!;
+ // No unreadable no-response terminal: the claim stays running, the spawned
+ // provider pid survives in the witness, and no failed/finishedAt was written.
+ assert.equal(call.value.status,'running');assert.equal(call.value.error,null);assert.equal(call.value.finishedAt,null);
+ const witness=processStopWitnesses(f.store,call.id)[0]!.value as ProcessStopWitness;
+ assert.ok(witness.pid&&witness.pid>0);assert.equal(witness.child,null);
+ await provenAbsent(witness.pid);
+ // The claim is genuinely recoverable, not silently terminal: while the owner
+ // (this process) is alive, recovery refuses as still-running rather than
+ // misreading it as a finished failure.
+ assert.throws(()=>recoverModelCall(f.store,'p',reference(call)),{code:'model_call_still_running'});
 });
 
 test('assessment receives every candidate fragment and retains a contradiction across evidence pages',async t=>{

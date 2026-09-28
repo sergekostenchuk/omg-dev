@@ -1,6 +1,6 @@
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
-import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt } from './model-call-recovery.js';
+import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, executionOf } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
@@ -15,6 +15,7 @@ import { researchScope } from "../graph/research-scope.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
+import { isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
@@ -317,8 +318,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
   let physicalResult: import('../runtime/process.js').ProcessResult | null = null;
+  let stopRefusal: EngineError | null = null;
+  let heldSpawn: EngineError | null = null;
+  let spawnedPid: number | null = null;
   try {
     const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, signal, true, pid=>{
+      spawnedPid = pid;
       if(call&&audit) call = authorizeModelDispatch(audit.store, reference(call), pid);
     });
     physicalResult = result;
@@ -331,9 +336,25 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     if (outcome.error) throw new EngineError(outcome.error, outcome.message ?? 'Research call failed');
     return outcome.payload;
   } catch (error) {
+    // An unproven stop is not a terminal model failure: the running claim, the
+    // reserved call and the physical witness survive; only the witness is
+    // appended — no failed/finishedAt, no intent refusal, no finalization.
+    if (isProcessStopRefusal(error)) { stopRefusal = error as EngineError; throw error; }
+    // A spawned provider whose authorization or identity capture was refused
+    // before the dispatch commit leaves no providerProcess and no readable
+    // no-response terminal. The running claim stays open — the witness holds
+    // the spawned pid so recovery can prove its end instead.
+    if (call && audit && spawnedPid !== null && executionOf(call.value)?.phase === 'claimed') {
+      heldSpawn = error instanceof EngineError ? error
+        : new EngineError('process_record_failed', error instanceof Error ? error.message : 'The spawned provider was not durably recorded');
+      throw error;
+    }
     patch.status = "failed"; patch.error = error instanceof EngineError ? error.code : "research_call_failed"; throw error;
   } finally {
-    if (call && audit) {
+    if (call && audit && (stopRefusal || heldSpawn))
+      writeProcessStopWitness(audit.store, reference(call),
+        { owner: call.value.ownerProcess ?? null, child: call.value.providerProcess ?? null, pid: spawnedPid }, stopRefusal ?? heldSpawn);
+    else if (call && audit) {
       const responseWrites = [];
       if (rawResponse !== null) {
         const saved = { id: `model-response:${requestId}`, kind: "model-response", expected: 0,

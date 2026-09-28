@@ -7,7 +7,7 @@ import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { EngineError, requireCondition } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
-  prepareLateModelReceipt, readLateModelReceipt, executionOf } from '../discovery/model-call-recovery.js';
+  prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { ResearchSources } from '../discovery/research-sources.js';
@@ -705,6 +705,7 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
 // Dispatch lifecycle.
 import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
+import { isProcessStopRefusal, writeProcessStopWitness } from '../runtime/process-identity.js';
 import { recordCall, readCall, readCallLedgerAt, readCallLedger, callRecordId, callLedgerId, settleCall, prepareCallDispatch, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory, type CallLedger } from './call-record.js';
 import { prepareQuestionPacket, preparePartResult, partResponseId,
   PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
@@ -1598,9 +1599,17 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
       record = authorizeModelDispatch(store, reference(record), pid);
     }); }
   catch (error) {
-    // Every typed failure at this physical boundary is retained, including a failed
-    // ownership CAS/identity capture in onSpawn. No request was sent on that path.
+    // An unproven stop is not a launch error: the dispatched process may still
+    // be executing. The claim stays running, the process-stop/v1 witness keeps
+    // the evidence, and the typed error propagates for an explicit recovery.
     if (!(error instanceof EngineError)) throw error;
+    if (isProcessStopRefusal(error)) {
+      writeProcessStopWitness(store, reference(record),
+        { owner: (record.value as ModelCall).ownerProcess ?? null, child: (record.value as ModelCall).providerProcess ?? null }, error);
+      throw error;
+    }
+    // Every other typed failure at this physical boundary is retained, including a failed
+    // ownership CAS/identity capture in onSpawn. No request was sent on that path.
     launchError = { code: error.code, message: error.message };
   }
   return { record, process: processResult, launchError, guards: admissionGuards };
@@ -1971,6 +1980,16 @@ export function recoverOmModelCall(store: Store, project: string, ref: Ref): Rev
         fail('model_call_record_invalid', ref.id, 'transport', 'Only an unreceived direct transport can be interrupted without a result');
     } else fail('model_call_foreign', ref.id, 'producer', 'The runtime has no E4 producer');
     writes.push({ id: original.id, kind: original.kind, expected: original.revision, value: finished });
+    // The late receipt prepared by shared recovery was bound to the
+    // intermediate body; the committed recovery is this post-producer body —
+    // the paid receipt is rebuilt over it so its recovered ref names the
+    // saved revision, inside the same guarded write set.
+    const receiptIndex = writes.findIndex(write => write.kind === 'model-late-receipt');
+    if (receiptIndex >= 0) {
+      const rebuilt = prepared.paid && paidModelReceipt(store, project, reference(original),
+        writeRef(writes[writes.length - 1]!), incident, prepared.paid);
+      if (rebuilt) writes[receiptIndex] = rebuilt; else writes.splice(receiptIndex, 1);
+    }
     const view = pendingCallStore(store, writes), terminal = writeRef(writes[writes.length - 1]!);
     if ('om' in original.value) take(readModelCall(view, { project, record: terminal }));
     else take(readModelTransport(view, { project, record: terminal }));

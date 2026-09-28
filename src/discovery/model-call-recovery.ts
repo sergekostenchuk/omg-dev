@@ -3,8 +3,8 @@ import { Store, type Revision, type Write } from '../storage/store.js';
 import type { ModelCall, ModelExecution, ProcessIdentity } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { processStart } from '../runtime/process-identity.js';
-import { requireCondition } from '../errors.js';
+import { processStart, probeProcessIdentity, evaluateProcessStopWitnesses, type ProcessStopPhysical } from '../runtime/process-identity.js';
+import { EngineError, requireCondition } from '../errors.js';
 import { canonical, hashJson } from '../canonical.js';
 
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -63,6 +63,10 @@ export interface ModelRecovery {
 }
 export interface PreparedModelRecovery {
   call: Revision<ModelCall>; incident: Revision<ModelRecovery>; writes: Write[]; guards: Ref[];
+  /** The complete physical result paid by an ended, exact-subject witness —
+   * or null. Producers that mutate the recovered call body before writing
+   * must rebuild the late receipt over their final body (paidModelReceipt). */
+  paid: ProcessStopPhysical | null;
 }
 
 // An empty, successfully observed owned process group proves that the leader's
@@ -81,13 +85,11 @@ function requireEmptyProviderGroup(group: number | null): void {
 }
 
 export function requireIdentityGone(identity: ProcessIdentity, message: string): void {
-  const observed = spawnSync('ps', ['-p', String(identity.pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 5000 });
-  requireCondition(!observed.error && (observed.status === 0 || observed.status === 1 && observed.stdout.trim() === '' && observed.stderr.trim() === ''),
-    'model_call_process_uncertain', 'Process identity could not be observed; observation failure is not proof of death');
-  requireCondition(observed.status !== 0 || observed.stdout.trim() !== identity.started,
+  const observed = probeProcessIdentity(identity.pid);
+  if (observed.state === 'unavailable') throw new EngineError('model_call_process_uncertain',
+    'Process identity could not be observed; observation failure is not proof of death', { errno: observed.errno });
+  requireCondition(!(observed.state === 'present' && observed.started === identity.started),
     'model_call_still_running', message);
-  requireCondition(observed.status !== 0 || observed.stdout.trim().length > 0,
-    'model_call_process_uncertain', 'Process observation did not yield its identity');
 }
 
 /** No writes here: the producer adds its product transition to these same CAS writes. */
@@ -97,7 +99,26 @@ export function prepareModelCallRecovery(store: Store, project: string, ref: Ref
   const owner = call.value.ownerProcess, e = executionOf(call.value);
   requireCondition(identity(owner), 'model_call_identity_missing', 'The legacy call has no provable owner identity; do not guess that its provider stopped');
   if (e) requireIdentityGone(owner, 'The execution owner is still alive');
-  else requireCondition(processStart(owner.pid) !== owner.started, 'model_call_still_running', 'The research owner is still alive');
+  else requireIdentityGone(owner, 'The research owner is still alive');
+  // A process-stop/v1 witness of this call may carry a spawned pid that was
+  // never committed as provider identity — a refused authorization write still
+  // left an OS process. Neither the claimed phase nor a missing provider
+  // proves its end; every recorded spawned pid needs an explicit proof before
+  // the running claim is released. A claimed call without such a witness keeps
+  // its legacy lawful close.
+  // Every witness under this call's namespace is evaluated by the shared
+  // reader: it validates the record form, binds the stored subject to an
+  // actual call revision by hash, honours a durably resolved end, and only
+  // then probes today's process table. A malformed or foreign witness is a
+  // typed refusal, never an absent witness.
+  const verdicts = evaluateProcessStopWitnesses(store, call.id);
+  for (const verdict of verdicts) {
+    if (verdict.state === 'ended') continue;
+    throw new EngineError(
+      verdict.state === 'alive' ? 'model_call_still_running' : 'model_call_process_uncertain',
+      'A spawned provider recorded only in the stop witness has no proven end; the call stays running',
+      verdict.state === 'unavailable' ? { errno: verdict.errno } : { pid: verdict.witness.pid });
+  }
   let proof: ModelRecovery['proof'];
   if (e?.phase === 'claimed') {
     // A child may be waiting on stdin. No authorization means no request was
@@ -107,7 +128,7 @@ export function prepareModelCallRecovery(store: Store, project: string, ref: Ref
     const provider = call.value.providerProcess;
     requireCondition(identity(provider), 'model_call_identity_missing', 'Provider identity was not saved; its termination cannot be inferred from the owner exit');
     if (e) requireIdentityGone(provider, 'The recorded provider is still alive');
-    else requireCondition(processStart(provider.pid) !== provider.started, 'model_call_still_running', 'The recorded provider is still alive');
+    else requireIdentityGone(provider, 'The recorded provider is still alive');
     if (e) { requireEmptyProviderGroup(e.provider!.group); proof = { owner: 'gone', provider: 'gone', group: 'empty', request: 'unknown', physical: 'group-terminated' }; }
   }
   const value: ModelRecovery = { projectId: project, call: ref,
@@ -115,9 +136,43 @@ export function prepareModelCallRecovery(store: Store, project: string, ref: Ref
       : 'Recorded owner and provider processes no longer exist with their original identities', usageKnown: call.value.usage !== null,
     ...(e ? { version: 'model-recovery/v1' as const, execution: e, proof: proof! } : {}) };
   const incident: Revision<ModelRecovery> = { id: `model-call-recovery:${call.value.requestId}`, kind: 'model-call-recovery', revision: 1, hash: hashJson(value), value };
-  return { call, incident, guards: [ref], writes: [
-    { id: call.id, kind: call.kind, expected: call.revision, value: { ...call.value, status: 'failed', finishedAt: Date.now(), error: 'process_lost', ...(e ? { recovery: reference(incident) } : {}) } },
-    { id: incident.id, kind: incident.kind, expected: 0, value }] };
+  const failed: ModelCall = { ...call.value, status: 'failed', finishedAt: Date.now(), error: 'process_lost',
+    ...(e ? { recovery: reference(incident) } : {}) };
+  const writes: Write[] = [
+    { id: call.id, kind: call.kind, expected: call.revision, value: failed },
+    { id: incident.id, kind: incident.kind, expected: 0, value }];
+  // A complete physical result preserved by a stop witness is paid evidence
+  // only when the witness belongs to THIS exact dispatch — its subject must
+  // name the running call revision being recovered — and the witnessed launch
+  // is proven ended. It transfers into the dispatch's late receipt inside the
+  // same transaction — never applied automatically; a partial stream stays
+  // in the witness only.
+  const paid = verdicts.find(verdict => verdict.state === 'ended'
+    && verdict.witness.physical?.complete === true
+    && same(verdict.witness.subject, reference(call)))?.witness.physical ?? null;
+  if (e?.phase === 'authorized' && paid) {
+    const recovered: Ref = { id: call.id, revision: call.revision + 1, hash: hashJson(failed) };
+    const receiptWrite = paidModelReceipt(store, project, reference(call), recovered, reference(incident), paid);
+    if (receiptWrite) writes.push(receiptWrite);
+  }
+  return { call, incident, guards: [ref], writes, paid };
+}
+
+/** The late-receipt write for paid physical evidence, bound to the exact
+ * recovered body that will actually be persisted. Producers that modify the
+ * recovery body must call this with their final body's ref so the receipt
+ * names what is written — the write set is committed as one guarded unit. */
+export function paidModelReceipt(store: Store, project: string, dispatch: Ref, recovered: Ref, incident: Ref,
+  physical: ProcessStopPhysical): Write | null {
+  const evidence = { process: { exitCode: physical.exitCode, signal: physical.signal,
+    stdout: physical.stdout, stderr: physical.stderr }, launchError: null };
+  lateEvidence(evidence);
+  const receipt: LateModelReceipt = { version: 'model-late-receipt/v1', projectId: project,
+    dispatch, recovered, incident, evidence };
+  const id = `model-late-receipt:${hashJson({ dispatch })}`, prior = store.get<LateModelReceipt>(id);
+  requireCondition(!prior || (prior.kind === 'model-late-receipt' && same(prior.value, receipt)),
+    'model_call_late_receipt_invalid', 'Late receipt identity has conflicting content');
+  return prior ? null : { id, kind: 'model-late-receipt', expected: 0, value: receipt };
 }
 
 /** Historical proof does not re-observe today's processes. Product fields (OM)

@@ -17,8 +17,9 @@ import {collectRuntimeEvidence} from '../src/graph/runtime-evidence.js';
 import {assessAnswer} from '../src/discovery/research-assessment.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
-import {processStart} from '../src/runtime/process-identity.js';
-import type {RuntimeObservationResult} from '../src/runtime/runtime-observation.js';
+import {processStart,probeProcessIdentity,processStopWitnesses,type ProcessStopWitness} from '../src/runtime/process-identity.js';
+import {observeRuntime,recoverRuntimeObservation,type RuntimeObservationResult} from '../src/runtime/runtime-observation.js';
+import type {EngineError} from '../src/errors.js';
 import type {RuntimeObservation} from '../src/runtime/runtime-observation-model.js';
 import type {RuntimeCheck} from '../src/graph/obligation-policy.js';
 import type {Source} from '../src/evidence/evidence.js';
@@ -239,11 +240,173 @@ test('recovery checks PID identity, preserves other processes and releases an in
  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await once(child,'spawn');
  const pid=child.pid!;let started:string|null=null;await until(()=>Boolean(started=processStart(pid)));
  t.after(()=>{if(processStart(pid)===started)try{process.kill(-pid,'SIGKILL');}catch{}});
- const interrupted=f.store.write<RuntimeObservation>({id:result.observation.id,kind:'runtime-observation',expected:result.observation.revision,value:{...result.observation.value,status:'running',owner:{pid:2147483647,started:'ended-owner'},child:{pid,started:'different-process'}}});
+ const interrupted=f.store.write<RuntimeObservation>({id:result.observation.id,kind:'runtime-observation',expected:result.observation.revision,value:{...result.observation.value,status:'running',owner:{pid:99998,started:'ended-owner'},child:{pid,started:'different-process'}}});
  const recovered=f.engine.execute({type:'recover-runtime-observation',project:'p',observation:reference(interrupted)}) as typeof interrupted;
  assert.equal(recovered.value.status,'failed');assert.equal(processStart(pid),started,'A recycled PID must not be killed');
  const actual=f.store.write<RuntimeObservation>({id:recovered.id,kind:recovered.kind,expected:recovered.revision,value:{...recovered.value,status:'running',child:{pid,started:started!}}});
- const closed=f.engine.execute({type:'recover-runtime-observation',project:'p',observation:reference(actual)}) as typeof actual;
+ // A refused stop defers recovery: the record, the child identity and the
+ // snapshot survive untouched, and an explicit repeat finishes the job.
+ const killMock=t.mock.method(process,'kill',()=>{throw Object.assign(new Error('operation not permitted'),{code:'EPERM'});});
+ try{
+  assert.throws(()=>f.engine.execute({type:'recover-runtime-observation',project:'p',observation:reference(actual)}),{code:'process_stop_denied'});
+ }finally{killMock.mock.restore();}
+ const kept=f.store.get<RuntimeObservation>(actual.id)!;
+ assert.equal(kept.revision,actual.revision);assert.equal(kept.value.status,'running');
+ assert.deepEqual(kept.value.child,{pid,started});assert.equal(kept.value.snapshot,actual.value.snapshot);
+ assert.equal(processStart(pid),started,'A refused stop must not have touched the child');
+ // A delivered SIGKILL still needs the reaped post-check: while the killed
+ // child is a zombie the record stays deferred; a bounded explicit repeat closes it.
+ let closed:typeof actual|null=null;
+ for(let i=0;i<80&&!closed;i++){
+  try{closed=f.engine.execute({type:'recover-runtime-observation',project:'p',observation:reference(actual)}) as typeof actual;}
+  catch(e){assert.equal((e as EngineError).code,'process_stop_unconfirmed');await new Promise(r=>setTimeout(r,50));}
+ }
+ assert.ok(closed,'bounded explicit retry must close once the OS proves the child gone');
  assert.equal(closed.value.status,'failed');await until(()=>processStart(pid)!==started);
  assert.equal(closed.value.child,null);
+});
+
+test('№1631-2 C18/C44/C46: recovery honors a stop witness holding a spawned pid when child is null',async t=>{
+ const f=fixture(t,'positive',10,4000);let pid:number|null=null,snapshot:string|null=null;
+ t.after(()=>{if(pid){try{process.kill(-pid,'SIGKILL')}catch(e){if((e as NodeJS.ErrnoException).code!=='ESRCH')throw e}}if(snapshot)rmSync(snapshot,{recursive:true,force:true});});
+ const write=f.store.write.bind(f.store);
+ (f.store as {write:unknown}).write=(input:{kind:string;value:{child?:unknown}})=>{
+  if(input.kind==='runtime-observation'&&input.value.child)throw Error('injected registration failure');
+  return write(input as never);};
+ let failure:EngineError|null=null;
+ try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'lost-child'},undefined,
+  {signal:p=>{pid=p;return 'EPERM'},identify:probeProcessIdentity});}catch(e){failure=e as EngineError;}
+ assert.equal(failure?.code,'process_stop_denied');
+ (f.store as {write:unknown}).write=write;
+ const record=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
+ const witness=processStopWitnesses(f.store,record.id)[0]!.value as ProcessStopWitness;
+ snapshot=record.value.snapshot;
+ assert.equal(record.value.child,null);assert.equal(record.value.status,'running');
+ assert.equal(witness.pid,pid);assert.equal(witness.child,null);
+ assert.equal(probeProcessIdentity(pid!).state,'present');
+ // A new witness must prove the spawned pid's end before the running record
+ // closes; child:null alone is not absence.
+ const ownerGone={identify:(p:number)=>p===record.value.owner.pid?{state:'absent' as const}:probeProcessIdentity(p),
+  signal:()=>{throw Error('must not signal an identity the record never committed')}};
+ assert.throws(()=>recoverRuntimeObservation(f.store,'p',reference(record),ownerGone),{code:'process_stop_unconfirmed'});
+ assert.equal(f.store.get<RuntimeObservation>(record.id)!.value.status,'running');
+ assert.equal(probeProcessIdentity(pid!).state,'present','the refused recovery must not touch the spawned process');
+ // Once the OS provably reaps it, the same recovery closes the record.
+ process.kill(-pid!,'SIGKILL');
+ await until(()=>probeProcessIdentity(pid!).state==='absent');
+ const closed=recoverRuntimeObservation(f.store,'p',reference(record),ownerGone);
+ assert.equal(closed.value.status,'failed');
+});
+
+test('D8.5 r3 row 2: a tampered witness is a typed refusal, never an absent one',async t=>{
+ const f=fixture(t,'positive',10,4000);let pid:number|null=null,snapshot:string|null=null;
+ t.after(()=>{if(pid){try{process.kill(-pid,'SIGKILL')}catch(e){if((e as NodeJS.ErrnoException).code!=='ESRCH')throw e}}if(snapshot)rmSync(snapshot,{recursive:true,force:true});});
+ const write=f.store.write.bind(f.store);
+ (f.store as {write:unknown}).write=(input:{kind:string;value:{child?:unknown}})=>{
+  if(input.kind==='runtime-observation'&&input.value.child)throw Error('injected registration failure');
+  return write(input as never);};
+ let failure:EngineError|null=null;
+ try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'tampered-witness'},undefined,
+  {signal:p=>{pid=p;return 'EPERM'},identify:probeProcessIdentity});}catch(e){failure=e as EngineError;}
+ assert.equal(failure?.code,'process_stop_denied');
+ (f.store as {write:unknown}).write=write;
+ const record=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
+ const witness=processStopWitnesses(f.store,record.id)[0]!;
+ snapshot=record.value.snapshot;
+ assert.equal(probeProcessIdentity(pid!).state,'present');
+ const hooks={identify:(p:number)=>p===record.value.owner.pid?{state:'absent' as const}:probeProcessIdentity(p),
+  signal:()=>{throw Error('must not signal an unidentified process')}};
+ // A malformed record under the witness address is invalid evidence: the
+ // claim stays open and the live pid is never treated as absent.
+ f.store.write({id:witness.id,kind:witness.kind,expected:witness.revision,
+  value:{...(witness.value as ProcessStopWitness),protocol:'process-stop/unknown'}});
+ assert.throws(()=>recoverRuntimeObservation(f.store,'p',reference(record),hooks),{code:'process_stop_witness_invalid'});
+ assert.equal(f.store.get<RuntimeObservation>(record.id)!.value.status,'running');
+ assert.equal(probeProcessIdentity(pid!).state,'present','an invalid witness must not stand in for a missing one');
+ // Restoring the form makes the same witness evaluate again: it still holds
+ // the claim while the pid is present, and only a proven absence closes it.
+ const current=f.store.get<ProcessStopWitness>(witness.id)!;
+ f.store.write({id:witness.id,kind:witness.kind,expected:current.revision,
+  value:{...(current.value as ProcessStopWitness),protocol:'process-stop/v1'}});
+ assert.throws(()=>recoverRuntimeObservation(f.store,'p',reference(record),hooks),{code:'process_stop_unconfirmed'});
+ // Row 7: when the probe itself cannot answer, the refusal is the identity
+ // channel — distinct from the busy-pid unconfirmed outcome above.
+ const unavailableForChild={identify:(p:number)=>p===record.value.owner.pid?{state:'absent' as const}:p===pid?{state:'unavailable' as const,errno:'EPERM'}:probeProcessIdentity(p)};
+ assert.throws(()=>recoverRuntimeObservation(f.store,'p',reference(record),unavailableForChild),{code:'process_identity_unavailable'});
+ assert.equal(f.store.get<RuntimeObservation>(record.id)!.value.status,'running');
+ process.kill(-pid!,'SIGKILL');
+ await until(()=>probeProcessIdentity(pid!).state==='absent');
+ assert.equal(recoverRuntimeObservation(f.store,'p',reference(record),hooks).value.status,'failed');
+});
+
+test('№1631-4 C28: a failed child commit after a real cleanup keeps the running record and witness',async t=>{
+ const f=fixture(t,'positive',10,4000);let pid:number|null=null,snapshot:string|null=null;
+ t.after(()=>{if(pid){try{process.kill(-pid,'SIGKILL')}catch(e){if((e as NodeJS.ErrnoException).code!=='ESRCH')throw e}}if(snapshot)rmSync(snapshot,{recursive:true,force:true});});
+ const write=f.store.write.bind(f.store);
+ (f.store as {write:unknown}).write=(input:{kind:string;value:{child?:unknown}})=>{
+  if(input.kind==='runtime-observation'&&input.value.child)throw Error('injected registration failure');
+  return write(input as never);};
+ // No signal mock: the real terminate kills the spawned check child, so the
+ // original registration failure — not a stop refusal — rejects the run. The
+ // spawned-but-uncommitted pid must still hold the record open.
+ let failure:EngineError|null=null;
+ try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'lost-registration'},undefined,
+  {identify:probeProcessIdentity});}catch(e){failure=e as EngineError;}
+ (f.store as {write:unknown}).write=write;
+ assert.equal(failure?.code,'process_record_failed');
+ const record=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
+ snapshot=record.value.snapshot;
+ assert.equal(record.value.status,'running');assert.equal(record.value.child,null);assert.equal(record.value.finishedAt,null);
+ const witness=processStopWitnesses(f.store,record.id)[0]!.value as ProcessStopWitness;
+ assert.ok(witness.pid&&witness.pid>0);pid=witness.pid;assert.equal(witness.child,null);
+ // The real cleanup already ended the child: once the OS proves absence, the
+ // same running record closes — the witness made the pid reachable.
+ await until(()=>probeProcessIdentity(pid!).state==='absent');
+ const closed=recoverRuntimeObservation(f.store,'p',reference(record),
+  {identify:p=>p===record.value.owner.pid?{state:'absent' as const}:probeProcessIdentity(p)});
+ assert.equal(closed.value.status,'failed');
+});
+
+test('a refused cleanup keeps the running record, the child identity and the snapshot for an explicit retry',async t=>{
+ const f=fixture(t,'positive',2000,150);
+ let childPid:number|null=null,snapshot:string|null=null;
+ t.after(()=>{if(childPid&&processStart(childPid))try{process.kill(-childPid,'SIGKILL');}catch{} if(snapshot)rmSync(snapshot,{recursive:true,force:true});});
+ let error:EngineError|null=null;
+ try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'denied'},undefined,
+  {signal:()=>'EPERM',identify:()=>({state:'present' as const,started:'unverifiable'})});}catch(e){error=e as EngineError;}
+ assert.equal(error?.code,'process_stop_denied');
+ const details=error!.details as {outcome:string;errno:string;cause:{code:string}};
+ assert.equal(details.outcome,'denied');assert.equal(details.errno,'EPERM');assert.equal(details.cause.code,'process_timeout');
+ const kept=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
+ assert.equal(kept.value.status,'running');assert.ok(kept.value.child);childPid=kept.value.child.pid;
+ snapshot=kept.value.snapshot;assert.ok(snapshot&&existsSync(snapshot),'a child that may still live keeps its snapshot');
+ const closed=recoverRuntimeObservation(f.store,'p',reference(kept),{identify:()=>({state:'absent' as const})});
+ assert.equal(closed.value.status,'failed');assert.equal(closed.value.child,null);
+});
+
+// №1679-2: a recovery diagnostic that captures no new bytes must keep the
+// complete physical result captured at the original refusal.
+test('a recovery diagnostic without new bytes preserves the complete physical evidence across a reopen',async t=>{
+ const f=fixture(t,'positive',10,4000);
+ let failure:EngineError|null=null;
+ try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'paid'},undefined,
+  {signal:()=>'EPERM',identify:probeProcessIdentity});}catch(e){failure=e as EngineError;}
+ assert.equal(failure?.code,'process_stop_denied');
+ const record=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
+ t.after(()=>{if(record.value.snapshot)rmSync(record.value.snapshot,{recursive:true,force:true});});
+ const witness=f.store.list<ProcessStopWitness>('process-stop')[0]!;
+ assert.equal(witness.value.physical?.complete,true);
+ assert.equal(witness.value.physical?.exitCode,0);
+ assert.ok(witness.value.physical!.stdout.length>0,'the completed check left its full stdout');
+ let diagnostic:EngineError|null=null;
+ try{recoverRuntimeObservation(f.store,'p',reference(record),
+  {identify:pid=>pid===record.value.owner!.pid?{state:'absent' as const}:{state:'unavailable' as const,errno:'probe-temporarily-unavailable'},
+   signal:()=>{throw Error('must not signal an unproven process')}});}catch(e){diagnostic=e as EngineError;}
+ assert.equal(diagnostic?.code,'process_identity_unavailable');
+ const updated=f.store.get<ProcessStopWitness>(witness.id)!;
+ assert.equal(updated.revision,witness.revision+1,'the diagnostic advanced the witness by CAS');
+ assert.deepEqual(updated.value.physical,witness.value.physical,'a diagnostic without new bytes preserves the complete physical result');
+ const reopened=new Store(join(f.root,'db.sqlite'));t.after(()=>reopened.close());
+ assert.deepEqual(reopened.get<ProcessStopWitness>(witness.id)!.value.physical,witness.value.physical,
+  'a reopen of the store returns the same complete physical result');
 });

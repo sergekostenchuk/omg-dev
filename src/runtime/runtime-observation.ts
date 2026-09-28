@@ -13,6 +13,8 @@ import { Environments, workspacePath, executablePath, uniqueTransactionGuards } 
 import { readerPilot } from '../discovery/reader-pilot.js';
 import { processStart } from './process-identity.js';
 import { runProcess, type ProcessResult } from './process.js';
+import { probeProcessIdentity, stopOwnedGroup, processStopRefusal, writeProcessStopWitness,
+  evaluateProcessStopWitnesses, type ProcessStopHooks, type ProcessStopReport } from './process-identity.js';
 import type { ModelCall } from './model-usage.js';
 import { runtimeSource, type RuntimeObservation } from './runtime-observation-model.js';
 import { readOmObligationLedger } from '../om/obligations.js';
@@ -141,7 +143,7 @@ function recordedResult(store: Store, observation: Revision<RuntimeObservation>)
 
 /** Only an explicit operator command executes the source declared in owner
  * policy. ResearchAction remains read-only and cannot invent an executable. */
-export async function observeRuntime(store: Store, project: string, request: RuntimeObservationRequest, signal?: AbortSignal): Promise<RuntimeObservationResult> {
+export async function observeRuntime(store: Store, project: string, request: RuntimeObservationRequest, signal?: AbortSignal, stopHooks?: ProcessStopHooks): Promise<RuntimeObservationResult> {
   requireCondition(request && isRef(request.scope) && (request.scope.id===`research-scope:${project}:R2` || request.scope.id.startsWith('om-obligations:'))
     && typeof request.obligation==='string' && request.obligation.trim() && typeof request.key==='string' && request.key.trim(),
   'runtime_observation_invalid','An observation needs its exact scope, obligation and stable operation key');
@@ -196,6 +198,8 @@ export async function observeRuntime(store: Store, project: string, request: Run
   }
   let result:ProcessResult|null=null;
   let snapshot:string|null=null;
+  let spawnedPid:number|null=null;
+  let keepResources=false;
   try {
     const script=store.get<Source>(check.script.id,check.script.revision)!;
     snapshot=mkdtempSync(join(tmpdir(),'omg-runtime-check-'));
@@ -208,13 +212,19 @@ export async function observeRuntime(store: Store, project: string, request: Run
     record=store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,snapshot,invocation}});
     result=await runProcess(invocation,current.root,
       canonical({protocol:'omg-runtime-observation/v1',scope,obligation:assignment.original,runtime:current.binding}),check.timeoutMs,signal,true,pid=>{
+        spawnedPid=pid;
         const started=processStart(pid);
         if(!started){
-          try{process.kill(pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')return;throw error;}
-          throw new EngineError('runtime_observation_identity_missing','A live check child must have an exact identity');
+          // kill(pid,0) is a liveness probe, not a group signal: EPERM also
+          // proves the child exists — it can never stand in for absence.
+          let probeErrno:string|null=null;
+          try{process.kill(pid,0);}catch(error){probeErrno=(error as NodeJS.ErrnoException)?.code??'unknown';}
+          if(probeErrno==='ESRCH')return;
+          throw new EngineError('process_identity_unavailable','A live check child must have a provable exact identity',
+            {stage:'identity-probe',target:'child',pid,expectedStarted:null,observedStarted:null,errno:probeErrno});
         }
         record=store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,child:{pid,started}}});
-      });
+      },stopHooks);
     requireCondition(result.signal===null && result.exitCode!==null,'runtime_observation_interrupted','A terminated check is not a completed runtime observation');
     const after=runtimeContext(store,project);runtimeCode(store,project,check,codeRoot);
     requireCondition(canonical(after.binding)===canonical(current.binding) && await executableHash(executable.path)===executable.hash
@@ -232,14 +242,27 @@ export async function observeRuntime(store: Store, project: string, request: Run
     return {observation:saved[0]! as Revision<RuntimeObservation>,source:saved[1]! as Revision<Source>};
   } catch(error) {
     const code=error instanceof EngineError?error.code:'runtime_observation_failed';
+    const stopDetails=error instanceof EngineError?error.details as Record<string,unknown>|null:null;
+    const refusal=['process_stop_denied','process_stop_unconfirmed','process_stop_failed'].includes(code)
+      ||(code==='process_identity_unavailable'&&stopDetails!==null&&typeof stopDetails==='object'&&'outcome' in stopDetails);
+    // An unproven stop frees nothing: the child may still execute from the
+    // snapshot, and the running record keeps its identity for explicit retry.
+    // The same holds for any failure after spawn that left no committed child
+    // identity — a bare identity refusal is recoverable only through the
+    // witness, never through a failed terminal.
+    if(refusal||(spawnedPid!==null&&record.value.child===null)){
+      keepResources=true;
+      writeProcessStopWitness(store,reference(record),{owner:record.value.owner,child:record.value.child,pid:spawnedPid},error);
+      throw error;
+    }
     record=store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,
       status:['input_stale','revision_conflict','runtime_check_source_invalid','source_stale','runtime_observation_stale'].includes(code)?'stale':'failed',
       child:null,finishedAt:Date.now(),result,error:`${code}: ${error instanceof Error?error.message:'Check failed'}`}});
     return {observation:record,source:null};
-  } finally {if(snapshot)rmSync(snapshot,{recursive:true,force:true});}
+  } finally {if(snapshot&&!keepResources)rmSync(snapshot,{recursive:true,force:true});}
 }
 
-export function recoverRuntimeObservation(store:Store,project:string,ref:Ref):Revision<RuntimeObservation>{
+export function recoverRuntimeObservation(store:Store,project:string,ref:Ref,stopHooks?:ProcessStopHooks):Revision<RuntimeObservation>{
   requireCondition(isRef(ref),'runtime_observation_invalid','Recovery needs an exact observation');
   const record=store.get<RuntimeObservation>(ref.id);
   requireCondition(record?.kind==='runtime-observation'&&record.value.projectId===project&&canonical(reference(record))===canonical(ref),
@@ -251,12 +274,38 @@ export function recoverRuntimeObservation(store:Store,project:string,ref:Ref):Re
     &&(record.value.child===null||record.value.child&&Number.isSafeInteger(record.value.child.pid)&&record.value.child.pid>0
       &&typeof record.value.child.started==='string'&&record.value.child.started.length>0),
   'runtime_observation_identity_missing','Recovery cannot guess a missing process identity');
-  requireCondition(processStart(record.value.owner.pid)!==record.value.owner.started,
+  const owner=(stopHooks?.identify??probeProcessIdentity)(record.value.owner.pid);
+  if(owner.state==='unavailable')throw new EngineError('process_identity_unavailable',
+    'The recorded observer identity cannot be verified; an unverifiable owner is not a dead owner',
+    {stage:'pre-check',target:'owner',pid:record.value.owner.pid,expectedStarted:record.value.owner.started,observedStarted:null,errno:owner.errno});
+  requireCondition(!(owner.state==='present'&&owner.started===record.value.owner.started),
     'runtime_observation_busy','The observer is still alive; do not interrupt its work');
   const child=record.value.child;
-  if(child&&processStart(child.pid)===child.started){
-    requireCondition(process.platform!=='win32','runtime_recovery_unsupported','Process-group recovery requires the supported POSIX runtime');
-    try{process.kill(-child.pid,'SIGKILL');}catch(error){if((error as NodeJS.ErrnoException).code!=='ESRCH')throw error;}
+  if(child){
+    const present=(stopHooks?.identify??probeProcessIdentity)(child.pid);
+    if(present.state==='present'&&present.started===child.started)
+      requireCondition(process.platform!=='win32','runtime_recovery_unsupported','Process-group recovery requires the supported POSIX runtime');
+    const stop=stopOwnedGroup(child,stopHooks);
+    // Only a proven absence, a confirmed stop or a changed identity lets the
+    // record close; every refusal leaves it running for an explicit retry.
+    if(!['absent','stopped','identity-changed'].includes(stop.outcome)){
+      const refusal=processStopRefusal(stop,'The recorded check child could not be provably stopped; the observation stays running for an explicit retry');
+      writeProcessStopWitness(store,reference(record),{owner:record.value.owner,child:record.value.child},refusal);
+      throw refusal;
+    }
+  }
+  // A process-stop witness may carry a spawned pid that was never committed
+  // as record identity — a refused child write still left an OS process.
+  // Its end must be proven before the running record closes; a child:null
+  // record without such a witness keeps its legacy lawful close.
+  for(const verdict of evaluateProcessStopWitnesses(store,record.id,stopHooks?.identify??probeProcessIdentity)){
+    if(verdict.state==='ended')continue;
+    const report:ProcessStopReport={outcome:verdict.state==='unavailable'?'identity-unavailable':'unconfirmed',stage:'post-check',target:'child',
+      pid:verdict.witness.pid,expectedStarted:verdict.witness.child?.started??null,
+      observedStarted:verdict.observedStarted,errno:verdict.errno};
+    const refusal=processStopRefusal(report,'A spawned process recorded only in the stop witness has no proven end; the observation stays running for an explicit retry');
+    writeProcessStopWitness(store,reference(record),{owner:record.value.owner,child:record.value.child,pid:verdict.witness.pid},refusal);
+    throw refusal;
   }
   return store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,
     value:{...record.value,status:'failed',child:null,finishedAt:Date.now(),error:'runtime_observation_interrupted: observer process ended; use a new operation key for an explicit retry'}});

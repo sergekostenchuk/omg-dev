@@ -233,7 +233,7 @@ export async function recoverLegacyOperation(engine:ProductEngine,request:{proje
  }
  const head=ownedLegacyOperation(store,source);
  try{requireIdentityGone(head.value.owner,'The legacy operation owner is still alive');}
- catch(error){if(error instanceof EngineError)throw new EngineError(error.code,error.message,{unit:'product',target:head.id});throw error;}
+ catch(error){if(error instanceof EngineError)throw new EngineError(error.code,error.message,{unit:'product',target:head.id,original:error.details??null});throw error;}
  const state=physicalLegacyState(store,head),recoveries=state.calls.filter(call=>call.value.status==='running').map(call=>{
   if(call.value.execution?.version!=='model-execution/v1')legacyFailure(project,'legacy_operation_pending','A call without physical identity cannot be released');
   return prepareModelCallRecovery(store,project,reference(call));
@@ -263,7 +263,7 @@ export async function recoverLegacyOperation(engine:ProductEngine,request:{proje
  }
  return releaseLegacyOperation(store,head,null,null,true);
  }catch(error){
-  if(error instanceof EngineError)throw new EngineError(error.code,error.message,{unit:'product',target:`legacy-operation:${project}`});
+  if(error instanceof EngineError)throw new EngineError(error.code,error.message,{unit:'product',target:`legacy-operation:${project}`,original:error.details??null});
   throw error;
  }
 }

@@ -9,6 +9,7 @@ import { capture, requireWritePaths } from "./candidate.js";
 import { currentBasis } from "./basis.js";
 import { callAgent, implementation, review } from "./protocol.js";
 import { executeProcess, stopOrphan, type ProcessObserver } from "./process.js";
+import { isProcessStopRefusal, writeProcessStopWitness, evaluateProcessStopWitnesses } from "../runtime/process-identity.js";
 import { checkCommands, commitIntent, publishCommit, finishCommit, subjectHash } from "./commit.js";
 import { runId, type TaskRun, type ExecutionResult, type ExecutionOptions, type AgentUsage } from "./model.js";
 import { executionInputs } from "./inputs.js";
@@ -58,9 +59,30 @@ export class Executor {
         }
         requireCondition(parent === root.value.head, "execution_parent_changed", "The next task must extend the last accepted result");
         requireWorktree(root.value, parent);
-        if (run && ["implementing", "checking", "reviewing"].includes(run.value.state)) {
-          await stopOrphan(run.value.child);
-          run = this.save(run, { state: "interrupted", child: null, error: "Previous process stopped before acceptance. Candidate files are preserved; retry explicitly." });
+        if (run) {
+          // The unfinished-process check precedes candidate creation and covers
+          // every unfinished state — including interrupted/needs_code re-entry.
+          if (run.value.child) {
+            await stopOrphan(run.value.child);
+            run = this.save(run, ["implementing", "checking", "reviewing"].includes(run.value.state)
+              ? { state: "interrupted", child: null, error: "Previous process stopped before acceptance. Candidate files are preserved; retry explicitly." }
+              : { child: null });
+          } else {
+            // Stop witnesses are addressed per exact attempt revision, so an
+            // earlier attempt's witness can never be inherited by this entry.
+            // The shared reader proves each witness's form and exact subject
+            // revision before trusting it; an already resolved end stays
+            // resolved even when a foreign process reuses its pid, while any
+            // still-live or unverifiable spawned pid keeps blocking the next
+            // executor.
+            for (const verdict of evaluateProcessStopWitnesses(this.store, run.id)) {
+              if (verdict.state === "ended") continue;
+              throw new EngineError(
+                verdict.state === "unavailable" ? "process_identity_unavailable" : "executor_still_running",
+                "The interrupted launch left an unproven process; retry only after it provably ended",
+                { pid: verdict.witness.pid, observedStarted: verdict.observedStarted, errno: verdict.errno });
+            }
+          }
         }
         if (run && (run.value.state === "needs_plan" || !options.retry && !corrections.has(task.id))) { results.push(run); return results; }
         const guards = currentBasis(this.store, plan, root.value);
@@ -151,12 +173,18 @@ export class Executor {
           // A pending Git intent is durable. It must be recovered, never retried as implementation.
           if (run.value.state === "commit_pending") throw error;
           const code = error instanceof EngineError ? error.code : "implementation_failed";
+          const stopRefusal = error instanceof EngineError && isProcessStopRefusal(error) ? error : null;
+          if (stopRefusal)
+            writeProcessStopWitness(this.store, reference(run), { child: run.value.child }, stopRefusal);
           const interrupted = ["process_cancelled", "process_timeout", "process_failed", "executor_failed", "executor_protocol_invalid", "executor_response_foreign", "process_output_limit",
+            "process_stop_denied", "process_stop_unconfirmed", "process_stop_failed", "process_identity_unavailable",
             "context_budget_exceeded", "write_scope_exceeded", "worktree_changed", "candidate_bytes_mismatch", "candidate_bytes_changed", "candidate_entry_unsupported"].includes(code);
           const planDefect = ["plan_review_failed", "plan_stale", "execution_input_missing", "execution_input_foreign", "producer_not_ready", "implementation_proof_foreign", "artifact_stale"].includes(code);
           const obligationPause = ['task_obligation_start_stale', 'task_obligation_result_required'].includes(code);
           run = this.save(run, { state: obligationPause ? 'awaiting_obligation' : interrupted ? "interrupted" : planDefect ? "needs_plan" : "needs_code",
-            child: null, error: om && code === 'context_budget_exceeded' && error instanceof EngineError
+            // A refused or unproven stop keeps the last committed child identity;
+            // the next entry repeats the check instead of trusting a bare null.
+            child: stopRefusal ? run.value.child : null, error: om && code === 'context_budget_exceeded' && error instanceof EngineError
               ? `${code}: ${task.id}: ${error.message}; ${canonical(error.details)}`
               : obligationPause ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}` : error instanceof Error ? error.message : "Execution failed" });
           if (run.value.state === "needs_code" && (corrections.get(task.id) ?? 0) < options.maxCorrections) {
