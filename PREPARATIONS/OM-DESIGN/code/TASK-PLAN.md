@@ -1273,7 +1273,7 @@
 - Отдаёт: —
 - Читает записи: журнал отказов, строки G4b, evaluation, completion-work, пакеты E2
 - Пишет записи: —
-- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `src/om/model-call.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `src/om/model-call.ts`, `src/om/gap-lines.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`, `test/om-gap-lines.test.ts`
 - Из движка как есть: withHistoricalReads / historicalRead / historicalProof — src/om/input.ts (урок 36, S1); readJournalAt — src/om/refusal-journal.ts; разбор ревьюера №1753 — ~/REPORTS/review/omg-code-s11_contract.md
 - После: S1, H1.0c, H1.0d, Q1, H1
 - Тесты сверх обязательных:
