@@ -14,8 +14,9 @@ import { prepareLiftOriginHold, readOriginHoldAt, ORIGIN_ANALYSIS_KIND, originAn
   REFUSAL_CLASSES, type RefusalClass } from './repeat-gate.js';
 import { normalizeOriginSource, type OriginSource } from './refusal-journal.js';
 import { recordCall, readCall, type AnyRecordCallRequest, type CallBasis, type DispatchContract } from './call-record.js';
-import { adapterRequest, runModelTransport, readModelTransport, type ModelTransportOutcome } from './model-call.js';
+import { adapterRequest, transportUnder, readModelTransport, type ModelTransportOutcome } from './model-call.js';
 import { withHistoricalReads } from './input.js';
+import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 
 export const STOP_ANALYSIS_CONTRACT = 'om-stop-analysis/v1';
 export const STOP_ANALYSIS_FAILURE_KIND = 'om-stop-analysis-failure';
@@ -305,9 +306,15 @@ export function readStopAnalysis(store: Store, request: { project: string; recor
     return saved as Revision<AnalysisRecord>;
   });
 }
-export async function runStopAnalysis(store: Store, request: StopAnalysisRequest, signal?: AbortSignal): Promise<OmResult<Sealed<Revision<AnalysisRecord>>>> {
+/**
+ * H1.3: the intent, E1 and dispatch of a review are new work under the pass's control; its saved result is read under
+ * any control, and the application of a paid review (its result, escalation or lift) passes by its exact links.
+ */
+export async function runStopAnalysis(store: Store, request: StopAnalysisRequest, signal?: AbortSignal, control?: RunControlHold): Promise<OmResult<Sealed<Revision<AnalysisRecord>>>> {
   requireRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw new EngineError('analysis_request_invalid', 'A signal must be an AbortSignal');
+  if (control !== undefined && (control === null || typeof control !== 'object')) throw new EngineError('analysis_request_invalid', 'A control hold must be an object');
+  const gate = new RunControlGate(store, request.project, control);
   try {
     const prepared = take(prepareStopAnalysis(store, request));
     const intent = prepared.intent as AnalysisIntent, key = identity(store, request, seriesOf(store, request).value);
@@ -317,12 +324,12 @@ export async function runStopAnalysis(store: Store, request: StopAnalysisRequest
     if (existing.length > 1) fail('analysis_invalid', request.series.id, 'result', 'A single reviewer request cannot have two results');
     if (existing[0]) return readStopAnalysis(store, { project: request.project, record: reference(existing[0]) });
     const originalIntent = { id: intentId(request.project, key), revision: 1, hash: hashJson(intent) };
-    const source = prepared.writes.length ? take(writeGuarded(store, { unit: 'A6', target: intentId(request.project, key),
+    const source = prepared.writes.length ? take(writeGuarded(gate.view(), { unit: 'A6', target: intentId(request.project, key),
       writes: prepared.writes, guards: prepared.guards }))[0]! : readIntent(store, request.project, originalIntent);
     const admissionGuards = uniqueTransactionGuards([...prepared.guards, originalIntent]);
-    const admitted = take(recordCall(store, request.project, intent.call, admissionGuards));
+    const admitted = take(recordCall(gate.view(), request.project, intent.call, admissionGuards));
     const first = store.get(admitted.call.id, 1)!;
-    const physical = take(await runModelTransport(store, { project: request.project, call: reference(first), packet: intent.packet, role: 'reviewer' }, signal, admissionGuards));
+    const physical = take(await transportUnder(store, { project: request.project, call: reference(first), packet: intent.packet, role: 'reviewer' }, signal, admissionGuards, gate));
     const record = deriveRecord({ ...source, value: intent } as Revision<AnalysisIntent>, physical);
     const address = resultAddress(intent, record, key), write: Write = { ...address, expected: 0, value: json(record) };
     let writes: readonly Write[] = [write], guards = uniqueTransactionGuards([...prepared.guards, reference(source)]);
@@ -343,5 +350,9 @@ export async function runStopAnalysis(store: Store, request: StopAnalysisRequest
     }
     const saved = stored.value.find(row => row.id === write.id)!;
     return readStopAnalysis(store, { project: request.project, record: reference(saved) });
-  } catch (error) { if (error instanceof AnalysisFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) {
+    if (error instanceof AnalysisFailure) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }

@@ -10,6 +10,7 @@ import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readMo
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { provenSourceReads, registerSourceOverlay, storeView } from '../storage/store-view.js';
+import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
 import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
@@ -620,9 +621,10 @@ function prepareCycleCompletion(store: Store, binding: Ref, cycle: Ref, value: M
   return { writes: [] as Write[], guards: [reference(head), binding, ...sources] as TransactionGuard[] };
 }
 /** Continue only addressed source reads and assigned node parts; neither starts another A3 attempt. */
-export async function runModelCycle(store: Store, request: ModelCallRequest, signal?: AbortSignal): Promise<OmResult<Sealed<ModelCycleOutcome>>> {
+export async function runModelCycle(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<OmResult<Sealed<ModelCycleOutcome>>> {
   requireModelRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  if (control !== undefined && !object(control)) invalid('control');
   request = sealed(request) as ModelCallRequest;
   const id = cycleId(request), old = store.get(id);
   if (old) return result(() => {
@@ -660,9 +662,15 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
   if (!selected.ok) return selected;
   const value: ModelCycleRecord = { request, steps: [], results: [], assembly: null, next: null, diagnostic: null, terminal: 'outcome' };
   let packetRef = request.packet;
+  // H1.3 (№2121-1): one admission for the whole chain of this invocation. Its first new work — a dispatch, a delivery
+  // or a next packet — takes it once, and every later call, continuation and part writes under that same admission: a
+  // stop and resume between them fence the old invocation instead of lending it the new generation. What was already
+  // admitted and paid is accounted under any control. A lost control leaves no cycle record, so a resumed cycle finds
+  // its saved calls again.
+  const gate = new RunControlGate(store, request.project, control);
   try {
     while (true) {
-      const call = take(await runModelCall(store, { ...request, packet: packetRef }, signal));
+      const call = take(await modelCallUnder(store, sealed({ ...request, packet: packetRef }) as ModelCallRequest, signal, gate));
       value.steps.push({ packet: packetRef, record: reference(call.record) });
       if (call.part) value.results.push(call.part.result);
       value.diagnostic = call.diagnostic;
@@ -673,8 +681,8 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       };
       if (call.outcome?.kind === 'need-source' && call.response) {
         const basis = { project: request.project, packet: packetRef, call: call.call, response: call.response };
-        const delivered = take(deliverModelSources(store, basis));
-        const next = take(writeQuestionPacket(store, { ...packet.value.request, previous: [...packet.value.request.previous],
+        const delivered = take(deliverModelSources(gate.view(), basis));
+        const next = take(writeQuestionPacket(gate.view(), { ...packet.value.request, previous: [...packet.value.request.previous],
           continuation: { packet: packetRef, call: call.call, response: call.response, deliveries: delivered.deliveries as Ref[] } }));
         if (next.record.value.state !== 'ready') {
           if (next.record.value.refusal?.code === 'research_no_progress') {
@@ -689,7 +697,7 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       if (call.part && packet.value.plan) {
         if (packet.value.plan.position + 1 < packet.value.plan.assignments.length) {
           const { continuation: _continuation, ...root } = packet.value.request;
-          const next = take(writeQuestionPacket(store, { ...root, previous: [...root.previous, { packet: packetRef, ...call.part }] }));
+          const next = take(writeQuestionPacket(gate.view(), { ...root, previous: [...root.previous, { packet: packetRef, ...call.part }] }));
           if (next.record.value.state !== 'ready') {
             value.terminal = 'blocked'; value.next = reference(next.record);
             finish(next.record.value.refusal?.code ?? 'node_unexpandable', next.record.value.refusal?.message ?? 'The next assigned part does not fit', [value.next]); break;
@@ -715,7 +723,11 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       const read = take(readModelCycle(store, { project: request.project, record: reference(written[0]!) }));
       return { ...read, repeated: false } as ModelCycleOutcome;
     });
-  } catch (error) { if (error instanceof CallFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) {
+    if (error instanceof CallFailure) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }
 
 // Dispatch lifecycle.
@@ -1462,9 +1474,17 @@ function settleAppliedCall(store: Store, outcome: ModelCallOutcome): ModelCallOu
 }
 
 /** One physical dispatch. Each new continuation is another packet and therefore another E1 call. */
-export async function runModelCall(store: Store, request: ModelCallRequest, signal?: AbortSignal): Promise<OmResult<Sealed<ModelCallOutcome>>> {
+export async function runModelCall(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<OmResult<Sealed<ModelCallOutcome>>> {
   requireModelRequest(store, request); request = sealed(request) as ModelCallRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  if (control !== undefined && !object(control)) invalid('control');
+  return modelCallUnder(store, request, signal, new RunControlGate(store, request.project, control));
+}
+/**
+ * One dispatch under the gate of its chain (H1.3): a cycle hands its own gate on, so the admission its first new
+ * dispatch takes is the one every continuation and next part of the same invocation writes under.
+ */
+async function modelCallUnder(store: Store, request: ModelCallRequest, signal: AbortSignal | undefined, gate: RunControlGate): Promise<OmResult<Sealed<ModelCallOutcome>>> {
   try {
     const assignment = modelAssignment(store, request), { packet, payload, wire, binding } = assignment;
     const id = modelRecordId(request.project, wire.requestId), old = store.get<OmModelCall>(id);
@@ -1485,13 +1505,15 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
     const admission = take(prepareSeriesLineAdmission(admittedStore, request.project, assignment.admission.series));
     const prepared = take(prepareQuestionPacket(admittedStore, packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet)) fail('model_call_request_invalid', request.packet.id, 'packet', 'Dispatch uses exactly the currently admitted E2 packet');
+    // H1.3: a new dispatch is new work of the pass; its E1, claim and transfer carry the admitted control.
+    const controlled = gate.view();
     const guarded = storeView(store, { write(inputs, guards) {
       // Q1: one interception for write and writeMany; caller guards plus the
       // four groups are concatenated first, then environment.remap, then only
       // Refs exactly equal to a pending writeRef drop out (№1734, C20) — the
       // absent guards of H1.0d are kept, nothing is dropped by id alone.
       const all = [...guards, ...prepared.guards, ...admission.guards, request.packet, ...(environment?.guards ?? [])];
-      return store.writeMany(inputs, (environment ? environment.remap(all) : all)
+      return controlled.writeMany(inputs, (environment ? environment.remap(all) : all)
         .filter(guard => !isRef(guard) || !inputs.some(write => same(writeRef(write), guard))));
     } });
     const admitted = take(recordCall(guarded, request.project, assignment.admission));
@@ -1516,7 +1538,7 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
       { id, kind: 'model-call', expected: 0, value: running }, [...claimPacket.guards.filter(isRef), ...claimAdmission.guards, request.packet], signal,
       [...claimPacket.guards.filter(guard => !isRef(guard)),
         ...(claimEnvironment ? claimEnvironment.remap([...completion.guards, ...claimEnvironment.guards]) : completion.guards as TransactionGuard[])],
-      completion.writes as Write[]);
+      completion.writes as Write[], gate);
     const runningRecord = physical.record as Revision<OmModelCall>;
     const exchange: ModelExchange = { project: request.project, request, call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError, admissionGuards: physical.guards };
@@ -1542,6 +1564,7 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
     return delivered(settleAppliedCall(store, applied as ModelCallOutcome)) as OmResult<Sealed<ModelCallOutcome>>;
   } catch (error) {
     if (error instanceof CallFailure) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
     throw error;
   }
 }
@@ -1615,8 +1638,8 @@ function prepareClaimEnvironment(store: Store, project: string, callRef: Ref, ro
   return take(prepareManagedCallEnvironment(store, project, call.value, role));
 }
 /** Shared physical boundary: real body fingerprint, current purpose admission and durable claim before spawn. */
-async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal?: AbortSignal,
-  extraGuards: readonly TransactionGuard[] = [], sourceWrites: readonly Write[] = []) {
+async function startPhysicalTransport(store: Store, request: ModelTransportRequest, running: Write, guards: readonly Ref[], signal: AbortSignal | undefined,
+  extraGuards: readonly TransactionGuard[], sourceWrites: readonly Write[], gate: RunControlGate) {
   const assignment = transportAssignment(store, request);
   const environment = prepareClaimEnvironment(store, request.project, request.call, request.role);
   const admittedStore = environment?.store ?? store;
@@ -1631,7 +1654,8 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
   requireCondition(!counter || (counter.kind === 'project-dispatch' && object(counter.value)
     && counter.value.projectId === request.project && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0),
   'research_dispatch_invalid', 'Invalid project dispatch counter');
-  let record = take(writeGuarded<ModelCall>(store, { unit: 'E4', target: running.id,
+  const controlled = gate.view();
+  let record = take(writeGuarded<ModelCall>(controlled, { unit: 'E4', target: running.id,
     writes: [...sourceWrites, { ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
       { id: counterId, kind: 'project-dispatch', expected: counter?.revision ?? 0,
         value: { projectId: request.project, serial: (counter?.value.serial ?? 0) + 1 } }],
@@ -1640,9 +1664,19 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
       .filter(guard => !isRef(guard) || !sourceWrites.some(write => same(writeRef(write), guard)))) }))
     .find(row => row.id === running.id)!;
   let processResult: ProcessResult | null = null, launchError: ModelExchange['launchError'] = null;
+  // The permission to transfer is the committed authorization under the admitted control (№1910 п.4): a stop saved
+  // before it transfers nothing and the created process is stopped by the common runtime; after it, the live call is
+  // cancelled through its signal once the watched control moves on.
+  const cancel = new AbortController(), forward = () => cancel.abort();
+  if (signal?.aborted) cancel.abort(); else signal?.addEventListener('abort', forward, { once: true });
+  const unwatch = gate.watch(cancel);
   try { processResult = await runProcess(assignment.binding.command, assignment.environment.workspace,
-    canonical(assignment.wire), assignment.environment.timeoutMs, signal, true, pid => {
-      record = authorizeModelDispatch(store, reference(record), pid);
+    canonical(assignment.wire), assignment.environment.timeoutMs, cancel.signal, true, pid => {
+      try { record = authorizeModelDispatch(controlled, reference(record), pid); }
+      catch (error) {
+        if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
+        throw error;
+      }
     }); }
   catch (error) {
     // An unproven stop is not a launch error: the dispatched process may still
@@ -1657,7 +1691,7 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
     // Every other typed failure at this physical boundary is retained, including a failed
     // ownership CAS/identity capture in onSpawn. No request was sent on that path.
     launchError = { code: error.code, message: error.message };
-  }
+  } finally { unwatch(); signal?.removeEventListener('abort', forward); }
   return { record, process: processResult, launchError, guards: admissionGuards };
 }
 const transportExchangeId = (request: ModelTransportRequest) => `om-model-transport:${request.project}:${hashJson(request)}`;
@@ -1727,9 +1761,18 @@ export function readModelTransport(store: Store, request: { project: string; rec
   });
 }
 export async function runModelTransport(store: Store, request: ModelTransportRequest, signal?: AbortSignal,
-  extraGuards: readonly TransactionGuard[] = []): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
+  extraGuards: readonly TransactionGuard[] = [], control?: RunControlHold): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
   requireTransport(store, request); request = sealed(request) as ModelTransportRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  if (control !== undefined && !object(control)) invalid('control');
+  return transportUnder(store, request, signal, extraGuards, new RunControlGate(store, request.project, control));
+}
+/** A direct transport under the gate of its producer's chain (E5 or A6): their intent, E1 and dispatch share one admission. */
+export async function transportUnder(store: Store, request: ModelTransportRequest, signal: AbortSignal | undefined,
+  extraGuards: readonly TransactionGuard[], gate: RunControlGate): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
+  requireTransport(store, request); request = sealed(request) as ModelTransportRequest;
+  if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  requireCondition(gate instanceof RunControlGate && gate.project === request.project, 'model_call_request_invalid', 'A transport runs under the control gate of its own project');
   extraGuards = uniqueTransactionGuards(extraGuards);
   try {
     const { call, wire, binding } = transportAssignment(store, request), id = modelRecordId(request.project, wire.requestId);
@@ -1752,7 +1795,7 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
       response: null, usage: null, usageSource: 'unavailable', error: null,
       transport: { version: completion.owner ? 'om-model-transport/managed-v1' : 'om-model-transport/v1',
         ...(completion.owner ? { completionOwner: { ...completion.owner, call: request.call } } : {}), request, exchange: null } };
-    const physical = await startPhysicalTransport(store, request, { id, kind: 'model-call', expected: 0, value: running }, [], signal, extraGuards);
+    const physical = await startPhysicalTransport(store, request, { id, kind: 'model-call', expected: 0, value: running }, [], signal, extraGuards, [], gate);
     const exchange: TransportExchange = { project: request.project, request, call: request.call, wire: wire as AdapterRequest,
       process: physical.process, launchError: physical.launchError };
     const exchangeWrite: Write = { id: transportExchangeId(request), kind: EXCHANGE_KIND, expected: 0, value: exchange }, ref = writeRef(exchangeWrite);
@@ -1775,6 +1818,7 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
     if (error instanceof CallFailure) {
       return { ok: false, refusal: error.refusal };
     }
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
     throw error;
   }
 }

@@ -17,7 +17,7 @@ import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recor
   type AddressedGap, type CallLedger, type DispatchContract, type FactAssessmentBasis,
   type RecordCallRequest } from './call-record.js';
 import { readApplicationSources, captureApplicationFileObservation, readApplicationFileObservation, type ApplicationFileObservation,
-  readModelCallState, readModelTransport, runModelTransport, prepareCompletionProducts, pendingCallStore,
+  readModelCallState, readModelTransport, transportUnder, prepareCompletionProducts, pendingCallStore,
   prepareApplicationEnvironment, prepareAssessmentDisposition, readAssessmentCessation, readCompletionWorkAt, readCompletionDispositionContext, prepareCompletionCause, readCompletionCause,
   type CompletionCause, type TransportModelCall } from './model-call.js';
 import { readPacketResponse } from './question-packet.js';
@@ -26,6 +26,7 @@ import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, r
   seriesId, readCompletionBinding, completionWorkId, prepareCompletionAdmission, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt } from './repeat-gate.js';
 import { acceptanceRepresents } from './achievements.js';
+import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
 export const ASSESSMENT_RESULT_KIND = 'om-assessment-result';
@@ -1193,16 +1194,26 @@ export function finishAssessmentAttempt(store: Store, project: string, intent: R
   });
 }
 
-/** Public producer joins the intent, E1 admission, saved physical reply and product application. */
-export async function assessFact(store: Store, request: AssessmentIntentRequest, signal?: AbortSignal):
+/**
+ * Public producer joins the intent, E1 admission, saved physical reply and product application. H1.3: its intent, E1
+ * and dispatch are new work under the pass's control; a saved terminal is applied under any control, since it only
+ * accounts for what was already admitted and paid.
+ */
+export async function assessFact(store: Store, request: AssessmentIntentRequest, signal?: AbortSignal, control?: RunControlHold):
   Promise<OmResult<Sealed<Revision<AssessmentResultRecord>>>> {
   requireIntentRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
+  if (control !== undefined && !isPlainObject(control)) invalid('control');
+  try { return await assessUnderControl(store, request, signal, new RunControlGate(store, request.project, control)); }
+  catch (error) { if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal }; throw error; }
+}
+async function assessUnderControl(store: Store, request: AssessmentIntentRequest, signal: AbortSignal | undefined, gate: RunControlGate):
+  Promise<OmResult<Sealed<Revision<AssessmentResultRecord>>>> {
   const ceased = readAssessmentCessation(store, request.project, request.modelCall, request.questionId);
   if (!ceased.ok) return ceased;
   if (ceased.value) return refused('completion_ceased', 'The exact mandatory assessor remains ceased without another intent or physical call',
     { unit: 'E5', target: ceased.value.value.assignment.id, field: 'disposition', ref: reference(ceased.value) }, 'producer');
-  const intent = writeAssessmentIntent(store, request);
+  const intent = writeAssessmentIntent(gate.view(), request);
   if (!intent.ok) return intent;
   const intentRef = reference(intent.value), history = readAssessmentIntentAt(store, request.project, intentRef);
   if (!history.ok) return history;
@@ -1214,13 +1225,13 @@ export async function assessFact(store: Store, request: AssessmentIntentRequest,
     basis: admission.basis, block: admission.block, gaps: admission.gaps,
     series: admission.series, attempt: admission.attempt, goal: admission.goal,
     dispatch: admission.dispatch, packet: admission.packet as unknown as Json };
-  const call = recordCall(store, request.project, callRequest);
+  const call = recordCall(gate.view(), request.project, callRequest);
   if (!call.ok) return call;
   const firstCall = store.get(call.value.call.id, 1);
   if (!firstCall) return refused('assessment_result_invalid', 'The assessor needs its original E1 admission',
     { unit: 'E5', target: call.value.call.id, field: 'call' }, 'producer');
-  const transport = await runModelTransport(store, { project: request.project, call: reference(firstCall),
-    packet: admission.packet as unknown as Json, role: 'reviewer' }, signal);
+  const transport = await transportUnder(store, { project: request.project, call: reference(firstCall),
+    packet: admission.packet as unknown as Json, role: 'reviewer' }, signal, [], gate);
   if (!transport.ok) return transport;
   return applyAssessmentResult(store,
     { project: request.project, intent: intentRef, assessor: reference(transport.value.record) });

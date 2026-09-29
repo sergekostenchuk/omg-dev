@@ -36,6 +36,7 @@ import { ProductEngine } from "../product/engine.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readGaps, type GapReadRequest } from "./gaps.js";
 import type { DispatchContract } from "./call-record.js";
+import { RunControlGate, RunControlLost, type RunControlHold } from "./run-control.js";
 
 /**
  * H1 — the pass of the OM block (№1427 as amended by №1452 and №1737).
@@ -112,7 +113,13 @@ function fail(code: string, target: string, field: string, message: string, ref?
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new RunFailure(result.refusal); return result.value; }
 async function run<T>(action: () => T | Promise<T>): Promise<OmResult<Sealed<T>>> {
-  try { return delivered(await action()); } catch (error) { if (error instanceof RunFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  try { return delivered(await action()); }
+  catch (error) {
+    if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
+    // A lost control is the typed control outcome of this entry (H1.3), never a wait of the pass.
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const object = (value: unknown): value is Record<string, any> => isPlainObject(value);
@@ -206,11 +213,12 @@ function checkStep(step: unknown): step is RunStep {
  * also after complete. A first pass fixes the named outcomes, or every outcome of its exact B1, as a concrete set; an
  * outcome B1 does not accept is run_outcome_unknown, and nothing is written for such an intent.
  */
-export function startRun(store: Store, request: { project: string; outcomes?: readonly string[] }): OmResult<Sealed<Revision<RunRecord>>> {
+export function startRun(store: Store, request: { project: string; outcomes?: readonly string[] }, control?: RunControlHold): OmResult<Sealed<Revision<RunRecord>>> {
   requireCondition(store instanceof Store && object(request) && isText(request.project)
     && Object.keys(request).every(key => key === "project" || key === "outcomes")
     && (request.outcomes === undefined || normalizedOutcomes(request.outcomes) !== null),
   "run_request_invalid", "A pass is started by its project and, optionally, a nonempty set of intended outcomes");
+  requireCondition(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
   const project = request.project, named = request.outcomes === undefined ? null : normalizedOutcomes(request.outcomes)!;
   const existing = (): Revision<RunRecord> | null => {
     const saved = take(readRun(store, { project })) as Revision<RunRecord> | null;
@@ -219,6 +227,9 @@ export function startRun(store: Store, request: { project: string; outcomes?: re
     return saved;
   };
   try {
+    // H1.3 (№1991 п.5): a stop is weighed first; a stopped project starts nothing and records no intent.
+    const gate = new RunControlGate(store, project, control);
+    gate.admit();
     const saved = existing();
     if (saved) return delivered(saved);
     const head = store.get(`om-input:${project}`);
@@ -230,21 +241,30 @@ export function startRun(store: Store, request: { project: string; outcomes?: re
     const unknown = outcomes.find(outcome => !accepted.includes(outcome));
     if (unknown !== undefined) fail("run_outcome_unknown", input.id, "outcomes", `The accepted input has no feature with the outcome ${unknown}`, reference(input));
     const value: RunRecord = { contract: RUN_CONTRACT, project, input: reference(input), intent: { outcomes }, state: { phase: "ready" }, last: null };
-    const written = writeGuarded<RunRecord>(store, { unit: UNIT, target: runId(project),
+    const written = writeGuarded<RunRecord>(gate.view(), { unit: UNIT, target: runId(project),
       writes: [{ id: runId(project), kind: RUN_KIND, expected: 0, value: value as unknown as Json }], guards: [reference(input)] });
     if (written.ok) return delivered(written.value[0]! as Revision<RunRecord>);
     // Two stores: the winner's pass is read again; an equal intent converges to it, another one conflicts.
     const raced = existing();
     return raced ? delivered(raced) : written;
-  } catch (error) { if (error instanceof RunFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) {
+    if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }
 
 /**
  * One transition of the pass. A saved step is performed (or found again) by its producer; otherwise the next action is
  * chosen, saved, and left for the next call. A wait that still stands is returned without a write.
+ *
+ * H1.3: every entry weighs the pass's control first. A stopped pass begins no step and no dispatch; each new step and
+ * each new record of its work carries the admitted control in its final transaction, and a physical step gets the same
+ * hold for its claim and transfer while its paid results pass by their exact links. A holder never takes a newer head.
  */
-export async function advanceRun(store: Store, request: RunRequest): Promise<OmResult<Sealed<RunAdvance>>> {
+export async function advanceRun(store: Store, request: RunRequest, control?: RunControlHold): Promise<OmResult<Sealed<RunAdvance>>> {
   requireRequest(store, request);
+  requireCondition(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
   return run(async () => {
     const saved = take(readRun(store, { project: request.project }));
     if (!saved) fail("record_missing", runId(request.project), "run", "The pass must be started before it advances");
@@ -252,11 +272,12 @@ export async function advanceRun(store: Store, request: RunRequest): Promise<OmR
     // A completed pass returns its proved completion and an unable one its grounds, before any environment, base or
     // payment is looked at; neither starts a second pass by itself (№1737 п.1, №1995 п.11).
     if (state.phase === "complete" || state.phase === "unable") return { record: head, performed: null, products: [] };
-    if (state.phase === "step") return settle(store, head, state.step, await perform(store, request, state.step));
+    const gate = new RunControlGate(store, request.project, control), hold = gate.admit().hold, guarded = gate.view();
+    if (state.phase === "step") return settle(guarded, head, state.step, await perform(guarded, store, hold, request, state.step));
     const history = historyOf(store, head), performed = history.performed;
     let next = selectNext(store, request, history);
-    if ("complete" in next) return transition(store, head, { phase: "complete", proof: next.complete }, head.value.last, null, []);
-    if ("unable" in next) return transition(store, head, { phase: "unable", reasons: next.unable }, head.value.last, null, [], next.guards);
+    if ("complete" in next) return transition(guarded, head, { phase: "complete", proof: next.complete }, head.value.last, null, []);
+    if ("unable" in next) return transition(guarded, head, { phase: "unable", reasons: next.unable }, head.value.last, null, [], next.guards);
     // A choice identical to a request already performed with a product would repeat it without effect: the pass stands
     // on that product and waits for its producer or a changed basis instead of looping on it.
     const done = "step" in next ? performed(next.step.action, next.step.request) : null;
@@ -267,15 +288,15 @@ export async function advanceRun(store: Store, request: RunRequest): Promise<OmR
       // The same request that was refused is already saved: it is repeated by that request, and a refusal that still
       // stands is returned without a write.
       if (last?.refusal && same(last.step, next.step)) {
-        const outcome = await perform(store, request, next.step);
+        const outcome = await perform(guarded, store, hold, request, next.step);
         if ("wait" in outcome && state.phase === "waiting" && same(state.wait, outcome.wait)) return { record: head, performed: null, products: [] };
-        return settle(store, head, next.step, outcome);
+        return settle(guarded, head, next.step, outcome);
       }
-      return transition(store, head, { phase: "step", step: next.step }, head.value.last, null, []);
+      return transition(guarded, head, { phase: "step", step: next.step }, head.value.last, null, []);
     }
     if (state.phase === "waiting" && same(state.wait, next.wait))
       return { record: head, performed: null, products: [] };
-    return transition(store, head, { phase: "waiting", wait: next.wait }, head.value.last, null, []);
+    return transition(guarded, head, { phase: "waiting", wait: next.wait }, head.value.last, null, []);
   });
 }
 function settle(store: Store, head: Revision<RunRecord>, step: RunStep, outcome: Performed): RunAdvance {
@@ -293,7 +314,11 @@ function transition(store: Store, head: Revision<RunRecord>, state: RunState, la
 // ---- Performing a saved step: the producer finds or makes its product by the saved request. ----
 
 type Performed = { products: Ref[] } | { wait: RunWait };
-async function perform(store: Store, request: RunRequest, step: RunStep): Promise<Performed> {
+/**
+ * `store` carries the admitted control into every write of the producer; a physical producer gets the plain `raw`
+ * store and the hold instead, since its receipt and the application of its paid result are not today's new work.
+ */
+async function perform(store: Store, raw: Store, hold: RunControlHold, request: RunRequest, step: RunStep): Promise<Performed> {
   const project = request.project, body = step.request as Record<string, unknown>;
   const outcome = await (async (): Promise<OmResult<Ref[]>> => {
     switch (step.action) {
@@ -301,8 +326,8 @@ async function perform(store: Store, request: RunRequest, step: RunStep): Promis
       case "open": return mapped(openAttempt(store, body as never), record => [refOf(record)]);
       case "register": return mapped(writeAnswersRegistration(store, body as never), record => [refOf(record)]);
       case "packet": return mapped(writeQuestionPacket(store, body as never), prepared => [refOf(prepared.record)]);
-      case "cycle": return mapped(await recovering(store, project, () => runModelCycle(store, body as never)), cycle => [refOf(cycle.record)]);
-      case "assess": return mapped(await recovering(store, project, () => assessFact(store, body as never)), terminal => [refOf(terminal)]);
+      case "cycle": return mapped(await recovering(raw, project, () => runModelCycle(raw, body as never, undefined, hold)), cycle => [refOf(cycle.record)]);
+      case "assess": return mapped(await recovering(raw, project, () => assessFact(raw, body as never, undefined, hold)), terminal => [refOf(terminal)]);
       case "routes": return mapped(writeRoutes(store, body as never), record => [refOf(record)]);
       case "lines": case "confirm": return mapped(writeGapLines(store, body as never), record => [refOf(record)]);
       case "obligations": return mapped(writeOmObligations(store, body as never), written => [refOf(written.producer), refOf(written.record)]);
@@ -327,7 +352,7 @@ async function perform(store: Store, request: RunRequest, step: RunStep): Promis
           { unit: UNIT, target: stageId(project, "compilation"), field: "compile" }, "producer");
       }
       case "evaluate": return mapped(writeAnswersEvaluation(store, body as never), written => [refOf(written.evaluation)]);
-      case "analyze": return mapped(await recovering(store, project, () => runStopAnalysis(store, body as never)), record => [refOf(record)]);
+      case "analyze": return mapped(await recovering(raw, project, () => runStopAnalysis(raw, body as never, undefined, hold)), record => [refOf(record)]);
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
       case "cease-check": return mapped(writeAnswersCheckCessation(store, body as never), record => [refOf(record)]);
       case "resume": return mapped(resumeSeries(store, body as never), record => [refOf(record)]);
@@ -1144,7 +1169,9 @@ function obligationsOf(batches: readonly RouteBatch[], level: 2 | 3): string[] {
  */
 function worksLedger(store: Store, project: string, scope: GapReadRequest):
 { step: RunStep } | { wait: RunWait; final?: RunReason } | { works: { producer: Ref; ledger: Ref } } {
-  const lines = linesOf(store, project, scope);
+  // D7 is admitted on the CURRENT line history: its head when that head is of this exact scope, otherwise a new pass of
+  // the scope. An older revision of the same scope is history, never the basis of a new step (it would stand stale forever).
+  const lines = currentLinesOf(store, project, scope);
   if (!lines) return linesStep(store, project, scope, null, null);
   const obligations = { project, gaps: scope, lines, assignments: [] };
   const prepared = prepareOmObligations(store, obligations);
@@ -1245,11 +1272,18 @@ function acceptedWith(store: Store, project: string, level: 2 | 3, own: readonly
   return null;
 }
 /** The D2 snapshot over exactly this D1 scope, wherever it stands in the D2 history. */
+const sortedRefs = (refs: readonly Ref[]) => [...refs].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+const ofScope = (row: Revision<GapLinesRecord>, scope: GapReadRequest): boolean =>
+  same(row.value.request.gaps.sources, scope.sources) && same(sortedRefs(row.value.request.gaps.records), sortedRefs(scope.records));
+/** Whether a D2 snapshot of this exact scope was ever written: a fact of the history, not a basis for new work. */
 function linesOf(store: Store, project: string, scope: GapReadRequest): Ref | null {
-  const sorted = (refs: readonly Ref[]) => [...refs].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-  for (const row of store.history<GapLinesRecord>(gapLinesId(project)))
-    if (same(row.value.request.gaps.sources, scope.sources) && same(sorted(row.value.request.gaps.records), sorted(scope.records))) return reference(row);
+  for (const row of store.history<GapLinesRecord>(gapLinesId(project))) if (ofScope(row, scope)) return reference(row);
   return null;
+}
+/** The current line history when its head is of this exact scope; the basis a new D7 admission may stand on. */
+function currentLinesOf(store: Store, project: string, scope: GapReadRequest): Ref | null {
+  const head = store.get<GapLinesRecord>(gapLinesId(project));
+  return head && ofScope(head, scope) ? reference(head) : null;
 }
 function linesStep(store: Store, project: string, scope: GapReadRequest, series: string | null, attempt: number | null): { step: RunStep } {
   const latest = store.get<GapLinesRecord>(gapLinesId(project));
