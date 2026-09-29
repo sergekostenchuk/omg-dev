@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 95. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0c → D8.5 → H1.0d → Q1 → H1 → S1.1 → Q2 → H1.1 → Q2b → E4.1 → H1.2 → H1.3 → Q2c → D8.4.2 → V3 → E2.2 → Q3 → Q2.1 → H2 → Q4 → Q5 → H2.0.
+Задач: 95. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0c → D8.5 → H1.0d → Q1 → H1 → H1.1 → S1.1 → Q2 → Q2b → E4.1 → H1.2 → H1.3 → Q2c → D8.4.2 → V3 → E2.2 → Q3 → Q2.1 → H2 → Q4 → Q5 → H2.0.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -1273,9 +1273,9 @@
 - Отдаёт: —
 - Читает записи: журнал отказов, строки G4b, evaluation, completion-work, пакеты E2
 - Пишет записи: —
-- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `src/om/model-call.ts`, `src/om/gap-lines.ts`, `src/storage/store-view.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`, `test/om-gap-lines.test.ts`, `test/store-view.test.ts`
+- Разрешённые пути: `src/om/question-packet.ts`, `src/om/refusal-journal.ts`, `src/om/model-call.ts`, `src/om/gap-lines.ts`, `src/om/atomic-gate.ts`, `src/storage/store-view.ts`, `test/om-question-packet.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`, `test/om-gap-lines.test.ts`, `test/om-atomic-gate.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: withHistoricalReads / historicalRead / historicalProof — src/om/input.ts (урок 36, S1); readJournalAt — src/om/refusal-journal.ts; разбор ревьюера №1753 — ~/REPORTS/review/omg-code-s11_contract.md
-- После: S1, H1.0c, H1.0d, Q1, H1
+- После: S1, H1.0c, H1.0d, Q1, H1, H1.1
 - Тесты сверх обязательных:
   - РАСШИРЕНИЕ №1787 (вопрос H1 №1785): взаимная рекурсия доказательств между попытками одной сферы — тот же класс S1, текущий вход тоже покрыт; обязательные сценарии в тех же 4 путях: N2 A-положительная / B1-отрицательная → B2-положительная (одно C5, D2, отдельные G7, без повторной оплаты A) и L3 produce → consume со смешанными исходами; проверка на ПРИНЯТОМ H1 поверх Q1 через существующий тестовый loader (test/om-run.test.ts не добавлять); фиксировать ключи активной цепочки, чтобы отличить цикл от повторной работы; не запускать 36-минутный опыт ради OOM
   - ДОПОЛНЕНИЕ №1759 ПО ГРАФУ (№1773 — конец ~/REPORTS/review/omg-code-s11_contract.md): runtime-импорт input.js в refusal-journal.ts ЗАПРЕЩЁН (цикл ESM, TDZ answersSourceReader — проба ревьюера); refusal-journal экспортирует узкую регистрацию исполнителя доказательства, question-packet.ts передаёт туда historicalProof при загрузке; без регистрации — тот же полный вывод; ключ A2.readJournalAt/project/{id,revision,hash}; кэшируется только успешный результат; цикл — journal_invalid field=derivation; счёт — по областям sourceView с показом их числа и причин
