@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const has = (value, key) => Object.hasOwn(value, key);
@@ -41,7 +41,10 @@ function traceLength(path) {
 
 function pauseFixture(path, body) {
   requireFixture(typeof path === "string" && path.length > 0, "A pause checkpoint needs its own file path");
-  writeFileSync(path, JSON.stringify({ pid: process.pid, parent: process.ppid, ...body }));
+  // №28: the checkpoint appears only complete. A watcher that sees the name reads the whole JSON, never a partial write.
+  const pending = `${path}.${process.pid}.tmp`;
+  writeFileSync(pending, JSON.stringify({ pid: process.pid, parent: process.ppid, ...body }));
+  renameSync(pending, path);
   // Only the test-created fixture stops itself. The controlling test resumes or kills this exact PID.
   process.kill(process.pid, "SIGSTOP");
 }

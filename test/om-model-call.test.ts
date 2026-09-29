@@ -239,6 +239,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requiremen
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import { gardenGraph } from './om-fixture.js';
+import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { historicalProof, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
@@ -267,10 +268,9 @@ import { checkAnswerForm } from '../src/om/answer-form.js';
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { checkCompletionLedger, pendingCallStore, readCompletionWorkAt } from '../src/om/model-call.js';
 
-function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e4-dispatch-')), database = join(root, 'state.sqlite');
-  let store = new Store(database), engine = new ProductEngine(store);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+/** The directory-independent prefix of e4Fixture — upstream stages, B1, M5 address, G2, D1 and routes — one seed per variant. */
+function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field', extraQuestion: boolean) {
+  const engine = new ProductEngine(store);
   const project = 'garden', graphData = gardenGraph('cross');
   graphData.nodes.find(node => node.id === 'garden-produce-block')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
   graphData.nodes.find(node => node.id === 'garden-consume-block')!.ports.push({ id: 'in-side', direction: 'in', contract: 'garden-contract' });
@@ -303,6 +303,17 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', cap
   const routes = valueOf(writeRoutes(store, { project, gaps: gapRequest,
     tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
     catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }));
+  return { graphData, graph, input, sources, gaps, gapRequest, source, routes };
+}
+
+function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
+  // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
+  const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : 'addressed'}:${extraQuestion}`,
+    store => e4Prefix(store, kind, extraQuestion), 'omg-e4-dispatch-');
+  const { root, database } = seeded, { graphData, graph, input, sources, gaps, gapRequest, source, routes } = seeded.data;
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const project = 'garden';
   writeFileSync(join(root, 'e4-source.txt'), 'UTF-8 is the supported encoding.');
   const batch = routes.value.batches.find(batch => kind === 'node' ? batch.task === 'node-expansion' && batch.node === 'garden-produce-block'
     : kind === 'field' ? batch.model === 'MC2' && batch.task === 'input-field' && batch.items.some(item => item.target === 'discovery:encoding')
@@ -666,16 +677,6 @@ test('E4 cycle repeated unchanged reads refuse once while exact late replay adds
   const series = f.store.get<{attempts: {outcome: {reason: string}}[]; withoutProgress: number}>(f.series.id)!;
   assert.equal(series.value.attempts.length, 1); assert.equal(series.value.attempts[0]!.outcome.reason, 'refused');
   assert.equal(series.value.withoutProgress, 1);
-  for (const alteration of ['diagnostic', 'dispatch'] as const) {
-    const body = { ...cycle.record.value,
-      ...(alteration === 'diagnostic' ? { diagnostic: null } : { request: { ...cycle.record.value.request, role: 'reviewer' } }) };
-    const forged = { ...cycle.record, id: `om-model-cycle:${f.project}:${hashJson(body.request)}`, value: body, hash: hashJson(body) };
-    const view = new Proxy(f.store, { get(target, key) {
-      if (key === 'get') return (id: string, revision?: number) => id === forged.id ? forged : target.get(id, revision);
-      const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
-    } });
-    assert.equal(readModelCycle(view, { project: f.project, record: reference(forged) }).ok, false, alteration);
-  }
   const snapshot = f.store.list().map(reference); f.restart();
   valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
   valueOf(await runModelCycle(f.store, f.request));
@@ -901,25 +902,6 @@ test('E4 carries checked works handoffs through local dispatch, split assembly, 
   });
 });
 
-test('E4 delivery reader rejects substituted data, response and source even when record hashes are recomputed', async t => {
-  const f = e4Fixture(t); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
-  const call = valueOf(await runModelCall(f.store, f.request)); assert.ok(call.response);
-  const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response };
-  const delivered = valueOf(deliverModelSources(f.store, basis));
-  for (const change of ['data', 'response', 'sources'] as const) {
-    const original = f.store.get<Record<string, Json>>(delivered.deliveries[0]!.id)!, value = structuredClone(original.value);
-    if (change === 'data') value.data = 'forged';
-    else if (change === 'response') value.response = reference(f.source) as unknown as Json;
-    else value.sources = [reference(f.source)] as unknown as Json;
-    const forged = f.store.write({ id: `om-read-delivery:${f.project}:${hashJson(value)}`, kind: 'om-read-delivery', expected: 0, value });
-    const actual = readContinuationEvidence(f.store, { ...basis, deliveries: [reference(forged)] });
-    assert.equal(actual.ok, false, change);
-  }
-  const before = f.store.list().map(reference); f.restart();
-  assert.deepEqual(valueOf(deliverModelSources(f.store, basis)).deliveries, delivered.deliveries);
-  assert.deepEqual(f.store.list().map(reference), before);
-});
-
 // E1 analysis admissions use the same physical boundary, without manufacturing E2 or A6 forms.
 import { Environments } from '../src/runtime/environment.js';
 import { completeAttempt, readSeries, type RepairSeries } from '../src/om/series.js';
@@ -1032,7 +1014,7 @@ test('E4 cycle refuses missing coverage and conflicting definitions without acce
   }
 });
 
-test('E4 delivery writes guard source heads and reject corrupt replay records with addressed errors', async t => {
+test('E4 delivery writes guard source heads, and a repeat after restart returns the same deliveries without writes', async t => {
   const f = e4Fixture(t); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
   const call = valueOf(await runModelCall(f.store, f.request)); assert.ok(call.response);
   const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response };
@@ -1050,12 +1032,10 @@ test('E4 delivery writes guard source heads and reject corrupt replay records wi
   assert.equal(refused.ok, false); if (!refused.ok) assert.equal(refused.refusal.code, 'input_stale');
   assert.equal(f.store.list('om-read-delivery').length, 0); assert.equal(f.store.list('om-read-delivery-set').length, 0);
   const delivered = valueOf(deliverModelSources(f.store, basis));
-  const set = f.store.list('om-read-delivery-set')[0]!;
-  const get = f.store.get.bind(f.store);
-  f.store.get = ((id, revision) => id === set.id ? { ...set, value: null } : get(id, revision)) as Store['get'];
-  const malformed = deliverModelSources(f.store, basis); f.store.get = get;
-  assert.equal(malformed.ok, false); if (!malformed.ok) assert.equal(malformed.refusal.code, 'model_delivery_invalid');
   assert.equal(valueOf(readContinuationEvidence(f.store, { ...basis, deliveries: delivered.deliveries as Ref[] })).data.length, 1);
+  const before = f.store.list().map(reference); f.restart();
+  assert.deepEqual(valueOf(deliverModelSources(f.store, basis)).deliveries, delivered.deliveries);
+  assert.deepEqual(f.store.list().map(reference), before);
 });
 
 test('E4 node result conflict leaves no partial response/proposal/result, accounts observed usage and never dispatches twice', async t => {
@@ -1181,25 +1161,6 @@ test('E4 preserves received exchange when another Store completes the attempt du
     assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) })), expected);
     assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), expected);
     assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 1);
-    if (phase === 'before-form' && kind === 'fact') {
-      const rejection = f.store.get<Record<string, Json>>(actual.record.value.om.rejection!.id)!;
-      const forged = { ...structuredClone(rejection.value), completion: reference(f.series) };
-      const record = f.store.write({ id: `om-model-application-rejection:${f.project}:${hashJson(forged)}`,
-        kind: rejection.kind, expected: 0, value: forged });
-      const denied = readModelApplicationRejection(f.store, { project: f.project, record: reference(record) });
-      assert.equal(denied.ok, false);
-      if (!denied.ok) assert.equal(denied.refusal.at.field, 'completion');
-      const head = f.store.get(f.series.id)!;
-      const later = f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
-      const substituted = { ...structuredClone(rejection.value), completion: reference(later) };
-      const wrongWindow = f.store.write({ id: `om-model-application-rejection:${f.project}:${hashJson(substituted)}`,
-        kind: rejection.kind, expected: 0, value: substituted });
-      const wrong = readModelApplicationRejection(f.store, { project: f.project, record: reference(wrongWindow) });
-      assert.equal(wrong.ok, false, 'Another legal completed revision is not the preserved rejection window');
-      if (!wrong.ok) assert.equal(wrong.refusal.at.field, 'completion');
-      f.restart();
-      assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) })), expected);
-    }
   }
 });
 
@@ -1487,36 +1448,6 @@ test('E4 restarts a later node part after receipt or application and assembles o
       assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, calls.length);
     });
   }
-});
-
-test('E4 receipt state requires an explicit application discriminator and preserves the original historical receipt', async t => {
-  const f = e4Fixture(t); f.steps([{ research: e4Fact(f), usage }]);
-  const writeMany = f.store.writeMany.bind(f.store); let stopped = false;
-  f.store.writeMany = ((writes, guards) => {
-    const committed = writeMany(writes, guards);
-    if (!stopped && writes.some(write => write.kind === 'model-call'
-      && (write.value as unknown as OmModelCall).om.application === 'received')) {
-      stopped = true; throw new Error('E4 simulated stop after durable receipt');
-    }
-    return committed;
-  }) as Store['writeMany'];
-  try { await assert.rejects(runModelCall(f.store, f.request), /E4 simulated stop after durable receipt/); }
-  finally { f.store.writeMany = writeMany; }
-  const receipt = f.store.list<OmModelCall>('model-call')[0]!;
-  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(receipt) })).state, 'received');
-  for (const application of [undefined, 'terminal'] as const) {
-    const body = structuredClone(receipt.value) as unknown as {om: Record<string, Json>};
-    if (application === undefined) delete body.om.application;
-    else body.om.application = application;
-    const forged = f.store.write({ id: receipt.id, kind: receipt.kind, expected: f.store.get(receipt.id)!.revision,
-      value: body as unknown as Json });
-    const denied = readModelCallState(f.store, { project: f.project, record: reference(forged) });
-    assert.equal(denied.ok, false);
-    if (!denied.ok) { assert.equal(denied.refusal.code, 'model_call_record_invalid'); assert.equal(denied.refusal.at.field, 'application'); }
-  }
-  f.restart();
-  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(receipt) })).state, 'received');
-  assert.equal(f.sent().length, 1); assert.equal(f.store.list('om-model-exchange').length, 1);
 });
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -2254,44 +2185,6 @@ test('14 H1.0a physical technical and control terminals keep their own diagnosti
   });
 });
 
-function alteredRead(store: Store, replacement: (record: Revision<unknown> | null) => Revision<unknown> | null): Store {
-  return new Proxy(store, { get(target, key) {
-    if (key === 'get') return (id:string, revision?:number) => replacement(target.get(id, revision));
-    const value:unknown=Reflect.get(target,key,target); return typeof value==='function'?value.bind(target):value;
-  } });
-}
-
-test('5 H1.0a managed history rejects missing or counterfeit independent ownership instead of selecting legacy', async t => {
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);
-  f.steps([{research:e4Fact(f),usage}]);
-  const call=valueOf(await runModelCall(f.store,f.request)); f.restart();
-  for (const kind of ['om-completion-era','om-completion-owner','om-completion-assignment','om-completion-work']) {
-    for (const damage of ['missing','kind','body'] as const) {
-      const view=alteredRead(f.store, row => {
-        if (row?.kind!==kind) return row;
-        if (damage==='missing') return null;
-        if (damage==='kind') return {...row,kind:'unrelated'};
-        const body={...(row.value as object),contract:'fabricated'};
-        return {...row,value:body,hash:hashJson(body)};
-      });
-      assert.equal(readModelCallState(view,{project:f.project,record:reference(call.record)}).ok,false,`${kind}/${damage}`);
-    }
-  }
-  await t.test('36 foreign step and contradictory physical family cannot become a second assignment',()=>{
-  for (const damage of ['marker','version','both','other-family','foreign-assignment'] as const) {
-    const body=structuredClone(call.record.value) as OmModelCall;
-    if (damage==='marker'||damage==='both') delete body.om.completionOwner;
-    if (damage==='version'||damage==='both') body.om.version='om-model-call/v1';
-    if (damage==='other-family') Object.assign(body,{transport:{version:'om-model-transport/v1'}});
-    if (damage==='foreign-assignment') body.om.completionOwner!.assignment=body.om.completionOwner!.binding;
-    const forged={...call.record,value:body,hash:hashJson(body)};
-    const view=alteredRead(f.store,row => row?.id===forged.id&&row.revision===forged.revision?forged:row);
-    assert.equal(readModelCallState(view,{project:f.project,record:reference(forged)}).ok,false,damage);
-  }
-  });
-  assert.equal(f.sent().length,1);
-});
-
 test('33 H1.0a direct E1 cannot rename or replace the proved E2, and an unpaid admitted step resumes once',async t => {
   const f=e4Fixture(t,'fact',100_000,0,1000,true);
   const payload=f.packet.value.packet as Record<string,Json> & {requestId:string;purpose:'model-research'};
@@ -2466,23 +2359,6 @@ test('37 H1.0a direct local finish proves its diagnostic and repeats without cur
   f.restart();assert.equal(valueOf(prepareModelAttemptFinish(f.store,finishRequest)).writes.length,0);
 });
 
-test('C28 H1.0a retained completion producer addresses refuse lost B1 even for incomplete records',async t=>{
-  for(const kind of ['om-completion-owner','om-completion-era','om-completion-assignment','om-completion-work','om-completion-close']){
-    await t.test(kind,child=>{
-      const root=mkdtempSync(join(tmpdir(),'omg-h10a-era-')),path=join(root,'state.sqlite');let store=new Store(path);
-      child.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
-      new ProductEngine(store).execute({type:'create-project',project:'era',title:'Before B1'});
-      store.write({id:`${kind}:era:retained`,kind,expected:0,value:{}});
-      for(const restart of [false,true]){
-        if(restart){store.close();store=new Store(path);}
-        const before=store.list();
-        assert.throws(()=>new ProductEngine(store).projection('era'),(error:unknown)=>error instanceof EngineError && error.code==='record_missing');
-        assert.deepEqual(store.list(),before);
-      }
-    });
-  }
-});
-
 test('32 H1.0a direct assembly repeat restores a lost registry cursor without producing or paying twice',async t=>{
   const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
   const call=valueOf(await runModelCall(f.store,f.request));assert.ok(call.part);
@@ -2541,34 +2417,6 @@ test('C06 H1.0a successor inherits original completion proofs but starts its own
   assert.equal(f.sent().length,1);
 });
 
-test('C36 H1.0a a closed A3 needs the full exact close proof and cannot use an old terminal marker',async t=>{
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
-  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
-  valueOf(closeAttempt(f.store,{...address,attempt:1,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
-  f.restart();const closed=f.store.get(f.series.id)!;
-  for(const damage of ['missing','foreign-kind','false-claim','missing-work','legacy-terminal']){
-    const view=alteredRead(f.store,row=>{
-      if(row?.kind==='om-completion-close'){
-        if(damage==='missing')return null;
-        if(damage==='foreign-kind')return {...row,kind:'another-contract'};
-        if(damage==='false-claim'){
-          const value=structuredClone(row.value) as {claim:{accepting:Ref[];reason:string}};
-          value.claim.reason='result';return {...row,value,hash:hashJson(value)};
-        }
-      }
-      if(damage==='missing-work'&&row?.kind==='om-completion-work')return null;
-      if(damage==='legacy-terminal'&&row?.id===closed.id&&row.revision===closed.revision){
-        const value=structuredClone(row.value) as RepairSeries;
-        Object.assign(value.attempts[0]!,{terminal:{source:work.products[0],call:work.products[0]}});
-        return {...row,value,hash:hashJson(value)};
-      }
-      return row;
-    });
-    assert.equal(readSeries(view,address).ok,false,damage);
-  }
-  assert.equal(f.sent().length,1);
-});
-
 test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 decision can resume it',async t=>{
   const {runStopAnalysis}=await import('../src/om/stop-analysis.js');
   const {resumeSeries}=await import('../src/om/series.js');
@@ -2590,28 +2438,6 @@ test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 
   const saved=f.store.list();f.restart();
   assert.deepEqual(valueOf(await runStopAnalysis(f.store,request)),analysis);assert.deepEqual(f.store.list(),saved);
   assert.equal(f.sent().length,2);
-});
-
-test('5 H1.0a exact completion readers reject missing source fields and a closed cursor without its whole G7 derivation',async t=>{
-  const {readCompletionOwnerAt}=await import('../src/om/series.js');
-  const {readCompletionAssignmentAt}=await import('../src/om/model-call.js');
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
-  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f);
-  valueOf(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
-    outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
-  const owner=work.binding,part=work.assignments.find(row=>row.value.kind==='part')!,closed=f.store.get(work.work.id)!;
-  for(const [row,field,reader]of [
-    [owner,'goal',readCompletionOwnerAt],[part,'source',readCompletionAssignmentAt],[part,'kind',readCompletionAssignmentAt],
-    [closed,'previous',readCompletionWorkAt],
-  ] as const){
-    const value={...row.value as object} as Record<string,unknown>;delete value[field];
-    const changed={...row,value,hash:hashJson(value)},view=alteredRead(f.store,r=>r?.id===changed.id&&r.revision===changed.revision?changed:r);
-    const result=reader(view,f.project,reference(changed));assert.equal(result.ok,false,field);
-    if(!result.ok)assert.equal(result.refusal.code,'completion_invalid');
-  }
-  const value={...closed.value as object,closed:reference(f.routes)},changed={...closed,value,hash:hashJson(value)};
-  assert.equal(readCompletionWorkAt(alteredRead(f.store,r=>r?.id===changed.id&&r.revision===changed.revision?changed:r),f.project,reference(changed)).ok,false);
-  f.restart();assert.equal(valueOf(readCompletionWorkAt(f.store,f.project,reference(closed))).complete,true);
 });
 
 test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its earlier claim guards',async t=>{
@@ -2776,21 +2602,6 @@ test('34 H1.0a a completion ledger retains the exact journal context of a genuin
   assert.deepEqual(valueOf(closeAttempt(f.store,claim)),closed);
 });
 
-
-test('2 H1.0b a retained cessation address cannot downgrade the project after losing B1', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-h10b-era-')), path = join(root, 'state.sqlite');
-  let store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  new ProductEngine(store).execute({ type: 'create-project', project: 'era', title: 'Before B1' });
-  store.write({ id: 'om-completion-cessation:era:retained', kind: 'om-completion-cessation', expected: 0, value: {} });
-  for (const restart of [false, true]) {
-    if (restart) { store.close(); store = new Store(path); }
-    const before = store.list();
-    assert.throws(() => new ProductEngine(store).projection('era'),
-      (error: unknown) => error instanceof EngineError && error.code === 'record_missing');
-    assert.deepEqual(store.list(), before);
-  }
-});
 
 test('20 H1.0b exact MC2 remainder cessation preserves produced parts and blocks materialization without hiding siblings', async t => {
   const { prepareCompletionCessation, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');

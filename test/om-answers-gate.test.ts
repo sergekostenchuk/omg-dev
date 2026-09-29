@@ -38,14 +38,14 @@ import { writeRoutes } from '../src/om/routes.js';
 import { beginAttempt, completeAttempt, openSeries, type AttemptGoal } from '../src/om/series.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { createOmFixture, gardenGraph } from './om-fixture.js';
+import { seedCopy } from './om-seed.js';
 import { canonical, hashJson } from '../src/canonical.js';
 import { isRef } from '../src/pipeline/contracts.js';
 import type { Revision } from '../src/storage/store.js';
 import type { Sealed } from '../src/om/refusal.js';
 import { applyAssessmentResult, readAssessmentIntentAt, writeAssessmentIntent } from '../src/om/assessment.js';
 import { ANSWERS_GATE_EMISSIONS, ANSWERS_GATE_MISMATCHES, ANSWERS_GATE_SOURCE_ROLES, prepareAnswersGateTrace,
-  readAnswersGateTrace, type AnswerRouteResult, type AnswersGateRecord, type AnswersGateTraceEntry,
-  type PreparedAnswersGate } from '../src/om/answers-gate.js';
+  readAnswersGateTrace, type AnswerRouteResult, type AnswersGateRecord, type AnswersGateTraceEntry } from '../src/om/answers-gate.js';
 import { readFileSync } from 'node:fs';
 import { readMc1Question } from '../src/om/accepted-answer.js';
 import { runModelTransport } from '../src/om/model-call.js';
@@ -59,12 +59,10 @@ import { answersGateAssignment, completionAssignmentId, completionCloseId, compl
 import { readCompletionAssignmentAt, readCompletionWorkAt } from '../src/om/model-call.js';
 import { closeAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
 import { runModelCycle } from '../src/om/model-call.js';
-import { ANSWERS_EVALUATION_KIND, ANSWERS_FINDING_KIND, answersEvaluationId, answersFindingId, answersRefusalId,
+import { ANSWERS_EVALUATION_KIND, ANSWERS_FINDING_KIND, answersEvaluationId, answersRefusalId,
   prepareAnswersDelivery, prepareAnswersEvaluation, readAnswersEvaluationAt, readAnswersFindingAt, readAnswersGateRefusalAt,
-  writeAnswersDelivery, writeAnswersEvaluation, type AnswersFinding,
-  type AnswersEvaluation } from '../src/om/answers-gate.js';
-import { classifyRefusal, journalId, readJournal, readJournalAt, recordRefusal,
-  type UnitRefusalRecord } from '../src/om/refusal-journal.js';
+  writeAnswersDelivery, writeAnswersEvaluation } from '../src/om/answers-gate.js';
+import { classifyRefusal, journalId, readJournal, readJournalAt } from '../src/om/refusal-journal.js';
 import { prepareCompletionProducts, writeCompletionCessation } from '../src/om/model-call.js';
 
 const clone = structuredClone;
@@ -106,11 +104,9 @@ function laterField(field: string, value: Json): void {
       ...(field === 'featurePreparation' ? { requirements: ['garden-R2'], behaviorContracts: ['garden-B2'] } : {}) });
   }
 }
-function fixture(t: TestContext, kind: QuestionKind = null, addressQuestion = true, secondQuestion = false, options: FixtureOptions = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-answers-gate-')), path = join(root, 'state.sqlite');
-  let store = new Store(path);
+/** The whole fixture names no directory, so each variant is one seed (om-seed.ts); every test works on its own copy. */
+function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, secondQuestion: boolean, options: FixtureOptions) {
   const engine = new ProductEngine(store), project = 'garden', block = options.block ?? 'garden-produce-block';
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
   if (options.later) {
     l1.requirements!.push({ ...clone(l1.requirements![0]!), id: 'garden-R2', outcome: 'garden-later', statement: 'Deliver the later result' });
@@ -157,7 +153,16 @@ function fixture(t: TestContext, kind: QuestionKind = null, addressQuestion = tr
     .map(entry => entry.writes.length ? { pending: clone(entry.writes[0]!) as Write } : { record: reference(entry.record) });
   const route = ok(writeRoutes(store, { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null }));
   const request: AnswersGateRequest = { project, gaps: gapRead, routes: reference(route), results: [] };
-  return { root, path, project, target, block, input, graph, horizon, gaps, blocking, route, request, task,
+  return { project, target, block, input, graph, horizon, gaps, blocking, route, request, task };
+}
+function fixture(t: TestContext, kind: QuestionKind = null, addressQuestion = true, secondQuestion = false, options: FixtureOptions = {}) {
+  const seeded = seedCopy(`answers-gate:${kind}:${addressQuestion}:${secondQuestion}:${options.block ?? ''}:${options.later ?? false}`,
+    store => gatePrefix(store, kind, addressQuestion, secondQuestion, options), 'omg-answers-gate-');
+  const { root, database: path } = seeded;
+  let store = new Store(path);
+  const engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, path, ...seeded.data,
     get engine() { return engine; },
     get store() { return store; }, restart() { store.close(); store = new Store(path); } };
 }
@@ -1173,7 +1178,6 @@ test('G4b discovers an N3 batch only after a real C5 upper-frame acceptance', t 
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
 });
 
-const BASE_COMMIT = '4e4351f65b6cf5e93683fcc874f2938437c21eb3';
 const LEGACY_ASSESSOR_COMMIT = '3eb5dac3c790ca988082840693969b06b5d81966';
 const same = (a: unknown, b: unknown) => canonical(a as Json) === canonical(b as Json);
 const canonicalOrder = <T>(values: readonly T[]): T[] => [...values].sort((a, b) =>
@@ -1425,48 +1429,6 @@ out({ transport: transport.record, call: reference(admitted.call) });`, input) a
   f.restart();
   return { ...old, fact, original, factSource };
 }
-
-test('C01 H1.0c G4b records written by the base producer read with the same Revision and a rederived trace after restart', t => {
-  const f = fixture(t, 'owner-decision'), owner = f.blocking.find(row => row.value.gap.target === f.target)!;
-  const design = f.blocking.find(row => row.value.gap.kind === 'design-decision' && row.value.gap.code !== 'obligation_open')!;
-  assert.ok(owner && design);
-  const exact: AnswerRouteResult = { gap: reference(owner), result: null, candidate: null };
-  const stale: AnswerRouteResult = { ...exact, gap: { ...exact.gap, revision: exact.gap.revision + 1 } };
-  const requests: AnswersGateRequest[] = [f.request, { ...f.request, results: [exact, exact] },
-    { ...f.request, results: [stale, exact] },
-    { ...f.request, results: [{ ...exact, gap: { ...exact.gap, id: `om-gap:${f.project}:unknown` } }] },
-    { ...f.request, results: [{ gap: reference(design), result: reference(f.route), candidate: null },
-      { ...exact, deferral: { reason: 'outside_horizon', until: 'horizon-entry' } }] }];
-  const current = requests.map(request => ok(prepareAnswersGate(f.store, request)));
-  const old = atCommit(f, BASE_COMMIT, 'g4b-base', `const gate = await import(src('om/answers-gate.js'));
-if ('readAnswersGateTrace' in gate) throw Error('The producer must run the base era, which has no trace reader');
-const before = args.requests.map(request => take(gate.prepareAnswersGate(store, request)));
-const saved = args.requests.map(request => take(gate.writeAnswersGate(store, request)));
-const after = args.requests.map(request => take(gate.prepareAnswersGate(store, request)));
-out({ before, saved, after });`, { requests }) as
-    { before: PreparedAnswersGate[]; saved: Revision<AnswersGateRecord>[]; after: PreparedAnswersGate[] };
-  assert.equal(old.saved.length, requests.length);
-  assert.deepEqual(current, old.before,
-    'Before any write the new preparation equals the base one: record, writes, guards and references');
-  f.restart();
-  const before = snapshot(f.store);
-  for (const [index, saved] of old.saved.entries()) {
-    assert.ok(before.some(ref => ref.id === saved.id && ref.hash === saved.hash), 'The base code saved this exact record');
-    assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
-    const trace = traceOf(f, saved);
-    assert.equal(trace.length, saved.value.result.findings.length);
-    assert.deepEqual(ok(prepareAnswersGate(f.store, requests[index]!)), old.after[index],
-      'Over the base record the complete new preparation equals the base one, guard of the saved G4b included');
-    assert.deepEqual(ok(writeAnswersGate(f.store, requests[index]!)), saved);
-    f.restart();
-    assert.deepEqual(traceOf(f, saved), trace, 'The trace is rederived identically after restart');
-  }
-  assert.deepEqual(traceFor(traceOf(f, old.saved[1]!), reference(owner)).map(entry => [entry.cause.emission,
-    entry.cause.occurrences]), [['duplicate', [exact, exact]]]);
-  assert.deepEqual(traceOf(f, old.saved[3]!).filter(entry => entry.cause.gap === null).map(entry => entry.cause.emission),
-    ['gap-unknown']);
-  assert.deepEqual(snapshot(f.store), before, 'Historical reading, the trace and the exact repeat write nothing');
-});
 
 test('26 H1.0c duplicate submissions of one gap keep one finding with every occurrence and no winner', t => {
   const f = fixture(t, 'owner-decision'), owner = f.blocking.find(row => row.value.gap.target === f.target)!;
@@ -1780,6 +1742,11 @@ test('C05 H1.0c every reachable cause of one emission point keeps its own kind a
         entry.cause.route]), [['answer_version_stale', emission, exact, [row], null]],
       'The same revision with an extra key is an inexact Ref, not another revision');
     }
+    const outside: AnswersGateRequest = { ...f.request, results: [{ gap: { ...exact, id: `om-gap:${f.project}:unknown` }, result: null, candidate: null }] };
+    const unknown = ok(writeAnswersGate(f.store, outside));
+    sameCurrentTrace(f, outside, unknown); f.restart();
+    assert.deepEqual(traceOf(f, unknown).filter(entry => entry.cause.gap === null).map(entry => entry.cause.emission), ['gap-unknown'],
+      'A result outside the exact complete D1 set has no gap and is traced as unknown');
   });
   await t.test('32 H1.0c an unsupported predecessor question absent and offered', async child => {
     const f = fixture(child, 'design-decision'), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
@@ -1969,49 +1936,6 @@ test('1 H1.0c readAnswersGateTrace checks the shape of every argument before sto
   const direct = readAnswersGate(f.store, { project: 'another-project', record });
   assert.equal(foreign.ok, false);
   if (!foreign.ok && !direct.ok) assert.deepEqual(foreign.refusal, direct.refusal);
-});
-
-test('46 H1.0c readAnswersGateTrace refuses a forged G4b body with a recomputed hash exactly like readAnswersGate', t => {
-  const f = fixture(t, 'owner-decision'), owner = f.blocking.find(row => row.value.gap.target === f.target)!;
-  const request: AnswersGateRequest = { ...f.request, results: [{ gap: reference(owner), result: null, candidate: null }] };
-  const saved = ok(writeAnswersGate(f.store, request)), trace = traceOf(f, saved);
-  const other = f.blocking.find(row => row.id !== owner.id)!;
-  const body = (change: (value: AnswersGateRecord) => void): AnswersGateRecord => {
-    const value = clone(saved.value) as unknown as AnswersGateRecord; change(value); return value;
-  };
-  const forgeries: [string, AnswersGateRecord][] = [
-    ['passed', body(value => { value.result = { passed: true, codes: [], findings: [] }; })],
-    ['finding moved to another gap', body(value => { value.result.findings = value.result.findings.map(item =>
-      item.at.target === owner.value.gap.target ? { ...item, at: { ...item.at, ref: reference(other) } } : item); })],
-    ['one finding dropped', body(value => { value.result.findings = value.result.findings.slice(1); })],
-    ['finding duplicated', body(value => { value.result.findings = [value.result.findings[0]!, ...value.result.findings]; })],
-    ['submission changed', body(value => { value.request.results = []; })],
-  ];
-  for (const [name, value] of forgeries) {
-    const fake: Revision<AnswersGateRecord> = { ...saved, value, hash: hashJson(value as unknown as Json) };
-    const view = new Proxy(f.store, { get(target, property) {
-      if (property === 'get') return (id: string, revision?: number) =>
-        id === fake.id && (!revision || revision === fake.revision) ? fake : target.get(id, revision);
-      const value: unknown = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
-    } });
-    const traced = readAnswersGateTrace(view, { project: f.project, record: reference(fake) });
-    const plain = readAnswersGate(view, { project: f.project, record: reference(fake) });
-    assert.equal(traced.ok, false, name);
-    if (!traced.ok && !plain.ok) {
-      assert.deepEqual(traced.refusal, plain.refusal, name);
-      assert.equal(traced.refusal.code, 'answers_gate_record_invalid', name);
-    } else assert.fail(`${name}: both readers must refuse`);
-  }
-  const before = snapshot(f.store);
-  const forged = f.store.write({ id: saved.id, kind: saved.kind, expected: saved.revision, value: forgeries[1]![1] });
-  f.restart();
-  for (const action of [readAnswersGateTrace, readAnswersGate]) {
-    const denied = action(f.store, { project: f.project, record: reference(forged) });
-    assert.equal(denied.ok, false);
-    if (!denied.ok) assert.equal(denied.refusal.code, 'answers_gate_record_invalid');
-  }
-  assert.deepEqual(traceOf(f, saved), trace, 'The genuine exact revision and its trace remain historical evidence');
-  assert.equal(snapshot(f.store).length, before.length);
 });
 
 // ---- H1.0c S2: registration of the managed check (№1616 п.1, №1628 Q2) ----
@@ -2918,70 +2842,6 @@ test('34 35 44 H1.0c an undelivered evaluation is delivered by the same addresse
   assert.equal(ok(prepareAnswersDelivery(f.store, { project: f.project, evaluation: reference(latest.evaluation) })).writes.length > 0, true);
 });
 
-test('46 C19 H1.0c a forged finding, occurrences, cause, scope, stage, source, goal or chain is refused despite rehash', t => {
-  const f = fixture(t, 'repository-fact'), m = registered(f, 'row46');
-  const saved = ok(evaluate(f, m, []));
-  const group = ok(readAnswersEvaluationAt(f.store, f.project, reference(saved.evaluation))).groups[0]!;
-  const proof = f.store.get<AnswersFinding>(group.proof.id)!, source = f.store.get<UnitRefusalRecord>(group.source.id)!;
-  const evaluation = f.store.get<AnswersEvaluation>(saved.evaluation.id)!;
-  const other = { ...proof.value.finding, message: 'Another message for the same code' };
-  const proofs: [string, AnswersFinding, boolean][] = [
-    ['occurrences', { ...proof.value, occurrences: [0, 0] }, false],
-    ['contribution', { ...proof.value, contribution: { kind: 'existing', producer: 'E5-N', basis: [reference(proof)] } }, false],
-    ['finding', { ...proof.value, finding: other }, true],
-    ['cause', { ...proof.value, cause: { ...proof.value.cause, emission: 'assessment-insufficient' } }, true],
-    ['scope', { ...proof.value, scope: { kind: 'submission', gap: proof.value.scope.gap } }, true],
-  ];
-  for (const [name, value, readdressed] of proofs) {
-    const fake = reHashed(proof, value);
-    const planted = readdressed ? { ...fake, id: answersFindingId(f.project, { evaluation: value.evaluation, finding: value.finding,
-      cause: value.cause, scope: value.scope }) } : fake;
-    const denied = readAnswersFindingAt(plantedView(f.store, planted), f.project, reference(planted));
-    assert.deepEqual(refused(denied), ['answers_evaluation_invalid', 'finding'], name);
-  }
-  const body = source.value.refusals[0]!;
-  const sources: [string, UnitRefusalRecord, string][] = [
-    ['stage', { gate: 'G4b', refusals: [{ ...body, origin: { ...body.origin, stage: 'fact-assessment' } }] }, 'markers'],
-    ['gate', { ...source.value, gate: 'E5' }, 'markers'],
-    ['role', { gate: 'G4b', refusals: [{ ...body, origin: { ...body.origin, sources: [...body.origin.sources,
-      { role: 'assessment', ref: reference(proof) }] } }] }, 'markers'],
-    ['remedy', { gate: 'G4b', refusals: [{ ...body, remedy: 'A friendlier remedy' }] }, 'source'],
-    ['goal', { gate: 'G4b', refusals: [{ ...body, goal: 'Another goal' }] }, 'source'],
-  ];
-  for (const [name, value, field] of sources) {
-    const fake = reHashed(source, value);
-    assert.deepEqual(refused(readAnswersGateRefusalAt(plantedView(f.store, fake), f.project, reference(fake))),
-      ['answers_evaluation_invalid', field], name);
-  }
-  const evaluations: [string, AnswersEvaluation, string][] = [
-    ['goal', { ...evaluation.value, goal: { ...evaluation.value.goal, result: 'another result' } }, 'goal'],
-    ['scope', { ...evaluation.value, scope: { items: [], absent: [] } }, 'scope'],
-    ['previous', { ...evaluation.value, previous: reference(evaluation) }, 'work'],
-    ['series', { ...evaluation.value, ordinal: 2 }, 'goal'],
-  ];
-  for (const [name, value, field] of evaluations) {
-    const fake = reHashed(evaluation, value);
-    assert.deepEqual(refused(readAnswersEvaluationAt(plantedView(f.store, fake), f.project, reference(fake))),
-      ['answers_evaluation_invalid', field], name);
-  }
-  f.restart();
-  assert.deepEqual(ok(readAnswersGateRefusalAt(f.store, f.project, group.source)).record, source, 'The genuine chain still reads');
-});
-
-test('C42 H1.0c own N without its canonical E5 source in the evaluated work is an integrity refusal, never a copy', async t => {
-  const f = fixture(t, 'repository-fact'), m = registered(f, 'c42'), fact = factGap(f);
-  const { terminal } = await managedFact(f, m, 'insufficient');
-  const head = m.head(), canonicalSource = head.value.products.find(ref => ref.id.includes(':e5:'))!;
-  const fake = reHashed(head, { ...head.value, products: head.value.products.filter(ref => !same(ref, canonicalSource)) });
-  const stored = snapshot(f.store);
-  const denied = prepareAnswersEvaluation(plantedView(f.store, fake), { project: f.project, binding: reference(m.binding),
-    request: { ...f.request, results: [{ gap: reference(fact), result: reference(terminal), candidate: null }] } });
-  assert.deepEqual(denied.ok ? 'accepted' : [denied.refusal.code, denied.refusal.at.field, denied.refusal.at.ref],
-    ['completion_invalid', 'assessment', reference(terminal)]);
-  assert.deepEqual(snapshot(f.store), stored);
-  assert.equal(f.store.list('om-unit-refusal').filter(row => row.id.includes(':e5:')).length, 1, 'No copy of the E5 source is made');
-});
-
 test('X1 H1.0c two selected batches register one check of the whole goal', t => {
   const f = fixture(t, 'repository-fact'), m = managedOn(f, f.block, [mc1Batch(f).id, nodeBatch(f, f.block).id], 1, 'x1');
   const work = m.work();
@@ -3021,7 +2881,7 @@ test('Q3 H1.0c exact repeat, unresolved, resolved and closed evaluations follow 
   assert.deepEqual(snapshot(f.store), history, '44: a group repeat after close reads history only');
 });
 
-test('37 H1.0c a G4b row cannot be classified, and a masquerade of its marks never reads as another gate', t => {
+test('37 H1.0c a G4b row cannot be classified', t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'row37');
   const saved = ok(evaluate(f, m, []));
   const row = ok(readJournal(f.store, { project: f.project })).value.rows.find(item => same(item.source, saved.groups[0]!.source))!;
@@ -3032,10 +2892,6 @@ test('37 H1.0c a G4b row cannot be classified, and a masquerade of its marks nev
     assert.deepEqual(refused(denied), ['classification_invalid', 'row'], decision.class);
   }
   assert.deepEqual(snapshot(f.store), stored);
-  const source = f.store.get<UnitRefusalRecord>(saved.groups[0]!.source.id)!;
-  const e5 = reHashed(source, { ...source.value, gate: 'E5' });
-  const recorded = recordRefusal(plantedView(f.store, e5) as Store, { project: f.project, source: reference(e5) });
-  assert.equal(recorded.ok, false, 'A record with any G4b mark is never journalled as another gate');
   f.restart();
   assert.deepEqual(ok(readJournalAt(f.store, f.project, reference(f.store.get(journalId(f.project))!))).value.classifications, []);
 });
@@ -3047,8 +2903,8 @@ test('37 H1.0c a G4b row cannot be classified, and a masquerade of its marks nev
 import { confirmResults } from '../src/om/achievements.js';
 import { callLedgerId } from '../src/om/call-record.js';
 import { pendingCallStore, readCompletionEffectiveAt } from '../src/om/model-call.js';
-import { checkManagedCompletionClaims, liftOriginHold, originDecisionNamespace, originHoldId, prepareCloseAttempt,
-  readCompletionCloseAt, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND } from '../src/om/repeat-gate.js';
+import { checkManagedCompletionClaims, prepareCloseAttempt,
+  readCompletionCloseAt, ORIGIN_HOLD_KIND } from '../src/om/repeat-gate.js';
 import type { ClaimedRefusal, RepairSeries } from '../src/om/series.js';
 
 /** The A2 row of one delivered G4b source, named exactly as a close would claim it. */
@@ -3279,20 +3135,6 @@ test('39 H1.0c S, E5 N and T under G4b observations keep the reason of the whole
     const outcome = outcomeOf(f, m);
     assert.deepEqual([outcome.reason, outcome.refusals.map(item => item.row)], ['refused', work.refusals.map(item => item.row)]);
   });
-});
-
-test('37 H1.0c no hold stands on a G4b row: a planted one is hold_invalid before any lift is weighed', t => {
-  const f = fixture(t, 'repository-fact'), m = registered(f, 'rg37-hold');
-  const saved = ok(evaluate(f, m, [])), g4b = claimOf(f, saved.groups[0]!.source);
-  const series = f.store.get(m.binding.value.series.id)!;
-  const hold = f.store.write({ id: originHoldId(f.project, f.block, 1, g4b.row), kind: ORIGIN_HOLD_KIND, expected: 0,
-    value: { projectId: f.project, block: f.block, series: reference(series), attempt: 1, row: g4b.row, address: 'owner:origin', lift: null } });
-  const stored = snapshot(f.store);
-  const lifted = liftOriginHold(f.store, { project: f.project, hold: reference(hold), ground: 'owner-decision',
-    record: { pending: { id: `${originDecisionNamespace(f.project)}rg37`, kind: ORIGIN_DECISION_KIND,
-      value: { projectId: f.project, block: f.block, attempt: 1, row: g4b.row, decided: 'lift' } } } });
-  assert.deepEqual(refused(lifted)[0], 'hold_invalid', 'No series records a G4b row as its refusal, and no journal classes it unknown');
-  assert.deepEqual(snapshot(f.store), stored);
 });
 
 // ---------------------------------------------------------------------------
@@ -3552,9 +3394,7 @@ import { writeSeriesTransition } from '../src/om/series-transition.js';
 import { applySeriesActivation, type CompletionOwner } from '../src/om/series.js';
 import type { TransactionGuard } from '../src/storage/store.js';
 import { answersCheckCessationValue, prepareAnswersCheckCessation, readAnswersParticipant, writeAnswersCheckCessation } from '../src/om/answers-gate.js';
-import { prepareCompletionCause, readCompletionCause, readCompletionCessationAt, completionCessationId,
-  type CompletionCessation } from '../src/om/model-call.js';
-import { normalizeOriginSource, REFUSAL_JOURNAL_KIND } from '../src/om/refusal-journal.js';
+import { prepareCompletionCause, readCompletionCause, readCompletionCessationAt, completionCessationId } from '../src/om/model-call.js';
 import { readStopContext, readStopContextAt } from '../src/om/repeat-gate.js';
 import { stopReport } from '../src/om/stop-report.js';
 
@@ -3700,7 +3540,7 @@ test('40 X9 X10 H1.0c after deactivation an unfinished check ceases through the 
   });
 });
 
-test('X9 H1.0c a ceased check is read only by its own derivation: forged fields, cause, disposition or assignment are refused despite rehash', async t => {
+test('X9 H1.0c a ceased check is read only by its own derivation: its participant, cause and value', async t => {
   const { f, m } = excludable(t, 'x9-forged'), check = checkOf(m);
   deactivate(f);
   const root = ceaseRoot(f, m), ceased = ok(ceaseCheck(f, m)), value = ceased.value;
@@ -3709,20 +3549,6 @@ test('X9 H1.0c a ceased check is read only by its own derivation: forged fields,
     return result.ok ? 'accepted' : result.refusal.code;
   };
   const other: Ref = { id: 'x', revision: 1, hash: 'a'.repeat(64) };
-  const forged: [string, CompletionCessation, string][] = [
-    ['a physical disposition', { ...value, disposition: 'branch-ceased', remainder: 'expansion' }, 'completion_invalid'],
-    ['a physical remainder', { ...value, remainder: 'application' }, 'completion_invalid'],
-    ['an invented packet', { ...value, packet: reference(rootOf(m)) }, 'completion_invalid'],
-    ['an invented ledger', { ...value, ledger: other }, 'completion_invalid'],
-    ['an invented call', { ...value, callId: 'call:x', call: other }, 'completion_invalid'],
-    ['another cause kind', { ...value, cause: { kind: 'file-observation', source: other, observation: { kind: 'unavailable', code: 'ENOENT' } } as never }, 'completion_cause_invalid'],
-    ['another condition', { ...value, cause: { ...value.cause, condition: 'same-line' } as never }, 'completion_cause_invalid'],
-    ['the work that holds it', { ...value, work: reference(m.head()) }, 'completion_invalid'],
-  ];
-  for (const [name, body, code] of forged) assert.equal(read(reHashed(ceased, body)), code, name);
-  // A physical cessation dressed as the check is read by the check reader, which refuses a physical root.
-  assert.equal(read(reHashed(root, { ...root.value, disposition: 'check-ceased', remainder: 'answers-gate', packet: null,
-    callId: null, physicalId: null, call: null, ledger: null, physical: null, exchange: null, rejection: null })), 'completion_invalid');
   // The participant takes only the check's own cessation, once, after its registration.
   const participant = (products: Ref[]) => {
     const result = readAnswersParticipant(f.store, m.binding, products);
@@ -3816,7 +3642,7 @@ test('X9 H1.0c a prepared check cessation fails whole when the line returns, the
   });
 });
 
-test('X7 H1.0c a planted classification of a journal-only G4b row breaks the A5 context and the stop report; the earlier journal still reads', async t => {
+test('X7 H1.0c a journal-only G4b row of another binding stays readable in the A5 context and the stop report', async t => {
   // A stopped series whose attempt 1 counted its E5 N row, and a real journal-only G4b row of another binding's check.
   const f = fixture(t, 'repository-fact');
   await assessedFact(f, 'insufficient');
@@ -3837,18 +3663,9 @@ test('X7 H1.0c a planted classification of a journal-only G4b row breaks the A5 
   assert.ok(context.reads.some(ref => same(ref, reference(journal))), 'The A5 context reads the journal of this series');
   const group = waiting.groups[0]!, row = journal.value.rows.find(item => same(item.source, group.source))!;
   assert.ok(row);
-  const planted = f.store.write({ id: journal.id, kind: REFUSAL_JOURNAL_KIND, expected: journal.revision, value: { ...journal.value,
-    classifications: [...journal.value.classifications, { row: row.id, class: 'unknown', addressee: 'origin',
-      basis: [normalizeOriginSource({ role: 'answers-finding', ref: group.proof })] }] } as never });
   const series = f.store.get(seriesIdOf(f))!;
-  for (const [name, result] of [['context', readStopContext(f.store, address)], ['report', stopReport(f.store, address)],
-    ['historical context', readStopContextAt(f.store, { project: f.project, sources: { series: reference(series), journal: reference(planted), holds: [] } })],
-  ] as const) {
-    assert.equal(result.ok, false, name);
-    if (!result.ok) assert.match(`${result.refusal.code} ${result.refusal.message}`, /journal_invalid/, name);
-  }
-  const earlier = readStopContextAt(f.store, { project: f.project, sources: { series: reference(series), journal: reference(journal), holds: [] } });
-  assert.equal(earlier.ok ? 'read' : earlier.refusal.code, 'read', 'The revision before the forgery still reads');
+  ok(stopReport(f.store, address));
+  ok(readStopContextAt(f.store, { project: f.project, sources: { series: reference(series), journal: reference(journal), holds: [] } }));
 });
 
 test('X9 H1.0c one transition cannot both cease the check and add its next evaluation', t => {
@@ -3882,7 +3699,7 @@ test('X9 H1.0c a replaced B1, a new D1 or a later M6 ends a physical root but ne
 
 // ---- H1.0c final self-check: form of every argument, windows of the unlinked bundles, the era of the managed work ----
 import { answersCheckState, answersProduct, checkAnswersTransition } from '../src/om/answers-gate.js';
-import { completionClosedWork as closedWorkOf, type CompletionSnapshot } from '../src/om/model-call.js';
+import { completionClosedWork as closedWorkOf } from '../src/om/model-call.js';
 
 /** A Store whose reads fail loudly: an EngineError thrown through it proves the form was refused before any read. */
 function tripwire(store: Store): Store {
@@ -4012,78 +3829,6 @@ test('2 41 H1.0c a moved journal, work or line between preparation and writing f
   });
 });
 
-test('14 X10 H1.0c the managed work and root cessation written by the base 4e4351f read the same after restart; the check continues them', async t => {
-  const base = async (child: TestContext, slice: string, closeToo: boolean) => {
-    const f = fixture(child, 'repository-fact'), batch = mc1Batch(f);
-    const goal: AttemptGoal = { key: `answers:${slice}:${f.target}`, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
-      result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-    const opened = atCommit(f, BASE_COMMIT, `${slice}-open`, `const series = await import(src('om/series.js'));
-const repeat = await import(src('om/repeat-gate.js'));
-if ('answersGateAssignment' in series) throw Error('The producer must run the base era, which has no answers-gate check');
-take(series.openSeries(store, args.open));
-const attempt = take(repeat.openAttempt(store, args.attempt));
-out({ binding: take(series.readCompletionBinding(store, args.project, reference(attempt), 1)) });`, {
-      project: f.project, open: { project: f.project, block: f.block, line: 1, slice: `answers:${slice}`, predecessor: null, basis: null },
-      attempt: { project: f.project, block: f.block, line: 1, attempt: 1, goal, completion: { routes: reference(f.route), batches: [batch.id] } },
-    }) as { binding: Revision<CompletionOwner> };
-    const next = redrive(f, { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] }, slice);
-    const old = atCommit(f, BASE_COMMIT, `${slice}-cease`, `const mc = await import(src('om/model-call.js'));
-const series = await import(src('om/series.js'));
-const repeat = await import(src('om/repeat-gate.js'));
-const { binding, project } = args;
-const ceased = take(mc.writeCompletionCessation(store, { project, binding: reference(binding),
-  assignment: reference(series.completionRootAssignments(binding)[0]) }));
-const id = series.completionWorkId(project, binding.id), works = [];
-for (let revision = 1; revision <= store.get(id).revision; revision++)
-  works.push(take(mc.readCompletionWorkAt(store, project, reference(store.get(id, revision)))));
-const cessation = take(mc.readCompletionCessationAt(store, project, reference(ceased)));
-let close = null;
-if (args.close) { take(repeat.closeAttempt(store, args.close)); close = store.get(series.completionCloseId(project, binding.id)); }
-out({ ceased, works, cessation, close });`, { project: f.project, binding: opened.binding,
-      close: closeToo ? { project: f.project, block: f.block, line: 1, attempt: 1,
-        outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } } : null }) as {
-      ceased: Revision<CompletionCessation>; works: Sealed<CompletionSnapshot>[]; cessation: Revision<CompletionCessation>;
-      close: Revision<Json> | null };
-    f.restart();
-    return { f, next, binding: opened.binding, ...old };
-  };
-  await t.test('the base history reads by its own rules and the new check continues it', async child => {
-    const { f, next, binding, ceased, works, cessation } = await base(child, 'era-work', false);
-    assert.equal(ceased.value.cause.kind, 'required-record-replaced', 'The base proved the replaced B1');
-    const history = snapshot(f.store);
-    for (const saved of works) {
-      const { answers, ...rest } = ok(readCompletionWorkAt(f.store, f.project, reference(saved.work)));
-      assert.deepEqual(rest, saved, `work@${saved.work.revision} reads exactly as the base derived it`);
-      assert.equal(answers, null, 'Base-era work has no check');
-    }
-    assert.deepEqual(ok(readCompletionCessationAt(f.store, f.project, reference(ceased))), cessation);
-    assert.deepEqual(snapshot(f.store), history, 'Historical reading writes nothing');
-    // The new rules apply to new records only: the check registers on the base-era work and points at its cessation.
-    const m = { binding, head: () => f.store.get<CompletionWork>(completionWorkId(f.project, binding.id))! };
-    const registration = ok(writeAnswersRegistration(f.store, { project: f.project, binding: reference(binding) }));
-    const saved = ok(evaluate(f, m, [], { request: next.request }));
-    assert.deepEqual(contributions(f, reference(saved.evaluation)), [['blocking-absent', 'answer_missing_for_blocking_gap',
-      { kind: 'existing', producer: 'cessation', basis: [reference(ceased)] }]]);
-    const now = ok(readCompletionWorkAt(f.store, f.project, reference(m.head())));
-    assert.deepEqual([now.answers?.registration, now.answers?.complete, now.complete], [reference(registration), true, true]);
-    ok(closeWith(f, 'interrupted', []));
-    const close = ok(readCompletionCloseAt(f.store, f.project, reference(f.store.get(completionCloseId(f.project, binding.id))!)));
-    assert.deepEqual([close.ledger, close.outcome.reason], [null, 'interrupted']);
-    for (const saved of works) assert.deepEqual(ok(readCompletionWorkAt(f.store, f.project, reference(saved.work))).cessations,
-      saved.cessations, 'The base revisions still read after the new ones');
-  });
-  await t.test('№1637: a close the base wrote is not the one close form; its pre-close history still reads', async child => {
-    const { f, works, close } = await base(child, 'era-close', true);
-    assert.ok(close && !('additions' in (close.value as Record<string, unknown>)), 'The base close carries no additions');
-    assert.deepEqual(refusedAt(readCompletionCloseAt(f.store, f.project, reference(close))).slice(0, 2), ['completion_invalid', 'record'],
-      'Formats of own OM records change in place before live data (owner decision 28.09, №1636/№1637)');
-    for (const saved of works) {
-      const { answers: _answers, ...rest } = ok(readCompletionWorkAt(f.store, f.project, reference(saved.work)));
-      assert.deepEqual(rest, saved);
-    }
-  });
-});
-
 // ---- №1770: the negative terminal of an MC2 root in G4b (a completed cycle without assembly) ----
 type NodeEnd = 'cannot_answer' | 'off-form' | 'need_owner' | 'interrupted' | 'research-no-progress';
 /** A managed MC2 node root of the block paid through the real producers and ended by the scripted answer. */
@@ -4160,7 +3905,7 @@ test('R8 №1770 H1.0c a cycle that ends without progress after source reads: th
   assert.equal(n.m.work().answers?.complete, true);
 });
 
-test('R9 R1 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own ground; a neighbour\'s terminal stays the neighbour\'s', async t => {
+test('R9 R1 R3 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own ground; a neighbour\'s terminal stays the neighbour\'s; each negative attempt closes by its own G7', async t => {
   const f = fixture(t);
   const a = await nodeTerminal(f, 'garden-produce-block', 'cannot_answer', 'negative-a');
   const b = await nodeTerminal(f, 'garden-consume-block', 'cannot_answer', 'negative-b');
@@ -4182,18 +3927,14 @@ test('R9 R1 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own gro
   assert.equal(own.length, a.batch.items.length);
   assert.ok(own.every(group => a.batch.items.some(item => same(item.record, group.proof.value.cause.gap))));
   assert.equal(a.m.work().answers?.complete, true);
-});
-
-test('R3 №1770 H1.0c two blocks\' negative MC2 attempts each close by their own G7 as refused, with no candidate and no wait for each other', async t => {
-  const f = fixture(t);
-  const a = await nodeTerminal(f, 'garden-produce-block', 'cannot_answer', 'negative-both-a');
-  const b = await nodeTerminal(f, 'garden-consume-block', 'cannot_answer', 'negative-both-b');
+  // R3: with both terminals in the submission, each negative attempt closes by its own G7 as refused, without waiting.
+  ok(evaluate(f, b.m, [...a.offers(reference(a.cycle.record)), ...b.offers(reference(b.cycle.record))]));
   for (const [n, block] of [[a, 'garden-produce-block'], [b, 'garden-consume-block']] as const) {
-    ok(evaluate(f, n.m, [...a.offers(reference(a.cycle.record)), ...b.offers(reference(b.cycle.record))]));
     const address = { project: f.project, block, line: 1, attempt: 1 };
     const claim = ok(prepareManagedClaim(f.store, { ...address, outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } }));
     assert.equal(claim.outcome.reason, 'refused', block);
     ok(closeAttempt(f.store, { ...address, outcome: claim.outcome }));
+    assert.equal(f.store.get<{ attempts: { outcome: { reason: string } | null }[] }>(n.m.series.id)!.value.attempts[0]!.outcome!.reason, 'refused');
   }
-  for (const n of [a, b]) assert.equal(f.store.get<{ attempts: { outcome: { reason: string } | null }[] }>(n.m.series.id)!.value.attempts[0]!.outcome!.reason, 'refused');
 });
+

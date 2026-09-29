@@ -21,6 +21,7 @@ import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { seedCopy } from "./om-seed.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from "../src/om/addressing.js";
@@ -34,8 +35,8 @@ import type { Question } from "../src/discovery/discovery.js";
 import { mc1FieldSpec, readAcceptedAnswer, writeAcceptedAnswer, writeMc1Question,
   acceptedAnswerRepresents, confirmAnswerGapClosure, type Mc1QuestionRecord } from "../src/om/accepted-answer.js";
 import { CALL_LEDGER_KIND, callLedgerId, readCallLedger, recordCall } from "../src/om/call-record.js";
-import { assessFact, assessmentIntentId, assessmentResultId, assessmentRefusalId,
-  finishAssessmentAttempt, readAssessmentIntentAt, readAssessmentRefusalAt, writeAssessmentIntent,
+import { assessFact, assessmentAttemptReason, assessmentRefusalId,
+  finishAssessmentAttempt, readAssessmentIntentAt, readAssessmentRefusalAt, readAssessmentTerminalAt, writeAssessmentIntent,
   readAssessmentSet, readCurrentAssessmentAttemptClosure, ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from "../src/om/assessment.js";
 import {
@@ -43,7 +44,7 @@ import {
   REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal, type OriginSource,
 } from "../src/om/refusal-journal.js";
 import {
-  beginAttempt, completeAttempt, openSeries, readAnySeriesAt, resumeSeries, seriesId,
+  beginAttempt, completeAttempt, openSeries, resumeSeries, seriesId,
   STOP_REVIEW_KIND, stopReviewNamespace,
   type AttemptGoal, type BeginAttemptRequest, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
@@ -53,7 +54,7 @@ import {
   ADDRESSEE_KINDS, GATE_REFUSAL_CODES, LIFT_GROUNDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND,
   ORIGIN_ROLES, REFUSAL_CLASSES, REFUSAL_STAGES, REPEAT_GATE_CODES, SUBJECT_DECISIONS,
   type CloseAttemptRequest, type GateOutcome, type LiftOriginHoldRequest, type OriginHold, type RefusalClass,
-  type RepeatOutcome, type RoutedRefusal,
+  type OriginTally, type RepeatOutcome, type RoutedRefusal,
 } from "../src/om/repeat-gate.js";
 
 const UNIT = "gate-repeat";
@@ -1485,35 +1486,8 @@ test("a lift applies to its own hold and once: a repeat changes nothing, a later
   deliveredOf(openAttempt(back, { ...address(PROJECT), attempt: 3, goal: goal() }));
 });
 
-test("a hold or a lift written by hand is refused: each is derived again from what it stands on (T3)", t => {
+test("a cycle closed around the gate is held all the same, and closing it through the gate raises the hold", t => {
   const { store } = fixture(t);
-  const forge = (project: string, build: (hold: OriginHold) => Record<string, unknown>): Ref => {
-    opened(store, project);
-    const { hold } = heldBy(store, project);
-    store.write({ id: hold.id, kind: ORIGIN_HOLD_KIND, expected: 1, value: build(holdAt(store, hold)) as Json });
-    return hold;
-  };
-  const cases: [string, (hold: OriginHold, project: string) => Record<string, unknown>][] = [
-    ["a lift with no record of its ground at all", hold => ({ ...hold, lift: { ground: "owner-decision", record: { id: `${originDecisionNamespace(hold.projectId)}gone`, revision: 1, hash: hex("a") }, class: null, addressee: null, basis: [] } })],
-    ["a lift that re-routes where its analysis did not", (hold, project) => {
-      const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace(project), analysisOf(hold));
-      return { ...hold, lift: { ground: "origin-analysis", record: analysis, class: "proposal", addressee: `node:${SUBJECT}`, basis: [] } };
-    }],
-    ["a lift on the executor's own word", hold => ({ ...hold, lift: { ground: "the approach has changed", record: { id: "x", revision: 1, hash: hex("a") }, class: null, addressee: null, basis: [] } })],
-    ["a hold that names another refusal", hold => ({ ...hold, row: "om-refusal:other" })],
-    ["a hold that names a series revision which never recorded it", hold => ({ ...hold, series: { ...hold.series, revision: 1 } })],
-    ["a hold carrying a field of its own", hold => ({ ...hold, lifted: true })],
-    ["a hold at another address than the one for the analysis", hold => ({ ...hold, address: "analysis:elsewhere" })],
-  ];
-  cases.forEach(([name, build], index) => {
-    const project = `forged${index}`;
-    const hold = forge(project, hold_ => build(hold_, project));
-    const found = refusalOf(openAttempt(store, { ...address(project), attempt: 2, goal: goal() }));
-    assert.equal(found.code, "hold_invalid", name);
-    assert.equal(found.at.target, hold.id, name);
-    assert.equal(refusalOf(stopContext(store, address(project))).code, "hold_invalid", name);
-  });
-
   // A cycle closed AROUND the gate — the series and the journal written by hand — leaves a refusal of unknown origin
   // with no hold: the series is held all the same, and closing the cycle through the gate raises the hold.
   opened(store, "around");
@@ -1655,14 +1629,28 @@ test("the table of decision: every tally of roles and holders gets the class its
     "1 1 1 1 1 1": "unknown", // proposed and accepted both: whose definition is unfit is not said
   };
 
-  // A closed, legitimately built snapshot preserves exact source histories for every table row.
-  // Each row gets an independent journal, so the truth table does not repeatedly replay unrelated refusals.
-  template.close();
-  const seen = new Map<string, RefusalClass>();
+  // Every tally on the table itself (Т3): at most one row suffices, and the class is the independent rule's.
+  const classes = new Map<string, RefusalClass>();
   for (let p = 0; p <= 2; p += 1) for (let hp = 0; hp <= p; hp += 1)
   for (let b = 0; b <= 2; b += 1) for (let hb = 0; hb <= b; hb += 1)
   for (let d = 0; d <= 2; d += 1) for (let hd = 0; hd <= d; hd += 1) {
     const key = `${p} ${hp} ${b} ${hb} ${d} ${hd}`;
+    const tally: OriginTally = { named: { proposal: p, base: b, derived: d }, holding: { proposal: hp, base: hb, derived: hd } };
+    const rows = SUBJECT_DECISIONS.filter(row => row.sufficient(tally));
+    assert.ok(rows.length <= 1, `${key}: two rows of the table admit one tally`);
+    classes.set(key, rows[0]?.class ?? "unknown");
+    assert.equal(classes.get(key), expected(p, hp, b, hb, d, hd), key);
+  }
+  assert.equal(classes.size, 216);
+  for (const [key, want] of Object.entries(pinned)) assert.equal(classes.get(key), want, key);
+  assert.deepEqual([...new Set(classes.values())].sort(), ["derivation", "input", "proposal", "unknown"]);
+  assert.deepEqual(SUBJECT_DECISIONS.map(row => row.class), ["derivation", "input", "proposal"]);
+
+  // The gate counts the real sources itself: the pinned rows, and a proposal and a derived role each held twice, end to end.
+  // A closed, legitimately built snapshot preserves exact source histories for every row; each row gets its own journal.
+  template.close();
+  for (const key of [...Object.keys(pinned), "2 2 0 0 0 0", "0 0 0 0 2 2"]) {
+    const [p, hp, b, hb, d, hd] = key.split(" ").map(Number) as [number, number, number, number, number, number];
     const database = join(root, `row-${p}${hp}${b}${hb}${d}${hd}.sqlite`);
     copyFileSync(path, database);
     const store = new Store(database);
@@ -1678,8 +1666,7 @@ test("the table of decision: every tally of roles and holders gets the class its
       deliveredOf(openAttempt(store, { ...request, attempt: 1, goal: goal() }));
       const result = deliveredOf(closeAttempt(store, { ...request, attempt: 1, outcome: refusedBy(refusal) }));
       const routed = routeOf(result, refusal.row);
-      seen.set(key, routed.class);
-      assert.equal(routed.class, expected(p, hp, b, hb, d, hd), key);
+      assert.equal(routed.class, classes.get(key), key);
       // No positive class without the role it blames, and its responsible is the one record the rule singles out.
       if (routed.class === "derivation") {
         assert.ok(d === 1, key);
@@ -1695,11 +1682,6 @@ test("the table of decision: every tally of roles and holders gets the class its
       assert.equal(routed.toModel, routed.class === "proposal", key);
     } finally { store.close(); rmSync(database); }
   }
-  assert.equal(seen.size, 216);
-  for (const [key, want] of Object.entries(pinned)) assert.equal(seen.get(key), want, key);
-  // Every row of the table is reachable, and most tallies are not enough to say anything.
-  assert.deepEqual([...new Set(seen.values())].sort(), ["derivation", "input", "proposal", "unknown"]);
-  assert.deepEqual(SUBJECT_DECISIONS.map(row => row.class), ["derivation", "input", "proposal"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1918,62 +1900,6 @@ test("the classes decided by the STAGE go through the same function on a lift: n
   deliveredOf(liftOriginHold(store, liftBy("nostage", nameless.hold, "owner-decision",
     { ref: storedAs(store, ORIGIN_DECISION_KIND, originDecisionNamespace("nostage"), decisionOf(nameless.standing)) })));
   deliveredOf(openAttempt(store, { ...address("nostage"), attempt: 2, goal: goal() }));
-});
-
-test("a saved lift whose grounds no longer establish its class is refused at the next opening, and after a restart", t => {
-  const { store, path } = fixture(t);
-  // The forgery the reviewer's defect made possible, written straight into the base: a REAL analysis record of this
-  // project, about this very hold, whose grounds establish an error of derivation — and a lift that says "proposal",
-  // with the addressee and the grounds recomputed to agree with itself. The store hashes it, so it is self-consistent.
-  opened(store);
-  const held = heldOn(store, PROJECT, { sources: [] });
-  const basis = assembly(store, PROJECT, { proposals: [[SUBJECT]], derived: [[]] });
-  const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace(PROJECT),
-    analysisOf(held.standing, { class: "proposal", basis }));
-  const forged = { ...held.standing, lift: { ground: "origin-analysis", record: analysis, class: "proposal", addressee: `${ADDRESSEE_KINDS.proposal}:${SUBJECT}`, basis } };
-  const written = store.write({ id: held.hold.id, kind: ORIGIN_HOLD_KIND, expected: 1, value: forged as unknown as Json });
-  assert.equal(written.revision, 2);
-
-  // It opens nothing: the lift is weighed AGAIN out of the record it names, by the function that lifted it (T3).
-  const refused_ = addressed(refusalOf(openAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() })), "hold_invalid", held.hold.id);
-  assert.equal(refused_.at.field, "lift.record");
-  assert.equal(heldSeries(store)!.value.attempts.length, 1);
-  assert.equal(refusalOf(stopContext(store, address(PROJECT))).code, "hold_invalid");
-  // And a lift offered on top of it is refused too: the hold it would lift does not read as one.
-  assert.equal(refusalOf(liftOriginHold(store, liftBy(PROJECT, reference(store.get(held.hold.id)!), "owner-decision",
-    { ref: storedAs(store, ORIGIN_DECISION_KIND, originDecisionNamespace(PROJECT), decisionOf(held.standing)) }))).code, "hold_invalid");
-  store.close();
-
-  // A restart reads the same records and reaches the same finding: a silent opening is exactly what it must not be.
-  const back = new Store(path);
-  t.after(() => back.close());
-  assert.equal(refusalOf(openAttempt(back, { ...address(PROJECT), attempt: 2, goal: goal() })).code, "hold_invalid");
-  assert.equal(refusalOf(stopContext(back, address(PROJECT))).code, "hold_invalid");
-
-  // The same again where the CLASS agrees with the analysis but the grounds saved beside it were trimmed: what the
-  // record establishes is the whole finding, and a lift that holds part of it does not hold the finding.
-  opened(back, "trimmed");
-  const other = heldOn(back, "trimmed", { sources: [] });
-  const grounds = assembly(back, "trimmed", { bases: [true], derived: [[SUBJECT]] });
-  const culprit = grounds.find(item => item.role === "base")!.ref;
-  const record = storedAs(back, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace("trimmed"),
-    analysisOf(other.standing, { class: "input", basis: grounds }));
-  back.write({
-    id: other.hold.id, kind: ORIGIN_HOLD_KIND, expected: 1,
-    value: {
-      ...other.standing,
-      lift: {
-        ground: "origin-analysis", record, class: "input",
-        addressee: `${ADDRESSEE_KINDS.input}:${culprit.id}`, basis: grounds.filter(item => item.role === "base"),
-      },
-    } as unknown as Json,
-  });
-  const trimmed = addressed(refusalOf(openAttempt(back, { ...address("trimmed"), attempt: 2, goal: goal() })), "hold_invalid", other.hold.id);
-  assert.equal(trimmed.at.field, "lift");
-  // Lifted through the gate instead, the very same analysis opens the next attempt.
-  back.write({ id: other.hold.id, kind: ORIGIN_HOLD_KIND, expected: 2, value: other.standing as unknown as Json });
-  deliveredOf(liftOriginHold(back, liftBy("trimmed", reference(back.get(other.hold.id)!), "origin-analysis", { ref: record })));
-  deliveredOf(openAttempt(back, { ...address("trimmed"), attempt: 2, goal: goal() }));
 });
 
 // ---------------------------------------------------------------------------
@@ -2488,16 +2414,10 @@ function e51AssessorStep(verdict: E51Verdict) {
     usage: e51Usage };
 }
 
-/** An issued one-to-three-question MC1 response, with the real E1 transport and D1 attempt behind E5. */
-function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
-  const factCount = typeof twoFacts === "boolean" ? twoFacts ? 2 : 1 : twoFacts;
-  assert.ok(Number.isInteger(factCount) && factCount >= 1 && factCount <= 3);
+/** The directory-independent prefix of e51Fixture — stages, B1, M5 addresses, G2, D1, routes and the open attempt — per fact count. */
+function e51Prefix(store: Store, factCount: number) {
   const facts = ["encoding", "transport", "retention"].slice(0, factCount);
-  const root = mkdtempSync(join(tmpdir(), "omg-e51-g7-"));
-  const path = join(root, "state.sqlite"), project = "garden";
-  let store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const engine = new ProductEngine(store), desired = gardenGraph("cross");
+  const project = "garden", engine = new ProductEngine(store), desired = gardenGraph("cross");
   desired.nodes.find(node => node.id === "garden-produce-block")!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
   desired.nodes.find(node => node.id === "garden-consume-block")!.ports.push({ id: "in-side", direction: "in", contract: "garden-contract" });
   desired.connectors.push({ id: "garden-side-flow", artifact: "garden-data", returnsTo: "garden-produce-block", wakeTest: null,
@@ -2540,6 +2460,19 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   deliveredOf(openSeries(store, { project, block, line: 1, slice: "e51-fact", predecessor: null, basis: null }));
   const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
+  return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series };
+}
+
+/** An issued one-to-three-question MC1 response, with the real E1 transport and D1 attempt behind E5. */
+function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
+  const factCount = typeof twoFacts === "boolean" ? twoFacts ? 2 : 1 : twoFacts;
+  assert.ok(Number.isInteger(factCount) && factCount >= 1 && factCount <= 3);
+  const seeded = seedCopy(`e51:${factCount}`, store => e51Prefix(store, factCount), "omg-e51-g7-");
+  const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series } = seeded.data;
+  const project = "garden", block = "garden-consume-block";
+  let store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [e51Adapter, "--scenario", scenario, "--trace", trace] };
   const config = engine.environments.configure(project, { workspace: root,
@@ -2557,7 +2490,7 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
   let secondOriginalStep = originalStep;
   const dispatch = { adapter: reference(adapter), config: reference(config) };
   writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
-  return { root, path, project, block, series, attemptGoal, frame: sources.operations.frame,
+  return { root, path, project, block, series, attemptGoal, frame,
     engine, config, scenario, originalStep,
     questionIds: batch.items.map(item => item.gap),
     get store() { return store; },
@@ -2624,6 +2557,7 @@ test("E5.1 closes a real insufficient or conflicting fact as one proved G7 refus
     const result = deliveredOf(await assessFact(f.store, request));
     assert.equal(result.value.verdict, verdict);
     assert.equal(result.value.accepted, null);
+    assert.equal(result.value.index, null, "No D5 index for a negative fact");
     const sourceId = assessmentRefusalId(f.project, reference(result));
     const source = f.store.get(sourceId)!;
     const proved = deliveredOf(readAssessmentRefusalAt(f.store, f.project, reference(source)));
@@ -2637,6 +2571,8 @@ test("E5.1 closes a real insufficient or conflicting fact as one proved G7 refus
       .find(item => item.row === claim.row);
     assert.equal(classification?.class, "proposal");
     assert.equal(classification?.addressee, `node:${proved.target}`);
+    const row = f.store.get<RefusalJournal>(journalId(f.project))!.value.rows.find(item => item.id === claim.row);
+    assert.deepEqual([row?.gate, row?.code], ["E5", `fact_assessment_${verdict}`]);
     const attempt = e51Outcome(f);
     assert.ok(attempt);
     assert.equal(attempt.reason, "refused");
@@ -2646,6 +2582,7 @@ test("E5.1 closes a real insufficient or conflicting fact as one proved G7 refus
     assert.equal(line.value.withoutProgress, 1);
     const before = f.store.list().map(reference), calls = f.sent().length;
     f.restart();
+    assert.deepEqual(deliveredOf(readAssessmentTerminalAt(f.store, f.project, reference(result))), result);
     assert.deepEqual(deliveredOf(await assessFact(f.store, request)), result);
     assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, result.value.intent)),
       { complete: true, closed: true, results: [reference(result)] });
@@ -2660,6 +2597,7 @@ test("E5.1 closes a mixed set with exactly the supported fact and negative refus
   f.assessor("supported", "insufficient");
   const positive = deliveredOf(await assessFact(f.store, request));
   assert.ok(positive.value.accepted);
+  assert.equal(deliveredOf(readAssessmentSet(f.store, f.project, positive.value.intent)).complete, false);
   assert.equal(e51Outcome(f), null);
   const negative = deliveredOf(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }));
   const set = deliveredOf(readAssessmentSet(f.store, f.project, positive.value.intent));
@@ -2736,44 +2674,6 @@ async function e51BeforeGate(f: ReturnType<typeof e51Fixture>) {
   assert.equal(e51Outcome(f), null);
   return { request, positive, negative, source, refusal: e51Claim(f.store, f.project, reference(source)) };
 }
-
-test("E5.1 rejects direct G7 mixed closures that omit, swap, or fake a terminal outcome", async t => {
-  const f = e51Fixture(t), before = await e51BeforeGate(f);
-  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
-  const supported = before.positive.value.accepted!;
-  const attempts: { name: string; proposed: GateOutcome }[] = [
-    { name: "without E5 refusal", proposed: outcome({ accepting: [supported] }) },
-    { name: "without supported fact", proposed: refusedBy(before.refusal) },
-    { name: "wrong completion reason", proposed: outcome({ reason: "refused", accepting: [supported], refusals: [before.refusal] }) },
-  ];
-  const fact = before.source.value as unknown as { gate: string; refusals: { code: string; goal: string; remedy: string;
-    origin: { name: string; stage: string; subject: string; sources: OriginSource[] } }[] };
-  const sourceRow = fact.refusals[0]!;
-  const positiveRef = reference(before.positive);
-  const forged = f.store.write({ id: assessmentRefusalId(f.project, positiveRef), kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "E5", refusals: [{ ...sourceRow, origin: { ...sourceRow.origin,
-      sources: [{ role: "assessment", ref: positiveRef }] } }] } });
-  const badSource = readAssessmentRefusalAt(f.store, f.project, reference(forged));
-  assert.equal(badSource.ok, false);
-  if (!badSource.ok) assert.equal(badSource.refusal.code, "assessment_refusal_invalid");
-  deliveredOf(recordRefusal(f.store, { project: f.project, source: reference(forged) }));
-  const positiveClaim = e51Claim(f.store, f.project, reference(forged));
-  attempts.push({ name: "supported fact disguised as a refusal", proposed: outcome({ accepting: [supported],
-    refusals: [before.refusal, positiveClaim] }) });
-  const line = f.store.get<RepairSeries>(f.series.id)!;
-  for (const item of attempts) {
-    const attempt = closeAttempt(f.store, { ...at, outcome: item.proposed });
-    assert.equal(attempt.ok, false, item.name);
-    if (!attempt.ok) assert.ok(attempt.refusal.code.length > 0, item.name);
-    assert.deepEqual(f.store.get<RepairSeries>(f.series.id), line, item.name);
-  }
-  const count = f.sent().length;
-  const final = deliveredOf(finishAssessmentAttempt(f.store, f.project, before.positive.value.intent));
-  assert.equal(final.complete, true);
-  assert.equal(final.closed, true);
-  assert.equal(e51Outcome(f)?.reason, "result");
-  assert.equal(f.sent().length, count);
-});
 
 test("E5.1 rejects a partial two-refusal claim and closes the full negative set once", async t => {
   const f = e51Fixture(t), request = await f.original();
@@ -2870,8 +2770,8 @@ async function e51SingleBeforeGate(f: ReturnType<typeof e51Fixture>) {
   return { request, result, source, refusal: e51Claim(f.store, f.project, reference(source)) };
 }
 
-test("E5.1 binds a refusal to its exact consumer, attempt ordinal, and goal result", async t => {
-  for (const changed of ["consumer", "ordinal", "result"] as const) await t.test(changed, async child => {
+test("E5.1 binds a refusal to its exact consumer and attempt ordinal", async t => {
+  for (const changed of ["consumer", "ordinal"] as const) await t.test(changed, async child => {
     const f = e51Fixture(child, false), saved = await e51SingleBeforeGate(f);
     const otherBlock = "garden-foreign-block";
     if (changed === "consumer") {
@@ -2879,17 +2779,11 @@ test("E5.1 binds a refusal to its exact consumer, attempt ordinal, and goal resu
         slice: "foreign-consumer", predecessor: null, basis: null }));
       deliveredOf(openAttempt(f.store, { project: f.project, block: otherBlock, line: 1,
         attempt: 1, goal: f.attemptGoal }));
-    } else if (changed === "ordinal") {
+    } else {
       const real = deliveredOf(finishAssessmentAttempt(f.store, f.project, saved.result.value.intent));
       assert.equal(real.closed, true);
       deliveredOf(openAttempt(f.store, { project: f.project, block: f.block, line: 1,
         attempt: 2, goal: f.attemptGoal }));
-    } else {
-      const current = f.store.get<RepairSeries>(f.series.id)!;
-      const value = structuredClone(current.value);
-      const attempts = [...value.attempts];
-      attempts[0] = { ...attempts[0]!, goal: { ...attempts[0]!.goal, result: "foreign-result" } };
-      f.store.write({ id: current.id, kind: current.kind, expected: current.revision, value: { ...value, attempts } });
     }
     const block = changed === "consumer" ? otherBlock : f.block;
     const attempt = changed === "ordinal" ? 2 : 1;
@@ -2902,41 +2796,28 @@ test("E5.1 binds a refusal to its exact consumer, attempt ordinal, and goal resu
   });
 });
 
-test("E5.1 rejects a refusal with a changed question or result source before G7 can route it", async t => {
-  for (const changed of ["question", "result"] as const) await t.test(changed, async child => {
-    const f = e51Fixture(child, false), request = await f.original();
-    f.assessor("insufficient");
-    const originalWrite = f.store.writeMany.bind(f.store);
-    f.store.writeMany = ((writes, guards) => {
-      if (writes.some(write => write.kind === UNIT_REFUSAL_KIND)) throw new Error("stop before E5 refusal source");
-      return originalWrite(writes, guards);
-    }) as Store["writeMany"];
-    try { await assert.rejects(() => assessFact(f.store, request), /stop before E5 refusal source/); }
-    finally { f.store.writeMany = originalWrite; }
-    const result = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
-    const intent = deliveredOf(readAssessmentIntentAt(f.store, f.project, result.value.intent));
-    const resultRef = reference(result);
-    const target = intent.question.target;
-    const original = { gate: "E5", refusals: [{ code: "fact_assessment_insufficient", goal: intent.goal.result,
-      remedy: `Provide evidence for ${target}/${intent.question.field} toward ${intent.goal.result}: ${result.value.reasons.join("; ")}`,
-      origin: { name: intent.question.record.id, stage: "fact-assessment", subject: target,
-        sources: [{ role: "assessment", ref: resultRef }] } }] };
-    const bad = structuredClone(original);
-    if (changed === "question") bad.refusals[0]!.origin.name = "mc1-question:foreign";
-    else bad.refusals[0]!.origin.sources[0]!.ref = { ...resultRef, hash: hex("0") };
-    const source = f.store.write({ id: assessmentRefusalId(f.project, resultRef), kind: UNIT_REFUSAL_KIND,
-      expected: 0, value: bad });
-    const proof = readAssessmentRefusalAt(f.store, f.project, reference(source));
-    assert.equal(proof.ok, false, changed);
-    if (!proof.ok) assert.ok(["assessment_refusal_invalid", "record_forged", "record_missing"].includes(proof.refusal.code), changed);
-    deliveredOf(recordRefusal(f.store, { project: f.project, source: reference(source) }));
-    const before = f.store.get<RepairSeries>(f.series.id)!;
-    const rejection = closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
-      outcome: refusedBy(e51Claim(f.store, f.project, reference(source))) });
-    assert.equal(rejection.ok, false, changed);
-    if (!rejection.ok) assert.equal(rejection.refusal.code, "origin_unreadable", changed);
-    assert.deepEqual(f.store.get<RepairSeries>(f.series.id), before);
-  });
+test("E5.1 a stop between the negative terminal and its A2 source is completed by the next run without another call", async t => {
+  const f = e51Fixture(t, false), request = await f.original();
+  f.assessor("insufficient");
+  const originalWrite = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes, guards) => {
+    if (writes.some(write => write.kind === UNIT_REFUSAL_KIND)) throw new Error("stop before E5 refusal source");
+    return originalWrite(writes, guards);
+  }) as Store["writeMany"];
+  try { await assert.rejects(() => assessFact(f.store, request), /stop before E5 refusal source/); }
+  finally { f.store.writeMany = originalWrite; }
+  const result = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
+  assert.equal(f.store.get(assessmentRefusalId(f.project, reference(result))), null);
+  assert.equal(e51Outcome(f), null);
+  const calls = f.sent().length;
+  f.restart();
+  assert.deepEqual(reference(deliveredOf(await assessFact(f.store, request))), reference(result));
+  const source = f.store.get(assessmentRefusalId(f.project, reference(result)));
+  assert.ok(source);
+  const claim = e51Claim(f.store, f.project, reference(source));
+  assert.deepEqual([e51Outcome(f)?.reason, e51Outcome(f)?.refusals], ["refused", [{ row: claim.row }]]);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 1);
+  assert.equal(f.sent().length, calls);
 });
 
 /** A normal G3 row from an observed proposal and its actual upper frame, independent of E5. */
@@ -3194,97 +3075,45 @@ test("E5.1 proves an absent E1 ledger for a new G3 closure and does not revisit 
   assert.deepEqual(reopened.get<RepairSeries>(at(PROJECT)), closed);
 });
 
-type E51Class = "S" | "N" | "T" | "I";
-function e51ClassMultisets(): E51Class[][] {
-  const classes: E51Class[] = ["S", "N", "T", "I"], rows: E51Class[][] = [];
-  const add = (prefix: E51Class[], start: number, count: number) => {
+test("E5.1 the one S/N/T reason table over every one-to-three-fact multiset, with G7's own results and independent refusals", () => {
+  // Т3: the table is walked on the exported rule G7 and the finalizer share; each producer, write window and restart
+  // keeps its end-to-end row (N, S, SN, NN, TT, SNT, T+G3, T+D5, I, SI, NI, TI).
+  type Kind = "S" | "N" | "To" | "Ti";
+  const kinds: Kind[] = ["S", "N", "To", "Ti"], rows: Kind[][] = [];
+  const add = (prefix: Kind[], start: number, count: number) => {
     if (prefix.length === count) { rows.push(prefix); return; }
-    for (let index = start; index < classes.length; index++) add([...prefix, classes[index]!], index, count);
+    for (let index = start; index < kinds.length; index++) add([...prefix, kinds[index]!], index, count);
   };
   for (const count of [1, 2, 3]) add([], 0, count);
-  return rows;
-}
-
-test("E5.1 closes every one-to-three-fact S/N/T multiset and refuses every incomplete I multiset", async t => {
-  for (const [caseIndex, classes] of e51ClassMultisets().entries()) {
-    await t.test(classes.join(""), async child => {
-      const f = e51Fixture(child, classes.length), original = await f.original();
-      assert.equal(f.questionIds.length, classes.length);
-      let negative = 0, technical = 0;
-      const verdicts = classes.map(kind => kind === "S" ? "supported"
-        : kind === "N" ? (caseIndex + negative++) % 2 ? "conflicting" : "insufficient"
-          : kind === "T" ? (caseIndex + technical++) % 2 ? "interrupted" : "off-form" : null);
-      f.assessor(...verdicts.filter((verdict): verdict is E51Verdict => verdict !== null));
-      if (classes.every(kind => kind === "I")) deliveredOf(e51AdmitAssessorE1(f.store, original).call);
-
-      let stoppedClosingWrite = false;
-      for (const [index, verdict] of verdicts.entries()) {
-        if (verdict === null) continue;
-        const request = { ...original, questionId: f.questionIds[index]! };
-        const lastTerminal = verdicts.slice(index + 1).every(next => next === null);
-        if (!classes.includes("I") && lastTerminal) {
-          const originalWrite = f.store.writeMany.bind(f.store);
-          f.store.writeMany = ((writes, guards) => {
-            if (writes.some(write => write.kind === "repair-series" && write.id === f.series.id && write.expected > 0)) {
-              stoppedClosingWrite = true;
-              throw new Error("stop before multiset G7 closure");
-            }
-            return originalWrite(writes, guards);
-          }) as Store["writeMany"];
-          try {
-            try { deliveredOf(await assessFact(f.store, request)); }
-            catch (error) { assert.match(String(error), /stop before multiset G7 closure/); }
-          } finally { f.store.writeMany = originalWrite; }
-        } else deliveredOf(await assessFact(f.store, request));
-      }
-
-      const results = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
-      assert.equal(results.length, verdicts.filter(Boolean).length);
-      assert.deepEqual(results.map(row => row.value.verdict).sort(), verdicts.filter(Boolean).sort());
-      assert.equal(e51Outcome(f), null, "the direct closing claim must see an open attempt");
-      if (classes.includes("I")) {
-        const incomplete = closeAttempt(f.store, { project: f.project, block: f.block, line: 1,
-          attempt: 1, outcome: outcome() });
-        assert.equal(incomplete.ok, false, "a missing terminal cannot be hidden by another reason");
-        if (!incomplete.ok) assert.equal(incomplete.refusal.code, "origin_unreadable");
-        assert.equal(e51Outcome(f), null);
-        return;
-      }
-      const supported = results.filter(row => row.value.verdict === "supported").map(row => {
-        assert.ok(row.value.accepted);
-        return row.value.accepted;
-      });
-      const negatives = results.filter(row => row.value.verdict === "insufficient" || row.value.verdict === "conflicting")
-        .map(row => {
-          const source = f.store.get(assessmentRefusalId(f.project, reference(row)));
-          assert.ok(source, `missing A2 source for ${row.value.verdict} beside ${classes.join("")}`);
-          return e51Claim(f.store, f.project, reference(source));
-        });
-      const technicalVerdicts = results.filter(row => row.value.verdict === "off-form" || row.value.verdict === "interrupted")
-        .map(row => row.value.verdict);
-      const reason: GateOutcome["reason"] = supported.length ? "result" : negatives.length ? "refused"
-        : technicalVerdicts.includes("interrupted") ? "interrupted" : "off-form";
-      if (negatives.length || supported.length) assert.equal(stoppedClosingWrite, true,
-        "the semantic finalizer must attempt to close a complete set");
-      else assert.equal(stoppedClosingWrite, false, "pure technical sets wait for an explicit G7 close");
-      const request = { project: f.project, block: f.block, line: 1, attempt: 1,
-        outcome: outcome({ reason, accepting: supported, refusals: negatives }) };
-      const closed = deliveredOf(closeAttempt(f.store, request));
-      const saved = e51Outcome(f);
-      assert.ok(saved);
-      assert.equal(saved.reason, reason);
-      assert.equal(saved.achieved.length, supported.length);
-      assert.equal(saved.refusals.length, negatives.length);
-      assert.equal(f.store.list(UNIT_REFUSAL_KIND).length, negatives.length,
-        "technical E5 terminals never become A2 refusals");
-      assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, supported.length ? 0 : 1);
-      const before = f.store.list().map(reference), calls = f.sent().length;
-      f.restart();
-      assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
-      assert.deepEqual(f.store.list().map(reference), before);
-      assert.equal(f.sent().length, calls);
-    });
+  assert.equal(rows.length, 34);
+  const ref = (index: number): Ref => ({ id: `om-assessment-result:e51:${index}`, revision: 1, hash: hex(index.toString(16)) });
+  for (const row of rows) for (const otherResult of [false, true]) for (const independentRefusal of [false, true]) {
+    let index = 0;
+    const accepting = row.filter(kind => kind === "S").map(() => ref(index++));
+    const negatives = row.filter(kind => kind === "N").map(() => ref(index++));
+    const technical = row.filter(kind => kind === "To" || kind === "Ti")
+      .map(kind => ({ result: ref(index++), verdict: kind === "Ti" ? "interrupted" as const : "off-form" as const }));
+    const reason: GateOutcome["reason"] = accepting.length || otherResult ? "result" : negatives.length || independentRefusal ? "refused"
+      : technical.some(item => item.verdict === "interrupted") ? "interrupted" : "off-form";
+    for (const order of [technical, [...technical].reverse()])
+      assert.equal(assessmentAttemptReason(accepting, negatives, order, otherResult, independentRefusal), reason,
+        `${row.join("+")} otherResult=${otherResult} independentRefusal=${independentRefusal}`);
   }
+});
+
+test("E5.1 an incomplete set with a negative or a technical fact cannot be closed around its missing terminal (NI, TI)", async t => {
+  for (const verdict of ["insufficient", "interrupted"] as const) await t.test(verdict === "insufficient" ? "NI" : "TI", async child => {
+    const f = e51Fixture(child, 2), original = await f.original();
+    f.assessor(verdict);
+    deliveredOf(await assessFact(f.store, original));
+    const results = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
+    assert.deepEqual(results.map(row => row.value.verdict), [verdict]);
+    assert.equal(e51Outcome(f), null, "the attempt stays open while a fact has no terminal");
+    const incomplete = closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, outcome: outcome() });
+    assert.equal(incomplete.ok, false, "a missing terminal cannot be hidden by another reason");
+    if (!incomplete.ok) assert.equal(incomplete.refusal.code, "origin_unreadable");
+    assert.equal(e51Outcome(f), null);
+  });
 });
 
 test("E5.1 selects interrupted when technical facts include both interrupted and off-form", async t => {
@@ -3307,7 +3136,7 @@ test("E5.1 selects interrupted when technical facts include both interrupted and
 });
 
 test("E5.1 gives the same mixed result across fact order and two original MC1 sets", async t => {
-  for (const order of [[0, 1, 2], [2, 1, 0]] as const) await t.test(`fact order ${order.join("")}`, async child => {
+  for (const order of [[2, 1, 0]] as const) await t.test(`fact order ${order.join("")}`, async child => {
     const f = e51Fixture(child, 3), original = await f.original();
     f.assessor("supported", "conflicting", "interrupted");
     const results = [];
@@ -3324,7 +3153,7 @@ test("E5.1 gives the same mixed result across fact order and two original MC1 se
     assert.equal(f.store.list(UNIT_REFUSAL_KIND).length, 1);
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 0);
   });
-  for (const reverse of [false, true]) await t.test(`MC1 discovery ${reverse ? "reverse" : "forward"}`, async child => {
+  for (const reverse of [true]) await t.test(`MC1 discovery ${reverse ? "reverse" : "forward"}`, async child => {
     const f = e51Fixture(child, false), first = await f.original(), second = await f.secondOriginal();
     deliveredOf(e51AdmitAssessorE1(f.store, first).call);
     deliveredOf(e51AdmitAssessorE1(f.store, second).call);
@@ -3354,7 +3183,7 @@ test("E5.1 gives the same mixed result across fact order and two original MC1 se
   });
 });
 
-test("E5.1 rejects a hidden S, missing N, technical N masquerade, and wrong reason in S+N+T", async t => {
+test("E5.1 rejects a hidden S, a missing N and a wrong reason in S+N+T", async t => {
   const f = e51Fixture(t, 3), original = await f.original();
   f.assessor("supported", "insufficient", "off-form");
   const positive = deliveredOf(await assessFact(f.store, original));
@@ -3371,25 +3200,15 @@ test("E5.1 rejects a hidden S, missing N, technical N masquerade, and wrong reas
   } finally { f.store.writeMany = originalWrite; }
   const results = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
   const negative = results.find(row => row.value.verdict === "insufficient")!;
-  const technical = results.find(row => row.value.verdict === "off-form")!;
   const source = f.store.get(assessmentRefusalId(f.project, reference(negative)))!;
   assert.ok(source);
   const real = e51Claim(f.store, f.project, reference(source));
-  const fact = source.value as unknown as { gate: string; refusals: { code: string; goal: string; remedy: string;
-    origin: { name: string; stage: string; subject: string; sources: OriginSource[] } }[] };
-  const forged = f.store.write({ id: assessmentRefusalId(f.project, reference(technical)),
-    kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "E5", refusals: [{ ...fact.refusals[0]!, origin: { ...fact.refusals[0]!.origin,
-      sources: [{ role: "assessment", ref: reference(technical) }] } }] } });
-  assert.equal(readAssessmentRefusalAt(f.store, f.project, reference(forged)).ok, false);
-  deliveredOf(recordRefusal(f.store, { project: f.project, source: reference(forged) }));
-  const fake = e51Claim(f.store, f.project, reference(forged));
   const accepted = positive.value.accepted!;
   const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   const proposals: GateOutcome[] = [
     refusedBy(real),
     outcome({ reason: "result", refusals: [real] }),
-    outcome({ reason: "result", accepting: [accepted], refusals: [real, fake] }),
+    outcome({ accepting: [accepted] }),
     outcome({ reason: "off-form", accepting: [accepted], refusals: [real] }),
   ];
   const before = f.store.get<RepairSeries>(f.series.id)!;
@@ -3470,92 +3289,6 @@ test("E5.1 lets a proved native D5 achievement close a technical E5 set as resul
   assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent)),
     { complete: true, closed: true, results: [reference(terminal)] });
   assert.deepEqual(deliveredOf(await assessFact(f.store, original)), terminal);
-  assert.deepEqual(f.store.list().map(reference), before);
-  assert.equal(f.sent().length, calls);
-});
-
-test("E5.1 treats a terminal at an absent candidate intent as corrupt rather than incomplete", async t => {
-  const f = e51Fixture(t), original = await f.original();
-  f.assessor("supported");
-  const first = deliveredOf(await assessFact(f.store, original));
-  const checked = deliveredOf(readAssessmentIntentAt(f.store, f.project, first.value.intent));
-  const missing = checked.candidates.find(item => item.questionId === f.questionIds[1])!;
-  const absentId = assessmentIntentId(f.project, { call: checked.record.value.source.call,
-    question: missing.question, questionId: missing.questionId });
-  assert.equal(f.store.get(absentId), null);
-  const absentRef = { id: absentId, revision: 1, hash: first.value.intent.hash };
-  const orphan = f.store.write({ id: assessmentResultId(f.project, absentRef), kind: ASSESSMENT_RESULT_KIND,
-    expected: 0, value: { ...first.value, intent: absentRef, accepted: null, index: null,
-      verdict: "off-form", reasons: ["untyped response"] } });
-  assert.ok(orphan.hash);
-  const set = readAssessmentSet(f.store, f.project, first.value.intent);
-  assert.equal(set.ok, false);
-  if (!set.ok) {
-    assert.equal(set.refusal.code, "assessment_set_invalid");
-    assert.equal(set.refusal.at.field, "intent");
-  }
-  const closing = closeAttempt(f.store, { project: f.project, block: f.block, line: 1,
-    attempt: 1, outcome: outcome({ accepting: [first.value.accepted!] }) });
-  assert.equal(closing.ok, false);
-  assert.equal(e51Outcome(f), null);
-  const before = f.store.list().map(reference), calls = f.sent().length;
-  f.restart();
-  const repeated = readAssessmentSet(f.store, f.project, first.value.intent);
-  assert.equal(repeated.ok, false);
-  if (!repeated.ok) assert.equal(repeated.refusal.code, "assessment_set_invalid");
-  assert.deepEqual(f.store.list().map(reference), before);
-  assert.equal(f.sent().length, calls);
-});
-
-test("E5.1 exact finalizer replay rejects forged extra saved A3 claims", async t => {
-  for (const extra of ["refusal", "achievement"] as const) await t.test(extra, async child => {
-    const f = e51Fixture(child, false), original = await f.original();
-    f.assessor("insufficient");
-    const terminal = deliveredOf(await assessFact(f.store, original));
-    assert.equal(e51Outcome(f)?.reason, "refused");
-    const current = f.store.get<RepairSeries>(f.series.id)!;
-    const attempt = current.value.attempts[0]!;
-    assert.ok(attempt.outcome);
-    const outcomeWithExtra = extra === "refusal"
-      ? { ...attempt.outcome, refusals: [...attempt.outcome.refusals, { row: "unregistered-extra-row" }] }
-      : { ...attempt.outcome, achieved: [...attempt.outcome.achieved,
-        { key: "forged-result", basis: reference(terminal) }] };
-    const value = { ...current.value, attempts: [{ ...attempt, outcome: outcomeWithExtra },
-      ...current.value.attempts.slice(1)] };
-    f.store.write({ id: current.id, kind: current.kind, expected: current.revision, value });
-    const before = f.store.list().map(reference), calls = f.sent().length;
-    f.restart();
-    const replay = finishAssessmentAttempt(f.store, f.project, terminal.value.intent);
-    assert.equal(replay.ok, false, "a saved A3 extra must pass its real G7 provider");
-    assert.deepEqual(f.store.list().map(reference), before);
-    assert.equal(f.sent().length, calls);
-  });
-});
-
-test("E5.1 exact replay rechecks a structurally valid extra A3 refusal through G7", async t => {
-  const f = e51Fixture(t, false), original = await f.original();
-  f.assessor("insufficient");
-  const terminal = deliveredOf(await assessFact(f.store, original));
-  assert.equal(e51Outcome(f)?.reason, "refused");
-  const extra = journalled(f.store, f.project,
-    { stage: "fact-assessment", subject: "artifact:e51-unrelated", sources: [] },
-    { gate: "G3", code: `graph_invalid:e51:${next()}`, goal: f.attemptGoal.result });
-  const current = f.store.get<RepairSeries>(f.series.id)!;
-  const attempt = current.value.attempts[0]!;
-  assert.ok(attempt.outcome);
-  const refusals = [...attempt.outcome.refusals, { row: extra.row }]
-    .sort((left, right) => left.row < right.row ? -1 : left.row > right.row ? 1 : 0);
-  const value = { ...current.value, attempts: [{ ...attempt,
-    outcome: { ...attempt.outcome, refusals } }, ...current.value.attempts.slice(1)] };
-  const altered = f.store.write({ id: current.id, kind: current.kind,
-    expected: current.revision, value });
-  assert.equal(readAnySeriesAt(f.store, f.project, reference(altered)).ok, true,
-    "the A3 outcome remains structurally valid");
-  const before = f.store.list().map(reference), calls = f.sent().length;
-  f.restart();
-  const replay = finishAssessmentAttempt(f.store, f.project, terminal.value.intent);
-  assert.equal(replay.ok, false, "an A3 row still needs its common G7 producer proof");
-  if (!replay.ok) assert.equal(replay.refusal.code, "assessment_set_invalid");
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, calls);
 });

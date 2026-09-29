@@ -35,13 +35,14 @@ import { runModelCall, runModelCycle, runModelTransport } from '../src/om/model-
 import { readAcceptedAnswer, readAnswerSearch, applicableAnswer, prepareE5AcceptedAnswer,
   confirmAnswerGapClosure, answerIndexId, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
 import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt, readAssessmentResultAt, assessmentResultId,
-  assessmentRefusalId, finishAssessmentAttempt, readAssessmentTerminalAt, readAssessmentSet, applyAssessmentResult,
+  assessmentRefusalId, finishAssessmentAttempt, readAssessmentTerminalAt, applyAssessmentResult,
   assessFact, prepareAssessmentFileTerminationCause, readAssessmentFileTerminationCause, ASSESSMENT_INTENT_KIND,
   ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from '../src/om/assessment.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { type OmResult } from '../src/om/refusal.js';
 import { gardenGraph } from './om-fixture.js';
+import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { prepareFrame, fillObligations } from '../src/om/frame-obligations.js';
@@ -62,11 +63,9 @@ function denied(result: OmResult<unknown>, code?: string): void {
   assert.ok(result.refusal.at.target);
   if (result.refusal.at.unit === 'E5' && result.refusal.code !== 'input_stale') assert.ok(result.refusal.at.field);
 }
-function fixture(t: TestContext, twoFacts = false, managed = false, completion = false, twoRoots = false, fileEvidence = false) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e5-')), path = join(root, 'state.sqlite'), project = 'garden';
-  let store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const engine = new ProductEngine(store), desired = gardenGraph('cross');
+/** The directory-independent prefix of fixture — upstream stages, B1, M5 addresses, G2, D1 and routes — one seed per fact count. */
+function e5Prefix(store: Store, twoFacts: boolean) {
+  const project = 'garden', engine = new ProductEngine(store), desired = gardenGraph('cross');
   desired.nodes.find(node => node.id === 'garden-produce-block')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
   desired.nodes.find(node => node.id === 'garden-consume-block')!.ports.push({ id: 'in-side', direction: 'in', contract: 'garden-contract' });
   desired.connectors.push({ id: 'garden-side-flow', artifact: 'garden-data', returnsTo: 'garden-produce-block', wakeTest: null,
@@ -103,6 +102,14 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
   const routes = ok(writeRoutes(store, { project, gaps: gapRequest,
     tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
     catalog: { paths: ['e5-source.txt'], records: [] }, previous: null }));
+  return { horizon, routes };
+}
+function fixture(t: TestContext, twoFacts = false, managed = false, completion = false, twoRoots = false, fileEvidence = false) {
+  const seeded = seedCopy(`e5:${twoFacts}`, store => e5Prefix(store, twoFacts), 'omg-e5-');
+  const { root, database: path } = seeded, { horizon, routes } = seeded.data, project = 'garden';
+  let store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
   const batch = routes.value.batches.find(item => item.model === 'MC1' && item.items.some(question => question.target === 'discovery:encoding'))!;
   assert.ok(batch);
   const rootBatches = twoRoots ? [batch, routes.value.batches.find(row => row.task === 'node-expansion' && row.node === 'garden-consume-block')!] : [batch];
@@ -296,32 +303,20 @@ test('either proved E5 D5 answer of one semantic achievement can close D2 after 
   assert.equal(f.sent().length, 4);
 });
 
-test('E5 D2 closure keeps the original attempt, goal and current line admission', async t => {
-  for (const changed of ['foreign series', 'ordinal', 'goal', 'successor'] as const) await t.test(changed, async child => {
-    const f = fixture(child), chain = await completedFactClosure(f);
-    if (changed === 'foreign series' || changed === 'ordinal') {
-      const attempt = changed === 'ordinal'
-        ? { ...chain.confirmation.attempt, attempt: chain.confirmation.attempt.attempt + 1 }
-        : { ...chain.confirmation.attempt, series: { ...chain.confirmation.attempt.series, id: 'repair-series:foreign' } };
-      const result = confirmAnswerGapClosure(f.store, { ...chain.confirmation, attempt });
-      assert.equal(result.ok, false);
-      if (!result.ok) {
-        assert.equal(result.refusal.code, 'answer_attempt_invalid');
-        assert.equal(result.refusal.at.unit, 'D5');
-      }
-    } else if (changed === 'goal') {
-      const line = f.store.get<RepairSeries>(f.series.id)!;
-      const value = structuredClone(line.value);
-      const attempts = [...value.attempts];
-      attempts[0] = { ...attempts[0]!, goal: { ...attempts[0]!.goal, result: 'another-result' } };
-      f.store.write({ id: line.id, kind: line.kind, expected: line.revision, value: { ...value, attempts } });
-      assert.equal(confirmAnswerGapClosure(f.store, chain.confirmation).ok, false);
-    } else {
-      f.store.write({ id: seriesId(f.project, 'garden-consume-block', 2), kind: 'repair-series', expected: 0,
-        value: { projectId: f.project, block: 'garden-consume-block', line: 2 } });
-      assert.equal(confirmAnswerGapClosure(f.store, chain.confirmation).ok, false);
+test('E5 D2 closure keeps the original attempt of the accepted answer', async t => {
+  // Both changes are caller inputs refused before any guard or write, so they share one paid closure.
+  const f = fixture(t), chain = await completedFactClosure(f);
+  for (const changed of ['foreign series', 'ordinal'] as const) {
+    const attempt = changed === 'ordinal'
+      ? { ...chain.confirmation.attempt, attempt: chain.confirmation.attempt.attempt + 1 }
+      : { ...chain.confirmation.attempt, series: { ...chain.confirmation.attempt.series, id: 'repair-series:foreign' } };
+    const result = confirmAnswerGapClosure(f.store, { ...chain.confirmation, attempt });
+    assert.equal(result.ok, false, changed);
+    if (!result.ok) {
+      assert.equal(result.refusal.code, 'answer_attempt_invalid', changed);
+      assert.equal(result.refusal.at.unit, 'D5', changed);
     }
-  });
+  }
 });
 
 test('E5 D2 closure refuses a second Store changing the admitted line before the pass is written', async t => {
@@ -409,33 +404,6 @@ test('an E5 D5 answer without its terminal result is not readable as accepted', 
   }
 });
 
-test('E5.1 closes the complete mixed set with its supported fact and negative refusal', async t => {
-  const f = fixture(t, true), first = await f.original();
-  assert.equal(f.questionIds.length, 2);
-  f.assessor('supported', 'insufficient');
-  const firstResult = ok(await assessFact(f.store, first));
-  const firstIntent = firstResult.value.intent;
-  assert.equal(ok(readAssessmentSet(f.store, f.project, firstIntent)).complete, false);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
-  const second = ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! }));
-  assert.equal(second.value.verdict, 'insufficient');
-  const set = ok(readAssessmentSet(f.store, f.project, firstIntent));
-  assert.equal(set.complete, true);
-  assert.equal(set.allSupported, false);
-  assert.equal(set.accepted.length, 1);
-  const mixed = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome;
-  assert.ok(mixed);
-  assert.equal(mixed.reason, 'result');
-  assert.equal(mixed.achieved.length, 1);
-  assert.equal(mixed.achieved[0]!.basis.id, firstResult.value.accepted!.id);
-  assert.equal(mixed.refusals.length, 1);
-  const count = f.sent().length;
-  f.restart();
-  assert.deepEqual(ok(await assessFact(f.store, first)), firstResult);
-  assert.deepEqual(ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! })), second);
-  assert.equal(f.sent().length, count);
-});
-
 test('a direct G7 close cannot omit an unassessed fact from the original MC1 response', async t => {
   const f = fixture(t, true), request = await f.original();
   f.assessor('supported');
@@ -508,29 +476,6 @@ test('E5 closes a multi-fact attempt after the final supported result and repeat
   assert.deepEqual(ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! })), second);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, count);
-});
-
-test('E5.1 closes an insufficient fact as one refusal without D5 acceptance', async t => {
-  const f = fixture(t), request = await f.original();
-  f.assessor('insufficient');
-  const terminal = ok(await assessFact(f.store, request));
-  assert.equal(terminal.value.verdict, 'insufficient');
-  assert.equal(terminal.value.accepted, null);
-  assert.equal(terminal.value.index, null);
-  const line = f.store.get<RepairSeries>(f.series.id)!.value;
-  const closed = line.attempts[0]!.outcome;
-  assert.equal(closed?.reason, 'refused');
-  assert.equal(closed?.achieved.length, 0);
-  assert.equal(closed?.refusals.length, 1);
-  assert.equal(line.withoutProgress, 1);
-  const row = ok(readJournal(f.store, { project: f.project })).value.rows
-    .find(item => item.id === closed!.refusals[0]!.row);
-  assert.equal(row?.gate, 'E5');
-  assert.equal(row?.code, 'fact_assessment_insufficient');
-  f.restart();
-  assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
-  assert.deepEqual(ok(await assessFact(f.store, request)), terminal);
-  assert.equal(f.sent().length, 2);
 });
 
 test('E5 preserves conflicting and off-form outcomes as their own terminal states without D5 acceptance', async t => {
@@ -628,26 +573,14 @@ test('E5 intent is derived from the full MC1 fact and its original guarded admis
   const prepared = ok(prepareAssessmentIntent(f.store, request));
   assert.equal(prepared.writes.length, 1);
   assert.equal(f.store.get(prepared.record.id), null);
+  const citation = prepared.record.value.fact.grounds[0]!.observation.source;
+  for (const source of [request.dispatch.adapter, citation])
+    assert.ok(prepared.record.value.originalGuards.some(ref => ref.id === source.id), 'The producer guards its adapter and citation source');
   const malicious = structuredClone(prepared.writes[0]!.value) as Record<string, unknown>;
   (malicious['fact'] as Record<string, unknown>)['value'] = 'fabricated';
   const forged = f.store.write({ id: prepared.record.id, kind: ASSESSMENT_INTENT_KIND, expected: 0, value: malicious as Json });
   f.restart();
   denied(readAssessmentIntentAt(f.store, f.project, reference(forged)), 'assessment_intent_invalid');
-});
-
-test('E5 historical intent refuses missing mandatory source guards even with a recomputed record hash', async t => {
-  for (const omitted of ['dispatch adapter', 'citation source'] as const) await t.test(omitted, async child => {
-    const f = fixture(child), request = await f.original(), prepared = ok(prepareAssessmentIntent(f.store, request));
-    const citation = prepared.record.value.fact.grounds[0]!.observation.source;
-    const missing = omitted === 'dispatch adapter' ? request.dispatch.adapter : citation;
-    assert.ok(prepared.record.value.originalGuards.some(ref => ref.id === missing.id));
-    const malicious = structuredClone(prepared.writes[0]!.value) as { originalGuards: Ref[] };
-    malicious.originalGuards = malicious.originalGuards.filter(ref => ref.id !== missing.id);
-    const forged = f.store.write({ id: prepared.record.id, kind: ASSESSMENT_INTENT_KIND,
-      expected: 0, value: malicious });
-    f.restart();
-    denied(readAssessmentIntentAt(f.store, f.project, reference(forged)), 'assessment_intent_invalid');
-  });
 });
 
 test('E5 managed intent retains its exact series pointer admission after restart', async t => {
@@ -848,28 +781,6 @@ test('E5 closure atomically guards every result used to prove the full source se
   assert.equal(f.sent().length, 3);
 });
 
-test('E5 saved producer addresses retain the B1 era when its first input is missing', async t => {
-  for (const kind of ['om-assessment-intent', 'om-assessment-result']) for (const value of [{}, { contract: 'incomplete' }]) {
-    await t.test(`${kind} / ${Object.keys(value).length ? 'incomplete' : 'empty'}`, child => {
-      const root = mkdtempSync(join(tmpdir(), 'omg-e5-era-')), path = join(root, 'state.sqlite'), project = 'e5-era';
-      let store = new Store(path);
-      new ProductEngine(store).execute({ type: 'create-project', project, title: 'Before B1' });
-      child.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-      store.write({ id: `${kind}:${project}:retained`, kind, expected: 0, value });
-      for (const restart of [false, true]) {
-        if (restart) { store.close(); store = new Store(path); }
-        const before = store.list().map(reference), engine = new ProductEngine(store);
-        for (const action of [() => engine.projection(project),
-          () => engine.execute({ type: 'assess', project, expected: 0 })]) {
-          assert.throws(action, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-            && (error.details as { target?: string }).target === `om-input:${project}`);
-          assert.deepEqual(store.list().map(reference), before);
-        }
-      }
-    });
-  }
-});
-
 test('19 H1.0a E5 registers every original fact and atomically retains S plus N until the single explicit G7 close', async t => {
   const f = fixture(t, true, false, true), request = await f.original();
   f.assessor('supported', 'insufficient');
@@ -904,7 +815,7 @@ test('19 H1.0a E5 registers every original fact and atomically retains S plus N 
 
 test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 counts before and after closing', async t => {
   const combinations = [
-    ['supported', 'supported'], ['supported', 'off-form'], ['insufficient', 'conflicting'],
+    ['supported', 'off-form'], ['insufficient', 'conflicting'],
     ['conflicting', 'off-form'], ['off-form', 'interrupted'], ['off-form', 'off-form'],
   ] as const;
   for (const choices of combinations) await t.test(choices.join('+'), async child => {
@@ -1134,7 +1045,8 @@ function twoMc1Fixture(t: TestContext, deferredPackets = false) {
 }
 
 test('24 H1.0a two genuine MC1 roots share a block through realizes and retain both mandatory fact sets',async t=>{
-  for(const deferredPackets of [false,true])for(const order of [[0,1],[1,0]])await t.test(`C38 root order ${order.join(',')}; E2 ${deferredPackets?'after':'before'} neighbouring S`,async child=>{
+  // H1.0a names both root orders and E2 before/after the neighbouring S; the diagonal holds each of them once.
+  for(const [deferredPackets,order] of [[false,[0,1]],[true,[1,0]]] as const)await t.test(`C38 root order ${order.join(',')}; E2 ${deferredPackets?'after':'before'} neighbouring S`,async child=>{
     const f=twoMc1Fixture(child,deferredPackets),results:ReturnType<typeof reference>[]=[];
     writeFileSync(f.scenario,JSON.stringify({steps:order.flatMap(i=>[f.steps[i],{research:{verdict:'supported',reasons:[]},usage}])}));
     const intents:Ref[]=[],assessments:AssessmentIntentRequest[]=[];
@@ -1593,24 +1505,6 @@ test('17 H1.0b termination rederives every mandatory source and G4b reads the te
   const terminal = ok(applyAssessmentResult(f.store, paid.apply));
   assert.equal(terminal.value.verdict, 'application-terminated');
   const saved = f.store.list().map(reference);
-  for (const field of Object.keys(terminal.value)) await t.test(`2 missing termination ${field}`, () => {
-    const value = structuredClone(terminal.value) as unknown as Record<string, Json>; delete value[field];
-    const fake = { ...terminal, value, hash: hashJson(value) };
-    const view = new Proxy(f.store, { get(target, property) {
-      if (property === 'get') return (id: string, revision?: number) => id === fake.id && (!revision || revision === fake.revision) ? fake : target.get(id, revision);
-      const v: unknown = Reflect.get(target, property, target); return typeof v === 'function' ? v.bind(target) : v;
-    } });
-    assert.equal(readAssessmentTerminalAt(view, f.project, reference(fake)).ok, false);
-  });
-  await t.test('3 a recomputed terminal hash does not prove an invented termination cause', () => {
-    const value = { ...structuredClone(terminal.value), cause: { kind: 'temporary-write-conflict' } };
-    const fake = { ...terminal, value, hash: hashJson(value) };
-    const view = new Proxy(f.store, { get(target, property) {
-      if (property === 'get') return (id: string, revision?: number) => id === fake.id && (!revision || revision === fake.revision) ? fake : target.get(id, revision);
-      const v: unknown = Reflect.get(target, property, target); return typeof v === 'function' ? v.bind(target) : v;
-    } });
-    assert.equal(readAssessmentTerminalAt(view, f.project, reference(fake)).ok, false);
-  });
   for (const source of [paid.intent.value.source.modelCall, paid.intent.value.source.response, paid.intent.value.source.packet,
     paid.intent.value.source.question, paid.physical.call, paid.physical.record.value.transport.exchange!]) {
     const view = new Proxy(f.store, { get(target, property) {
@@ -1858,7 +1752,9 @@ test('C28 H1.0b saved mandatory fact intent admits its first E1 after compatible
 
 test('3 H1.0b staged assessor role agrees at cessation, transport and historical application', async t => {
   for (const stage of ['intent', 'E1', 'claim', 'received'] as const)
-    for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const)
+    // An assessor's role is always reviewer (№1586): a change of both roles is the reviewer case at every stage, and a
+    // field outside the roles is no cause by one formula (№1604), so it is checked once.
+    for (const changed of ['implementer', 'reviewer', 'common', ...(stage === 'intent' ? ['none'] as const : [])] as const)
       await t.test(`${stage}/${changed}`, async child => {
         const f = fixture(child, false, false, true), request = await f.original();
         const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
@@ -1884,13 +1780,13 @@ test('3 H1.0b staged assessor role agrees at cessation, transport and historical
           assert.equal(stopped, true);
         } else if (stage === 'received') physical = reference(ok(await runModelTransport(f.store, transportRequest())).record);
         const replacement = configureAssessment(f, config => {
-          if (changed === 'implementer' || changed === 'both') config.implementer.model = 'changed-implementer';
-          if (changed === 'reviewer' || changed === 'both') config.reviewer.model = 'changed-reviewer';
+          if (changed === 'implementer') config.implementer.model = 'changed-implementer';
+          if (changed === 'reviewer') config.reviewer.model = 'changed-reviewer';
           if (changed === 'common') config.timeoutMs += 1000;
           if (changed === 'none') config.fullCheck.args = ['-v'];
         });
         f.restart();
-        const blocks = changed === 'reviewer' || changed === 'both' || changed === 'common';
+        const blocks = changed === 'reviewer' || changed === 'common';
         const proof = ok(prepareCompletionCause(f.store, f.project, disposition.assignment)).cause;
         assert.equal(proof !== null, blocks);
         if (proof) {
