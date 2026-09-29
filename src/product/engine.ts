@@ -2,6 +2,8 @@ import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { readOmInput } from '../om/input.js';
 import { configureDispatch } from '../om/dispatch.js';
+import { continuePass, readPass, resumeStoppedPass, startPass, stopPass } from '../om/run-driver.js';
+import { spendReport } from '../om/spend-report.js';
 import { isPlainObject } from '../om/refusal.js';
 import { writeGuarded } from '../om/refs.js';
 import { prepareFeasibility, readFeasibility, type OmFeasibility } from '../om/feasibility.js';
@@ -519,6 +521,21 @@ export class ProductEngine {
         if (!configured.ok) throw new EngineError(configured.refusal.code, configured.refusal.message, configured.refusal.at);
         return configured.value;
       }
+      // H2: the pass of a project through the common H1.3 driver and F8.3 report; their outcomes and refusals are the answer.
+      case "om-start": this.#project(command.project);
+        return startPass(this.store, { project: command.project, ...(command.outcomes ? { outcomes: command.outcomes } : {}) });
+      case "om-continue": {
+        this.#project(command.project);
+        // The named resume is decided first, and only its success continues; no transaction spans both (№2131-2).
+        if (command.resumeStop !== undefined) {
+          const resumed = resumeStoppedPass(this.store, { project: command.project, stop: command.resumeStop });
+          if (!resumed.ok) return Promise.resolve(resumed);
+        }
+        return continuePass(this.store, { project: command.project });
+      }
+      case "om-state": this.#project(command.project); return readPass(this.store, { project: command.project });
+      case "om-spend": this.#project(command.project); return spendReport(this.store, { project: command.project });
+      case "om-stop": this.#project(command.project); return stopPass(this.store, { project: command.project });
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);

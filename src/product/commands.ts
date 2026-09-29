@@ -24,6 +24,11 @@ export type ProductCommand =
   | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
   | {type:"recover-model-call";project:string;call:Ref}
   | {type:"continue-preparation";project:string;maxCalls:number}
+  | { type: "om-start"; project: string; outcomes?: string[] }
+  | { type: "om-continue"; project: string; resumeStop?: string }
+  | { type: "om-state"; project: string }
+  | { type: "om-spend"; project: string }
+  | { type: "om-stop"; project: string }
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
@@ -81,7 +86,14 @@ environmentSettings.properties['requestCapacityChars'] = { type: "integer", mini
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
+const text = { ...string, pattern: "\\S" };
+// Optional after object() fixed the required set: an absent intent or stop is the driver's own case, never an empty value.
+const omStart = command("om-start", { project });
+omStart.properties['outcomes'] = { type: "array", minItems: 1, items: text };
+const omContinue = command("om-continue", { project });
+omContinue.properties['resumeStop'] = text;
 const schema = { oneOf: [
+  omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }),
   command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),
