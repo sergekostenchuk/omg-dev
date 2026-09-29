@@ -13,10 +13,10 @@ import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
-import { writeOmInput } from '../src/om/input.js';
+import { withHistoricalReads, writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { readAnswerTask, readMc1Question, writeAcceptedAnswer, readAcceptedAnswer, type AnswerTaskBasis } from '../src/om/accepted-answer.js';
 import { confirmResults } from '../src/om/achievements.js';
@@ -35,7 +35,7 @@ import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQ
   normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, WORKS_PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
+import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type RefusalJournal } from '../src/om/refusal-journal.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -935,6 +935,159 @@ test('E2 retry context contains only addressed refusals from the preceding attem
   refusal('later-unrelated-history', p.batch.items[0]!.target);
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+});
+
+/** S1.1: a real retry history of the packet fixture — two refused attempts of the same goal, then the running attempt 3. */
+function retryHistory(t: TestContext) {
+  const p = packetFixture(t), { f } = p;
+  let nextSource = 0;
+  function refusal(code: string, goal: string) {
+    const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}s11-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
+      value: { gate: 'G4', refusals: [{ code, goal, remedy: 'Resolve the addressed question',
+        origin: { name: code, stage: 'question-packet', subject: goal, sources: [{ role: 'input', ref: reference(f.input) }] } }] } });
+    const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+    const row = journal.value.rows.find(row => row.source.id === source.id)!;
+    return { row: row.id, name: row.code, goal: row.goal };
+  }
+  const address = { project: f.project, block: p.block, line: 1 };
+  const older = refusal('older-own-refusal', p.batch.items[0]!.target);
+  ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [older] } }));
+  ok(beginAttempt(f.store, { ...address, attempt: 2, goal: p.goal }));
+  const own = refusal('latest-own-refusal', p.batch.items[0]!.target), foreign = refusal('foreign-refusal', 'unrelated-question');
+  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [own, foreign] } }));
+  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+  const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(third), ordinal: 3 } };
+  return { p, f, refusal, own, request };
+}
+/** Every read of an exact record through any Store, by id, while the returned function is installed. */
+function countingReads(t: TestContext, ids: readonly string[]) {
+  const originalGet = Store.prototype.get, reads = new Map<string, number>();
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    reads.set(id, (reads.get(id) ?? 0) + 1); return originalGet.call(this, id, revision);
+  } as typeof Store.prototype.get;
+  t.after(() => { Store.prototype.get = originalGet; });
+  return () => ids.reduce((sum, id) => sum + (reads.get(id) ?? 0), 0);
+}
+
+test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation or a new Store prove it again', t => {
+  const { p, f, refusal, own, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [{ code: own.name, target: own.goal }]);
+  // The head moves on after the packet was saved: the packet stands on the saved revision, never on today's head.
+  refusal('later-unrelated-history', p.batch.items[0]!.target);
+  refusal('another-later-history', 'unrelated-question');
+  assert.ok(f.store.get(journalId(project))!.revision > journal.revision);
+  f.restart();
+  const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows;
+  assert.equal(rows.length, 3);
+  const count = countingReads(t, [journal.id, ...rows.map(row => row.source.id)]);
+  const read = () => ok(readQuestionPacket(f.store, { project, record: reference(packet) }));
+  withHistoricalReads(() => {
+    assert.deepEqual(read(), packet);
+    const cold = count();
+    assert.ok(cold > rows.length, 'The cold proof reads the saved revision and every source its rows name');
+    assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
+    assert.equal(count(), cold, 'The exact proof E2 executed serves a direct exact read of the same revision');
+    assert.deepEqual(read(), packet);
+    assert.deepEqual(reference(ok(readJournalAt(f.store, project, { ...journal, kind: 'om-refusal-journal' } as Ref))), journal);
+    assert.equal(count(), cold, 'Repeats, and a reference carrying extra fields, reuse the one proof of the exact {id, revision, hash}');
+  });
+  const outside = count();
+  assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
+  assert.ok(count() > outside, 'A new operation proves the exact revision again');
+  const before = count();
+  f.restart();
+  assert.deepEqual(read(), packet);
+  assert.ok(count() > before, 'A new Store proves again');
+  // A direct read keeps its former refusal context: the reference it received, addressed as every refusal is.
+  const raw = { ...reference(f.input), note: 'read as received' };
+  const foreign = readJournalAt(f.store, project, raw as Ref);
+  assert.equal(foreign.ok, false);
+  if (!foreign.ok) {
+    assert.deepEqual([foreign.refusal.code, foreign.refusal.at.target, foreign.refusal.at.ref], ['record_foreign', journalId(project), reference(f.input)]);
+  }
+});
+
+test('S1.1 a new preparation takes the current journal head and guards it: a head moved before the write refuses the packet', t => {
+  const { f, refusal, request } = retryHistory(t);
+  const prepared = ok(prepareQuestionPacket(f.store, request)), head = f.store.get(journalId(f.project))!;
+  assert.deepEqual(prepared.record.value.journal, reference(head));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(head))), 'The current journal head guards the write');
+  refusal('moved-before-write', 'unrelated-question');
+  rejected(writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.equal(f.store.get(prepared.record.id), null, 'Nothing of the stale packet is written');
+  const fresh = ok(prepareQuestionPacket(f.store, request)), moved = f.store.get(journalId(f.project))!;
+  assert.ok(moved.revision > head.revision);
+  assert.deepEqual(fresh.record.value.journal, reference(moved));
+  assert.deepEqual(fresh.record.value.packet, prepared.record.value.packet, 'An unrelated later row changes no refusal of the packet');
+  // Inside one operation the second preparation finds the journal proof hot: its guard and reference are the same.
+  withHistoricalReads(() => {
+    const cold = ok(prepareQuestionPacket(f.store, request)), hot = ok(prepareQuestionPacket(f.store, request));
+    const journalRefs = (refs: readonly Ref[]) => refs.filter(ref => ref.id === journalId(f.project));
+    assert.deepEqual([hot.record.value.journal, journalRefs(hot.references), journalRefs(hot.guards.filter(isRef))],
+      [reference(moved), journalRefs(cold.references), journalRefs(cold.guards.filter(isRef))]);
+    assert.equal(journalRefs(hot.guards.filter(isRef)).length, 1);
+  });
+  assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record.value.journal, reference(moved));
+});
+
+test('S1.1 an unavailable journal source is the former typed refusal and is never cached; a storage fault propagates and releases the proof', t => {
+  const { f, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
+  const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows, source = rows[0]!.source.id;
+  let hidden: string | null = null, fault: Error | null = null;
+  const view: Store = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      if (fault && id === source) throw fault;
+      return id === hidden ? null : target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const read = () => readQuestionPacket(view, { project, record: reference(packet) });
+  withHistoricalReads(() => {
+    hidden = source;
+    const broken = rejected(read(), 'journal_invalid');
+    assert.deepEqual([broken.at.unit, broken.at.target, broken.at.ref], ['store-refusals', journalId(project), journal]);
+    assert.match(broken.at.field!, /^rows\.\d+\.source$/);
+    hidden = journal.id;
+    const missing = rejected(read(), 'record_missing');
+    assert.deepEqual([missing.at.unit, missing.at.ref], ['E2', journal]);
+    hidden = null;
+    assert.deepEqual(ok(read()), packet, 'A refused proof is not cached: the restored source proves again');
+    fault = new TypeError('journal source unavailable');
+    assert.throws(() => read(), error => error === fault);
+    fault = null;
+    assert.deepEqual(ok(read()), packet, 'The active key is released after the fault');
+  });
+});
+
+test('S1.1 a repeated entry into the same active journal proof is journal_invalid at its derivation; an earlier revision is another key', t => {
+  const { f, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, later = packet.value.journal!, project = f.project;
+  const earlier = reference(f.store.history<RefusalJournal>(later.id).find(row => row.revision === later.revision - 1)!);
+  const source = f.store.get<RefusalJournal>(later.id, later.revision)!.value.rows.at(-1)!.source.id;
+  let inner: OmResult<Sealed<Revision<RefusalJournal>>> | null = null, probe: Ref | null = null;
+  const view: Store = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      if (probe && id === source) { const ref = probe; probe = null; inner = readJournalAt(view, project, ref); }
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    probe = later;
+    assert.deepEqual(reference(ok(readJournalAt(view, project, later))), later, 'The outer proof completes');
+    assert.ok(inner !== null && !inner.ok);
+    const cyclic = rejected(inner!, 'journal_invalid');
+    assert.deepEqual(cyclic.at, { unit: 'store-refusals', target: journalId(project), field: 'derivation', ref: later });
+    assert.match(cyclic.message, /cyclic/);
+  });
+  withHistoricalReads(() => {
+    inner = null; probe = earlier;
+    assert.deepEqual(reference(ok(readJournalAt(view, project, later))), later);
+    assert.ok(inner !== null);
+    assert.deepEqual(reference(ok(inner!)), earlier, 'An earlier revision inside the active proof is another key, not a cycle');
+  });
 });
 
 test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', t => {

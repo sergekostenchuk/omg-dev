@@ -22,10 +22,10 @@ import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, 
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
-import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
+import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
-import { historicalRead, withHistoricalReads } from './input.js';
+import { historicalRead, historicalProof, withHistoricalReads } from './input.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareOmObligations, readOmObligations, type ObligationRequest, type OmObligations, type OmObligationHandoff } from './obligations.js';
@@ -246,7 +246,9 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   if (!journalRef) fail('packet_record_invalid', batch.id, 'journal', 'A repeated question must preserve its refusal source');
   const journal = take(readRecord<RefusalJournal>(store, journalRef, { unit: 'E2', target: batch.id,
     id: journalId(request.project), kind: 'om-refusal-journal' }));
-  const checkedJournal = take(readJournal(pinned(store, journal), { project: request.project }));
+  // S1.1 (№1773): the saved revision is proved at its exact reference, inside the common proof scope of this
+  // operation — never today's head, and never through a view of its own that would derive the history again.
+  const checkedJournal = take(readJournalAt(store, request.project, reference(journal)));
   references.push(journalRef);
   if (current) { head(store, journalRef); guards.push(journalRef); }
   const addresses = new Set(batch.items.flatMap(item => [item.target, item.gap]));
@@ -1109,3 +1111,8 @@ function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNu
       ...(contract === WORKS_PACKET_CONTRACT ? { tests: checked.proposal.value.tests, edges: checked.proposal.value.edges } : {}) });
   });
 }
+
+// S1.1 (№1773): the journal proves an exact historical revision through the common proof scope of this operation.
+// The journal must not import input.ts itself (an ESM cycle would reach its reader registry before it has evaluated),
+// so this module, which already imports both, hands the existing executor in once; nothing is called here.
+registerJournalProofExecutor(historicalProof);
