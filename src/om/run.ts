@@ -4,9 +4,12 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
-import { readHorizon } from "./horizon.js";
 import { prepareRoutes, readRoutes, writeRoutes, type RouteBatch, type RoutesRecord, type RoutesRequest } from "./routes.js";
 import { readQuestionQueue } from "./queue.js";
+import { prepareRunBases, writeRunBases, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
+import { readOmInput, type OmInputRecord } from "./input.js";
+import { readAcceptedAnswer } from "./accepted-answer.js";
+import { writeApplyAnswer } from "./addressing.js";
 import { openSeries, readAnySeriesAt, readCompletionBinding, completionWorkId, completionCloseId, prepareSeriesLineAdmission,
   resumeSeries, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
@@ -22,7 +25,7 @@ import { gateCandidate, prepareCandidate, writeCandidate, type CandidateRequest 
 import { prepareSettleCandidate, type SettleCandidateRequest } from "./frame-accept.js";
 import { readAcceptedFrameLayer, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
-import { prepareWorksAcceptance, type WorksAcceptanceRequest } from "./atomic-gate.js";
+import { prepareWorksAcceptance, prepareWorksSources, type WorksAcceptanceRequest } from "./atomic-gate.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines, type GapLinesRecord } from "./gap-lines.js";
 import { prepareOmObligations, writeOmObligations } from "./obligations.js";
 import { prepareFeasibility, readFeasibility, writeFeasibility, type OmFeasibility } from "./feasibility.js";
@@ -30,7 +33,7 @@ import { writeHandoff } from "./handoff.js";
 import { stageId } from "../pipeline/contracts.js";
 import { ProductEngine } from "../product/engine.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { prepareGaps, readGaps, writeGaps, type GapReadRequest, type GapRequest } from "./gaps.js";
+import { readGaps, type GapReadRequest } from "./gaps.js";
 import type { DispatchContract } from "./call-record.js";
 
 /**
@@ -41,25 +44,27 @@ import type { DispatchContract } from "./call-record.js";
  * check — is made by its common producer, and every outcome of an attempt goes through G7. The chosen action is saved
  * with its exact request BEFORE its producer runs (the identity survives a crash; two stores cannot choose two names for
  * one step), and a repeat finds the product again by that request: every producer used here returns the saved product
- * for an exact repeat. The pass never counts attempts, never derives a reason and never chooses a horizon or an order.
+ * for an exact repeat. The pass never counts attempts and never derives a reason. Its bases — B1, the horizon of its
+ * launch intent, D1, D5, M6 and the C1 queue — are built by the common machine producer of H1.1 (run-bases.ts) in a
+ * saved step of the pass itself; nobody outside the pass chooses a horizon or an order (№1844, №1852).
  */
 export const RUN_KIND = "om-run";
 export const RUN_CONTRACT = "om-run/v1";
-export const RUN_CODES = Object.freeze(["run_request_invalid", "run_record_invalid"] as const);
+export const RUN_CODES = Object.freeze(["run_request_invalid", "run_record_invalid", "run_outcome_unknown", "run_intent_conflict",
+  "horizon_empty"] as const);
 export type RunCode = typeof RUN_CODES[number];
 const UNIT = "H1";
 export const runId = (project: string): string => `${RUN_KIND}:${project}`;
 
-/**
- * The owner's (or H2's) current bases of new work: one accepted horizon gate, its M3 queue, the M6 routes, and the
- * captured Sources of external inputs the owner named for G5 (G5 itself checks that they are exactly the necessary ones).
- */
-export interface RunBases { readonly horizon: Ref; readonly queue: Ref; readonly routes: Ref; readonly sources: readonly Ref[] }
-export interface RunRequest { readonly project: string; readonly bases: RunBases; readonly dispatch: DispatchContract }
+export type { RunBases } from "./run-bases.js";
+/** A pass is advanced by its project and the technical dispatch contract; its bases are the pass's own (H1.1). */
+export interface RunRequest { readonly project: string; readonly dispatch: DispatchContract }
+/** The launch intent of a pass (№1852): the exact outcomes it works toward, fixed when the pass is first written. */
+export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
-  "candidate", "routes", "evaluate", "accept", "works", "gaps", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile"] as const);
+  "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
+  "handoff", "compile", "bases", "apply"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -75,6 +80,8 @@ export interface RunRecord {
   readonly contract: typeof RUN_CONTRACT; readonly project: string;
   /** The exact B1 the pass began from; new B1 revisions never rewrite it (№1737 п.1). */
   readonly input: Ref;
+  /** The launch intent, unchanged for the whole history of the pass (№1852 п.1). */
+  readonly intent: RunIntent;
   readonly state: RunState;
   /**
    * The previous performed action, the exact products its producer returned, or the refusal it gave. A refused step
@@ -102,12 +109,15 @@ const refOf = (record: { id: string; revision: number; hash: string }): Ref => (
 
 function requireRequest(store: unknown, request: unknown): asserts request is RunRequest {
   requireCondition(store instanceof Store, "run_request_invalid", "A pass runs through a store");
-  requireCondition(object(request) && isText(request.project) && object(request.bases)
-    && isRef(request.bases.horizon) && isRef(request.bases.queue) && isRef(request.bases.routes)
-    && Array.isArray(request.bases.sources) && request.bases.sources.every(isRef) && Object.keys(request.bases).length === 4
+  requireCondition(object(request) && isText(request.project)
     && object(request.dispatch) && isRef(request.dispatch.adapter) && isRef(request.dispatch.config) && Object.keys(request.dispatch).length === 2
-    && Object.keys(request).length === 3,
-  "run_request_invalid", "A pass names its project, the exact horizon, queue, routes and external sources it works from, and its dispatch contract");
+    && Object.keys(request).length === 2,
+  "run_request_invalid", "A pass names its project and its dispatch contract; its bases are its own");
+}
+/** An intent is a nonempty set of outcome identifiers, sorted by code units without repeats (№1852 п.1). */
+function normalizedOutcomes(value: unknown): string[] | null {
+  if (!Array.isArray(value) || !value.length || !value.every(isText)) return null;
+  return [...new Set(value as string[])].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
 }
 
 /** The saved pass, checked as a whole; a missing or malformed required field is an integrity refusal, never guessed. */
@@ -125,8 +135,10 @@ export function readRun(store: Store, request: { project: string }): OmResult<Se
 }
 function checkRecord(value: unknown, project: string): value is RunRecord {
   if (!object(value) || value.contract !== RUN_CONTRACT || value.project !== project || !isRef(value.input)) return false;
-  const keys = ["contract", "project", "input", "state", "last"];
+  const keys = ["contract", "project", "input", "intent", "state", "last"];
   if (Object.keys(value).length !== keys.length || !keys.every(key => Object.hasOwn(value, key))) return false;
+  const outcomes = object(value.intent) && Object.keys(value.intent).length === 1 ? normalizedOutcomes(value.intent.outcomes) : null;
+  if (!outcomes || !same(outcomes, value.intent.outcomes)) return false;
   const state = value.state;
   if (!object(state)) return false;
   if (state.phase === "ready") { if (Object.keys(state).length !== 1) return false; }
@@ -153,17 +165,43 @@ function checkStep(step: unknown): step is RunStep {
  * exists: a repeated start reads the saved pass first and never derives a new address from today's B1 (№1737 п.1).
  * The first creation is `expected: 0`, so a race has one winner.
  */
-export function startRun(store: Store, request: { project: string }): OmResult<Sealed<Revision<RunRecord>>> {
-  const saved = readRun(store, request);
-  if (!saved.ok) return saved;
-  if (saved.value) return delivered(saved.value);
-  const input = store.get(`om-input:${request.project}`);
-  if (!input) return refused("record_missing", "A pass begins from the exact first B1 of the project", { unit: UNIT, target: runId(request.project), field: "input" }, "producer");
-  const value: RunRecord = { contract: RUN_CONTRACT, project: request.project, input: reference(input), state: { phase: "ready" }, last: null };
-  const written = writeGuarded<RunRecord>(store, { unit: UNIT, target: runId(request.project),
-    writes: [{ id: runId(request.project), kind: RUN_KIND, expected: 0, value: value as unknown as Json }], guards: [reference(input)] });
-  if (!written.ok) return written;
-  return delivered(written.value[0]! as Revision<RunRecord>);
+/**
+ * The one pass of a project and its launch intent (№1852 п.1–2). An existing pass is read first: no intent continues
+ * it, an equal one (in any order, with repeats) is the same pass without a write, another one is run_intent_conflict —
+ * also after complete. A first pass fixes the named outcomes, or every outcome of its exact B1, as a concrete set; an
+ * outcome B1 does not accept is run_outcome_unknown, and nothing is written for such an intent.
+ */
+export function startRun(store: Store, request: { project: string; outcomes?: readonly string[] }): OmResult<Sealed<Revision<RunRecord>>> {
+  requireCondition(store instanceof Store && object(request) && isText(request.project)
+    && Object.keys(request).every(key => key === "project" || key === "outcomes")
+    && (request.outcomes === undefined || normalizedOutcomes(request.outcomes) !== null),
+  "run_request_invalid", "A pass is started by its project and, optionally, a nonempty set of intended outcomes");
+  const project = request.project, named = request.outcomes === undefined ? null : normalizedOutcomes(request.outcomes)!;
+  const existing = (): Revision<RunRecord> | null => {
+    const saved = take(readRun(store, { project })) as Revision<RunRecord> | null;
+    if (saved && named && !same(named, saved.value.intent.outcomes))
+      fail("run_intent_conflict", saved.id, "intent.outcomes", "This pass works toward another intent; a pass never changes its intent", reference(saved));
+    return saved;
+  };
+  try {
+    const saved = existing();
+    if (saved) return delivered(saved);
+    const head = store.get(`om-input:${project}`);
+    if (!head) fail("record_missing", runId(project), "input", "A pass begins from the exact first B1 of the project");
+    const input = take(readOmInput(store, project, reference(head))) as Revision<OmInputRecord>;
+    const accepted = normalizedOutcomes(input.value.input.features.map(feature => feature.outcome));
+    if (!accepted) fail("horizon_empty", input.id, "features", "The accepted input names no outcome a pass could work toward", reference(input));
+    const outcomes = named ?? accepted;
+    const unknown = outcomes.find(outcome => !accepted.includes(outcome));
+    if (unknown !== undefined) fail("run_outcome_unknown", input.id, "outcomes", `The accepted input has no feature with the outcome ${unknown}`, reference(input));
+    const value: RunRecord = { contract: RUN_CONTRACT, project, input: reference(input), intent: { outcomes }, state: { phase: "ready" }, last: null };
+    const written = writeGuarded<RunRecord>(store, { unit: UNIT, target: runId(project),
+      writes: [{ id: runId(project), kind: RUN_KIND, expected: 0, value: value as unknown as Json }], guards: [reference(input)] });
+    if (written.ok) return delivered(written.value[0]! as Revision<RunRecord>);
+    // Two stores: the winner's pass is read again; an equal intent converges to it, another one conflicts.
+    const raced = existing();
+    return raced ? delivered(raced) : written;
+  } catch (error) { if (error instanceof RunFailure) return { ok: false, refusal: error.refusal }; throw error; }
 }
 
 /**
@@ -230,7 +268,6 @@ async function perform(store: Store, request: RunRequest, step: RunStep): Promis
       case "assess": return mapped(await recovering(store, project, () => assessFact(store, body as never)), terminal => [refOf(terminal)]);
       case "routes": return mapped(writeRoutes(store, body as never), record => [refOf(record)]);
       case "lines": case "confirm": return mapped(writeGapLines(store, body as never), record => [refOf(record)]);
-      case "gaps": return mapped(writeGaps(store, body as never), written => written.records.map(refOf));
       case "obligations": return mapped(writeOmObligations(store, body as never), written => [refOf(written.producer), refOf(written.record)]);
       case "candidate": {
         const written = writeCandidate(store, body as never);
@@ -257,6 +294,12 @@ async function perform(store: Store, request: RunRequest, step: RunStep): Promis
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
       case "cease-check": return mapped(writeAnswersCheckCessation(store, body as never), record => [refOf(record)]);
       case "resume": return mapped(resumeSeries(store, body as never), record => [refOf(record)]);
+      case "bases": {
+        const build = body as unknown as BasesStep;
+        return mapped(writeRunBases(store, { project }, { guards: build.guards, open: build.open, completion: build.completion }),
+          built => [built.input, built.bases.horizon, built.bases.routes, built.bases.queue]);
+      }
+      case "apply": return mapped(writeApplyAnswer(store, body as never), record => [refOf(record)]);
       case "close": {
         const closed = closeAttempt(store, body as never);
         if (!closed.ok) return closed;
@@ -331,25 +374,38 @@ type Choice = { step: RunStep } | { wait: RunWait };
 const step = (action: RunAction, request: unknown, series: string | null = null, attempt: number | null = null): { step: RunStep } =>
   ({ step: { action, request: sealed(request) as unknown as Json, series, attempt } });
 
-interface Bases { routes: Revision<RoutesRecord>; order: readonly string[]; input: Ref }
+interface Bases { routes: Revision<RoutesRecord>; order: readonly string[]; input: Ref; refs: RunBases }
+/**
+ * The saved build of the pass's bases: the exact roots its need was read on (for its identity), the attempt heads it
+ * was decided on (its guards) and the attempts it lets stay open — none for new work, the frame group after C5.
+ */
+interface BasesStep { project: string; basis: Ref[]; guards: Ref[]; open: string[]; completion: boolean }
 /**
  * The next action. An owner that waits keeps its own addressed wait and never stops an independent owner whose own
  * admission holds (row 3, К1): the pass goes on in M3 order and, if nothing is admissible, stands on the first wait.
  */
 function selectNext(store: Store, request: RunRequest, history: RunHistory): Next {
-  const project = request.project, waits: { wait: RunWait }[] = [];
+  const project = request.project, waits: { wait: RunWait }[] = [], open: Ref[] = [];
   // 1. An open attempt of any series — on any line, a superseded one included (№1737 п.10, C57) — is continued first,
   // on its own saved plan and before any new B1 is looked at (№1737 п.2, п.8): its results stay results of the B1 it
   // began from. A second attempt of that series never runs beside it.
   for (const series of projectSeries(store, project, true)) {
-    const open = [...series.value.attempts].find(attempt => attempt.outcome === null);
-    if (!open) continue;
-    const next = continueAttempt(store, request, series, open.ordinal, history);
+    const running = [...series.value.attempts].find(attempt => attempt.outcome === null);
+    if (!running) continue;
+    open.push(reference(series));
+    const next = continueAttempt(store, request, series, running.ordinal, history);
     if ("step" in next) return next;
     waits.push(next);
   }
-  const bases = currentBases(store, request);
+  const bases = machineBases(store, request, open);
+  if ("step" in bases) return bases;
   if ("wait" in bases) return waits[0] ?? bases;
+  // №1860 п.5 (C38): an accepted answer M6 already routes as answered is applied to B1 when no attempt works on the
+  // B1 it would replace; the new B1 then gets its own bases in the next step.
+  if (!open.length) {
+    const applied = applyStep(store, project, bases);
+    if (applied) return applied;
+  }
   // 2. New work: the project mechanism M5:addressing first (№1737 п.2), then blocks strictly in M3 order.
   const m5 = bases.routes.value.batches.filter(isM5Batch).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const owners: [Owner, RouteBatch[]][] = m5.length ? [[{ owner: M5_OWNER }, [m5[0]!]]] : [];
@@ -368,37 +424,62 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
   const end = completion(store, request);
   if (end) return end;
   return wait("run_idle", runId(project), "bases", "No admissible new work remains on these exact bases; the pass waits for their next lawful revision",
-    [request.bases.horizon, request.bases.queue, request.bases.routes]);
+    [bases.input, bases.refs.horizon, bases.refs.queue, bases.refs.routes]);
 }
 const isM5Batch = (batch: RouteBatch): boolean => batch.model === "MC2" && batch.task === "input-field"
   && batch.items.length > 0 && batch.items.every(item => item.field === "address" && item.consumers.length === 0);
 
 /**
- * The bases of new work must belong to today's B1: the horizon gate, the M3 queue over it and the M6 routes over the
- * same input and horizon. After a new B1 (for example, from D3 of M5) the pass waits for their lawful new chain with the
- * exact new B1 and the old bases — it never copies the owner's choice onto a new input (№1737 п.8).
+ * The bases of new work are the machine bases of today's B1 (H1.1): the issue of the launch intent, the M3 queue over
+ * it and the M6 routes over the same input and horizon, each current. After a new B1 (from D3 of M5 or an applied fact)
+ * or a new accepted layer the pass builds them in its own saved step — only when no open attempt still works on the
+ * old heads (№1860 п.5); it never carries an earlier issue over to a new input (№1737 п.8).
  */
-function currentBases(store: Store, request: RunRequest): Bases | { wait: RunWait } {
-  const project = request.project, input = store.get(`om-input:${project}`);
-  if (!input) fail("record_missing", `om-input:${project}`, "input", "The pass requires its current B1");
-  const stale = (field: string, message: string, extra: Ref[] = []) => wait("bases_stale", runId(project), field, message,
-    [reference(input), request.bases.horizon, request.bases.queue, request.bases.routes, ...extra]);
-  // A basis the owner has not lawfully issued is addressed to that exact basis, not to the project as a whole.
-  const unread = (refusal: Refusal, field: string, ref: Ref): { wait: RunWait } =>
-    wait(refusal.code, ref.id, field, refusal.message, [ref, ...(refusal.at.ref ? [refusal.at.ref] : [])]);
-  const horizon = readHorizon(store, project, request.bases.horizon);
-  if (!horizon.ok) return unread(horizon.refusal, "horizon", request.bases.horizon);
-  if (horizon.value.gate.value.state !== "accepted") return stale("horizon", "The named horizon gate did not accept the horizon");
-  if (!sameRef(horizon.value.horizon.value.request.input as Ref, reference(input)))
-    return stale("horizon", "The horizon belongs to another B1; the owner's new horizon for this input has not been issued");
-  const routes = readRoutes(store, { project, record: request.bases.routes });
-  if (!routes.ok) return unread(routes.refusal, "routes", request.bases.routes);
-  const sources = routes.value.record.value.request.gaps.sources;
-  if (!sameRef(sources.input, reference(input)) || !sameRef(sources.horizon, request.bases.horizon))
-    return stale("routes", "The routes belong to another B1 or horizon");
-  const queue = readQuestionQueue(store, { project, queue: request.bases.queue, routes: request.bases.routes });
-  if (!queue.ok) return unread(queue.refusal, "queue", request.bases.queue);
-  return { routes: routes.value.record as unknown as Revision<RoutesRecord>, order: queue.value.order.map(row => row.block), input: reference(input) };
+function machineBases(store: Store, request: RunRequest, open: readonly Ref[]): Bases | Choice {
+  const project = request.project, checked = prepareRunBases(store, { project });
+  if (!checked.ok) return { wait: waitOf(checked.refusal, project) };
+  if (checked.value.state === "missing") {
+    // №1860 п.5: new heads of B1, D1, M6 or C1 would take the current area from attempts still working on it. The
+    // common B3 of the same issue — a missing participant registered while the first one waits for the common frame —
+    // is admitted meanwhile: B3 itself refuses a new local subject beside a running attempt (№1937-1).
+    if (open.length && (RUN_BASES_HEAD_STAGES as readonly string[]).includes(checked.value.stage))
+      return wait("bases_after_work", open[0]!.id, "attempts",
+        `The next bases (${checked.value.stage}) wait until the open attempts finish on their current bases`, [...open]);
+    return basesStep(store, project, [], false);
+  }
+  const built = checked.value.built;
+  const routes = readRoutes(store, { project, record: built.bases.routes });
+  if (!routes.ok) return { wait: waitOf(routes.refusal, project) };
+  const queue = readQuestionQueue(store, { project, queue: built.bases.queue, routes: built.bases.routes });
+  if (!queue.ok) return { wait: waitOf(queue.refusal, project) };
+  return { routes: routes.value.record as unknown as Revision<RoutesRecord>, order: queue.value.order.map(row => row.block),
+    input: built.input, refs: built.bases as RunBases };
+}
+/**
+ * The saved build of the bases. Its identity is every root the machine derivation reads — B1, the stages and
+ * inventory, the graph, the accepted frames and the research L2 — so a changed world is a new step, never a repeat
+ * without effect; the heads of the attempts it was decided on guard its writes (№1860 п.5).
+ */
+function basesStep(store: Store, project: string, open: string[], completion: boolean, series: string | null = null, attempt: number | null = null): { step: RunStep } {
+  const ids = [`om-input:${project}`, `graph:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`, `phase:${project}:L2`,
+    `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`)];
+  const basis = ids.flatMap(id => { const head = store.get(id); return head ? [reference(head)] : []; });
+  const guards = projectSeries(store, project, true).map(row => reference(row));
+  const build: BasesStep = { project, basis, guards, open: [...open].sort(), completion };
+  return step("bases", build, series, attempt);
+}
+/** The first answered fact of the current M6 whose question B1 still holds open: its accepted answer and MC1 question. */
+function applyStep(store: Store, project: string, bases: Bases): Choice | null {
+  const input = store.get<OmInputRecord>(`om-input:${project}`)!;
+  const held = new Set(input.value.input.questions.map(question => question.id));
+  const answered = bases.routes.value.routes.filter(route => route.state === "answered" && route.answer && route.field === "answer" && held.has(route.target))
+    .sort((a, b) => a.target < b.target ? -1 : a.target > b.target ? 1 : 0);
+  for (const route of answered) {
+    const answer = readAcceptedAnswer(store, { project, record: route.answer! });
+    if (!answer.ok) return { wait: waitOf(answer.refusal, project) };
+    return step("apply", { project, input: reference(input), answer: route.answer, question: reference(answer.value.question) });
+  }
+  return null;
 }
 
 /** Every current line of the project (or every line), blocks and the mechanism; each series is read through its common reader. */
@@ -455,13 +536,16 @@ function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, 
   if (control.length) return wait("owner_control", series.id, "goal",
     "This goal waits for its owner's verified answer; no trusted producer of it exists before H2.0", [reference(series), ...control]);
   const last = attempts.at(-1);
-  // A goal already achieved on these exact routes is done for them: repeating it would pay for the same work. On other
-  // routes the same goal may be worked again, and A3 decides whether its result is new (row 14).
-  if (last && same(last.goal, goal) && last.outcome?.reason === "result" && samePlan(store, project, series, last.ordinal, bases)) return null;
+  // A goal already achieved is done: on these exact routes nothing remains, and a new routes Ref alone never pays for
+  // the same goal again (№1860 п.5, C52) — its results are delivered first; a gap it still does not close waits,
+  // addressed to that result, instead of a new ordinal.
+  if (last && same(last.goal, goal) && last.outcome?.reason === "result") return samePlan(store, project, series, last.ordinal, bases) ? null
+    : wait("goal_achieved", series.id, "goal", "This goal was achieved on earlier routes; its gaps remain open on the current ones without a proved new subject",
+      [reference(series), bases.refs.routes]);
   const ordinal = (attempts.at(-1)?.ordinal ?? 0) + 1;
-  const plan = { routes: request.bases.routes, batches: batches.map(batch => batch.id).sort() };
+  const plan = { routes: bases.refs.routes, batches: batches.map(batch => batch.id).sort() };
   return step("open", { ...ownerRequest(project, owner, series.value.line), attempt: ordinal, goal,
-    ...(owner.owner ? { admission: { gaps: scope, routes: request.bases.routes, batch: batches[0]!.id } } : {}), completion: plan },
+    ...(owner.owner ? { admission: { gaps: scope, routes: bases.refs.routes, batch: batches[0]!.id } } : {}), completion: plan },
   series.id, ordinal);
 }
 
@@ -676,27 +760,32 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       const bound: FrameAttemptBinding = { series: reference(series), ordinal, obligations: obligationsOf(batches, level) };
       if (level === 2) return step("accept", { gate: checked.request, settle: { project, level: 2, candidate: candidate!.ref,
         outcome: { gate: "G3", candidate: candidate!.ref, graphHash: candidate!.graphHash, passed: true, codes: [] }, binding: bound } }, series.id, ordinal);
-      return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...request.bases.sources],
-        results: group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: "assembly" as const, record: item.record }))),
-        binding: bound } }, series.id, ordinal);
+      const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: "assembly" as const, record: item.record })));
+      const sources = prepareWorksSources(store, { project, results });
+      if (!sources.ok) return { wait: waitOf(sources.refusal, project) };
+      return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...sources.value.sources],
+        results, binding: bound } }, series.id, ordinal);
     }
     // The coordinator keeps its own accepting C5; every attempt of the group proves its goal through its own D2 event.
     if (accepted.binding?.series.id === series.id && accepted.binding.ordinal === ordinal) accepting.push(accepted.frame);
     const confirmed = confirmationOf(store, project, series.id, ordinal);
     if (!confirmed) {
-      // The current D1 with the exact accepted frame: the owner's current bases when they already name it; otherwise the
-      // same sources with the accepted frame. When the common D1 needs a new owner's horizon (an L3 witness after N2), the
-      // D2 event waits for those bases — H1 never chooses a horizon.
-      let current = ownersScope(store, project, request.bases.routes, accepted.acceptance, level);
-      if (!current) {
-        const d1 = acceptedScope(scope, accepted.acceptance, level);
-        const gaps = prepareGaps(store, d1);
-        if (!gaps.ok) return wait("d2_bases", series.id, "gaps",
-          `The D2 event of this goal needs the current D1 over the accepted frame; the common D1 refused it (${gaps.refusal.code}: ${gaps.refusal.message}); it waits for the owner's bases over that frame`,
-          [accepted.frame, request.bases.horizon, request.bases.routes]);
-        if (gaps.value.writes.length) return step("gaps", d1, series.id, ordinal);
-        current = { sources: gaps.value.sources as GapRequest, records: [...gaps.value.existing].map(reference).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0) };
+      // The current D1 over the exact accepted frame is the machine D1 of the project (№1860 п.5, C84): after the
+      // common C5 its new horizon and D1 serve the D2 events of this group, though its attempts are still open; any
+      // other attempt still working on the old heads finishes first. The old scope stays the history of the goal.
+      // Bases that complete this accepted group: its B3 of the new slices comes only after its own D2 and G7 (№1860 п.8).
+      const checkedBases = prepareRunBases(store, { project }, { completion: true });
+      if (!checkedBases.ok) return { wait: waitOf(checkedBases.refusal, project) };
+      if (checkedBases.value.state === "missing") {
+        const others = projectSeries(store, project, true).filter(row => row.value.attempts.some(attempt => attempt.outcome === null)
+          && !group.some(member => member.series.id === row.id));
+        if (others.length) return wait("bases_after_work", others[0]!.id, "attempts",
+          "The D2 bases over the accepted frame wait until the other open attempts finish on their current bases", others.map(row => reference(row)));
+        return basesStep(store, project, group.map(member => member.series.id), true, series.id, ordinal);
       }
+      const current = ownersScope(store, project, checkedBases.value.built.bases.routes, accepted.acceptance, level);
+      if (!current) return wait("d2_bases", series.id, "gaps",
+        "The machine D1 of this project does not stand on the accepted frame of this goal", [accepted.frame, checkedBases.value.built.bases.routes]);
       const latest = store.get<GapLinesRecord>(gapLinesId(project))!;
       return step("confirm", { project, previous: reference(latest), pass: latest.value.request.pass + 1, gaps: current,
         closures: goalLines.map(id => ({ id, reason: "filled", basis: accepted.acceptance.frame, acceptance: accepted.acceptance,
@@ -925,7 +1014,7 @@ function confirmationOf(store: Store, project: string, series: string, ordinal: 
     if (row.value.request.closures.some(item => item.attempt?.series.id === series && item.attempt.attempt === ordinal)) return reference(row);
   return null;
 }
-/** The owner's current D1 (of the named routes) when its frame at this level is exactly this acceptance. */
+/** The current machine D1 (of the named routes) when its frame at this level is exactly this acceptance. */
 function ownersScope(store: Store, project: string, routes: Ref, acceptance: AcceptedFrameRequest, level: 2 | 3): GapReadRequest | null {
   const read = readRoutes(store, { project, record: routes });
   if (!read.ok) return null;
@@ -936,17 +1025,6 @@ function ownersScope(store: Store, project: string, routes: Ref, acceptance: Acc
     && same(frame.frame, acceptance.frame) && same(gaps.sources.graph, acceptance.graph) ? gaps : null;
 }
 /** The current D1 request with the exact accepted frame at its level: the same input, horizon and other sources. */
-function acceptedScope(scope: GapReadRequest, acceptance: AcceptedFrameRequest, level: 2 | 3): GapRequest {
-  const sources = structuredClone(scope.sources) as unknown as GapRequest & { operations: { frame: Record<string, unknown> }; works: Record<string, unknown> };
-  const accepted = { graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame };
-  sources.graph = acceptance.graph;
-  if (level === 2) sources.operations = { frame: { ...sources.operations.frame, ...accepted }, proposals: [] } as never;
-  else {
-    sources.operations = { ...sources.operations, frame: { ...sources.operations.frame, graph: acceptance.graph } } as never;
-    sources.works = { frame: { ...(sources.works.frame as Record<string, unknown>), ...accepted }, proposals: [] } as never;
-  }
-  return sources as GapRequest;
-}
 const uniqueRefs = (refs: readonly Ref[]): Ref[] => refs.filter((ref, index, all) => all.findIndex(other => same(other, ref)) === index)
   .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
 interface Member { series: Sealed<Revision<AnyRepairSeries>>; ordinal: number; open: boolean; work: CompletionSnapshot; batches: RouteBatch[];

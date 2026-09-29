@@ -237,49 +237,65 @@ export function checkAtomicWorks(graph: Graph, collection: GapCollection): OmRes
   });
 }
 
-/** Measure the exact compiler task DTO plus the complete checked F4 packet, before any MachinePlan exists. */
-function packetCapacity(store: Store, request: AtomicGateRequest, candidate: FrameCandidateRecord,
-  neighbors: Revision<NeighborCollection>, limit: number, current: boolean): Finding[] {
+type ExternalInput = (artifact: string) => Pick<TaskInput, 'receipt' | 'source'>;
+/**
+ * The one task derivation of a works candidate: the compiler's deriveTasks with the G5 input resolution. G5 checks the
+ * external Sources its request names; the machine caller collects exactly the Sources the same derivation asks for
+ * (H1.1, №1860-7). `admit` runs where G5 admits its environment, so both keep the original order of refusals.
+ */
+function candidateTasks(store: Store, project: string, target: string, candidate: FrameCandidateRecord,
+  neighbors: Revision<NeighborCollection>, external: ExternalInput, admit: () => void) {
   const graph = candidate.graph;
   const delivery = take(readDeliveries(store, neighbors.value.source));
-  const handoff = take(readOmObligations(store, { project: request.project, producer: candidate.works!.producer }));
-  const obligations = bindTaskObligations(store, request.project, graph, handoff.handoff as OmObligationHandoff);
-  if (!graph.horizon.length) {
-    if (request.sources.length) fail('atomic_gate_basis_unproven', request.candidate.id, 'sources', 'A context names exactly its necessary external sources');
-    return obligations.findings;
-  }
-  const environment = take(readRecord<Environment>(store, request.environment, { unit: 'G5', target: request.environment.id,
-    id: `environment:${request.project}`, kind: 'environment' }));
+  const handoff = take(readOmObligations(store, { project, producer: candidate.works!.producer }));
+  const obligations = bindTaskObligations(store, project, graph, handoff.handoff as OmObligationHandoff);
+  if (!graph.horizon.length) return { tasks: null, obligations };
+  admit();
   const root = delivery.request.ownership.root === null ? null : take(readRecord<ExecutionRoot>(store,
-    delivery.request.ownership.root, { unit: 'G5', target: request.candidate.id,
-      id: `execution-root:${request.project}`, kind: 'execution-root' }));
+    delivery.request.ownership.root, { unit: 'G5', target, id: `execution-root:${project}`, kind: 'execution-root' }));
   const writers = new Map<string, WriterProof | null>();
   const owner = (path: string): WriterProof | null => {
     if (writers.has(path)) return writers.get(path)!;
     const ref = delivery.writers[path];
     if (ref && !root) fail('atomic_gate_basis_unproven', path, 'ownership.root', 'A checked writer needs its exact execution slice');
-    const proof = ref ? readWriter(store, request.project, { root: root!.value.path, head: root!.value.head }, ref, path) : null;
+    const proof = ref ? readWriter(store, project, { root: root!.value.path, head: root!.value.head }, ref, path) : null;
     writers.set(path, proof); return proof;
   };
-  const external = new Map(request.sources.map(ref => [ref.id, ref])), used = new Set<string>();
   const resolveInput = (producer: string, artifact: string): Pick<TaskInput, 'receipt' | 'source'> => {
-    if (graph.artifacts.find(item => item.id === artifact)?.external) {
-      const id = `source:${request.project}:${artifact}`, ref = external.get(id);
-      if (!ref) fail('atomic_gate_basis_unproven', artifact, 'sources', 'Each external task input needs its exact declared Source');
-      used.add(id); return resolveExternalSource(store, request.project, graph, artifact, ref, current);
-    }
+    if (graph.artifacts.find(item => item.id === artifact)?.external) return external(artifact);
     const receipts = unique(neighbors.value.packets.flatMap(packet => packet.neighbors.flatMap(neighbor =>
       (neighbor.direction === 'reads' || neighbor.direction === 'requires') && neighbor.neighbor.work.id === producer
         && neighbor.artifact === artifact && neighbor.delivery === 'available' && neighbor.basis ? [neighbor.basis] : [])));
     if (receipts.length !== 1) fail('atomic_gate_basis_unproven', artifact, 'delivery', 'A task input needs one checked F3 receipt for this producer and artifact');
     return { receipt: receipts[0]!, source: null };
   };
-  const { tasks } = deriveTasks(request.project, candidate.graphHash, graph, resolveInput,
+  const { tasks } = deriveTasks(project, candidate.graphHash, graph, resolveInput,
     { version: 2, owner, researchObligations: obligations.byNode });
+  return { tasks, obligations };
+}
+/** Measure the exact compiler task DTO plus the complete checked F4 packet, before any MachinePlan exists. */
+function packetCapacity(store: Store, request: AtomicGateRequest, candidate: FrameCandidateRecord,
+  neighbors: Revision<NeighborCollection>, limit: number, current: boolean): Finding[] {
+  const graph = candidate.graph;
+  const external = new Map(request.sources.map(ref => [ref.id, ref])), used = new Set<string>();
+  let fullCheck: Environment['fullCheck'] | null = null;
+  const derived = candidateTasks(store, request.project, request.candidate.id, candidate, neighbors, artifact => {
+    const id = `source:${request.project}:${artifact}`, ref = external.get(id);
+    if (!ref) fail('atomic_gate_basis_unproven', artifact, 'sources', 'Each external task input needs its exact declared Source');
+    used.add(id); return resolveExternalSource(store, request.project, graph, artifact, ref, current);
+  }, () => {
+    const environment = take(readRecord<Environment>(store, request.environment, { unit: 'G5', target: request.environment.id,
+      id: `environment:${request.project}`, kind: 'environment' }));
+    fullCheck = environment.value.fullCheck as Environment['fullCheck'];
+  });
+  if (!derived.tasks) {
+    if (request.sources.length) fail('atomic_gate_basis_unproven', request.candidate.id, 'sources', 'A context names exactly its necessary external sources');
+    return derived.obligations.findings;
+  }
   if (used.size !== external.size) fail('atomic_gate_basis_unproven', request.candidate.id, 'sources', 'A context names exactly its necessary external sources');
-  const findings: Finding[] = [...obligations.findings];
-  for (const task of tasks) {
-    try { preplanTaskContext({ project: request.project, graph, task, fullCheck: environment.value.fullCheck as Environment['fullCheck'],
+  const findings: Finding[] = [...derived.obligations.findings];
+  for (const task of derived.tasks) {
+    try { preplanTaskContext({ project: request.project, graph, task, fullCheck: fullCheck!,
       basis: { candidate: request.candidate, environment: request.environment }, neighbors }, limit); }
     catch (error) {
       if (!(error instanceof EngineError) || error.code !== 'context_budget_exceeded') throw error;
@@ -411,6 +427,58 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
   });
 }
 
+/**
+ * The final works candidate these exact results make, previewed in one transaction view: D1 over the final proposals,
+ * the next D2 snapshot, the D7 transfer, C4 and F3. G5 acceptance and the machine list of its external Sources share it.
+ */
+function worksCandidate(store: Store, project: string, results: readonly WorkProposalSource[], target: string) {
+  const checked = modelSources(store, project, results), first = checked.works[0]!;
+  const old = take(readOmObligations(store, { project, producer: first.producer }));
+  if (!same(reference(old.record), first.ledger)) fail('atomic_gate_bindings_unproven', first.ledger.id, 'ledger', 'The source ledger must belong to the checked answer');
+  const oldRequest = old.record.value.request, initial = oldRequest.gaps.sources.works;
+  if ('state' in initial) fail('atomic_gate_basis_unproven', target, 'works', 'The original assignment requires an accepted operation frame');
+  const works: ProposalRequest = { frame: copy(initial.frame) as ProposalRequest['frame'],
+    proposals: unique([...initial.proposals, ...checked.outputs.map(output => reference(output.proposal))]) };
+  const tx = new Transaction(store);
+  const gaps = take(prepareGaps(tx.view, { ...copy(oldRequest.gaps.sources), works } as GapRequest)); tx.add(gaps);
+  const gapRecords = [...gaps.existing.map(reference), ...gaps.writes.map(write => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }))];
+  const gapRead: GapReadRequest = { sources: gaps.sources as GapRequest, records: unique(gapRecords) };
+  const previousHead = store.get(oldRequest.lines.id);
+  if (!previousHead) fail('atomic_gate_basis_unproven', oldRequest.lines.id, 'lines', 'The existing D2 line history must be retained');
+  const previous = take(readGapLines(store, { project, record: reference(previousHead) }));
+  const lines = take(prepareGapLines(tx.view, { project, previous: reference(previousHead),
+    pass: previous.value.request.pass + 1, gaps: gapRead, closures: [] })); tx.add(lines);
+  const lineWrite = lines.writes.find(write => write.kind === 'gap-line');
+  const linesRef = lines.existing ? reference(lines.existing) : lineWrite
+    ? { id: lineWrite.id, revision: lineWrite.expected + 1, hash: hashJson(lineWrite.value) } : null;
+  if (!linesRef) fail('atomic_gate_basis_unproven', target, 'lines', 'The transition must retain the new full D2 snapshot');
+  const context = { gaps: gapRead, lines: linesRef }, assignments: ObligationRequest['assignments'] = [];
+  const oldGaps = take(readGaps(store, oldRequest.gaps as GapReadRequest));
+  const newGaps = take(readGaps(tx.view, gapRead));
+  for (const source of oldRequest.assignments) {
+    if (!('record' in source)) fail('atomic_gate_bindings_unproven', old.record.id, 'assignment', 'An original saved handoff must name an exact assignment');
+    const sourceRecord = store.get<{ gap: Ref }>(source.record.id, source.record.revision);
+    const sourceGap = oldGaps.records.find(row => same(reference(row), sourceRecord?.value.gap));
+    const destination = sourceGap && newGaps.records.find(row => row.value.gap.id === sourceGap.value.gap.id);
+    if (!destination) fail('obligation_assignment_invalid', source.record.id, 'gap', 'An assignment cannot disappear from the final D1 set');
+    const transfer = take(prepareObligationTransfer(tx.view, { project,
+      from: { producer: reference(old.producer), ledger: reference(old.record), assignment: source.record }, context, gap: reference(destination) }));
+    tx.add(transfer); assignments.push({ record: reference(transfer.record) });
+  }
+  const handoff = take(prepareOmObligations(tx.view, { project, ...context, assignments })); tx.add(handoff);
+  const bindings = remapBindings(old, handoff, checked.works.flatMap(work => work.bindings));
+  const candidateRequest: CandidateRequest = { ...works, works: { contract: WORKS_FRAME_CONTRACT,
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings } };
+  const candidate = take(prepareWorksFrame(tx.view, candidateRequest));
+  if (candidate.state !== 'candidate') fail('work_blocking_gap_open', target, 'candidate', 'The final proposals must fill the complete work frame');
+  tx.add(candidate);
+  const candidateWrite = candidate.writes.find(write => write.kind === 'frame-candidate');
+  const candidateRef = candidate.existing ? reference(candidate.existing) : candidateWrite
+    ? { id: candidateWrite.id, revision: candidateWrite.expected + 1, hash: hashJson(candidateWrite.value) } : null;
+  if (!candidateRef) fail('atomic_gate_basis_unproven', target, 'candidate', 'The common C4 transition must yield its exact candidate');
+  const neighbors = take(prepareNeighbors(tx.view, { project, candidate: candidateRef })); tx.add(neighbors);
+  return { tx, gapRead, candidateRef, neighbors };
+}
 /** Rebuild D1/D2/D7 over the final proposals and join every write with common C5 acceptance. */
 export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest): OmResult<Sealed<PreparedWorksAcceptance>> {
   return run(() => {
@@ -421,51 +489,7 @@ export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest
       return { state: 'unchanged' as const, record: saved as Revision<WorksAcceptanceRecord>, acceptance: saved.value.acceptance as AcceptedFrameRequest | null,
         writes: [], guards: [] };
     }
-    const checked = modelSources(store, request.project, request.results), first = checked.works[0]!;
-    const old = take(readOmObligations(store, { project: request.project, producer: first.producer }));
-    if (!same(reference(old.record), first.ledger)) fail('atomic_gate_bindings_unproven', first.ledger.id, 'ledger', 'The source ledger must belong to the checked answer');
-    const oldRequest = old.record.value.request, initial = oldRequest.gaps.sources.works;
-    if ('state' in initial) fail('atomic_gate_basis_unproven', id, 'works', 'The original assignment requires an accepted operation frame');
-    const works: ProposalRequest = { frame: copy(initial.frame) as ProposalRequest['frame'],
-      proposals: unique([...initial.proposals, ...checked.outputs.map(output => reference(output.proposal))]) };
-    const tx = new Transaction(store);
-    const gaps = take(prepareGaps(tx.view, { ...copy(oldRequest.gaps.sources), works } as GapRequest)); tx.add(gaps);
-    const gapRecords = [...gaps.existing.map(reference), ...gaps.writes.map(write => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }))];
-    const gapRead: GapReadRequest = { sources: gaps.sources as GapRequest, records: unique(gapRecords) };
-    const previousHead = store.get(oldRequest.lines.id);
-    if (!previousHead) fail('atomic_gate_basis_unproven', oldRequest.lines.id, 'lines', 'The existing D2 line history must be retained');
-    const previous = take(readGapLines(store, { project: request.project, record: reference(previousHead) }));
-    const lines = take(prepareGapLines(tx.view, { project: request.project, previous: reference(previousHead),
-      pass: previous.value.request.pass + 1, gaps: gapRead, closures: [] })); tx.add(lines);
-    const lineWrite = lines.writes.find(write => write.kind === 'gap-line');
-    const linesRef = lines.existing ? reference(lines.existing) : lineWrite
-      ? { id: lineWrite.id, revision: lineWrite.expected + 1, hash: hashJson(lineWrite.value) } : null;
-    if (!linesRef) fail('atomic_gate_basis_unproven', id, 'lines', 'The transition must retain the new full D2 snapshot');
-    const context = { gaps: gapRead, lines: linesRef }, assignments: ObligationRequest['assignments'] = [];
-    const oldGaps = take(readGaps(store, oldRequest.gaps as GapReadRequest));
-    const newGaps = take(readGaps(tx.view, gapRead));
-    for (const source of oldRequest.assignments) {
-      if (!('record' in source)) fail('atomic_gate_bindings_unproven', old.record.id, 'assignment', 'An original saved handoff must name an exact assignment');
-      const sourceRecord = store.get<{ gap: Ref }>(source.record.id, source.record.revision);
-      const sourceGap = oldGaps.records.find(row => same(reference(row), sourceRecord?.value.gap));
-      const destination = sourceGap && newGaps.records.find(row => row.value.gap.id === sourceGap.value.gap.id);
-      if (!destination) fail('obligation_assignment_invalid', source.record.id, 'gap', 'An assignment cannot disappear from the final D1 set');
-      const transfer = take(prepareObligationTransfer(tx.view, { project: request.project,
-        from: { producer: reference(old.producer), ledger: reference(old.record), assignment: source.record }, context, gap: reference(destination) }));
-      tx.add(transfer); assignments.push({ record: reference(transfer.record) });
-    }
-    const handoff = take(prepareOmObligations(tx.view, { project: request.project, ...context, assignments })); tx.add(handoff);
-    const bindings = remapBindings(old, handoff, checked.works.flatMap(work => work.bindings));
-    const candidateRequest: CandidateRequest = { ...works, works: { contract: WORKS_FRAME_CONTRACT,
-      producer: reference(handoff.producer), ledger: reference(handoff.record), bindings } };
-    const candidate = take(prepareWorksFrame(tx.view, candidateRequest));
-    if (candidate.state !== 'candidate') fail('work_blocking_gap_open', id, 'candidate', 'The final proposals must fill the complete work frame');
-    tx.add(candidate);
-    const candidateWrite = candidate.writes.find(write => write.kind === 'frame-candidate');
-    const candidateRef = candidate.existing ? reference(candidate.existing) : candidateWrite
-      ? { id: candidateWrite.id, revision: candidateWrite.expected + 1, hash: hashJson(candidateWrite.value) } : null;
-    if (!candidateRef) fail('atomic_gate_basis_unproven', id, 'candidate', 'The common C4 transition must yield its exact candidate');
-    const neighbors = take(prepareNeighbors(tx.view, { project: request.project, candidate: candidateRef })); tx.add(neighbors);
+    const { tx, gapRead, candidateRef, neighbors } = worksCandidate(store, request.project, request.results, id);
     const gate = take(prepareAtomicGate(tx.view, { project: request.project, candidate: candidateRef, neighbors: neighbors.reference,
       environment: request.environment, gaps: gapRead, results: request.results, sources: request.sources })); tx.add(gate);
     const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef, binding: request.binding ?? null,
@@ -484,5 +508,56 @@ export function writeWorksAcceptance(store: Store, request: WorksAcceptanceReque
   return run(() => { const prepared = take(prepareWorksAcceptance(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'G5', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
     return prepared;
+  });
+}
+
+export interface WorksSourcesRequest { project: string; results: WorkProposalSource[] }
+export interface CandidateSourcesRequest { project: string; candidate: Ref; neighbors: Ref }
+export interface WorksSources { candidate: Ref; sources: Ref[] }
+const SOURCE_UNFIT = new Set(['external_input_missing', 'artifact_contract_mismatch', 'external_source_request_invalid']);
+/** The collecting side of the one task derivation: each external input's current Source, checked by the common resolver. */
+function neededSources(view: Store, store: Store, project: string, candidateRef: Ref, neighborsRef: Ref): Ref[] {
+  const candidate = take(readWorksFrame(view, { project, candidate: candidateRef }));
+  const neighbors = take(readNeighbors(view, { project, neighbors: neighborsRef }));
+  if (!same(neighbors.value.source.candidate, candidateRef)) fail('packet_foreign', neighborsRef.id, 'candidate', 'Neighbors belong to this exact works candidate');
+  const graph = (candidate.value as FrameCandidateRecord).graph, found = new Map<string, Ref>();
+  candidateTasks(view, project, candidateRef.id, candidate.value as FrameCandidateRecord, neighbors as Revision<NeighborCollection>, artifact => {
+    const id = `source:${project}:${artifact}`, head = store.get(id);
+    if (!head) fail('atomic_gate_basis_unproven', artifact, 'sources', 'Each external task input needs its exact declared Source');
+    try {
+      const resolved = resolveExternalSource(store, project, graph, artifact, reference(head), true);
+      found.set(id, reference(head)); return resolved;
+    } catch (error) {
+      if (error instanceof EngineError && SOURCE_UNFIT.has(error.code)) fail(error.code, artifact, 'sources', error.message);
+      throw error;
+    }
+  }, () => undefined);
+  return sorted([...found.values()]);
+}
+/**
+ * The exact external Sources G5 requires of an existing works candidate (H1.1, №1860-7): the same task derivation G5
+ * runs, collecting instead of checking. Each needed source:<project>:<artifact> is read at its current head and checked
+ * by the common resolver; a missing or unfit one is an addressed refusal naming the artifact. Nothing is written.
+ */
+export function prepareCandidateSources(store: Store, raw: CandidateSourcesRequest): OmResult<Sealed<WorksSources>> {
+  return run(() => {
+    if (!(store instanceof Store) || !object(raw) || !same(Object.keys(raw).sort(), ['candidate', 'neighbors', 'project']) || !text(raw.project)
+      || !isRef(raw.candidate) || !isRef(raw.neighbors)) invalid('sources');
+    return { candidate: copy(raw.candidate), sources: neededSources(store, store, raw.project, raw.candidate, raw.neighbors) };
+  });
+}
+/**
+ * The same list for the works candidate these results make: the acceptance's own candidate transition, previewed
+ * without durable writes, then the same collection. G5 still admits the list it is given currently.
+ */
+export function prepareWorksSources(store: Store, raw: WorksSourcesRequest): OmResult<Sealed<WorksSources>> {
+  return run(() => {
+    if (!(store instanceof Store) || !object(raw) || !same(Object.keys(raw).sort(), ['project', 'results']) || !text(raw.project)
+      || !Array.isArray(raw.results) || !raw.results.length || !raw.results.every(item => object(item)
+        && (item.kind === 'part' || item.kind === 'assembly') && isRef(item.record) && same(Object.keys(item).sort(), ['kind', 'record']))
+      || new Set(raw.results.map(item => canonical(item.record))).size !== raw.results.length) invalid('sources');
+    const project = raw.project, results = sorted(copy(raw.results));
+    const built = worksCandidate(store, project, results, `works-sources:${project}`);
+    return { candidate: built.candidateRef, sources: neededSources(built.tx.view, store, project, built.candidateRef, built.neighbors.reference) };
   });
 }

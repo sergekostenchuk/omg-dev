@@ -24,7 +24,7 @@ import { writeGuarded } from '../src/om/refs.js';
 import { openSeries, beginAttempt } from '../src/om/series.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { QUEUE_POLICY_VERSION, computeBlockWeights, prepareBlockQueue, writeBlockQueue, readBlockQueue,
-  readQuestionQueue, prepareQuestionQueue,
+  readQuestionQueue, prepareQuestionQueue, selectMachinePath,
   type QueuePolicy, type QueueRequest } from '../src/om/queue.js';
 import { fillObligations, prepareFrame, prepareHorizonBasis, readFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import type { LayerProposal } from '../src/om/frame-proposals.js';
@@ -57,7 +57,7 @@ function upper(): Graph {
 }
 function policy(graph: Graph, layer: Ref = { id: 'graph-layer:garden:1', revision: 1, hash: hashJson(graph) }): QueuePolicy {
   const journey = graph.journeys!.find(item => item.terminal === 'success' && item.outcome === 'garden-result')!;
-  return { version: QUEUE_POLICY_VERSION, ownerPath: { layer, journeyId: journey.id, actorId: journey.actor, outcomeId: journey.outcome } };
+  return { version: QUEUE_POLICY_VERSION, machinePath: { layer, journeyId: journey.id, actorId: journey.actor, outcomeId: journey.outcome } };
 }
 const blocksOf = (graph: Graph) => graph.nodes.filter(node => node.kind === 'block').map(node => node.id);
 const snapshots = (store: Store) => store.list().flatMap(row => store.history(row.id));
@@ -125,14 +125,14 @@ test('queue P uses the single explicit successful journey without guessing from 
   const graph = upper(), original = policy(graph), other = graph.journeys!.find(item => item.outcome === 'garden-later')!;
   const baseline = ok(computeBlockWeights(graph, blocksOf(graph), original));
   assert.deepEqual(baseline.order.filter(row => row.P).map(row => row.block).sort(), [consumer, producer].sort());
-  const selected = { ...original, ownerPath: { ...original.ownerPath, journeyId: other.id, actorId: other.actor, outcomeId: other.outcome } };
+  const selected = { ...original, machinePath: { ...original.machinePath, journeyId: other.id, actorId: other.actor, outcomeId: other.outcome } };
   assert.deepEqual(ok(computeBlockWeights(graph, blocksOf(graph), selected)).order.filter(row => row.P).map(row => row.block).sort(), [later, producer].sort());
   for (const change of [{ journeyId: 'unknown' }, { actorId: 'other' }, { outcomeId: 'other' }])
-    rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, ownerPath: { ...original.ownerPath, ...change } }), 'queue_policy_invalid');
+    rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath, ...change } }), 'queue_policy_invalid');
   const failed = graph.journeys!.find(item => item.terminal === 'safe_failure')!;
-  rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, ownerPath: { ...original.ownerPath,
+  rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath,
     journeyId: failed.id, actorId: failed.actor, outcomeId: failed.outcome } }), 'queue_policy_invalid');
-  graph.journeys!.push(clone(graph.journeys!.find(item => item.id === original.ownerPath.journeyId)!));
+  graph.journeys!.push(clone(graph.journeys!.find(item => item.id === original.machinePath.journeyId)!));
   rejected(computeBlockWeights(graph, blocksOf(graph), original), 'queue_policy_invalid');
 });
 
@@ -174,7 +174,7 @@ test('queue public inputs distinguish absent sources and sets from explicitly em
   for (const absent of [undefined, null, false, 'blocks']) malformed(() => computeBlockWeights(graph, absent as unknown as string[], p));
   for (const absent of [undefined, null, false, []]) malformed(() => computeBlockWeights(graph, rows, absent as unknown as QueuePolicy));
   for (const field of ['layer', 'journeyId', 'actorId', 'outcomeId'] as const) {
-    const given = clone(p) as any; delete given.ownerPath[field];
+    const given = clone(p) as any; delete given.machinePath[field];
     malformed(() => computeBlockWeights(graph, rows, given));
   }
   rejected(computeBlockWeights(graph, [], p), 'queue_source_invalid');
@@ -191,7 +191,7 @@ test('historical omg-live r2 has the accepted 24-block policy calculation withou
   const selected = graph.nodes.filter(node => node.kind === 'block' && node.id !== 'n-ui').map(node => node.id);
   assert.equal(selected.length, 24);
   const exactBody = { id: 'graph:omg-live', revision: 2, hash: createHash('sha256').update(bytes).digest('hex') };
-  const selection: QueuePolicy = { version: QUEUE_POLICY_VERSION, ownerPath: { layer: exactBody,
+  const selection: QueuePolicy = { version: QUEUE_POLICY_VERSION, machinePath: { layer: exactBody,
     journeyId: 'jy-owner-success', actorId: 'owner', outcomeId: 'persistent-through-run' } };
   const expected: [string, number, number, number][] = [
     ['n-state',7,1,1], ['n-implement',4,1,1], ['n-publish',3,1,1], ['n-recovery',14,0,1], ['n-control',10,1,0],
@@ -232,13 +232,43 @@ test('historical omg-live r2 has the accepted 24-block policy calculation withou
   }
 });
 
+test('H1.1 №1844-7 №1852-4 the machine path is the minimum canonical key among admitted successful journeys of the intended outcomes, in any order', () => {
+  const graph = upper(), blocks = blocksOf(graph), layer: Ref = { id: 'graph-layer:garden:1', revision: 1, hash: hashJson(graph) };
+  const key = (journey: { outcome: string; actor: string; id: string }) => canonical([journey.outcome, journey.actor, journey.id]);
+  const successes = graph.journeys!.filter(item => item.terminal === 'success' && item.outcome === 'garden-result').sort((a, b) => key(a) < key(b) ? -1 : 1);
+  assert.ok(successes.length > 1, 'Several successful journeys reach the garden result');
+  const success = successes[0]!;
+  // Only the journeys of the intended outcomes: the later outcome's journey is never taken for a garden-result horizon.
+  assert.deepEqual(ok(selectMachinePath(graph, blocks, ['garden-result'], layer)),
+    { layer, journeyId: success.id, actorId: success.actor, outcomeId: 'garden-result' });
+  // The key orders by outcome first: with both outcomes the later outcome's journey is the minimum.
+  assert.equal(ok(selectMachinePath(graph, blocks, ['garden-result', 'garden-later'], layer)).outcomeId, 'garden-later');
+  // A smaller admitted key wins in any array order; a smaller key the common C1 refuses is skipped, not guessed around.
+  const second = { ...clone(success), id: 'garden-a-journey' }, refused = { ...clone(success), id: 'garden-0-journey', path: ['garden-unknown-node'] };
+  assert.ok(key(refused) < key(second) && key(second) < key(success));
+  for (const journeys of [[...graph.journeys!, second, refused], [refused, second, ...graph.journeys!].reverse()])
+    assert.equal(ok(selectMachinePath({ ...clone(graph), journeys }, blocks, ['garden-result'], layer)).journeyId, 'garden-a-journey');
+  // No admitted journey of the intent: the machine's own refusal, addressed to the exact L1, never the owner's.
+  const none = { ...clone(graph), journeys: graph.journeys!.filter(item => item.outcome !== 'garden-result' || item.terminal !== 'success') };
+  const empty = rejected(selectMachinePath(none, blocks, ['garden-result'], layer), 'queue_policy_invalid');
+  assert.deepEqual([empty.route, empty.at.target, empty.at.field], ['producer', layer.id, 'machinePath']);
+  // A refused common source is returned as it is, never skipped for the next convenient path.
+  const broken = { ...clone(graph), edges: [{ id: 'garden-edge', relation: 'unknown', source: blocks[0]!, target: blocks[1]! }] } as unknown as Graph;
+  rejected(selectMachinePath(broken, blocks, ['garden-result'], layer), 'queue_source_invalid');
+});
+test('H1.1 №1852-4 a queue never orders a horizon by the path of another outcome', t => {
+  const f = fixture(t);
+  const foreign = { ...f.request, policy: { ...f.request.policy, machinePath: { ...f.request.policy.machinePath, outcomeId: 'garden-later' } } };
+  const refused = rejected(prepareBlockQueue(f.store, foreign), 'queue_policy_invalid');
+  assert.deepEqual([refused.route, refused.at.field], ['producer', 'machinePath']);
+});
 test('a genuine accepted L1 and horizon produce the first queue before L2 without requiring gaps', t => {
   const f = fixture(t), before = canonical(snapshots(f.store)), prepared = ok(prepareBlockQueue(f.store, f.request));
   assert.equal(canonical(snapshots(f.store)), before);
   assert.equal(prepared.record.value.contract, 'block-weight/v1');
   assert.equal(prepared.record.value.policyVersion, QUEUE_POLICY_VERSION);
   assert.equal(prepared.record.value.horizonHash, f.first.horizon.value.result.horizon.hash);
-  assert.deepEqual(prepared.record.value.request.policy.ownerPath.layer, f.layer);
+  assert.deepEqual(prepared.record.value.request.policy.machinePath.layer, f.layer);
   assert.equal(f.graph.value.nodes.some(node => node.kind === 'operation' || node.kind === 'work'), false);
   assert.deepEqual(prepared.record.value.order.map(row => row.block), [producer, consumer]);
   assert.equal(f.store.list('gap').length, 0);
@@ -451,7 +481,7 @@ test('saved queue entry points reject incomplete public sources before reading o
   for (const request of [undefined, null, [], { project }, { project, record: null }])
     malformed(() => readBlockQueue(noRead, request as Parameters<typeof readBlockQueue>[1]));
   const wrongLayer = { ...f.request, policy: { ...f.request.policy,
-    ownerPath: { ...f.request.policy.ownerPath, layer: { ...f.layer, hash: '0'.repeat(64) } } } };
+    machinePath: { ...f.request.policy.machinePath, layer: { ...f.layer, hash: '0'.repeat(64) } } } };
   rejected(prepareBlockQueue(f.store, wrongLayer), 'queue_policy_invalid');
   const changedGraph = clone(f.graph.value);
   changedGraph.nodes.find(node => node.id === producer)!.title += ' changed';
@@ -460,7 +490,7 @@ test('saved queue entry points reject incomplete public sources before reading o
   assert.notEqual(otherSavedLayer.revision, f.layer.revision, 'The graph producer saved a different exact L1 revision');
   for (const layer of [{ ...f.layer, id: 'graph-layer:other:1' }, reference(otherSavedLayer)])
     rejected(prepareBlockQueue(f.store, { ...f.request, policy: { ...f.request.policy,
-      ownerPath: { ...f.request.policy.ownerPath, layer } } }), 'queue_policy_invalid');
+      machinePath: { ...f.request.policy.machinePath, layer } } }), 'queue_policy_invalid');
 });
 
 test('a sole saved queue establishes missing B1 provenance for projection and assess after restart', t => {
@@ -648,7 +678,7 @@ test('late queue preparation refuses a changed accepted L1 while the original H 
   const request = { ...f.request, override: { order: [consumer, producer], reason: 'Reorder after the graph changed' } };
   rejected(prepareBlockQueue(f.store, request));
   rejected(prepareBlockQueue(f.store, { ...request, policy: { ...request.policy,
-    ownerPath: { ...request.policy.ownerPath, layer: newLayer } } }), 'queue_policy_invalid');
+    machinePath: { ...request.policy.machinePath, layer: newLayer } } }), 'queue_policy_invalid');
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try { assert.deepEqual(ok(readBlockQueue(exact, { project, record: reference(initial) })), initial); }
@@ -700,7 +730,7 @@ test('late admission cannot replace missing H, B1, policy or required exact upst
   }
   const choices = [
     { ...request.policy, version: 'unknown-version' },
-    { ...request.policy, ownerPath: { ...request.policy.ownerPath, actorId: 'a-different-owner' } },
+    { ...request.policy, machinePath: { ...request.policy.machinePath, actorId: 'a-different-owner' } },
     { ...request.policy, coefficients: { D: 1, P: 1, S: 1 } },
   ];
   for (const selection of choices) rejected(prepareBlockQueue(f.store, { ...request, policy: selection as QueuePolicy }), 'queue_policy_invalid');
