@@ -1,6 +1,7 @@
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { readOmInput } from '../om/input.js';
+import { configureDispatch } from '../om/dispatch.js';
 import { isPlainObject } from '../om/refusal.js';
 import { writeGuarded } from '../om/refs.js';
 import { prepareFeasibility, readFeasibility, type OmFeasibility } from '../om/feasibility.js';
@@ -511,6 +512,13 @@ export class ProductEngine {
       case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
       case "repair-plan": this.#project(command.project); return this.repairs.run(command.project, command.run, command.maxTurns);
       case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
+      case "configure-om-dispatch": {
+        // Legal before and after the first B1: the adapter is a setting, never evidence of the OM era.
+        this.#project(command.project);
+        const configured = configureDispatch(this.store, { project: command.project, protocol: command.protocol });
+        if (!configured.ok) throw new EngineError(configured.refusal.code, configured.refusal.message, configured.refusal.at);
+        return configured.value;
+      }
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);

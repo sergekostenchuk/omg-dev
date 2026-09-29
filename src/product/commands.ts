@@ -36,6 +36,7 @@ export type ProductCommand =
   | { type: "recover-execution"; project: string }
   | { type: "repair-plan"; project: string; run: Ref; maxTurns: number }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
+  | { type: "configure-om-dispatch"; project: string; protocol: "codex-stdio" }
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
   | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
   | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
@@ -73,6 +74,10 @@ const command = (type: string, properties: Record<string, unknown>) => object({ 
 const processCommand = object({ executable: string, args: { type: "array", items: { type: "string" } } });
 const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
 role.properties['speed'] = { enum: ["inherited", "fast"] };
+const environmentSettings = object({ workspace: string, implementer: role, reviewer: role, fullCheck: processCommand,
+  timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } });
+// Added after object() fixed the required set, so a configure without it stays valid; the saved-environment validator judges the value.
+environmentSettings.properties['requestCapacityChars'] = { type: "integer", minimum: 1 };
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
@@ -102,8 +107,8 @@ const schema = { oneOf: [
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),
   command("repair-plan", { project, run: ref, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
-  command("configure", { project, expected, environment: object({ workspace: string, implementer: role, reviewer: role,
-    fullCheck: processCommand, timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } }) }),
+  command("configure", { project, expected, environment: environmentSettings }),
+  command("configure-om-dispatch", { project, protocol: { const: "codex-stdio" } }),
   command("begin-research", { project, level: researchLevel }),
   command("finish-research", { project, level: researchLevel, draft: ref, expected }),
   command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),
