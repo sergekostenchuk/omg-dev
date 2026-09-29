@@ -2387,11 +2387,13 @@ test('X32 a received response keeps the reserved run position and budget across 
   const { projectId: _p, ...settings } = f.pilot.value;
   configureReaderPilot(f.store, f.engine.environments, 'p', { ...settings,
     planning: { fields: [f.question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, f.pilot.revision);
+  // The synthesis step is the managed intent under test: the planner is now a
+  // managed intent too, so the interruption targets the running synthesis one.
   const restore = f.interruptAfter(f.store, writes => writes.some(w => w.kind === 'model-response')
-    && f.store.list<any>('research-consumer-intent').some(x => x.value.state === 'running'));
+    && f.store.list<any>('research-consumer-intent').some(x => x.value.kind === 'synthesis' && x.value.state === 'running'));
   const first = await f.engine.researcher.run('p', f.draft.id, 4);
   restore();
-  const intent = f.store.list<any>('research-consumer-intent')[0]!;
+  const intent = f.store.list<any>('research-consumer-intent').find(x => x.value.kind === 'synthesis')!;
   assert.equal(intent.value.cursor.delivery?.turn, first.value.turns, 'the reserved position survives the interruption');
   const second = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 6);
   assert.equal(second.value.status, 'completed');
@@ -2411,7 +2413,8 @@ test('X32 a received response keeps the reserved run position and budget across 
   const restoreA = fa.interruptAfter(fa.store, writes => writes.some(w => w.kind === 'synthesis-session' && w.expected === 0));
   const firstA = await fa.engine.researcher.run('p', fa.draft.id, 4);
   restoreA();
-  assert.equal(fa.store.list('research-consumer-intent').length, 0, 'the crash preceded the first intent');
+  assert.equal(fa.store.list<any>('research-consumer-intent').filter(x => x.value.kind === 'synthesis').length, 0,
+    'the crash preceded the first synthesis intent');
   const secondA = await new ProductEngine(fa.open()).researcher.run('p', fa.draft.id, 6);
   assert.equal(secondA.value.status, 'completed');
   assert.equal(secondA.value.turns, firstA.value.turns, 'the first session record already proves the reservation');
@@ -2482,7 +2485,8 @@ test('X06 the delivered synthesis outcome moves the question past a stale blocke
   const resumed = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 4);
   assert.notEqual(resumed.value.pauseCode, 'reading_plan_blocked',
     'the saved response is applied and delivered before any new-plan check can shadow it');
-  assert.equal(f.store.list<any>('research-consumer-intent')[0]!.value.state, 'applied');
+  assert.equal(f.store.list<any>('research-consumer-intent')
+    .find(x => x.value.kind === 'synthesis')!.value.state, 'applied');
   const answerTurn = f.store.list<ResearchTurn>('research-turn')
     .find(turn => (turn.value.action as any).action === 'answer' && turn.value.run === resumed.id);
   assert.ok(answerTurn, 'the applied answer was delivered to a run turn');

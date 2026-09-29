@@ -1,16 +1,19 @@
 import { configurePhasePolicy } from "../src/discovery/phase-policy.js";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Store } from "../src/storage/store.js";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { EngineError } from "../src/errors.js";
+import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { configureReaderPilot, pilotEnvironment, type ReaderPilotSettings } from "../src/discovery/reader-pilot.js";
+import { configureReaderPilot, pilotEnvironment, type ReaderPilot, type ReaderPilotSettings } from "../src/discovery/reader-pilot.js";
 import { numberedSource, readerSourcePacket, readerObservations, readBundle } from "../src/discovery/reader.js";
 import { pilotContext, readPilotContext } from "../src/discovery/pilot-context.js";
-import { reference } from "../src/pipeline/contracts.js";
-import { canonical } from "../src/canonical.js";
+import { reference, isRef } from "../src/pipeline/contracts.js";
+import { canonical, digest, hashJson } from "../src/canonical.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
@@ -23,7 +26,7 @@ import { expandLayerDelta, layerDeltaCandidate, layerDeltaView } from "../src/di
 import type { ConsumerResult } from "../src/discovery/consumer-research.js";
 import type { Json } from "../src/canonical.js";
 import { answerLayerFixture } from "./layer-design-fixture.js";
-import type { ResearchTurn } from "../src/discovery/research-model.js";
+import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
 import { modelUsage } from "../src/runtime/model-usage.js";
 import { contextTable, targetFieldGroups, type ContextTable } from "../src/discovery/context-tables.js";
 import { workingContext } from "../src/discovery/working-context.js";
@@ -36,7 +39,9 @@ import { synthesisSession, pendingSynthesis } from "../src/discovery/synthesis-s
 import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
 import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
-import { readResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { readResearchConsumerIntent, readResearchConsumerTurn, readManagedProposalRefusalAt,
+  type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { retryPlannedRead } from '../src/discovery/reading-plan.js';
 
 function records<T>(value: T[] | ContextTable): T[] {
   return Array.isArray(value) ? value : value.rows.map(row => Object.fromEntries(value.columns.map((column, index) => [column, row[index]])) as T);
@@ -398,21 +403,61 @@ test("intermediate checkpoints preserve exact evidence and never accept a questi
 });
 
 test("legacy transport-stopped answer is replayed to assessor without another analyst or history rewrite", async t => {
-  const { engine, store, settings, pilot, draft, question } = fixture(t);
+  const { root, engine, store, settings, pilot, draft, question } = fixture(t);
   const limited = configureReaderPilot(store, engine.environments, "p", { ...settings, maxCalls: 3 }, pilot.revision);
+  // The former producer wrote unversioned research-turn:<hash([run,number])>
+  // records. Preserve the exact paid answer from this fixture, then install
+  // that former record shape/address rather than reclassifying a v1 turn.
+  const adapter = join(root, 'reader.mjs');
+  const originalAdapter = readFileSync(adapter, 'utf8');
+  assert.ok(originalAdapter.includes("claim:'README defines scope and rollback',path:'README.md'"));
+  writeFileSync(adapter, originalAdapter.replace("claim:'README defines scope and rollback',path:'README.md'",
+    "claim:'README defines scope and rollback',path:'alias.md'"));
   await engine.researcher.run("p", draft.id, 2);
-  const pending = store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
-  const legacy = store.write<ResearchTurn>({ id: pending.id, kind: pending.kind, expected: pending.revision,
-    value: { ...pending.value, status: "completed", error: "An input changed before the transaction could commit" } });
-  assert.equal(recoverableAnswer([legacy], question)?.id, legacy.id);
-  assert.equal(recoverableAnswer([{ ...legacy, value: { ...legacy.value, error: "Semantic refusal" } }], question), null);
-  assert.equal(recoverableAnswer([legacy], { ...question, revision: 99 }), null);
+  symlinkSync('README.md', join(root, 'alias.md'));
+  const paid = store.list<ResearchTurn>('research-turn').find(turn => (turn.value.action as { action?: string }).action === 'answer')!;
+  assert.equal(paid.value.status, 'completed');
+  assert.equal(store.get<Question>(question.id)!.value.status, 'open');
+  const refusalRef = (paid.value.observation as { refusal: ReturnType<typeof reference> }).refusal;
+  const refusal = readManagedProposalRefusalAt(store, 'p', paid.id, refusalRef);
+  assert.equal(refusal.value.findings[0]?.code, 'repository_evidence_required',
+    'The exact precheck refusal remains readable after the missing path appears');
+  const run = store.list<ResearchRun>('research-run')[0]!, number = run.value.turns + 1;
+  const oldValue: ResearchTurn = { run: run.id, number, action: paid.value.action, assessment: null, observation: null,
+    error: null, status: 'pending', question: reference(question),
+    ...(paid.value.dispatchMode ? { dispatchMode: paid.value.dispatchMode } : {}) };
+  const [, originalLegacy] = store.writeMany<ResearchRun | ResearchTurn>([
+    { id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, turns: number } },
+    { id: `research-turn:${hashJson([run.id, number])}`, kind: 'research-turn', expected: 0, value: oldValue }
+  ]);
+  const legacyTurn = store.write<ResearchTurn>({ id: originalLegacy!.id, kind: originalLegacy!.kind,
+    expected: originalLegacy!.revision, value: { ...oldValue, status: 'completed',
+      error: 'An input changed before the transaction could commit' } });
+  assert.deepEqual(readResearchConsumerTurn(store, reference(legacyTurn)), legacyTurn);
+  assert.equal(recoverableAnswer([legacyTurn], question)?.id, legacyTurn.id);
+  assert.equal(recoverableAnswer([{ ...legacyTurn, value: { ...legacyTurn.value, error: "Semantic refusal" } }], question), null);
+  assert.equal(recoverableAnswer([legacyTurn], { ...question, revision: 99 }), null);
   configureReaderPilot(store, engine.environments, "p", { ...settings, maxCalls: 4 }, limited.revision);
   await engine.researcher.run("p", draft.id, 1);
-  assert.deepEqual(store.get(legacy.id), legacy, "Historical failed turn is untouched");
-  assert.ok(store.list<ResearchTurn>("research-turn").some(turn => turn.value.replayedFrom?.id === legacy.id));
+  assert.deepEqual(store.get(legacyTurn.id), legacyTurn, "Historical failed turn is untouched");
+  assert.ok(store.list<ResearchTurn>("research-turn").some(turn => turn.value.replayedFrom?.id === legacyTurn.id));
   assert.equal(store.list<ModelCall>("model-call").filter(call => call.value.purpose === "analyst").length, 2);
   assert.equal(store.get<Question>(question.id)!.value.status, "answered");
+});
+
+test('a fabricated managed completed turn cannot use legacy transport replay without its producer proof', async t => {
+  const { engine, store, settings, pilot, draft, question } = fixture(t);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, maxCalls: 3 }, pilot.revision);
+  await engine.researcher.run('p', draft.id, 2);
+  const pending = store.list<ResearchTurn>('research-turn').find(turn => turn.id.startsWith('research-turn:v1:')
+    && turn.value.status === 'pending' && (turn.value.action as { action?: string }).action === 'answer')!;
+  const fabricated = store.write<ResearchTurn>({ id: pending.id, kind: pending.kind, expected: pending.revision,
+    value: { ...pending.value, status: 'completed', error: 'An input changed before the transaction could commit' } });
+  assert.throws(() => readResearchConsumerTurn(store, reference(fabricated)), { code: 'research_consumer_intent_invalid' });
+  const calls = store.list<ModelCall>('model-call').length;
+  await assert.rejects(engine.researcher.run('p', draft.id, 1), { code: 'research_consumer_intent_invalid' });
+  assert.equal(store.list<ModelCall>('model-call').length, calls);
+  assert.equal(store.get<Question>(question.id)!.value.status, 'open');
 });
 
 test("assessor resumes bounded evidence pages after budget stop and sees a late exception before acceptance", async t => {
@@ -705,49 +750,93 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   assert.equal(store.get<Question>(question.id)!.value.status,'open');
 });
 
-test("an audited archive plan recovers its question binding without another planner call", async t => {
-  const {root,store,engine,pilot,settings,draft,question}=fixture(t);
-  const command=join(root,'archived-plan.mjs');
-  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+/** C52 fixture: the exact pre-intent (legacy) planner chain — an audited
+ * model-call/model-response pair plus a previous-era turn — written directly
+ * so the test does not depend on the retired runner. */
+function legacyRejectedPlan(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  actionOverride?: unknown) {
+  const packet = workingContext(store, 'p', draft.id, question.id,
+    { note: 'legacy archived packet' }, 90000, { common: true });
+  const archiveRef = (packet as { working: { archive: ReturnType<typeof reference> } }).working.archive;
+  const action = actionOverride ?? { action: 'read_plan', question: 'a prose question, not the id',
+    reads: [{ action: 'read_context', record: archiveRef, pointer: '/body/question/prompt' }] };
+  const requestId = `legacy-${randomUUID()}`;
+  const text = JSON.stringify({ protocol: 'omg-agent/v1', requestId, research: action });
+  const response = store.write({ id: `model-response:${requestId}`, kind: 'model-response', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, text } });
+  const call = store.write<ModelCall>({ id: `model-call:${requestId}`, kind: 'model-call', expected: 0, value: {
+    projectId: 'p', draftId: draft.id, questionId: question.id, purpose: 'reading-planner', requestId,
+    requested: { actor: 'author', model: 'fixture-author', effort: 'high' }, profile: null,
+    status: 'succeeded', startedAt: 1, finishedAt: 2, error: null,
+    request: { chars: text.length, bytes: Buffer.byteLength(text), hash: digest(text) },
+    response: { record: reference(response), chars: text.length, bytes: Buffer.byteLength(text), hash: digest(text) } } } as any);
+  const runId = `research-run:${hashJson(['p', draft.id])}`;
+  const turn = store.write<ResearchTurn>({ id: `research-turn:${hashJson([runId, 2])}`, kind: 'research-turn',
+    expected: 0, value: { run: runId, number: 2, action: action as any, question: null,
+      dispatchMode: 'planning', status: 'completed', error: 'reading_plan_invalid: foreign target',
+      assessment: null, observation: null } });
+  return { action: action as any, call, response, turn };
+}
+
+// C52 split: the removed single test encoded the obsolete invariant that any
+// audited plan could be replayed. The door now repairs only the legacy era.
+test("a previous-era audited archive plan recovers its question binding without another planner call", async t => {
+  const { store, draft, question } = fixture(t);
+  const { action, call, turn } = legacyRejectedPlan(store, draft, question);
+  const recovery = recoverableReadingPlan(store, [turn], draft, question)!;
+  assert.ok(recovery);
+  assert.equal(recovery.action.question, question.id);
+  assert.deepEqual(recovery.action.reads, action.reads);
+  assert.deepEqual(recovery.request, reference(call));
+  assert.deepEqual(store.get(turn.id), turn, 'Original rejected turn remains immutable');
+});
+
+test("a managed planner rejection is corrected by its own era, never the legacy replay door", async t => {
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const command = join(root, 'managed-plan.mjs');
+  writeFileSync(command, `import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
 const research={action:'read_plan',question:c.question.prompt,reads:[{action:'read_context',record:c.working.archive,pointer:'/body/question/prompt'}]};
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:1}},pilot.revision);
-  await engine.researcher.run('p',draft.id,1);
-  const original=store.list<ResearchTurn>('research-turn').at(-1)!;
-  const recovery=recoverableReadingPlan(store,[original],draft,question)!;
-  assert.ok(recovery);assert.equal(recovery.action.question,question.id);
-  assert.deepEqual(recovery.action.reads,(original.value.action as any).reads);
-  await engine.researcher.run('p',draft.id,2);
-  const turns=store.list<ResearchTurn>('research-turn').sort((a,b)=>a.value.number-b.value.number);
-  assert.deepEqual(store.get(original.id),original,'Original rejected turn remains immutable');
-  assert.equal(store.list('model-call').length,1,'Recovery consumes no new planning allowance');
-  assert.deepEqual(turns[1]!.value.replayedFrom,reference(original));
-  assert.deepEqual(turns[1]!.value.recoveredRequest,recovery.request);
-  assert.equal(turns[2]!.value.status,'completed');assert.equal(turns[2]!.value.error,null);
-  assert.equal(recoverableReadingPlan(store,turns,draft,question),null,'Never replay the same request twice');
-  assert.equal(store.get<Question>(question.id)!.value.status,'open','Reading recovery never accepts a question');
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] }, planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 1 } }, pilot.revision);
+  await engine.researcher.run('p', draft.id, 1);
+  const original = store.list<ResearchTurn>('research-turn').at(-1)!;
+  assert.ok(original.id.startsWith('research-turn:v1:'), 'The fixture turn is a managed-era record');
+  // A matching previous-era call that saves even the same action bytes still
+  // must not hijack the managed turn into the legacy replay door.
+  legacyRejectedPlan(store, draft, question, original.value.action);
+  assert.equal(recoverableReadingPlan(store, [original], draft, question), null,
+    'A managed turn is never repaired through the previous-era replay door');
+  await engine.researcher.run('p', draft.id, 1);
+  assert.equal(store.list<ModelCall>('model-call').filter(c => c.value.purpose === 'reading-planner').length, 2,
+    'The correction pays the next managed planner generation');
+  assert.ok(store.list<ResearchTurn>('research-turn').every(turn => !turn.value.replayedFrom),
+    'No previous-era replayed turn was created');
 });
 
 test("archive plan recovery rejects missing audit, forged response and foreign or changed question", async t => {
-  const {root,store,engine,pilot,settings,draft,question}=fixture(t);
-  const command=join(root,'recovery-audit.mjs');
-  writeFileSync(command,`import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
-console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'read_plan',question:'A prose question',reads:[{action:'read_context',record:c.working.archive,pointer:'/body/question/prompt'}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:{executable:process.execPath,args:[command]},planning:{fields:[question.value.spec.field],maxRequestChars:50000,maxRounds:1}},pilot.revision);
-  await engine.researcher.run('p',draft.id,1);
-  const original=store.list<ResearchTurn>('research-turn').at(-1)!,call=store.list<ModelCall>('model-call')[0]!;
-  assert.ok(recoverableReadingPlan(store,[original],draft,question));
-  const altered=(patch:Partial<ModelCall>)=>{const current=store.get<ModelCall>(call.id)!;store.write({id:call.id,kind:call.kind,expected:current.revision,value:{...call.value,...patch}});};
-  for(const patch of [{questionId:'question:foreign'}, {response:null}, {status:'failed' as const}, {response:{...call.value.response!,record:{...call.value.response!.record!,hash:'0'.repeat(64)}}}]){
-    altered(patch);assert.equal(recoverableReadingPlan(store,[original],draft,question),null);
+  const { store, draft, question } = fixture(t);
+  const { action, call, turn } = legacyRejectedPlan(store, draft, question);
+  assert.ok(recoverableReadingPlan(store, [turn], draft, question));
+  const altered = (patch: Partial<ModelCall>) => { const current = store.get<ModelCall>(call.id)!;
+    store.write({ id: call.id, kind: call.kind, expected: current.revision, value: { ...call.value, ...patch } }); };
+  for (const patch of [{ questionId: 'question:foreign' }, { response: null }, { status: 'failed' as const },
+    { response: { ...call.value.response!, record: { ...call.value.response!.record!, hash: '0'.repeat(64) } } }]) {
+    altered(patch); assert.equal(recoverableReadingPlan(store, [turn], draft, question), null);
   }
   altered({});
-  const foreign={...original,value:{...original.value,action:{...(original.value.action as any),question:'question:foreign'}}};
-  assert.equal(recoverableReadingPlan(store,[foreign],draft,question),null);
-  const forged={...original,value:{...original.value,action:{...(original.value.action as any),reads:[{action:'read_context',record:(original.value.action as any).reads[0].record,pointer:'/body/inventory'}]}}};
-  assert.equal(recoverableReadingPlan(store,[forged],draft,question),null,'Changed selection does not match paid response');
-  const current=store.get<Question>(question.id)!;store.write({id:current.id,kind:current.kind,expected:current.revision,value:{...current.value,spec:{...current.value.spec,prompt:'Changed question'}}});
-  assert.equal(recoverableReadingPlan(store,[original],draft,store.get<Question>(question.id)!),null);
+  const foreign = { ...turn, value: { ...turn.value, action: { ...action, question: 'question:foreign' } } };
+  assert.equal(recoverableReadingPlan(store, [foreign], draft, question), null);
+  const forged = { ...turn, value: { ...turn.value, action: { ...action,
+    reads: [{ action: 'read_context', record: action.reads[0].record, pointer: '/body/inventory' }] } } };
+  assert.equal(recoverableReadingPlan(store, [forged], draft, question), null,
+    'Changed selection does not match paid response');
+  const managedDescendant = { ...turn, id: 'research-turn:v1:forged-ancestor' } as typeof turn;
+  assert.equal(recoverableReadingPlan(store, [managedDescendant], draft, question), null,
+    'A managed-era turn id is never replayed through the legacy door');
+  const current = store.get<Question>(question.id)!;
+  store.write({ id: current.id, kind: current.kind, expected: current.revision,
+    value: { ...current.value, spec: { ...current.value.spec, prompt: 'Changed question' } } });
+  assert.equal(recoverableReadingPlan(store, [turn], draft, store.get<Question>(question.id)!), null);
 });
 
 test("grouped reads resume only the failed child and then switch to substantive synthesis", async t => {
@@ -968,6 +1057,24 @@ test("current replies are accepted; a historical reply-limit record replays only
   assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'assessor',input),null);
   store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'Changed basis'}}});
   assert.throws(()=>replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',input),{code:'context_reference_stale'});
+  // C51: a managed consumer call is recovered only through its own intent
+  // chain. Both era markers independently exclude it from legacy replay.
+  const managedRequest=(requestId:string)=>{
+    const raw=JSON.stringify({...JSON.parse(input),prompt:'Managed instruction',requestId});
+    return {...original.value,requested:role,profile:reference(configured),status:'failed' as const,
+      error:'pilot_reply_limit',requestId,request:{hash:digest(raw),chars:raw.length,bytes:Buffer.byteLength(raw)},
+      response:original.value.response,startedAt:original.value.startedAt+1,finishedAt:original.value.startedAt+2,
+      consumerIntent:{id:'research-consumer-intent:managed',revision:1,hash:hashJson(['managed'])}};
+  };
+  const managedInput=JSON.stringify({...JSON.parse(input),prompt:'Managed instruction'});
+  store.write<ModelCall>({id:`model-call:consumer:v1:${hashJson(['managed-1'])}`,kind:'model-call',expected:0,
+    value:managedRequest('managed-1') as ModelCall});
+  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',managedInput),null,
+    'A consumer-namespaced call keeps its bytes out of legacy replay');
+  store.write<ModelCall>({id:`model-call:legacy-shaped:${hashJson(['managed-2'])}`,kind:'model-call',expected:0,
+    value:managedRequest('managed-2') as ModelCall});
+  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',managedInput),null,
+    'A consumerIntent marker alone excludes the call even under a legacy-shaped id');
 });
 
 test("planner response is accepted regardless of the former reply and round disciplines", async t => {
@@ -1115,4 +1222,620 @@ test('assessor can inspect distinct original pointers with equal values without 
  assert.equal(result.verdict,'supported');
  const pages=readFileSync(join(root,'equal-pages.jsonl'),'utf8').trim().split('\n').map(s=>JSON.parse(s));
  assert.deepEqual(pages,[{offset:0,pointer:null},{offset:0,pointer:'/body/value/a'},{offset:0,pointer:'/body/value/b'}]);
+});
+
+test("a malformed paid analyst payload ends in a typed terminal refusal instead of a repurchase", async t => {
+  // C13/C62: the invalid response is the intent's terminal consumer-invalid
+  // outcome bound to its exact call; repeat entry restores it, never repays.
+  const { root, store, engine, pilot, settings, draft } = fixture(t);
+  const command = join(root, 'invalid-analyst.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{bad:'payload'},usage:{inputTokens:1,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const first = await engine.researcher.run('p', draft.id, 1);
+  assert.equal(first.value.pauseCode, 'research_response_invalid');
+  const intent = store.list<ResearchConsumerIntent>('research-consumer-intent').find(i => i.value.kind === 'analyst')!;
+  assert.equal(intent.value.state, 'refused');
+  assert.equal(intent.value.refusal?.kind, 'consumer-invalid');
+  assert.equal(intent.value.refusal?.code, 'research_response_invalid');
+  assert.equal(store.list('model-call').length, 1);
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  for (let i = 0; i < 2; i++) {
+    const next = await new ProductEngine(db).researcher.run('p', draft.id, 1);
+    assert.equal(next.value.status, 'paused');
+    assert.equal(next.value.pauseCode, 'research_response_invalid');
+    assert.equal(db.list('model-call').length, 1, 'A refused paid position never pays again');
+  }
+});
+
+test("a malformed paid escalation verdict ends in a typed terminal refusal instead of a repurchase", async t => {
+  const { root, store, engine, pilot, settings, draft } = fixture(t);
+  const consulted = engine.discovery.evidence.document('p', 'owner-basis', 'Already consulted evidence', 'text/plain', 0);
+  const command = join(root, 'invalid-escalation.mjs');
+  writeFileSync(command, `import{readFileSync,writeFileSync,existsSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;const n=existsSync('count')?Number(readFileSync('count','utf8')):0;writeFileSync('count',String(n+1));let research;
+if(c.role==='reader'){const lines=c.sources[0].lines.filter(l=>l[0]>=2&&l[0]<=3);research={selections:lines.length?[{source:c.sources[0].ref,firstLine:lines[0][0],lastLine:lines.at(-1)[0]}]:[],unresolved:[]};}
+else if(c.role==='assess-escalation')research={unstructured:true};
+else if(!n)research={action:'read',path:'README.md',media:'text/plain'};
+else research={action:'need_owner',question:c.question.id,reason:'Owner-only choice',searched:[${JSON.stringify(reference(consulted))}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:1,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd, reader: { ...settings.reader, command: cmd } }, pilot.revision);
+  const first = await engine.researcher.run('p', draft.id, 3);
+  assert.equal(first.value.pauseCode, 'escalation_assessment_invalid');
+  const intent = store.list<ResearchConsumerIntent>('research-consumer-intent').find(i => i.value.kind === 'escalation-assessor')!;
+  assert.equal(intent.value.state, 'refused');
+  assert.equal(intent.value.refusal?.kind, 'consumer-invalid');
+  assert.equal(intent.value.refusal?.code, 'escalation_assessment_invalid');
+  const calls = store.list('model-call').length;
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const next = await new ProductEngine(db).researcher.run('p', draft.id, 3);
+  assert.equal(next.value.pauseCode, 'escalation_assessment_invalid');
+  assert.equal(db.list('model-call').length, calls, 'A refused escalation never pays again');
+});
+
+test("retry of a failed planned child rebinds its unclaimed reader atomically", async t => {
+  // C23: the retry writes the pending child and the rebound prepared reader in
+  // one transaction; a claimed in-flight reader refuses the whole retry.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  for (const path of ['a.txt', 'b.txt']) writeFileSync(join(root, path), `Header\n${path} condition\n${path} exception\n`);
+  const command = join(root, 'retry-reader.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='reader')research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};
+else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both read',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd, reader: { ...settings.reader, command: cmd }, planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => { const rows = original(writes, guards);
+    if (!hit && writes.some(w => w.kind === 'research-consumer-intent'
+      && (w.value as ResearchConsumerIntent).kind === 'reader'
+      && (w.value as ResearchConsumerIntent).state === 'prepared')) { hit = true; throw new EngineError('fixture_prepared', 'crash with unsent reader'); }
+    return rows; }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 10); store.writeMany = original;
+  const intent = store.list<ResearchConsumerIntent>('research-consumer-intent').find(i => i.value.kind === 'reader')!;
+  assert.equal(intent.value.state, 'prepared', 'fixture left an unclaimed reader');
+  const child = store.get<ResearchTurn>(intent.value.owner.id)!;
+  assert.equal(child.value.status, 'pending');
+  const failed = store.write<ResearchTurn>({ id: child.id, kind: child.kind, expected: child.revision,
+    value: { ...child.value, status: 'completed', error: 'provider interrupted' } });
+  const retried = retryPlannedRead(store, 'p', reference(failed));
+  assert.equal(retried.value.status, 'pending'); assert.deepEqual(retried.value.replayedFrom, reference(failed));
+  const rebound = readResearchConsumerIntent(store, reference(store.get(intent.id)!));
+  assert.equal(rebound.revision, intent.revision + 1);
+  assert.equal(rebound.value.state, 'prepared');
+  assert.deepEqual(rebound.value.owner, reference(retried));
+  assert.deepEqual(rebound.value.cursor.consumer.turn, reference(retried));
+  store.write<ResearchConsumerIntent>({ id: rebound.id, kind: rebound.kind, expected: rebound.revision,
+    value: { ...rebound.value, state: 'running',
+      call: reference(store.list('model-call').at(-1)!), request: reference(store.list('model-request').at(-1)!),
+      archive: reference(store.list('research-context').at(-1)!) } });
+  const second = store.write<ResearchTurn>({ id: retried.id, kind: retried.kind, expected: retried.revision,
+    value: { ...retried.value, status: 'completed', error: 'failed again' } });
+  assert.throws(() => retryPlannedRead(store, 'p', reference(second)), { code: 'reading_plan_recovery_invalid' });
+});
+
+test("a saved paid analyst response is delivered even after the allowance profile changes", async t => {
+  // C61: once the physical response exists, it is resumed and applied under
+  // its original profile; a future maxCalls change cannot invalidate paid bytes.
+  const { root, store, engine, settings, draft, question } = fixture(t);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => {
+    if (!hit && writes.some(w => w.kind === 'research-consumer-intent'
+      && (w.value as ResearchConsumerIntent).state === 'applied')) {
+      hit = true; throw new EngineError('input_stale', 'interrupt before paid application'); }
+    return original(writes, guards); }) as typeof store.writeMany;
+  const first = await engine.researcher.run('p', draft.id, 1); store.writeMany = original;
+  assert.ok(hit);
+  assert.equal(first.value.pauseCode, 'input_stale');
+  const analyst = store.list<ResearchConsumerIntent>('research-consumer-intent').find(i => i.value.kind === 'analyst')!;
+  assert.equal(analyst.value.state, 'running');
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, maxCalls: settings.maxCalls + 1 },
+    store.get('reader-pilot:p')!.revision);
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const result = await new ProductEngine(db).researcher.run('p', draft.id, 1);
+  assert.notEqual(result.value.pauseCode, 'research_consumer_context_stale');
+  assert.equal(db.list<ResearchTurn>('research-turn').filter(x => x.value.status === 'completed').length, 1,
+    'The saved response completed its paid turn');
+  assert.equal(db.list<ModelCall>('model-call').filter(c => c.value.purpose === 'analyst').length, 1,
+    'No second analyst payment');
+  const again = new Store(join(root, 'state.sqlite')); t.after(() => again.close());
+  await new ProductEngine(again).researcher.run('p', draft.id, 5);
+  assert.equal(again.list<ResearchTurn>('research-turn').filter(x => x.value.status === 'completed'
+    && (x.value.action as { action?: string }).action === 'read_bundle'
+    && x.value.question?.id === question.id).length, 1,
+    'the applied paid step of this question is not re-executed on continuation');
+  assert.ok(again.list<ResearchTurn>('research-turn').length > 1,
+    'the run progressed past the applied paid step');
+});
+
+test("a completed local read retains its derived reading on re-entry without another execution", async t => {
+  // C32 first window: the completed turn is durable before retainPilotRead;
+  // a crash between them is repaired from the exact turn on re-entry.
+  // read_source is used because its observation binds a verifiable source
+  // record — a path read is a navigation hint that stays non-current.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const source = engine.discovery.evidence.document('p', 'read-proof', '{"note":"local"}', 'application/json', 0);
+  const command = join(root, 'local-read.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(!(c.readings||[]).length&&!(c.directReadings||[]).length&&!c.focus)research={action:'read_source',source:${JSON.stringify(reference(source))},start:0,end:15};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'read',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'json-pointer',pointer:'/note'}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => {
+    if (!hit && writes.some(w => w.kind === 'pilot-reading')) { hit = true; throw new EngineError('input_stale', 'interrupt before derivative'); }
+    return original(writes, guards); }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1); store.writeMany = original;
+  assert.ok(hit);
+  const readsOf = (db: Store) => db.list<ResearchTurn>('research-turn').filter(x => isRef(x.value.question)
+    && x.value.question!.id === question.id && x.value.status === 'completed'
+    && (x.value.action as { action?: string }).action === 'read_source');
+  assert.equal(readsOf(store).length, 1, 'the read turn is durable');
+  assert.equal(store.list('pilot-reading').length, 0, 'the derivative did not land');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  await new ProductEngine(db).researcher.run('p', draft.id, 2);
+  assert.equal(readsOf(db).length, 1,
+    'no second read of this question was executed');
+  assert.equal(db.list<{ question: string }>('pilot-reading').filter(r => r.value.question === question.id).length, 1,
+    'the completed turn re-derives its reading without another execution');
+});
+
+test("a completed search keeps its capture and re-derives its reading on re-entry", async t => {
+  // C32 second window: the captured search record and the completed turn are
+  // durable; the derived reading is repaired on re-entry, never by a second grep.
+  const { root, store, engine, pilot, settings, draft } = fixture(t);
+  writeFileSync(join(root, 'target.txt'), 'Alpha\nRestrict writes to the chosen scope.\nOmega\n');
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['add', 'target.txt', 'README.md'], { cwd: root });
+  const command = join(root, 'local-search.mjs');
+  writeFileSync(command, `import{readFileSync,writeFileSync,existsSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;const n=existsSync('count')?Number(readFileSync('count','utf8')):0;writeFileSync('count',String(n+1));let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(!n)research={action:'search',query:'Restrict'};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'searched',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => {
+    if (!hit && writes.some(w => w.kind === 'pilot-reading')) { hit = true; throw new EngineError('input_stale', 'interrupt before derivative'); }
+    return original(writes, guards); }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1); store.writeMany = original;
+  assert.ok(hit);
+  assert.equal(store.list<ResearchTurn>('research-turn').filter(x => (x.value.action as any).action === 'search'
+    && x.value.status === 'completed').length, 1, 'the search turn is durable');
+  assert.equal(store.list('pilot-reading').length, 0, 'the derivative did not land');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  await new ProductEngine(db).researcher.run('p', draft.id, 2);
+  assert.equal(db.list('pilot-reading').length, 1,
+    'the completed search turn re-derives its reading without another grep');
+});
+
+test("a matching pre-intent reply-limit call is recovered before a managed intent is paid", async t => {
+  // C51 run door: a byte-identical legacy pilot_reply_limit call with a saved
+  // response is delivered as a previous-era turn; no managed intent is created.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const packet = workingContext(store, 'p', draft.id, question.id,
+    { note: 'legacy archived packet' }, 90000, { common: true });
+  const archiveRef = (packet as { working: { archive: ReturnType<typeof reference> } }).working.archive;
+  const requestId = `legacy-${randomUUID()}`;
+  const requestText = JSON.stringify({ protocol: 'omg-agent/v1', requestId,
+    subject: { working: { archive: archiveRef } } });
+  const research = { action: 'read_bundle', purpose: 'recovered legacy read',
+    inputs: [{ path: 'README.md', media: 'text/plain' }] };
+  const responseText = JSON.stringify({ protocol: 'omg-agent/v1', requestId, research });
+  const requestRecord = store.write({ id: `model-request:${requestId}`, kind: 'model-request', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, text: requestText } });
+  const responseRecord = store.write({ id: `model-response:${requestId}`, kind: 'model-response', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, text: responseText } });
+  store.write<ModelCall>({ id: `model-call:${requestId}`, kind: 'model-call', expected: 0, value: {
+    projectId: 'p', draftId: draft.id, questionId: question.id, purpose: 'analyst', requestId,
+    requested: { actor: 'author', model: 'fixture-author', effort: 'high' }, profile: reference(pilot),
+    status: 'failed', startedAt: 1, finishedAt: 2, error: 'pilot_reply_limit',
+    confirmed: { model: null, effort: null, speed: null }, usage: null, usageSource: 'unavailable',
+    request: { chars: requestText.length, bytes: Buffer.byteLength(requestText), hash: digest(requestText),
+      record: reference(requestRecord) },
+    response: { record: reference(responseRecord), chars: responseText.length,
+      bytes: Buffer.byteLength(responseText), hash: digest(responseText) } } as any });
+  const command = join(root, 'should-not-be-called.mjs');
+  writeFileSync(command, `import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync('called.jsonl','x'+'\\n');console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'managed path reached'},usage:{inputTokens:1,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
+  const first = await engine.researcher.run('p', draft.id, 1);
+  assert.equal(store.list('research-response-replay').length, 1, 'the saved response is delivered as a replay');
+  const turn = store.list<ResearchTurn>('research-turn').find(x => x.value.run === first.id)!;
+  assert.ok(!turn.id.startsWith('research-turn:v1:'), 'the recovered turn is a previous-era record');
+  assert.equal((turn.value.action as any).action, 'read_bundle');
+  assert.equal(store.list<ModelCall>('model-call').filter(c => c.value.purpose === 'analyst').length, 1,
+    'the same logical step was not sent again');
+  assert.equal(store.list<ResearchConsumerIntent>('research-consumer-intent').filter(i => i.value.kind === 'analyst').length, 0,
+    'no managed analyst intent was created for the replayed step');
+});
+
+test("an accepted paid answer persists its exact chain and stays readable across repeated identical answers", async t => {
+  // №1745-2: each completed managed answer turn carries the exact adjacent
+  // draft/question pair it accepted; history consumes the stored references
+  // instead of rescanning a draft that moved on through identical cycles.
+  const root = mkdtempSync(join(tmpdir(), 'omg-accepted-chain-'));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'History' });
+  const source = engine.discovery.evidence.document('p', 'values', '{"result":"same answer"}', 'application/json', 0);
+  const script = join(root, 'provider.mjs');
+  writeFileSync(script, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;const research=c.role==='assess-answer'?{verdict:'supported',reasons:[]}:{action:'answer',question:c.questions[0].id,value:{result:'same answer'},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'json-pointer',pointer:'/result'}}]};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:1,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [script] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 3000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation', [{ field: 'result', kind: 'design',
+    prompt: 'Give result', risk: 'missing', schema: { type: 'object', required: ['result'],
+      properties: { result: { type: 'string' } } } }], []);
+  const chains: { revision: number }[] = [];
+  for (let i = 0; i < 3; i++) {
+    await engine.researcher.run('p', draft.id, 1);
+    const turns = store.list<ResearchTurn>('research-turn').sort((a, b) => a.value.number - b.value.number);
+    const accepted = turns.filter(turn => turn.value.status === 'completed' && !turn.value.error
+      && (turn.value.action as { action?: string }).action === 'answer' && turn.value.assessment);
+    assert.equal(accepted.length, i + 1);
+    const chain = (accepted.at(-1)!.value as { acceptance?: Record<string, { id: string; revision: number; hash: string }> }).acceptance;
+    assert.ok(chain, 'Completed accepted turn persists the exact chain');
+    for (const [key, kind] of [['draftBefore', 'discovery-draft'], ['draftAfter', 'discovery-draft'],
+      ['questionBefore', 'question'], ['questionAfter', 'question'],
+      ['answer', 'research-answer'], ['assessment', 'research-assessment']] as const) {
+      const ref: { id: string; revision: number; hash: string } = chain[key]!;
+      const record: Revision<unknown> | null = store.get(ref.id, ref.revision);
+      assert.equal(record?.kind, kind); assert.equal(record?.hash, ref.hash, `${key} binds its exact revision`);
+    }
+    chains.push({ revision: chain['draftAfter']!.revision });
+    for (const turn of turns) assert.doesNotThrow(() => readResearchConsumerTurn(store, reference(turn)));
+    if (i < 2) { const q = store.get<Question>(draft.value.questions[0]!)!; engine.discovery.reopen(q.id, q.revision); }
+  }
+  assert.ok(chains[1]!.revision > chains[0]!.revision && chains[2]!.revision > chains[1]!.revision,
+    'Identical answers still bind distinct exact chains');
+  const callsDone = store.list('model-call').length;
+  const resumed = new Store(join(root, 'db.sqlite')); t.after(() => resumed.close());
+  const tail = await new ProductEngine(resumed).researcher.run('p', draft.id, 1);
+  assert.notEqual(tail.value.pauseCode, 'research_consumer_intent_invalid');
+  assert.equal(resumed.list('model-call').length, callsDone,
+    'an answered question is not repurchased on continuation');
+  for (const turn of resumed.list<ResearchTurn>('research-turn'))
+    assert.doesNotThrow(() => readResearchConsumerTurn(resumed, reference(turn)),
+      'every accepted chain stays readable on the new Store');
+});
+
+test("a retried planned child lets its rebound reader continue the queue on a new Store", async t => {
+  // C23 continuation: the fix is proven on the NEXT entry — the rebound
+  // unclaimed reader resumes from the parent queue (original stored ref plus
+  // the lawful retry chain to the current pending revision), reads once and
+  // the retried child completes. The run is not lost to
+  // research_consumer_intent_invalid and paid parts are not repurchased.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  for (const path of ['a.txt', 'b.txt']) writeFileSync(join(root, path), `Header\n${path} condition\n${path} exception\n`);
+  const command = join(root, 'retry-continue.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;let research;
+if(c.role==='reader')research={selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]};
+else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Both read',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(r=>r.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd, reader: { ...settings.reader, command: cmd }, planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => { const rows = original(writes, guards);
+    if (!hit && writes.some(w => w.kind === 'research-consumer-intent'
+      && (w.value as ResearchConsumerIntent).kind === 'reader'
+      && (w.value as ResearchConsumerIntent).state === 'prepared')) { hit = true; throw new EngineError('fixture_prepared', 'crash with unsent reader'); }
+    return rows; }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 10); store.writeMany = original;
+  const intent = store.list<ResearchConsumerIntent>('research-consumer-intent').find(i => i.value.kind === 'reader')!;
+  assert.equal(intent.value.state, 'prepared', 'fixture left an unclaimed reader');
+  const child = store.get<ResearchTurn>(intent.value.owner.id)!;
+  const failed = store.write<ResearchTurn>({ id: child.id, kind: child.kind, expected: child.revision,
+    value: { ...child.value, status: 'completed', error: 'provider interrupted' } });
+  const retried = retryPlannedRead(store, 'p', reference(failed));
+  assert.equal(retried.value.status, 'pending');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const out = await new ProductEngine(db).researcher.run('p', draft.id, 10);
+  assert.notEqual(out.value.pauseCode, 'research_consumer_intent_invalid',
+    'the rebound reader resumes from its queue through the lawful retry chain');
+  const continued = db.get<ResearchTurn>(retried.id)!;
+  assert.equal(continued.value.status, 'completed');
+  assert.equal(continued.value.error, null);
+  const childCalls = db.list<ModelCall>('model-call')
+    .filter(call => (call.value as { consumerIntent?: { id: string } }).consumerIntent?.id === intent.id);
+  assert.equal(childCalls.length, 1, 'the retried child is read exactly once');
+  assert.equal(db.list<ModelCall>('model-call').filter(c => c.value.purpose === 'reader').length, 2,
+    'each queued child is read exactly once');
+  assert.equal(db.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest).length, 0,
+    'a managed-era queue never falls through the legacy recovery door');
+});
+
+function legacyReplyLimit(store: Store, pilot: Revision<ReaderPilot>,
+  draft: Revision<DiscoveryDraft>, question: Revision<Question>, research: unknown) {
+  const packet = workingContext(store, 'p', draft.id, question.id, { note: 'legacy archived packet' }, 90000, { common: true });
+  const archiveRef = (packet as { working: { archive: ReturnType<typeof reference> } }).working.archive;
+  const requestId = `legacy-${randomUUID()}`;
+  const requestText = JSON.stringify({ protocol: 'omg-agent/v1', requestId,
+    subject: { working: { archive: archiveRef } } });
+  const responseText = JSON.stringify({ protocol: 'omg-agent/v1', requestId, research });
+  const requestRecord = store.write({ id: `model-request:${requestId}`, kind: 'model-request', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, text: requestText } });
+  const responseRecord = store.write({ id: `model-response:${requestId}`, kind: 'model-response', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, text: responseText } });
+  return store.write<ModelCall>({ id: `model-call:${requestId}`, kind: 'model-call', expected: 0, value: {
+    projectId: 'p', draftId: draft.id, questionId: question.id, purpose: 'analyst', requestId,
+    requested: { actor: 'author', model: 'fixture-author', effort: 'high' }, profile: reference(pilot),
+    status: 'failed', startedAt: 1, finishedAt: 2, error: 'pilot_reply_limit',
+    confirmed: { model: null, effort: null, speed: null },
+    usage: { inputTokens: 5, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+    usageSource: 'adapter',
+    request: { chars: requestText.length, bytes: Buffer.byteLength(requestText), hash: digest(requestText),
+      record: reference(requestRecord) },
+    response: { record: reference(responseRecord), chars: responseText.length,
+      bytes: Buffer.byteLength(responseText), hash: digest(responseText) } } as any });
+}
+
+test("a delivered legacy call keeps its position and never re-delivers on the next entry", async t => {
+  // C51 continuation: the recovered turn owns the call's exact recoveredRequest
+  // (id+revision+hash, this run only); repeated entries through new Stores move
+  // on to the next lawful step — one managed analyst call — instead of
+  // re-delivering the same paid bytes into new run positions.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const call = legacyReplyLimit(store, pilot, draft, question,
+    { action: 'read_bundle', purpose: 'recovered legacy read',
+      inputs: [{ path: 'README.md', media: 'text/plain' }] });
+  const command = join(root, 'next-step.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='reader'){const lines=c.sources[0].lines.filter(l=>l[0]>=2&&l[0]<=3);research={selections:lines.length?[{source:c.sources[0].ref,firstLine:lines[0][0],lastLine:lines.at(-1)[0]}]:[],unresolved:[]};}
+else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Recovered reading',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd, reader: { ...settings.reader, command: cmd } }, pilot.revision);
+  await engine.researcher.run('p', draft.id, 1);
+  assert.equal(store.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest?.id === call.id).length, 1,
+    'the first entry delivers the saved response into exactly one turn');
+  for (let n = 0; n < 2; n++) {
+    const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+    await new ProductEngine(db).researcher.run('p', draft.id, 1);
+    assert.equal(db.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest?.id === call.id).length, 1,
+      'a delivered legacy call does not own another run position');
+  }
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const analysts = db.list<ModelCall>('model-call').filter(c => c.value.purpose === 'analyst');
+  assert.equal(analysts.filter(c => c.id === call.id).length, 1, 'the fabricated legacy call is the only pre-intent one');
+  assert.ok(analysts.length >= 2 && analysts.filter(c => c.id !== call.id)
+    .every(c => c.id.startsWith('model-call:consumer:v1:')),
+    'every analyst call after the legacy one belongs to the managed era');
+  assert.equal(db.get<Question>(question.id)!.value.status, 'answered',
+    'the question progressed to its terminal outcome');
+});
+
+test("a replay receipt without its delivered turn keeps the legacy call recoverable exactly once", async t => {
+  // C51 window: research-response-replay is written before the turn — a crash
+  // in between must not mark the call delivered. The next entry still picks it
+  // as the single candidate and binds the delivery in exactly one turn.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  const call = legacyReplyLimit(store, pilot, draft, question,
+    { action: 'read_bundle', purpose: 'window read', inputs: [{ path: 'README.md', media: 'text/plain' }] });
+  const command = join(root, 'window.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='reader'){const lines=c.sources[0].lines.filter(l=>l[0]>=2&&l[0]<=3);research={selections:lines.length?[{source:c.sources[0].ref,firstLine:lines[0][0],lastLine:lines.at(-1)[0]}]:[],unresolved:[]};}
+else if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Recovered',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const cmd = { executable: process.execPath, args: [command] };
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: cmd, reader: { ...settings.reader, command: cmd } }, pilot.revision);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes, guards = []) => {
+    if (!hit && writes.some(w => w.kind === 'research-turn' && w.expected === 0)) {
+      hit = true; throw new EngineError('input_stale', 'crash before legacy turn delivery'); }
+    return original(writes, guards); }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1); store.writeMany = original;
+  assert.ok(hit, 'the crash landed between the receipt and the turn');
+  assert.equal(store.list('research-response-replay').length, 1, 'the paid receipt exists');
+  assert.equal(store.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest?.id === call.id).length, 0,
+    'no turn delivered it yet');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  await new ProductEngine(db).researcher.run('p', draft.id, 1);
+  assert.equal(db.list('research-response-replay').length, 1,
+    'the content-addressed receipt is not duplicated');
+  assert.equal(db.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest?.id === call.id).length, 1,
+    'the window closes by delivering the call exactly once');
+  const again = new Store(join(root, 'state.sqlite')); t.after(() => again.close());
+  await new ProductEngine(again).researcher.run('p', draft.id, 1);
+  assert.equal(again.list<ResearchTurn>('research-turn').filter(x => x.value.recoveredRequest?.id === call.id).length, 1,
+    'the delivered call leaves the candidate set');
+});
+
+test("a completed queued search child without a retry reads exactly as before", async t => {
+  // Era rule for queuedChildReached: the stored ref remains the first exact
+  // link — a managed search child that completed without any retry is read by
+  // the historical validator through the same stored provenance as before.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['add', 'README.md'], { cwd: root });
+  const command = join(root, 'queued-search.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'search',query:'Restrict'}]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Searched',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] },
+    planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  await engine.researcher.run('p', draft.id, 10);
+  const child = store.list<ResearchTurn>('research-turn').find(x => x.value.plannedBy
+    && (x.value.action as { action?: string }).action === 'search' && x.value.status === 'completed' && !x.value.error);
+  assert.ok(child, 'the queued search child completed');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const head = db.get<ResearchTurn>(child.id)!;
+  assert.equal(head.value.status, 'completed');
+  assert.doesNotThrow(() => readResearchConsumerTurn(db, reference(head)),
+    'the non-retried completed search child still reads through its exact stored ref');
+});
+
+test("a failed queued search retries through its pending basis and the retried completion reads historically", async t => {
+  // №1927-4(2): O stays the stored queue ref; the completion is proven from P —
+  // the pending revision the retry actually produced. failed@2 must read as a
+  // lawful failed outcome (no capture derivation), pending@3 -> completed@4
+  // with capture bound to @3, all readable on a new Store.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['add', 'README.md'], { cwd: root });
+  const command = join(root, 'search-retry.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'search',query:'Restrict'}]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Searched',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] },
+    planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const original = ResearchSources.prototype.searchCaptured; let hit = false;
+  ResearchSources.prototype.searchCaptured = function (this: ResearchSources, ...args: Parameters<ResearchSources['searchCaptured']>) {
+    if (!hit) { hit = true; throw new EngineError('fixture_search_io', 'Transient search failure'); }
+    return original.apply(this, args);
+  } as typeof ResearchSources.prototype.searchCaptured;
+  try { await engine.researcher.run('p', draft.id, 10); }
+  finally { ResearchSources.prototype.searchCaptured = original; }
+  const failed = store.list<ResearchTurn>('research-turn').find(x => x.value.plannedBy
+    && (x.value.action as { action?: string }).action === 'search' && x.value.question?.id === question.id
+    && x.value.status === 'completed' && x.value.error);
+  assert.ok(failed, 'the runner recorded the failed search child');
+  assert.equal(failed.revision, 2);
+  const db0 = new Store(join(root, 'state.sqlite')); t.after(() => db0.close());
+  assert.doesNotThrow(() => readResearchConsumerTurn(db0, reference(failed)),
+    'a lawful failed queue child reads as failed — never as a successful capture');
+  const retried = retryPlannedRead(store, 'p', reference(failed));
+  assert.equal(retried.revision, 3);
+  assert.equal(retried.value.status, 'pending');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const out = await new ProductEngine(db).researcher.run('p', draft.id, 10);
+  assert.notEqual(out.value.pauseCode, 'research_consumer_intent_invalid');
+  assert.notEqual(out.value.pauseCode, 'reading_plan_blocked',
+    'the run moved past the retried child — the plan is no longer blocked on it');
+  const completed = db.get<ResearchTurn>(retried.id)!;
+  assert.equal(completed.revision, 4);
+  assert.equal(completed.value.status, 'completed');
+  assert.equal(completed.value.error, null);
+  const capture = db.get<Record<string, any>>((completed.value.observation as { capture?: { id: string } }).capture!.id)!;
+  assert.equal(capture.kind, 'research-search-capture');
+  assert.equal((capture.value.turn as { revision?: number }).revision, 3,
+    'the capture is bound to the exact pending basis P, not to the stored O');
+  assert.doesNotThrow(() => readResearchConsumerTurn(db, reference(completed)),
+    'the retried completed search reads historically from its pending basis');
+  assert.doesNotThrow(() => readResearchConsumerTurn(db, reference(db.get<ResearchTurn>(failed.id, 2)!)),
+    'the failed attempt still reads as failed after the retried completion');
+});
+
+test("a doubly retried queued search keeps every failed attempt and the final completion readable by their own bases", async t => {
+  // №1927-4(3): two failures with a retry between them — @2 and @4 read as
+  // failed from their own pending bases (@1 and @3), the success @6 reads from
+  // @5 with its capture, all proven without today's files on a new Store.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['add', 'README.md'], { cwd: root });
+  const command = join(root, 'search-retry2.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'search',query:'Restrict'}]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Searched',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] },
+    planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const original = ResearchSources.prototype.searchCaptured; let failures = 2;
+  ResearchSources.prototype.searchCaptured = function (this: ResearchSources, ...args: Parameters<ResearchSources['searchCaptured']>) {
+    if (failures > 0) { failures -= 1; throw new EngineError('fixture_search_io', 'Transient search failure'); }
+    return original.apply(this, args);
+  } as typeof ResearchSources.prototype.searchCaptured;
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  const db2 = new Store(join(root, 'state.sqlite')); t.after(() => db2.close());
+  let childId = '';
+  try {
+    await engine.researcher.run('p', draft.id, 10);
+    const child = store.list<ResearchTurn>('research-turn').find(x => x.value.plannedBy
+      && (x.value.action as { action?: string }).action === 'search' && x.value.question?.id === question.id)!;
+    childId = child.id;
+    const current = db.get<ResearchTurn>(child.id)!;
+    assert.equal(current.revision, 2);
+    assert.equal(current.value.status, 'completed');
+    assert.ok(current.value.error, 'first attempt failed');
+    assert.doesNotThrow(() => readResearchConsumerTurn(db, reference(current)),
+      'failed revision 2 reads by its own pending basis');
+    retryPlannedRead(db, 'p', reference(current));
+    // The second failure is still armed — the retried pending child fails again.
+    await new ProductEngine(db2).researcher.run('p', draft.id, 10);
+  } finally { ResearchSources.prototype.searchCaptured = original; }
+  const secondFailed = db2.get<ResearchTurn>(childId, 4)!;
+  assert.equal(secondFailed.value.status, 'completed');
+  assert.ok(secondFailed.value.error, 'second attempt failed from its own pending basis @3');
+  assert.doesNotThrow(() => readResearchConsumerTurn(db2, reference(secondFailed)),
+    'the second failed attempt reads historically');
+  retryPlannedRead(db2, 'p', reference(secondFailed));
+  const db3 = new Store(join(root, 'state.sqlite')); t.after(() => db3.close());
+  const out = await new ProductEngine(db3).researcher.run('p', draft.id, 10);
+  assert.notEqual(out.value.pauseCode, 'research_consumer_intent_invalid');
+  assert.notEqual(out.value.pauseCode, 'reading_plan_blocked',
+    'the run moved past the retried child — the plan is no longer blocked on it');
+  const completed = db3.get<ResearchTurn>(childId)!;
+  assert.equal(completed.revision, 6);
+  assert.equal(completed.value.status, 'completed');
+  assert.equal(completed.value.error, null);
+  assert.doesNotThrow(() => readResearchConsumerTurn(db3, reference(completed)),
+    'the final retried completion reads from pending basis @5');
+  const capture = db3.get<Record<string, any>>((completed.value.observation as { capture?: { id: string } }).capture!.id)!;
+  assert.equal((capture.value.turn as { revision?: number }).revision, 5,
+    'the capture of the final completion is bound to its own pending basis');
+});
+
+test("a failed queued search that rewrote its pending basis is refused, not read as failed", async t => {
+  // №1927-4 masquerade: a failed outcome may change only the completion
+  // payload. Forging a different question/action on top of the pending basis
+  // is refused by the shared derivation, not read as a lawful failure.
+  const { root, store, engine, pilot, settings, draft, question } = fixture(t);
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['add', 'README.md'], { cwd: root });
+  const command = join(root, 'search-forge.mjs');
+  writeFileSync(command, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;let research;
+if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'search',query:'Restrict'}]};
+else research={action:'answer',question:c.question.id,value:{applicability:'applicable',reason:'Searched',facts:[],designs:[{id:'d',decision:'ok',benefit:'ok',consumer:'compilation'}],gaps:[]},citations:(c.readings||[]).flatMap(x=>x.observations.map(o=>({source:o.source,selector:o.selector})))};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, agentCommand: { executable: process.execPath, args: [command] },
+    planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
+  const original = ResearchSources.prototype.searchCaptured; let hit = false;
+  ResearchSources.prototype.searchCaptured = function (this: ResearchSources, ...args: Parameters<ResearchSources['searchCaptured']>) {
+    if (!hit) { hit = true; throw new EngineError('fixture_search_io', 'Transient search failure'); }
+    return original.apply(this, args);
+  } as typeof ResearchSources.prototype.searchCaptured;
+  try { await engine.researcher.run('p', draft.id, 10); }
+  finally { ResearchSources.prototype.searchCaptured = original; }
+  const failed = store.list<ResearchTurn>('research-turn').find(x => x.value.plannedBy
+    && (x.value.action as { action?: string }).action === 'search' && x.value.question?.id === question.id
+    && x.value.status === 'completed' && x.value.error)!;
+  const retried = retryPlannedRead(store, 'p', reference(failed));
+  assert.equal(retried.value.status, 'pending');
+  // Forge a failed outcome on the pending basis but with a foreign question.
+  const forged = store.write<ResearchTurn>({ id: retried.id, kind: retried.kind, expected: retried.revision,
+    value: { ...retried.value, status: 'completed', question: { id: 'question:p:forged', revision: 1, hash: 'f'.repeat(64) },
+      observation: { code: 'fixture_search_io', details: null }, error: { code: 'fixture_search_io', details: null } } });
+  assert.throws(() => readResearchConsumerTurn(store, reference(forged)),
+    (error: unknown) => (error as { code?: string }).code === 'research_consumer_intent_invalid',
+    'a failed outcome that changed its pending basis is refused, not read as failed');
+  const db = new Store(join(root, 'state.sqlite')); t.after(() => db.close());
+  assert.throws(() => readResearchConsumerTurn(db, reference(forged)),
+    (error: unknown) => (error as { code?: string }).code === 'research_consumer_intent_invalid',
+    'the forged failure is refused on a new Store as well');
+  // A forged middle step of the chain is refused too: a pending replay whose
+  // recorded action differs from the queue's basis is not part of the lawful
+  // chain even when the endpoint pending looks original.
+  const forgedStep = store.write<ResearchTurn>({ id: retried.id, kind: retried.kind, expected: forged.revision,
+    value: { ...retried.value, replayedFrom: reference(forged), action: { action: 'search', query: 'forged query' } } });
+  const endpoint = store.write<ResearchTurn>({ id: retried.id, kind: retried.kind, expected: forgedStep.revision,
+    value: { ...retried.value, replayedFrom: reference(forgedStep) } });
+  const outcome = store.write<ResearchTurn>({ id: retried.id, kind: retried.kind, expected: endpoint.revision,
+    value: { ...endpoint.value, status: 'completed', observation: { code: 'fixture_search_io', details: null },
+      error: { code: 'fixture_search_io', details: null } } });
+  assert.throws(() => readResearchConsumerTurn(db, reference(outcome)),
+    (error: unknown) => (error as { code?: string }).code === 'research_consumer_intent_invalid',
+    'a lawful-looking endpoint over a forged middle step is refused');
 });

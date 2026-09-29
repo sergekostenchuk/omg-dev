@@ -27,8 +27,20 @@ export function recoverableReadingPlan(store: Store, turns: Revision<ResearchTur
       if (canonical(archive.question) !== canonical(reference(question))) return null;
     } catch { return null; }
   }
+  // C52 era binding: this door repairs only the previous (legacy) chain. A
+  // managed turn — or a turn descending from one through replay or queue —
+  // is corrected by the new shared outcome path, never by an old-era replay.
+  const managedEra = (turn: Revision<ResearchTurn> | null | undefined): boolean =>
+    !!turn && (turn.id.startsWith("research-turn:v1:")
+      || (turn.value as { contract?: unknown }).contract === "research-consumer-turn/v1"
+      || isRef((turn.value as { consumerIntent?: unknown }).consumerIntent));
+  if (managedEra(latest)) return null;
+  const originRef = latest.value.replayedFrom ?? latest.value.splitFrom ?? latest.value.plannedBy;
+  if (isRef(originRef) && managedEra(store.get<ResearchTurn>(originRef.id, originRef.revision))) return null;
   const matches = store.list<ModelCall>("model-call").flatMap(call => {
     const c = call.value, ref = c.response?.record;
+    const callIntent = (c as { consumerIntent?: unknown }).consumerIntent;
+    if (isRef(callIntent) || call.id.startsWith("model-call:consumer:v1:")) return [];
     if (c.projectId !== draft.value.projectId || c.draftId !== draft.id || c.questionId !== question.id
       || c.purpose !== "reading-planner" || c.status !== "succeeded" || !isRef(ref)) return [];
     const response = store.get<{ projectId: string; draftId: string; text: string }>(ref.id, ref.revision);

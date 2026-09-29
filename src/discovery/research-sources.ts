@@ -1,11 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { Store } from "../storage/store.js";
+import { Store, type Revision, type Write } from "../storage/store.js";
 import { Evidence, sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { digest } from "../canonical.js";
 import { workspacePath, gitBytes } from "../runtime/environment.js";
 import { requireCondition } from "../errors.js";
+import type { ResearchTurn } from './research-model.js';
+import { projectResearchSearchObservation, projectSearchTurnCompletion, requireSearchQuery,
+  type ResearchSearchProcess } from './research-consumer-transition.js';
 
 export class ResearchSources {
   constructor(private readonly store: Store, private readonly project: string, private readonly root: string) {}
@@ -36,16 +39,38 @@ export class ResearchSources {
     requireCondition(end - start <= 50_000, "research_excerpt_limit", "Read a smaller source range");
     return new Evidence(this.store).observe(this.project, ref, { kind: "text-range", start, end });
   }
-  search(query: string) {
-    requireCondition(query.trim().length > 0 && query.length <= 1000, "research_query_invalid", "Use a nonempty bounded search query");
-    const sources = this.list().flatMap(source => {
-      const offset = source.value.content.toLowerCase().indexOf(query.toLowerCase());
-      return offset < 0 ? [] : [{ source: reference(source), offset, excerpt: source.value.content.slice(Math.max(0, offset - 200), offset + 1200) }];
-    });
+  private searchFacts(query: string) {
+    requireSearchQuery(query);
+    const sources = this.list();
     const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "grep", "-n", "-I", "-i", "-F", "-e", query, "--"],
       { cwd: this.root, encoding: "utf8", timeout: 10_000, maxBuffer: 200_000,
         env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))) });
-    return { sources, repositoryMatches: (result.stdout ?? "").slice(0, 20_000),
-      repositoryStatus: result.status === 0 ? "matches" : result.status === 1 ? "no_matches" : "unavailable_or_truncated" };
+    const error = result.error as NodeJS.ErrnoException | undefined;
+    const processFacts: ResearchSearchProcess = { stdout: result.stdout ?? null,
+      status: result.status, signal: result.signal,
+      error: error ? { name: error.name, message: error.message,
+        code: typeof error.code === 'string' ? error.code : null } : null };
+    return { sources: sources.map(source => ({ ref: reference(source), value: source.value })),
+      process: processFacts };
+  }
+  search(query: string) {
+    const facts = this.searchFacts(query);
+    return projectResearchSearchObservation(query, facts.sources, facts.process);
+  }
+  /** Prepare the capture and turn result from one Source enumeration and one
+   * git grep. The caller writes both with its run in one guarded transaction. */
+  searchCaptured(query: string, turn: Revision<ResearchTurn>,
+    parent?: { original: Revision<ResearchTurn>; queued: Revision<ResearchTurn> }):
+    { turn: ResearchTurn; capture: Write; captureRef: Ref; guards: Ref[] } {
+    const facts = this.searchFacts(query);
+    const projected = projectSearchTurnCompletion({ projectId: this.project,
+      turn, store: this.store, ...(parent ? { parent } : {}), query, workspace: this.root, ...facts });
+    const capture: Write = { id: projected.capture.id,
+      kind: 'research-search-capture', expected: 0, value: projected.capture.value };
+    return { turn: projected.turn, capture, captureRef: projected.capture.ref,
+      // The original parent is an exact historical proof, while its queued
+      // revision is the current CAS guard for this child application.
+      guards: [reference(turn), ...(parent ? [reference(parent.queued)] : []),
+        ...facts.sources.map(source => source.ref)] };
   }
 }

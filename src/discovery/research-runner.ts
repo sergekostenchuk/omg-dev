@@ -1,31 +1,56 @@
+import { realpathSync } from "node:fs";
+import { Ajv } from "ajv";
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
-import { Environments } from "../runtime/environment.js";
-import { reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
+import { Environments, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
+import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { Discovery, type DiscoveryDraft, type Question } from "./discovery.js";
-import type { ResearchAction, ResearchRun, ResearchTurn } from "./research-model.js";
+import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./discovery.js";
+import type { ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
 import { researchAction, researchCall } from "./research-protocol.js";
+import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
+  projectResearchTurnRevision, projectPaidLocalRefusal, projectRepeatedContextRead,
+  projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES,
+  type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState } from "./research-consumer-transition.js";
+import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents,
+  prepareResearchConsumerIntent, readResearchConsumerIntent,
+  readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
+  prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
+  readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
+  assessmentReadView, prepareManagedProposalRefusal, PreparedManagedProposalRefusal,
+  refuseResearchConsumerIntent, pinnedLayerDeltaStore,
+  type ManagedProposalRefusal,
+  type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
+import { Evidence, type Source } from "../evidence/evidence.js";
 import { assessAnswer } from "./research-assessment.js";
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { processStart } from "../runtime/process-identity.js";
 import { reuseResearch } from "./research-reuse.js";
 import { researchPrerequisites, researchGraphContext } from "./research-context.js";
+import type { Graph } from '../graph/model.js';
+import type { TechnicalReport } from '../graph/research-contracts.js';
+import { technicalProposalFindings, type LegacyPathResolution } from '../graph/research-evidence.js';
+import type { Finding } from '../pipeline/contracts.js';
+import { collectRuntimeEvidence } from '../graph/runtime-evidence.js';
+import { obligationHandoff } from '../graph/obligation-handoff.js';
+import { requireTaskObligations } from '../graph/task-obligations.js';
+import { composeLayer } from '../graph/layer-design.js';
 import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
-import { assertPilotBoundary, readerPilot, pilotEnvironment } from "./reader-pilot.js";
+import { assertPilotBoundary, readerPilot, pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
 import { pilotContext, retainPilotRead } from "./pilot-context.js";
-import { readBundle, readerResumeStep } from "./reader.js";
-import { captureResearchConsumerRetryPermits } from "./response-recovery.js";
+import { readBundle, readReaderResultAt, resumeReadBundleIntent } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
-import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead, addressedWorkspace } from "./research-continuation.js";
+import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
+  addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
 import { addContextLookup } from './context-workspace.js';
-import { dispatchMode, queueReadingPlan, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
+import { dispatchMode, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
+import { replayableLegacyCall } from "./response-replay.js";
 import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, synthesisOutcomeDelivery,
   synthesisDeliveryMarks } from "./synthesis-session.js";
 
@@ -40,6 +65,8 @@ const INSTRUCTION = `Resolve the internal research questions yourself using exis
 {"action":"need_owner","question":"question ID","reason":"specific unavailable information and why it blocks this consumer","searched":[{"id":"...","revision":1,"hash":"..."}]}
 {"action":"pause","reason":"technical limitation"}
 Use read/search tools before concluding information is unavailable. A failed provider or exhausted turn budget is a technical pause, never a reason to ask the owner a subject-matter question. Do not mutate files or invoke external paid actions. Citations must point to source refs from inventory, not stage or graph refs; use json-pointer selectors for JSON when appropriate. File inventory entries contain metadata only: use read_source or search to obtain their exact contents. A history answer with valuePointer references the identical value already present in the current context fields; the original action remains stored unchanged.`;
+
+const paidTurnId = (run: string, number: number) => `research-turn:v1:${hashJson([run, number])}`;
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
  * planning phase only. When a synthesis-phase turn of this same question is
@@ -80,33 +107,287 @@ export class Researcher {
     const id = `research-run:${hashJson([project, draftId])}`;
     // A child may use only the retry allowance visible at the external run
     // boundary. A refusal produced inside this run cannot authorize g+1.
-    const readerRetryPermits = captureResearchConsumerRetryPermits(this.store, project);
+    const retryPermits = captureResearchConsumerRetryPermits(this.store, project);
+    const intents = listResearchConsumerIntents(this.store, project, draftId);
+    const unfinished = intents.filter(intent => (intent.value.state === "prepared" || intent.value.state === "running")
+      && (!(intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
+        || (intent.value.cursor.delivery && typeof intent.value.cursor.delivery === "object"
+          && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
+          && intent.value.cursor.delivery.turn > 0)));
+    const unhandedSynthesis = intents.filter(intent => intent.value.state === "applied"
+      && (intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
+      && intent.value.cursor.delivery && typeof intent.value.cursor.delivery === "object"
+      && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
+      && intent.value.cursor.delivery.turn > 0
+      && !this.store.get(paidTurnId(id, intent.value.cursor.delivery.turn)));
+    const refusedSynthesis = intents.filter(intent => intent.value.state === "refused"
+      && (intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
+      && intent.value.cursor.delivery && typeof intent.value.cursor.delivery === "object"
+      && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
+      && intent.value.cursor.delivery.turn > 0
+      && !this.store.get(paidTurnId(id, intent.value.cursor.delivery.turn))
+      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key)?.id === intent.id);
+    requireCondition(refusedSynthesis.every(intent => retryPermits.some(permit => canonical(permit) === canonical(reference(intent)))),
+      "research_consumer_retry_permit_missing", "A failed synthesis cannot be retried inside the invocation that proved its failure");
+    const unhandedReader = intents.filter(intent => intent.value.state === "applied" && intent.value.kind === "reader"
+      && intent.value.cursor.consumer?.run?.id === id && isRef(intent.value.cursor.consumer?.turn)
+      && this.store.get<ResearchTurn>(intent.value.cursor.consumer.turn.id)?.value.status === "pending");
+    const resumable = Array.from(new Map([...unfinished, ...unhandedSynthesis, ...refusedSynthesis, ...unhandedReader]
+      .map(intent => [intent.id, intent])).values());
+    const groups = new Set(resumable.map(intent => intent.value.kind === "synthesis" || intent.value.kind === "consolidation"
+      ? `synthesis:${intent.value.cursor.sessionId}:${intent.value.cursor.delivery?.turn}`
+      : intent.value.kind === "reader" ? `reader:${intent.value.cursor.rootKey}` : intent.id));
+    requireCondition(groups.size <= 1, "research_consumer_intent_invalid",
+      "Only one original research operation can resume at a time");
+    const resumePriority = { applied: 0, prepared: 1, running: 2, refused: 3 };
+    let outstanding = resumable.sort((a, b) => Number(a.value.cursor.offset ?? 0) - Number(b.value.cursor.offset ?? 0)
+      || Number(a.value.cursor.materialOffset ?? 0) - Number(b.value.cursor.materialOffset ?? 0)
+      || resumePriority[a.value.state as keyof typeof resumePriority] - resumePriority[b.value.state as keyof typeof resumePriority]).at(-1) ?? null;
+    const recordedTurns = this.store.list<ResearchTurn>("research-turn")
+      .map(turn => readResearchConsumerTurn(this.store, reference(turn)) as Revision<ResearchTurn>)
+      .filter(turn => turn.value.run === id);
+    const pendingPaidTurns = recordedTurns.filter(turn => turn.id.startsWith("research-turn:v1:")
+      && turn.value.status === "pending");
+    requireCondition(pendingPaidTurns.length <= 1, "research_consumer_intent_invalid",
+      "The run has several unfinished paid turns");
+    let forcedPendingTurn = pendingPaidTurns[0] ?? null;
+    // C32: a completed read/search turn owns its derived pilot reading. A
+    // crash between the durable turn write and the derivation is repaired
+    // here from the exact saved action and observation — before any new
+    // context is packed, searched, or paid for.
+    if (pilot) for (const item of recordedTurns) {
+      if (item.value.status === "completed" && item.value.error === null
+        && item.value.observation !== null && isRef(item.value.question)
+        && ["read", "read_source", "read_context", "search"].includes(
+          String((item.value.action as { action?: unknown } | null)?.action)))
+        retainPilotRead(this.store, project, item.value.question.id, item.value.action, item.value.observation);
+    }
     let run = this.store.get<ResearchRun>(id);
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
-    const checked = this.discovery.gate(project, reference(draft));
-    if (run?.value.status === "completed" && checked.findings.length === 0) return run;
-    requireCondition(!checked.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
+    const refusedAction = intents.filter(intent => intent.value.state === "refused"
+      && intent.value.refusal?.kind === "consumer-invalid"
+      && ["analyst", "reading-planner", "escalation-assessor"].includes(intent.value.kind)
+      && intent.value.cursor.run === id);
+    requireCondition(refusedAction.length <= 1, "research_consumer_intent_invalid",
+      "Several paid operations claim a terminal refusal for this run");
+    if (refusedAction.length === 1) {
+      // C13/C62: the saved refusal is this run position's terminal outcome —
+      // repeat entry restores it instead of paying the same step again.
+      const refusal = refusedAction[0]!.value.refusal!;
+      requireCondition(run?.kind === "research-run", "research_consumer_intent_invalid",
+        "The refused paid action lost its run");
+      const message = `[${refusedAction[0]!.id}] ${refusal.code} (call ${refusal.call.id})`;
+      if (run.value.status === "paused" && run.value.pauseCode === refusal.code) return run;
+      return this.save(run, { status: "paused", pauseCode: refusal.code, error: message },
+        [reference(refusedAction[0]!), refusal.call]);
+    }
+    if (run?.kind === "research-run" && outstanding?.value.kind === "escalation-assessor"
+      && isRef(outstanding.value.cursor.pendingTurn)) {
+      const questionRef = outstanding.value.question;
+      const originalQuestion = this.store.get<Question>(questionRef.id, questionRef.revision);
+      const question = this.store.get<Question>(questionRef.id);
+      const pendingRef = outstanding.value.cursor.pendingTurn;
+      const pendingTurn = this.store.get<ResearchTurn>(pendingRef.id);
+      const answerRef = question?.value.answer;
+      const answer = answerRef ? this.store.get<Decision>(answerRef.id, answerRef.revision) : null;
+      if (originalQuestion?.kind === "question" && canonical(reference(originalQuestion)) === canonical(questionRef)
+        && question?.kind === "question" && question.revision === originalQuestion.revision + 1
+        && question.value.status === "answered" && isRef(answerRef)
+        && canonical(question.value) === canonical({ ...originalQuestion.value, status: "answered", answer: answerRef })
+        && question.value.projectId === project && question.value.draftId === draftId
+        && draft.value.questions.includes(question.id)
+        && answer && answer.kind === originalQuestion.value.spec.kind
+        && canonical(reference(answer)) === canonical(answerRef)
+        && answer.value.projectId === project && answer.value.question === question.id
+        && typeof answer.value.actor === "string" && answer.value.actor.trim()
+        && canonical(draft.value.fields[question.value.spec.field]) === canonical(answer.value.value)
+        && pendingTurn?.kind === "research-turn" && canonical(reference(pendingTurn)) === canonical(pendingRef)
+        && pendingTurn.value.run === id && pendingTurn.value.number === run.value.turns
+        && pendingTurn.value.status === "pending"
+        && canonical(pendingTurn.value.question) === canonical(questionRef)
+        && outstanding.value.cursor.run === id && outstanding.value.cursor.turn === run.value.turns
+        && researchAction(pendingTurn.value.action).action === "need_owner") {
+        readResearchConsumerTurn(this.store, reference(pendingTurn));
+        const gate = this.discovery.gate(project, reference(draft));
+        if (gate.findings.length === 0) {
+          if (run.value.status === "completed" && run.value.ownerQuestion === null) return run;
+          return this.save(run, { status: "completed", ownerQuestion: null, error: null, pauseCode: null },
+            uniqueRefs([reference(outstanding), reference(pendingTurn), reference(question),
+              reference(answer), ...gate.guards]));
+        }
+      }
+    }
+    if (run?.value.status === "needs_owner" && !outstanding && !forcedPendingTurn) {
+      const ownerQuestion = run.value.ownerQuestion?.question;
+      const question = ownerQuestion ? this.store.get<Question>(ownerQuestion) : null;
+      requireCondition(question?.kind === "question" && question.value.projectId === project
+        && question.value.draftId === draftId && draft.value.questions.includes(question.id),
+        "research_owner_question_invalid", "The saved owner decision has no question in this draft");
+      if (question.value.status !== "answered") return run;
+    }
+    const checked = outstanding || forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
+    if (run?.value.status === "completed" && checked?.findings.length === 0) return run;
+    requireCondition(!checked?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
     const owner = { pid: process.pid, started: processStart(process.pid) };
     requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
-    run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: run?.revision ?? 0,
+    if (outstanding || forcedPendingTurn) requireCondition(run?.kind === "research-run" && run.value.projectId === project && run.value.draftId === draftId,
+      "research_consumer_intent_invalid", "The original research run is missing");
+    else run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: run?.revision ?? 0,
       value: { projectId: project, draftId, environment: reference(environment), status: "running", turns: run?.value.turns ?? 0,
         limit, inputs: uniqueRefs([...draft.value.inputs, ...effective.guards]), ownerQuestion: null, error: null, pauseCode: null, owner,
         requestChars: run?.value.requestChars ?? 0 } }], [reference(draft), reference(environment), ...draft.value.inputs])[0]!;
+    requireCondition(run, "research_consumer_intent_invalid", "The research run was not claimed");
     try {
       const staleCodes = new Set(["research_evidence_stale", "evidence_stale", "answer_target_mismatch"]);
-      for (const finding of checked.findings.filter(item => staleCodes.has(item.code))) {
+      for (const finding of (checked?.findings ?? []).filter(item => staleCodes.has(item.code))) {
         const question = this.store.get<Question>(finding.target);
         if (question?.kind === "question" && question.value.status === "answered") this.discovery.reopen(question.id, question.revision);
       }
-      reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
+      if (!outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
+      let resumedSent: Record<string, any> | undefined;
       for (let turn = 0; turn < limit; turn++) {
+        if (outstanding && (outstanding.value.kind === "synthesis" || outstanding.value.kind === "consolidation")) {
+          requireCondition(pilot, "reader_pilot_required", "The saved synthesis requires its original reader profile");
+          const original = outstanding;
+          const delivery = original.value.cursor.delivery;
+          requireCondition(delivery && typeof delivery === "object" && delivery.run === id
+            && Number.isSafeInteger(delivery.turn) && run.value.turns === delivery.turn,
+            "research_consumer_intent_invalid", "The saved synthesis turn no longer matches its run counter");
+          const saved = original.value.state === "applied"
+            ? readResearchConsumerExecution(this.store, project, reference(original)) : null;
+          const savedAction = saved?.kind === "response" ? researchAction(saved.payload) : null;
+          const action = savedAction?.action === "pause" ? savedAction
+            : savedAction ?? await synthesisSession(this.store, draft,
+              this.store.get<Question>(original.value.question.id)!, environment,
+              dispatch, pilot, original.value.cursor.context, original.value.cursor.prompt, signal,
+              { retryPermits, delivery: { run: id, turn: delivery.turn } });
+          const applied = original.value.state === "applied" ? original
+            : this.synthesisResultIntent(project, draftId, id, delivery.turn, action);
+          requireCondition(applied, "research_consumer_intent_invalid",
+            "The resumed synthesis produced no exact applied session result");
+          const handoff = this.handoffSynthesis(applied, run, action, owner,
+            [reference(draft), reference(environment), original.value.question]);
+          run = handoff.run;
+          forcedPendingTurn = handoff.turn;
+          outstanding = null;
+          turn--;
+          continue;
+        }
+        if (outstanding && (outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner")) {
+          const resumed = await this.applyActionIntent(outstanding, run, dispatch, pilot, owner, limit, signal);
+          run = resumed.run;
+          resumedSent = resumed.sent;
+          forcedPendingTurn = resumed.turn;
+          outstanding = null;
+          turn--;
+          continue;
+        }
+        if (outstanding && outstanding.value.kind === "escalation-assessor") {
+          run = await this.applyEscalationIntent(outstanding, run, dispatch, pilot, owner, limit, signal);
+          outstanding = null;
+          forcedPendingTurn = null;
+          if (run.value.status === "needs_owner") return run;
+          continue;
+        }
+        if (outstanding && outstanding.value.kind === "reader") {
+          requireCondition(pilot, "reader_pilot_required", "The saved reader requires its original profile");
+          const consumer = outstanding.value.cursor.consumer;
+          requireCondition(consumer && isRef(consumer.run) && isRef(consumer.turn) && consumer.run.id === id,
+            "research_consumer_intent_invalid", "The saved reader does not name this run and turn");
+          const originalTurn = this.store.get<ResearchTurn>(consumer.turn.id);
+          const plannedBy = originalTurn?.value.plannedBy;
+          const parent = plannedBy ? this.store.get<ResearchTurn>(plannedBy.id, plannedBy.revision) : null;
+          const plan = parent?.value.action as Extract<ResearchAction, { action: "read_plan" }> | undefined;
+          const position = parent && plan?.action === "read_plan"
+            ? plan.reads.findIndex((read, index) => originalTurn?.id === `research-turn:${hashJson([parent.id, "read", index])}`
+              && canonical(read) === canonical(originalTurn.value.action)) : -1;
+          const queuedChild = parent && position >= 0
+            ? this.store.get<ResearchTurn>(parent.id)?.value.observation as { state?: string; children?: Ref[] } | null
+            : null;
+          const belongsToQueue = parent?.kind === "research-turn" && canonical(reference(parent)) === canonical(plannedBy)
+            && parent.value.run === id && plan?.question === outstanding.value.question.id
+            && position >= 0 && originalTurn?.value.number === parent.value.number + position + 1
+            && originalTurn.value.number <= run.value.turns
+            && (queuedChild?.state !== "queued" || queuedChildReached(this.store, queuedChild.children?.[position], originalTurn));
+          requireCondition(originalTurn?.kind === "research-turn" && canonical(reference(originalTurn)) === canonical(consumer.turn)
+            && originalTurn.value.run === id && (belongsToQueue || !plannedBy && originalTurn.value.number === run.value.turns)
+            && originalTurn.value.status === "pending" && canonical(originalTurn.value.question) === canonical(outstanding.value.question),
+            "research_consumer_intent_invalid", "The reader's original pending turn is missing or changed");
+          readResearchConsumerTurn(this.store, reference(originalTurn));
+          const originalAction = researchAction(originalTurn.value.action);
+          requireCondition(originalAction.action === "read_bundle", "research_consumer_intent_invalid",
+            "The reader continuation belongs to a source bundle action");
+          const result = await resumeReadBundleIntent(this.store, reference(outstanding), dispatch, pilot, signal, retryPermits);
+          const saved = this.store.writeMany<ResearchRun | ResearchTurn>([
+            { id: run.id, kind: run.kind, expected: run.revision,
+              value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
+            { id: originalTurn.id, kind: originalTurn.kind, expected: originalTurn.revision,
+              value: { ...originalTurn.value, status: "completed", observation: { ref: reference(result),
+                observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved },
+                error: null } }
+          ], [reference(run), reference(originalTurn), reference(result), reference(pilot), outstanding.value.question]);
+          run = saved[0]! as Revision<ResearchRun>;
+          outstanding = null;
+          forcedPendingTurn = null;
+          continue;
+        }
         draft = this.store.get<DiscoveryDraft>(draftId)!;
-        const gate = this.discovery.gate(project, reference(draft));
-        if (gate.findings.length === 0) return this.save(run, { status: "completed" });
-        requireCondition(!gate.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed during the run");
+        const gate = forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
+        if (gate?.findings.length === 0) return this.save(run, { status: "completed" });
+        requireCondition(!gate?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed during the run");
+        const forcedQuestionRef = forcedPendingTurn?.value.question;
+        requireCondition(!forcedPendingTurn || isRef(forcedQuestionRef), "research_consumer_intent_invalid",
+          "The paid turn lost its exact research question");
+        const forcedQuestion = forcedQuestionRef ? this.store.get<Question>(forcedQuestionRef.id) : null;
+        if (forcedPendingTurn && forcedQuestion?.kind === "question"
+          && canonical(reference(forcedQuestion)) !== canonical(forcedQuestionRef)) {
+          const originalQuestion = this.store.get<Question>(forcedQuestionRef!.id, forcedQuestionRef!.revision);
+          const accepted = originalQuestion?.kind === "question" && forcedQuestion.value.status === "answered"
+            ? this.acceptedPaidAnswer(project, draft, forcedPendingTurn, originalQuestion, forcedQuestion) : null;
+          if (accepted) {
+            const saved = this.store.writeMany<ResearchRun | ResearchTurn>([
+              { id: run.id, kind: run.kind, expected: run.revision,
+                value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
+              { id: forcedPendingTurn.id, kind: forcedPendingTurn.kind, expected: forcedPendingTurn.revision,
+                value: projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
+                  { kind: 'accepted-answer', inputs: accepted.inputs }) }
+            ], uniqueTransactionGuards([reference(run), reference(forcedPendingTurn), reference(draft),
+              reference(forcedQuestion), ...accepted.guards]));
+            run = saved[0]! as Revision<ResearchRun>;
+            forcedPendingTurn = null;
+            turn--;
+            continue;
+          }
+          const reopened = originalQuestion?.kind === "question"
+            && canonical(reference(originalQuestion)) === canonical(forcedQuestionRef)
+            && forcedQuestion.revision === originalQuestion.revision + 1
+            && forcedQuestion.value.projectId === project && forcedQuestion.value.draftId === draftId
+            && draft.value.questions.includes(forcedQuestion.id)
+            && forcedPendingTurn.value.number === run.value.turns
+            && canonical(forcedQuestion.value) === canonical({ ...originalQuestion.value,
+              beforeHash: hashJson(draft.value.fields[originalQuestion.value.spec.field]), status: "open", answer: null });
+          if (reopened) {
+            const saved = this.store.writeMany<ResearchRun | ResearchTurn>([
+              { id: run.id, kind: run.kind, expected: run.revision,
+                value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
+              { id: forcedPendingTurn.id, kind: forcedPendingTurn.kind, expected: forcedPendingTurn.revision,
+                value: projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
+                  { kind: 'question-reopened', original: originalQuestion!, reopened: forcedQuestion,
+                    draft }) }
+            ], [reference(run), reference(forcedPendingTurn), reference(forcedQuestion), reference(draft)]);
+            run = saved[0]! as Revision<ResearchRun>;
+            forcedPendingTurn = null;
+            turn--;
+            continue;
+          }
+        }
+        requireCondition(!forcedPendingTurn || forcedQuestion?.kind === "question"
+          && canonical(reference(forcedQuestion)) === canonical(forcedQuestionRef)
+          && draft.value.questions.includes(forcedQuestion.id), "research_consumer_context_stale",
+          "The paid turn's original question changed before it was completed");
         const unresolved = draft.value.questions.map(id => this.store.get<Question>(id)!).filter(question => question.value.status !== "answered");
-        const pending = unresolved.slice(0, 1);
+        const pending = forcedPendingTurn ? [forcedQuestion!] : unresolved.slice(0, 1);
         requireCondition(pending.length > 0, "research_answers_stale", "Existing answers need targeted reopening before research can continue");
         // An unfinished synthesis/consolidation operation of this draft is
         // resumed before any new question selection or context packing; its
@@ -120,6 +401,7 @@ export class Researcher {
         }
         requireDocumentarySources(this.store,project,pending[0]!.value.spec);
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
+          .map(item => readResearchConsumerTurn(this.store, reference(item)) as Revision<ResearchTurn>)
           .sort((a, b) => a.value.number - b.value.number);
         const history = turns.slice(-8).map(item => item.value);
         let previousProposal = latestProposal(turns, pending[0]!.id);
@@ -171,27 +453,17 @@ export class Researcher {
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
-        // A queued child with a paid claim owns this position even if the question
-        // gained a new revision. Recover that exact child first; the reader then
-        // applies it or refuses the current admission without buying an analyst.
-        const paidTurn = turns.find(item => {
-          if (item.value.status !== 'pending'
-            || item.value.question?.id !== pending[0]!.id) return false;
-          const planned = item.value.action as ResearchAction;
-          if (planned.action !== 'read_bundle' || !item.value.question) return false;
-          const step = readerResumeStep(this.store, project, item.value.question,
-            planned.purpose, planned.inputs, { run: reference(run!), turn: reference(item) });
-          return step.kind !== 'none';
-        });
-        let pendingTurn = paidTurn ?? turns.find(item => item.value.status === "pending" && (!savedMaterials || !item.value.plannedBy) && (!item.value.question
+        let pendingTurn = forcedPendingTurn ?? turns.find(item => item.value.status === "pending" && (!savedMaterials || !item.value.plannedBy) && (!item.value.question
           || pending.some(question => canonical(reference(question)) === canonical(item.value.question))));
         const recoveredPlan = !savedMaterials && !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
         if (recoveredPlan) {
           const number = run.value.turns + 1;
+          const { contract: _contract, consumerIntent: _consumerIntent, ...originalPlan } = recoveredPlan.original.value as
+            ResearchTurn & { contract?: string; consumerIntent?: Ref };
           const saved = this.store.writeMany<ResearchRun | ResearchTurn>([{ id: run.id, kind: run.kind, expected: run.revision,
             value: { ...run.value, turns: number } },
           { id: `research-turn:${hashJson([id, number])}`, kind: "research-turn", expected: 0,
-            value: { ...recoveredPlan.original.value, number, action: recoveredPlan.action, status: "pending", error: null,
+            value: { ...originalPlan, number, action: recoveredPlan.action, status: "pending", error: null,
               observation: null, question: reference(pending[0]!), replayedFrom: reference(recoveredPlan.original),
               recoveredRequest: recoveredPlan.request } }],
           [...recoveredPlan.guards, reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]);
@@ -201,12 +473,32 @@ export class Researcher {
         const recover = !pendingTurn && pilot ? recoverableAnswer(turns, pending[0]!) : null;
         if (recover) {
           run = this.save(run, { turns: run.value.turns + 1 });
+          const { contract: _contract, consumerIntent: _consumerIntent, ...originalAnswer } = recover.value as
+            ResearchTurn & { contract?: string; consumerIntent?: Ref };
           pendingTurn = this.store.writeMany<ResearchTurn>([{ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
-            value: { ...recover.value, number: run.value.turns, status: "pending", error: null, observation: null, replayedFrom: reference(recover) } }],
+            value: { ...originalAnswer, number: run.value.turns, status: "pending", error: null, observation: null, replayedFrom: reference(recover) } }],
             [reference(recover), reference(pending[0]!), reference(draft), reference(environment), ...draft.value.inputs])[0]!;
         }
         let action: ResearchAction;
-        let sent:Record<string,any>|undefined;
+        let sent:Record<string,any>|undefined = resumedSent;
+        resumedSent = undefined;
+        if (pendingTurn && !sent) {
+          const linked = (pendingTurn.value as ResearchTurn & { consumerIntent?: unknown }).consumerIntent;
+          if (linked !== undefined) {
+            requireCondition(isRef(linked), "research_consumer_intent_invalid",
+              "The saved pending turn lost its exact consumer intent");
+            const applied = readResearchConsumerIntent(this.store, linked);
+            if (applied.value.kind === "analyst" || applied.value.kind === "reading-planner") {
+              requireCondition(applied.value.cursor.run === id && applied.value.cursor.turn === pendingTurn.value.number,
+                "research_consumer_intent_invalid", "The pending turn belongs to another paid action");
+              const paid = readResearchConsumerExecution(this.store, project, linked);
+              requireCondition(paid.kind === "response", "research_consumer_execution_failed",
+                "The saved action has no physical response");
+              sent = paid.subject;
+            } else requireCondition(applied.value.kind === "synthesis" || applied.value.kind === "consolidation",
+              "research_consumer_intent_invalid", "The pending turn belongs to another consumer family");
+          }
+        }
         if (pendingTurn) action = researchAction(pendingTurn.value.action);
         else {
           // The reserved position and the logical budget of a synthesis task
@@ -222,37 +514,92 @@ export class Researcher {
             reserve = { write: { id: run.id, kind: run.kind, expected: run.revision,
                 value: { ...run.value, turns: reservedTurn, requestChars: run.value.requestChars + canonical(context).length } },
               guards: [reference(run)] };
-          } else if (!synthesisEntry && (!synthesisOp || recordedTurn === null))
-            run = this.save(run, { requestChars: run.value.requestChars + canonical(context).length, turns: run.value.turns + 1 });
+          }
           const deltaInstruction = pilot && pending[0]!.value.spec.field === "layerDesign"
             ? (draft.value.level === "R2" ? DELTA_INSTRUCTION.replaceAll("L2", "L3").replace("preserve L1", "preserve L1/L2").replace("and do not add L3", "and provide the nonempty horizon array of atomic result IDs") : DELTA_INSTRUCTION) : "";
           const instruction = mode === "planning" ? PLANNING_INSTRUCTION : mode === "synthesis" ? SYNTHESIS_INSTRUCTION + deltaInstruction
             : INSTRUCTION + (pilot ? PILOT_INSTRUCTION + deltaInstruction : "");
-          action = synthesisEntry ? await synthesisSession(this.store, draft, pending[0]!, environment,
-            dispatch, pilot, context, instruction, signal,
-            { retryPermits: readerRetryPermits, delivery: { run: id, turn: reservedTurn! }, ...(reserve ? { reserve } : {}) })
-            : researchAction(await researchCall(dispatch.implementer, dispatch, instruction, context, signal,
-              { store: this.store, draftId, questionId: pending[0]!.id, purpose: mode === "planning" ? "reading-planner" : "analyst", ...(pilot ? { pilot } : {}),onContext:packet=>{sent=packet;} }));
-          if (synthesisEntry) run = this.store.get<ResearchRun>(id)!; // the atomic reservation moved the shared run record
-          const questionId = "question" in action ? action.question : null;
-          const question = questionId ? pending.find(item => item.id === questionId) : pending[0];
-          const delivery = mode === "synthesis" && pilot
-            ? synthesisOutcomeDelivery(this.store, project, draft.id) : null;
-          const turnNumber = delivery?.turn ?? (reservedTurn ?? run.value.turns);
-          const turnWrite: Write = { id: `research-turn:${hashJson([id, turnNumber])}`, kind: "research-turn", expected: 0,
-            value: { run: id, number: turnNumber, action, assessment: null, observation: null, error: null,
-              status: "pending", question: question ? reference(question) : null, ...(mode ? { dispatchMode: mode } : {}) } };
-          if (delivery) {
-            // Y and the pending turn bind atomically (№1499-38).
-            const mark = synthesisDeliveryMarks(delivery.session, turnWrite);
-            pendingTurn = this.store.writeMany<ResearchTurn>([turnWrite, mark.write], mark.guards)[0]!;
+          if (synthesisEntry) {
+            action = await synthesisSession(this.store, draft, pending[0]!, environment,
+              dispatch, pilot, context, instruction, signal,
+              { retryPermits, delivery: { run: id, turn: reservedTurn! }, ...(reserve ? { reserve } : {}) });
+            run = this.store.get<ResearchRun>(id)!; // the atomic reservation moved the shared run record
+            const questionId = "question" in action ? action.question : null;
+            const question = questionId ? pending.find(item => item.id === questionId) : pending[0];
+            const applied = this.synthesisResultIntent(project, draftId, id, reservedTurn!, action);
+            if (applied) {
+              const handoff = this.handoffSynthesis(applied, run, action, owner,
+                [reference(draft), reference(environment), reference(pending[0]!)]);
+              run = handoff.run; pendingTurn = handoff.turn;
+            } else {
+              const delivery = synthesisOutcomeDelivery(this.store, project, draft.id);
+              const turnNumber = delivery?.turn ?? run.value.turns;
+              const turnWrite: Write = { id: `research-turn:${hashJson([id, turnNumber])}`, kind: "research-turn", expected: 0,
+                value: { run: id, number: turnNumber, action, assessment: null, observation: null, error: null,
+                  status: "pending", question: question ? reference(question) : null, dispatchMode: "synthesis" } };
+              if (delivery) {
+                // Y and the pending turn bind atomically (№1499-38).
+                const mark = synthesisDeliveryMarks(delivery.session, turnWrite);
+                pendingTurn = this.store.writeMany<ResearchTurn>([turnWrite, mark.write], mark.guards)[0]!;
+              } else {
+                pendingTurn = this.store.write<ResearchTurn>(turnWrite);
+              }
+            }
           } else {
-            pendingTurn = this.store.write<ResearchTurn>(turnWrite);
+            const kind = mode === "planning" ? "reading-planner" as const : "analyst" as const;
+            const number = run.value.turns + 1;
+            // C51: a matching pre-intent pilot_reply_limit call already paid for
+            // this exact logical step — deliver it as a previous-era turn
+            // before a managed intent could claim another physical send.
+            const legacyReplay = pilot ? replayableLegacyCall(this.store, pilot,
+              dispatch.implementer, draft.id, pending[0]!.id, kind, id) : null;
+            if (legacyReplay) {
+              const replayed = this.store.writeMany<ResearchRun | ResearchTurn>([
+                { id: run.id, kind: run.kind, expected: run.revision,
+                  value: { ...run.value, turns: number } },
+                { id: `research-turn:${hashJson([id, number])}`, kind: "research-turn", expected: 0,
+                  value: { run: id, number, action: legacyReplay.research as ResearchAction,
+                    assessment: null, observation: null, error: null,
+                    status: "pending" as const, question: reference(pending[0]!),
+                    ...(mode ? { dispatchMode: mode } : {}), recoveredRequest: legacyReplay.call } }],
+                uniqueTransactionGuards([reference(run), legacyReplay.call, legacyReplay.response,
+                  reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]));
+              run = replayed[0]! as Revision<ResearchRun>;
+              pendingTurn = replayed[1]! as Revision<ResearchTurn>;
+              action = researchAction(pendingTurn.value.action);
+            } else {
+            const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...turns.map(reference),
+              ...sources.list().map(reference)]);
+            const layerGraph = draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign'
+              ? this.store.get<Graph>(`graph:${project}`) : null;
+            if (draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign')
+              requireCondition(layerGraph?.kind === 'graph' && hashJson(layerGraph.value) === layerGraph.hash,
+                'graph_missing', 'The paid layer design needs its exact current graph');
+            const intent = prepareResearchConsumerIntent(this.store, {
+              projectId: project, kind, key: hashJson([id, number, kind]), owner: reference(run),
+              draft: reference(draft), question: reference(pending[0]!), role: dispatch.implementer,
+              dispatch, profile: pilot ? reference(pilot) : null,
+              cursor: { run: id, turn: number, mode, instruction, context,
+                ...(layerGraph ? { graphBase: reference(layerGraph) } : {}) }, basis,
+              guards: uniqueTransactionGuards([reference(run), reference(draft), reference(pending[0]!),
+                reference(environment), ...basis, ...(pilot ? [reference(pilot)] : []),
+                ...(layerGraph ? [reference(layerGraph)] : []),
+                { id: paidTurnId(id, number), absent: true }]) }, retryPermits);
+            const applied = await this.applyActionIntent(intent, run, dispatch, pilot, owner, limit, signal);
+            run = applied.run; pendingTurn = applied.turn; sent = applied.sent;
+            action = researchAction(pendingTurn.value.action);
+            }
           }
         }
         let observation: unknown = null; let assessment: Ref | null = null; let error: string | null = null;
         let stop: Partial<ResearchRun> | null = null;
         let stopGuards: Ref[] = [];
+        let escalationIntent: Revision<ResearchConsumerIntent> | null = null;
+        let turnProof: TurnTransitionProof | null = null;
+        let capturedSearch: ReturnType<ResearchSources['searchCaptured']> | null = null;
+        let capturedProposalRefusal: PreparedManagedProposalRefusal | null = null;
+        let ownerConsulted: Ref[] | null = null;
+        let ownerHadPriorRead = false;
         try {
           if (planning && pendingTurn.value.dispatchMode && !pendingTurn.value.plannedBy) requireCondition(pendingTurn.value.dispatchMode === "planning"
             ? ["read_plan", "synthesize", "pause"].includes(action.action)
@@ -262,17 +609,42 @@ export class Researcher {
             requireCondition(planning, "reading_plan_disabled", "Grouped reading requires the planning preset");
             const queued = queueReadingPlan(this.store, run, pendingTurn, draft, pending[0]!, action);
             run = queued.run; observation = { state: "queued", children: queued.children };
+            turnProof = { kind: 'reading-plan-queued', children: queued.children };
           } else if (action.action === "synthesize" || action.action === "need_research") {
             requireCondition(planning && action.question === pending[0]!.id, "research_question_foreign", "Mode transition must target the current question");
             observation = { nextMode: action.action === "synthesize" ? "synthesis" : "planning" };
+            turnProof = { kind: 'reading-mode' };
           } else if (action.action === "read_bundle") {
             requireCondition(pilot, "reader_pilot_required", "A source bundle needs the configured reader experiment");
-            const paidQuestion = paidTurn && pendingTurn.id === paidTurn.id ? paidTurn.value.question : null;
-            const result = await readBundle(this.store, dispatch, pilot, paidQuestion ?? reference(pending[0]!), action.purpose, action.inputs,
-              signal, { run: reference(run), turn: reference(pendingTurn) }, readerRetryPermits);
+            const attachedReaders = intents.filter(intent => intent.value.kind === "reader"
+              && intent.value.owner.id === pendingTurn.id);
+            const savedRuns = attachedReaders.map(intent => {
+              const binding = intent.value.cursor.consumer;
+              requireCondition(binding && isRef(binding.run) && isRef(binding.turn)
+                && canonical(binding.turn) === canonical(reference(pendingTurn)),
+                "research_consumer_intent_invalid", "The reader lost its original pending turn binding");
+              return binding.run as Ref;
+            });
+            requireCondition(new Set(savedRuns.map(canonical)).size <= 1,
+              "research_consumer_intent_invalid", "The pending bundle has several original run bindings");
+            const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs,
+              signal, { run: savedRuns[0] ?? reference(run), turn: reference(pendingTurn) }, retryPermits);
+            readReaderResultAt(this.store, project, reference(result));
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
+            turnProof = { kind: 'read-bundle', result: { ref: reference(result), value: result.value } };
           } else if (action.action === "read_context") {
-            try { observation = readResearchContext(this.store, draft, pending[0]!.id, pilot ?? undefined, action.record, action.pointer, action.page); }
+            try {
+              const managedRead = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1';
+              const admitted = readResearchContext(this.store, draft, pending[0]!.id,
+                pilot ?? undefined, action.record, action.pointer, action.page);
+              if (managedRead) {
+                const projected = readResearchContextOutcomeAt(this.store, draft, pending[0]!, action,
+                  pilot?.value.maxRequestChars ?? 300000);
+                requireCondition(canonical(admitted) === canonical(projected), 'research_consumer_intent_invalid',
+                  'The addressed read differs from its exact historical projection');
+                observation = projected;
+              } else observation = admitted;
+            }
             catch(failure){
               if(failure instanceof EngineError&&failure.code==='context_read_limit'&&pendingTurn.value.plannedBy){
                 const split=splitPlannedContextRead(this.store,run,pendingTurn,draft,pending[0]!);
@@ -283,28 +655,80 @@ export class Researcher {
             // Resuming a pending turn does not imply that its old requested
             // original was delivered again. Validate the actual packet set.
             if(sent) {
-              try { addContextLookup(workspace,observation as any,sent.contextWorkspace,pilot?.value.contextLimits?.maxLookups); }
+              const managed = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1';
+              const originalWorkspace = managed ? projectAddressedWorkspace(pendingTurn.value as ManagedResearchTurn,
+                readContextTurnHistoryAt(this.store, project, draft, reference(pending[0]!),
+                  turns, pendingTurn.value.number), reference(pending[0]!)) : workspace;
+              if (managed) requireCondition(canonical(originalWorkspace) === canonical(workspace),
+                'research_consumer_context_stale', 'The delivered workspace changed after its exact saved history');
+              try { addContextLookup(originalWorkspace,observation as any,sent.contextWorkspace,pilot?.value.contextLimits?.maxLookups); }
               catch(failure) {
+                const exact = managed ? readResearchContextRecordAt(this.store, draft, action) : null;
+                const projected = managed ? projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, {
+                  kind: 'delivery-refusal', recordValue: exact!.value, record: action.record,
+                  maxChars: pilot?.value.maxRequestChars ?? 300000, workspace: originalWorkspace,
+                  delivered: sent.contextWorkspace,
+                  ...(pilot?.value.contextLimits?.maxLookups !== undefined
+                    ? { maxLookups: pilot.value.contextLimits.maxLookups } : {}) }) : null;
                 this.store.write<ResearchTurn>({id:pendingTurn.id,kind:pendingTurn.kind,expected:pendingTurn.revision,
-                  value:{...pendingTurn.value,status:'completed',error:failure instanceof Error?failure.message:'Context lookup refused',
+                  value: projected ?? {...pendingTurn.value,status:'completed',error:failure instanceof Error?failure.message:'Context lookup refused',
                     observation:{code:failure instanceof EngineError?failure.code:'research_context_invalid',requested:observation}}});
                 throw failure;
               }
             }
-            const repeated = !sent ? repeatedContextRead(this.store, turns, pending[0]!, 0, observation, action) : null;
+            const managed = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1';
+            const repeatProof = !sent && managed
+              ? { kind: 'repeat-context' as const,
+                current: readContextIdentityAt(this.store, project, draft, reference(pending[0]!), action, observation),
+                history: readContextTurnHistoryAt(this.store, project, draft, reference(pending[0]!),
+                  turns, pendingTurn.value.number) } : null;
+            const repeated = !sent && repeatProof
+              ? projectRepeatedContextRead(pendingTurn.value as ManagedResearchTurn,
+                repeatProof.current, repeatProof.history)
+              : !sent ? repeatedContextRead(this.store, turns, pending[0]!, 0, observation, action) : null;
             if (repeated) {
               this.store.write<ResearchTurn>({ id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
-                value: { ...pendingTurn.value, observation: { code: "research_no_progress", previous: repeated }, status: "pending" } });
-              throw new EngineError("research_no_progress", "The same unchanged page was requested again without a checkpoint; research is paused", repeated);
+                value: repeatProof
+                  ? projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, repeatProof)
+                  : { ...pendingTurn.value, observation: { code: "research_no_progress", previous: repeated }, status: "pending" } });
+              throw new EngineError("research_no_progress", "The same unchanged page was requested again without a checkpoint; research is paused",
+                'previous' in repeated ? repeated.previous : repeated);
             }
+            const exact = this.store.get(action.record.id, action.record.revision);
+            requireCondition(exact && canonical(reference(exact)) === canonical(action.record),
+              'research_consumer_intent_invalid', 'The addressed read lost its exact record');
+            turnProof = { kind: 'read-context', recordValue: exact.value, record: action.record,
+              maxChars: pilot?.value.maxRequestChars ?? 300000 };
           } else if (action.action === "checkpoint") {
             const saved = checkpoint(this.store, draft, pending[0]!, action);
             observation = { ref: reference(saved), ...saved.value as object };
-          } else if (action.action === "search") observation = sources.search(action.query);
+            turnProof = { kind: 'checkpoint', checkpoint: { ref: reference(saved), value: saved.value as any } };
+          } else if (action.action === "search") {
+            const plannedBy = pendingTurn.value.plannedBy;
+            const parent = isRef(plannedBy)
+              ? this.store.get<ResearchTurn>(plannedBy.id, plannedBy.revision) : null;
+            const managed = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
+              || (parent?.value as Partial<ManagedResearchTurn> | undefined)?.contract === 'research-consumer-turn/v1';
+            if (managed) {
+              const queued = parent ? this.store.get<ResearchTurn>(parent.id, parent.revision + 1) : null;
+              capturedSearch = sources.searchCaptured(action.query, pendingTurn,
+                parent && queued ? { original: parent, queued } : undefined);
+              observation = capturedSearch.turn.observation;
+            } else observation = sources.search(action.query);
+          }
           else if (action.action === "read") {
             const source = sources.read(action.path, action.media); observation = { ref: reference(source), length: source.value.content.length,
               excerpt: source.value.content.slice(0, 3000), truncated: source.value.content.length > 3000 };
-          } else if (action.action === "read_source") observation = sources.excerpt(action.source, action.start, action.end);
+            turnProof = { kind: 'source-read', projectId: project,
+              source: { ref: reference(source), value: source.value } };
+          } else if (action.action === "read_source") {
+            observation = sources.excerpt(action.source, action.start, action.end);
+            const source = this.store.get<Source>(action.source.id, action.source.revision);
+            requireCondition(source && canonical(reference(source)) === canonical(action.source),
+              'research_consumer_intent_invalid', 'The paid excerpt lost its exact source');
+            turnProof = { kind: 'source-excerpt', projectId: project,
+              source: { ref: reference(source), value: source.value } };
+          }
           else if (action.action === "pause") stop = { status: "paused", error: action.reason };
           else {
             const question = pending.find(item => item.id === action.question);
@@ -315,57 +739,451 @@ export class Researcher {
                 "layer_delta_required", "The L2 experiment accepts changes, not a regenerated full graph");
               const proposal = action.action === "answer_delta" ? { action: "answer" as const, question: action.question,
                 value: expandLayerDelta(this.store, draft, question, action), citations: action.citations } : action;
-              const result = await assessAnswer(this.store, question, proposal, environment, effective.root, signal, pilot ?? undefined);
-              assessment = reference(result); observation = { verdict: result.value.verdict, reasons: result.value.reasons };
-              if (result.value.verdict === "supported") this.discovery.researched(question.id, question.revision, assessment);
+              const managedPending = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
+                ? reference(pendingTurn) : undefined;
+              // №1745-1: the local technical pre-check runs BEFORE any paid
+              // assessor call, on one captured read view; a refusal and its
+              // completed turn are written atomically below. The same shared
+              // derivation proves the refusal historically.
+              const precheck = managedPending ? this.proposalPrecheck(project, draft, question,
+                proposal, environment, effective.root, pendingTurn) : null;
+              if (precheck) {
+                capturedProposalRefusal = precheck;
+                turnProof = { kind: 'technical-refusal', result: {
+                  ref: precheck.prepared.ref,
+                  value: precheck.prepared.write.value as ManagedProposalRefusal } };
+              } else {
+                const result = await assessAnswer(this.store, question, proposal, environment, effective.root, signal, pilot ?? undefined);
+                assessment = reference(result); observation = { verdict: result.value.verdict, reasons: result.value.reasons };
+                if (result.value.verdict === "supported") {
+                  const acceptedDraft = this.discovery.researched(question.id, question.revision, assessment);
+                  const answered = this.store.get<Question>(question.id)!;
+                  // The acceptance just written names its own exact adjacent
+                  // draft pair — proof never scans today's moving head.
+                  const accepted = this.acceptedPaidAnswer(project, acceptedDraft, pendingTurn, question, answered,
+                    { before: acceptedDraft.revision - 1, after: acceptedDraft.revision });
+                  requireCondition(accepted, 'research_consumer_intent_invalid',
+                    'The accepted answer lost its exact paid action and transition');
+                  turnProof = { kind: 'accepted-answer', inputs: accepted.inputs };
+                } else if (managedPending) {
+                  const checked = this.store.get<ResearchAssessment>(reference(result).id, reference(result).revision);
+                  turnProof = { kind: 'assessed-answer', question, assessment: checked!,
+                    ...(action.action === 'answer_delta' ? { expandedProposal: proposal.value } : {}) };
+                }
+              }
             } else {
               const consulted = sources.list().map(reference);
+              ownerConsulted = consulted;
+              ownerHadPriorRead = history.some(item => ["search", "read", "read_source", "read_bundle", "read_context"].includes(String((item.action as { action?: string })?.action)));
               requireCondition(action.searched.every(ref => consulted.some(item => canonical(item) === canonical(ref)))
-                && history.some(item => ["search", "read", "read_source", "read_bundle", "read_context"].includes(String((item.action as { action?: string })?.action))),
+                && ownerHadPriorRead,
               "owner_escalation_premature", "Research must consult actual sources before involving the owner");
-              const verdict = await researchCall(dispatch.reviewer, dispatch,
-                "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts.",
-                { role: "assess-escalation", question: question.value.spec, request: action, inventory: sources.inventory(), history }, signal,
-                { store: this.store, draftId, questionId: question.id, purpose: "escalation-assessor", ...(pilot ? { pilot } : {}) }) as { necessary?: unknown; reason?: unknown } | null;
-              requireCondition(verdict && typeof verdict.necessary === "boolean" && typeof verdict.reason === "string" && verdict.reason.trim(), "escalation_assessment_invalid", "Escalation assessment requires an explicit decision and reason");
-              observation = verdict;
-              if (verdict.necessary) {
-                const currentSources = sources.list().map(reference);
-                requireCondition(action.searched.every(ref => currentSources.some(item => canonical(item) === canonical(ref))),
-                  "research_context_stale", "A consulted source changed while assessing the owner question");
-                stop = { status: "needs_owner", ownerQuestion: { question: question.id, reason: verdict.reason, searched: action.searched } };
-                stopGuards = [reference(question), reference(environment), ...draft.value.inputs, ...action.searched];
-              }
+              const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts.";
+              const escalationContext = { role: "assess-escalation", question: question.value.spec,
+                request: action, inventory: sources.inventory(), history };
+              const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...consulted,
+                ...action.searched, reference(pendingTurn), ...turns.map(reference)]);
+              const intent = prepareResearchConsumerIntent(this.store, {
+                projectId: project, kind: "escalation-assessor", key: hashJson([id, pendingTurn.value.number, "escalation-assessor"]),
+                owner: reference(run), draft: reference(draft), question: reference(question),
+                role: dispatch.reviewer, dispatch, profile: pilot ? reference(pilot) : null,
+                cursor: { run: id, turn: pendingTurn.value.number, pendingTurn: reference(pendingTurn),
+                  instruction, context: escalationContext }, basis,
+                guards: uniqueTransactionGuards([reference(run), reference(draft), reference(question),
+                  reference(environment), ...basis, ...(pilot ? [reference(pilot)] : [])]) }, retryPermits);
+              escalationIntent = intent;
+              run = await this.applyEscalationIntent(intent, run, dispatch, pilot, owner, limit, signal);
+              if (run.value.status === "needs_owner") return run;
+              continue;
             }
           }
         } catch (failure) {
+          const managed = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1';
+          if (escalationIntent || action.action === 'read_bundle'
+            && (!managed || !(failure instanceof EngineError) || failure.code !== 'research_mode_invalid'))
+            throw failure;
           if (failure instanceof EngineError && OBLIGATION_EVIDENCE_PAUSES.has(failure.code)) {
-            this.store.write<ResearchTurn>({id:pendingTurn.id,kind:pendingTurn.kind,expected:pendingTurn.revision,
+            if (!managed) this.store.write<ResearchTurn>({id:pendingTurn.id,kind:pendingTurn.kind,expected:pendingTurn.revision,
               value:{...pendingTurn.value,observation:{code:failure.code,details:failure.details},error:failure.message}});
             throw failure; // Keep the paid action pending: unchanged resume needs no new model call.
           }
-          if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
-            "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
-            || (action.action === 'read_bundle' && !!paidTurn && failure.code === 'question_stale')
-            || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
-            || failure.code.endsWith("_no_progress"))) throw failure;
-          error = failure instanceof Error ? failure.message : "Research action failed";
-          if (failure instanceof EngineError) observation = { code: failure.code, details: failure.details };
+          if (managed) {
+            if (!(failure instanceof EngineError)) throw failure;
+            if (failure instanceof PreparedManagedProposalRefusal) {
+              capturedProposalRefusal = failure;
+              turnProof = { kind: 'technical-refusal', result: {
+                ref: failure.prepared.ref,
+                value: failure.prepared.write.value as ManagedProposalRefusal } };
+            } else if (failure.code === 'owner_escalation_premature' && ownerConsulted) {
+              turnProof = { kind: 'premature-owner', consulted: ownerConsulted,
+                hadPriorRead: ownerHadPriorRead };
+            } else {
+              const local = projectPaidLocalRefusal(pendingTurn.value as ManagedResearchTurn);
+              if (local && local.failure.code === failure.code
+                && local.failure.message === failure.message
+                && canonical(local.failure.details) === canonical(failure.details)) {
+                turnProof = local.proof;
+              } else if (action.action === 'answer' || action.action === 'answer_delta') {
+                const producer = readResearchConsumerIntent(this.store,
+                  (pendingTurn.value as ManagedResearchTurn).consumerIntent);
+                const refusal = projectPaidLayerDesignRefusal(this.store, producer, pendingTurn, 'current');
+                if (refusal && refusal.failure.code === failure.code
+                  && refusal.failure.message === failure.message
+                  && canonical(refusal.failure.details) === canonical(failure.details))
+                  turnProof = refusal.proof;
+              } else if (action.action === 'read_context') {
+                // Only an exact, producer-checked record may prove a refusal.
+                // A stale current admission or missing source leaves the paid
+                // response pending for recovery.
+                try {
+                  const record = readResearchContextRecordAt(this.store, draft, action);
+                  const proof = { kind: 'context-refusal' as const, recordValue: record.value,
+                    record: action.record, maxChars: pilot?.value.maxRequestChars ?? 300000 };
+                  const projected = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, proof);
+                  const refusal = projected.observation as { code?: unknown; details?: unknown } | null;
+                  if (refusal?.code === failure.code
+                    && projected.error === failure.message
+                    && canonical(refusal.details) === canonical(failure.details))
+                    turnProof = proof;
+                } catch { /* An unproved refusal must leave the paid turn pending. */ }
+              }
+            }
+            if (!turnProof) throw failure;
+            const projected = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, turnProof);
+            error = projected.error; observation = projected.observation;
+          } else {
+            if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
+              "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
+              || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
+              || failure.code.endsWith("_no_progress"))) throw failure;
+            error = failure instanceof Error ? failure.message : "Research action failed";
+            if (failure instanceof EngineError) observation = { code: failure.code, details: failure.details };
+          }
         }
-        if (pilot && !error && ["read", "read_source", "read_context", "search"].includes(action.action))
+        const completedTurn = { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
+          value: capturedSearch ? capturedSearch.turn
+            : turnProof && (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
+            ? projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, turnProof)
+            : { ...pendingTurn.value, status: "completed" as const, assessment, observation, error } };
+        if (stop) {
+          const projected = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === "research-consumer-turn/v1"
+            ? projectPaidPause(run.value, pendingTurn.value as ManagedResearchTurn) : null;
+          if (projected && canonical(completedTurn.value) !== canonical(projected.turn))
+            throw new EngineError("research_consumer_intent_invalid", "The paid pause changed its projected turn");
+          const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
+            projected ? { ...completedTurn, value: projected.turn } : completedTurn,
+            { id: run.id, kind: run.kind, expected: run.revision,
+              value: projected?.run ?? { ...run.value, ...stop } }], stopGuards);
+          return saved[1]! as Revision<ResearchRun>;
+        }
+        if (capturedSearch) {
+          this.store.writeMany([capturedSearch.capture, completedTurn],
+            uniqueTransactionGuards(capturedSearch.guards));
+        } else if (capturedProposalRefusal) {
+          this.store.writeMany([capturedProposalRefusal.prepared.write, completedTurn],
+            uniqueTransactionGuards([reference(pendingTurn), ...capturedProposalRefusal.prepared.guards]));
+        } else this.store.write<ResearchTurn>(completedTurn);
+        // C32: the derived reading is retained only after its completed turn
+        // is durable; a crash between the two is repaired from the turn on
+        // re-entry, never by another read, grep, or payment.
+        if (pilot && (!error || capturedSearch)
+          && ["read", "read_source", "read_context", "search"].includes(action.action))
           retainPilotRead(this.store, project, pending[0]!.id, action, observation);
-        this.store.write<ResearchTurn>({ id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
-          value: { ...pendingTurn.value, status: "completed", assessment, observation, error } });
-        if (stop) return this.save(run, stop, stopGuards);
+        forcedPendingTurn = null;
       }
       draft = this.store.get<DiscoveryDraft>(draftId)!;
       return this.save(run, this.discovery.gate(project, reference(draft)).findings.length === 0 ? { status: "completed" }
         : { status: "paused", error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
     } catch (error) {
-      run = this.store.get<ResearchRun>(id) ?? run; // the synthesis reservation may have moved the shared record
-      return this.save(run, { status: "paused", error: error instanceof Error ? error.message : "Research was interrupted",
+      const current = this.store.get<ResearchRun>(run.id) ?? run; // the synthesis reservation may have moved the shared record
+      requireCondition(current?.kind === "research-run" && current.value.projectId === project
+        && current.value.draftId === draftId
+        && (canonical(current.value.owner) === canonical(owner)
+          || processStart(current.value.owner.pid) !== current.value.owner.started),
+        "research_busy", "Another researcher owns the current run");
+      const committedPause = current.value.status === "paused" && this.store.list<ResearchTurn>("research-turn")
+        .some(item => item.value.run === id && item.value.number === current.value.turns
+          && item.value.status === "completed" && (item.value.action as { action?: string } | null)?.action === "pause"
+          && (item.value.action as { reason?: unknown } | null)?.reason === current.value.error);
+      if (current.revision > run.revision
+        && (current.value.status === "completed" || current.value.status === "needs_owner" || committedPause)) return current;
+      return this.save(current, { status: "paused", error: error instanceof Error ? error.message : "Research was interrupted",
         pauseCode: error instanceof EngineError ? error.code : "research_interrupted" });
     }
+  }
+  /** №1745-1: the shared local technical derivation, run on one captured read
+   * view before any paid assessor call. Returns the prepared refusal (written
+   * atomically with its completed turn by the caller) or null when the paid
+   * assessment may proceed. Obligation-evidence pauses escape as pauses. */
+  private proposalPrecheck(project: string, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+    proposal: Extract<ResearchAction, { action: "answer" }>, environment: Revision<Environment>, root: string,
+    pendingTurn: Revision<ResearchTurn>): PreparedManagedProposalRefusal | null {
+    const first = this.store.get<ResearchTurn>(pendingTurn.id, 1);
+    requireCondition(first?.kind === 'research-turn' && first.value.status === 'pending'
+      && hashJson(first.value) === first.hash, 'research_consumer_intent_invalid',
+      'The technical refusal lost its exact original turn');
+    const readView = assessmentReadView(this.store);
+    const inputStore = readView.store;
+    requireDocumentarySources(inputStore, project, question.value.spec);
+    const schemaOk = new Ajv({ strict: true, allowUnionTypes: true })
+      .compile(question.value.spec.schema as object)(proposal.value);
+    const capturedDraft = inputStore.get<DiscoveryDraft>(question.value.draftId);
+    requireCondition(capturedDraft?.kind === 'discovery-draft'
+      && canonical(reference(capturedDraft)) === canonical(reference(draft)),
+      'draft_missing', 'The research context is missing');
+    requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor,
+      "assessor_not_independent", "Research assessment requires a separate actor");
+    if (schemaOk && draft.value.stage === 'om-g2' && draft.value.level === 'R2' && question.value.spec.field === 'layerDesign') {
+      const handoff = obligationHandoff(this.store, project, draft.value.inputs);
+      const base = this.store.get<Graph>(`graph:${project}`)!;
+      const assembled = composeLayer(base.value, 3, proposal.value, question.value.spec.layerAssembly);
+      if (handoff) requireTaskObligations(this.store, project, assembled, handoff);
+    }
+    const observations = proposal.citations.map(item =>
+      new Evidence(inputStore).observe(project, item.source, item.selector));
+    // A malformed paid answer cannot drive the typed runtime/finding
+    // derivation; its refusal is exactly the schema refusal and nothing else.
+    const runtime: ReturnType<typeof collectRuntimeEvidence> = schemaOk
+      ? collectRuntimeEvidence(this.store, project, question.value.spec,
+        proposal.value as unknown as TechnicalReport, observations)
+      : { proofs: [], supporting: [], guards: [], admissionGuards: [] };
+    const gated = draft.value.stage === 'om-g2' && ['R1', 'R2'].includes(draft.value.level)
+      && draft.value.consumer === 'compilation';
+    const graph = gated ? inputStore.get<Graph>(`graph:${project}`) : null;
+    if (!gated || !graph || graph.kind !== 'graph' || hashJson(graph.value) !== graph.hash) {
+      // A malformed paid answer is a typed local refusal of the consumed call,
+      // not a retryable pending action; outside the typed-proposal gate keep
+      // the same refusal code as the shared assessment.
+      requireCondition(schemaOk, "answer_invalid", "Proposed research result does not satisfy its consumer contract");
+      return null;
+    }
+    const canonicalRoot = realpathSync(root);
+    const legacyPaths: LegacyPathResolution[] = [];
+    const findings: Finding[] = !schemaOk
+      ? [{ code: 'answer_invalid', target: question.id, field: question.value.spec.field,
+          message: 'Proposed research result does not satisfy its consumer contract' }]
+      : technicalProposalFindings(inputStore, project, draft.value.level, question.id,
+          question.value.spec.field, proposal.value as unknown as TechnicalReport, observations,
+          graph.value, canonicalRoot, runtime, { mode: 'current', legacyPaths });
+    const pause = findings.find(finding => OBLIGATION_EVIDENCE_PAUSES.has(finding.code));
+    if (pause) throw new EngineError(pause.code, `[${pause.target}] ${pause.message}`, findings);
+    if (!findings.length) return null;
+    return prepareManagedProposalRefusal(project, reference(first), reference(pendingTurn),
+      draft, question, environment, reference(graph), canonicalRoot, legacyPaths,
+      readView.finish(), runtime, findings,
+      uniqueTransactionGuards([...runtime.guards, ...runtime.admissionGuards, ...readView.guards]));
+  }
+  private synthesisResultIntent(project: string, draftId: string,
+    runId: string, turn: number, action: ResearchAction): Revision<ResearchConsumerIntent> | null {
+    const candidates = listResearchConsumerIntents(this.store, project, draftId)
+      .filter(intent => (intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
+        && intent.value.cursor.delivery && typeof intent.value.cursor.delivery === "object"
+        && intent.value.cursor.delivery.run === runId && intent.value.cursor.delivery.turn === turn);
+    const results = candidates.filter(intent => {
+      if (intent.value.state !== "applied") return false;
+      const output = intent.value.outputs?.find(ref => ref.id === intent.value.owner.id);
+      const session = output ? this.store.get<{ result: ResearchAction | null }>(output.id, output.revision) : null;
+      if (session?.kind !== "synthesis-session" || canonical(reference(session)) !== canonical(output)) return false;
+      if (action.action !== "pause") return canonical(session.value.result) === canonical(action);
+      const paid = readResearchConsumerExecution(this.store, project, reference(intent));
+      return session.value.result === null && paid.kind === "response"
+        && canonical(researchAction(paid.payload)) === canonical(action);
+    });
+    requireCondition(results.length === 1 || candidates.length === 0,
+      "research_consumer_intent_invalid", "The synthesis result has no unique accepted producer");
+    return results[0] ?? null;
+  }
+  private async receivedIntent(intent: Revision<ResearchConsumerIntent>, dispatch: Environment,
+    pilot: Revision<ReaderPilot> | null, signal?: AbortSignal) {
+    const cursor = intent.value.cursor;
+    requireCondition(typeof cursor.instruction === "string" && cursor.context && typeof cursor.context === "object"
+      && !Array.isArray(cursor.context), "research_consumer_intent_invalid",
+      "The original research instruction and context are missing");
+    if (intent.value.state === "prepared") {
+      // C61: only an unsent intent pays — the dispatch/profile equality guards
+      // a future send, never the application of a response already received.
+      requireCondition(canonical(intent.value.dispatch) === canonical(dispatch)
+        && canonical(intent.value.profile) === canonical(pilot ? reference(pilot) : null),
+        "research_consumer_context_stale", "The original research dispatch or reader profile changed");
+      await researchCall(intent.value.role, intent.value.dispatch, cursor.instruction, cursor.context, signal,
+        { store: this.store, draftId: intent.value.draft.id, questionId: intent.value.question.id,
+          purpose: intent.value.kind, ...(pilot ? { pilot } : {}), consumerIntent: reference(intent) });
+    }
+    const paid = resumeResearchConsumerExecution(this.store, intent.value.projectId, reference(intent));
+    requireCondition(paid.kind === "response", "research_consumer_execution_failed",
+      "The original physical call did not return a usable research response");
+    return paid;
+  }
+  /** Finish the original paid turn only when one exact accepted-answer chain
+   * exists (№1745-2). The revision scan is candidate search only; the proof is
+   * the single complete chain of exact references from the shared formula. */
+  private acceptedPaidAnswer(project: string, draft: Revision<DiscoveryDraft>, turn: Revision<ResearchTurn>,
+    original: Revision<Question>, answered: Revision<Question>,
+    pair?: { before: number; after: number }):
+    { assessment: Ref; observation: { verdict: ResearchAssessment['verdict']; reasons: string[] };
+      guards: Ref[]; inputs: import("./research-consumer-transition.js").AcceptedPaidAnswerInputs } | null {
+    const deltaStore = researchAction(turn.value.action).action === 'answer_delta'
+      ? pinnedLayerDeltaStore(this.store, researchAction(turn.value.action) as LayerDelta) : undefined;
+    const bound = findAcceptedPaidAnswerChain(this.store, project, turn, original, answered, deltaStore, pair);
+    if (!bound) return null;
+    requireCondition(turn.value.status === 'pending' && draft.id === bound.inputs.draftAfter.id
+      && canonical(turn.value.question) === canonical(reference(original)),
+      'research_consumer_intent_invalid', 'The accepted paid answer lost its exact pending turn or draft');
+    return { ...bound.proof, inputs: bound.inputs,
+      guards: uniqueRefs([reference(answered), reference(bound.answer), reference(bound.assessment)]) };
+  }
+  private async applyActionIntent(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
+    dispatch: Environment, pilot: Revision<ReaderPilot> | null, owner: ResearchRun["owner"], limit: number,
+    signal?: AbortSignal) {
+    requireCondition(intent.value.kind === "analyst" || intent.value.kind === "reading-planner",
+      "research_consumer_intent_invalid", "The saved operation is not an analyst or planner turn");
+    const cursor = intent.value.cursor;
+    requireCondition(cursor.run === run.id && cursor.turn === run.value.turns + 1
+      && (cursor.mode === null || cursor.mode === "planning" || cursor.mode === "synthesis"),
+      "research_consumer_intent_invalid", "The saved action no longer follows the exact run counter");
+    if (intent.value.state === "prepared" && (run.value.status !== "running"
+      || canonical(run.value.owner) !== canonical(owner))) {
+      requireCondition(run.value.status === "running" || run.value.status === "paused",
+        "research_consumer_context_stale", "A prepared action cannot replace a settled run");
+      run = this.save(run, { status: "running", owner, error: null, pauseCode: null }, [reference(intent)]);
+    }
+    const paid = await this.receivedIntent(intent, dispatch, pilot, signal);
+    const action = this.consumerAction(intent, paid.payload);
+    const originalIntent = this.store.get<ResearchConsumerIntent>(intent.id, 1);
+    requireCondition(originalIntent?.kind === "research-consumer-intent", "research_consumer_intent_invalid",
+      "The paid action lost its original producer intent");
+    const selectedQuestion = "question" in action && action.question !== intent.value.question.id
+      ? null : intent.value.question;
+    const turnId = paidTurnId(run.id, cursor.turn);
+    const projected = projectPaidTurnAdmission(run.value, {
+      runId: run.id, intent: reference(originalIntent), response: paid.payload,
+      question: selectedQuestion, owner, limit, context: cursor.context,
+      ...(cursor.mode ? { mode: cursor.mode } : {}) });
+    const writes: Write[] = [
+      { id: run.id, kind: run.kind, expected: run.revision,
+        value: projected.run },
+      { id: turnId, kind: "research-turn", expected: 0,
+        value: projected.turn }
+    ];
+    // C61: mutable admission heads (environment, allowance profile) refresh to
+    // today's revisions inside the application transaction — the immutable
+    // prepare-time pins for them would otherwise stale a lawfully saved paid
+    // response after a later profile change.
+    const environmentHead = this.store.get<Environment>(`environment:${intent.value.projectId}`);
+    const prepared = prepareResearchConsumerApplication(this.store, reference(intent), reference(paid.call), writes,
+      uniqueTransactionGuards([reference(run), { id: turnId, absent: true },
+        ...(environmentHead ? [reference(environmentHead)] : []),
+        ...(pilot ? [reference(pilot)] : [])]));
+    const saved = this.store.writeMany<ResearchRun | ResearchTurn>(prepared.writes, prepared.guards);
+    return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn>, sent: paid.subject };
+  }
+  /** C13/C62: a paid analyst/planner payload that cannot become an action is
+   * the intent's terminal typed refusal, bound to its exact call — not a raw
+   * exception that would make the next run pay for the same step again. */
+  private consumerAction(intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
+    try { return researchAction(payload); }
+    catch (failure) {
+      if (!(failure instanceof EngineError) || !ACTION_RESPONSE_REFUSAL_CODES.has(failure.code)) throw failure;
+      const refused = refuseResearchConsumerIntent(this.store, reference(intent), failure.code);
+      throw new EngineError(failure.code,
+        `[${refused.id}] ${failure.message}; paid call ${refused.value.refusal!.call.id}`,
+        { intent: reference(refused), call: refused.value.refusal!.call });
+    }
+  }
+  private async applyEscalationIntent(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
+    dispatch: Environment, pilot: Revision<ReaderPilot> | null, owner: ResearchRun["owner"], limit: number,
+    signal?: AbortSignal): Promise<Revision<ResearchRun>> {
+    requireCondition(intent.value.kind === "escalation-assessor" && intent.value.cursor.run === run.id
+      && intent.value.cursor.turn === run.value.turns,
+      "research_consumer_intent_invalid", "The saved escalation no longer follows its exact run turn");
+    const pendingRef = intent.value.cursor.pendingTurn;
+    requireCondition(isRef(pendingRef), "research_consumer_intent_invalid",
+      "The escalation lost its exact pending turn");
+    const pending = this.store.get<ResearchTurn>(pendingRef.id);
+    requireCondition(pending && pending.kind === "research-turn" && canonical(reference(pending)) === canonical(pendingRef)
+      && pending.value.run === run.id && pending.value.number === run.value.turns && pending.value.status === "pending"
+      && canonical(pending.value.question) === canonical(intent.value.question),
+      "research_consumer_intent_invalid", "The original pending owner question is missing or changed");
+    readResearchConsumerTurn(this.store, reference(pending));
+    const action = researchAction(pending.value.action);
+    requireCondition(action.action === "need_owner", "research_consumer_intent_invalid",
+      "The escalation assessor belongs to an owner question");
+    if (intent.value.state === "prepared" && (run.value.status !== "running"
+      || canonical(run.value.owner) !== canonical(owner))) {
+      requireCondition(run.value.status === "running" || run.value.status === "paused",
+        "research_consumer_context_stale", "A prepared escalation cannot replace a settled run");
+      run = this.save(run, { status: "running", owner, error: null, pauseCode: null }, [reference(intent)]);
+    }
+    const paid = await this.receivedIntent(intent, dispatch, pilot, signal);
+    const verdict = paid.payload as { necessary?: unknown; reason?: unknown } | null;
+    if (!(verdict && typeof verdict.necessary === "boolean" && typeof verdict.reason === "string"
+      && verdict.reason.trim())) {
+      // C13/C62: the malformed verdict is this intent's terminal typed refusal.
+      const refused = refuseResearchConsumerIntent(this.store, reference(intent), 'escalation_assessment_invalid');
+      throw new EngineError('escalation_assessment_invalid',
+        `[${refused.id}] Escalation assessment requires an explicit decision and reason; paid call ${refused.value.refusal!.call.id}`,
+        { intent: reference(refused), call: refused.value.refusal!.call });
+    }
+    if (verdict.necessary) {
+      const current = new ResearchSources(this.store, intent.value.projectId,
+        this.environments.effective(intent.value.projectId).root).list().map(reference);
+      requireCondition(action.searched.every(ref => current.some(item => canonical(item) === canonical(ref))),
+        "research_context_stale", "A consulted source changed while assessing the owner question");
+    }
+    const projected = projectPaidOwnerReview(run.value, pending.value as ManagedResearchTurn,
+      { necessary: verdict.necessary, reason: verdict.reason }, owner, limit);
+    const writes: Write[] = [
+      { id: run.id, kind: run.kind, expected: run.revision,
+        value: projected.run },
+      { id: pending.id, kind: pending.kind, expected: pending.revision,
+        value: projected.turn }
+    ];
+    const environmentHead = this.store.get<Environment>(`environment:${intent.value.projectId}`);
+    const prepared = prepareResearchConsumerApplication(this.store, reference(intent), reference(paid.call), writes,
+      uniqueTransactionGuards([reference(run), reference(pending),
+        ...(environmentHead ? [reference(environmentHead)] : []),
+        ...(pilot ? [reference(pilot)] : [])]));
+    return this.store.writeMany<ResearchRun | ResearchTurn>(prepared.writes, prepared.guards)[0]! as Revision<ResearchRun>;
+  }
+  private handoffSynthesis(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
+    action: ResearchAction, owner: ResearchRun["owner"], guards: Ref[] = []) {
+    const current = this.store.get<ResearchConsumerIntent>(intent.id);
+    requireCondition(current && (current.value.kind === "synthesis" || current.value.kind === "consolidation")
+      && current.value.state === "applied" && Array.isArray(current.value.outputs)
+      && current.value.cursor.delivery && typeof current.value.cursor.delivery === "object"
+      && current.value.cursor.delivery.run === run.id && current.value.cursor.delivery.turn === run.value.turns,
+      "research_consumer_intent_invalid", "Only the exact completed synthesis may hand off its turn");
+    const original = this.store.get<ResearchConsumerIntent>(current.id, 1);
+    requireCondition(original?.kind === "research-consumer-intent", "research_consumer_intent_invalid",
+      "The synthesis handoff lost its original producer intent");
+    const sessionRef = current.value.outputs.find(ref => ref.id === current.value.owner.id);
+    const session = sessionRef
+      ? this.store.get<SynthesisSessionState>(sessionRef.id, sessionRef.revision) : null;
+    const turnId = paidTurnId(run.id, run.value.turns);
+    const turnValue = { contract: "research-consumer-turn/v1", consumerIntent: reference(original),
+      run: run.id, number: run.value.turns, action, assessment: null, observation: null, error: null,
+      status: "pending", question: current.value.question, dispatchMode: "synthesis" };
+    const turnRef: Ref = { id: turnId, revision: 1, hash: hashJson(turnValue) };
+    const writes: Write[] = [
+      { id: run.id, kind: run.kind, expected: run.revision,
+        value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
+      { id: turnId, kind: "research-turn", expected: 0, value: turnValue },
+      { id: current.id, kind: current.kind, expected: current.revision,
+        value: { ...current.value, outputs: [...current.value.outputs, turnRef] } }
+    ];
+    // The one-time delivered mark rides the same transaction (№1499-38): the
+    // reserved turn, the producer outputs and the consumed reservation commit
+    // or fail together.
+    let mark: { write: Write; guards: import("../storage/store.js").TransactionGuard[] } | null = null;
+    if (sessionRef && session?.kind === 'synthesis-session' && session.value.delivered == null) {
+      mark = synthesisDeliveryMarks(session,
+        { id: turnId, kind: 'research-turn', expected: 0, value: turnValue });
+      writes.push(mark.write);
+    }
+    const saved = this.store.writeMany<ResearchRun | ResearchTurn>(writes,
+      uniqueTransactionGuards([reference(run), reference(current), { id: turnId, absent: true },
+        ...(mark ? mark.guards : []), ...guards]));
+    return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn> };
   }
   private save(run: Revision<ResearchRun>, patch: Partial<ResearchRun>, guards: Ref[] = []): Revision<ResearchRun> {
     return this.store.writeMany<ResearchRun>([{ id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, ...patch } }], guards)[0]!;
