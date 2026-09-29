@@ -1,0 +1,65 @@
+step-16-performed-cycle.cpuprofile: 427.7 s sampled
+
+SELF
+    99.5 s  23.3%  encode src/canonical.js:5
+    65.5 s  15.3%  #get src/storage/store.js:55
+    53.9 s  12.6%  decode src/storage/store.js:25
+    47.9 s  11.2%  (garbage collector)
+    32.5 s   7.6%  update node:internal/crypto/hash:132
+    20.2 s   4.7%  (anonymous) src/canonical.js:24
+    20.1 s   4.7%  seal src/om/refusal.js:13
+    19.7 s   4.6%  get
+    19.6 s   4.6%  update
+     8.5 s   2.0%  prepare
+     4.3 s   1.0%  addNames compile/codegen/index.js:637
+     2.2 s   0.5%  (anonymous) compile/codegen/index.js:181
+     1.2 s   0.3%  Hash
+     1.0 s   0.2%  safeStringify compile/codegen/code.js:134
+     1.0 s   0.2%  (anonymous) compile/codegen/code.js:47
+     0.9 s   0.2%  unique src/om/layer-basis.js:111
+     0.8 s   0.2%  digest
+     0.7 s   0.2%  canonical src/canonical.js:3
+     0.7 s   0.2%  isRef src/pipeline/contracts.js:8
+     0.7 s   0.2%  (anonymous) src/om/refusal.js:26
+     0.6 s   0.1%  validate11
+     0.6 s   0.1%  compileSchema compile/index.js:33
+     0.6 s   0.1%  subschema compile/validate/index.js:433
+     0.5 s   0.1%  optimizeNames compile/codegen/index.js:167
+     0.5 s   0.1%  get names compile/codegen/index.js:234
+     0.4 s   0.1%  Hash node:internal/crypto/hash:88
+     0.4 s   0.1%  shouldUseRule compile/validate/applicability.js:13
+     0.4 s   0.1%  validate0
+     0.4 s   0.1%  ucs2length runtime/ucs2length.js:5
+     0.4 s   0.1%  get /Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/profile-steps.mjs:24
+
+INCLUSIVE (om/, storage/, canonical, runtime/)
+   379.2 s  88.7%  synchronous src/om/input.js:629
+   379.2 s  88.7%  withHistoricalReads src/om/input.js:795
+   349.8 s  81.8%  modelCallUnder src/om/model-call.js:1567
+   340.2 s  79.6%  useHistoricalProof src/om/input.js:807
+   340.2 s  79.6%  (anonymous) src/om/input.js:812
+   320.3 s  74.9%  (anonymous) src/om/input.js:835
+   313.8 s  73.4%  historicalRead src/om/input.js:854
+   272.0 s  63.6%  runModelCycle src/om/model-call.js:663
+   259.3 s  60.6%  (anonymous) src/om/model-call.js:56
+   259.3 s  60.6%  result src/om/model-call.js:55
+   243.5 s  56.9%  (anonymous) src/om/run.js:322
+   243.5 s  56.9%  recovering src/om/run.js:379
+   243.5 s  56.9%  (anonymous) src/om/run.js:316
+   243.5 s  56.9%  perform src/om/run.js:314
+   243.5 s  56.9%  (anonymous) src/om/run.js:259
+   243.5 s  56.9%  run src/om/run.js:77
+   243.5 s  56.9%  advanceRun src/om/run.js:256
+   225.7 s  52.8%  currentFootprint src/om/input.js:752
+   193.4 s  45.2%  result src/om/question-packet.js:71
+   193.4 s  45.2%  (anonymous) src/om/question-packet.js:72
+   191.8 s  44.8%  (anonymous) src/om/series.js:184
+   191.8 s  44.8%  readAnySeriesAt src/om/series.js:180
+   185.8 s  43.4%  recordCallInScope src/om/call-record.js:192
+   185.8 s  43.4%  (anonymous) src/om/call-record.js:190
+   185.8 s  43.4%  recordCall src/om/call-record.js:189
+   178.7 s  41.8%  problem.target src/om/series.js:184
+   178.7 s  41.8%  readSeriesHistory src/om/series.js:186
+   178.7 s  41.8%  checkSeries src/om/series.js:1384
+   176.8 s  41.3%  #get src/storage/store.js:55
+   176.7 s  41.3%  get src/storage/store.js:52

@@ -1,0 +1,65 @@
+step-02-performed-analyze.cpuprofile: 181.4 s sampled
+
+SELF
+    39.3 s  21.6%  encode src/canonical.js:5
+    37.3 s  20.6%  #get src/storage/store.js:55
+    31.7 s  17.5%  decode src/storage/store.js:25
+    16.3 s   9.0%  update node:internal/crypto/hash:132
+    10.8 s   5.9%  update
+    10.3 s   5.7%  (garbage collector)
+     9.6 s   5.3%  get
+     8.1 s   4.5%  (anonymous) src/canonical.js:24
+     5.9 s   3.2%  seal src/om/refusal.js:13
+     4.2 s   2.3%  prepare
+     0.6 s   0.3%  addNames compile/codegen/index.js:637
+     0.5 s   0.2%  Hash
+     0.4 s   0.2%  digest
+     0.3 s   0.2%  canonical src/canonical.js:3
+     0.3 s   0.2%  isRef src/pipeline/contracts.js:8
+     0.3 s   0.1%  (anonymous) compile/codegen/index.js:181
+     0.2 s   0.1%  get /Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/profile-steps.mjs:24
+     0.2 s   0.1%  (anonymous) src/om/refusal.js:26
+     0.1 s   0.1%  Hash node:internal/crypto/hash:88
+     0.1 s   0.1%  safeStringify compile/codegen/code.js:134
+     0.1 s   0.1%  (anonymous) compile/codegen/code.js:47
+     0.1 s   0.1%  refs src/om/model-call.js:69
+     0.1 s   0.1%  unique src/om/layer-basis.js:111
+     0.1 s   0.1%  post node:inspector:118
+     0.1 s   0.1%  compareJson src/om/model-call.js:68
+     0.1 s   0.1%  digest node:internal/crypto/hash:150
+     0.1 s   0.0%  digest src/canonical.js:31
+     0.1 s   0.0%  (anonymous) src/om/input.js:756
+     0.1 s   0.0%  checkedModelExchange src/om/model-call.js:1183
+     0.1 s   0.0%  (anonymous) src/om/input.js:812
+
+INCLUSIVE (om/, storage/, canonical, runtime/)
+   170.9 s  94.2%  synchronous src/om/input.js:629
+   170.9 s  94.2%  withHistoricalReads src/om/input.js:795
+   170.2 s  93.8%  useHistoricalProof src/om/input.js:807
+   170.2 s  93.8%  historicalRead src/om/input.js:854
+   170.2 s  93.8%  (anonymous) src/om/input.js:812
+   169.7 s  93.6%  checkSeries src/om/series.js:1384
+   169.1 s  93.3%  (anonymous) src/om/input.js:835
+   165.3 s  91.1%  runStopAnalysis src/om/stop-analysis.js:337
+   164.4 s  90.7%  readAnySeriesAt src/om/series.js:180
+   164.4 s  90.7%  (anonymous) src/om/series.js:184
+   164.0 s  90.5%  readSeriesHistory src/om/series.js:186
+   164.0 s  90.5%  problem.target src/om/series.js:184
+   151.1 s  83.3%  (anonymous) src/om/model-call.js:56
+   151.1 s  83.3%  result src/om/model-call.js:55
+   149.9 s  82.7%  mechanismResult src/om/series.js:1667
+   149.9 s  82.7%  (anonymous) src/om/series.js:1668
+   148.0 s  81.6%  (anonymous) src/om/run.js:352
+   148.0 s  81.6%  recovering src/om/run.js:379
+   148.0 s  81.6%  (anonymous) src/om/run.js:316
+   148.0 s  81.6%  perform src/om/run.js:314
+   148.0 s  81.6%  (anonymous) src/om/run.js:259
+   148.0 s  81.6%  run src/om/run.js:77
+   148.0 s  81.6%  advanceRun src/om/run.js:256
+   143.5 s  79.1%  readMechanismAttemptAdmission src/om/series.js:1843
+   143.1 s  78.9%  (anonymous) src/om/series.js:1849
+   142.5 s  78.6%  resolveMechanismSeries src/om/call-record.js:645
+   140.7 s  77.6%  readMechanismAnalysisAdmission src/om/series.js:1840
+   134.9 s  74.4%  (anonymous) src/om/repeat-gate.js:1498
+   134.9 s  74.4%  managedResult src/om/repeat-gate.js:1497
+   134.9 s  74.4%  readCompletionCloseAt src/om/repeat-gate.js:1749

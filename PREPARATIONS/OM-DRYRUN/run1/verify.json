@@ -1,0 +1,41 @@
+{
+  "dispatch": {
+    "adapter": {
+      "id": "adapter:omg-live:codex-stdio",
+      "revision": 1,
+      "hash": "eb60d7e94feca2e7230e29a91c361282582bafc36cc42a4a7614dd08e431942a"
+    },
+    "config": {
+      "id": "environment:omg-live",
+      "revision": 2,
+      "hash": "9d7c7ec81750172760bccf94773d7b41e469f4f8c29286593f7e866f2974e06f"
+    }
+  },
+  "adapter": {
+    "projectId": "omg-live",
+    "protocol": "codex-stdio"
+  },
+  "environmentRevision": 2,
+  "commands": [
+    {
+      "args": [
+        "/Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/stub-adapter.mjs",
+        "--dir",
+        "/tmp/omg-dryrun/run1"
+      ],
+      "executable": "/Users/kostenchuksergey/.hermes/node/bin/node"
+    },
+    {
+      "args": [
+        "/Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/stub-adapter.mjs",
+        "--dir",
+        "/tmp/omg-dryrun/run1"
+      ],
+      "executable": "/Users/kostenchuksergey/.hermes/node/bin/node"
+    }
+  ],
+  "workspace": "/Users/kostenchuksergey/OMG/.omg/live-source",
+  "capacity": 400000,
+  "workspaceRecordRewritten": false,
+  "stubOnly": true
+}

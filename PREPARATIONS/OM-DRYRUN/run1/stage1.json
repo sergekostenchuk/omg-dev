@@ -1,0 +1,291 @@
+{
+ "configure": {
+  "value": {
+   "id": "environment:omg-live",
+   "kind": "environment",
+   "revision": 2,
+   "hash": "9d7c7ec81750172760bccf94773d7b41e469f4f8c29286593f7e866f2974e06f",
+   "value": {
+    "fullCheck": {
+     "args": [
+      "--version"
+     ],
+     "executable": "/Users/kostenchuksergey/.hermes/node/bin/node"
+    },
+    "implementer": {
+     "actor": "omg-author",
+     "command": {
+      "args": [
+       "/Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/stub-adapter.mjs",
+       "--dir",
+       "/tmp/omg-dryrun/run1"
+      ],
+      "executable": "/Users/kostenchuksergey/.hermes/node/bin/node"
+     },
+     "effort": "high",
+     "model": "gpt-6-astra"
+    },
+    "projectId": "omg-live",
+    "requestCapacityChars": 400000,
+    "reviewer": {
+     "actor": "omg-independent-reviewer",
+     "command": {
+      "args": [
+       "/Users/kostenchuksergey/OMG/PREPARATIONS/OM-DRYRUN/stub-adapter.mjs",
+       "--dir",
+       "/tmp/omg-dryrun/run1"
+      ],
+      "executable": "/Users/kostenchuksergey/.hermes/node/bin/node"
+     },
+     "effort": "high",
+     "model": "gpt-6-astra"
+    },
+    "timeoutMs": 600000,
+    "workspace": "/Users/kostenchuksergey/OMG/.omg/live-source"
+   }
+  },
+  "ms": 22
+ },
+ "configure-om-dispatch": {
+  "value": {
+   "dispatch": {
+    "adapter": {
+     "id": "adapter:omg-live:codex-stdio",
+     "revision": 1,
+     "hash": "eb60d7e94feca2e7230e29a91c361282582bafc36cc42a4a7614dd08e431942a"
+    },
+    "config": {
+     "id": "environment:omg-live",
+     "revision": 2,
+     "hash": "9d7c7ec81750172760bccf94773d7b41e469f4f8c29286593f7e866f2974e06f"
+    }
+   },
+   "references": [
+    {
+     "id": "adapter:omg-live:codex-stdio",
+     "revision": 1,
+     "hash": "eb60d7e94feca2e7230e29a91c361282582bafc36cc42a4a7614dd08e431942a"
+    },
+    {
+     "id": "environment:omg-live",
+     "revision": 2,
+     "hash": "9d7c7ec81750172760bccf94773d7b41e469f4f8c29286593f7e866f2974e06f"
+    }
+   ],
+   "guards": [
+    {
+     "id": "adapter:omg-live:codex-stdio",
+     "revision": 1,
+     "hash": "eb60d7e94feca2e7230e29a91c361282582bafc36cc42a4a7614dd08e431942a"
+    },
+    {
+     "id": "environment:omg-live",
+     "revision": 2,
+     "hash": "9d7c7ec81750172760bccf94773d7b41e469f4f8c29286593f7e866f2974e06f"
+    }
+   ]
+  },
+  "ms": 9
+ },
+ "om-state:before": {
+  "value": {
+   "ok": true,
+   "value": {
+    "run": null,
+    "control": {
+     "control": null,
+     "stopped": false,
+     "finished": true,
+     "pending": []
+    }
+   }
+  },
+  "ms": 121
+ },
+ "om-spend:before": {
+  "value": {
+   "ok": true,
+   "value": {
+    "scope": "om-e1",
+    "snapshot": {
+     "purposeSet": "om-e1-purposes/v2",
+     "project": "omg-live",
+     "ledger": null,
+     "calls": [],
+     "series": [],
+     "histories": [],
+     "significance": [],
+     "late": []
+    },
+    "rows": [],
+    "findings": [],
+    "totals": {
+     "calls": 0,
+     "measuredCalls": 0,
+     "unmeasuredCalls": 0,
+     "reportedTokens": null
+    },
+    "byPurpose": {
+     "model-research": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "model-design": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "stop-analysis": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "origin-analysis": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "fact-assessment": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     }
+    }
+   }
+  },
+  "ms": 7
+ },
+ "om-start:first-dispatch-ms": null,
+ "om-start": {
+  "value": {
+   "ok": false,
+   "refusal": {
+    "code": "frame_basis_unproven",
+    "message": "An accepted lower layer needs its own derivation proof",
+    "at": {
+     "unit": "F4",
+     "target": "graph-layer:omg-live:3",
+     "field": "layerProofs"
+    },
+    "route": "producer"
+   }
+  },
+  "ms": 0
+ },
+ "om-state:after": {
+  "value": {
+   "ok": true,
+   "value": {
+    "run": {
+     "id": "om-run:omg-live",
+     "kind": "om-run",
+     "revision": 1,
+     "hash": "acfb3140bf19933131c7e668192f944a93928d231a75d03058f2137e9cb1049e",
+     "value": {
+      "contract": "om-run/v1",
+      "input": {
+       "hash": "830f6cd46a6fa99da472c4d2bf8f9d66d1b9ba113575d4e11253e112dc169ce9",
+       "id": "om-input:omg-live",
+       "revision": 1
+      },
+      "intent": {
+       "outcomes": [
+        "autonomous-knowledge"
+       ]
+      },
+      "last": null,
+      "project": "omg-live",
+      "state": {
+       "phase": "ready"
+      }
+     }
+    },
+    "control": {
+     "control": {
+      "id": "om-run-control:omg-live",
+      "kind": "om-run-control",
+      "revision": 2,
+      "hash": "ba6ee6cceb2dcbb89f25957fe951061f04823ded69befbdf3f91b97b0b4cee91",
+      "value": {
+       "contract": "om-run-control/v1",
+       "execution": null,
+       "generation": 1,
+       "project": "omg-live",
+       "resumed": null,
+       "stop": null
+      }
+     },
+     "stopped": false,
+     "finished": true,
+     "pending": []
+    }
+   }
+  },
+  "ms": 5
+ },
+ "om-spend:after": {
+  "value": {
+   "ok": true,
+   "value": {
+    "scope": "om-e1",
+    "snapshot": {
+     "purposeSet": "om-e1-purposes/v2",
+     "project": "omg-live",
+     "ledger": null,
+     "calls": [],
+     "series": [],
+     "histories": [],
+     "significance": [],
+     "late": []
+    },
+    "rows": [],
+    "findings": [],
+    "totals": {
+     "calls": 0,
+     "measuredCalls": 0,
+     "unmeasuredCalls": 0,
+     "reportedTokens": null
+    },
+    "byPurpose": {
+     "model-research": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "model-design": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "stop-analysis": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "origin-analysis": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     },
+     "fact-assessment": {
+      "calls": 0,
+      "measuredCalls": 0,
+      "unmeasuredCalls": 0,
+      "reportedTokens": null
+     }
+    }
+   }
+  },
+  "ms": 14
+ }
+}

@@ -1,0 +1,6 @@
+before index: 2026-09-05 18:20:00 (1788621600) size 10728 /Users/kostenchuksergey/OMG/.git/worktrees/live-source/index
+before .git file: 2026-09-05 18:20:00 /Users/kostenchuksergey/OMG/.omg/live-source/.git
+marker: 2026-09-29 23:23:50 /tmp/omg-dryrun/marker
+after index: 2026-09-05 18:20:00 (1788621600) size 10728 /Users/kostenchuksergey/OMG/.git/worktrees/live-source/index
+find live-source -newer marker: 0 entries
+find gitdir -newer marker: 0 entries

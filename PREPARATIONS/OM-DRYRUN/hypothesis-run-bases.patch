@@ -1,0 +1,14 @@
+diff --git a/src/om/run-bases.ts b/src/om/run-bases.ts
+index e78960e..d27712c 100644
+--- a/src/om/run-bases.ts
++++ b/src/om/run-bases.ts
+@@ -223,7 +223,8 @@ function gapRequest(store: Store, project: string, input: Ref, horizon: Ref, bas
+   }
+   if (basis.phase) return { project, input, graph, horizon,
+     operations: { frame: frame(2, layerHead(store, project, 2), null, null), proposals: [] },
+-    works: { frame: frame(3, layerHead(store, project, 3), null, { horizon, frame: null }), proposals: [] } } as GapRequest;
++    // DRY-RUN HYPOTHESIS (not product code): a level-3 layer counts only when its L3 phase is accepted; otherwise open work.
++    works: { frame: frame(3, store.get(`phase:${project}:L3`) ? layerHead(store, project, 3) : null, null, { horizon, frame: null }), proposals: [] } } as GapRequest;
+   const layer = layerHead(store, project, 2);
+   if (!layer) fail("record_missing", `graph-layer:${project}:2`, "works.layer", "The unaccepted upper layer of the works must exist before D1");
+   return { project, input, graph, horizon, operations: { frame: frame(2, null, null, null), proposals: [] },

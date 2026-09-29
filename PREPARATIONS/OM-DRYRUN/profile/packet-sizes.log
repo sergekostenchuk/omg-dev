@@ -1,0 +1,18 @@
+routes om-routes:omg-live:144cd55bb6cc9adb8bce3529ee5d1a745ddcf4d96a9cb8589a37daf5c64a4344 r1: 13 batches; capacity 400000
+MC2 node-expansion L3 node=o-control-select items=3 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-state items=4 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-state-project items=2 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 input-field L- node=- items=12 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 input-field L- node=- items=2 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-research items=3 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-intake items=2 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-runtime items=3 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-control items=4 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 node-expansion L3 node=o-research-collect items=6 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 input-field L- node=- items=2 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+MC2 input-field L- node=- items=10 | state=ready chars=11189 (2.8% of capacity) parts=1 13925 ms
+MC2 node-expansion L3 node=o-results items=3 | attempt=saved: REFUSED answer_route_foreign completion | attempt=null: REFUSED packet_attempt_invalid attempt
+sum of first packets: 11189 chars ≈ 3197 tokens (3.5 chars/token, rough)
+(node:18825) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+SIZES EXIT 0 01:04:53
