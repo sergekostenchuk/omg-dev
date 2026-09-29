@@ -1,5 +1,3 @@
-import { realpathSync } from "node:fs";
-import { Ajv } from "ajv";
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
@@ -20,25 +18,19 @@ import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listRe
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
-  assessmentReadView, prepareManagedProposalRefusal, PreparedManagedProposalRefusal,
+  PreparedManagedProposalRefusal,
   refuseResearchConsumerIntent, pinnedLayerDeltaStore,
   type ManagedProposalRefusal,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
-import { Evidence, type Source } from "../evidence/evidence.js";
-import { assessAnswer } from "./research-assessment.js";
+import type { Source } from "../evidence/evidence.js";
+import { assessAnswer, readResearchAssessmentAt } from "./research-assessment.js";
+import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { processStart } from "../runtime/process-identity.js";
 import { reuseResearch } from "./research-reuse.js";
 import { researchPrerequisites, researchGraphContext } from "./research-context.js";
 import type { Graph } from '../graph/model.js';
-import type { TechnicalReport } from '../graph/research-contracts.js';
-import { technicalProposalFindings, type LegacyPathResolution } from '../graph/research-evidence.js';
-import type { Finding } from '../pipeline/contracts.js';
-import { collectRuntimeEvidence } from '../graph/runtime-evidence.js';
-import { obligationHandoff } from '../graph/obligation-handoff.js';
-import { requireTaskObligations } from '../graph/task-obligations.js';
-import { composeLayer } from '../graph/layer-design.js';
 import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
 import { assertPilotBoundary, readerPilot, pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
@@ -99,12 +91,63 @@ export class Researcher {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
-    if (draft.value.stage === "om-g2") assertPilotBoundary(this.store, project, draft.value.level);
+    const id = `research-run:${hashJson([project, draftId])}`;
+    // №2000-8: the prologue's first duty is restoring a PROVEN paid terminal —
+    // a pending paid turn whose session already reached its terminal
+    // application. Everything this step needs is an exact saved record: the
+    // run identity, the recorded turns, the paid origin M and its terminal
+    // S/A chain. None of today's prologue admissions — the execution root and
+    // effective environment below, the pilot boundary, the question head, the
+    // filesystem — may precede it: a moved worktree HEAD or a deactivated
+    // pilot is a lawful reason to refuse NEW work, never to lose a result the
+    // project already paid for. assessAnswer on a priorOrigin reads only the
+    // saved materials (environment, dispatch, context, prompt, runtime proofs).
+    const recordedTurns = this.store.list<ResearchTurn>("research-turn")
+      .map(turn => readResearchConsumerTurn(this.store, reference(turn)) as Revision<ResearchTurn>)
+      .filter(turn => turn.value.run === id);
+    const pendingPaidTurns = recordedTurns.filter(turn => turn.id.startsWith("research-turn:v1:")
+      && turn.value.status === "pending");
+    requireCondition(pendingPaidTurns.length <= 1, "research_consumer_intent_invalid",
+      "The run has several unfinished paid turns");
+    let forcedPendingTurn = pendingPaidTurns[0] ?? null;
+    let restoredPaidTerminal = false;
+    if (forcedPendingTurn) {
+      const savedOrigin = readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn));
+      if (savedOrigin && paidAssessmentTerminal(this.store, project, reference(forcedPendingTurn))) {
+        const paid = researchAction(forcedPendingTurn.value.action);
+        requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
+          'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
+        const savedQuestion = this.store.get<Question>(savedOrigin.value.question.id, savedOrigin.value.question.revision);
+        const savedDraft = this.store.get<DiscoveryDraft>(savedOrigin.value.draft.id, savedOrigin.value.draft.revision);
+        const originEnvironment = this.store.get<Environment>(savedOrigin.value.environment.id, savedOrigin.value.environment.revision);
+        const originPilot = savedOrigin.value.profile
+          ? this.store.get<ReaderPilot>(savedOrigin.value.profile.id, savedOrigin.value.profile.revision) : null;
+        requireCondition(savedQuestion?.kind === 'question' && savedDraft?.kind === 'discovery-draft'
+          && originEnvironment?.kind === 'environment' && hashJson(originEnvironment.value) === savedOrigin.value.environment.hash
+          && (savedOrigin.value.profile === null || (originPilot?.kind === 'reader-pilot'
+            && hashJson(originPilot.value) === savedOrigin.value.profile.hash)),
+          'research_assessment_binding_invalid', 'The paid origin lost its exact question, draft, environment or profile');
+        const proposal: Extract<ResearchAction, { action: 'answer' }> = paid.action === 'answer' ? paid
+          : { action: 'answer', question: paid.question,
+            value: expandLayerDelta(this.store, savedDraft, savedQuestion, paid, 'historical'), citations: paid.citations };
+        try {
+          await assessAnswer(this.store, savedQuestion, proposal, originEnvironment, savedOrigin.value.root, signal,
+            originPilot ?? undefined, reference(forcedPendingTurn));
+          restoredPaidTerminal = true;
+        } catch (failure) {
+          // A transient claim loss or a typed integrity refusal repeats through
+          // the gated path below as an addressed pause on the run.
+          if (!(failure instanceof EngineError)) throw failure;
+        }
+      }
+    }
+    // Everything below is admission for NEW work — current environment,
+    // execution root, pilot, filesystem and heads. The restored paid terminal
+    // above required none of them.
     const effective = this.environments.effective(project); const environment = effective.environment;
     const pilot = draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) ? readerPilot(this.store, project) : null;
     const dispatch = { ...(pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value), workspace: effective.root };
     const sources = new ResearchSources(this.store, project, effective.root);
-    const id = `research-run:${hashJson([project, draftId])}`;
     // A child may use only the retry allowance visible at the external run
     // boundary. A refusal produced inside this run cannot authorize g+1.
     const retryPermits = captureResearchConsumerRetryPermits(this.store, project);
@@ -143,14 +186,10 @@ export class Researcher {
     let outstanding = resumable.sort((a, b) => Number(a.value.cursor.offset ?? 0) - Number(b.value.cursor.offset ?? 0)
       || Number(a.value.cursor.materialOffset ?? 0) - Number(b.value.cursor.materialOffset ?? 0)
       || resumePriority[a.value.state as keyof typeof resumePriority] - resumePriority[b.value.state as keyof typeof resumePriority]).at(-1) ?? null;
-    const recordedTurns = this.store.list<ResearchTurn>("research-turn")
-      .map(turn => readResearchConsumerTurn(this.store, reference(turn)) as Revision<ResearchTurn>)
-      .filter(turn => turn.value.run === id);
-    const pendingPaidTurns = recordedTurns.filter(turn => turn.id.startsWith("research-turn:v1:")
-      && turn.value.status === "pending");
-    requireCondition(pendingPaidTurns.length <= 1, "research_consumer_intent_invalid",
-      "The run has several unfinished paid turns");
-    let forcedPendingTurn = pendingPaidTurns[0] ?? null;
+    // The live pilot boundary admits NEW work only — a proven paid terminal
+    // was already restored above, before any current-state admission; a moved
+    // or deactivated pilot never blocks it.
+    if (draft.value.stage === "om-g2") assertPilotBoundary(this.store, project, draft.value.level);
     // C32: a completed read/search turn owns its derived pilot reading. A
     // crash between the durable turn write and the derivation is repaired
     // here from the exact saved action and observation — before any new
@@ -243,6 +282,37 @@ export class Researcher {
       for (const finding of (checked?.findings ?? []).filter(item => staleCodes.has(item.code))) {
         const question = this.store.get<Question>(finding.target);
         if (question?.kind === "question" && question.value.status === "answered") this.discovery.reopen(question.id, question.revision);
+      }
+      // №2000-8: a pending paid turn with a saved origin proves and restores its
+      // assessment BEFORE any remaining prologue step (documentary read,
+      // inventory, pilot checks, question selection, reuse). Every input is the
+      // exact saved record — never today's heads or filesystem. Failures become
+      // an addressed pause on the run via the outer catch.
+      if (forcedPendingTurn && !restoredPaidTerminal) {
+        // Recovery applies only while the paid turn is still pending against
+        // its exact recorded question. A moved head is a lawful transition —
+        // explicit reopen or a sibling answer — and the turn loop retires the
+        // turn with its own proven proof instead of replaying the assessment.
+        const turnQuestion = forcedPendingTurn.value.question;
+        const turnQuestionHead = isRef(turnQuestion) ? this.store.get<Question>(turnQuestion.id) : null;
+        const pendingQuestionLive = turnQuestionHead?.kind === 'question'
+          && canonical(reference(turnQuestionHead)) === canonical(turnQuestion);
+        const savedOrigin = pendingQuestionLive
+          ? readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn)) : null;
+        if (savedOrigin) {
+          const paid = researchAction(forcedPendingTurn.value.action);
+          requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
+            'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
+          const savedQuestion = this.store.get<Question>(savedOrigin.value.question.id, savedOrigin.value.question.revision);
+          const savedDraft = this.store.get<DiscoveryDraft>(savedOrigin.value.draft.id, savedOrigin.value.draft.revision);
+          requireCondition(savedQuestion?.kind === 'question' && savedDraft?.kind === 'discovery-draft',
+            'research_assessment_binding_invalid', 'The paid origin lost its exact question and draft');
+          const proposal: Extract<ResearchAction, { action: 'answer' }> = paid.action === 'answer' ? paid
+            : { action: 'answer', question: paid.question,
+              value: expandLayerDelta(this.store, savedDraft, savedQuestion, paid, 'historical'), citations: paid.citations };
+          await assessAnswer(this.store, savedQuestion, proposal, environment, effective.root, signal,
+            pilot ?? undefined, reference(forcedPendingTurn));
+        }
       }
       if (!outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
       let resumedSent: Record<string, any> | undefined;
@@ -741,19 +811,13 @@ export class Researcher {
                 value: expandLayerDelta(this.store, draft, question, action), citations: action.citations } : action;
               const managedPending = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
                 ? reference(pendingTurn) : undefined;
-              // №1745-1: the local technical pre-check runs BEFORE any paid
-              // assessor call, on one captured read view; a refusal and its
-              // completed turn are written atomically below. The same shared
-              // derivation proves the refusal historically.
-              const precheck = managedPending ? this.proposalPrecheck(project, draft, question,
-                proposal, environment, effective.root, pendingTurn) : null;
-              if (precheck) {
-                capturedProposalRefusal = precheck;
-                turnProof = { kind: 'technical-refusal', result: {
-                  ref: precheck.prepared.ref,
-                  value: precheck.prepared.write.value as ManagedProposalRefusal } };
-              } else {
-                const result = await assessAnswer(this.store, question, proposal, environment, effective.root, signal, pilot ?? undefined);
+              // №2000: assessAnswer itself derives the managed technical findings
+              // on the captured/pinned read view before any paid dispatch and
+              // throws PreparedManagedProposalRefusal; the refusal and its
+              // completed turn are written atomically below.
+              {
+                const result = await assessAnswer(this.store, question, proposal, environment, effective.root, signal,
+                  pilot ?? undefined, managedPending);
                 assessment = reference(result); observation = { verdict: result.value.verdict, reasons: result.value.reasons };
                 if (result.value.verdict === "supported") {
                   const acceptedDraft = this.discovery.researched(question.id, question.revision, assessment);
@@ -766,8 +830,8 @@ export class Researcher {
                     'The accepted answer lost its exact paid action and transition');
                   turnProof = { kind: 'accepted-answer', inputs: accepted.inputs };
                 } else if (managedPending) {
-                  const checked = this.store.get<ResearchAssessment>(reference(result).id, reference(result).revision);
-                  turnProof = { kind: 'assessed-answer', question, assessment: checked!,
+                  const checked = readResearchAssessmentAt(this.store, project, pendingTurn.id, reference(result));
+                  turnProof = { kind: 'assessed-answer', question, assessment: checked,
                     ...(action.action === 'answer_delta' ? { expandedProposal: proposal.value } : {}) };
                 }
               }
@@ -818,6 +882,14 @@ export class Researcher {
               turnProof = { kind: 'premature-owner', consulted: ownerConsulted,
                 hadPriorRead: ownerHadPriorRead };
             } else {
+              // №2000-4: managed material/derivation proof failures are integrity
+              // refusals, never a coincidental completed-error match — they
+              // escape before any local or layer-design proof is selected.
+              if (['research_assessment_materials_invalid', 'research_assessment_binding_invalid',
+                'research_context_application_invalid', 'research_context_application_refused',
+                'research_context_application_running', 'research_proposal_refusal_invalid',
+                'research_context_read_proof_invalid', 'layer_delta_base_invalid',
+                'layer_delta_revision_invalid'].includes(failure.code)) throw failure;
               const local = projectPaidLocalRefusal(pendingTurn.value as ManagedResearchTurn);
               if (local && local.failure.code === failure.code
                 && local.failure.message === failure.message
@@ -853,7 +925,9 @@ export class Researcher {
             error = projected.error; observation = projected.observation;
           } else {
             if (failure instanceof EngineError && (["research_no_progress", "input_stale", "research_provider_failed", "process_timeout", "process_cancelled", "research_response_foreign",
-              "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready"].includes(failure.code)
+              "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready",
+              "research_assessment_materials_invalid", "research_assessment_binding_invalid", "research_proposal_refusal_invalid",
+              "layer_delta_base_invalid", "layer_delta_revision_invalid"].includes(failure.code)
               || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
               || failure.code.endsWith("_no_progress"))) throw failure;
             error = failure instanceof Error ? failure.message : "Research action failed";
@@ -915,64 +989,6 @@ export class Researcher {
    * view before any paid assessor call. Returns the prepared refusal (written
    * atomically with its completed turn by the caller) or null when the paid
    * assessment may proceed. Obligation-evidence pauses escape as pauses. */
-  private proposalPrecheck(project: string, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
-    proposal: Extract<ResearchAction, { action: "answer" }>, environment: Revision<Environment>, root: string,
-    pendingTurn: Revision<ResearchTurn>): PreparedManagedProposalRefusal | null {
-    const first = this.store.get<ResearchTurn>(pendingTurn.id, 1);
-    requireCondition(first?.kind === 'research-turn' && first.value.status === 'pending'
-      && hashJson(first.value) === first.hash, 'research_consumer_intent_invalid',
-      'The technical refusal lost its exact original turn');
-    const readView = assessmentReadView(this.store);
-    const inputStore = readView.store;
-    requireDocumentarySources(inputStore, project, question.value.spec);
-    const schemaOk = new Ajv({ strict: true, allowUnionTypes: true })
-      .compile(question.value.spec.schema as object)(proposal.value);
-    const capturedDraft = inputStore.get<DiscoveryDraft>(question.value.draftId);
-    requireCondition(capturedDraft?.kind === 'discovery-draft'
-      && canonical(reference(capturedDraft)) === canonical(reference(draft)),
-      'draft_missing', 'The research context is missing');
-    requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor,
-      "assessor_not_independent", "Research assessment requires a separate actor");
-    if (schemaOk && draft.value.stage === 'om-g2' && draft.value.level === 'R2' && question.value.spec.field === 'layerDesign') {
-      const handoff = obligationHandoff(this.store, project, draft.value.inputs);
-      const base = this.store.get<Graph>(`graph:${project}`)!;
-      const assembled = composeLayer(base.value, 3, proposal.value, question.value.spec.layerAssembly);
-      if (handoff) requireTaskObligations(this.store, project, assembled, handoff);
-    }
-    const observations = proposal.citations.map(item =>
-      new Evidence(inputStore).observe(project, item.source, item.selector));
-    // A malformed paid answer cannot drive the typed runtime/finding
-    // derivation; its refusal is exactly the schema refusal and nothing else.
-    const runtime: ReturnType<typeof collectRuntimeEvidence> = schemaOk
-      ? collectRuntimeEvidence(this.store, project, question.value.spec,
-        proposal.value as unknown as TechnicalReport, observations)
-      : { proofs: [], supporting: [], guards: [], admissionGuards: [] };
-    const gated = draft.value.stage === 'om-g2' && ['R1', 'R2'].includes(draft.value.level)
-      && draft.value.consumer === 'compilation';
-    const graph = gated ? inputStore.get<Graph>(`graph:${project}`) : null;
-    if (!gated || !graph || graph.kind !== 'graph' || hashJson(graph.value) !== graph.hash) {
-      // A malformed paid answer is a typed local refusal of the consumed call,
-      // not a retryable pending action; outside the typed-proposal gate keep
-      // the same refusal code as the shared assessment.
-      requireCondition(schemaOk, "answer_invalid", "Proposed research result does not satisfy its consumer contract");
-      return null;
-    }
-    const canonicalRoot = realpathSync(root);
-    const legacyPaths: LegacyPathResolution[] = [];
-    const findings: Finding[] = !schemaOk
-      ? [{ code: 'answer_invalid', target: question.id, field: question.value.spec.field,
-          message: 'Proposed research result does not satisfy its consumer contract' }]
-      : technicalProposalFindings(inputStore, project, draft.value.level, question.id,
-          question.value.spec.field, proposal.value as unknown as TechnicalReport, observations,
-          graph.value, canonicalRoot, runtime, { mode: 'current', legacyPaths });
-    const pause = findings.find(finding => OBLIGATION_EVIDENCE_PAUSES.has(finding.code));
-    if (pause) throw new EngineError(pause.code, `[${pause.target}] ${pause.message}`, findings);
-    if (!findings.length) return null;
-    return prepareManagedProposalRefusal(project, reference(first), reference(pendingTurn),
-      draft, question, environment, reference(graph), canonicalRoot, legacyPaths,
-      readView.finish(), runtime, findings,
-      uniqueTransactionGuards([...runtime.guards, ...runtime.admissionGuards, ...readView.guards]));
-  }
   private synthesisResultIntent(project: string, draftId: string,
     runId: string, turn: number, action: ResearchAction): Revision<ResearchConsumerIntent> | null {
     const candidates = listResearchConsumerIntents(this.store, project, draftId)

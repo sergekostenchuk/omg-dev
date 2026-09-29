@@ -1,19 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Store, type Write } from '../src/storage/store.js';
+import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { preparedFeatures } from './product-fixture.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { readBundle, readReaderResultAt, resumeReadBundleIntent, type ReaderResult } from '../src/discovery/reader.js';
-import { readResearchConsumerIntent, readResearchConsumerExecution,
-  prepareResearchConsumerApplication, refuseResearchConsumerIntent, captureResearchConsumerRetryPermits } from '../src/discovery/response-recovery.js';
+import { readResearchConsumerIntent, readResearchConsumerExecution, readResearchConsumerTurn,
+  prepareResearchConsumerApplication, refuseResearchConsumerIntent, captureResearchConsumerRetryPermits,
+  assessmentReadView } from '../src/discovery/response-recovery.js';
+import { readResearchAssessmentAt } from '../src/discovery/research-assessment.js';
+import { readAssessmentPaidOrigin } from '../src/discovery/assessment-session.js';
+import { Evidence , type Source, type Observation } from '../src/evidence/evidence.js';
+import { withTypedBasis } from '../src/graph/research-basis.js';
+import { technicalProposalFindings, type LegacyPathResolution } from '../src/graph/research-evidence.js';
+import { TECHNICAL_RESEARCH, type TechnicalReport } from '../src/graph/research-contracts.js';
+import type { Graph } from '../src/graph/model.js';
+import { projectGraph } from '../src/graph/project.js';
+import { layerDesignOf } from '../src/graph/layer-design.js';
+import { layerDeltaView } from '../src/discovery/layer-delta.js';
+import { configureResearchScope } from '../src/graph/research-scope.js';
+import { configureBudgetSegment } from '../src/runtime/research-budget.js';
+import { configurePhasePolicy } from '../src/discovery/phase-policy.js';
+import { answerTechnicalFixture } from './technical-research-fixture.js';
+import { answerLayerFixture } from './layer-design-fixture.js';
+import { enrichedGraph } from './enriched-graph-fixture.js';
+import { exampleGraph } from './graph-fixture.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
 import { ResearchSources } from '../src/discovery/research-sources.js';
 import { prepareLateModelReceipt, readLateModelReceipt, readModelCallRecovery,
@@ -2594,4 +2612,1660 @@ test('R4-10 a new failed plan keeps reading_plan_blocked after an old recovery; 
   assert.equal(fresh.value.pauseCode, 'reading_plan_blocked', 'the NEW failed plan blocks');
   assert.equal(retry.value.pauseCode, 'reading_plan_blocked', 'the block repeats as itself');
   assert.equal(f.store.list('model-call').length, calls, 'the blocked plan never pays again');
+});
+
+for (const verdict of ['insufficient', 'conflicting'] as const) {
+  test(`a paid ${verdict} assessment keeps its exact terminal proof after later session heads`, async t => {
+    const root = mkdtempSync(join(tmpdir(), `omg-d84-${verdict}-`));
+    const database = join(root, 'state.sqlite'), stores: Store[] = [];
+    const open = () => { const db = new Store(database); stores.push(db); return db; };
+    t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+    const store = open(), engine = new ProductEngine(store);
+    engine.execute({ type: 'create-project', project: 'p', title: `Assessment ${verdict}` });
+    const source = engine.discovery.evidence.document('p', 'proof', 'One exact documentary observation', 'text/plain', 0);
+    const adapter = join(root, 'adapter.mjs');
+    writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:${JSON.stringify(verdict)},reasons:['The fixture did not support acceptance']}
+ :{action:'answer',question:s.questions[0].id,value:{ok:true},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:12}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+    const command = { executable: process.execPath, args: [adapter] };
+    engine.environments.configure('p', { workspace: root,
+      implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+      fullCheck: command, timeoutMs: 5000 }, 0);
+    const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+      [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+    await engine.researcher.run('p', draft.id, 1);
+    const assessment = store.list<any>('research-assessment')[0]!, turn = store.list<ResearchTurn>('research-turn')[0]!;
+    assert.equal(assessment.value.verdict, verdict);
+    const proved = readResearchAssessmentAt(open(), 'p', turn.id, reference(assessment));
+    assert.deepEqual(proved.value, assessment.value);
+    const proof = store.get<any>(`research-assessment-binding:v1:${hashJson({ projectId: 'p', turnId: turn.id })}`)!;
+    assert.ok(proof);
+    const terminal = store.get<any>(proof.value.session.id, proof.value.session.revision)!;
+    store.write({ id: terminal.id, kind: terminal.kind, expected: terminal.revision,
+      value: { ...terminal.value, notes: [...terminal.value.notes, { later: true }] } });
+    assert.deepEqual(readResearchAssessmentAt(open(), 'p', turn.id, reference(assessment)).value,
+      assessment.value, 'the later session head does not reinterpret the terminal verdict');
+  });
+}
+
+function graphPrecheckFixture(t: test.TestContext, typed: boolean) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-graph-history-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const store = new Store(database); stores.push(store); return store; };
+  t.after(() => { for (const store of stores) store.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), evidence = new Evidence(store);
+  const spec = typed ? withTypedBasis(TECHNICAL_RESEARCH.R1[0]!) : TECHNICAL_RESEARCH.R1[0]!;
+  const draft = store.write({ id: 'd84-graph-draft', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', stage: 'om-g2', level: 'R1', consumer: 'compilation',
+      ...(typed ? { basisContract: 'typed-v1' } : {}), questions: ['d84-graph-question'], inputs: [], fields: {} } });
+  const question = store.write<Question>({ id: 'd84-graph-question', kind: 'question', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, stage: 'om-g2', level: 'R1', consumer: 'compilation',
+      status: 'open', answer: null, spec } as Question });
+  const graph = { nodes: [{ id: 'node', code: [], tests: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  const report = (path: string): TechnicalReport => ({ applicability: 'applicable', reason: 'A precise captured file',
+    facts: [{ id: 'file-fact', claim: 'The file contains its recorded condition',
+      ...(typed ? { evidence: { kind: 'repository-file' as const, citation: 0 } } : { path }) }],
+    designs: [{ id: 'design', decision: 'Use the recorded condition', benefit: 'A checked result', consumer: 'compilation' }],
+    gaps: [], ...(typed ? { documents: [] } : {}) });
+  const check = (db: Store, value: TechnicalReport, observations: ReturnType<Evidence['observe']>[],
+    mode: 'current' | 'historical', legacyPaths: LegacyPathResolution[] = []) => {
+    const view = assessmentReadView(db);
+    const findings = technicalProposalFindings(view.store, 'p', 'R1', question.id, spec.field,
+      value, observations, graph, root, { proofs: [] }, { mode, legacyPaths });
+    return { findings, proof: view.finish(), legacyPaths };
+  };
+  const replay = (db: Store, proof: ReturnType<typeof assessmentReadView>['proof'], value: TechnicalReport,
+    observations: ReturnType<Evidence['observe']>[], legacyPaths: LegacyPathResolution[] = []) => {
+    const view = assessmentReadView(db, proof);
+    const findings = technicalProposalFindings(view.store, 'p', 'R1', question.id, spec.field,
+      value, observations, graph, root, { proofs: [] }, { mode: 'historical', legacyPaths });
+    view.finish();
+    return findings;
+  };
+  return { root, store, open, evidence, report, check, replay };
+}
+
+test('historical typed precheck keeps exact file origin after its source file disappears', t => {
+  const f = graphPrecheckFixture(t, true), path = join(f.root, 'condition.txt');
+  writeFileSync(path, 'The exact condition is retained.');
+  const source = f.evidence.file('p', 'condition', f.root, 'condition.txt', 'text/plain', 0);
+  const observations = [f.evidence.observe('p', reference(source), { kind: 'text-range', start: 0, end: source.value.content.length })];
+  const report = f.report('condition.txt');
+  const captured = f.check(f.store, report, observations, 'current');
+  assert.deepEqual(captured.findings, []);
+  unlinkSync(path);
+  const reopened = f.open();
+  assert.deepEqual(f.replay(reopened, captured.proof, report, observations), [],
+    'historical source membership uses captured bytes and canonical origin, not the present filesystem');
+  assert.throws(() => f.check(reopened, report, observations, 'current'), { code: 'source_stale' },
+    'new precheck must still reject a missing current file');
+});
+
+test('historical legacy path resolution survives changed symlink while current admission rejects the escape', t => {
+  const f = graphPrecheckFixture(t, false), target = join(f.root, 'target.txt');
+  writeFileSync(target, 'Original canonical target');
+  symlinkSync('target.txt', join(f.root, 'alias.txt'));
+  const source = f.evidence.file('p', 'alias', f.root, 'alias.txt', 'text/plain', 0);
+  const observations = [f.evidence.observe('p', reference(source), { kind: 'text-range', start: 0, end: source.value.content.length })];
+  const report = f.report('alias.txt');
+  const captured = f.check(f.store, report, observations, 'current');
+  assert.deepEqual(captured.findings, []);
+  assert.deepEqual(captured.legacyPaths, [{ path: 'alias.txt', resolved: target }]);
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-escaped-target-')));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  writeFileSync(join(outside, 'outside.txt'), 'A different file');
+  unlinkSync(join(f.root, 'alias.txt'));
+  symlinkSync(join(outside, 'outside.txt'), join(f.root, 'alias.txt'));
+  const reopened = f.open();
+  assert.deepEqual(f.replay(reopened, captured.proof, report, observations, captured.legacyPaths), []);
+  assert.ok(f.check(reopened, report, observations, 'current').findings.some(item => item.code === 'repository_evidence_required'));
+  assert.ok(f.replay(reopened, captured.proof, report, observations,
+    [{ path: 'alias.txt', resolved: join(outside, 'outside.txt') }]).some(item => item.code === 'repository_evidence_required'),
+  'a forged historical resolution cannot make an outside target into the captured file');
+});
+
+test('a file citation outside the workspace fails even when no fact selects it', t => {
+  const f = graphPrecheckFixture(t, true), path = join(f.root, 'inside.txt');
+  writeFileSync(path, 'Inside fact');
+  const inside = f.evidence.file('p', 'inside', f.root, 'inside.txt', 'text/plain', 0);
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-foreign-citation-')));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  writeFileSync(join(outside, 'foreign.txt'), 'Unused foreign citation');
+  const foreign = f.evidence.file('p', 'foreign', outside, 'foreign.txt', 'text/plain', 0);
+  const observations = [inside, foreign].map(source => f.evidence.observe('p', reference(source),
+    { kind: 'text-range', start: 0, end: source.value.content.length }));
+  const report = f.report('inside.txt');
+  const captured = f.check(f.store, report, observations, 'current');
+  assert.ok(captured.findings.some(item => item.code === 'research_source_foreign'));
+  assert.ok(f.replay(f.open(), captured.proof, report, observations).some(item => item.code === 'research_source_foreign'));
+});
+
+test('historical technical findings keep an absent actor, incomplete coverage and an unresolved current gap', t => {
+  const f = graphPrecheckFixture(t, true), path = join(f.root, 'condition.txt');
+  writeFileSync(path, 'The recorded local condition.');
+  const source = f.evidence.file('p', 'condition', f.root, 'condition.txt', 'text/plain', 0);
+  const observations = [f.evidence.observe('p', reference(source),
+    { kind: 'text-range', start: 0, end: source.value.content.length })];
+  const draft = f.store.get<any>('d84-graph-draft')!, question = f.store.get<Question>('d84-graph-question')!;
+  f.store.write({ id: draft.id, kind: draft.kind, expected: draft.revision,
+    value: { ...draft.value, obligationContract: 'evidence-v1' } });
+  f.store.write<Question>({ id: question.id, kind: question.kind, expected: question.revision,
+    value: { ...question.value, spec: { ...question.value.spec, obligationContract: 'evidence-v1',
+      obligations: [{ id: 'required', target: 'node', field: 'tests', consumer: 'compilation' }] } } });
+  const report: TechnicalReport = { ...f.report('condition.txt'),
+    designs: [{ id: 'later-design', decision: 'Use the local result', benefit: 'A recorded output', consumer: 'later-actor' }],
+    gaps: [{ id: 'still-open', target: 'node', field: 'tests', question: 'Prove the current condition',
+      consumer: 'compilation', requiredFor: 'current' }], coverage: [] };
+  const captured = f.check(f.store, report, observations, 'current');
+  const codes = (findings: typeof captured.findings) => new Set(findings.map(item => item.code));
+  assert.ok(codes(captured.findings).has('research_consumer_missing'));
+  assert.ok(codes(captured.findings).has('research_group_coverage_missing'));
+  assert.ok(codes(captured.findings).has('research_gap_unresolved'));
+  f.store.write({ id: 'stage:p:discovery', kind: 'stage', expected: 0,
+    value: { content: { fields: { preparation: { actors: [{ id: 'later-actor' }] } } } } });
+  assert.equal(codes(f.check(f.store, report, observations, 'current').findings).has('research_consumer_missing'), false,
+    'a new admission sees the newly added actor');
+  const historical = codes(f.replay(f.open(), captured.proof, report, observations));
+  for (const code of ['research_consumer_missing', 'research_group_coverage_missing', 'research_gap_unresolved'])
+    assert.ok(historical.has(code), `the saved paid-era precheck retains ${code}`);
+});
+
+test('a paid assessor resumes its frozen origin after terminal application and a removed source file', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-assessor-origin-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Frozen assessor origin' });
+  const file = join(root, 'source.txt');
+  writeFileSync(file, 'This exact local condition supports the proposed result.');
+  const source = engine.discovery.evidence.file('p', 'source', root, 'source.txt', 'text/plain', 0);
+  const wire = join(root, 'calls.ndjson'), adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const request=JSON.parse(readFileSync(0,'utf8')),subject=request.subject;
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:subject.role,requestId:request.requestId})+'\\n');
+const research=subject.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:subject.questions[0].id,value:{ok:true},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
+console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+    [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+  const original = store.writeMany.bind(store); let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = original(writes, guards);
+    if (!interrupted && writes.some(write => write.kind === 'assessment-application'
+      && (write.value as { state?: string }).state === 'applied')
+      && writes.some(write => write.kind === 'assessment-session'
+        && (write.value as { result?: unknown }).result !== null)) {
+      interrupted = true;
+      throw new EngineError('fixture_after_paid_assessor', 'The paid verdict was applied before its assessment binding');
+    }
+    return rows;
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = original;
+  assert.equal(interrupted, true);
+  assert.equal(store.list('research-assessment-binding').length, 0);
+  const pending = store.list<ResearchTurn>('research-turn')[0]!;
+  const origin = readAssessmentPaidOrigin(store, 'p', reference(pending));
+  assert.ok(origin);
+  assert.equal(origin.value.root, root);
+  assert.equal(origin.value.dispatch.workspace, root);
+  const paidBefore = store.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor').length;
+  assert.equal(paidBefore, 1);
+  unlinkSync(file);
+  configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command },
+    agentCommand: command, maxCalls: 10, maxReportedTokens: 100000,
+    maxRequestChars: 100000, maxReadChars: 60000, maxReplyChars: 10000 }, 0);
+  const restarted = open();
+  const resumed = await new ProductEngine(restarted).researcher.run('p', draft.id, 1);
+  assert.equal(resumed.value.status, 'paused', JSON.stringify(resumed.value));
+  assert.equal(resumed.value.pauseCode, 'research_not_supported',
+    'the historical paid result survives, while new acceptance still checks present file support');
+  const binding = restarted.list<any>('research-assessment-binding')[0]!;
+  assert.ok(binding, 'the exact paid assessment is bound before current acceptance refuses');
+  assert.deepEqual(readResearchAssessmentAt(restarted, 'p', pending.id, binding.value.assessment).value,
+    restarted.get(binding.value.assessment.id, binding.value.assessment.revision)?.value);
+  assert.equal(restarted.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor').length, paidBefore,
+    'the public retry reuses the exact paid application without rebuilding a new assessor request');
+  assert.deepEqual(readAssessmentPaidOrigin(restarted, 'p', reference(pending))?.value, origin.value);
+  const rewrite = (id: string, revision: number, value: unknown) => {
+    const db = new DatabaseSync(database);
+    try {
+      db.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+      db.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+        .run(canonical(value), hashJson(value), id, revision);
+    } finally { db.close(); }
+  };
+  for (const altered of [
+    { ...origin.value, root: join(root, 'other-root') },
+    { ...origin.value, dispatch: { ...origin.value.dispatch, workspace: join(root, 'other-root') } },
+    { ...origin.value, prompt: `${origin.value.prompt} changed` },
+    { ...origin.value, profile: { id: 'reader-pilot:p', revision: 1, hash: '0'.repeat(64) } },
+    { ...origin.value, reads: { ...origin.value.reads, files: [] } }
+  ]) {
+    rewrite(origin.id, origin.revision, altered);
+    assert.throws(() => readResearchAssessmentAt(open(), 'p', pending.id, binding.value.assessment),
+      { code: 'research_context_application_invalid' },
+      'a rehashed final origin cannot rewrite the root, source view, reviewer packet or profile of the paid application');
+    rewrite(origin.id, origin.revision, origin.value);
+  }
+});
+
+for (const level of ['R1', 'R2'] as const) {
+  test(`managed technical ${level} binds its paid assessor after graph, scope, draft and file heads change`, async t => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), `omg-d84-technical-${level.toLowerCase()}-`)));
+    const database = join(root, 'state.sqlite'), stores: Store[] = [];
+    const open = () => { const db = new Store(database); stores.push(db); return db; };
+    t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+    const store = open(), engine = new ProductEngine(store);
+    preparedFeatures(engine, 'p');
+    writeFileSync(join(root, 'README.md'), 'The fixture product transforms local input into a validated output.\n');
+    const sourcePath = join(root, 'condition.txt');
+    writeFileSync(sourcePath, 'The original technical condition is retained in a file.\n');
+    const source = engine.discovery.evidence.file('p', 'paid-technical-condition', root,
+      'condition.txt', 'text/plain', 0);
+    const report: TechnicalReport = {
+      applicability: 'applicable', reason: 'The local file gives a bounded technical condition',
+      facts: [{ id: 'condition', claim: 'The file records the original technical condition',
+        ...(level === 'R2' ? { evidence: { kind: 'repository-file' as const, citation: 0 } }
+          : { path: 'condition.txt' }) }],
+      designs: [{ id: 'local-result', decision: 'Preserve the validated local result',
+        benefit: 'Compilation consumes one recorded result', consumer: 'compilation' }],
+      gaps: [], ...(level === 'R2' ? { documents: [] } : {})
+    };
+    const wire = join(root, 'calls.ndjson'), adapter = join(root, 'adapter.mjs');
+    writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const request=JSON.parse(readFileSync(0,'utf8')),subject=request.subject;
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:subject.role,requestId:request.requestId})+'\\n');
+const research=subject.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:subject.questions[0].id,value:${JSON.stringify(report)},
+ citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
+console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+    const command = { executable: process.execPath, args: [adapter] };
+    engine.environments.configure('p', { workspace: root,
+      implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command },
+      fullCheck: command, timeoutMs: 5000 }, 0);
+    const r0 = engine.refinement.begin('p', 'R0');
+    engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+    engine.refinement.sealLayer('p', 1, 0);
+    let scope: ReturnType<typeof import('../src/graph/research-scope.js').configureResearchScope> | null = null;
+    if (level === 'R2') {
+      const { answerTechnicalFixture } = await import('./technical-research-fixture.js');
+      const { deriveLayerFixture } = await import('./layer-design-fixture.js');
+      const { configureResearchScope } = await import('../src/graph/research-scope.js');
+      const r1 = engine.refinement.begin('p', 'R1');
+      answerTechnicalFixture(engine, 'p', r1);
+      engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+      deriveLayerFixture(engine, 'p', 2);
+      engine.refinement.sealLayer('p', 2, 0);
+      scope = configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+        r1: reference(store.get('phase:p:R1')!), outcome: 'Preserve a validated local result',
+        nodes: [store.get<Graph>('graph:p')!.value.nodes.find(node => node.kind === 'product')!.id],
+        boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+    }
+    const draft = engine.refinement.begin('p', level);
+    const question = store.get<Question>(draft.value.questions[0]!)!;
+    assert.equal(question.value.spec.field, level === 'R1' ? 'productDomain' : 'contractsAndConsumers');
+    const original = store.writeMany.bind(store); let interrupted = false;
+    store.writeMany = ((writes: Write[], guards = []) => {
+      const rows = original(writes, guards);
+      if (!interrupted && writes.some(write => write.kind === 'assessment-application'
+        && (write.value as { state?: string }).state === 'applied')
+        && writes.some(write => write.kind === 'assessment-session'
+          && (write.value as { result?: unknown }).result !== null)) {
+        interrupted = true;
+        throw new EngineError('fixture_after_technical_assessor', 'The paid terminal result was saved before binding');
+      }
+      return rows;
+    }) as typeof store.writeMany;
+    try { await engine.researcher.run('p', draft.id, 1); }
+    finally { store.writeMany = original; }
+    assert.equal(interrupted, true, 'the real adapter reached terminal assessor application');
+    assert.equal(store.list('research-assessment-binding').length, 0);
+    const pending = store.list<ResearchTurn>('research-turn').find(turn => turn.value.question?.id === question.id)!;
+    assert.equal(pending.value.status, 'pending');
+    const paidOrigin = readAssessmentPaidOrigin(store, 'p', reference(pending));
+    assert.ok(paidOrigin);
+    const originalGraph = paidOrigin.value.graph;
+    assert.deepEqual(originalGraph, reference(store.get('graph:p')!));
+    const originalScope = scope && reference(scope);
+    const calls = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean)
+      .map(line => JSON.parse(line) as { role: string; requestId: string });
+    assert.deepEqual(calls().map(call => call.role), ['research', 'assess-answer']);
+    const assessorCalls = () => store.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor');
+    assert.equal(assessorCalls().length, 1);
+    assert.equal(assessorCalls()[0]!.value.status, 'succeeded');
+
+    const sibling = store.get<Question>(draft.value.questions[1]!)!;
+    engine.discovery.decision(sibling.id, sibling.revision, 'owner', report as unknown as import('../src/canonical.js').Json);
+    assert.ok(store.get(draft.id)!.revision > draft.revision, 'the discovery head advanced independently');
+    const graph = store.get<Graph>('graph:p')!;
+    engine.graphs.save('p', { ...graph.value, title: `${graph.value.title} after paid assessment` },
+      graph.revision, 'fixture-author');
+    assert.notDeepEqual(reference(store.get('graph:p')!), originalGraph);
+    if (scope) {
+      const { configureResearchScope } = await import('../src/graph/research-scope.js');
+      const advanced = configureResearchScope(store, { ...scope.value,
+        layer: reference(store.get('graph-layer:p:2')!), changedPaths: ['after-paid.txt'] }, scope.revision);
+      assert.notDeepEqual(reference(advanced), originalScope);
+    }
+    unlinkSync(sourcePath);
+    const restarted = open();
+    const resumed = await new ProductEngine(restarted).researcher.run('p', draft.id, 1);
+    assert.equal(resumed.value.status, 'paused', JSON.stringify(resumed.value));
+    assert.equal(resumed.value.pauseCode, 'research_not_supported',
+      'the historical paid result binds, while current acceptance rejects the missing file');
+    const binding = restarted.list<any>('research-assessment-binding')[0]!;
+    assert.ok(binding);
+    const assessment = readResearchAssessmentAt(open(), 'p', pending.id, binding.value.assessment);
+    assert.equal(assessment.value.verdict, 'supported');
+    assert.deepEqual(assessment.value.value, report);
+    assert.deepEqual(reference(assessment), binding.value.assessment);
+    assert.deepEqual(readAssessmentPaidOrigin(open(), 'p', reference(pending))?.value, paidOrigin.value);
+    assert.deepEqual(calls().map(call => call.role), ['research', 'assess-answer'],
+      'cold retry must neither repeat the analyst nor pay the assessor again');
+    assert.equal(assessorCalls().length, 1);
+
+    // A rehashed saved origin must not substitute the newer graph for the paid proposal's graph.
+    const forgedOrigin = { ...paidOrigin.value, graph: reference(store.get('graph:p')!) };
+    const rewriteOrigin = (value: unknown) => {
+      const db = new DatabaseSync(database);
+      try {
+        db.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+        db.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+          .run(canonical(value), hashJson(value), paidOrigin.id, paidOrigin.revision);
+      } finally { db.close(); }
+    };
+    rewriteOrigin(forgedOrigin);
+    try {
+      assert.throws(() => readResearchAssessmentAt(open(), 'p', pending.id, binding.value.assessment),
+        (error: unknown) => error instanceof EngineError
+          && ['research_context_application_invalid', 'research_assessment_binding_invalid'].includes(error.code),
+        'a current graph with a valid hash cannot masquerade as the original paid technical graph');
+    } finally { rewriteOrigin(paidOrigin.value); }
+  });
+}
+
+test('saved runtime proof derives from exact observation, declaration, code and paid citation after heads move', async t => {
+  const { configureResearchScope, scopedQuestions } = await import('../src/graph/research-scope.js');
+  const { withObligationEvidence } = await import('../src/graph/obligation-evidence.js');
+  const { collectRuntimeEvidence, collectRuntimeSelection, readRuntimeEvidenceAt, projectRuntimeSupportAt } = await import('../src/graph/runtime-evidence.js');
+  const { uniqueRefs } = await import('../src/pipeline/contracts.js');
+  const { assessmentSessionWithProof, checkAssessmentRuntimeMaterials } = await import('../src/discovery/assessment-session.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-runtime-proof-')));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Pinned runtime proof' });
+  const graph = { nodes: [{ id: 'n', code: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  store.write({ id: 'graph:p', kind: 'graph', expected: 0, value: graph });
+  const layer = store.write({ id: 'graph-layer:p:2', kind: 'graph-layer', expected: 0, value: { projection: graph } });
+  const gap = { id: 'boundary', target: 'n', field: 'code', consumer: 'compilation', requiredFor: 'next' as const,
+    question: 'Record the actual fixture invocation' };
+  const r1 = store.write({ id: 'runtime-r1', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', fields: { technical: { gaps: [gap] } } } });
+  const phase = store.write({ id: 'phase:p:R1', kind: 'phase', expected: 0, value: { draft: reference(r1) } });
+  const original = configureResearchScope(store, { projectId: 'p', layer: reference(layer), r1: reference(phase),
+    outcome: 'Keep the exact observed result', nodes: ['n'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
+    obligations: [{ gap, state: 'active', reason: 'Original requirement', wake: null }] }, 0);
+  writeFileSync(join(root, 'check.mjs'), "console.log('observed fixture result')\n");
+  const code = engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', 0);
+  const check = { script: reference(code), dependencies: [], subjects: [], executables: [], args: [], timeoutMs: 4000,
+    purpose: 'Observe the exact fixture invocation' };
+  const scope = configureResearchScope(store, { ...original.value, policy: { version: 1, sourceScope: reference(original),
+    assignments: [{ obligation: gap.id, original: { record: reference(original), pointer: '/obligations/0/gap' },
+      kind: 'environment-confirmation' as const, moment: 'R2' as const, responsibleNode: 'n',
+      responsibleConsumer: 'compilation', neededForR2: true, reason: 'Observe actual execution', returnCondition: null,
+      runtimeCheck: check }] } }, 1);
+  const command = { executable: process.execPath, args: ['--version'] };
+  const environment = engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const spec = withObligationEvidence(withTypedBasis(scopedQuestions(scope.value).find(item => item.obligations)!));
+  const draft = engine.discovery.create('p', 'om-g2', 'R2', 'compilation', [spec], [reference(scope)], 2);
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const observed = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'proof' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.ok(observed.source);
+  const cited = new Evidence(store).observe('p', reference(observed.source), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const report: TechnicalReport = { applicability: 'applicable', reason: 'The command completed', facts: [],
+    designs: [{ id: 'd', decision: 'Use the observed result', benefit: 'An exact fixture result exists', consumer: 'compilation' }],
+    gaps: [], documents: [{ id: 'runtime', claim: 'The command emitted its result', kind: 'document-observation',
+      citation: 0, quote: String(cited.value).trim(), designs: ['d'], gaps: [] }],
+    coverage: [{ obligation: 'boundary', facts: [], designs: ['d'], gaps: [] }] };
+  const savedSelection = collectRuntimeSelection(store, 'p', spec, report, [cited]), saved = savedSelection.runtime;
+  assert.deepEqual(saved, collectRuntimeEvidence(store, 'p', spec, report, [cited]), 'the D8.4c result is the selection\'s runtime');
+  assert.equal(saved.proofs.length, 1);
+  assert.equal(saved.supporting.length, 2);
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved), saved);
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved, savedSelection.admission), saved);
+  const context = { role: 'assess-answer', question: spec, value: report, runtimeProofs: saved.proofs,
+    observations: [cited, ...saved.supporting] };
+  const pending = store.write({ id: 'research-turn:runtime-proof-fixture', kind: 'research-turn', expected: 0,
+    value: { action: { action: 'answer', question: question.id, value: report,
+      citations: [{ source: cited.source, selector: cited.selector }] }, status: 'pending', question: reference(question) } });
+  const paidInput = { pending: reference(pending), root, graph: null, legacyPaths: [],
+    reads: { contract: 'assessment-read/v1', reads: [], files: [] } as any, runtime: saved, runtimeAdmission: savedSelection.admission };
+  const originalWriteMany = store.writeMany.bind(store);
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = originalWriteMany(writes, guards);
+    if (writes.some(write => write.kind === 'assessment-paid-origin'))
+      throw new EngineError('fixture_after_runtime_origin', 'The exact origin was saved before dispatch');
+    return rows;
+  }) as typeof store.writeMany;
+  try {
+    await assert.rejects(assessmentSessionWithProof(store, draft, question, environment, environment.value, undefined,
+      context, 'Assess the exact saved runtime result', undefined, [], paidInput),
+    { code: 'fixture_after_runtime_origin' });
+  } finally { store.writeMany = originalWriteMany; }
+  const originalOrigin = readAssessmentPaidOrigin(store, 'p', reference(pending));
+  assert.ok(originalOrigin, 'the valid shared projection permits the origin write before dispatch');
+  assert.equal(store.list('model-call').length, 0);
+  const fullCitation = new Evidence(store).observe('p', reference(observed.source), { kind: 'json-pointer', pointer: '' });
+  const extraCitations = [cited, fullCitation];
+  const extraSelection = collectRuntimeSelection(store, 'p', spec, report, extraCitations), extraRuntime = extraSelection.runtime;
+  assert.equal(extraRuntime.supporting.length, 1, 'a genuine full citation suppresses only the duplicate supporting quote');
+  const extraPending = store.write({ id: 'research-turn:runtime-extra-citation', kind: 'research-turn', expected: 0,
+    value: { action: { action: 'answer', question: question.id, value: report,
+      citations: extraCitations.map(item => ({ source: item.source, selector: item.selector })) },
+      status: 'pending', question: reference(question) } });
+  const extraContext = { ...context, observations: [...extraCitations, ...extraRuntime.supporting],
+    runtimeProofs: extraRuntime.proofs };
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = originalWriteMany(writes, guards);
+    if (writes.some(write => write.kind === 'assessment-paid-origin'))
+      throw new EngineError('fixture_after_runtime_origin', 'The exact origin was saved before dispatch');
+    return rows;
+  }) as typeof store.writeMany;
+  try {
+    await assert.rejects(assessmentSessionWithProof(store, draft, question, environment, environment.value, undefined,
+      extraContext, 'Assess the exact saved runtime result', undefined, [],
+      { ...paidInput, pending: reference(extraPending), runtime: extraRuntime, runtimeAdmission: extraSelection.admission }),
+    { code: 'fixture_after_runtime_origin' });
+  } finally { store.writeMany = originalWriteMany; }
+  const extraOrigin = readAssessmentPaidOrigin(store, 'p', reference(extraPending));
+  assert.ok(extraOrigin);
+  const oldTmpdir = process.env.TMPDIR;
+  t.after(() => { if (oldTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmpdir; });
+  process.env.TMPDIR = root;
+  const laterObserved = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'other-runtime-binding' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.ok(laterObserved.source);
+  const laterCitation = new Evidence(store).observe('p', reference(laterObserved.source),
+    { kind: 'json-pointer', pointer: '/result/stdout' });
+  const mixedReport: TechnicalReport = { ...report, documents: [report.documents![0]!,
+    { ...report.documents![0]!, id: 'runtime-second', citation: 1 }] };
+  const firstSupport = projectRuntimeSupportAt(store, 'p', spec.obligations![0]!.assignment!, cited.source);
+  const secondSupport = projectRuntimeSupportAt(store, 'p', spec.obligations![0]!.assignment!, laterCitation.source);
+  assert.ok(firstSupport && secondSupport);
+  assert.notDeepEqual(firstSupport.record.value.runtimeBinding, secondSupport.record.value.runtimeBinding);
+  assert.equal(collectRuntimeEvidence(store, 'p', spec, mixedReport, [cited, laterCitation]).proofs.length, 1,
+    'the current collector admits only the observation matching its entire runtime binding');
+  const mixedRuntime = { ...saved,
+    proofs: [saved.proofs[0]!, { ...saved.proofs[0]!, document: 'runtime-second',
+      observation: reference(secondSupport.record), source: laterCitation.source }],
+    supporting: [...saved.supporting, secondSupport.full],
+    guards: uniqueRefs([...saved.guards, ...secondSupport.guards]) };
+  assert.throws(() => readRuntimeEvidenceAt(store, 'p', spec, mixedReport, [cited, laterCitation], mixedRuntime),
+    { code: 'runtime_evidence_invalid' },
+    'two observed results with different saved process environments cannot form one paid runtime result');
+  if (oldTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmpdir;
+  const { projectId: _projectId, ...settings } = environment.value;
+  engine.environments.configure('p', { ...settings, implementer: { ...settings.implementer, model: 'later' } }, 1);
+  engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', code.revision);
+  unlinkSync(join(root, 'check.mjs'));
+  // After the environment, Source heads and files moved the current derivation lawfully differs; the historical replay
+  // derives the original selection from the saved admission material alone (№2141).
+  assert.throws(() => readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved), { code: 'runtime_evidence_invalid' },
+    'without the material a replay is only the current derivation, and today\'s admission moved');
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved, savedSelection.admission), saved,
+    'historical projection reads exact old Sources after their heads and files change');
+  assert.deepEqual(readAssessmentPaidOrigin(store, 'p', reference(pending))?.value, originalOrigin.value,
+    'the paid origin stays readable after environment, Source and filesystem changes');
+  assert.deepEqual(readAssessmentPaidOrigin(store, 'p', reference(extraPending))?.value, extraOrigin.value);
+
+  const fakeSource = reference(code);
+  const mutations: [string, (value: typeof saved) => typeof saved][] = [
+    ['source', value => ({ ...value, proofs: [{ ...value.proofs[0]!, source: fakeSource }] })],
+    ['authorization', value => ({ ...value, proofs: [{ ...value.proofs[0]!, authorization: reference(environment) }] })],
+    ['obligation', value => ({ ...value, proofs: [{ ...value.proofs[0]!, obligation: 'other' }] })],
+    ['document', value => ({ ...value, proofs: [{ ...value.proofs[0]!, document: 'other' }] })],
+    ['code', value => ({ ...value, proofs: [{ ...value.proofs[0]!, code: [reference(observed.source!)] }] })],
+    ['supporting', value => ({ ...value, supporting: [{ ...value.supporting[0]!, source: fakeSource }, ...value.supporting.slice(1)] })],
+    ['guards', value => ({ ...value, guards: value.guards.filter(guard => guard.id !== observed.source!.id) })],
+  ];
+  for (const [name, mutate] of mutations) {
+    const changed = mutate(saved);
+    const rehashed = store.write<typeof saved>({ id: `runtime-proof-forgery:${name}`, kind: 'runtime-proof-forgery',
+      expected: 0, value: changed });
+    assert.equal(rehashed.hash, hashJson(changed));
+    assert.throws(() => readRuntimeEvidenceAt(store, 'p', spec, report, [cited], rehashed.value, savedSelection.admission),
+      { code: 'runtime_evidence_invalid' }, `${name} must not gain authority through a consistent Store hash`);
+  }
+
+  const rewriteOrigin = (origin: typeof originalOrigin, value: unknown) => {
+    const db = new DatabaseSync(store.path);
+    try {
+      db.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+      db.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+        .run(canonical(value), hashJson(value), origin.id, origin.revision);
+    } finally { db.close(); }
+  };
+  for (const [name, value] of [
+    ['runtime source', { ...originalOrigin.value, runtime: mutations[0]![1](saved) }],
+    ['report', { ...originalOrigin.value, context: { ...context, value: { ...report, reason: 'Other report' } } }],
+    ['question', { ...originalOrigin.value, context: { ...context, question: { ...spec, field: 'other' } } }],
+    ['packet proof', { ...originalOrigin.value, context: { ...context, runtimeProofs: [] } }],
+  ] as const) {
+    rewriteOrigin(originalOrigin, value);
+    try {
+      assert.throws(() => readAssessmentPaidOrigin(store, 'p', reference(pending)),
+        { code: 'research_context_application_invalid' }, `the historical reader rejects rehashed ${name} substitution`);
+    } finally { rewriteOrigin(originalOrigin, originalOrigin.value); }
+  }
+  const forgedFullCitation = { ...fullCitation, value: { forged: true } };
+  const forgedExtraContext = { ...extraContext,
+    observations: [cited, forgedFullCitation, ...extraRuntime.supporting] };
+  rewriteOrigin(extraOrigin, { ...extraOrigin.value, context: forgedExtraContext });
+  try {
+    assert.throws(() => readAssessmentPaidOrigin(store, 'p', reference(extraPending)),
+      { code: 'research_context_application_invalid' },
+      'a rehashed unused full citation cannot suppress the authentic supporting quote after restart');
+  } finally { rewriteOrigin(extraOrigin, extraOrigin.value); }
+
+  const badPending = store.write({ id: 'research-turn:runtime-proof-forgery', kind: 'research-turn', expected: 0,
+    value: { action: { action: 'answer', question: question.id, value: report,
+      citations: [{ source: cited.source, selector: cited.selector }] }, status: 'pending', question: reference(question) } });
+  const malformed = { ...saved, proofs: [{ ...saved.proofs[0]!, authorization: reference(environment) }] };
+  await assert.rejects(assessmentSessionWithProof(store, draft, question, environment, environment.value, undefined,
+    context,
+    'Assess the exact saved runtime result', undefined, [], {
+      pending: reference(badPending), root, graph: null, legacyPaths: [],
+      reads: { contract: 'assessment-read/v1', reads: [], files: [] } as any, runtime: malformed, runtimeAdmission: savedSelection.admission }),
+  { code: 'research_context_application_invalid' }, 'the paid-origin producer must refuse before assessor dispatch');
+  for (const [name, altered] of [
+    ['report', { ...context, value: { ...report, reason: 'Other report' } }],
+    ['question', { ...context, question: { ...spec, field: 'other' } }],
+    ['packet proof', { ...context, runtimeProofs: [] }],
+  ] as const) {
+    await assert.rejects(assessmentSessionWithProof(store, draft, question, environment, environment.value, undefined,
+      altered, 'Assess the exact saved runtime result', undefined, [], { ...paidInput, pending: reference(badPending) }),
+    { code: 'research_context_application_invalid' }, `${name} substitution is rejected before dispatch`);
+  }
+  const extraBadPending = store.write({ id: 'research-turn:runtime-extra-forgery', kind: 'research-turn', expected: 0,
+    value: { action: { action: 'answer', question: question.id, value: report,
+      citations: extraCitations.map(item => ({ source: item.source, selector: item.selector })) },
+      status: 'pending', question: reference(question) } });
+  await assert.rejects(assessmentSessionWithProof(store, draft, question, environment, environment.value, undefined,
+    forgedExtraContext, 'Assess the exact saved runtime result', undefined, [],
+    { ...paidInput, pending: reference(extraBadPending), runtime: extraRuntime, runtimeAdmission: extraSelection.admission }),
+  { code: 'research_context_application_invalid' },
+  'an unused full citation with forged value is rejected before assessor dispatch');
+  assert.equal(store.list('model-call').length, 0);
+  assert.deepEqual(store.list('assessment-paid-origin').map(record => record.id).sort(),
+    [originalOrigin.id, extraOrigin.id].sort(),
+    'the forged paid turn creates no origin');
+  assert.throws(() => checkAssessmentRuntimeMaterials(store, 'p',
+    { ...saved, admissionGuards: [null] } as any, 'malformed-runtime'),
+  { code: 'research_context_application_invalid' }, 'malformed admission guards receive a typed refusal');
+});
+
+test('a paid L3 layer drift becomes an exact correctable refusal across restart', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-layer-refusal-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  const full = enrichedGraph(exampleGraph('p'), 'p');
+  preparedFeatures(engine, 'p', full);
+  const { level: _level, ...initial } = projectGraph(full, 1);
+  engine.graphs.save('p', initial, store.get('graph:p')!.revision, 'fixture');
+  writeFileSync(join(root, 'README.md'), 'A local scoped transformation with an atomic result and recovery.\n');
+  const adapter = join(root, 'adapter.mjs'), replies = join(root, 'replies.json'), wire = join(root, 'wire.ndjson');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,f=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role,mode:s.dispatchMode,previous:s.previousProposalRef??null})+'\\n');
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :s.dispatchMode==='planning'?{action:'synthesize',question:s.question.id}
+ :{action:'answer_delta',question:s.question.id,base:s.graphBase,
+   ...(s.previousProposalRef?{...f.correction,revises:s.previousProposalRef}:f.first),citations:f.citations};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const pilot = configureReaderPilot(store, engine.environments, 'p', {
+    experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command },
+    agentCommand: command, maxRequestChars: 100000, maxReadChars: 60000,
+    maxReplyChars: 100000, maxCalls: 12, maxReportedTokens: 100000,
+    planning: { fields: ['layerDesign'], maxRequestChars: 100000, maxRounds: 3 } }, 0);
+  configurePhasePolicy(store, 'p', 'L3', 'layer-refusal', 0);
+  const calibrated = pilotEnvironment(engine.environments.get('p').value, pilot.value);
+  for (const [purpose, role] of [['reading-planner', calibrated.implementer],
+    ['analyst', calibrated.implementer],
+    ['assessor', calibrated.reviewer]] as const) {
+    store.write<ModelCall>({ id: `model-call:layer-calibration-${purpose}`, kind: 'model-call', expected: 0,
+      value: { projectId: 'p', draftId: 'fixture', purpose, requestId: `layer-calibration-${purpose}`,
+        startedAt: 0, finishedAt: 1, status: 'succeeded', requested: role,
+        confirmed: { model: null, effort: null, speed: null },
+        request: { chars: 1000, bytes: 1000, hash: hashJson(purpose) }, response: null,
+        usage: { inputTokens: 100, outputTokens: 25, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+        usageSource: 'adapter', error: null } });
+  }
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+  engine.refinement.sealLayer('p', 1, 0);
+  const r1 = engine.refinement.begin('p', 'R1');
+  answerTechnicalFixture(engine, 'p', r1);
+  engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+  const l2 = engine.refinement.prepareLayer('p', 2);
+  const ready2 = answerLayerFixture(engine, 'p', l2, 2, full);
+  engine.refinement.buildLayer('p', 2, reference(ready2), store.get('graph:p')!.revision, 'fixture');
+  engine.refinement.sealLayer('p', 2, 0);
+  configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+    r1: reference(store.get('phase:p:R1')!), outcome: 'Validated local output',
+    nodes: full.nodes.filter(node => node.kind === 'operation').map(node => node.id),
+    boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+  const r2 = engine.refinement.begin('p', 'R2');
+  answerTechnicalFixture(engine, 'p', r2);
+  engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  const draft = engine.refinement.prepareLayer('p', 3);
+  configureBudgetSegment(store, 'p', 'layer-refusal');
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const source = engine.discovery.evidence.document('p', 'design-source',
+    'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
+  const citations = [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }];
+  const delta = layerDeltaView(store, 'p', layerDesignOf(full, 3, question.value.spec.layerAssembly),
+    3, question.value.spec.layerAssembly);
+  const block = full.nodes.find(node => node.kind === 'block')!;
+  const first = { horizon: delta.horizon,
+    upserts: { ...delta.upserts, nodes: [...(delta.upserts.nodes ?? []),
+      { id: block.id, purpose: 'Silent rewrite of accepted upper meaning' }] },
+    removes: delta.removes };
+  const correction = { upserts: { nodes: [{ id: block.id, purpose: block.purpose }] }, removes: {} };
+  writeFileSync(replies, JSON.stringify({ first, correction, citations }));
+
+  const result = await engine.researcher.run('p', draft.id, 4);
+  assert.equal(result.value.status, 'completed', JSON.stringify(store.list<ResearchTurn>('research-turn')
+    .filter(turn => turn.value.run === result.id).map(turn => ({ number: turn.value.number,
+      action: turn.value.action, error: turn.value.error, status: turn.value.status,
+      observation: turn.value.observation }))));
+  const drift = store.list<ResearchTurn>('research-turn').find(turn =>
+    (turn.value.observation as {code?: string} | null)?.code === 'upper_layer_drift');
+  assert.ok(drift, 'the first paid answer has a deterministic completed refusal');
+  assert.equal(drift.value.status, 'completed');
+  const corrected = store.list<ResearchTurn>('research-turn').find(turn =>
+    (turn.value.action as {revises?: unknown}).revises
+      && canonical((turn.value.action as {revises: unknown}).revises) === canonical(reference(drift)));
+  assert.ok(corrected, 'the second answer corrects the exact refused proposal');
+  assert.equal(corrected.value.error, null);
+  const sent = readFileSync(wire, 'utf8').trim().split('\n').length;
+  const cold = open();
+  assert.deepEqual(readResearchConsumerTurn(cold, reference(drift)), drift);
+  assert.equal((await new ProductEngine(cold).researcher.run('p', draft.id, 4)).value.status, 'completed');
+  assert.equal(readFileSync(wire, 'utf8').trim().split('\n').length, sent,
+    're-reading the accepted result sends no new model request');
+
+  const altered = { ...drift.value, error: 'Invented design rejection',
+    observation: { code: 'upper_layer_drift', details: { invented: true } } };
+  const db = new DatabaseSync(database);
+  try {
+    db.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    db.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+      .run(canonical(altered), hashJson(altered), drift.id, drift.revision);
+  } finally { db.close(); }
+  assert.throws(() => readResearchConsumerTurn(open(), { ...reference(drift), hash: hashJson(altered) }),
+    { code: 'research_consumer_intent_invalid' },
+    'a rehashed saved error cannot impersonate the refusal derived from the paid delta');
+});
+
+test('a paid full L3 answer is corrected from its exact graph and rejects a forged refusal', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-full-layer-refusal-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  const full = enrichedGraph(exampleGraph('p'), 'p');
+  preparedFeatures(engine, 'p', full);
+  const { level: _level, ...initial } = projectGraph(full, 1);
+  engine.graphs.save('p', initial, store.get('graph:p')!.revision, 'fixture');
+  writeFileSync(join(root, 'README.md'), 'An accepted scoped transformation with an atomic result.\n');
+  const adapter = join(root, 'adapter.mjs'), replies = join(root, 'replies.json'), wire = join(root, 'wire.ndjson');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,f=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role,history:s.history?.length??0})+'\\n');
+const q=s.questions?.[0],failed=(s.corrections??[]).some(t=>t.error&&t.question===q?.id);
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:q.id,value:failed?f.corrected:f.first,citations:f.citations};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+  engine.refinement.sealLayer('p', 1, 0);
+  const r1 = engine.refinement.begin('p', 'R1');
+  answerTechnicalFixture(engine, 'p', r1);
+  engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+  const l2 = engine.refinement.prepareLayer('p', 2);
+  const ready2 = answerLayerFixture(engine, 'p', l2, 2, full);
+  engine.refinement.buildLayer('p', 2, reference(ready2), store.get('graph:p')!.revision, 'fixture');
+  engine.refinement.sealLayer('p', 2, 0);
+  configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+    r1: reference(store.get('phase:p:R1')!), outcome: 'Validated local output',
+    nodes: full.nodes.filter(node => node.kind === 'operation').map(node => node.id),
+    boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+  const r2 = engine.refinement.begin('p', 'R2');
+  answerTechnicalFixture(engine, 'p', r2);
+  engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  const draft = engine.refinement.prepareLayer('p', 3);
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const source = engine.discovery.evidence.document('p', 'design-source',
+    'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
+  const citations = [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }];
+  const corrected = layerDesignOf(full, 3, question.value.spec.layerAssembly) as Record<string, any>;
+  const first = structuredClone(corrected);
+  first.nodes.find((node: {kind:string}) => node.kind === 'block').purpose = 'Silent rewrite of accepted upper meaning';
+  writeFileSync(replies, JSON.stringify({ first, corrected, citations }));
+
+  const result = await engine.researcher.run('p', draft.id, 4);
+  assert.equal(result.value.status, 'completed', JSON.stringify(store.list<ResearchTurn>('research-turn')
+    .filter(turn => turn.value.run === result.id).map(turn => ({ number: turn.value.number,
+      action: (turn.value.action as {action?:string}).action, error: turn.value.error,
+      observation: turn.value.observation }))));
+  const drift = store.list<ResearchTurn>('research-turn').find(turn => turn.value.run === result.id
+    && (turn.value.observation as {code?:string} | null)?.code === 'upper_layer_drift');
+  assert.ok(drift, 'the first full answer has a deterministic completed refusal');
+  assert.equal(drift.value.status, 'completed');
+  const correction = store.list<ResearchTurn>('research-turn').find(turn => turn.value.run === result.id
+    && turn.value.number > drift.value.number && turn.value.error === null
+    && (turn.value.action as {action?:string}).action === 'answer');
+  assert.ok(correction, 'the second full answer corrects the refused design');
+  const sent = readFileSync(wire, 'utf8').trim().split('\n').length;
+  const cold = open();
+  assert.deepEqual(readResearchConsumerTurn(cold, reference(drift)), drift);
+  assert.equal((await new ProductEngine(cold).researcher.run('p', draft.id, 4)).value.status, 'completed');
+  assert.equal(readFileSync(wire, 'utf8').trim().split('\n').length, sent,
+    're-reading the accepted result sends no new model request');
+
+  const altered = { ...drift.value, error: 'Invented design rejection',
+    observation: { code: 'upper_layer_drift', details: { invented: true } } };
+  const db = new DatabaseSync(database);
+  try {
+    db.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    db.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+      .run(canonical(altered), hashJson(altered), drift.id, drift.revision);
+  } finally { db.close(); }
+  assert.throws(() => readResearchConsumerTurn(open(), { ...reference(drift), hash: hashJson(altered) }),
+    { code: 'research_consumer_intent_invalid' },
+    'a rehashed error cannot impersonate the refusal derived from the paid full answer');
+});
+
+// ═══ Возврат №1 вердикта №2059: один класс — история/восстановление не должны
+// читать сегодняшние головы, а отсутствие части не выбирает другую эру.
+
+test('historical runtime replay reproduces a lawful one-of-two selection', async t => {
+  // reviewer-runtime-choice.mjs (R5/№1318-1)
+  const { configureResearchScope, scopedQuestions } = await import('../src/graph/research-scope.js');
+  const { withObligationEvidence } = await import('../src/graph/obligation-evidence.js');
+  const { collectRuntimeEvidence, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-runtime-choice-')));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Pinned runtime proof' });
+  const graph = { nodes: [{ id: 'n', code: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  store.write({ id: 'graph:p', kind: 'graph', expected: 0, value: graph });
+  const layer = store.write({ id: 'graph-layer:p:2', kind: 'graph-layer', expected: 0, value: { projection: graph } });
+  const gap = { id: 'boundary', target: 'n', field: 'code', consumer: 'compilation', requiredFor: 'next' as const,
+    question: 'Record the actual fixture invocation' };
+  const r1 = store.write({ id: 'runtime-r1', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', fields: { technical: { gaps: [gap] } } } });
+  const phase = store.write({ id: 'phase:p:R1', kind: 'phase', expected: 0, value: { draft: reference(r1) } });
+  const original = configureResearchScope(store, { projectId: 'p', layer: reference(layer), r1: reference(phase),
+    outcome: 'Keep the exact observed result', nodes: ['n'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
+    obligations: [{ gap, state: 'active', reason: 'Original requirement', wake: null }] }, 0);
+  writeFileSync(join(root, 'check.mjs'), "console.log('observed fixture result')\n");
+  const code = engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', 0);
+  const check = { script: reference(code), dependencies: [], subjects: [] as string[], executables: [] as string[],
+    args: [], timeoutMs: 4000, purpose: 'Observe the exact fixture invocation' };
+  const scope = configureResearchScope(store, { ...original.value, policy: { version: 1 as const, sourceScope: reference(original),
+    assignments: [{ obligation: gap.id, original: { record: reference(original), pointer: '/obligations/0/gap' },
+      kind: 'environment-confirmation' as const, moment: 'R2' as const, responsibleNode: 'n',
+      responsibleConsumer: 'compilation', neededForR2: true, reason: 'Observe actual execution', returnCondition: null,
+      runtimeCheck: check }] } }, 1);
+  const command = { executable: process.execPath, args: ['--version'] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const spec = withObligationEvidence(withTypedBasis(scopedQuestions(scope.value).find(item => item.obligations)!));
+  engine.discovery.create('p', 'om-g2', 'R2', 'compilation', [spec], [reference(scope)], 2);
+  const observed = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'proof' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.ok(observed.source);
+  const cited = new Evidence(store).observe('p', reference(observed.source), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const report: TechnicalReport = { applicability: 'applicable', reason: 'The command completed', facts: [],
+    designs: [{ id: 'd', decision: 'Use the observed result', benefit: 'An exact fixture result exists', consumer: 'compilation' }],
+    gaps: [], documents: [{ id: 'runtime', claim: 'The command emitted its result', kind: 'document-observation',
+      citation: 0, quote: String(cited.value).trim(), designs: ['d'], gaps: [] }],
+    coverage: [{ obligation: 'boundary', facts: [], designs: ['d'], gaps: [] }] };
+  const saved = collectRuntimeEvidence(store, 'p', spec, report, [cited]);
+  assert.equal(saved.proofs.length, 1);
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved), saved);
+  // A second lawful observation under a moved TMPDIR carries a different
+  // runtimeBinding; the collector selects only the one matching its own.
+  const oldTmpdir = process.env.TMPDIR;
+  t.after(() => { if (oldTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmpdir; });
+  process.env.TMPDIR = root;
+  const later = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'second-legal-runtime' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  const laterCitation = new Evidence(store).observe('p', reference(later.source!), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const mixedReport: TechnicalReport = { ...report,
+    documents: [report.documents![0]!, { ...report.documents![0]!, id: 'runtime-second', citation: 1 }] };
+  const legal = collectRuntimeEvidence(store, 'p', spec, mixedReport, [cited, laterCitation]);
+  assert.equal(legal.proofs.length, 1, 'admission selects only the observation of its own binding');
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, mixedReport, [cited, laterCitation], legal), legal,
+    'history reproduces the lawful one-of-two selection instead of demanding both');
+});
+
+test('historical runtime proof rejects subjects inconsistent with the declared check', async t => {
+  // reviewer-runtime-subjects.mjs (R6/№1318-5)
+  const { configureResearchScope, scopedQuestions } = await import('../src/graph/research-scope.js');
+  const { withObligationEvidence } = await import('../src/graph/obligation-evidence.js');
+  const { collectRuntimeEvidence, readRuntimeEvidenceAt, projectRuntimeSupportAt } = await import('../src/graph/runtime-evidence.js');
+  const { uniqueRefs } = await import('../src/pipeline/contracts.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-runtime-subjects-')));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Pinned runtime proof' });
+  const graph = { nodes: [{ id: 'n', code: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  store.write({ id: 'graph:p', kind: 'graph', expected: 0, value: graph });
+  const layer = store.write({ id: 'graph-layer:p:2', kind: 'graph-layer', expected: 0, value: { projection: graph } });
+  const gap = { id: 'boundary', target: 'n', field: 'code', consumer: 'compilation', requiredFor: 'next' as const,
+    question: 'Record the actual fixture invocation' };
+  const r1 = store.write({ id: 'runtime-r1', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', fields: { technical: { gaps: [gap] } } } });
+  const phase = store.write({ id: 'phase:p:R1', kind: 'phase', expected: 0, value: { draft: reference(r1) } });
+  const original = configureResearchScope(store, { projectId: 'p', layer: reference(layer), r1: reference(phase),
+    outcome: 'Keep the exact observed result', nodes: ['n'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
+    obligations: [{ gap, state: 'active', reason: 'Original requirement', wake: null }] }, 0);
+  writeFileSync(join(root, 'check.mjs'), "console.log('observed fixture result')\n");
+  const code = engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', 0);
+  const check = { script: reference(code), dependencies: [], subjects: ['check.mjs'], executables: [] as string[],
+    args: [], timeoutMs: 4000, purpose: 'Observe the exact fixture invocation' };
+  const scope = configureResearchScope(store, { ...original.value, policy: { version: 1 as const, sourceScope: reference(original),
+    assignments: [{ obligation: gap.id, original: { record: reference(original), pointer: '/obligations/0/gap' },
+      kind: 'environment-confirmation' as const, moment: 'R2' as const, responsibleNode: 'n',
+      responsibleConsumer: 'compilation', neededForR2: true, reason: 'Observe actual execution', returnCondition: null,
+      runtimeCheck: check }] } }, 1);
+  const command = { executable: process.execPath, args: ['--version'] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const spec = withObligationEvidence(withTypedBasis(scopedQuestions(scope.value).find(item => item.obligations)!));
+  engine.discovery.create('p', 'om-g2', 'R2', 'compilation', [spec], [reference(scope)], 2);
+  const observed = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'proof' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.ok(observed.source);
+  const cited = new Evidence(store).observe('p', reference(observed.source), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const report: TechnicalReport = { applicability: 'applicable', reason: 'The command completed', facts: [],
+    designs: [{ id: 'd', decision: 'Use the observed result', benefit: 'An exact fixture result exists', consumer: 'compilation' }],
+    gaps: [], documents: [{ id: 'runtime', claim: 'The command emitted its result', kind: 'document-observation',
+      citation: 0, quote: String(cited.value).trim(), designs: ['d'], gaps: [] }],
+    coverage: [{ obligation: 'boundary', facts: [], designs: ['d'], gaps: [] }] };
+  const saved = collectRuntimeEvidence(store, 'p', spec, report, [cited]);
+  assert.equal(saved.proofs.length, 1);
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved), saved);
+  // A historically consistent record whose subjects were emptied still fails:
+  // subject count/order/requested/kind is a subject-matter check, not storage.
+  const { runtimeSource } = await import('../src/runtime/runtime-observation-model.js');
+  const value = { ...observed.observation.value, subjects: [] };
+  const altered = { ...observed.observation, value, hash: hashJson(value) };
+  const projected = runtimeSource(altered as any);
+  const source = { id: projected.id, kind: 'source', revision: 1, value: projected.value, hash: hashJson(projected.value) };
+  const view = new Proxy(store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) =>
+      id === altered.id ? altered as any : id === source.id ? source as any : target.get(id, revision as any);
+    const member = Reflect.get(target, key, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } }) as unknown as Store;
+  const citation = new Evidence(view).observe('p', reference(source as any), cited.selector);
+  const support = projectRuntimeSupportAt(view, 'p', (spec.obligations![0] as any).assignment, reference(source as any));
+  const replaced = { ...saved,
+    proofs: saved.proofs.map(proof => ({ ...proof, source: reference(source as any), observation: reference(altered as any) })),
+    supporting: [support!.full, ...support!.code],
+    guards: uniqueRefs(saved.guards.map(ref => ref.id === observed.observation.id ? reference(altered as any)
+      : ref.id === observed.source!.id ? reference(source as any) : ref)) };
+  assert.throws(() => readRuntimeEvidenceAt(view, 'p', spec, report, [citation], replaced as any),
+    { code: 'runtime_evidence_invalid' },
+    'historical runtime must enforce declared subject count/order/kind');
+});
+
+test('a paid L3 terminal binds from its exact original graph after the head moved', async t => {
+  // reviewer-l3-graph.mjs (R11/№1318-2)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-layer-graph-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  const full = enrichedGraph(exampleGraph('p'), 'p');
+  preparedFeatures(engine, 'p', full);
+  const { level: _level, ...initial } = projectGraph(full, 1);
+  engine.graphs.save('p', initial, store.get('graph:p')!.revision, 'fixture');
+  writeFileSync(join(root, 'README.md'), 'A local scoped transformation with an atomic result and recovery.\n');
+  const adapter = join(root, 'adapter.mjs'), replies = join(root, 'replies.json'), wire = join(root, 'wire.ndjson');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,f=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role,mode:s.dispatchMode,previous:s.previousProposalRef??null})+'\\n');
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :s.dispatchMode==='planning'?{action:'synthesize',question:s.question.id}
+ :{action:'answer_delta',question:s.question.id,base:s.graphBase,
+   ...(s.previousProposalRef?{...f.correction,revises:s.previousProposalRef}:f.first),citations:f.citations};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const pilot = configureReaderPilot(store, engine.environments, 'p', {
+    experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command },
+    agentCommand: command, maxRequestChars: 100000, maxReadChars: 60000,
+    maxReplyChars: 100000, maxCalls: 12, maxReportedTokens: 100000,
+    planning: { fields: ['layerDesign'], maxRequestChars: 100000, maxRounds: 3 } }, 0);
+  configurePhasePolicy(store, 'p', 'L3', 'layer-refusal', 0);
+  const calibrated = pilotEnvironment(engine.environments.get('p').value, pilot.value);
+  for (const [purpose, role] of [['reading-planner', calibrated.implementer],
+    ['analyst', calibrated.implementer], ['assessor', calibrated.reviewer]] as const) {
+    store.write({ id: `model-call:layer-calibration-${purpose}`, kind: 'model-call', expected: 0,
+      value: { projectId: 'p', draftId: 'fixture', purpose, requestId: `layer-calibration-${purpose}`,
+        startedAt: 0, finishedAt: 1, status: 'succeeded', requested: role,
+        confirmed: { model: null, effort: null, speed: null },
+        request: { chars: 1000, bytes: 1000, hash: hashJson(purpose) }, response: null,
+        usage: { inputTokens: 100, outputTokens: 25, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+        usageSource: 'adapter', error: null } });
+  }
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+  engine.refinement.sealLayer('p', 1, 0);
+  const r1 = engine.refinement.begin('p', 'R1');
+  answerTechnicalFixture(engine, 'p', r1);
+  engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+  const l2 = engine.refinement.prepareLayer('p', 2);
+  const ready2 = answerLayerFixture(engine, 'p', l2, 2, full);
+  engine.refinement.buildLayer('p', 2, reference(ready2), store.get('graph:p')!.revision, 'fixture');
+  engine.refinement.sealLayer('p', 2, 0);
+  configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+    r1: reference(store.get('phase:p:R1')!), outcome: 'Validated local output',
+    nodes: full.nodes.filter(node => node.kind === 'operation').map(node => node.id),
+    boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+  const r2 = engine.refinement.begin('p', 'R2');
+  answerTechnicalFixture(engine, 'p', r2);
+  engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  const draft = engine.refinement.prepareLayer('p', 3);
+  configureBudgetSegment(store, 'p', 'layer-refusal');
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const source = engine.discovery.evidence.document('p', 'design-source',
+    'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
+  const citations = [{ source: reference(source), selector: { kind: 'text-range' as const, start: 0, end: source.value.content.length } }];
+  const delta = layerDeltaView(store, 'p', layerDesignOf(full, 3, question.value.spec.layerAssembly), 3,
+    question.value.spec.layerAssembly);
+  writeFileSync(replies, JSON.stringify({ first: { horizon: delta.horizon, upserts: delta.upserts, removes: delta.removes },
+    correction: { upserts: {}, removes: {} }, citations }));
+  const originalWriteMany = store.writeMany.bind(store);
+  let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = originalWriteMany(writes, guards);
+    if (!interrupted && writes.some(w => w.kind === 'assessment-application' && (w.value as {state?:string}).state === 'applied')
+      && writes.some(w => w.kind === 'assessment-session' && (w.value as {result?:unknown}).result !== null)) {
+      interrupted = true;
+      throw new EngineError('fixture_after_paid_assessor', 'terminal saved before binding');
+    }
+    return rows;
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 4);
+  store.writeMany = originalWriteMany;
+  assert.equal(interrupted, true, 'legitimate L3 must reach paid terminal');
+  const pending = store.list<ResearchTurn>('research-turn')
+    .find(turn => turn.value.status === 'pending' && (turn.value.action as any)?.action === 'answer_delta');
+  assert.ok(pending);
+  assert.equal(store.list('research-assessment-binding').length, 0);
+  const graph2 = store.get<Graph>('graph:p')!, block = graph2.value.nodes.find(n => n.kind === 'block')!;
+  engine.graphs.save('p', { ...graph2.value,
+    nodes: graph2.value.nodes.map(n => n.id === block.id ? { ...n, purpose: `${n.purpose} independently revised` } : n) },
+    graph2.revision, 'fixture');
+  await new ProductEngine(open()).researcher.run('p', draft.id, 1);
+  assert.equal(store.list('research-assessment-binding').length, 1,
+    'L3 terminal must bind using its original upper graph');
+});
+
+test('a moved question head binds the paid terminal before lawful retirement', async t => {
+  // reviewer-question-head.mjs (№2000-8)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-question-head-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Assessment head drift' });
+  const source = engine.discovery.evidence.document('p', 'proof', 'One exact documentary observation', 'text/plain', 0);
+  const adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:s.questions[0].id,value:{ok:true},
+   citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:12}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+    [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+  const originalWriteMany = store.writeMany.bind(store);
+  let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = originalWriteMany(writes, guards);
+    if (!interrupted && writes.some(w => w.kind === 'assessment-application' && (w.value as {state?:string}).state === 'applied')
+      && writes.some(w => w.kind === 'assessment-session' && (w.value as {result?:unknown}).result !== null)) {
+      interrupted = true;
+      throw new EngineError('fixture_after_paid_assessor', 'The paid verdict was applied before its assessment binding');
+    }
+    return rows;
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = originalWriteMany;
+  assert.equal(interrupted, true);
+  assert.equal(store.list('research-assessment-binding').length, 0);
+  const pending = store.list<ResearchTurn>('research-turn')[0]!;
+  const origin = readAssessmentPaidOrigin(store, 'p', reference(pending));
+  assert.ok(origin);
+  assert.equal(origin.value.root, root);
+  assert.equal(origin.value.dispatch.workspace, root);
+  assert.equal(store.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor').length, 1);
+  // A lawful owner decision moves the question head after the paid terminal.
+  engine.discovery.decision((pending.value.question as Ref).id, (pending.value.question as Ref).revision, 'owner', { ok: true });
+  await new ProductEngine(open()).researcher.run('p', draft.id, 1);
+  assert.equal(store.list('research-assessment-binding').length, 1,
+    'paid terminal must bind before retiring a question that moved');
+});
+
+test('a deactivated pilot binds the applied paid terminal before refusing new work', async t => {
+  // reviewer-pilot-head.mjs (№2000-8)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-pilot-head-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  const full = enrichedGraph(exampleGraph('p'), 'p');
+  preparedFeatures(engine, 'p', full);
+  const { level: _level, ...initial } = projectGraph(full, 1);
+  engine.graphs.save('p', initial, store.get('graph:p')!.revision, 'fixture');
+  writeFileSync(join(root, 'README.md'), 'A local scoped transformation with an atomic result and recovery.\n');
+  const adapter = join(root, 'adapter.mjs'), replies = join(root, 'replies.json'), wire = join(root, 'wire.ndjson');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,f=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role,mode:s.dispatchMode,previous:s.previousProposalRef??null})+'\\n');
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :s.dispatchMode==='planning'?{action:'synthesize',question:s.question.id}
+ :{action:'answer_delta',question:s.question.id,base:s.graphBase,
+   ...(s.previousProposalRef?{...f.correction,revises:s.previousProposalRef}:f.first),citations:f.citations};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const pilot = configureReaderPilot(store, engine.environments, 'p', {
+    experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command },
+    agentCommand: command, maxRequestChars: 100000, maxReadChars: 60000,
+    maxReplyChars: 100000, maxCalls: 12, maxReportedTokens: 100000,
+    planning: { fields: ['layerDesign'], maxRequestChars: 100000, maxRounds: 3 } }, 0);
+  configurePhasePolicy(store, 'p', 'L3', 'layer-refusal', 0);
+  const calibrated = pilotEnvironment(engine.environments.get('p').value, pilot.value);
+  for (const [purpose, role] of [['reading-planner', calibrated.implementer],
+    ['analyst', calibrated.implementer], ['assessor', calibrated.reviewer]] as const) {
+    store.write({ id: `model-call:layer-calibration-${purpose}`, kind: 'model-call', expected: 0,
+      value: { projectId: 'p', draftId: 'fixture', purpose, requestId: `layer-calibration-${purpose}`,
+        startedAt: 0, finishedAt: 1, status: 'succeeded', requested: role,
+        confirmed: { model: null, effort: null, speed: null },
+        request: { chars: 1000, bytes: 1000, hash: hashJson(purpose) }, response: null,
+        usage: { inputTokens: 100, outputTokens: 25, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+        usageSource: 'adapter', error: null } });
+  }
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+  engine.refinement.sealLayer('p', 1, 0);
+  const r1 = engine.refinement.begin('p', 'R1');
+  answerTechnicalFixture(engine, 'p', r1);
+  engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+  const l2 = engine.refinement.prepareLayer('p', 2);
+  const ready2 = answerLayerFixture(engine, 'p', l2, 2, full);
+  engine.refinement.buildLayer('p', 2, reference(ready2), store.get('graph:p')!.revision, 'fixture');
+  engine.refinement.sealLayer('p', 2, 0);
+  configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+    r1: reference(store.get('phase:p:R1')!), outcome: 'Validated local output',
+    nodes: full.nodes.filter(node => node.kind === 'operation').map(node => node.id),
+    boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+  const r2 = engine.refinement.begin('p', 'R2');
+  answerTechnicalFixture(engine, 'p', r2);
+  engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  const draft = engine.refinement.prepareLayer('p', 3);
+  configureBudgetSegment(store, 'p', 'layer-refusal');
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const source = engine.discovery.evidence.document('p', 'design-source',
+    'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
+  const citations = [{ source: reference(source), selector: { kind: 'text-range' as const, start: 0, end: source.value.content.length } }];
+  const delta = layerDeltaView(store, 'p', layerDesignOf(full, 3, question.value.spec.layerAssembly), 3,
+    question.value.spec.layerAssembly);
+  writeFileSync(replies, JSON.stringify({ first: { horizon: delta.horizon, upserts: delta.upserts, removes: delta.removes },
+    correction: { upserts: {}, removes: {} }, citations }));
+  const originalWriteMany = store.writeMany.bind(store);
+  let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = originalWriteMany(writes, guards);
+    if (!interrupted && writes.some(w => w.kind === 'assessment-application' && (w.value as {state?:string}).state === 'applied')
+      && writes.some(w => w.kind === 'assessment-session' && (w.value as {result?:unknown}).result !== null)) {
+      interrupted = true;
+      throw new EngineError('fixture_after_paid_assessor', 'terminal saved before binding');
+    }
+    return rows;
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 4);
+  store.writeMany = originalWriteMany;
+  assert.equal(interrupted, true, 'legitimate L3 must reach paid terminal');
+  const pending = store.list<ResearchTurn>('research-turn')
+    .find(turn => turn.value.status === 'pending' && (turn.value.action as any)?.action === 'answer_delta');
+  assert.ok(pending);
+  assert.equal(store.list('research-assessment-binding').length, 0);
+  // Deactivating today's pilot admits no NEW work, but the applied paid
+  // terminal must still bind first.
+  const { projectId: _projectId, ...settings } = pilot.value as any;
+  configureReaderPilot(store, engine.environments, 'p', { ...settings, active: false }, pilot.revision);
+  try { await new ProductEngine(open()).researcher.run('p', draft.id, 1); }
+  catch { /* the deactivated pilot still refuses NEW work after the bind */ }
+  assert.equal(store.list('research-assessment-binding').length, 1,
+    'a current pilot restriction must not discard an applied terminal assessment');
+});
+
+test('a managed paid turn with a missing origin refuses instead of choosing a legacy era', async t => {
+  // reviewer-missing-origin.mjs (R19/№2000-12)
+  const root = mkdtempSync(join(tmpdir(), 'omg-d84-missing-origin-'));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Assessment missing origin' });
+  const source = engine.discovery.evidence.document('p', 'proof', 'One exact documentary observation', 'text/plain', 0);
+  const adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:'insufficient',reasons:['The fixture did not support acceptance']}
+ :{action:'answer',question:s.questions[0].id,value:{ok:true},
+   citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:12}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+    [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+  await engine.researcher.run('p', draft.id, 1);
+  const assessment = store.list<import('../src/discovery/research-model.js').ResearchAssessment>('research-assessment')[0]!, turn = store.list<ResearchTurn>('research-turn')[0]!;
+  assert.equal(assessment.value.verdict, 'insufficient');
+  const proved = readResearchAssessmentAt(open(), 'p', turn.id, reference(assessment));
+  assert.deepEqual(proved.value, assessment.value);
+  const proof = store.get(`research-assessment-binding:v1:${hashJson({ projectId: 'p', turnId: turn.id })}`)!;
+  assert.ok(proof);
+  // Losing M must not silently pick the legacy era: the turn's stable links
+  // (session, binding) still prove the managed paid era → typed refusal.
+  const mid = store.list('assessment-paid-origin')[0]!.id;
+  const hidden = new Proxy(store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) => id === mid ? null : target.get(id, revision as any);
+    const value = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } }) as unknown as Store;
+  assert.throws(() => readResearchConsumerTurn(hidden, reference(turn)),
+    { code: 'research_context_application_invalid' },
+    'v2 completed turn must not fall back when its mandatory M is missing');
+});
+
+test('historical runtime replay reproduces selection when a declared subject changed under one binding', async t => {
+  // reviewer-runtime-subject-selection.mjs (№1971-4/№2000-5): two lawful
+  // observations share one runtimeBinding but differ in subject.txt content —
+  // the collector keeps only the one matching the admission snapshot, and the
+  // historical replay must derive that same selection from saved material.
+  const { configureResearchScope, scopedQuestions } = await import('../src/graph/research-scope.js');
+  const { withObligationEvidence } = await import('../src/graph/obligation-evidence.js');
+  const { collectRuntimeEvidence, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-runtime-subject-')));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Pinned runtime proof' });
+  const graph = { nodes: [{ id: 'n', code: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  store.write({ id: 'graph:p', kind: 'graph', expected: 0, value: graph });
+  const layer = store.write({ id: 'graph-layer:p:2', kind: 'graph-layer', expected: 0, value: { projection: graph } });
+  const gap = { id: 'boundary', target: 'n', field: 'code', consumer: 'compilation', requiredFor: 'next' as const,
+    question: 'Record the actual fixture invocation' };
+  const r1 = store.write({ id: 'runtime-r1', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', fields: { technical: { gaps: [gap] } } } });
+  const phase = store.write({ id: 'phase:p:R1', kind: 'phase', expected: 0, value: { draft: reference(r1) } });
+  const original = configureResearchScope(store, { projectId: 'p', layer: reference(layer), r1: reference(phase),
+    outcome: 'Keep the exact observed result', nodes: ['n'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
+    obligations: [{ gap, state: 'active', reason: 'Original requirement', wake: null }] }, 0);
+  writeFileSync(join(root, 'check.mjs'), "console.log('observed fixture result')\n");
+  const code = engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', 0);
+  const check = { script: reference(code), dependencies: [], subjects: ['subject.txt'], executables: [] as string[],
+    args: [], timeoutMs: 4000, purpose: 'Observe the exact fixture invocation' };
+  const scope = configureResearchScope(store, { ...original.value, policy: { version: 1 as const, sourceScope: reference(original),
+    assignments: [{ obligation: gap.id, original: { record: reference(original), pointer: '/obligations/0/gap' },
+      kind: 'environment-confirmation' as const, moment: 'R2' as const, responsibleNode: 'n',
+      responsibleConsumer: 'compilation', neededForR2: true, reason: 'Observe actual execution', returnCondition: null,
+      runtimeCheck: check }] } }, 1);
+  const command = { executable: process.execPath, args: ['--version'] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const spec = withObligationEvidence(withTypedBasis(scopedQuestions(scope.value).find(item => item.obligations)!));
+  engine.discovery.create('p', 'om-g2', 'R2', 'compilation', [spec], [reference(scope)], 2);
+  writeFileSync(join(root, 'subject.txt'), 'first subject bytes');
+  const observed = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'proof' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.ok(observed.source);
+  const cited = new Evidence(store).observe('p', reference(observed.source), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const report: TechnicalReport = { applicability: 'applicable', reason: 'The command completed', facts: [],
+    designs: [{ id: 'd', decision: 'Use the observed result', benefit: 'An exact fixture result exists', consumer: 'compilation' }],
+    gaps: [], documents: [{ id: 'runtime', claim: 'The command emitted its result', kind: 'document-observation',
+      citation: 0, quote: String(cited.value).trim(), designs: ['d'], gaps: [] }],
+    coverage: [{ obligation: 'boundary', facts: [], designs: ['d'], gaps: [] }] };
+  const saved = collectRuntimeEvidence(store, 'p', spec, report, [cited]);
+  assert.equal(saved.proofs.length, 1);
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, report, [cited], saved), saved);
+  // The declared subject's content moves under the SAME runtimeBinding —
+  // the original admission snapshot distinguishes what the binding cannot.
+  writeFileSync(join(root, 'subject.txt'), 'second changed subject bytes');
+  const later = await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key: 'second-legal-runtime' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  assert.equal(canonical(observed.observation.value.runtimeBinding), canonical(later.observation.value.runtimeBinding),
+    'both observations share one binding — the difference is the subject identity');
+  const laterCitation = new Evidence(store).observe('p', reference(later.source!), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const mixedReport: TechnicalReport = { ...report,
+    documents: [report.documents![0]!, { ...report.documents![0]!, id: 'runtime-second', citation: 1 }] };
+  const legal = collectRuntimeEvidence(store, 'p', spec, mixedReport, [cited, laterCitation]);
+  assert.equal(legal.proofs.length, 1, 'admission keeps only the observation matching the subject identity');
+  assert.deepEqual(readRuntimeEvidenceAt(store, 'p', spec, mixedReport, [cited, laterCitation], legal), legal,
+    'history derives the lawful exclusion from the saved admission basis, not the binding alone');
+});
+
+test('a paid terminal binds before the moved execution root refuses new work', async t => {
+  // reviewer-execution-root.mjs (№2000-8): after terminal S/applied A with no
+  // R/B, a new commit inside the execution worktree must not prevent binding —
+  // the proven paid terminal restores before any current environment check.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-exec-root-')));
+  const database = join(root, 'state.sqlite');
+  const stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Frozen assessor origin' });
+  const workspace = join(root, 'repo'); mkdirSync(workspace);
+  const file = join(workspace, 'source.txt');
+  writeFileSync(file, 'This exact local condition supports the proposed result.');
+  const source = engine.discovery.evidence.file('p', 'source', workspace, 'source.txt', 'text/plain', 0);
+  const wire = join(root, 'calls.ndjson'), adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const request=JSON.parse(readFileSync(0,'utf8')),subject=request.subject;
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:subject.role,requestId:request.requestId})+'\\n');
+const research=subject.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:subject.questions[0].id,value:{ok:true},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
+console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const { ensureWorktree } = await import('../src/execution/worktree.js');
+  const { git } = await import('../src/runtime/environment.js');
+  git(workspace, ['init', '-b', 'main']);
+  git(workspace, ['add', 'source.txt']);
+  git(workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'fixture']);
+  const execution = ensureWorktree(store, engine.environments,
+    { projectId: 'p', base: { root: workspace, head: git(workspace, ['rev-parse', 'HEAD']) } } as Parameters<typeof ensureWorktree>[2]);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+    [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+  const original = store.writeMany.bind(store);
+  let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = original(writes, guards);
+    if (!interrupted && writes.some(write => write.kind === 'assessment-application'
+      && (write.value as { state?: string }).state === 'applied')
+      && writes.some(write => write.kind === 'assessment-session'
+        && (write.value as { result?: unknown }).result !== null)) {
+      interrupted = true;
+      throw new EngineError('fixture_after_paid_assessor', 'The paid verdict was applied before its assessment binding');
+    }
+    return rows;
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = original;
+  assert.equal(interrupted, true);
+  assert.equal(store.list('research-assessment-binding').length, 0);
+  const pending = store.list('research-turn')[0]!;
+  const origin = readAssessmentPaidOrigin(store, 'p', reference(pending));
+  assert.ok(origin);
+  assert.equal(origin.value.root, execution.value.path);
+  assert.equal(origin.value.dispatch.workspace, execution.value.path);
+  assert.equal(store.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor').length, 1);
+  git(execution.value.path, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    'commit', '--allow-empty', '-m', 'move-after-terminal']);
+  let result: unknown;
+  try { result = await new ProductEngine(open()).researcher.run('p', draft.id, 1); }
+  catch (error) { result = { code: (error as EngineError).code, message: (error as EngineError).message }; }
+  assert.equal(store.list('research-assessment-binding').length, 1,
+    'paid terminal must bind before current execution-root admission refuses');
+  assert.equal(store.list<ModelCall>('model-call').filter(call => call.value.purpose === 'assessor').length, 1,
+    'the bound terminal is the saved paid call, not a new dispatch');
+  const outcome = result as { code?: string };
+  assert.equal(outcome.code, 'execution_root_recovery',
+    'new work still refuses on the moved execution root — admission is not weakened');
+});
+
+// ---- D8.4d fourth round (№2141): the admission material at the moment of assessment, one derivation of the selected and
+// the excluded candidates for the current and the historical mode, the proof before the first write of M, the addressed
+// refusal on loss, and the lawful zero selection only on a proved exclusion. Reviewer probes №2140 — permanent regressions.
+async function runtimeSelectionFixture(t: import('node:test').TestContext, subjects: string[] = ['subject.txt']) {
+  const { configureResearchScope, scopedQuestions } = await import('../src/graph/research-scope.js');
+  const { withObligationEvidence } = await import('../src/graph/obligation-evidence.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84d-runtime-admission-')));
+  const database = join(root, 'db.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  const store = open();
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Pinned runtime proof' });
+  const graph = { nodes: [{ id: 'n', code: [] }], horizon: [], connectors: [], tests: [], anchors: [] } as unknown as Graph;
+  store.write({ id: 'graph:p', kind: 'graph', expected: 0, value: graph });
+  const layer = store.write({ id: 'graph-layer:p:2', kind: 'graph-layer', expected: 0, value: { projection: graph } });
+  const gap = { id: 'boundary', target: 'n', field: 'code', consumer: 'compilation', requiredFor: 'next' as const,
+    question: 'Record the actual fixture invocation' };
+  const r1 = store.write({ id: 'runtime-r1', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', fields: { technical: { gaps: [gap] } } } });
+  const phase = store.write({ id: 'phase:p:R1', kind: 'phase', expected: 0, value: { draft: reference(r1) } });
+  const original = configureResearchScope(store, { projectId: 'p', layer: reference(layer), r1: reference(phase),
+    outcome: 'Keep the exact observed result', nodes: ['n'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
+    obligations: [{ gap, state: 'active', reason: 'Original requirement', wake: null }] }, 0);
+  writeFileSync(join(root, 'check.mjs'), "console.log('observed fixture result')\n");
+  const code = engine.discovery.evidence.file('p', 'runtime-check', root, 'check.mjs', 'text/plain', 0);
+  const check = { script: reference(code), dependencies: [], subjects, executables: [] as string[],
+    args: [], timeoutMs: 4000, purpose: 'Observe the exact fixture invocation' };
+  const scope = configureResearchScope(store, { ...original.value, policy: { version: 1 as const, sourceScope: reference(original),
+    assignments: [{ obligation: gap.id, original: { record: reference(original), pointer: '/obligations/0/gap' },
+      kind: 'environment-confirmation' as const, moment: 'R2' as const, responsibleNode: 'n',
+      responsibleConsumer: 'compilation', neededForR2: true, reason: 'Observe actual execution', returnCondition: null,
+      runtimeCheck: check }] } }, 1);
+  const command = { executable: process.execPath, args: ['--version'] };
+  const environment = engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const spec = withObligationEvidence(withTypedBasis(scopedQuestions(scope.value).find(item => item.obligations)!));
+  const draft = engine.discovery.create('p', 'om-g2', 'R2', 'compilation', [spec], [reference(scope)], 2);
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  for (const subject of subjects) writeFileSync(join(root, subject), 'first subject bytes');
+  const observe = async (key: string) => await engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(scope),
+    obligation: 'boundary', key }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  const cite = (source: Revision<Source>) => new Evidence(store).observe('p', reference(source), { kind: 'json-pointer', pointer: '/result/stdout' });
+  const report = (first: Observation, others: Observation[] = []): TechnicalReport => ({ applicability: 'applicable', reason: 'The command completed', facts: [],
+    designs: [{ id: 'd', decision: 'Use the observed result', benefit: 'An exact fixture result exists', consumer: 'compilation' }],
+    gaps: [], documents: [{ id: 'runtime', claim: 'The command emitted its result', kind: 'document-observation',
+      citation: 0, quote: String(first.value).trim(), designs: ['d'], gaps: [] },
+      ...others.map((_item, index) => ({ id: `runtime-${index + 2}`, claim: 'The command emitted its result', kind: 'document-observation' as const,
+        citation: index + 1, quote: String(first.value).trim(), designs: ['d'], gaps: [] }))],
+    coverage: [{ obligation: 'boundary', facts: [], designs: ['d'], gaps: [] }] });
+  const empty = { proofs: [], supporting: [], guards: [], admissionGuards: [] };
+  const hiding = (db: Store, id: string): Store => new Proxy(db, { get(target, key) {
+    if (key === 'get') return (record: string, revision?: number) => record === id ? undefined : target.get(record, revision);
+    const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  /** The direct session entry stopped right after M (before any model call), as the reviewer's probe drives it. */
+  const sessionUntilOrigin = async (db: Store, context: Record<string, unknown>, input: Record<string, unknown>) => {
+    const { assessmentSessionWithProof } = await import('../src/discovery/assessment-session.js');
+    const baseWriteMany = db.writeMany.bind(db);
+    db.writeMany = ((writes: Write[], guards = []) => {
+      const rows = baseWriteMany(writes, guards);
+      if (writes.some(write => write.kind === 'assessment-paid-origin')) throw new EngineError('fixture_after_runtime_origin', 'Stop after M before any model call');
+      return rows;
+    }) as typeof db.writeMany;
+    try { await assessmentSessionWithProof(db, draft, question, environment, environment.value, undefined, context as any,
+      'Assess the exact saved runtime result', undefined, [], input as any); return null; }
+    catch (error) { return error instanceof EngineError ? error.code : String(error); }
+    finally { db.writeMany = baseWriteMany; }
+  };
+  const pendingTurn = (key: string, citations: Observation[], value: TechnicalReport) => store.write({ id: `research-turn:${key}`, kind: 'research-turn', expected: 0,
+    value: { action: { action: 'answer', question: question.id, value, citations: citations.map(item => ({ source: item.source, selector: item.selector })) },
+      status: 'pending', question: reference(question) } });
+  const input = (pending: Revision<unknown>, runtime: unknown, runtimeAdmission?: unknown) => ({ pending: reference(pending), root, graph: null, legacyPaths: [],
+    reads: { contract: 'assessment-read/v1', reads: [], files: [] }, runtime, ...(runtimeAdmission === undefined ? {} : { runtimeAdmission }) });
+  return { root, store, open, engine, scope, spec, draft, question, environment, check, observe, cite, report, empty, hiding, sessionUntilOrigin, pendingTurn, input };
+}
+const withTmpdir = (t: import('node:test').TestContext, value: string) => {
+  const old = process.env.TMPDIR;
+  t.after(() => { if (old === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = old; });
+  process.env.TMPDIR = value;
+};
+
+test('D8.4d-4 A2/A5: an empty selection must not erase an admitted runtime candidate — the material records the admitted candidate and the replay, current or historical, derives it back (reviewer probe №2140-1)', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited);
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.equal(selection.runtime.proofs.length, 1); assert.equal(selection.runtime.supporting.length, 2);
+  assert.equal(selection.admission.contract, 'runtime-admission/v1');
+  assert.deepEqual(selection.admission.references.map(item => [item.basis !== null, item.unresolved]), [[true, null]], 'one live reference for the declared check');
+  assert.deepEqual(selection.admission.candidates.map(item => [item.admitted, item.mismatch, item.observation]), [[true, [], reference(observed.observation)]]);
+  assert.deepEqual(readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], selection.runtime), selection.runtime, 'the current replay');
+  assert.deepEqual(readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], selection.runtime, selection.admission), selection.runtime, 'the historical replay from the material');
+  assert.throws(() => readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], f.empty), { code: 'runtime_evidence_invalid' }, 'an empty result is not the current derivation');
+  assert.throws(() => readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], f.empty, selection.admission), { code: 'runtime_evidence_invalid' }, 'an empty result contradicts the admitted candidate of the material');
+  const forged = { ...selection.admission, candidates: selection.admission.candidates.map(item => ({ ...item, admitted: false, mismatch: ['binding'] })) };
+  assert.throws(() => readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], f.empty, forged), { code: 'runtime_evidence_invalid' }, 'a claimed exclusion re-derives from the exact record, never from the claim');
+});
+
+test('D8.4d-4 A2/A5: a lawfully excluded candidate whose exact observation is lost is an addressed refusal, never a proved exclusion (reviewer probe №2140-2)', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const first = await f.observe('proof');
+  const cited = f.cite(first.source!);
+  writeFileSync(join(f.root, 'subject.txt'), 'second changed subject bytes');
+  const later = await f.observe('second-legal-runtime');
+  const laterCitation = f.cite(later.source!), mixed = f.report(cited, [laterCitation]);
+  const legal = collectRuntimeSelection(f.store, 'p', f.spec, mixed, [cited, laterCitation]);
+  assert.equal(legal.runtime.proofs.length, 1);
+  assert.deepEqual(legal.admission.candidates.map(item => [item.citation, item.admitted, item.mismatch]), [[0, false, ['subjects/0']], [1, true, []]],
+    'the material records the excluded candidate with the component that excluded it');
+  assert.deepEqual(readRuntimeEvidenceAt(f.store, 'p', f.spec, mixed, [cited, laterCitation], legal.runtime), legal.runtime);
+  assert.deepEqual(readRuntimeEvidenceAt(f.store, 'p', f.spec, mixed, [cited, laterCitation], legal.runtime, legal.admission), legal.runtime);
+  const unavailable = f.hiding(f.store, first.observation.id);
+  assert.throws(() => readRuntimeEvidenceAt(unavailable, 'p', f.spec, mixed, [cited, laterCitation], legal.runtime), { code: 'runtime_evidence_invalid' },
+    'current replay: a cited runtime Source whose exact record is lost is not a silent exclusion');
+  assert.throws(() => readRuntimeEvidenceAt(unavailable, 'p', f.spec, mixed, [cited, laterCitation], legal.runtime, legal.admission), { code: 'runtime_evidence_invalid' },
+    'historical replay: the recorded candidate lost its exact observation');
+  const dropped = { ...legal.admission, candidates: legal.admission.candidates.filter(item => item.admitted) };
+  assert.throws(() => readRuntimeEvidenceAt(f.store, 'p', f.spec, mixed, [cited, laterCitation], legal.runtime, dropped), { code: 'runtime_evidence_invalid' },
+    'a material that forgets a cited candidate is not the material of this report');
+});
+
+test('D8.4d-4 A6: the direct session entry proves the runtime input by its admission material before saving M — no material, an empty caller-supplied result or a stale material writes nothing (reviewer probe №2140-3, R6)', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited);
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  const emptyContext = { role: 'assess-answer', question: f.spec, value: report, observations: [cited] };
+  const pending = f.pendingTurn('reviewer-empty-runtime', [cited], report);
+  const noMaterial = await f.sessionUntilOrigin(f.store, emptyContext, f.input(pending, f.empty));
+  assert.equal(noMaterial, 'research_context_application_invalid', 'no admission material: refused before M');
+  const emptyResult = await f.sessionUntilOrigin(f.store, emptyContext, f.input(pending, f.empty, selection.admission));
+  assert.equal(emptyResult, 'research_context_application_invalid', 'an empty result contradicts its own material: refused before M');
+  const forged = { ...selection.admission, candidates: selection.admission.candidates.map(item => ({ ...item, admitted: false, mismatch: ['binding'] })) };
+  assert.equal(await f.sessionUntilOrigin(f.store, emptyContext, f.input(pending, f.empty, forged)), 'research_context_application_invalid', 'a claimed exclusion is not the current admission');
+  assert.equal(f.store.list('assessment-paid-origin').length, 0, 'unproved caller-supplied results must not create M');
+  assert.equal(f.store.list('model-call').length, 0);
+  // The genuine pair passes the proof and M carries the material; it reads back exactly, also after a restart.
+  const context = { role: 'assess-answer', question: f.spec, value: report, runtimeProofs: selection.runtime.proofs, observations: [cited, ...selection.runtime.supporting] };
+  assert.equal(await f.sessionUntilOrigin(f.store, context, f.input(pending, selection.runtime, selection.admission)), 'fixture_after_runtime_origin');
+  const origin = readAssessmentPaidOrigin(f.store, 'p', reference(pending));
+  assert.ok(origin); assert.deepEqual(origin.value.runtimeAdmission, selection.admission); assert.deepEqual(origin.value.runtime, selection.runtime);
+  assert.equal(f.store.list('model-call').length, 0);
+  assert.deepEqual(readAssessmentPaidOrigin(f.open(), 'p', reference(pending))?.value, origin.value);
+  // A material that was today's admission when collected but is not any more (the binding moved) does not write M either.
+  const stalePending = f.pendingTurn('reviewer-stale-material', [cited], report);
+  withTmpdir(t, f.root);
+  assert.equal(await f.sessionUntilOrigin(f.store, context, f.input(stalePending, selection.runtime, selection.admission)), 'research_context_application_invalid',
+    'the material must be the current admission at the first write');
+  assert.equal(f.store.list('assessment-paid-origin').length, 1);
+});
+
+test('D8.4d-4 A5/A7 (R4): a lawful zero selection is saved with its proved exclusion and reads back after a restart; the loss of the excluded candidate\'s record is an addressed refusal of M, not a proved exclusion', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited);
+  withTmpdir(t, f.root);
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.deepEqual(selection.runtime, f.empty, 'the moved binding admits nothing');
+  assert.deepEqual(selection.admission.candidates.map(item => [item.admitted, item.mismatch]), [[false, ['binding']]], 'the exclusion is recorded with its component');
+  assert.deepEqual(readRuntimeEvidenceAt(f.store, 'p', f.spec, report, [cited], selection.runtime, selection.admission), selection.runtime, 'zero is lawful on a proved exclusion');
+  const pending = f.pendingTurn('lawful-zero', [cited], report);
+  const context = { role: 'assess-answer', question: f.spec, value: report, observations: [cited] };
+  assert.equal(await f.sessionUntilOrigin(f.store, context, f.input(pending, selection.runtime, selection.admission)), 'fixture_after_runtime_origin');
+  const origin = readAssessmentPaidOrigin(f.store, 'p', reference(pending));
+  assert.ok(origin); assert.deepEqual(origin.value.runtime, f.empty); assert.deepEqual(origin.value.runtimeAdmission, selection.admission);
+  assert.deepEqual(readAssessmentPaidOrigin(f.open(), 'p', reference(pending))?.value, origin.value, 'the zero selection reads back after a restart');
+  assert.throws(() => readAssessmentPaidOrigin(f.hiding(f.open(), observed.observation.id), 'p', reference(pending)), { code: 'research_context_application_invalid' },
+    'the excluded candidate lost its exact observation: the origin no longer proves its zero selection');
+});
+
+test('D8.4d-4 A4 (R6): observed subjects inconsistent with the declared check are a subject-matter refusal of both the current and the historical derivation', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited);
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.equal(selection.runtime.proofs.length, 1);
+  const record = f.store.get<Record<string, any>>(observed.observation.id)!;
+  const replaced = { ...record, value: { ...record.value, subjects: [] } };
+  const view: Store = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) => id === observed.observation.id ? replaced : target.get(id, revision);
+    const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  assert.throws(() => readRuntimeEvidenceAt(view, 'p', f.spec, report, [cited], selection.runtime), { code: 'runtime_evidence_invalid' });
+  assert.throws(() => readRuntimeEvidenceAt(view, 'p', f.spec, report, [cited], selection.runtime, selection.admission), { code: 'runtime_evidence_invalid' });
+});
+
+// ---- D8.4d fifth round (№2173): three outcomes of the projection — support, a subject-matter exclusion that re-derives, and a
+// lost mandatory basis that is an addressed refusal of the collector, of the session before M and of the historical read.
+// Reviewer probes №2172 (two negatives, one positive control) — permanent regressions.
+test('D8.4d-5 three outcomes: a missing declared check code Source is a lost mandatory basis — the collector, the session before M and the historical read refuse with the exact Ref; never a proved exclusion (reviewer probes №2172-1/3)', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt, projectRuntimeCandidate } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited), assignment = f.spec.obligations![0]!.assignment!;
+  const live = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.equal(live.runtime.proofs.length, 1);
+  const hidden = f.hiding(f.store, f.check.script.id);
+  const projection = projectRuntimeCandidate(hidden, 'p', assignment, cited.source);
+  assert.equal(projection.kind, 'lost');
+  if (projection.kind === 'lost') { assert.equal(projection.reason, 'check-code-missing'); assert.deepEqual(projection.ref, f.check.script); }
+  assert.throws(() => collectRuntimeSelection(hidden, 'p', f.spec, report, [cited]), { code: 'runtime_evidence_invalid' }, 'the collector refuses instead of excluding');
+  assert.throws(() => readRuntimeEvidenceAt(hidden, 'p', f.spec, report, [cited], live.runtime, live.admission), { code: 'runtime_evidence_invalid' }, 'the historical read of the genuine material refuses on the lost code');
+  assert.throws(() => readRuntimeEvidenceAt(hidden, 'p', f.spec, report, [cited], live.runtime), { code: 'runtime_evidence_invalid' }, 'the current replay refuses too');
+  const pending = f.pendingTurn('missing-code', [cited], report);
+  const claimed = { ...live.admission, candidates: live.admission.candidates.map(item => ({ ...item, admitted: false, mismatch: ['projection:check-code-missing'] })) };
+  const emptyContext = { role: 'assess-answer', question: f.spec, value: report, observations: [cited] };
+  assert.equal(await f.sessionUntilOrigin(hidden, emptyContext, f.input(pending, f.empty, claimed)), 'research_context_application_invalid', 'a claimed exclusion on a lost basis does not write M');
+  const context = { role: 'assess-answer', question: f.spec, value: report, runtimeProofs: live.runtime.proofs, observations: [cited, ...live.runtime.supporting] };
+  assert.equal(await f.sessionUntilOrigin(hidden, context, f.input(pending, live.runtime, live.admission)), 'research_context_application_invalid', 'the genuine pair cannot be proved without the code');
+  assert.equal(f.store.list('assessment-paid-origin').length, 0, 'no zero-runtime paid origin');
+  assert.equal(f.store.list('model-call').length, 0);
+  // The real Store still proves the genuine pair: M is written and read back with the material.
+  assert.equal(await f.sessionUntilOrigin(f.store, context, f.input(pending, live.runtime, live.admission)), 'fixture_after_runtime_origin');
+  assert.ok(readAssessmentPaidOrigin(f.store, 'p', reference(pending)));
+  assert.throws(() => readAssessmentPaidOrigin(f.hiding(f.open(), f.check.script.id), 'p', reference(pending)), { code: 'research_context_application_invalid' },
+    'the saved origin does not read once the declared code Source is unavailable');
+});
+
+test('D8.4d-5 three outcomes (positive control, reviewer probe №2172-2): a changed code FILE with the exact Sources intact is a lawful current exclusion, and that exclusion reads historically after the file is deleted', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { collectRuntimeSelection, readRuntimeEvidenceAt } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited);
+  writeFileSync(join(f.root, 'check.mjs'), "console.log('changed code')\n");
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.equal(selection.runtime.proofs.length, 0);
+  assert.ok(selection.admission.candidates[0]!.mismatch.some(part => part.startsWith('current:')), 'today\'s file differs: a current-admission exclusion, recorded as such');
+  unlinkSync(join(f.root, 'check.mjs'));
+  assert.deepEqual(readRuntimeEvidenceAt(f.open(), 'p', f.spec, report, [cited], selection.runtime, selection.admission), selection.runtime,
+    'history reads the recorded exclusion without today\'s file');
+});
+
+test('D8.4d-5 three outcomes: the authorization and the environment of an observation are mandatory bases — each hidden is an addressed refusal; an observation of another check declaration is a lawful, re-derivable exclusion', async t => {
+  const f = await runtimeSelectionFixture(t);
+  const { configureResearchScope } = await import('../src/graph/research-scope.js');
+  const { collectRuntimeSelection, readRuntimeEvidenceAt, projectRuntimeCandidate } = await import('../src/graph/runtime-evidence.js');
+  const observed = await f.observe('proof');
+  const cited = f.cite(observed.source!), report = f.report(cited), assignment = f.spec.obligations![0]!.assignment!;
+  const live = collectRuntimeSelection(f.store, 'p', f.spec, report, [cited]);
+  assert.equal(live.runtime.proofs.length, 1);
+  for (const [name, id, reason] of [['authorization', observed.observation.value.scope.id, 'authorization-missing'],
+    ['environment', observed.observation.value.environment.id, 'environment-missing']] as const) {
+    const hidden = f.hiding(f.store, id);
+    const projection = projectRuntimeCandidate(hidden, 'p', assignment, cited.source);
+    assert.equal(projection.kind, 'lost', name);
+    if (projection.kind === 'lost') { assert.equal(projection.reason, reason); assert.equal(projection.ref.id, id); }
+    assert.throws(() => collectRuntimeSelection(hidden, 'p', f.spec, report, [cited]), { code: 'runtime_evidence_invalid' }, name);
+    assert.throws(() => readRuntimeEvidenceAt(hidden, 'p', f.spec, report, [cited], live.runtime, live.admission), { code: 'runtime_evidence_invalid' }, name);
+  }
+  // Another declaration of the same obligation (a changed check purpose) authorizes a second observation; cited for the
+  // original question it is a candidate of another check: excluded on subject-matter grounds, and history re-derives it.
+  const policy = f.scope.value.policy!;
+  const other = configureResearchScope(f.store, { ...f.scope.value, policy: { ...policy,
+    assignments: [{ ...policy.assignments[0]!, runtimeCheck: { ...f.check, purpose: 'Observe the same script for another purpose' } }] } }, f.scope.revision);
+  const foreign = await f.engine.execute({ type: 'observe-runtime', project: 'p', scope: reference(other), obligation: 'boundary', key: 'other-check' }) as import('../src/runtime/runtime-observation.js').RuntimeObservationResult;
+  const foreignCitation = f.cite(foreign.source!), mixed = f.report(cited, [foreignCitation]);
+  const projection = projectRuntimeCandidate(f.store, 'p', assignment, foreignCitation.source);
+  assert.equal(projection.kind, 'excluded'); if (projection.kind === 'excluded') assert.equal(projection.reason, 'another-check');
+  const selection = collectRuntimeSelection(f.store, 'p', f.spec, mixed, [cited, foreignCitation]);
+  assert.deepEqual(selection.admission.candidates.map(item => [item.citation, item.admitted, item.mismatch]), [[0, true, []], [1, false, ['projection:another-check']]]);
+  assert.equal(selection.runtime.proofs.length, 1);
+  assert.deepEqual(readRuntimeEvidenceAt(f.open(), 'p', f.spec, mixed, [cited, foreignCitation], selection.runtime, selection.admission), selection.runtime);
+  assert.throws(() => readRuntimeEvidenceAt(f.hiding(f.open(), foreign.observation.id), 'p', f.spec, mixed, [cited, foreignCitation], selection.runtime, selection.admission),
+    { code: 'runtime_evidence_invalid' }, 'the excluded candidate\'s lost record is still a lost basis');
 });

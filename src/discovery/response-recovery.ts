@@ -46,6 +46,8 @@ import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queuedChildReached } from './reading-plan.js';
+import { paidOriginId, paidSessionId } from './assessment-session.js';
+import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 
 export interface ResponseRecovery {
   projectId: string; declaredBy: string; call: Ref; request: Ref; response: Ref; archive: Ref;
@@ -464,7 +466,7 @@ export class PreparedManagedProposalRefusal extends EngineError {
     super('research_proposal_invalid', PROPOSAL_REFUSAL_MESSAGE, findings);
   }
 }
-const proposalRefusalId = (projectId: string, turnId: string) =>
+export const proposalRefusalId = (projectId: string, turnId: string) =>
   `research-proposal-refusal:v1:${hashJson({ projectId, turnId })}`;
 function exactRecord<T>(store: Store, ref: Ref, kind: string): Revision<T> {
   requireCondition(isRef(ref), 'research_assessment_binding_invalid', 'An exact assessment source is required');
@@ -521,7 +523,8 @@ export function prepareManagedProposalRefusal(projectId: string, turn: Ref, pend
   const write: Write = { id, kind: 'research-proposal-refusal', expected: 0, value };
   return new PreparedManagedProposalRefusal({ write, ref: { id, revision: 1, hash: hashJson(value) },
     guards: uniqueTransactionGuards([pending, reference(draft), reference(question), reference(environment), graph,
-      ...runtime.guards, ...runtime.admissionGuards, ...guards, { id, absent: true }]) }, findings);
+      ...runtime.guards, ...runtime.admissionGuards, ...guards, { id, absent: true },
+      { id: paidOriginId(projectId, turn.id), absent: true }]) }, findings);
 }
 
 /** Read-only store projection of the exact delta.base and the complete revises
@@ -928,7 +931,16 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     }
     const assessmentRef = after.value.assessment;
     if (after.value.error === null && isRef(assessmentRef)) {
-      const assessment = store.get<ResearchAssessment>(assessmentRef.id, assessmentRef.revision);
+      // №2000-12/R19: the era is selected by the turn's stable links — any of
+      // its paid origin (M), managed session (S) or read binding (B) proves a
+      // managed paid step. A missing M then fails inside
+      // readResearchAssessmentAt as a typed refusal instead of silently
+      // choosing the legacy era; turns without any such link keep prior rules.
+      const managedEra = [paidOriginId, paidSessionId, assessmentBindingId]
+        .some(identity => store.get(identity(producer.value.projectId, before.id)) !== null);
+      const assessment = managedEra
+        ? readResearchAssessmentAt(store, producer.value.projectId, before.id, assessmentRef)
+        : store.get<ResearchAssessment>(assessmentRef.id, assessmentRef.revision);
       if (!assessment || assessment.kind !== 'research-assessment' || assessment.revision !== 1
         || canonical(reference(assessment)) !== canonical(assessmentRef)
         || assessment.id !== `research-assessment:${hashJson(assessment.value)}`
@@ -2367,6 +2379,10 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
     && session.value.projectId === project
     && (isV2Synthesis || canonical(reference(session)) === canonical(sessionRef)),
   'response_recovery_session_stale', 'Recovery requires the current exact supported session');
+  // №2000-11: a paid managed assessment session has no operator replay; its
+  // recovery is the automatic managed path through the exact saved origin.
+  requireCondition(!(session.kind === 'assessment-session' && session.id.startsWith('assessment-session:v2:')),
+    'response_recovery_invalid', 'A paid managed assessment session recovers only through its exact origin, never operator replay');
   if (isV2Synthesis) {
     // №1555 X27: v2 recovery is the exact restoration of the selected paid
     // step; sessionRef must name the proven pre-application state of that

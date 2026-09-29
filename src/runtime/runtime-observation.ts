@@ -90,20 +90,47 @@ export function runtimeContext(store: Store, project: string) {
     admissionGuards:uniqueTransactionGuards([...effective.admissionGuards,...(configured?[]:[{id:`reader-pilot:${project}`,absent:true as const}])]) };
 }
 
+/** The declared check-code selection shared by current admission and
+ * historical proof: an operator module (no code root) is its single inline
+ * owner-document script without dependencies; repository code is the script
+ * plus every declared dependency — each a project file inside the saved code
+ * root. The caller's `read` chooses the era — head records for admission,
+ * exact saved revisions for proof — and `inside` its root containment. */
+export function declaredCheckSources(project: string, check: RuntimeCheck, codeRoot: string | null,
+  read: (ref: Ref) => Revision<Source> | null | undefined,
+  inside: (root: string, location: string) => boolean): Revision<Source>[] | null {
+  if (!isRef(check.script) || !Array.isArray(check.dependencies) || !check.dependencies.every(isRef)) return null;
+  const valid = (source: Revision<Source> | null | undefined): source is Revision<Source> =>
+    !!source && source.kind === 'source' && source.value.projectId === project
+    && ['text/plain', 'application/json'].includes(source.value.mediaType) && !!source.value.content.trim();
+  if (codeRoot === null) {
+    if (check.dependencies.length !== 0) return null;
+    const script = read(check.script);
+    return valid(script) && script.value.origin.kind === 'owner-document' && !script.value.provenance
+      && script.value.mediaType === 'text/plain' ? [script] : null;
+  }
+  const code: Revision<Source>[] = [];
+  for (const ref of uniqueRefs([check.script, ...check.dependencies])) {
+    const source = read(ref);
+    if (!valid(source) || source.value.origin.kind !== 'file' || !inside(codeRoot, source.value.origin.location))
+      return null;
+    code.push(source);
+  }
+  return code;
+}
+
 export function runtimeCode(store: Store, project: string, check: RuntimeCheck, root: string | null): Observation[] {
   const evidence = new Evidence(store);
-  return uniqueRefs([check.script,...check.dependencies]).map(ref => {
-    const source = store.get<Source>(ref.id);
-    requireCondition(source?.kind==='source' && source.value.projectId===project
-      && ['text/plain','application/json'].includes(source.value.mediaType) && source.value.content.trim()
-      && canonical(reference(source))===canonical(ref),'runtime_check_source_invalid','The declared check code is missing, foreign or changed');
-    if(root===null)requireCondition(source.value.origin.kind==='owner-document'&&!source.value.provenance
-      &&source.value.mediaType==='text/plain'&&canonical(ref)===canonical(check.script)&&check.dependencies.length===0,
-    'runtime_check_source_invalid','An operator module is explicit immutable code, not a repository fact or runtime output');
-    else requireCondition(source.value.origin.kind==='file'&&realpathSync(workspacePath(root,relative(root,source.value.origin.location)))===source.value.origin.location,
-        'runtime_check_source_invalid','The check must execute the declared source inside the selected workspace');
-    return evidence.observe(project,ref,{kind:'text-range',start:0,end:source.value.content.length});
-  });
+  const code = declaredCheckSources(project, check, root,
+    ref => {
+      const source = store.get<Source>(ref.id);
+      return source?.kind === 'source' && canonical(reference(source)) === canonical(ref) ? source : null;
+    },
+    (codeRoot, location) => realpathSync(workspacePath(codeRoot, relative(codeRoot, location))) === location);
+  requireCondition(code, 'runtime_check_source_invalid',
+    'The declared check code is missing, foreign or outside its workspace');
+  return code.map(source =>
+    evidence.observe(project, reference(source), { kind: 'text-range', start: 0, end: source.value.content.length }));
 }
 
 function checkCodeRoot(store:Store,project:string,check:RuntimeCheck,current:ReturnType<typeof runtimeContext>):string|null{

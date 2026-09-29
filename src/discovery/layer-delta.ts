@@ -24,11 +24,19 @@ export interface LayerDelta {
 
 /** Build an unaccepted candidate for correction/display. Only expandLayerDelta
  * may turn it into a validated layer proposal. */
-export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, delta: LayerDelta): Json {
+export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  delta: LayerDelta, source: 'current' | 'historical' = 'current'): Json {
   requireCondition(draft.value.stage === "om-g2" && ["R1", "R2"].includes(draft.value.level) && question.value.draftId === draft.id
     && question.value.spec.field === "layerDesign", "layer_delta_foreign", "Deltas require a bound L2/L3 design question");
-  const base = store.get<Graph>(`graph:${draft.value.projectId}`);
-  requireCondition(base && canonical(reference(base)) === canonical(delta.base), "graph_stale", "The delta must bind the exact current graph");
+  const base = source === 'historical'
+    ? store.get<Graph>(delta.base.id, delta.base.revision)
+    : store.get<Graph>(`graph:${draft.value.projectId}`);
+  requireCondition(base?.kind === 'graph' && base.id === `graph:${draft.value.projectId}`
+    && canonical(reference(base)) === canonical(delta.base)
+    && hashJson(base.value) === base.hash,
+  source === 'historical' ? 'layer_delta_base_invalid' : 'graph_stale',
+  source === 'historical' ? 'The delta lost its exact saved graph'
+    : 'The delta must bind the exact current graph');
   const level = draft.value.level === "R2" ? 3 : 2;
   const design = layerDesignOf(base.value, level, question.value.spec.layerAssembly) as Record<string, Json>;
   const chain: LayerDelta[] = [delta], seen = new Set<string>();
@@ -36,9 +44,12 @@ export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft
   while (previous) {
     requireCondition(isRef(previous) && !seen.has(previous.id), "layer_delta_revision_invalid", "Invalid or cyclic proposal revision");
     seen.add(previous.id);
-    const turn = store.get<ResearchTurn>(previous.id);
+    const turn = source === 'historical'
+      ? store.get<ResearchTurn>(previous.id, previous.revision)
+      : store.get<ResearchTurn>(previous.id);
     const action = turn?.value.action as (LayerDelta & { action?: string; question?: string }) | undefined;
     requireCondition(turn?.kind === "research-turn" && canonical(reference(turn)) === canonical(previous)
+      && (source === 'historical' ? hashJson(turn.value) === turn.hash : true)
       && turn.value.status === "completed" && canonical(turn.value.question) === canonical(reference(question))
       && action?.action === "answer_delta" && action.question === question.id && canonical(action.base) === canonical(delta.base),
       "layer_delta_revision_foreign", "Correction must reference a completed proposal for this exact question and graph");
@@ -69,8 +80,9 @@ export function layerDeltaCandidate(store: Store, draft: Revision<DiscoveryDraft
   return design;
 }
 
-export function expandLayerDelta(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, delta: LayerDelta): Json {
-  const design = layerDeltaCandidate(store, draft, question, delta);
+export function expandLayerDelta(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  delta: LayerDelta, source: 'current' | 'historical' = 'current'): Json {
+  const design = layerDeltaCandidate(store, draft, question, delta, source);
   const base = store.get<Graph>(delta.base.id, delta.base.revision)!;
   // Validate the assembled graph, including unchanged upper layers and complete
   // L2 relationships. No graph or accepted draft is written by this expansion.
@@ -85,8 +97,14 @@ export function expandLayerDelta(store: Store, draft: Revision<DiscoveryDraft>, 
   return layerDesignOf(graph, level, question.value.spec.layerAssembly);
 }
 
-export function layerDeltaView(store: Store, project: string, value: Json, level: 2 | 3 = 2, assembly?: LayerAssembly) {
-  const base = store.get<Graph>(`graph:${project}`)!;
+export function layerDeltaView(store: Store, project: string, value: Json, level: 2 | 3 = 2,
+  assembly?: LayerAssembly, source?: { mode: 'historical'; graph: Ref }) {
+  const base = source ? store.get<Graph>(source.graph.id, source.graph.revision)
+    : store.get<Graph>(`graph:${project}`);
+  requireCondition(base?.kind === 'graph' && base.id === `graph:${project}`
+    && hashJson(base.value) === base.hash
+    && (!source || canonical(reference(base)) === canonical(source.graph)),
+  'layer_delta_base_invalid', 'The layer view needs its exact graph');
   const before = layerDesignOf(base.value, level, assembly) as Record<string, Json>;
   const after = value as Record<string, Json>;
   const upserts: LayerDelta['upserts'] = {}, removes: LayerDelta['removes'] = {};

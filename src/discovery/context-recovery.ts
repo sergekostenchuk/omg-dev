@@ -33,6 +33,10 @@ export function recoverContextSession(store: Store, project: string, sessionRef:
     && session.value.projectId === project, 'context_session_foreign', 'Recovery requires this project\'s context session');
   if (session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:'))
     return recoverContextSessionV2(store, project, session, sessionRef, selector);
+  // №2000-11: a paid managed assessment session has no operator workspace
+  // recovery; its only lawful path is the managed one through its exact origin.
+  requireCondition(!(session.kind === 'assessment-session' && session.id.startsWith('assessment-session:v2:')),
+    'context_recovery_invalid', 'A paid managed assessment session recovers only through its exact origin, never operator context recovery');
   requireCondition(canonical(reference(session)) === canonical(sessionRef), 'context_session_stale', 'Recover the current exact session revision');
   const binding = session.value.binding;
   requireCondition(binding && isRef(binding.draft) && isRef(binding.question) && isRef(binding.environment)
