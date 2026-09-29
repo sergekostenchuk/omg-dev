@@ -969,7 +969,6 @@ const { withHistoricalReads } = await imports('om/input');
 const { journalId, readJournalAt } = await imports('om/refusal-journal');
 const { readQuestionPacket } = await imports('om/question-packet');
 const { startRun, advanceRun } = await imports('om/run');
-const { ownerDecisionNamespace, OWNER_DECISION_KIND, resumeSeries, seriesRequestOf } = await imports('om/series');
 const h1 = await import(config.dist + 'test/om-run.test.js');
 ` + monitorTail + passDriver + String.raw`
 const outcomes = {};
@@ -1011,8 +1010,9 @@ try {
   outcomes.r4 = { a: aFinal.attempts.map(item => item.outcome.reason), b: bFinal.attempts.map(item => item.outcome.reason), calls: f.sent().length, performed: p.performed };
   // The earlier history read again after the journal head moved: B2's packet with the refusal of B1, cold, hot and restarted.
   rereadPacket(f, 'n2.b2', reference(b2Packet));
-  // ---- R4, the branch "B stopped / waits": three refusals of B stop it (A3), A6 reviews and waits for the owner; A stays open unpaid;
-  // the owner's decision continues B, its fourth attempt succeeds and the common C5, D2 and separate G7 follow. ----
+  // ---- R4, the branch "B stopped": three refusals of B stop it (A3), A6 reviews and decides; the pass continues B itself, A stays
+  // open unpaid; B's fourth attempt succeeds and the common C5, D2 and separate G7 follow. (H1.2: an undecided review ends the pass on
+  // the second rung, and a decision of the owner is no way to continue an autonomous pass — №1908.) ----
   const g = h1.runFixture(t, [], false);
   const stopBases = g.bases('s11-n2-stop'), q = pass(g, g.request(stopBases), 'n2s');
   ok(startRun(g.store, { project }));
@@ -1025,23 +1025,18 @@ try {
   const gb2 = await q.until('cycle', 30); assert.deepEqual([gb2.series, gb2.attempt], [gb.series, 2]);
   replies.push(cannotExpand(g, gb2)); g.steps(replies);
   const gb3 = await q.until('cycle', 30); assert.deepEqual([gb3.series, gb3.attempt], [gb.series, 3]);
-  replies.push(cannotExpand(g, gb3), h1.stopAnswer(g, false)); g.steps(replies);
-  const stood = await q.drive(30);
-  // R4: B stands stopped and reviewed; the pass waits either for the owner on that stop or, having moved on to A,
-  // on A's addressed dependency on B's work (frame_participants) — never on a new attempt of B or a repaid A.
-  assert.ok(['owner_decision', 'frame_participants'].includes(stood.wait.code), JSON.stringify(stood.wait));
-  const stopped = g.store.get(gb.series).value;
-  assert.ok(stopped.stop, 'A3 stopped B after three refused attempts');
-  assert.deepEqual(stopped.attempts.map(item => item.outcome.reason), ['refused', 'refused', 'refused']);
-  assert.equal(stopped.escalations.length, 1, 'The undecided review escalated the stop (A6)');
-  const aOpen = g.store.get(ga.series).value;
-  assert.equal(aOpen.attempts.length, 1); assert.equal(aOpen.attempts[0].outcome, null, 'A stays open and is not paid again while B waits');
-  assert.equal(g.sent().length, 5, 'A once, B three times, one stop analysis');
-  const decision = g.store.write({ id: ownerDecisionNamespace(project) + 's11-n2-window', kind: OWNER_DECISION_KIND, expected: 0,
-    value: { projectId: project, block: stopped.block, stop: stopped.stop.attempt, goals: [...stopped.stop.goals],
-      decided: 'go on: one more window for the second block', taken: { by: 'the owner', through: 'the command API', approved: true } } });
-  ok(resumeSeries(g.store, { ...seriesRequestOf(stopped), stop: stopped.stop.attempt, ground: 'owner-decision', text: 'the owner decided to go on', decision: { ref: reference(decision) } }));
+  replies.push(cannotExpand(g, gb3), h1.stopAnswer(g, true)); g.steps(replies);
+  // R4 (H1.2): B stands stopped after three refusals and the independent review of that exact stop DECIDED, so the pass itself
+  // continues B (resumeSeries on the review record — no decision of the owner is made or needed, and an undecided review would
+  // end the pass, which the om-run suite covers); the fourth attempt of B follows while A stays open and is not paid again.
   const gb4 = await q.until('cycle', 30); assert.deepEqual([gb4.series, gb4.attempt], [gb.series, 4]);
+  const stopped = g.store.get(gb.series).value;
+  assert.equal(stopped.stop, null, 'The decided review continued B after the stop of A3');
+  assert.equal(stopped.continuations.length, 1); assert.equal(stopped.escalations.length, 0, 'A decided review escalates nothing');
+  assert.deepEqual(stopped.attempts.slice(0, 3).map(item => item.outcome.reason), ['refused', 'refused', 'refused']);
+  const aOpen = g.store.get(ga.series).value;
+  assert.equal(aOpen.attempts.length, 1); assert.equal(aOpen.attempts[0].outcome, null, 'A stays open and is not paid again while B works');
+  assert.equal(g.sent().length, 5, 'A once, B three times, one stop analysis');
   const b4Packet = g.store.get(gb4.request.packet.id, gb4.request.packet.revision);
   assert.ok(b4Packet.value.journal, 'B4 stands on the journal of the refused attempts');
   replies.push(h1.nodeAnswer(g, gb4)); g.steps(replies);
@@ -1170,7 +1165,7 @@ function checkScenario(t: import('node:test').TestContext, run: Awaited<ReturnTy
     refined: (row as { refinedRepeats?: number }).refinedRepeats, executions: row.executions }));
 }
 
-test('S1.1 mixed N2 on the accepted H1 pass: A positive, B1 negative, B2 positive — and B stopped, reviewed and continued by the owner; history costs by exact keys', async t => {
+test('S1.1 mixed N2 on the accepted H1 pass: A positive, B1 negative, B2 positive — and B stopped, reviewed (decided) and continued by the pass; history costs by exact keys', async t => {
   checkScenario(t, await runScenario(t, 'mixed-n2', mixedN2Scenario));
 });
 

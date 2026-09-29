@@ -15,7 +15,7 @@ import { prepareSeriesTransition, readPreparedSeriesTransition } from "./series-
 import { readRoutes, prepareRoutes, type RoutesRecord, type RoutesRequest } from "./routes.js";
 import { writeGuarded } from "./refs.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
-import { readRun, startRun, type RunRecord } from "./run.js";
+import { readRun, runId, startRun, type RunRecord } from "./run.js";
 
 /**
  * H1.1 — the machine producer of the bases of an OM pass. From the accepted stages it takes the common B1, the pass
@@ -25,7 +25,7 @@ import { readRun, startRun, type RunRecord } from "./run.js";
  * It never calls a model, opens an attempt or advances the pass; it keeps no record of its own (№1844).
  */
 export const RUN_BASES_POLICY = "om-run-bases/v1";
-export const RUN_BASES_CODES = sealed(["run_bases_request_invalid", "run_bases_work_open"] as const);
+export const RUN_BASES_CODES = sealed(["run_bases_request_invalid", "run_bases_work_open", "run_bases_terminal"] as const);
 /**
  * The result form of every fact task this producer issues (№1844 п.9, №1860 п.4): the answer to the exact question,
  * a nonempty string. It is not evidence of truth — E5 and the answer's own sources still decide that.
@@ -91,7 +91,12 @@ function requireOptions(options: unknown): asserts options is RunBasesOptions {
 }
 
 interface Admission { readonly blocked: readonly Ref[]; readonly guards: readonly TransactionGuard[] }
-interface Mode { readonly write: boolean; readonly guards: readonly TransactionGuard[]; readonly completion: boolean; readonly admission: Admission }
+/**
+ * `pass` is what every write of a build depends on: the non-terminal pass it read, or its absence before the build
+ * itself creates it (which is a lawful change of that dependency, never a conflict).
+ */
+interface Mode { readonly write: boolean; readonly guards: readonly TransactionGuard[]; readonly completion: boolean; readonly admission: Admission;
+  readonly pass: { guard: TransactionGuard | null } }
 const HEADS = new Set<string>(RUN_BASES_HEAD_STAGES);
 /**
  * One product of the chain: nothing to write means the product exists and is currently admitted. A check stops at the
@@ -108,10 +113,24 @@ function commit(store: Store, mode: Mode, unit: string, target: string, stage: s
   const heads = HEADS.has(stage), blocked = mode.admission.blocked[0];
   if (heads && blocked) fail("run_bases_work_open", blocked.id, "attempts", "New bases wait until the open attempts finish on their current bases", blocked);
   const written = writeGuarded(store, { unit, target, writes: [...prepared.writes],
-    guards: [...prepared.guards, ...mode.guards, ...(heads ? mode.admission.guards : [])] });
+    guards: [...prepared.guards, ...mode.guards, ...(mode.pass.guard ? [mode.pass.guard] : []), ...(heads ? mode.admission.guards : [])] });
   if (written.ok) return;
   if (["input_stale", "revision_conflict"].includes(written.refusal.code)) throw new BasesConflict(written.refusal);
   take(written);
+}
+
+/**
+ * A pass that ended (complete or unable) takes no new bases (№1995 п.1): the saved pass is read before any product of the
+ * chain is derived. An explicit launch intent that differs from the saved one is still the intent conflict of startRun,
+ * whatever the phase. A pass that has not ended is returned as read, so a build depends on exactly that record.
+ */
+function livePass(store: Store, project: string, outcomes: readonly string[] | undefined): Revision<RunRecord> | null {
+  const saved = take(readRun(store, { project })) as Revision<RunRecord> | null;
+  if (!saved) return null;
+  const phase = saved.value.state.phase;
+  if (phase !== "complete" && phase !== "unable") return saved;
+  if (outcomes !== undefined) take(startRun(store, { project, outcomes: [...outcomes] }));
+  return fail("run_bases_terminal", saved.id, "state.phase", `The pass of this project ended (${phase}); no bases are built for it`, reference(saved));
 }
 
 /** B1 over today's accepted stages through the common G1: existing, refreshed or first — never a rebuilt "clean" input. */
@@ -310,19 +329,30 @@ function managedStage(store: Store, project: string, horizon: Ref, choiceVersion
  */
 function admissionOf(store: Store, project: string, open: readonly string[]): Admission {
   const heads = store.list<AnyRepairSeries>("repair-series").filter(row => row.id.startsWith(`repair-series:${project}:`));
-  const guards: TransactionGuard[] = [], blocked: Ref[] = [], lines = new Map<string, { owner: Record<string, unknown>; line: number }>();
+  const read = heads.map(head => take(readAnySeriesAt(store, project, reference(head))));
+  const blocked = read.filter(series => series.value.attempts.some(attempt => attempt.outcome === null) && !open.includes(series.id))
+    .map(series => reference(series));
+  return { blocked: blocked.sort((a, b) => order(a.id, b.id)), guards: standingOf(store, project, read) };
+}
+/** What the standing guards need of a series: its address, its owner and its line. */
+interface LineRow { readonly id: string; readonly revision: number; readonly hash: string;
+  readonly value: { readonly line: number; readonly block?: string; readonly owner?: unknown } }
+/**
+ * The heads of the series read, the absence of the next line of every owner (a root of each L1 block and of M5, or the
+ * successor of each current line), and the membership and pointer heads (№1937-3).
+ */
+function standingOf(store: Store, project: string, rows: readonly LineRow[]): TransactionGuard[] {
+  const guards: TransactionGuard[] = [], lines = new Map<string, { owner: Record<string, unknown>; line: number }>();
   const keyOf = (owner: Record<string, unknown>) => canonical(owner);
   const graph = store.get<{ nodes: { id: string; kind: string }[] }>(`graph:${project}`);
   for (const block of graph?.value.nodes.filter(node => node.kind === "block").map(node => node.id) ?? [])
     lines.set(keyOf({ block }), { owner: { block }, line: 0 });
   lines.set(keyOf({ owner: M5_OWNER }), { owner: { owner: M5_OWNER }, line: 0 });
-  for (const head of heads) {
-    const series = take(readAnySeriesAt(store, project, reference(head)));
-    guards.push(reference(series));
-    if (series.value.attempts.some(attempt => attempt.outcome === null) && !open.includes(series.id)) blocked.push(reference(series));
-    const owner = "block" in series.value ? { block: series.value.block } : { owner: (series.value as { owner: Json }).owner };
+  for (const row of rows) {
+    guards.push({ id: row.id, revision: row.revision, hash: row.hash });
+    const owner = row.value.block !== undefined ? { block: row.value.block } : { owner: row.value.owner as Json };
     const known = lines.get(keyOf(owner));
-    if (!known || known.line < series.value.line) lines.set(keyOf(owner), { owner, line: series.value.line });
+    if (!known || known.line < row.value.line) lines.set(keyOf(owner), { owner, line: row.value.line });
   }
   for (const { owner, line } of lines.values())
     guards.push({ id: seriesAddress({ project, ...owner, line: line + 1 } as never).id, absent: true });
@@ -330,13 +360,23 @@ function admissionOf(store: Store, project: string, open: readonly string[]): Ad
     const head = store.get(id);
     guards.push(head ? reference(head) : { id, absent: true });
   }
-  return { blocked: blocked.sort((a, b) => order(a.id, b.id)), guards };
+  return guards;
+}
+/**
+ * The standing heads a decision that no lawful work is left stands on, to be taken at the START of the choice, before
+ * the reading they protect (№1995 п.3): every series of the project, the absence of the next line of every owner, the
+ * membership and the pointer. It verifies nothing; the choice's own readers do.
+ */
+export function readRunStandingGuards(store: Store, project: string): OmResult<Sealed<TransactionGuard[]>> {
+  requireRequest(store, { project });
+  return run(() => standingOf(store, project, store.list<AnyRepairSeries>("repair-series").filter(row => row.id.startsWith(`repair-series:${project}:`))));
 }
 const M5_OWNER = sealed({ kind: "mechanism", mechanism: "M5:addressing" });
 function chain(store: Store, request: RunBasesRequest, mode: Mode): BuiltRunBases {
   const project = request.project;
   const input = inputStage(store, project, mode);
   const pass = runStage(store, project, request.outcomes, mode);
+  mode.pass.guard = reference(pass);
   const outcomes = pass.value.intent.outcomes;
   const basis = upperBasis(store, project);
   const issue = horizonRequest(project, reference(input), outcomes, basis);
@@ -371,7 +411,11 @@ export function writeRunBases(store: Store, request: RunBasesRequest, options: R
     // A lost compare-and-set derives the whole build again, its admission first: an equal concurrent build is then found
     // as it is, and work opened meanwhile blocks the heads it would move. The second loss is the answer.
     for (let attempt = 0; ; attempt++) {
-      try { return chain(store, request, { write: true, guards, completion, admission: admissionOf(store, request.project, open) }); }
+      // The pass is read first: a terminal one refuses here, and every write of the build depends on the record read.
+      const pass = livePass(store, request.project, request.outcomes);
+      const mode: Mode = { write: true, guards, completion, admission: admissionOf(store, request.project, open),
+        pass: { guard: pass ? reference(pass) : { id: runId(request.project), absent: true } } };
+      try { return chain(store, request, mode); }
       catch (error) {
         if (!(error instanceof BasesConflict)) throw error;
         if (attempt > 0) throw new BasesFailure(error.refusal);
@@ -390,8 +434,10 @@ export function prepareRunBases(store: Store, request: { project: string }, opti
   if (!object(options) || !Object.keys(options).every(key => key === "completion") || options.completion !== undefined && typeof options.completion !== "boolean")
     invalid("options", "A check names only whether it completes an accepted group");
   request = sealed(request) as RunBasesRequest;
-  const mode: Mode = { write: false, guards: [], completion: options.completion ?? false, admission: { blocked: [], guards: [] } };
+  const mode: Mode = { write: false, guards: [], completion: options.completion ?? false, admission: { blocked: [], guards: [] },
+    pass: { guard: null } };
   return run(() => {
+    livePass(store, request.project, undefined);
     try { return { state: "ready" as const, built: chain(store, request, mode) }; }
     catch (error) { if (error instanceof BasesMissing) return { state: "missing" as const, stage: error.stage }; throw error; }
   });

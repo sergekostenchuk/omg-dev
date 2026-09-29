@@ -1,12 +1,13 @@
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { prepareRoutes, readRoutes, writeRoutes, type RouteBatch, type RoutesRecord, type RoutesRequest } from "./routes.js";
 import { readQuestionQueue } from "./queue.js";
-import { prepareRunBases, writeRunBases, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
+import { readHorizon } from "./horizon.js";
+import { prepareRunBases, readRunStandingGuards, writeRunBases, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
 import { readOmInput, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer } from "./accepted-answer.js";
 import { writeApplyAnswer } from "./addressing.js";
@@ -14,12 +15,12 @@ import { openSeries, readAnySeriesAt, readCompletionBinding, completionWorkId, c
   resumeSeries, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim, readCompletionCloseAt, readStopContext } from "./repeat-gate.js";
-import { readStopAnalysis, runStopAnalysis } from "./stop-analysis.js";
-import { prepareCompletionCause, readCompletionWorkAt, readModelCycle, readPartAssembly, recoverOmModelCall, runModelCycle, writeCompletionCessation,
+import { prepareStopAnalysis, readStopAnalysis, runStopAnalysis, type StopAnalysisRequest } from "./stop-analysis.js";
+import { prepareCompletionCause, readCompletionWorkAt, readManagedModelDiagnostic, readModelCycle, readPartAssembly, recoverOmModelCall, runModelCycle, writeCompletionCessation,
   type CompletionSnapshot } from "./model-call.js";
 import { writeQuestionPacket } from "./question-packet.js";
 import { assessFact, readAssessmentIntentAt, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
-import { prepareAnswersGate, readAnswersEvaluationAt, readAnswersGate, writeAnswersCheckCessation, writeAnswersEvaluation, writeAnswersRegistration,
+import { prepareAnswersGate, prepareAnswersGateTrace, readAnswersEvaluationAt, readAnswersGate, readAnswersGateTrace, writeAnswersCheckCessation, writeAnswersEvaluation, writeAnswersRegistration,
   type AnswerRouteResult, type AnswersGateRequest } from "./answers-gate.js";
 import { gateCandidate, prepareCandidate, writeCandidate, type CandidateRequest } from "./frame-candidate.js";
 import { prepareSettleCandidate, type SettleCandidateRequest } from "./frame-accept.js";
@@ -70,12 +71,24 @@ export type RunAction = typeof RUN_ACTIONS[number];
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
 /** An addressed wait: what is missing, whose it is, and the exact records it stands on. */
 export interface RunWait { readonly code: string; readonly message: string; readonly target: string; readonly field: string; readonly basis: readonly Ref[] }
+/**
+ * The kinds of ground a pass ends on without a result (№1908, №1995): what proved that no lawful continuation is left.
+ * A kind names the ground; the code beside it is the one the source gave — or the state's own name where the source is a
+ * state, not a refusal — and the two never stand for each other.
+ */
+export const RUN_REASON_KINDS = Object.freeze(["stop-second-rung", "stop-analysis-failed", "hold-analysis-failed", "hold-origin-unestablished",
+  "analysis-unavailable", "owner-control", "frame-need-owner", "late-obligation", "unsupported-question"] as const);
+export type RunReasonKind = typeof RUN_REASON_KINDS[number];
+/** A ground of the terminal outcome: an addressed wait that will not resolve by itself, with the kind of the ground. */
+export interface RunReason extends RunWait { readonly kind: RunReasonKind }
 export type RunState =
   | { readonly phase: "ready" }
   | { readonly phase: "step"; readonly step: RunStep }
   | { readonly phase: "waiting"; readonly wait: RunWait }
   /** The proved end of the pass: its accepted M8, M9 stage and compilation stage (row 27). */
-  | { readonly phase: "complete"; readonly proof: readonly Ref[] };
+  | { readonly phase: "complete"; readonly proof: readonly Ref[] }
+  /** The proved end of the pass without a result: no lawful step is left and these grounds stand (№1908 п.1). Not a wait. */
+  | { readonly phase: "unable"; readonly reasons: readonly RunReason[] };
 export interface RunRecord {
   readonly contract: typeof RUN_CONTRACT; readonly project: string;
   /** The exact B1 the pass began from; new B1 revisions never rewrite it (№1737 п.1). */
@@ -145,6 +158,7 @@ function checkRecord(value: unknown, project: string): value is RunRecord {
   else if (state.phase === "step") { if (!checkStep(state.step)) return false; }
   else if (state.phase === "waiting") { if (!checkWait(state.wait) || Object.keys(state).length !== 2) return false; }
   else if (state.phase === "complete") { if (!Array.isArray(state.proof) || state.proof.length !== 3 || !state.proof.every(isRef) || Object.keys(state).length !== 2) return false; }
+  else if (state.phase === "unable") { if (!checkReasons(state.reasons) || Object.keys(state).length !== 2) return false; }
   else return false;
   const last = value.last;
   return last === null || object(last) && Object.keys(last).length === 3 && checkStep(last.step) && Array.isArray(last.products)
@@ -153,6 +167,27 @@ function checkRecord(value: unknown, project: string): value is RunRecord {
 function checkWait(wait: unknown): wait is RunWait {
   return object(wait) && Object.keys(wait).length === 5 && ["code", "message", "target", "field"].every(key => isText(wait[key]))
     && Array.isArray(wait.basis) && wait.basis.every(isRef);
+}
+/** A nonempty list in the canonical order without a repeat: one meaning, one row, whatever order the grounds were met in. */
+function checkReasons(reasons: unknown): reasons is RunReason[] {
+  if (!Array.isArray(reasons) || reasons.length === 0 || !reasons.every(checkReason)) return false;
+  const keys = (reasons as RunReason[]).map(reasonKey);
+  return keys.every((key, index) => index === 0 || keys[index - 1]! < key);
+}
+function checkReason(reason: unknown): reason is RunReason {
+  return object(reason) && Object.keys(reason).length === 6 && (RUN_REASON_KINDS as readonly string[]).includes(reason.kind as string)
+    && ["code", "message", "target", "field"].every(key => isText(reason[key])) && Array.isArray(reason.basis) && reason.basis.every(isRef)
+    && same(reason.basis, uniqueRefs(reason.basis));
+}
+/** The meaning of a ground: its kind, its address, the code the source gave and the exact records it stands on. */
+const reasonKey = (reason: RunReason): string => canonical([reason.kind, reason.target, reason.field, reason.code, reason.basis] as unknown as Json);
+function reasonOf(kind: RunReasonKind, code: string, target: string, field: string, message: string, basis: readonly Ref[]): RunReason {
+  return { kind, code, message, target, field, basis: uniqueRefs(basis) };
+}
+/** The grounds in their canonical order without a repeat; the order they were met in decides nothing. */
+function canonicalReasons(reasons: readonly RunReason[]): RunReason[] {
+  return [...new Map(reasons.map(item => [reasonKey(item), item])).entries()]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, item]) => item);
 }
 function checkStep(step: unknown): step is RunStep {
   return object(step) && (RUN_ACTIONS as readonly string[]).includes(step.action as string) && object(step.request)
@@ -214,12 +249,14 @@ export async function advanceRun(store: Store, request: RunRequest): Promise<OmR
     const saved = take(readRun(store, { project: request.project }));
     if (!saved) fail("record_missing", runId(request.project), "run", "The pass must be started before it advances");
     const head = saved as unknown as Revision<RunRecord>, state = head.value.state;
-    // A completed pass returns its proved completion; it never starts a second pass by itself (№1737 п.1).
-    if (state.phase === "complete") return { record: head, performed: null, products: [] };
+    // A completed pass returns its proved completion and an unable one its grounds, before any environment, base or
+    // payment is looked at; neither starts a second pass by itself (№1737 п.1, №1995 п.11).
+    if (state.phase === "complete" || state.phase === "unable") return { record: head, performed: null, products: [] };
     if (state.phase === "step") return settle(store, head, state.step, await perform(store, request, state.step));
     const history = historyOf(store, head), performed = history.performed;
     let next = selectNext(store, request, history);
     if ("complete" in next) return transition(store, head, { phase: "complete", proof: next.complete }, head.value.last, null, []);
+    if ("unable" in next) return transition(store, head, { phase: "unable", reasons: next.unable }, head.value.last, null, [], next.guards);
     // A choice identical to a request already performed with a product would repeat it without effect: the pass stands
     // on that product and waits for its producer or a changed basis instead of looping on it.
     const done = "step" in next ? performed(next.step.action, next.step.request) : null;
@@ -246,10 +283,10 @@ function settle(store: Store, head: Revision<RunRecord>, step: RunStep, outcome:
   return transition(store, head, { phase: "ready" }, { step, products: outcome.products, refusal: null }, step, outcome.products);
 }
 function transition(store: Store, head: Revision<RunRecord>, state: RunState, last: RunRecord["last"], performed: RunStep | null,
-  products: readonly Ref[]): RunAdvance {
+  products: readonly Ref[], guards: readonly TransactionGuard[] = []): RunAdvance {
   const value: RunRecord = { ...head.value, state, last };
   const written = take(writeGuarded<RunRecord>(store, { unit: UNIT, target: head.id,
-    writes: [{ id: head.id, kind: RUN_KIND, expected: head.revision, value: value as unknown as Json }], guards: [] }));
+    writes: [{ id: head.id, kind: RUN_KIND, expected: head.revision, value: value as unknown as Json }], guards }));
   return { record: written[0]! as Revision<RunRecord>, performed, products };
 }
 
@@ -335,13 +372,20 @@ function waitOf(refusal: Refusal, project: string): RunWait {
   return { code: refusal.code, message: refusal.message, target: refusal.at.target || project, field: refusal.at.field || "producer",
     basis: refusal.at.ref ? [refusal.at.ref] : [] };
 }
-function wait(code: string, target: string, field: string, message: string, basis: readonly Ref[] = []): { wait: RunWait } {
-  return { wait: { code, message, target, field, basis: [...basis] } };
+/**
+ * What a wait means to the end of the pass (№1995 п.8): `defer` — something may still change or finish (a physical call, a
+ * standalone attempt, bases, an environment that is not ready); `dependent` — it waits for a partner group and cannot
+ * end before that group does; `neutral` — it proves nothing and forbids nothing. A refusal of a producer always defers.
+ */
+type WaitRole = "defer" | "dependent" | "neutral";
+type Held = { wait: RunWait; role?: WaitRole };
+function wait(code: string, target: string, field: string, message: string, basis: readonly Ref[] = [], role: WaitRole = "defer"): Held {
+  return { wait: { code, message, target, field, basis: [...basis] }, role };
 }
 
 // ---- Choosing the next action. Reads only; the choice is written before any producer runs. ----
 
-type Next = { step: RunStep } | { wait: RunWait } | { complete: Ref[] };
+type Next = { step: RunStep } | Held | { complete: Ref[] } | { unable: RunReason[]; guards: TransactionGuard[] };
 /** The products this pass already received for an exact saved request, found in its own history; null if never performed. */
 type Performed_ = (action: RunAction, request: unknown) => Ref[] | null;
 /**
@@ -370,7 +414,7 @@ function historyOf(store: Store, head: Revision<RunRecord>): RunHistory {
   };
 }
 const M5_OWNER: SeriesOwner = Object.freeze({ kind: "mechanism", mechanism: "M5:addressing" }) as SeriesOwner;
-type Choice = { step: RunStep } | { wait: RunWait };
+type Choice = { step: RunStep } | Held;
 const step = (action: RunAction, request: unknown, series: string | null = null, attempt: number | null = null): { step: RunStep } =>
   ({ step: { action, request: sealed(request) as unknown as Json, series, attempt } });
 
@@ -381,11 +425,30 @@ interface Bases { routes: Revision<RoutesRecord>; order: readonly string[]; inpu
  */
 interface BasesStep { project: string; basis: Ref[]; guards: Ref[]; open: string[]; completion: boolean }
 /**
+ * What one choice of the next action learned: the heads it stands on and the grounds it proved final. A pass ends
+ * without a result only from these (№1995 п.3, п.8); a wait is never classified into an end by its code.
+ */
+interface Trail { readonly guards: Map<string, TransactionGuard>; readonly finals: RunReason[] }
+const newTrail = (): Trail => ({ guards: new Map(), finals: [] });
+function stand(trail: Trail, heads: readonly (TransactionGuard | Ref | null)[]): void {
+  for (const head of heads) if (head) trail.guards.set(canonical(head as unknown as Json), head as TransactionGuard);
+}
+/** The ground of the end, if no lawful step is left and nothing may still change or finish: proved grounds, and no deferring wait. */
+function endOf(trail: Trail, waits: readonly Held[]): Next | null {
+  if (!trail.finals.length || waits.some(item => (item.role ?? "defer") === "defer")) return null;
+  return { unable: canonicalReasons(trail.finals), guards: [...trail.guards.values()] };
+}
+/**
  * The next action. An owner that waits keeps its own addressed wait and never stops an independent owner whose own
- * admission holds (row 3, К1): the pass goes on in M3 order and, if nothing is admissible, stands on the first wait.
+ * admission holds (row 3, К1): the pass goes on in M3 order and, if nothing is admissible, stands on the first wait — or,
+ * when no step is left, nothing may still change and a ground is proved that no automatic continuation lifts, ends
+ * without a result (№1908, №1995).
  */
 function selectNext(store: Store, request: RunRequest, history: RunHistory): Next {
-  const project = request.project, waits: { wait: RunWait }[] = [], open: Ref[] = [];
+  const project = request.project, waits: Held[] = [], open: Ref[] = [], trail = newTrail();
+  // What an end without a result stands on is taken BEFORE the reading it protects: a head that moves after this point
+  // makes the write fail instead of letting a stale end pass (урок 42).
+  stand(trail, [...take(readRunStandingGuards(store, project)) as TransactionGuard[], ...rootGuards(store, project)]);
   // 1. An open attempt of any series — on any line, a superseded one included (№1737 п.10, C57) — is continued first,
   // on its own saved plan and before any new B1 is looked at (№1737 п.2, п.8): its results stay results of the B1 it
   // began from. A second attempt of that series never runs beside it.
@@ -393,13 +456,19 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
     const running = [...series.value.attempts].find(attempt => attempt.outcome === null);
     if (!running) continue;
     open.push(reference(series));
-    const next = continueAttempt(store, request, series, running.ordinal, history);
+    const next = continueAttempt(store, request, series, running.ordinal, history, trail);
     if ("step" in next) return next;
     waits.push(next);
   }
   const bases = machineBases(store, request, open);
   if ("step" in bases) return bases;
-  if ("wait" in bases) return waits[0] ?? bases;
+  if ("wait" in bases) {
+    // The wait for the open attempts to end stands — unless the attempts open are themselves proved final: bases would
+    // then wait for a group that cannot end, and that group's ground is the reason, not the builder's refusal (№1995 п.8).
+    const end = bases.role === "dependent" ? endOf(trail, waits) : null;
+    return end ?? waits[0] ?? bases;
+  }
+  stand(trail, [bases.input, bases.refs.horizon, bases.refs.queue, bases.refs.routes]);
   // №1860 п.5 (C38): an accepted answer M6 already routes as answered is applied to B1 when no attempt works on the
   // B1 it would replace; the new B1 then gets its own bases in the next step.
   if (!open.length) {
@@ -416,15 +485,21 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
     if (batches.length) owners.push([{ block }, batches]);
   }
   for (const [owner, batches] of owners) {
-    const next = newWork(store, request, bases, owner, batches, history);
+    const next = newWork(store, request, bases, owner, batches, history, trail);
     if (next && "step" in next) return next;
     if (next) waits.push(next);
   }
-  if (waits.length) return waits[0]!;
-  const end = completion(store, request);
+  idleBarriers(store, request, bases, owners.map(([owner]) => owner), history, trail);
+  // Before run_idle or any subject wait: no attempt is left to have asked, so the common G4b names what nobody can answer.
+  if (!waits.some(item => (item.role ?? "defer") === "defer") && !store.get(`om-frame:${project}:3`))
+    trail.finals.push(...unansweredQuestions(store, project, bases));
+  const end = endOf(trail, waits);
   if (end) return end;
+  if (waits.length) return trail.finals.length ? waits.find(item => (item.role ?? "defer") === "defer") ?? waits[0]! : waits[0]!;
+  const done = completion(store, request);
+  if (done) return done;
   return wait("run_idle", runId(project), "bases", "No admissible new work remains on these exact bases; the pass waits for their next lawful revision",
-    [bases.input, bases.refs.horizon, bases.refs.queue, bases.refs.routes]);
+    [bases.input, bases.refs.horizon, bases.refs.queue, bases.refs.routes], "neutral");
 }
 const isM5Batch = (batch: RouteBatch): boolean => batch.model === "MC2" && batch.task === "input-field"
   && batch.items.length > 0 && batch.items.every(item => item.field === "address" && item.consumers.length === 0);
@@ -444,7 +519,7 @@ function machineBases(store: Store, request: RunRequest, open: readonly Ref[]): 
     // is admitted meanwhile: B3 itself refuses a new local subject beside a running attempt (№1937-1).
     if (open.length && (RUN_BASES_HEAD_STAGES as readonly string[]).includes(checked.value.stage))
       return wait("bases_after_work", open[0]!.id, "attempts",
-        `The next bases (${checked.value.stage}) wait until the open attempts finish on their current bases`, [...open]);
+        `The next bases (${checked.value.stage}) wait until the open attempts finish on their current bases`, [...open], "dependent");
     return basesStep(store, project, [], false);
   }
   const built = checked.value.built;
@@ -460,10 +535,14 @@ function machineBases(store: Store, request: RunRequest, open: readonly Ref[]): 
  * inventory, the graph, the accepted frames and the research L2 — so a changed world is a new step, never a repeat
  * without effect; the heads of the attempts it was decided on guard its writes (№1860 п.5).
  */
+const rootIds = (project: string): string[] => [`om-input:${project}`, `graph:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`,
+  `phase:${project}:L2`, `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`)];
+/** The roots the machine bases derive from, each at its head or — where the choice depends on its absence — as absent. */
+function rootGuards(store: Store, project: string): TransactionGuard[] {
+  return rootIds(project).map(id => { const head = store.get(id); return head ? reference(head) : { id, absent: true as const }; });
+}
 function basesStep(store: Store, project: string, open: string[], completion: boolean, series: string | null = null, attempt: number | null = null): { step: RunStep } {
-  const ids = [`om-input:${project}`, `graph:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`, `phase:${project}:L2`,
-    `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`)];
-  const basis = ids.flatMap(id => { const head = store.get(id); return head ? [reference(head)] : []; });
+  const basis = rootIds(project).flatMap(id => { const head = store.get(id); return head ? [reference(head)] : []; });
   const guards = projectSeries(store, project, true).map(row => reference(row));
   const build: BasesStep = { project, basis, guards, open: [...open].sort(), completion };
   return step("bases", build, series, attempt);
@@ -509,7 +588,8 @@ function goalOf(project: string, owner: Owner, batches: readonly RouteBatch[]): 
   return { key: `om-goal:${hashJson({ owner: typed, result, questions } as unknown as Json)}`, questions, result };
 }
 
-function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, batches: readonly RouteBatch[], history: RunHistory): Choice | null {
+function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, batches: readonly RouteBatch[], history: RunHistory,
+  trail: Trail): Choice | null {
   const project = request.project;
   const address = seriesAddress(ownerRequest(project, owner, 1) as never);
   const first = store.get<AnyRepairSeries>(address.id);
@@ -521,31 +601,36 @@ function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, 
   const series = projectSeries(store, project).find(row => sameOwner(row.value, owner));
   if (!series) fail("record_missing", address.id, "line", "A registered series keeps one current line");
   if (series.value.attempts.some(attempt => attempt.outcome === null)) return null;
-  const barrier = ladder(store, request, series, history);
-  if (barrier) return barrier;
+  const barrier = ladder(store, request, series, history, trail);
+  if (barrier && ("step" in barrier || "wait" in barrier)) return barrier;
+  // What the owner still owes — a closed attempt that ended waiting for it — is proved by the close of that very attempt
+  // and matched to the questions of today's batches by their stable addresses, never by the key of a goal (№1995 п.5).
+  const keys = new Set(batches.flatMap(batch => batch.items.map(item => gapLineKey(project, item.target, item.field))));
+  const owed = owedBy(store, project, series, keys);
+  if (barrier) { trail.finals.push(...barrier.final, ...owed.flatMap(row => row.reasons)); return null; }
   // The current line admission of B3 (rows 1, 22, 24): an unactivated root, an excluded or a superseded line starts no work.
   if (owner.block) {
     const admission = prepareSeriesLineAdmission(store, project, reference(series));
     if (!admission.ok) return { wait: waitOf(admission.refusal, project) };
   }
-  const goal = goalOf(project, owner, batches);
+  // A batch that holds a question still owed is not paid again whatever the batches around it are; a batch that does not
+  // is independent work and goes on. The content of a batch is never divided (№1995 п.5).
+  const held = new Set(owed.flatMap(row => row.questions.filter(question => keys.has(question))));
+  const free = batches.filter(batch => !batch.items.some(item => held.has(gapLineKey(project, item.target, item.field))));
+  if (!free.length) { trail.finals.push(...owed.flatMap(row => row.reasons)); return null; }
+  const goal = goalOf(project, owner, free);
   const attempts = [...series.value.inherited, ...series.value.attempts];
-  // Owner-control of this goal stands at any reason of the attempt that raised it (№1452 Д, №1737 п.7): before H2.0 no
-  // trusted producer answers it, so the goal waits; another lawful goal of the series is not held by it.
-  const control = ownerControl(store, project, series, attempts.filter(attempt => attempt.outcome !== null && same(attempt.goal, goal)));
-  if (control.length) return wait("owner_control", series.id, "goal",
-    "This goal waits for its owner's verified answer; no trusted producer of it exists before H2.0", [reference(series), ...control]);
   const last = attempts.at(-1);
   // A goal already achieved is done: on these exact routes nothing remains, and a new routes Ref alone never pays for
   // the same goal again (№1860 п.5, C52) — its results are delivered first; a gap it still does not close waits,
   // addressed to that result, instead of a new ordinal.
   if (last && same(last.goal, goal) && last.outcome?.reason === "result") return samePlan(store, project, series, last.ordinal, bases) ? null
     : wait("goal_achieved", series.id, "goal", "This goal was achieved on earlier routes; its gaps remain open on the current ones without a proved new subject",
-      [reference(series), bases.refs.routes]);
+      [reference(series), bases.refs.routes], "neutral");
   const ordinal = (attempts.at(-1)?.ordinal ?? 0) + 1;
-  const plan = { routes: bases.refs.routes, batches: batches.map(batch => batch.id).sort() };
+  const plan = { routes: bases.refs.routes, batches: free.map(batch => batch.id).sort() };
   return step("open", { ...ownerRequest(project, owner, series.value.line), attempt: ordinal, goal,
-    ...(owner.owner ? { admission: { gaps: scope, routes: bases.refs.routes, batch: batches[0]!.id } } : {}), completion: plan },
+    ...(owner.owner ? { admission: { gaps: scope, routes: bases.refs.routes, batch: free[0]!.id } } : {}), completion: plan },
   series.id, ordinal);
 }
 
@@ -557,57 +642,138 @@ function samePlan(store: Store, project: string, series: Revision<AnyRepairSerie
   const binding = take(readCompletionBinding(store, project, reference(series), ordinal));
   return binding === null || sameRef(binding.value.plan.routes, reference(bases.routes));
 }
-/** The exact waiting sources closes of this goal saved: a managed close keeps them at any reason; a standalone one by reason. */
-function ownerControl(store: Store, project: string, series: Revision<AnyRepairSeries>, closed: readonly { ordinal: number; outcome: { reason: string } | null }[]): Ref[] {
-  const waiting: Ref[] = [];
-  for (const attempt of closed) {
-    const own = series.value.attempts.some(row => row.ordinal === attempt.ordinal);
-    const binding = own ? take(readCompletionBinding(store, project, reference(series), attempt.ordinal)) : null;
+/** The series that made an attempt itself: this one, or the predecessor that carried it before the line moved on (№1995 п.5). */
+function originOf(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number): Ref {
+  let at = series as Revision<AnyRepairSeries>;
+  while (!at.value.attempts.some(row => row.ordinal === ordinal)) {
+    if (at.value.predecessor === null) return reference(series);
+    at = take(readAnySeriesAt(store, project, at.value.predecessor)) as Revision<AnyRepairSeries>;
+  }
+  return reference(at);
+}
+/** A closed attempt that ended waiting for the owner: the questions it was asked, and the grounds its own close proves. */
+interface Owed { readonly questions: readonly string[]; readonly reasons: RunReason[] }
+/**
+ * Every closed attempt of the line that ended waiting for the owner and asked a question still open today (`keys`): a
+ * managed close keeps its waiting sources at any reason of the attempt, a standalone one is read by its reason. The
+ * attempt keeps its true origin — an inherited one is read at the series that made it — and its number is part of the
+ * address (№1995 п.5). The message is the saved diagnostic of E4, never a text made up here.
+ */
+function owedBy(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, keys: ReadonlySet<string>): Owed[] {
+  const owed: Owed[] = [];
+  for (const attempt of [...series.value.inherited, ...series.value.attempts]) {
+    if (attempt.outcome === null || !attempt.goal.questions.some(question => keys.has(question))) continue;
+    const origin = originOf(store, project, series, attempt.ordinal), field = `attempt.${attempt.ordinal}`;
+    const binding = take(readCompletionBinding(store, project, origin, attempt.ordinal));
     if (binding) {
       const record = store.get(completionCloseId(project, binding.id));
       if (!record) fail("record_missing", completionCloseId(project, binding.id), "close", "A closed managed attempt keeps its close record");
-      waiting.push(...take(readCompletionCloseAt(store, project, reference(record))).waiting);
-    } else if (attempt.outcome?.reason === "awaiting-owner") waiting.push(reference(series));
+      const close = take(readCompletionCloseAt(store, project, reference(record)));
+      if (!close.waiting.length) continue;
+      owed.push({ questions: attempt.goal.questions, reasons: close.waiting.map(diagnostic => {
+        const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
+        return reasonOf("owner-control", checked.request.code, series.id, field, checked.request.message, [reference(series), reference(record), diagnostic]);
+      }) });
+    } else if (attempt.outcome.reason === "awaiting-owner")
+      owed.push({ questions: attempt.goal.questions, reasons: [reasonOf("owner-control", "awaiting_owner", series.id, field,
+        `Attempt ${attempt.ordinal} of this line ended waiting for the owner; the earlier mode saved no diagnostic of the decision it needs`, [origin])] });
   }
-  return waiting;
+  return owed;
 }
 /**
  * The ladder after a stop and the origin holds, read by A3/A4 and answered by their own producers (rows 17–21). The
  * origin route goes first, and each ground lifts only its own barrier: A6 on the exact hold may lift it; on a first-rung
- * stop A6 reviews the exact stop-context — decided grounds `resumeSeries`, undecided escalates it (A6 itself), failed
- * waits for a door. The second rung waits for the owner's exact decision; H1 never makes one.
+ * stop A6 reviews the exact stop-context — decided grounds `resumeSeries`, undecided escalates it (A6 itself). A6 is
+ * asked for a possible continuation, never to fill a list: once a ground no automatic step lifts is proved — a standing
+ * hold, a failed review, the second rung — the rest of the line is not paid for (№1995 п.4). What is proved is a ground of
+ * the end of the pass; a stop not yet reviewed is not (R1). H1 never makes the owner's decision.
  */
-function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRepairSeries>>, history: RunHistory): Choice | null {
+type Barrier = { step: RunStep } | Held | { final: RunReason[] } | null;
+function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRepairSeries>>, history: RunHistory, trail: Trail): Barrier {
   const project = request.project, performed = history.performed;
   const read = readStopContext(store, seriesRequestOf(series.value));
-  if (!read.ok) return read.refusal.code === "stop_absent" ? null : { wait: waitOf(read.refusal, project) };
+  // A refusal to read the ground is a typed refusal of the pass, never a wait and never a ground of its end (№1995 п.6);
+  // only the plain absence of a stop is no ground at all.
+  if (!read.ok) {
+    if (read.refusal.code === "stop_absent") return null;
+    throw new RunFailure(read.refusal);
+  }
   const context = read.value.context;
+  stand(trail, read.value.reads as Ref[]);
   // №1814: the A6 of one exact ground goes on with the request this pass saved for it — its original dispatch — and
   // finds its result by that request; only a ground never analysed gets the current dispatch. A6 names a hold by the
   // hold itself, and a stop by its origin series and stop attempt, never by the series revision or the dispatch.
   for (const hold of [...context.holds].sort((a, b) => a.hold.id < b.hold.id ? -1 : a.hold.id > b.hold.id ? 1 : 0)) {
-    const analysis = history.saved("analyze", row => same(row.hold, hold.hold))
-      ?? { project, series: reference(series), hold: hold.hold, dispatch: request.dispatch };
+    const saved = history.saved("analyze", row => same(row.hold, hold.hold));
+    const analysis = saved ?? { project, series: reference(series), hold: hold.hold, dispatch: request.dispatch };
     const done = performed("analyze", analysis);
-    if (!done) return step("analyze", analysis, series.id, hold.attempt);
+    if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, hold.attempt);
     const record = take(readStopAnalysis(store, { project, record: done[0]! }));
-    return wait(record.value.state === "failed" ? "analysis_failed" : "origin_hold", hold.hold.id, "hold",
-      "The origin of this refusal is not established; the hold stands until its own lawful lift", [hold.hold, done[0]!]);
+    if (record.value.state === "failed") return { final: [reasonOf("hold-analysis-failed", "analysis_failed", hold.hold.id, "hold",
+      "The independent review of this hold ended without a result of its own; nothing automatic lifts the hold", [hold.hold, done[0]!])] };
+    if (record.value.state === "origin-unestablished") return { final: [reasonOf("hold-origin-unestablished", "origin_hold", hold.hold.id, "hold",
+      "The origin of this refusal is not established; the hold stands until its own lawful lift", [hold.hold, done[0]!])] };
+    // The record and the standing hold disagree: nothing is proved, the pass reads them again.
+    return wait("origin_hold", hold.hold.id, "hold", "The review of this hold is saved, but the hold still stands; the pass reads them again", [hold.hold, done[0]!]);
   }
   const stop = context.stop;
   if (!stop) return null;
-  if (context.ladder.rung >= 2) return wait("owner_decision", series.id, "stop",
-    "The second rung needs the owner's exact decision on this stop; a review or fixed inputs do not replace it", [reference(series)]);
-  const analysis = history.saved("analyze", row => row.hold === null && sameStop(store, project, series, stop.attempt, row.series))
-    ?? { project, series: reference(series), hold: null, dispatch: request.dispatch };
+  if (context.ladder.rung >= 2) {
+    const escalation = series.value.escalations.find(item => item.after === stop.attempt);
+    return { final: [reasonOf("stop-second-rung", "owner_decision", series.id, "stop",
+      `The stop after attempt ${stop.attempt} stands on the second rung: only a decision on it continues the series, and this pass makes none`,
+      [reference(series), ...(escalation ? [escalation.review] : [])])] };
+  }
+  const saved = history.saved("analyze", row => row.hold === null && sameStop(store, project, series, stop.attempt, row.series));
+  const analysis = saved ?? { project, series: reference(series), hold: null, dispatch: request.dispatch };
   const done = performed("analyze", analysis);
-  if (!done) return step("analyze", analysis, series.id, stop.attempt);
+  if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, stop.attempt);
   const record = take(readStopAnalysis(store, { project, record: done[0]! }));
   if (record.value.state === "decided") return step("resume", { ...seriesRequestOf(series.value), stop: stop.attempt, ground: "review-record",
     text: `The independent review of this stop decided: ${record.value.change?.text ?? record.value.cause?.text ?? "an addressed change"}`,
     review: { ref: done[0]! } }, series.id, null);
-  return wait(record.value.state === "failed" ? "analysis_failed" : "owner_decision", series.id, "stop",
-    "The review of this stop gave no ground to continue; the door is the owner's decision or proven fixed inputs", [reference(series), done[0]!]);
+  if (record.value.state === "failed") return { final: [reasonOf("stop-analysis-failed", "analysis_failed", series.id, "stop",
+    `The independent review of the stop after attempt ${stop.attempt} ended without a result of its own; nothing automatic continues the series`,
+    [reference(series), done[0]!])] };
+  // An undecided review escalates the stop atomically with its own record, so the next reading is on the second rung.
+  return wait("owner_decision", series.id, "stop", "The review of this stop is saved undecided but the stop is not on the second rung; the pass reads them again",
+    [reference(series), done[0]!]);
+}
+/**
+ * A6 for a saved request cannot even be prepared, and this is the same request for the same barrier: the environment has
+ * no independent reviewer or the complete reviewer request exceeds the technical capacity. That is not a failed review —
+ * no analysis and no transport exist — but nothing automatic lifts it, and a changed dispatch would be another
+ * identity of the review (№1995 п.7). Any other refusal of the preparation is not a ground.
+ */
+function unavailable(store: Store, series: Sealed<Revision<AnyRepairSeries>>, request: StopAnalysisRequest): Barrier {
+  const prepared = prepareStopAnalysis(store, request);
+  if (prepared.ok || !["assessor_not_independent", "context_too_large"].includes(prepared.refusal.code)) return null;
+  const refusal = prepared.refusal;
+  return { final: [reasonOf("analysis-unavailable", refusal.code, refusal.at.target, refusal.at.field ?? "request", refusal.message,
+    [reference(series), ...(request.hold ? [request.hold] : []), request.dispatch.adapter, request.dispatch.config, ...(refusal.at.ref ? [refusal.at.ref] : [])])] };
+}
+/**
+ * A line of this pass's own horizon that the batches do not reach today keeps the barrier it stands on: an absent batch
+ * does not erase a stop or a hold (№1995 п.8, C31). Only a line that belongs to the saved intent counts: its block is a
+ * node of the horizon the intent derived and B3 still admits the line. The finished history of any other block — one
+ * the intent never asked for — is another subject's and stops nothing, however legacy its line is (№2045-1). The
+ * mechanism M5 has no such line: it asks the questions of today's batches and nothing else, so without a batch nothing
+ * is left for it to ask. Only what is already proved counts; nothing is paid for an owner that has no work.
+ */
+function idleBarriers(store: Store, request: RunRequest, bases: Bases, owners: readonly Owner[], history: RunHistory, trail: Trail): void {
+  const project = request.project;
+  // The horizon is read once, and only when a line without a batch is met.
+  let nodes: ReadonlySet<string> | null = null;
+  const inside = (block: string): boolean =>
+    (nodes ??= new Set(take(readHorizon(store, project, bases.refs.horizon)).horizon.value.result.horizon.nodes)).has(block);
+  for (const series of projectSeries(store, project)) {
+    if (!("block" in series.value)) continue;
+    const block = series.value.block;
+    if (owners.some(item => item.block === block) || series.value.attempts.some(attempt => attempt.outcome === null)) continue;
+    if (!inside(block) || !prepareSeriesLineAdmission(store, project, reference(series)).ok) continue;
+    const barrier = ladder(store, request, series, history, trail);
+    if (barrier && "final" in barrier) trail.finals.push(...barrier.final);
+  }
 }
 /**
  * Whether a saved A6 request names this exact stop, as A6 itself names it: its series is this line or a predecessor
@@ -632,13 +798,16 @@ function sameStop(store: Store, project: string, series: Revision<AnyRepairSerie
  * its own E4/E5/G7 way (№1737 п.3). For a managed one the next unfinished assignment is chosen from the work itself,
  * never from today's E1 ledger (C23); a complete work is checked (block G4b) and closed through G7 with its derived claim.
  */
-function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number, history: RunHistory): Choice {
+function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number, history: RunHistory,
+  trail: Trail): Choice {
   const project = request.project;
   const binding = take(readCompletionBinding(store, project, reference(series), ordinal));
   if (!binding) return wait("standalone_attempt", series.id, "attempt",
     "A standalone attempt of the earlier mode continues by its own E4/E5/G7 way; the pass does not adopt it", [reference(series)]);
   const workHead = store.get<CompletionWork>(completionWorkId(project, binding.id));
   if (!workHead) fail("record_missing", completionWorkId(project, binding.id), "work", "A managed attempt keeps its registry");
+  // The registry of open work is a head an end without a result depends on (№1995 п.3).
+  stand(trail, [reference(workHead)]);
   const work = take(readCompletionWorkAt(store, project, reference(workHead))) as CompletionSnapshot;
   const address = { ...ownerRequest(project, "block" in series.value ? { block: series.value.block } : { owner: M5_OWNER }, series.value.line), attempt: ordinal };
   const block = "block" in series.value;
@@ -658,6 +827,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   // environment change); only a packet never cycled gets the current dispatch.
   const cycleOf = (packet: Ref): Choice => step("cycle", history.saved("cycle", row => same(row.packet, packet))
     ?? { project, packet, dispatch: request.dispatch, role: "implementer" }, series.id, ordinal);
+  const explained = new Set<string>();
   for (const assignment of open.filter(row => !parents.has(row.id))) {
     const value = assignment.value as CompletionAssignment;
     // Row 6, №1737 п.9: an unfinished assignment whose required condition lawfully changed is ended by the common H1.0b
@@ -671,7 +841,12 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
         // A works root (L3 node expansion) is asked with the D7 ledger of its exact D1 scope and D2 lines (F5).
         const batch = plan.value.batches.find(row => row.id === value.batch);
         const ledger = batch?.task === "node-expansion" && batch.level === 3 ? worksLedger(store, project, scope) : null;
-        if (ledger && !("works" in ledger)) return "step" in ledger ? { step: { ...ledger.step, series: series.id, attempt: ordinal } } : ledger;
+        if (ledger && !("works" in ledger)) {
+          if ("step" in ledger) return { step: { ...ledger.step, series: series.id, attempt: ordinal } };
+          // A root the D7 cannot assign is a proved ground: the attempt's other assignments still get their turn.
+          if (ledger.final) { trail.finals.push(ledger.final); explained.add(assignment.id); continue; }
+          return ledger;
+        }
         return step("packet", { project, routes: binding.value.plan.routes, batch: value.batch, environment: request.dispatch.config,
           attempt: { series: binding.value.series, ordinal }, previous: [], ...(ledger ? { works: ledger.works } : {}) }, series.id, ordinal);
       }
@@ -692,8 +867,10 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       return step("assess", saved ?? { project, ...fact, dispatch: request.dispatch }, series.id, ordinal);
     }
   }
+  // What is unfinished only because of a proved ground is that ground's, not a wait of its own (№1995 п.8).
   if (open.length) return wait("work_pending", workHead.id, "assignments",
-    "A registered assignment is unfinished and no action of this pass can finish it now", open.map(row => reference(row)));
+    "A registered assignment is unfinished and no action of this pass can finish it now", open.map(row => reference(row)),
+    explained.size && open.every(row => explained.has(row.id)) ? "dependent" : "defer");
   const batches = plan.value.batches.filter(row => binding.value.plan.batches.includes(row.id));
   const expansion = (level: 2 | 3) => batches.some(row => row.task === "node-expansion" && row.level === level);
   const level: 2 | 3 | null = !block ? null : expansion(2) ? 2 : expansion(3) ? 3 : null;
@@ -720,7 +897,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if (!prepared.ok) return { wait: waitOf(prepared.refusal as Refusal, project) };
     // Another block of this frame has not assembled its part yet: this attempt stays open and the pass goes on in M3.
     if (prepared.value.state === "gaps") return wait("frame_participants", series.id, "candidate",
-      "The common operations frame still has open obligations of other blocks; this attempt waits for their work", group.map(row => reference(row.series)));
+      "The common operations frame still has open obligations of other blocks; this attempt waits for their work", group.map(row => reference(row.series)), "dependent");
     if (!prepared.value.existing) return step("candidate", candidateRequest, series.id, ordinal);
     const gate = gateCandidate(store, { project, candidate: reference(prepared.value.existing) });
     if (!gate.ok) return { wait: waitOf(gate.refusal as Refusal, project) };
@@ -738,6 +915,20 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if ("successor" in current) return step("routes", current.successor, series.id, ordinal);
     const evaluation = { project, binding: reference(binding), deliver: "all",
       request: answersRequest(store, project, current.routes, members, { series: series.id, ordinal }, candidate?.ref ?? null) };
+    // This very check was evaluated already, so evaluating it again changes nothing and would starve every other owner of the
+    // pass: what its full G4b proved is read instead (№1995 п.9, №2045-2). A question no producer of this product answers
+    // is a final ground; the attempt stays open — no close, C5 or D2 is invented — and the pass goes on with whatever else
+    // it can do. A failed check without such a ground keeps its old choice.
+    const evaluated = history.performed("evaluate", evaluation);
+    if (evaluated) {
+      const read = passedGate(store, project, evaluated[0]!);
+      const grounds = read.passed ? [] : provenQuestions(store, project, read.gate, { binding, products: work.products });
+      if (grounds.length) {
+        trail.finals.push(...grounds);
+        return wait("check_unanswerable", series.id, "answers",
+          "The full G4b of this attempt's check names a question no producer of this product answers; the attempt stays open", [evaluated[0]!], "dependent");
+      }
+    }
     return step("evaluate", evaluation, series.id, ordinal);
   }
   const accepting: Ref[] = [];
@@ -751,10 +942,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       // passed; it binds only its own goal's obligations (№1737 п.12, №1749 п.3).
       const pending = group.filter(row => !row.work.answers?.complete);
       if (pending.length) return wait("frame_checks", series.id, "answers",
-        "The common acceptance waits for the registered checks of every attempt of this frame", pending.map(row => reference(row.series)));
+        "The common acceptance waits for the registered checks of every attempt of this frame", pending.map(row => reference(row.series)), "dependent");
       const checked = work.answers?.evaluation ? passedGate(store, project, work.answers.evaluation) : null;
+      if (checked && !checked.passed) trail.finals.push(...provenQuestions(store, project, checked.gate, { binding, products: work.products }));
       if (!checked?.passed) return wait("frame_gate", series.id, "answers",
-        "The full G4b of this attempt's check did not pass; the common acceptance belongs to an attempt whose check passed", group.map(row => reference(row.series)));
+        "The full G4b of this attempt's check did not pass; the common acceptance belongs to an attempt whose check passed", group.map(row => reference(row.series)), "dependent");
       // №1749 п.4: the ordinary D2 snapshot of the original D1, where the gaps still stand, precedes the acceptance.
       if (!linesOf(store, project, scope)) return linesStep(store, project, scope, series.id, ordinal);
       const bound: FrameAttemptBinding = { series: reference(series), ordinal, obligations: obligationsOf(batches, level) };
@@ -780,7 +972,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
         const others = projectSeries(store, project, true).filter(row => row.value.attempts.some(attempt => attempt.outcome === null)
           && !group.some(member => member.series.id === row.id));
         if (others.length) return wait("bases_after_work", others[0]!.id, "attempts",
-          "The D2 bases over the accepted frame wait until the other open attempts finish on their current bases", others.map(row => reference(row)));
+          "The D2 bases over the accepted frame wait until the other open attempts finish on their current bases", others.map(row => reference(row)), "dependent");
         return basesStep(store, project, group.map(member => member.series.id), true, series.id, ordinal);
       }
       const current = ownersScope(store, project, checkedBases.value.built.bases.routes, accepted.acceptance, level);
@@ -897,10 +1089,49 @@ function assembliesOf(store: Store, project: string, work: CompletionSnapshot): 
   return rows;
 }
 /** The gate of the latest evaluation of this check and its exact request: whether G4b passed there. */
-function passedGate(store: Store, project: string, evaluation: Ref): { passed: boolean; request: AnswersGateRequest } {
+function passedGate(store: Store, project: string, evaluation: Ref): { passed: boolean; request: AnswersGateRequest; gate: Ref } {
   const read = take(readAnswersEvaluationAt(store, project, evaluation));
-  const gate = take(readAnswersGate(store, { project, record: (read.record.value as unknown as { gate: Ref }).gate }));
-  return { passed: gate.value.result.passed, request: gate.value.request as unknown as AnswersGateRequest };
+  const ref = (read.record.value as unknown as { gate: Ref }).gate;
+  const gate = take(readAnswersGate(store, { project, record: ref }));
+  return { passed: gate.value.result.passed, request: gate.value.request as unknown as AnswersGateRequest, gate: ref };
+}
+/**
+ * The grounds a full G4b proves for a question this product cannot answer (№1995 п.9), read from the gate's own trace and
+ * never from the code of a wait: an MC1 answer of this very attempt that asked the owner (`mc1-technical`, outcome
+ * awaiting-owner, its call among the attempt's products — with the diagnostic E4 saved), or a blocking gap of the owner or
+ * of a kind that has no answer producer (`owner-*`, `unsupported-*`). A gap of a question anyone else may still answer
+ * (`blocking-absent`) is no ground. `own` is the attempt whose calls may be named; without it only the gap grounds count.
+ */
+const NO_PRODUCER = ["owner-absent", "owner-offered", "unsupported-absent", "unsupported-offered"];
+function provenQuestions(store: Store, project: string, gate: Ref, own: { binding: unknown; products: readonly Ref[] } | null): RunReason[] {
+  const reasons: RunReason[] = [];
+  for (const entry of take(readAnswersGateTrace(store, { project, record: gate })).trace) reasons.push(...groundOf(store, entry, gate, own));
+  return reasons;
+}
+function groundOf(store: Store, entry: { finding: Refusal; cause: { emission: string; gap: Ref | null; sources: readonly { role: string; ref: Ref }[];
+  detail: { outcome?: string | null } } }, gate: Ref | null, own: { binding: unknown; products: readonly Ref[] } | null): RunReason[] {
+  const cause = entry.cause, gap = cause.gap ? [cause.gap] : [];
+  if (cause.emission === "mc1-technical" && cause.detail.outcome === "awaiting-owner") {
+    const call = cause.sources.find(source => source.role === "model-call")?.ref, diagnostic = cause.sources.find(source => source.role === "diagnostic")?.ref;
+    if (!own || !call || !diagnostic || !own.products.some(product => sameRef(product, call))) return [];
+    const checked = take(readManagedModelDiagnostic(store, own.binding as never, diagnostic));
+    return [reasonOf("frame-need-owner", checked.request.code, entry.finding.at.target, "answer", checked.request.message,
+      [...(gate ? [gate] : []), call, diagnostic, ...gap])];
+  }
+  if (!NO_PRODUCER.includes(cause.emission)) return [];
+  return [reasonOf("unsupported-question", entry.finding.code, entry.finding.at.target, entry.finding.at.field ?? "answer", entry.finding.message, gap)];
+}
+/**
+ * The blocking gaps of today's D1 for which no answer producer exists, when no attempt is open to have asked: the common
+ * G4b over the machine bases without any result names them (`owner-absent`, `unsupported-absent`). A refusal of that
+ * preparation is no ground — the pass then keeps its ordinary wait (№1995 п.9).
+ */
+function unansweredQuestions(store: Store, project: string, bases: Bases): RunReason[] {
+  const gaps = bases.routes.value.request.gaps as unknown as GapReadRequest;
+  const prepared = prepareAnswersGateTrace(store, { project, gaps, routes: bases.refs.routes, results: [] });
+  if (!prepared.ok) return [];
+  return prepared.value.trace.filter(entry => entry.cause.emission === "owner-absent" || entry.cause.emission === "unsupported-absent")
+    .flatMap(entry => groundOf(store, entry as never, null, null));
 }
 /** The obligations the attempt declared at a level: the items of its node-expansion batches (goal questions `fill`). */
 function obligationsOf(batches: readonly RouteBatch[], level: 2 | 3): string[] {
@@ -911,14 +1142,31 @@ function obligationsOf(batches: readonly RouteBatch[], level: 2 | 3): string[] {
  * another scope) and the D7 derived from them. The owner's gap assignments are not invented: without them D7 refuses,
  * and the refusal is the addressed wait.
  */
-function worksLedger(store: Store, project: string, scope: GapReadRequest): { step: RunStep } | { wait: RunWait } | { works: { producer: Ref; ledger: Ref } } {
+function worksLedger(store: Store, project: string, scope: GapReadRequest):
+{ step: RunStep } | { wait: RunWait; final?: RunReason } | { works: { producer: Ref; ledger: Ref } } {
   const lines = linesOf(store, project, scope);
   if (!lines) return linesStep(store, project, scope, null, null);
   const obligations = { project, gaps: scope, lines, assignments: [] };
   const prepared = prepareOmObligations(store, obligations);
-  if (!prepared.ok) return { wait: waitOf(prepared.refusal, project) };
+  if (!prepared.ok) {
+    const proof = prepared.refusal.code === "obligation_assignment_unresolved" ? lateGap(store, scope, prepared.refusal, lines) : null;
+    return { wait: waitOf(prepared.refusal, project), ...(proof ? { final: proof } : {}) };
+  }
   if (prepared.value.writes.length) return step("obligations", obligations) as { step: RunStep };
   return { works: { producer: refOf(prepared.value.producer), ledger: refOf(prepared.value.record) } };
+}
+
+/**
+ * A late gap of the exact D1 scope that D7 refuses to assign (№1995 п.9): the refusal alone proves nothing — the gap it
+ * names must be a gap of this scope whose moment is not the pass itself. No assignment is invented for it. The Refs are
+ * the D1 record of the gap and the D2 lines the ledger was derived on, so the same gap reads as one ground.
+ */
+function lateGap(store: Store, scope: GapReadRequest, refusal: Refusal, lines: Ref): RunReason | null {
+  const read = readGaps(store, scope);
+  if (!read.ok) return null;
+  const row = read.value.records.find(item => item.value.gap.target === refusal.at.target && item.value.gap.field === refusal.at.field
+    && item.value.gap.moment !== "om-pass");
+  return row ? reasonOf("late-obligation", refusal.code, refusal.at.target, refusal.at.field ?? "assignment", refusal.message, [reference(row), lines]) : null;
 }
 
 // ---- M7: the frame transitions of a block attempt (rows 7, 25; №1737 п.12). ----

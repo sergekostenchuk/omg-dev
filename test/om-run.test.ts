@@ -40,7 +40,9 @@ import type { RoutesRecord } from "../src/om/routes.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { runModelCycle } from "../src/om/model-call.js";
-import { advanceRun, readRun, startRun, runId, type RunRequest, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
+import { runStopAnalysis } from "../src/om/stop-analysis.js";
+import { gapLineKey } from "../src/om/gap-lines.js";
+import { advanceRun, readRun, startRun, runId, type RunRequest, type RunRecord, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
 
 const project = "garden";
@@ -196,30 +198,38 @@ const actionsSteps = (store: Store): RunStep[] => store.history(runId(project)).
   return last && last.refusal === null && JSON.stringify(last) !== JSON.stringify(previous) ? [last.step as RunStep] : [];
 });
 /**
- * Advances the pass until it has performed the given action (or waits), recording every performed action. After the M5
- * result the pass builds the new B1's bases itself and goes on with block work (H1.1): a mechanism test stops there.
+ * Advances the pass until it waits or ends (complete or unable), recording every performed action; a bound stops an
+ * accidental loop. With `until` it also stops right after that action was performed (№1995 п.11).
+ */
+async function ends(f: Fixture, request: RunRequest, bound = 30, until?: string) {
+  const performed: string[] = [];
+  for (let index = 0; index < bound; index++) {
+    const advanced = ok(await advanceRun(f.store, request));
+    if (advanced.performed) performed.push(advanced.performed.action);
+    const state = advanced.record.value.state;
+    if (["waiting", "complete", "unable"].includes(state.phase) || until !== undefined && advanced.performed?.action === until) return { performed, state, record: advanced.record };
+  }
+  assert.fail(`The pass neither waited nor ended within ${bound} transitions: ${performed.join(",")}`);
+}
+/**
+ * After the M5 result the pass builds the new B1's bases itself and goes on with block work (H1.1): a mechanism test stops
+ * there. A wait is reported, a pass that ended before the action fails the test.
  */
 async function driveTo(f: Fixture, request: RunRequest, action: string, bound = 30) {
-  const performed: string[] = [];
-  for (let index = 0; index < bound; index++) {
-    const advanced = ok(await advanceRun(f.store, request));
-    if (advanced.performed) performed.push(advanced.performed.action);
-    const state = advanced.record.value.state;
-    if (state.phase === "waiting") return { performed, wait: state.wait as RunWait | null };
-    if (advanced.performed?.action === action) return { performed, wait: null };
-  }
-  assert.fail(`The pass did not perform ${action} within ${bound} transitions: ${performed.join(",")}`);
+  const end = await ends(f, request, bound, action);
+  if (end.state.phase === "complete" || end.state.phase === "unable") assert.fail(`The pass ended (${end.state.phase}) before ${action}: ${end.performed.join(",")}`);
+  return { performed: end.performed, wait: end.state.phase === "waiting" ? end.state.wait as RunWait : null };
 }
-/** Advances the pass until it waits, recording every performed action; a bound stops an accidental loop. */
+/** Advances the pass until it waits, recording every performed action; a pass that ended instead fails the test. */
 async function drive(f: Fixture, request: RunRequest, bound = 30) {
-  const performed: string[] = [];
-  for (let index = 0; index < bound; index++) {
-    const advanced = ok(await advanceRun(f.store, request));
-    if (advanced.performed) performed.push(advanced.performed.action);
-    const state = advanced.record.value.state;
-    if (state.phase === "waiting") return { performed, wait: state.wait, record: advanced.record };
-  }
-  assert.fail(`The pass did not reach a wait within ${bound} transitions: ${performed.join(",")}`);
+  const end = await ends(f, request, bound);
+  if (end.state.phase !== "waiting") assert.fail(`The pass reached ${end.state.phase}, not a wait: ${JSON.stringify(end.state)}`);
+  return { performed: end.performed, wait: end.state.wait, record: end.record };
+}
+/** The grounds of an unable pass in their saved order; any other state fails the test. */
+function reasonsOf(state: { readonly phase: string }): readonly RunReason[] {
+  if (state.phase !== "unable") assert.fail(`The pass is ${state.phase}, not unable: ${JSON.stringify(state)}`);
+  return (state as unknown as { reasons: readonly RunReason[] }).reasons;
 }
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
@@ -305,38 +315,577 @@ function cannotAnswer(f: Fixture, routes: Ref) {
     action: "cannot_answer", reason: "The requested information is unavailable" }, usage };
 }
 
-test("17 19 20 C33 H1 three attempts without progress stop the series; A6 reviews the exact stop and an undecided review waits for the owner", async t => {
+/** Everything but the Environment records: what an unchanged terminal must leave exactly as it is. */
+const untouched = (store: Store) => store.list().map(reference).filter(ref => !ref.id.startsWith("environment:") && !ref.id.startsWith("workspace:"));
+
+test("H1.2 R1 R3 R4 R10 17 19 20 C33 three attempts without progress stop the M5 series; A6 reviews the exact stop once, an undecided review ends the pass on the second rung, and nothing is written or paid again", async t => {
   const f = runFixture(t, ["encoding"]);
   const b = f.bases("h1-first"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false), addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
-  const driven = await drive(f, request, 40);
   const attempt = ["open", "packet", "cycle", "close"];
-  assert.deepEqual(driven.performed, ["open-series", ...attempt, ...attempt, ...attempt, "analyze"], JSON.stringify(driven.wait));
+  // R1: a stop of the first rung not yet reviewed is no ground: the one A6 of that exact stop is performed first.
+  const reviewed = await driveTo(f, request, "analyze", 40);
+  assert.deepEqual(reviewed.performed, ["open-series", ...attempt, ...attempt, ...attempt, "analyze"]);
   const series = mechanismSeries(f);
   assert.deepEqual(series.value.attempts.map(row => row.outcome?.reason), ["refused", "refused", "refused"]);
   assert.ok(series.value.stop, "A3 set the stop; the pass counts nothing itself");
-  assert.equal(driven.wait.code, "owner_decision");
   assert.equal(series.value.escalations.length, 1, "The undecided review escalated the stop atomically (A6)");
-  const before = f.store.list().map(reference), sends = f.sent().length;
-  f.restart();
-  const again = ok(await advanceRun(f.store, request));
-  assert.equal(again.performed, null);
-  assert.deepEqual(f.store.list().map(reference), before, "The second rung waits without a write and without a paid repeat");
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "ready", "Nothing ended before the review's own result was read");
+  const sends = f.sent().length;
+  assert.equal(sends, 4, "Three attempts and the one review");
+  // R3/R4: the saved review and the escalation are the ground; no further call is made and no decision is required or made.
+  const end = await ends(f, request, 5);
+  assert.deepEqual(end.performed, []);
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["stop-second-rung", "owner_decision", series.id, "stop"]]);
+  assert.match(reasons[0]!.message, /attempt 3/);
+  assert.equal(reasons[0]!.basis.length, 2);
+  assert.ok(reasons[0]!.basis.some(ref => ref.id === series.id && ref.revision === series.revision), "The exact stopped line");
+  assert.ok(reasons[0]!.basis.some(ref => ref.hash === series.value.escalations[0]!.review.hash), "The exact review of this stop");
+  assert.equal(f.store.list().filter(row => row.id.startsWith(ownerDecisionNamespace(project))).length, 0);
   assert.equal(f.sent().length, sends);
-  // The owner's exact decision on this stop (the owner's own act, not the pass's) opens the next window of work.
-  const stopped = mechanismSeries(f), stop = stopped.value.stop!;
-  const decision = f.store.write({ id: `${ownerDecisionNamespace(project)}h1-window`, kind: OWNER_DECISION_KIND, expected: 0,
-    value: { projectId: project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, stop: stop.attempt, goals: [...stop.goals],
-      decided: "go on: I have read what was tried and I want one more window", taken: { by: "the owner", through: "the command API", approved: true } } });
-  ok(resumeSeries(f.store, { ...seriesRequestOf(stopped.value), stop: stop.attempt, ground: "owner-decision",
-    text: "the owner decided to go on", decision: { ref: reference(decision) } } as never));
-  const window = await driveTo(f, request, "bases", 20);
-  assert.deepEqual(window.performed, ["open", "packet", "cycle", "close", "bases"], JSON.stringify(window.wait));
-  assert.equal(mechanismSeries(f).value.attempts.at(-1)!.outcome!.reason, "result");
+  // R10: the saved end comes back from advance, start, a new store and a changed Environment; nothing is written or paid.
+  const saved = ok(readRun(f.store, { project }))!, before = untouched(f.store);
+  f.restart();
+  assert.deepEqual(ok(await advanceRun(f.store, request)).record, saved);
+  f.environment();
+  const changed = ok(await advanceRun(f.store, f.request()));
+  assert.deepEqual([changed.performed, changed.products, changed.record], [null, [], saved]);
+  assert.deepEqual(ok(startRun(f.store, { project })), saved);
+  assert.equal(refusal(startRun(f.store, { project, outcomes: ["another-outcome"] })).code, "run_intent_conflict", "A pass never changes its intent");
+  // R10a: the direct entries of the builder read the saved end before any product of the chain: no base, no write.
+  for (const refused of [refusal(prepareRunBases(f.store, { project })), refusal(writeRunBases(f.store, { project })),
+    refusal(writeRunBases(f.store, { project, outcomes: saved.value.intent.outcomes as string[] }))]) {
+    assert.deepEqual([refused.code, refused.at.target, refused.at.field, refused.at.ref], ["run_bases_terminal", runId(project), "state.phase", reference(saved)]);
+    assert.match(refused.message, /unable/);
+  }
+  assert.equal(refusal(writeRunBases(f.store, { project, outcomes: ["another-outcome"] })).code, "run_intent_conflict", "The intent conflict is judged first");
+  assert.deepEqual(untouched(f.store), before);
+  assert.equal(f.sent().length, sends);
 });
 
-test("18 19 H1 a decided first-rung review grounds resumeSeries of that exact stop, and the next attempt works on", async t => {
+/**
+ * A line of the consuming block stopped by A3 through the real producers: three attempts of the earlier mode, each closed by
+ * G7 with a result that accepts nothing, move nothing. (The pass's own block attempts reach the same stop; that route
+ * re-reads the whole refusal journal for every later packet, which costs minutes in the shared readers and adds nothing
+ * to this row.)
+ */
+function stoppedBlockLine(f: Fixture, block = "garden-consume-block") {
+  const address = { project, block, line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "h12-stopped", predecessor: null, basis: null }));
+  const goal = { key: "h12-stopped-goal", questions: ["Address one contract"], result: "A supported contract" };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    ok(beginAttempt(f.store, { ...address, attempt, goal }));
+    ok(closeAttempt(f.store, { ...address, attempt, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } }));
+  }
+  return blockSeries(f, block);
+}
+
+test("H1.2 R4 R1 a block line stopped by three fruitless attempts: the one review is undecided and the second rung ends the pass on the block's exact stop", async t => {
+  const f = runFixture(t, ["encoding"], true, true);
+  const stopped = stoppedBlockLine(f);
+  assert.ok(stopped.value.stop, "A3 stopped the line");
+  assert.equal(stopped.value.escalations.length, 0, "Nothing reviewed it yet");
+  const request = f.request(f.bases("h12-block-stop"));
+  f.steps([stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 30);
+  const series = blockSeries(f);
+  assert.deepEqual(series.value.attempts.map(row => row.outcome?.reason), ["result", "result", "result"]);
+  assert.equal(end.performed.filter(action => action === "analyze").length, 1, "The one review of the exact stop");
+  assert.equal(end.performed.includes("open") || end.performed.includes("open-series"), false, "The stopped line opens no attempt");
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["stop-second-rung", "owner_decision", series.id, "stop"]]);
+  assert.equal(series.value.escalations.length, 1, "The undecided review escalated the stop atomically (A6)");
+  assert.ok(reasons[0]!.basis.some(ref => ref.hash === series.value.escalations[0]!.review.hash), "The review of this very stop");
+  assert.equal(f.store.list().filter(row => row.id.startsWith(ownerDecisionNamespace(project))).length, 0, "No decision of the owner is required or made");
+  const sends = f.sent().length;
+  assert.equal(sends, 1, "Only the one review was paid");
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+  assert.equal(f.sent().length, sends);
+});
+
+test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
+  const f = runFixture(t, []);
+  const stopped = stoppedBlockLine(f);
+  const request = f.request(f.bases("h12-idle"));
+  f.steps([stopAnswer(f, false)]);
+  // The one review of this exact stop is the earlier mode's own A6 (an operator act through the same producer); the second rung is what it leaves.
+  const review = ok(await runStopAnalysis(f.store, { project, series: reference(stopped), hold: null, dispatch: request.dispatch }));
+  assert.equal(review.value.state, "undecided");
+  const series = blockSeries(f);
+  assert.equal(series.value.escalations.length, 1);
+  const sends = f.sent().length;
+  assert.equal(sends, 1);
+  // No question is open, so no route reaches the block: the old absence of a batch must not erase its stop.
+  assert.deepEqual(f.store.list<RoutesRecord>("route-result").flatMap(row => row.value.batches.filter(batch => batch.items.length)), []);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 20);
+  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), [["stop-second-rung", "owner_decision", series.id, "stop"]]);
+  assert.deepEqual(end.performed.filter(action => action !== "bases"), [], "The idle owner is asked for nothing: only the pass's own bases were built");
+  assert.equal(f.sent().length, sends, "Nothing was paid for the owner that has no work");
+  assert.notEqual(end.state.phase, "complete", "A proved barrier forbids the completion of the pass");
+});
+
+test("H1.2 R8 C31 №2045-1 a stopped line of a block outside the horizon of the launch intent stops nothing; of two stopped lines only the one inside the horizon is a ground", async t => {
+  // Outside: the intent names garden-result, so the later block is no node of the horizon the pass derived.
+  const f = runFixture(t, []);
+  const stopped = stoppedBlockLine(f, "garden-later-block");
+  ok(startRun(f.store, { project, outcomes: ["garden-result"] }));
+  const request = f.request(), horizon = f.bases().horizon;
+  assert.deepEqual(ok(readHorizon(f.store, project, horizon)).horizon.value.result.horizon.nodes, ["garden-consume-block", "garden-produce-block"]);
+  f.steps([stopAnswer(f, false)]);
+  const review = ok(await runStopAnalysis(f.store, { project, series: reference(stopped), hold: null, dispatch: request.dispatch }));
+  assert.equal(review.value.state, "undecided");
+  f.restart();
+  const outside = await ends(f, request, 30);
+  assert.notEqual(outside.state.phase, "unable", "The finished history of a block the intent never asked for is another subject's: " + JSON.stringify(outside.state));
+  assert.equal(f.sent().length, 1, "Only the operator's review was paid");
+  // Both: the same kind of stop on a block of the horizon is the pass's ground, and only it is named.
+  const g = runFixture(t, []);
+  const foreign = stoppedBlockLine(g, "garden-later-block"), own = stoppedBlockLine(g, "garden-produce-block");
+  ok(startRun(g.store, { project, outcomes: ["garden-result"] }));
+  const asked = g.request();
+  g.bases();
+  g.steps([stopAnswer(g, false), stopAnswer(g, false)]);
+  for (const line of [foreign, own]) ok(await runStopAnalysis(g.store, { project, series: reference(line), hold: null, dispatch: asked.dispatch }));
+  g.restart();
+  const inside = await ends(g, asked, 30);
+  assert.deepEqual(reasonsOf(inside.state).map(row => [row.kind, row.code, row.target, row.field]),
+    [["stop-second-rung", "owner_decision", own.id, "stop"]], "The stop of the block outside the horizon is not among the grounds");
+  assert.equal(g.sent().length, 2);
+});
+
+test("H1.2 R5 a failed review of the stop ends the pass on that very record: a restart pays no second review", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("h1-failed"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, { rawStdout: "{broken", exitCode: 7, stderr: "intentional reviewer failure" }, addressAll(f, b.routes)]);
+  ok(startRun(f.store, { project }));
+  const attempt = ["open", "packet", "cycle", "close"];
+  const reviewed = await driveTo(f, request, "analyze", 40);
+  assert.deepEqual(reviewed.performed, ["open-series", ...attempt, ...attempt, ...attempt, "analyze"]);
+  const failure = f.store.list().find(row => row.kind === "om-stop-analysis-failure")!;
+  assert.ok(failure, "The failed review is a record of its own");
+  const sends = f.sent().length, series = mechanismSeries(f);
+  const end = await ends(f, request, 5);
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["stop-analysis-failed", "analysis_failed", series.id, "stop"]]);
+  assert.ok(reasons[0]!.basis.some(ref => ref.id === failure.id && ref.hash === failure.hash), "The Ref of exactly this review");
+  assert.equal(series.value.escalations.length, 0, "A failed review escalates nothing and opens no door of its own");
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+  assert.equal(f.sent().length, sends, "A restart does not pay the review again");
+  assert.equal(f.store.list().filter(row => row.kind === "om-stop-analysis-failure").length, 1);
+});
+
+test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("h1-a6-lost"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const analyzing = await until(f, request, "analyze", 50);
+  const release = await heldAfterClaim(t, f, analyzing);
+  const held = ok(await advanceRun(f.store, request)), sends = f.sent().length;
+  const wait = (held.record.value.state as { wait?: { code: string } }).wait;
+  assert.equal(held.record.value.state.phase, "waiting", "A live executor is not a ground of the end");
+  assert.equal(wait?.code, "model_call_still_running");
+  await release();
+  // R5a: the loss is proved by the common recovery and the same saved review goes on to its failed record.
+  const resumed = ok(await advanceRun(f.store, request));
+  assert.deepEqual(resumed.performed, analyzing, "The exact saved A6 step");
+  assert.ok(f.store.list().some(row => row.kind === "om-stop-analysis-failure"));
+  const end = await ends(f, request, 5), series = mechanismSeries(f);
+  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target]), [["stop-analysis-failed", "analysis_failed", series.id]]);
+  assert.equal(f.sent().length, sends, "Nothing is sent again and no second intent exists");
+  assert.equal(f.store.list().filter(row => row.kind === "om-analysis-intent").length, 1);
+});
+
+test("H1.2 R5b a review that cannot even be prepared for its saved request ends the pass on that refusal: no failed record, no transport, no new dispatch", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("h1-a6-unavailable"), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  let request = f.request(b);
+  for (let closes = 0; closes < 3;) {
+    const advanced = ok(await advanceRun(f.store, request));
+    if (advanced.performed?.action === "close") closes += 1;
+  }
+  // The environment now offers a request capacity no reviewer request can fit; the review is chosen with that dispatch.
+  f.environment(1);
+  request = f.request(b);
+  const waiting = await ends(f, request, 6);
+  assert.equal(waiting.state.phase, "waiting");
+  assert.equal((waiting.state as unknown as { wait: RunWait }).wait.code, "context_too_large");
+  const sends = f.sent().length, before = f.store.list().length, moved = ok(readRun(f.store, { project }))!.revision;
+  const end = await ends(f, request, 3), series = mechanismSeries(f);
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code]), [["analysis-unavailable", "context_too_large"]]);
+  assert.ok(reasons[0]!.basis.some(ref => ref.id === series.id), "The line it stands on");
+  assert.ok(reasons[0]!.basis.some(ref => ref.id === request.dispatch.config.id && ref.hash === request.dispatch.config.hash), "The exact dispatch of the saved request");
+  assert.equal(f.sent().length, sends, "No transport exists for a review that was never prepared");
+  assert.equal(f.store.list("om-stop-analysis-failure").length, 0);
+  assert.equal(f.store.list().length, before, "No record was added");
+  assert.equal(ok(readRun(f.store, { project }))!.revision, moved + 1, "Only the pass record moved, once");
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+});
+
+/** Reaches the second rung of the M5 line: three refused attempts, the one undecided review, nothing ended yet. */
+async function secondRung(t: test.TestContext) {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("h12-window"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, stopAnswer(f, false), addressAll(f, b.routes)]);
+  ok(startRun(f.store, { project }));
+  await driveTo(f, request, "analyze", 40);
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "ready");
+  return { f, request };
+}
+
+test("H1.2 R10a a second store ending the pass between the builder's derivation and its first write: the lost write reads the pass again and builds no base", async t => {
+  const f = runFixture(t);
+  const b = f.bases(), request = f.request();
+  f.steps([addressAll(f, b.routes)]);
+  ok(startRun(f.store, { project }));
+  await driveUntil(f, request, state => state.phase === "step" && state.step.action === "bases");
+  const d1 = gapHeads(f.store), horizons = f.store.list("om-horizon").length;
+  let raced = false;
+  class Ending extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "om-horizon")) {
+        raced = true;
+        const other = new Store(f.database);
+        try {
+          const head = other.get<RunRecord>(runId(project))!, input = other.get(`om-input:${project}`)!;
+          other.write({ id: head.id, kind: head.kind, expected: head.revision, value: { ...head.value, state: { phase: "unable", reasons: [
+            { kind: "stop-second-rung", code: "owner_decision", message: "Ended by another store", target: "repair-series:h12", field: "stop", basis: [reference(input)] }] } } as unknown as Json });
+        } finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  f.restart(path => new Ending(path));
+  const advanced = await advanceRun(f.store, request);
+  assert.ok(raced);
+  assert.equal(refusal(advanced).code, "revision_conflict", "The pass moved under the saved step: its outcome is not written over the other store's end");
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+  assert.deepEqual(gapHeads(f.store), d1, "The lost build moved no D1 head");
+  assert.equal(f.store.list("om-horizon").length, horizons);
+  assert.equal(refusal(writeRunBases(f.store, { project })).code, "run_bases_terminal");
+});
+
+test("H1.2 R11 an end derived on a stop that another store lawfully continues before the write is not saved: the next choice reads the new ladder", async t => {
+  const { f, request } = await secondRung(t);
+  let raced = false;
+  class Continuing extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "om-run" && (write.value as { state?: { phase?: string } }).state?.phase === "unable")) {
+        raced = true;
+        const other = new Store(f.database);
+        try {
+          const stopped = other.list<AnyRepairSeries>("repair-series").find(row => "owner" in row.value)!, stop = stopped.value.stop!;
+          const decision = other.write({ id: `${ownerDecisionNamespace(project)}h12-window`, kind: OWNER_DECISION_KIND, expected: 0,
+            value: { projectId: project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, stop: stop.attempt, goals: [...stop.goals],
+              decided: "go on: one more window", taken: { by: "the owner", through: "the command API", approved: true } } });
+          ok(resumeSeries(other, { ...seriesRequestOf(stopped.value), stop: stop.attempt, ground: "owner-decision",
+            text: "the owner decided to go on", decision: { ref: reference(decision) } } as never));
+        } finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  f.restart(path => new Continuing(path));
+  const lost = await advanceRun(f.store, request);
+  assert.ok(raced);
+  assert.equal(refusal(lost).code, "input_stale", "The line moved under the derivation: the stale end is not saved");
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "ready");
+  f.restart();
+  const window = await driveTo(f, request, "bases", 20);
+  assert.deepEqual(window.performed, ["open", "packet", "cycle", "close", "bases"], JSON.stringify(window.wait));
+  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable", "The next choice read the ladder as it stands now");
+});
+
+test("H1.2 R11 C11 an end derived on bases that another store lawfully renews before the write is not saved: the next choice starts from the new B1", async t => {
+  const { f, request } = await secondRung(t);
+  let raced = false;
+  class Renewing extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "om-run" && (write.value as { state?: { phase?: string } }).state?.phase === "unable")) {
+        raced = true;
+        const other = new Store(f.database);
+        try {
+          // The owner addresses the open question to the block: a lawful new B1 while the end was being derived.
+          const input = other.get<OmInputRecord>(`om-input:${project}`)!;
+          ok(writeAddressing(other, { project, input: reference(input), graph: f.graph, decisions: [{ pending: structuredClone(inputDecisionWrite({
+            project, input: reference(input), graph: f.graph, layers: [], decision: { target: "discovery:encoding", field: "address",
+              value: { consumer: "garden-consume-block", kind: "repository-fact" } } })) as Write }] }));
+        } finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  f.restart(path => new Renewing(path));
+  const sends = f.sent().length;
+  const lost = await advanceRun(f.store, request);
+  assert.ok(raced);
+  assert.equal(refusal(lost).code, "input_stale", "The B1 moved under the derivation: the stale end is not saved");
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "ready");
+  f.restart();
+  const next = ok(await advanceRun(f.store, request)).record.value.state;
+  assert.equal(next.phase === "step" && next.step.action, "bases", "The next choice builds the bases of the renewed B1 before any end");
+  assert.equal(f.sent().length, sends);
+});
+
+test("H1.2 R11 two stores deriving the same end: one write wins, the other reads the winner's pass, and the grounds are the same", async t => {
+  const { f, request } = await secondRung(t);
+  let raced = false;
+  class Losing extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "om-run" && (write.value as { state?: { phase?: string } }).state?.phase === "unable")) {
+        raced = true;
+        const other = new Store(f.database);
+        try { void advanceRun(other, request); } finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  f.restart(path => new Losing(path));
+  const lost = await advanceRun(f.store, request);
+  assert.ok(raced);
+  assert.equal(refusal(lost).code, "revision_conflict");
+  const winner = ok(readRun(f.store, { project }))!;
+  assert.equal(winner.value.state.phase, "unable");
+  f.restart();
+  const same = ok(await advanceRun(f.store, request));
+  assert.deepEqual(same.record, winner, "The loser converges to the one saved end");
+  assert.equal(f.store.history(runId(project)).filter(row => (row.value as unknown as RunRecord).state.phase === "unable").length, 1);
+  assert.equal(reasonsOf(winner.value.state).length, 1);
+});
+
+test("H1.2 R7 R7a R8 6 C54 M5 asks the owner while the independent block is worked to its end; only then does the pass end, on the goal that stays open, and its grounds keep the canonical order", async t => {
+  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const b = f.bases("h12-independent"), request = f.request(b);
+  const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
+  const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
+  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: m5.items.map(item => item.gap), action: "need_owner",
+    reason: "The owner must name the optional format", decision: "Name it" }, usage }, factsAll(f, b.routes), assessor("supported")]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 80);
+  const mechanism = mechanismSeries(f), reasons = reasonsOf(end.state);
+  assert.deepEqual(mechanism.value.attempts.map(row => row.outcome?.reason), ["awaiting-owner"], "M5's goal is held, not closed as done");
+  // R8: the independent block was worked, paid and applied before the end; the goal that waits for the owner is the ground.
+  assert.ok(end.performed.includes("assess") && end.performed.filter(action => action === "close").length >= 2, end.performed.join(","));
+  assert.equal(blockSeries(f).value.attempts[0]!.outcome!.reason, "result");
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]),
+    [["owner-control", "model_need_owner", mechanism.id, "attempt.1"]]);
+  assert.equal(reasons[0]!.message, "The owner must name the optional format; Name it", "The message is the saved diagnostic of E4");
+  // R7a: the applied facts made a new B1 and with it a new composition of M6; the held question stays the one ground, asked once.
+  assert.ok(end.performed.includes("apply") && end.performed.includes("bases"), end.performed.join(","));
+  assert.ok(f.store.list("route-result").length >= 2, "The independent batch changed the composition of M6 while the question stayed held");
+  assert.equal(f.sent().length, 3, "M5, the facts and their assessment: nothing is paid twice and nothing is paid for the held goal");
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+});
+
+/** The scripted answer of a paid cycle for its exact saved packet: an MC1 packet asks the owner, an MC2 packet assembles its part. */
+function frameAnswer(f: Fixture, step: { request: unknown }) {
+  const saved = (step.request as { packet: Ref }).packet;
+  const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+  const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
+  if (batch.model !== "MC1") return nodeAnswer(f, step);
+  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap), action: "need_owner",
+    reason: "Need a concrete source", decision: "Choose the source" }, usage };
+}
+
+test("H1.2 R13a R8 an open N2 attempt whose MC1 asked the owner: after the neighbour's work the full G4b proves that exact question, and no close, C5 or D2 is invented", async t => {
+  const f = runFixture(t, ["encoding"], false, true);
+  const b = f.bases("h12-frame-owner"), request = f.request(b);
+  ok(startRun(f.store, { project }));
+  const answers: Record<string, unknown>[] = [], answered = new Set<string>();
+  let state: RunRecord["state"] | null = null;
+  for (let index = 0; index < 150 && !state; index++) {
+    const advanced = ok(await advanceRun(f.store, request)), now = advanced.record.value.state as unknown as RunRecord["state"];
+    if (now.phase === "step" && now.step.action === "cycle") {
+      const packet = (now.step.request as unknown as { packet: Ref }).packet;
+      if (!answered.has(packet.id)) { answered.add(packet.id); answers.push(frameAnswer(f, now.step)); f.steps(answers); }
+    }
+    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") state = now;
+  }
+  assert.ok(state, "The pass came to rest");
+  const reasons = reasonsOf(state);
+  const need = reasons.filter(row => row.kind === "frame-need-owner");
+  assert.deepEqual(need.map(row => [row.code, row.target, row.field, row.message]),
+    [["model_need_owner", "discovery:encoding", "answer", "Need a concrete source; Choose the source"]], JSON.stringify(reasons));
+  assert.ok(need[0]!.basis.length >= 3, "The gate, the call and the diagnostic of E4");
+  for (const block of ["garden-produce-block", "garden-consume-block"])
+    assert.equal(blockSeries(f, block).value.attempts[0]!.outcome, null, `${block}: the attempt stays open, no close is invented`);
+  assert.equal(f.store.get(`om-frame:${project}:2`), null, "No C5");
+  assert.ok(!actions(f.store).some(action => ["accept", "confirm", "lines"].includes(action)), "No C5 and no D2 without a passed G4b");
+  assert.equal(f.sent().length, 3, "The neighbour's MC2 and the consumer's MC1 and MC2: everything reachable was worked first");
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+  assert.equal(f.sent().length, 3);
+});
+
+test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
+  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const b = f.bases("h12-both"), request = f.request(b);
+  const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
+  const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
+  const facts = saved.batches.find(item => item.model === "MC1")!;
+  const ask = (gaps: string[], reason: string) => ({ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: gaps,
+    action: "need_owner", reason, decision: "Decide it" }, usage });
+  f.steps([ask(m5.items.map(item => item.gap), "The optional format is not named"), ask(facts.items.map(item => item.gap), "The encoding source is not named")]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 60);
+  const reasons = reasonsOf(end.state);
+  assert.equal(reasons.length, 2, JSON.stringify(reasons));
+  assert.deepEqual(reasons.map(row => row.kind), ["owner-control", "owner-control"]);
+  assert.deepEqual(reasons.map(row => row.target), [mechanismSeries(f).id, blockSeries(f).id].sort(), "Canonical order, not the order the grounds were met in");
+  assert.deepEqual(reasons.map(row => row.message).sort(), ["The encoding source is not named; Decide it", "The optional format is not named; Decide it"]);
+  // A malformed end is an integrity refusal of the pass, never a guess: an empty list, and a list out of its canonical order.
+  const head = f.store.get<RunRecord>(runId(project))!;
+  const bad = (state: unknown) => f.store.write({ id: head.id, kind: head.kind, expected: f.store.get(head.id)!.revision, value: { ...head.value, state } as unknown as Json });
+  bad({ phase: "unable", reasons: [] });
+  assert.equal(refusal(readRun(f.store, { project })).code, "run_record_invalid");
+  bad({ phase: "unable", reasons: [...reasons].reverse() });
+  assert.equal(refusal(readRun(f.store, { project })).code, "run_record_invalid");
+  assert.equal(refusal(await advanceRun(f.store, request)).code, "run_record_invalid");
+  bad({ phase: "unable", reasons });
+  assert.equal(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+});
+
+test("H1.2 R8 R9 C11 3 a standalone open attempt of another owner defers the end: the proved second rung of M5 does not end a pass that may still change", async t => {
+  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const b = f.bases("h12-defer"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  // The independent block has an attempt of the earlier mode still open: the pass never adopts it and never ends over it.
+  const address = { project, block: "garden-consume-block", line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "h12-standalone", predecessor: null, basis: null }));
+  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-standalone", questions: ["Address one contract"], result: "A supported contract" } }));
+  f.steps([none, none, none, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 60);
+  assert.equal(end.state.phase, "waiting", JSON.stringify(end.state));
+  assert.equal((end.state as unknown as { wait: RunWait }).wait.code, "standalone_attempt");
+  assert.equal(mechanismSeries(f).value.escalations.length, 1, "M5 stands on its second rung, proved by its review");
+  assert.equal(f.sent().length, 4, "Only M5's three attempts and its one review were paid");
+  const before = f.store.list().map(reference);
+  f.restart();
+  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
+  assert.deepEqual(f.store.list().map(reference), before, "The standing wait is read, not written");
+});
+
+/** The scripted answer of a paid cycle for its exact saved packet: an MC1 packet answers its facts, an MC2 packet asks the owner. */
+function mixedAnswer(f: Fixture, step: { request: unknown }) {
+  const saved = (step.request as { packet: Ref }).packet;
+  const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+  const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
+  if (batch.model === "MC2") return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+    action: "need_owner", reason: "Only the design decision needs the owner", decision: "Choose the design" }, usage };
+  const brief = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", results: batch.items.map(item => ({
+    questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(brief), selector: { kind: "text-range", start: 0, end: brief.value.content.length } }] })) }, usage };
+}
+
+test("H1.2 R13 R8 №2045-2 a full G4b that proves a question nobody answers ends the pass after the saved evaluation: the check is never evaluated twice, the attempt stays open and nothing is invented", async t => {
+  const f = runFixture(t, ["encoding", "spare"]);
+  const input = f.store.get(`om-input:${project}`)!;
+  // One block gets a fact (MC1) and a design decision (MC2): one attempt with two assignments, the second without a producer.
+  ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph, decisions: ["encoding", "spare"].map(id => ({
+    pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph: f.graph, layers: [], decision: { target: `discovery:${id}`,
+      field: "address", value: { consumer: "garden-consume-block", kind: id === "encoding" ? "repository-fact" : "design-decision" } } })) as Write })) }));
+  const request = f.request(), answers: Record<string, unknown>[] = [], answered = new Set<string>();
+  ok(startRun(f.store, { project }));
+  let state: RunRecord["state"] | null = null;
+  for (let index = 0; index < 90 && !state; index++) {
+    const advanced = ok(await advanceRun(f.store, request)), now = advanced.record.value.state as unknown as RunRecord["state"];
+    if (now.phase === "step" && (now.step.action === "cycle" || now.step.action === "assess") && !answered.has(JSON.stringify(now.step.request))) {
+      answered.add(JSON.stringify(now.step.request));
+      answers.push(now.step.action === "assess" ? assessor("supported") : mixedAnswer(f, now.step));
+      f.steps(answers);
+    }
+    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") state = now;
+  }
+  assert.ok(state, "The pass came to rest");
+  const reasons = reasonsOf(state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["unsupported-question", "route_result_unsupported", "discovery:spare", "answer"]]);
+  assert.ok(reasons[0]!.basis.length >= 1, "The exact gap of the question");
+  assert.equal(actions(f.store).filter(action => action === "evaluate").length, 1, "The saved evaluation is read, never repeated");
+  assert.equal(blockSeries(f).value.attempts[0]!.outcome, null, "The attempt stays open: no close is invented");
+  assert.equal(f.store.get(`om-frame:${project}:2`), null, "No C5");
+  assert.ok(!actions(f.store).some(action => ["close", "accept", "confirm", "lines"].includes(action)), "No close, C5 or D2 without a passed G4b");
+  assert.equal(f.sent().length, 3, "The fact, the design decision and the one assessment: nothing else was paid");
+  const saved = ok(readRun(f.store, { project }))!;
+  f.restart();
+  const again = ok(await advanceRun(f.store, request));
+  assert.deepEqual([again.performed, again.record.hash], [null, saved.hash], "A new store returns the same end");
+  assert.equal(f.sent().length, 3);
+});
+
+test("H1.2 R13b a blocking question nobody can answer in this product ends the pass on that exact question, with no attempt open and nothing invented", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const input = f.store.get(`om-input:${project}`)!;
+  ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph, decisions: [{ pending: structuredClone(inputDecisionWrite({
+    project, input: reference(input), graph: f.graph, layers: [], decision: { target: "discovery:encoding", field: "address",
+      value: { consumer: "garden-consume-block", kind: "owner-decision" } } })) as Write }] }));
+  const request = f.request();
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 10);
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target]), [["unsupported-question", "owner_result_unavailable", "discovery:encoding"]]);
+  assert.equal(reasons[0]!.field, "owner-result");
+  assert.equal(f.store.list("repair-series").length, 0, "No line, no attempt: nobody was asked to answer it");
+  assert.equal(f.store.list().filter(row => row.id.startsWith("om-owner-result:")).length, 0, "No owner result is invented");
+  assert.equal(f.sent().length, 0);
+});
+
+test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that spent window: the first review is not borrowed, no second one is paid", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("h12-spent"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, stopAnswer(f, true), none, none, none]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 80);
+  const series = mechanismSeries(f), stop = series.value.stop!;
+  assert.equal(end.performed.filter(action => action === "analyze").length, 1, "Only the first stop was reviewed");
+  assert.equal(end.performed.filter(action => action === "resume").length, 1, "The first stop was continued by its decided review");
+  assert.equal(series.value.continuations.length, 1);
+  assert.ok(stop.attempt > 3, "The stop that ended the pass is a later stop of the same line");
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["stop-second-rung", "owner_decision", series.id, "stop"]]);
+  assert.match(reasons[0]!.message, new RegExp(`attempt ${stop.attempt}`), "The message names the later stop, not the first");
+  assert.deepEqual(reasons[0]!.basis, [reference(series)], "No review of another stop is borrowed to fill the reference");
+  assert.equal(f.sent().length, series.value.attempts.length + 1, "The attempts and the one review of the first stop");
+});
+
+test("H1.2 R6 an origin the review establishes lifts its own hold and the pass goes on; it is no ground of the end", async t => {
+  const f = runFixture(t, ["encoding"], true, true);
+  const address = { project, block: "garden-consume-block", line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "h12-established", predecessor: null, basis: null }));
+  const goal = { key: "h12-established-goal", questions: ["Address one contract"], result: "A supported contract" };
+  ok(beginAttempt(f.store, { ...address, attempt: 1, goal }));
+  const source = f.store.write({ id: `${unitRefusalNamespace(project)}h12-workspace`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: "G6", refusals: [{ code: "workspace_unavailable", goal: goal.key, remedy: "Observe the declared workspace condition",
+      origin: { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [] } }] } });
+  const journal = ok(recordRefusal(f.store, { project, source: reference(source) }));
+  const row = journal.value.rows.find(item => item.source.id === source.id)!;
+  const closed = ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "refused", accepting: [], cancelling: [],
+    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  assert.equal(closed.holds.length, 1, "G7 raised one hold of unknown origin");
+  const request = f.request(f.bases("h12-established"));
+  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
+    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage }]);
+  ok(startRun(f.store, { project }));
+  const driven = await driveTo(f, request, "open", 10);
+  assert.deepEqual(driven.performed, ["analyze", "open"], "The review lifts its own hold and the next attempt opens on the same line");
+  const hold = f.store.get<{ lift: { class: string } | null }>(closed.holds[0]!.id)!;
+  assert.equal(hold.value.lift?.class, "conditions");
+  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+});
+
+test("H1.2 R2 18 19 H1 a decided first-rung review grounds resumeSeries of that exact stop, the next attempt works on, and the pass does not end", async t => {
   const f = runFixture(t, ["encoding"]);
   const b = f.bases("h1-first"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, true), addressAll(f, b.routes)]);
@@ -349,6 +898,7 @@ test("18 19 H1 a decided first-rung review grounds resumeSeries of that exact st
   assert.equal(series.value.continuations.length, 1);
   assert.equal(series.value.attempts.at(-1)!.outcome!.reason, "result");
   assert.equal(f.store.get(`om-input:${project}`)!.revision, 3, "The applied addressing made a new B1, and the pass built its bases itself");
+  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable", "A decided review is a lawful continuation, never a ground of the end");
 });
 
 /** Advances until the pass has SAVED the given action (chosen, not yet performed), returning the saved step. */
@@ -469,26 +1019,31 @@ test("C01 №1852 H1 one pass per project: a repeated start reads it, equal conc
   assert.throws(() => new ProductEngine(other).legacyRoute(project), (error: unknown) => error instanceof EngineError && error.code === "record_missing");
 });
 
-test("15 16 C33 H1 owner-control of a goal holds it at any reason; new bases or a restart do not release it and nothing is paid again", async t => {
+test("H1.2 R7 R10a 15 16 C33 need_owner of a goal ends the pass on that goal at any reason of its close; new bases or a restart neither release it nor pay again", async t => {
   const f = runFixture(t, ["encoding"]);
   const { m5, second, request } = await blockBases(f);
   const saved = f.store.get<RoutesRecord>(second.routes.id, second.routes.revision)!.value;
   const gap = saved.batches.find(item => item.model === "MC1")!.items[0]!.gap;
   f.steps([m5, { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: [gap], action: "need_owner",
     reason: "Need a concrete source", decision: "Choose the source" }, usage }]);
-  const driven = await drive(f, request);
-  assert.equal(driven.performed.at(-1), "close", JSON.stringify(driven.wait));
-  assert.equal(driven.wait.code, "owner_control");
-  assert.ok(driven.wait.basis.length > 1, "The wait names the exact waiting sources of the close");
-  const sends = f.sent().length;
-  // The owner issues other bases for the same B1; the same goal stays held, and no second attempt is opened.
-  const third = f.bases("h1-third");
+  const end = await ends(f, request);
+  assert.equal(end.performed.at(-1), "close", JSON.stringify(end.state));
+  const series = blockSeries(f);
+  const reasons = reasonsOf(end.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["owner-control", "model_need_owner", series.id, "attempt.1"]]);
+  assert.equal(reasons[0]!.message, "Need a concrete source; Choose the source", "The message is the saved diagnostic of E4");
+  assert.equal(reasons[0]!.basis.length, 3, "The line, the close of that very attempt and the saved diagnostic");
+  assert.equal(series.value.attempts[0]!.outcome!.reason, "awaiting-owner");
+  const sends = f.sent().length, before = untouched(f.store);
+  // R10a: no base of any kind is built for a pass that ended; the saved end stands across a new store and a restart.
   f.restart();
-  const again = await drive(f, f.request(third));
-  assert.equal(again.wait.code, "owner_control");
-  assert.deepEqual(again.performed, []);
+  assert.equal(refusal(writeRunBases(f.store, { project })).code, "run_bases_terminal");
+  assert.equal(refusal(prepareRunBases(f.store, { project })).code, "run_bases_terminal");
+  const again = ok(await advanceRun(f.store, request));
+  assert.deepEqual([again.performed, again.record.value.state.phase], [null, "unable"]);
+  assert.deepEqual(untouched(f.store), before);
   assert.equal(f.sent().length, sends);
-  assert.equal(blockSeries(f).value.attempts.length, 1);
+  assert.equal(blockSeries(f).value.attempts.length, 1, "The held goal opens no second attempt");
 });
 
 /**
@@ -512,7 +1067,7 @@ function loadOperations() {
   return operationsModule;
 }
 
-test("27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2, G4b and one bound works acceptance, then M8, M9 and the existing compiler", async t => {
+test("H1.2 R12 R10a 27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2, G4b and one bound works acceptance, then M8 (not ready, then fixed), M9 and the existing compiler; no base is built for the completed pass", async t => {
   const f = (await loadOperations()).acceptedOperationsFixture(t, "planned", 0);
   const { store, project: name, workspace, desired } = f;
   assert.equal(name, project);
@@ -588,6 +1143,12 @@ test("27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2, G4b and one 
   const before = store.list().map(reference);
   const again = ok(await advanceRun(store, request));
   assert.equal(again.performed, null);
+  assert.deepEqual(store.list().map(reference), before);
+  // R10a: the same saved end is refused to the direct entries of the builder, with the phase named.
+  for (const refused of [refusal(prepareRunBases(store, { project })), refusal(writeRunBases(store, { project }))]) {
+    assert.equal(refused.code, "run_bases_terminal");
+    assert.match(refused.message, /complete/);
+  }
   assert.deepEqual(store.list().map(reference), before);
 });
 
@@ -684,12 +1245,18 @@ test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits 
  * the 'cross' graph, the owner's works horizon over that layer, D1 with the works frame, M6 and M3. The pass then pays one
  * MC2 works cycle per block and does everything else.
  */
-function worksFixture(t: test.TestContext) {
+function worksFixture(t: test.TestContext, late = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-h1-works-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const desired = gardenGraph("cross"), { level: _level, ...l1 } = projectGraph(desired, 1);
-  preparedFeatures(engine, project, l1 as Graph);
+  // A late question of the environment (checked when a task starts): D1 keeps it as a late gap and D7 needs its assignment.
+  preparedFeatures(engine, project, l1 as Graph, late ? field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "later-env", question: "Which runtime does the task start on?",
+      consumer: "garden-consume-block", moment: "task-start", blocksCurrentStage: false, resolution: "Confirm it when the task starts" }];
+    return value;
+  } : undefined);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages }));
   const first = reference(store.get(`graph:${project}`)!);
@@ -700,6 +1267,8 @@ function worksFixture(t: test.TestContext) {
     return { pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: first, layers: [],
       decision: { target: gap.target, field, value } })) as Write };
   });
+  if (late) decisions.push({ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: first, layers: [],
+    decision: { target: "discovery:later-env", field: "address", value: { consumer: "garden-consume-block", kind: "environment-confirmation" } } })) as Write });
   const input = decisions.length ? ok(writeAddressing(store, { project, input: reference(base), graph: first, decisions })) : base;
   const upper = ok(writeHorizon(store, { project, input: reference(input), graph: first, refinement: null, available: {},
     choice: { choiceVersion: "h1-upper", features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -792,6 +1361,21 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
   void phase;
 });
 
+test("H1.2 R13 R13b a late question of the environment that D7 cannot assign ends the pass on that gap, after the works are otherwise ready; no assignment is invented", async t => {
+  const f = worksFixture(t, true);
+  ok(startRun(f.store, { project }));
+  const end = await ends({ store: f.store } as unknown as Fixture, f.request, 60);
+  const reasons = reasonsOf(end.state);
+  assert.ok(reasons.length >= 1, JSON.stringify(end.state));
+  assert.ok(reasons.every(row => row.kind === "late-obligation" && row.code === "obligation_assignment_unresolved" && row.target === "discovery:later-env"), JSON.stringify(reasons));
+  assert.equal(new Set(reasons.map(row => JSON.stringify([row.target, row.field, row.basis]))).size, reasons.length, "One ground per meaning, however many roots meet it");
+  assert.equal(f.sent().length, 0, "Nothing is asked of a model for works that D7 cannot allow");
+  assert.equal(f.store.list("om-owner-gap-assignment").length, 0, "The pass invents no assignment");
+  const before = f.store.list().map(reference);
+  assert.equal(ok(await advanceRun(f.store, f.request)).performed, null);
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
 test("1 24 22 C57 R20 №1860-8 H1.1 a managed project works only on the activation of the pass's own issue: the machine runs B3, a new root works after it, a block outside the intent never", async t => {
   const f = runFixture(t, ["encoding"], false, true, true);
   // The project is already transition-managed: another issue activated an independent block's root.
@@ -863,7 +1447,51 @@ test("6 C54 H1 a lawfully changed required condition of an unfinished assignment
   assert.ok(f.store.list().some(row => row.kind === "om-completion-cessation"), "The proved cessation is its own record");
 });
 
-test("12 21 H1 stop and origin holds together: the origin route goes first (A6 on the exact hold), no attempt opens, an unestablished origin waits", async t => {
+test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothing: the line's work on today's question goes on", async t => {
+  const f = runFixture(t, ["encoding"], true, true);
+  const request = f.request(f.bases("h12-resolved"));
+  const address = { project, block: "garden-consume-block", line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "h12-resolved", predecessor: null, basis: null }));
+  // The earlier attempt asked the owner about a question that today's routes no longer carry (it was decided elsewhere).
+  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-gone-goal", questions: [gapLineKey(project, "discovery:gone", "answer")], result: "A supported fact" } }));
+  ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
+  ok(startRun(f.store, { project }));
+  const driven = await driveTo(f, request, "open", 10);
+  assert.deepEqual(driven.performed, ["open"], "A new attempt of the line opens for today's question; the old one holds nothing");
+  assert.equal(blockSeries(f).value.attempts.length, 2);
+  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+});
+
+test("H1.2 R6 R7 C32 a standing hold and the goal's own owner-control are both grounds: each is named once with its own records, and nothing else is paid", async t => {
+  const f = runFixture(t, ["encoding"], true, true);
+  const b = f.bases("h12-hold-owed"), request = f.request(b);
+  const item = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value.batches.find(row => row.model === "MC1")!.items[0]!;
+  const address = { project, block: "garden-consume-block", line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "h12-hold-owed", predecessor: null, basis: null }));
+  // Attempt 1 of the earlier mode asked the owner about today's very question; attempt 2 was refused with a refusal of unknown origin.
+  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-owed-goal", questions: [gapLineKey(project, item.target, item.field)], result: "A supported fact" } }));
+  ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
+  const goal = { key: "h12-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
+  ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
+  const source = f.store.write({ id: `${unitRefusalNamespace(project)}h12-owed-origin`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: "G3", refusals: [{ code: "unrecognized_fixture_refusal", goal: goal.key, remedy: "Identify the exact origin",
+      origin: { name: "artifact_missing", stage: "layer-check", subject: "artifact:fixture", sources: [] } }] } });
+  const row = ok(recordRefusal(f.store, { project, source: reference(source) })).value.rows.find(entry => entry.source.id === source.id)!;
+  const closed = ok(closeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: "refused", accepting: [], cancelling: [],
+    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  assert.equal(closed.holds.length, 1, "G7 raised the hold of an unknown origin");
+  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 10);
+  const series = blockSeries(f), reasons = reasonsOf(end.state);
+  assert.deepEqual(end.performed, ["analyze"], "Only the review of the hold was paid");
+  assert.deepEqual(reasons.map(entry => [entry.kind, entry.code, entry.target, entry.field]), [
+    ["hold-origin-unestablished", "origin_hold", closed.holds[0]!.id, "hold"],
+    ["owner-control", "awaiting_owner", series.id, "attempt.1"]]);
+  assert.equal(f.sent().length, 1);
+});
+
+test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes first (A6 on the exact hold), no attempt opens, an unestablished origin ends the pass without paying the other holds or the stop", async t => {
   const f = runFixture(t, ["encoding"], true, true);
   const request = f.request(f.bases("h1-hold"));
   // Three earlier standalone attempts of the block were refused with a refusal of unknown origin: A3 stopped the
@@ -887,17 +1515,20 @@ test("12 21 H1 stop and origin holds together: the origin route goes first (A6 o
   assert.ok(holds.length > 0, "G7 raised the origin holds");
   f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
   ok(startRun(f.store, { project }));
-  const driven = await drive(f, request, 10);
-  assert.deepEqual(driven.performed, ["analyze"], "The origin route first; the stop is not reviewed while a hold stands");
-  assert.equal(driven.wait.code, "origin_hold");
-  assert.ok(holds.some(hold => hold.id === driven.wait.target), "The wait names the exact hold");
-  const analysis = f.store.list().find(row => row.kind === "om-origin-analysis")!;
-  assert.equal((analysis.value as { state: string }).state, "origin-unestablished");
+  const driven = await ends(f, request, 10);
+  assert.deepEqual(driven.performed, ["analyze"], "The origin route first; nothing else of the line is paid once a hold stands unlifted");
+  const reasons = reasonsOf(driven.state);
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.field]), [["hold-origin-unestablished", "origin_hold", "hold"]]);
+  assert.ok(holds.some(hold => hold.id === reasons[0]!.target), "The reason names the exact hold");
+  const analyses = f.store.list().filter(row => row.kind === "om-origin-analysis");
+  assert.equal(analyses.length, 1, "R6a: the other holds and the stop are not reviewed just to fill the report");
+  assert.equal((analyses[0]!.value as { state: string }).state, "origin-unestablished");
+  assert.ok(reasons[0]!.basis.some(ref => ref.id === analyses[0]!.id), "The review of this very hold is a Ref of the reason");
   assert.equal(blockSeries(f).value.attempts.length, 3, "No new attempt while the stop and the hold stand");
   const before = f.store.list().map(reference), sends = f.sent().length;
   f.restart();
   assert.equal(ok(await advanceRun(f.store, request)).performed, null);
-  assert.deepEqual(f.store.list().map(reference), before, "The standing wait is read, not paid again");
+  assert.deepEqual(f.store.list().map(reference), before, "The saved end is read, not paid again");
   assert.equal(f.sent().length, sends);
 });
 
