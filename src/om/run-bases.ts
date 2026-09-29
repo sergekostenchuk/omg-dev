@@ -6,7 +6,8 @@ import { Store, type Revision, type TransactionGuard, type Write } from "../stor
 import { prepareHorizon, prepareHorizonIssuance, type HorizonRequest } from "./horizon.js";
 import { prepareOmInput, type OmInputRecord } from "./input.js";
 import { prepareGaps, type GapReadRequest, type GapRequest } from "./gaps.js";
-import { readAcceptedFrameLayer } from "./layer-basis.js";
+import { readAcceptedFrameLayer, readUnacceptedLayer, type LayerBasis } from "./layer-basis.js";
+import { prepareLayerAcceptance } from "./frame-obligations.js";
 import { prepareQuestionTasks } from "./question-packet.js";
 import { prepareBlockQueue, prepareMachinePath, QUEUE_POLICY_VERSION, type QueueRequest } from "./queue.js";
 import { prepareSeriesActivation, readAnySeriesAt, readAppliedSeriesTransition, readCurrentSeriesPointer, readSeriesMembership, seriesAddress,
@@ -25,7 +26,7 @@ import { readRun, runId, startRun, type RunRecord } from "./run.js";
  * It never calls a model, opens an attempt or advances the pass; it keeps no record of its own (№1844).
  */
 export const RUN_BASES_POLICY = "om-run-bases/v1";
-export const RUN_BASES_CODES = sealed(["run_bases_request_invalid", "run_bases_work_open", "run_bases_terminal"] as const);
+export const RUN_BASES_CODES = sealed(["run_bases_request_invalid", "run_bases_work_open", "run_bases_terminal", "run_bases_basis_stale"] as const);
 /**
  * The result form of every fact task this producer issues (№1844 п.9, №1860 п.4): the answer to the exact question,
  * a nonempty string. It is not evidence of truth — E5 and the answer's own sources still decide that.
@@ -212,22 +213,53 @@ function horizonStage(store: Store, project: string, request: HorizonRequest, mo
   return reference(gate);
 }
 /** One consistent D1 request from the same input, graph and horizon (№1844 п.8, №1860 п.2). */
-function gapRequest(store: Store, project: string, input: Ref, horizon: Ref, basis: ReturnType<typeof upperBasis>): GapRequest {
+function gapRequest(store: Store, project: string, input: Ref, horizon: Ref, basis: ReturnType<typeof upperBasis>): { request: GapRequest; guards: TransactionGuard[] } {
   const graph = basis.gapsGraph, frame = (level: 2 | 3, layer: Ref | null, accepted: Ref | null, upper: { horizon: Ref; frame: Ref | null } | null) =>
     ({ project, level, graph, horizon, layer, frame: accepted, upper });
   if (basis.n2) {
     const works = basis.n3 ? frame(3, basis.n3.layer, basis.n3.frame, { horizon, frame: basis.n2.frame })
       : frame(3, null, null, { horizon, frame: basis.n2.frame });
-    return { project, input, graph, horizon, operations: { frame: frame(2, basis.n2.layer, basis.n2.frame, null), proposals: [] },
-      works: { frame: works, proposals: [] } } as GapRequest;
+    return { guards: [], request: { project, input, graph, horizon, operations: { frame: frame(2, basis.n2.layer, basis.n2.frame, null), proposals: [] },
+      works: { frame: works, proposals: [] } } as GapRequest };
   }
-  if (basis.phase) return { project, input, graph, horizon,
-    operations: { frame: frame(2, layerHead(store, project, 2), null, null), proposals: [] },
-    works: { frame: frame(3, layerHead(store, project, 3), null, { horizon, frame: null }), proposals: [] } } as GapRequest;
+  if (basis.phase) {
+    const works3 = worksLayer3(store, project, graph);
+    return { guards: works3.guards, request: { project, input, graph, horizon,
+      operations: { frame: frame(2, layerHead(store, project, 2), null, null), proposals: [] },
+      works: { frame: frame(3, works3.layer, works3.frame, { horizon, frame: null }), proposals: [] } } as GapRequest };
+  }
   const layer = layerHead(store, project, 2);
   if (!layer) fail("record_missing", `graph-layer:${project}:2`, "works.layer", "The unaccepted upper layer of the works must exist before D1");
-  return { project, input, graph, horizon, operations: { frame: frame(2, null, null, null), proposals: [] },
-    works: { state: "upper-not-accepted", layer } } as GapRequest;
+  return { guards: [], request: { project, input, graph, horizon, operations: { frame: frame(2, null, null, null), proposals: [] },
+    works: { state: "upper-not-accepted", layer } } as GapRequest };
+}
+/**
+ * The level-3 slot of the research-phase branch (№2157): an existing graph-layer:3 head is accepted only as proven —
+ * the full common acceptance derivation and the current admission (prepareLayerAcceptance; an own derivation proof is
+ * lawful before sealLayer(3)), a shell with only inherited upper proofs is confirmed unaccepted by the common reader
+ * and the level-3 work stays open, and a published L3 phase names its sealed layer — missing, corrupt or moved head
+ * is an addressed refusal, never a fallback to open work. The exact read heads and significant absences of the choice
+ * are guards of the D1 write, so a competing acceptance between the choice and the write loses the compare-and-set and
+ * the whole chain is derived again.
+ */
+function worksLayer3(store: Store, project: string, graph: Ref): { layer: Ref | null; frame: Ref | null; guards: TransactionGuard[] } {
+  const phaseId = `phase:${project}:L3`;
+  const phase = store.get<{ layer: Ref | null }>(phaseId);
+  const head = store.get<LayerBasis>(`graph-layer:${project}:3`);
+  if (phase) {
+    const named = phase.value.layer;
+    if (!named || !head || !same(named, reference(head)))
+      fail("run_bases_basis_stale", phaseId, "layer", "The accepted L3 phase does not name the current level-3 layer head");
+    const proven = take(prepareLayerAcceptance(store, { project, level: 3, graph, layer: named }));
+    return { layer: named, frame: proven.frame, guards: [...proven.guards, reference(phase)] };
+  }
+  if (!head) return { layer: null, frame: null, guards: [{ id: `graph-layer:${project}:3`, absent: true }, { id: phaseId, absent: true }] };
+  if (head.value.acceptance !== undefined || (head.value.layerProofs ?? []).some(proof => proof.level >= 3)) {
+    const proven = take(prepareLayerAcceptance(store, { project, level: 3, graph, layer: reference(head) }));
+    return { layer: reference(head), frame: proven.frame, guards: [...proven.guards] };
+  }
+  const unaccepted = take(readUnacceptedLayer(store, { project, level: 3, graph, layer: reference(head) }));
+  return { layer: null, frame: null, guards: [...unaccepted.currentReferences, { id: phaseId, absent: true }] };
 }
 /**
  * The requirements of a fact task (№1860 п.3): only the exact contracts of B1 bound to the question's own consumer —
@@ -384,11 +416,11 @@ function chain(store: Store, request: RunBasesRequest, mode: Mode): BuiltRunBase
   const d1 = gapRequest(store, project, reference(input), horizon, basis);
   let scope: GapReadRequest | null = null;
   commit(store, mode, "G4", project, "gaps", () => {
-    const prepared = take(prepareGaps(store, d1));
+    const prepared = take(prepareGaps(store, d1.request));
     const written = prepared.writes.map(write => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }));
     scope = { sources: prepared.sources as GapRequest, records: [...prepared.existing.map(reference), ...written]
       .sort((a, b) => order(a.id, b.id)) };
-    return prepared;
+    return { ...prepared, guards: [...prepared.guards, ...d1.guards] };
   });
   const routes = routesStage(store, project, input, scope!, mode);
   const queue = queueStage(store, project, horizon, mode);
