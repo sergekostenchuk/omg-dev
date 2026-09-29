@@ -11,3 +11,15 @@ public/app.css
 
 # план команд тест-оператора Codex: машинный файл с путями этого компьютера
 .omg-final-check.json
+
+# секреты и учётные файлы — никогда в репозиторий (29.09.2026, перед выгрузкой на GitHub)
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.npmrc
+auth.json
+__pycache__/
+*.pyc
