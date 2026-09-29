@@ -23,7 +23,9 @@ const bodies = {
   'src/om/atomic-gate.js': { deriveGate: ["G5", "request", "!current"] },
   // S1.1: the families of the block chain — the historical E2 derivation and its preceding refusals, the A2 journal
   // derivation by the exact revision it checks, the G4b groups of an evaluation and the G7 completion snapshot.
-  'src/om/question-packet.js': { derivePacket: ["E2.derive", "[request.routes, request.batch, request.attempt ?? null, request.previous.length]", "!current"],
+  // E2.2: the key names the whole derivation — the environment bounds the packet and a continuation packet of the same
+  // attempt (need_source) is another derivation; without them two packets of one attempt looked like one key twice.
+  'src/om/question-packet.js': { derivePacket: ["E2.derive", "[request.routes, request.batch, request.attempt ?? null, request.previous.length, request.environment, request.continuation ?? null]", "!current"],
     previousRefusals: ["E2.refusals", "[batch.id, request.attempt ?? null]", "!current"] },
   'src/om/refusal-journal.js': { checkJournal: ["A2.checkJournal", "context.ref ?? context.target"] },
   'src/om/answers-gate.js': { deriveAnswersGroups: ["G4b.groups", "{ id: evaluation.id, revision: evaluation.revision, hash: evaluation.hash }"] },
@@ -32,7 +34,8 @@ const bodies = {
 // Accepted fixtures reached without their own test registrations, exactly as the F5 seed is (S1.1 adds the G4b one).
 const fixtures = {
   'test/om-atomic-gate.test.js': { registrations: ['test', 'after'], exports: ['produceAtomicSeed', 'seedResources'] },
-  'test/om-answers-gate.test.js': { registrations: ['test'], exports: ['fixture', 'registered', 'factGap', 'traceUsage'] },
+  // E2.2 (№1801): the real MC2 node root of a block ended by the scripted answer and the G4b evaluation of a managed attempt.
+  'test/om-answers-gate.test.js': { registrations: ['test'], exports: ['fixture', 'registered', 'factGap', 'traceUsage', 'nodeTerminal', 'evaluate'] },
   // S1.1 (№1787-3/4): the accepted H1 pass fixture for the mixed N2 and L3 scenarios.
   'test/om-run.test.js': { registrations: ['test'], exports: ['project', 'usage', 'runFixture', 'worksFixture', 'nodeAnswer', 'cannotAnswer',
     'addressAll', 'stopAnswer', 'blockSeries', 'mechanismSeries', 'actions'] },
@@ -603,7 +606,7 @@ const { journalId, readJournalAt } = await imports('om/refusal-journal');
 const { writeAnswersRegistration, writeAnswersEvaluation } = await imports('om/answers-gate');
 const { writeQuestionPacket, readQuestionPacket } = await imports('om/question-packet');
 const { runModelCall, readCompletionWorkAt } = await imports('om/model-call');
-const { assessFact } = await imports('om/assessment');
+const { assessFact, readAssessmentRefusalAt } = await imports('om/assessment');
 const { writeRoutes } = await imports('om/routes');
 const { openAttempt, closeAttempt } = await imports('om/repeat-gate');
 const { completionWorkId, readCompletionBinding, resumeSeries, ownerDecisionNamespace, OWNER_DECISION_KIND } = await imports('om/series');
@@ -638,10 +641,11 @@ try {
     const packet = measured('writeQuestionPacket.' + attempt, () => ok(writeQuestionPacket(f.store, request)).record).result;
     return { series, binding, packet };
   }
-  // The packet stands on the journal holding every refusal the latest preceding attempt of the same goal claimed, and
-  // lists those of them addressing this batch by the unchanged E2 rule. Observation for the reviewer: on this base the
-  // claimed E5 N row names the goal 'accepted-gap-fill', not the batch address, so the list is empty while the journal
-  // and its G4b rows are still proved in full — the cost path S1.1 corrects, with the composition untouched (№1773 §8).
+  // E2.2 (№1801, row 2): the packet stands on the journal holding every refusal the latest preceding attempt of the same
+  // goal claimed, and delivers the genuine E5 causes among them at the exact question address the common E5 reader
+  // proves — the row, its code, the question's target and field, and the E5 remedy — never the G4b rows beside them
+  // (row 9) and never a row matched by its goal text alone (№1792). The expectation is derived here from the E5 records
+  // themselves, not from E2: the two must agree.
   function expectedRefusals(attempt, packet) {
     const series = seriesValue();
     const prior = [...series.inherited, ...series.attempts].filter(item => item.ordinal < attempt && same(item.goal, goal)).at(-1);
@@ -649,9 +653,16 @@ try {
     assert.ok(packet.value.journal, 'The packet names the journal its preceding refusals stand in');
     const rows = f.store.get(packet.value.journal.id, packet.value.journal.revision).value.rows;
     const named = prior.outcome.refusals.map(link => rows.find(row => row.id === link.row));
-    assert.ok(named.every(Boolean) && named.some(row => row.gate === 'E5'), 'The named journal holds every claimed refusal of the preceding attempt');
+    assert.ok(named.every(Boolean) && named.every(row => row.gate === 'E5'), 'The named journal holds every claimed refusal of the preceding attempt, all genuine E5');
     assert.ok(rows.some(row => row.gate === 'G4b'), 'The named journal holds the delivered G4b rows');
-    const expected = named.filter(row => addresses.has(row.goal)).map(row => ({ code: row.code, target: row.goal }));
+    const expected = named.map(row => {
+      const proof = ok(readAssessmentRefusalAt(f.store, project, row.source));
+      assert.equal(proof.intent.attempt, prior.ordinal, 'The E5 verdict belongs to the preceding attempt');
+      assert.ok(row.remedy.includes(proof.intent.question.target + '/' + proof.intent.question.field) && row.remedy.includes('source not decisive'),
+        'The remedy is the E5 reader\'s own text with its reasons');
+      assert.ok(addresses.has(proof.intent.question.target), 'The question of the verdict is one of this batch');
+      return { row: row.id, code: row.code, target: proof.intent.question.target, field: proof.intent.question.field, remedy: row.remedy };
+    });
     return expected.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
   }
   const attempts = [];
@@ -1171,4 +1182,326 @@ test('S1.1 mixed N2 on the accepted H1 pass: A positive, B1 negative, B2 positiv
 
 test('S1.1 L3 produce → consume on the accepted H1 pass with mixed outcomes: no invented filling for the refused goal, the positive result kept, the frame completed lawfully', async t => {
   checkScenario(t, await runScenario(t, 'mixed-works', mixedWorksScenario));
+});
+
+// E2.2 (№1801, №1792): the causes of the preceding attempt reach the repeated packet by the exact chain attempt → claimed
+// journal row → proved E5/E4 source → question address of this batch, never by the text of a goal. Both scenarios pay the
+// real producers of the accepted fixture (MC1 with its E5 assessor, the MC2 node root with its cycle) and derive the
+// expectation from the sources themselves, so E2 and its readers must agree with them.
+const e22FactScenario = scenarioHeader + monitorHead + String.raw`
+register(config.loader, { data: { root: config.dist, repository: config.repository } });
+const imports = name => import(config.dist + 'src/' + name + '.js');
+const { canonical } = await imports('canonical');
+const { Store } = await imports('storage/store');
+const { reference } = await imports('pipeline/contracts');
+const { withHistoricalReads } = await imports('om/input');
+const { journalId } = await imports('om/refusal-journal');
+const { writeAnswersRegistration, writeAnswersEvaluation } = await imports('om/answers-gate');
+const { writeQuestionPacket, readQuestionPacket, prepareQuestionPacket } = await imports('om/question-packet');
+const { runModelCall, readCompletionWorkAt } = await imports('om/model-call');
+const { assessFact, readAssessmentRefusalAt } = await imports('om/assessment');
+const { openAttempt } = await imports('om/repeat-gate');
+const { completionWorkId, readCompletionBinding } = await imports('om/series');
+const g4b = await import(config.dist + 'test/om-answers-gate.test.js');
+` + monitorTail + String.raw`
+try {
+  const f = g4b.fixture(t, 'repository-fact', true, true), project = f.project;
+  const m = g4b.registered(f, 'e22'), batch = m.batch, seriesId = m.series.id;
+  const goal = m.series.value.attempts[0].goal;
+  assert.equal(batch.items.length, 2, 'One MC1 batch carries both fact questions of the block');
+  const a = batch.items.find(item => item.target === f.target), b = batch.items.find(item => item.target !== f.target);
+  assert.ok(a && b && b.target === 'discovery:other-choice');
+  const steps = [];
+  const assessor = verdict => verdict === 'off-form' ? { research: { answer: 'untyped reviewer reply' }, usage: g4b.traceUsage }
+    : { research: { verdict, reasons: ['source not decisive'] }, usage: g4b.traceUsage };
+  // The adapter answers request k with step k: one MC1 answer to both questions, then the assessor's verdict on A and
+  // its untyped reply on B — a negative E5 beside a technical E5 of the same attempt.
+  async function pay(packet, verdictA) {
+    steps.push(m.answer, assessor(verdictA), assessor('off-form')); writeFileSync(m.scenario, JSON.stringify({ steps }));
+    const original = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: m.dispatch, role: 'implementer' }));
+    assert.equal(original.outcome?.kind, 'fact-candidates');
+    const terminalA = ok(await assessFact(f.store, { project, modelCall: reference(original.record), questionId: a.gap, dispatch: m.dispatch }));
+    assert.equal(terminalA.value.verdict, verdictA);
+    const terminalB = ok(await assessFact(f.store, { project, modelCall: reference(original.record), questionId: b.gap, dispatch: m.dispatch }));
+    assert.equal(terminalB.value.verdict, 'off-form');
+    return { terminalA, terminalB };
+  }
+  const bindingOf = (series, attempt) => { const binding = ok(readCompletionBinding(f.store, project, reference(series), attempt)); assert.ok(binding); return binding; };
+  const headOf = binding => f.store.get(completionWorkId(project, binding.id));
+  const seriesValue = () => f.store.get(seriesId).value;
+  const completion = { routes: reference(f.route), batches: [batch.id] };
+  function openNext(attempt) {
+    const series = ok(openAttempt(f.store, { project, block: f.block, line: 1, attempt, goal, completion }));
+    const binding = bindingOf(series, attempt);
+    ok(writeAnswersRegistration(f.store, { project, binding: reference(binding) }));
+    const request = { project, routes: reference(f.route), batch: batch.id, environment: reference(m.config), attempt: { series: reference(series), ordinal: attempt }, previous: [] };
+    const packet = measured('writeQuestionPacket.' + attempt, () => ok(writeQuestionPacket(f.store, request)).record).result;
+    return { series, binding, packet, request };
+  }
+  // Rows 2, 3, 5, 9: the expectation is derived from the E5 records the preceding attempt claimed, never from E2 — one
+  // element per genuine negative E5 at the exact question address its own reader proves; the G4b rows beside them and
+  // the rows of an older attempt in the same journal give nothing.
+  function expectedRefusals(attempt, packet) {
+    const series = seriesValue();
+    const prior = [...series.inherited, ...series.attempts].filter(item => item.ordinal < attempt && same(item.goal, goal)).at(-1);
+    assert.ok(prior && prior.outcome && prior.outcome.refusals.length === 1, 'The preceding attempt claimed exactly one refusal: the negative E5 of A');
+    assert.ok(packet.value.journal, 'The packet names the journal its preceding refusals stand in');
+    const rows = f.store.get(packet.value.journal.id, packet.value.journal.revision).value.rows;
+    const named = prior.outcome.refusals.map(link => rows.find(row => row.id === link.row));
+    assert.ok(named.every(row => row && row.gate === 'E5'));
+    assert.ok(rows.some(row => row.gate === 'G4b'), 'The named journal holds G4b rows beside the claimed cause (row 9)');
+    if (attempt > 2) assert.ok(rows.some(row => row.gate === 'E5' && !named.includes(row)), 'The named journal holds the E5 row of the older attempt too (row 5)');
+    return named.map(row => {
+      const proof = ok(readAssessmentRefusalAt(f.store, project, row.source));
+      assert.equal(proof.intent.attempt, prior.ordinal, 'The E5 verdict belongs to the preceding attempt');
+      assert.equal(proof.intent.question.target, a.target, 'The claimed cause is the negative E5 of question A');
+      assert.ok(row.remedy.includes(a.target + '/' + proof.intent.question.field) && row.remedy.includes('source not decisive'));
+      return { row: row.id, code: row.code, target: proof.intent.question.target, field: proof.intent.question.field, remedy: row.remedy };
+    });
+  }
+  const attempts = [];
+  let current = { series: m.series, binding: m.binding, packet: m.packet, request: null };
+  for (const [attempt, verdict] of [[1, 'conflicting'], [2, 'insufficient']]) {
+    if (attempt > 1) {
+      current = openNext(attempt);
+      const expected = expectedRefusals(attempt, current.packet);
+      assert.deepEqual(current.packet.value.packet.refusals, expected, 'Attempt ' + attempt + ' carries exactly the one genuine cause of the preceding attempt');
+      assert.equal(expected[0].code, 'fact_assessment_' + attempts[attempt - 2].verdict, 'The code is the E5 verdict\'s own (row 2: conflicting as well as insufficient)');
+      assert.equal(canonical(current.packet.value.packet.refusals).includes(b.target), false, 'Question B, untyped at E5, is no task for the model (rows 3, 8)');
+      measured('readQuestionPacket.' + attempt, () => assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(current.packet) })), current.packet));
+    } else {
+      assert.deepEqual([current.packet.value.packet.refusals, current.packet.value.journal], [[], null], 'The first attempt has no preceding attempt (row 1)');
+      measured('readQuestionPacket.1', () => assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(current.packet) })), current.packet));
+    }
+    const { terminalA, terminalB } = await pay(current.packet, verdict);
+    const work = ok(readCompletionWorkAt(f.store, project, reference(headOf(current.binding))));
+    assert.equal(work.refusals.length, 1, 'The genuine negative E5 of A is the one claimed refusal of the open work');
+    const results = [{ gap: a.record, result: reference(terminalA), candidate: null }, { gap: b.record, result: reference(terminalB), candidate: null }];
+    const close = { project, block: f.block, line: 1, attempt, outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [...work.refusals] } };
+    const written = measured('writeAnswersEvaluation.' + attempt, () => ok(writeAnswersEvaluation(f.store, { project, binding: reference(current.binding),
+      request: { ...f.request, results }, close }))).result;
+    assert.equal(written.repeated, false); assert.ok(written.closed, 'The linked close closes the attempt');
+    const after = ok(readCompletionWorkAt(f.store, project, reference(headOf(current.binding))));
+    assert.deepEqual([after.refusals.length, after.technical.map(row => row.reason), after.negative.length], [1, ['off-form'], 1], 'One counted N (A) and one T (B): T is never a refusal row');
+    assert.equal(seriesValue().attempts.find(item => item.ordinal === attempt).outcome.reason, 'refused');
+    attempts.push({ attempt, verdict, packet: current.packet, binding: current.binding, rows: work.refusals.map(link => link.row) });
+  }
+  const third = openNext(3);
+  const expected3 = expectedRefusals(3, third.packet);
+  assert.deepEqual(third.packet.value.packet.refusals, expected3);
+  assert.deepEqual(expected3.map(item => item.row), attempts[1].rows, 'Attempt 3 carries the cause of attempt 2 alone');
+  assert.ok(!attempts[0].rows.some(row => expected3.some(item => item.row === row)), 'The older attempt\'s cause is not substituted (row 5)');
+  measured('readQuestionPacket.3', () => assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(third.packet) })), third.packet));
+  // Row 10: the packet of attempt 2 was saved before the journal moved on (its own evaluation, the rows of attempt 3):
+  // it reads the same in a new operation, cold on a copy and after a restart, by the journal revision it names.
+  const second = attempts[1];
+  assert.ok(f.store.get(journalId(project)).revision > second.packet.value.journal.revision, 'The journal head moved after the packet was saved');
+  const readSecond = store => ok(readQuestionPacket(store, { project, record: reference(second.packet) }));
+  assert.deepEqual(measured('readQuestionPacket.2.moved', () => readSecond(f.store)).result, second.packet);
+  // Row 6 (return №1, P2-3): the E5 result behind the delivered cause becomes unreadable (a view, no record changed): the
+  // common E5 reader refuses, and E2 carries that refusal as it is — code, address and route — never a packet refusal.
+  {
+    const rows3 = f.store.get(third.packet.value.journal.id, third.packet.value.journal.revision).value.rows;
+    const cause = rows3.find(row => row.id === expected3[0].row);
+    const resultRef = cause.origin.sources.find(item => item.role === 'assessment').ref;
+    const view = new Proxy(f.store, { get(target, property) {
+      if (property === 'get') return (id, revision) => id === resultRef.id ? undefined : target.get(id, revision);
+      const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    // On a managed attempt the registry of the preceding attempt (every product exact) or the E5 reader refuses first;
+    // whichever it is, E2 carries that common reader's refusal unchanged and never turns it into a packet refusal.
+    const direct = [readCompletionWorkAt(view, project, reference(headOf(attempts[1].binding))), readAssessmentRefusalAt(view, project, cause.source)]
+      .filter(result => !result.ok).map(result => [result.refusal.code, result.refusal.at, result.refusal.route]);
+    assert.ok(direct.length >= 1, 'A common reader refuses the hidden result');
+    const prepared = prepareQuestionPacket(view, third.request);
+    assert.equal(prepared.ok, false);
+    assert.notEqual(prepared.refusal.code, 'packet_record_invalid');
+    const carried = [prepared.refusal.code, prepared.refusal.at, prepared.refusal.route];
+    assert.ok(direct.some(item => canonical(item) === canonical(carried)), 'The reader\'s own refusal reaches the caller unchanged: ' + JSON.stringify([carried, direct]));
+  }
+  // Row 12: the delivered remedies are part of the packet the common capacity mechanism bounds — nothing is truncated
+  // or dropped: at a capacity the packet of this batch fits without its refusals, the packet with them is blocked with
+  // the typed refusal and its full size. (Before the restart: the engine that configures environments holds the first Store.)
+  const chars = packet => packet.value.fingerprint.chars;
+  assert.ok(chars(third.packet) > chars(attempts[0].packet), 'The refusals grew the packet');
+  const capacity = chars(third.packet) - 1;
+  assert.ok(chars(attempts[0].packet) <= capacity, 'Without refusals the packet of this batch fits the chosen capacity');
+  const command = { executable: process.execPath, args: [join(config.repository, 'test/om-adapter-fixture.mjs'), '--scenario', m.scenario, '--trace', join(f.root, 'e22-capacity-trace.jsonl')] };
+  const small = f.engine.environments.configure(project, { workspace: f.root,
+    implementer: { actor: 'answers-original', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'answers-independent', model: 'fixture', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: capacity },
+  f.store.get('environment:' + project).revision);
+  // Not measured (not E2.2's subject): a second packet of one managed attempt is prepared under the historical proof of the
+  // saved one, so the S1.1 monitor sees the E2.refusals key of this attempt derived twice in one operation.
+  const blocked = ok(prepareQuestionPacket(f.store, { ...third.request, environment: reference(small) })).record;
+  assert.deepEqual([blocked.value.state, blocked.value.refusal?.code, blocked.value.packet, blocked.value.fullChars > capacity], ['blocked', 'packet_too_large', null, true]);
+  f.restart();
+  assert.deepEqual(measured('readQuestionPacket.2.restart', () => readSecond(f.store)).result, second.packet);
+  assert.deepEqual(measured('readQuestionPacket.3.restart', () => ok(readQuestionPacket(f.store, { project, record: reference(third.packet) }))).result, third.packet);
+  const fixed = cloneStore(f.path, 'e22-fixed');
+  withHistoricalReads(() => {
+    const cold = measured('fixed.readQuestionPacket.2', () => readSecond(fixed));
+    assert.deepEqual(cold.result, second.packet);
+    for (const family of ['E2.derive', 'E2.refusals', 'A2.checkJournal']) assert.ok(cold.report.families[family] > 0, 'The cold proof reached ' + family);
+    assert.ok(cold.report.executions['E5.assessment-refusal'] > 0, 'The cold proof proved the E5 cause through its own reader, not by the text of the row');
+  });
+  console.log(JSON.stringify({ reports, outcomes: { questions: batch.items.map(item => item.target + '/' + item.field), delivered: third.packet.value.packet.refusals, capacity, fullChars: blocked.value.fullChars } }));
+} finally {
+  active = null;
+  for (const store of stores) store.close();
+  for (const action of cleanups.reverse()) action();
+}
+`;
+
+const e22NodeScenario = scenarioHeader + monitorHead + String.raw`
+register(config.loader, { data: { root: config.dist, repository: config.repository } });
+const imports = name => import(config.dist + 'src/' + name + '.js');
+const { canonical } = await imports('canonical');
+const { Store } = await imports('storage/store');
+const { reference } = await imports('pipeline/contracts');
+const { writeAnswersRegistration } = await imports('om/answers-gate');
+const { writeQuestionPacket, readQuestionPacket } = await imports('om/question-packet');
+const { runModelCycle, readManagedModelDiagnostic } = await imports('om/model-call');
+const { readCall } = await imports('om/call-record');
+const { openAttempt, closeAttempt, prepareManagedClaim } = await imports('om/repeat-gate');
+const { readCompletionBinding } = await imports('om/series');
+const g4b = await import(config.dist + 'test/om-answers-gate.test.js');
+` + monitorTail + String.raw`
+try {
+  const f = g4b.fixture(t), project = f.project;
+  const source = f.store.get('source:' + project + ':brief');
+  const seriesOf = id => f.store.get(id).value;
+  const bindingOf = (series, attempt) => { const binding = ok(readCompletionBinding(f.store, project, reference(series), attempt)); assert.ok(binding); return binding; };
+  /** Closes the managed attempt by the claim G7 derives from its complete registry: the reason is the diagnostic's own, never the caller's. */
+  function close(block, attempt) {
+    const address = { project, block, line: 1, attempt };
+    const claim = ok(prepareManagedClaim(f.store, { ...address, outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } }));
+    ok(closeAttempt(f.store, { ...address, outcome: claim.outcome }));
+    return claim.outcome;
+  }
+  // A packet after an attempt that ended in a cycle with need_source continuations is asserted but not measured: proving
+  // its E4 causes reads the continuation packets of that attempt, whose historical derivation re-derives the root packet
+  // once per packet — the S1.1 cost class of continuations noted for the registry, not E2.2's subject.
+  function openNext(n, attempt, measure = true) {
+    const series = ok(openAttempt(f.store, { project, block: n.block, line: 1, attempt, goal: n.m.goal, completion: { routes: reference(f.route), batches: [n.batch.id] } }));
+    const binding = bindingOf(series, attempt);
+    ok(writeAnswersRegistration(f.store, { project, binding: reference(binding) }));
+    const request = { ...n.packet.value.request, attempt: { series: reference(series), ordinal: attempt }, previous: [] };
+    const write = () => ok(writeQuestionPacket(f.store, request)).record;
+    const packet = measure ? measured('writeQuestionPacket.' + n.block + '.' + attempt, write).result : write();
+    const read = () => assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(packet) })), packet);
+    if (measure) measured('readQuestionPacket.' + n.block + '.' + attempt, read); else read();
+    return { series, binding, packet, request };
+  }
+  // Rows 7 and 8: for every E4 row the preceding attempt claimed whose diagnostic the managed reader proves a refusal of
+  // the model, one element per exact (target, field) of the admitted call it names, in this batch; a technical or
+  // control end of the model gives none, whatever rows it claimed.
+  let lastTrace = '';
+  function expectedRefusals(n, attempt, packet, priorBinding) {
+    const series = seriesOf(n.m.series.id);
+    const prior = [...series.inherited, ...series.attempts].filter(item => item.ordinal < attempt && same(item.goal, n.m.goal)).at(-1);
+    assert.ok(prior && prior.outcome);
+    if (!prior.outcome.refusals.length) { assert.equal(packet.value.journal, null); return []; }
+    assert.ok(packet.value.journal);
+    const rows = f.store.get(packet.value.journal.id, packet.value.journal.revision).value.rows;
+    const named = prior.outcome.refusals.map(link => rows.find(row => row.id === link.row));
+    assert.ok(named.every(row => row && row.gate === 'E4'), 'Every claimed cause is an E4 diagnostic row');
+    const expected = [], trace = [];
+    for (const row of named) {
+      const diagnostic = ok(readManagedModelDiagnostic(f.store, priorBinding, row.source));
+      assert.equal(diagnostic.request.code, row.code);
+      const call = ok(readCall(f.store, project, row.origin.sources.find(item => item.role === 'call').ref));
+      trace.push({ row: row.id, code: row.code, goal: row.goal, reason: diagnostic.reason, attempt: call.value.attempt, gaps: call.value.gaps });
+      if (diagnostic.reason !== 'refused') continue;
+      assert.equal(call.value.attempt, prior.ordinal, 'The admitted call belongs to the preceding attempt');
+      for (const gap of call.value.gaps) if (gap.goal === row.goal && n.batch.items.some(item => item.target === gap.goal && item.field === gap.field))
+        expected.push({ row: row.id, code: row.code, target: gap.goal, field: gap.field, remedy: row.remedy });
+    }
+    lastTrace = JSON.stringify({ trace, batch: n.batch.items.map(item => [item.target, item.field, item.consumers]) });
+    return [...new Map(expected.map(item => [canonical(item), item])).values()].sort((x, y) => canonical(x) < canonical(y) ? -1 : canonical(x) > canonical(y) ? 1 : 0);
+  }
+  const grow = (slice, ...added) => {
+    const file = join(f.root, slice + '-scenario.json'), script = JSON.parse(readFileSync(file, 'utf8'));
+    script.steps.push(...added); writeFileSync(file, JSON.stringify(script));
+  };
+  // The consume block first: an interrupted transport, then an untyped reply — technical ends are kept in the history and
+  // are no task for the model (row 8). (First, because every later G4b evaluation reads all packets of the project, and the
+  // continuation packets of the produce block below carry the S1.1 cost class noted above.)
+  const c = await g4b.nodeTerminal(f, 'garden-consume-block', 'interrupted', 'e22-consume');
+  c.block = 'garden-consume-block';
+  measured('writeAnswersEvaluation.consume.1', () => ok(g4b.evaluate(f, c.m, c.offers(reference(c.cycle.record)))));
+  const closedC1 = close(c.block, 1);
+  assert.equal(closedC1.reason, 'interrupted');
+  const c2 = openNext(c, 2);
+  assert.deepEqual(c2.packet.value.packet.refusals, expectedRefusals(c, 2, c2.packet, c.m.binding));
+  assert.deepEqual(c2.packet.value.packet.refusals, []);
+  assert.equal(c2.packet.value.journal !== null, closedC1.refusals.length > 0, 'The journal is named exactly when the end claimed rows');
+  grow('e22-consume', { research: { invalid: true }, usage: g4b.traceUsage });
+  const cycleC2 = ok(await runModelCycle(f.store, { project, packet: reference(c2.packet), dispatch: c.cycle.record.value.request.dispatch, role: 'implementer' }));
+  assert.ok(cycleC2.diagnostic);
+  measured('writeAnswersEvaluation.consume.2', () => ok(g4b.evaluate(f, { binding: c2.binding }, c.offers(reference(cycleC2.record)))));
+  const closedC2 = close(c.block, 2);
+  assert.equal(closedC2.reason, 'off-form');
+  const c3 = openNext(c, 3);
+  assert.deepEqual(c3.packet.value.packet.refusals, expectedRefusals(c, 3, c3.packet, c2.binding));
+  assert.deepEqual(c3.packet.value.packet.refusals, []);
+  // The produce block: attempt 1 refused by the model (cannot_answer), attempt 2 a cycle without progress after a source read.
+  const p = await g4b.nodeTerminal(f, 'garden-produce-block', 'cannot_answer', 'e22-produce');
+  p.block = 'garden-produce-block';
+  assert.deepEqual([p.packet.value.packet.refusals, p.packet.value.journal], [[], null], 'The first attempt has no preceding attempt (row 1)');
+  assert.equal(p.cycle.record.value.terminal, 'outcome'); assert.ok(p.cycle.diagnostic);
+  measured('writeAnswersEvaluation.produce.1', () => ok(g4b.evaluate(f, p.m, p.offers(reference(p.cycle.record)))));
+  const closed1 = close(p.block, 1);
+  assert.equal(closed1.reason, 'refused'); assert.ok(closed1.refusals.length >= 1, 'The refused close claims the E4 rows');
+  const p2 = openNext(p, 2);
+  const expected2 = expectedRefusals(p, 2, p2.packet, p.m.binding);
+  assert.ok(expected2.length >= 1 && expected2.every(item => item.code === 'model_cannot_answer'), 'A refusal of the model is delivered with its own code (row 7): ' + lastTrace);
+  assert.ok(expected2.every(item => p.batch.items.some(question => question.target === item.target && question.field === item.field)), 'Every delivered address is a question of this packet');
+  assert.deepEqual(p2.packet.value.packet.refusals, expected2);
+  assert.ok(canonical(p2.packet.value.packet.refusals).includes('The requested design is not available'), 'The remedy of the E4 source reaches the model, not a code alone');
+  // The saved packets read the same after a restart, before the cycle below (measured on the real Store, cold).
+  f.restart();
+  for (const [label, saved] of [['consume.2', c2.packet], ['consume.3', c3.packet], ['produce.2', p2.packet]])
+    measured('readQuestionPacket.' + label + '.restart', () => assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(saved) })), saved));
+  // Row 11: the model asks twice for the same source; the continuation packet after the read derives its previous
+  // refusals from the same root basis — attempt 1's causes — never from anything paid later in attempt 2.
+  const questions = p2.packet.value.packet.questions.map(row => row.id);
+  const need = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source', questionIds: questions, missing: 'Need the addressed source data',
+    reads: [{ action: 'read_source', source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] }, usage: g4b.traceUsage };
+  grow('e22-produce', need, need);
+  const cycle2 = ok(await runModelCycle(f.store, { project, packet: reference(p2.packet), dispatch: p.cycle.record.value.request.dispatch, role: 'implementer' }));
+  assert.equal(cycle2.record.value.terminal, 'research-no-progress'); assert.equal(cycle2.record.value.steps.length, 2, 'Both source requests were paid before the root ended');
+  const continuation = ok(readQuestionPacket(f.store, { project, record: cycle2.record.value.steps[1].packet }));
+  assert.ok(continuation.value.request.continuation && continuation.id !== p2.packet.id, 'The second step is the continuation packet of the root');
+  for (const [index, step] of cycle2.record.value.steps.entries()) {
+    const stepPacket = ok(readQuestionPacket(f.store, { project, record: step.packet }));
+    assert.deepEqual([stepPacket.value.packet.refusals, stepPacket.value.journal], [expected2, p2.packet.value.journal], 'step ' + index + ' keeps the root basis');
+  }
+  // From here on nothing is measured: the packets of this cycle carry the S1.1 cost class of continuations (see above).
+  ok(g4b.evaluate(f, { binding: p2.binding }, p.offers(reference(cycle2.record))));
+  const closed2 = close(p.block, 2);
+  assert.equal(closed2.reason, 'refused', 'A cycle ended without progress is a refusal of the model');
+  const p3 = openNext(p, 3, false);
+  const expected3 = expectedRefusals(p, 3, p3.packet, p2.binding);
+  assert.ok(expected3.length >= 1 && expected3.every(item => item.code === 'research_no_progress'), 'Delivered with its own code, at the addresses of the admitted call: ' + lastTrace);
+  assert.deepEqual(p3.packet.value.packet.refusals, expected3);
+  assert.ok(!expected3.some(item => closed1.refusals.some(link => link.row === item.row)), 'The causes of attempt 1 are not substituted for attempt 2\'s (row 5)');
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(p3.packet) })), p3.packet);
+  console.log(JSON.stringify({ reports, outcomes: { produce: p3.packet.value.packet.refusals, consume: c3.packet.value.packet.refusals, first: expected2,
+    ends: [closed1.reason, closed2.reason, closedC1.reason, closedC2.reason] } }));
+} finally {
+  active = null;
+  for (const store of stores) store.close();
+  for (const action of cleanups.reverse()) action();
+}
+`;
+
+test('E2.2 №1801 rows 1/2/3/5/9/10/12 on the real MC1 producers: two fact questions of one block, the negative E5 of one beside the untyped E5 of the other — the repeated packet carries the one genuine cause at its exact address, never the older attempt\'s, never a G4b row; the saved packet reads the same after the journal moved; the remedies are bounded by the common capacity', async t => {
+  checkScenario(t, await runScenario(t, 'e22-fact', e22FactScenario));
+});
+
+test('E2.2 №1801 rows 5/7/8/11 on the real MC2 producers: cannot_answer and a cycle without progress are delivered at the exact addresses of the admitted call with their own codes, a continuation packet keeps the root basis, and interrupted or off-form ends are no task for the model', async t => {
+  checkScenario(t, await runScenario(t, 'e22-node', e22NodeScenario));
 });

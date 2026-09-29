@@ -34,17 +34,19 @@ import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQ
   preparePartResult, readPartResult, readPacketResponse, partResponseId, type PartResponseRecord,
   normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, WORKS_PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
-import { recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
-import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type RefusalJournal } from '../src/om/refusal-journal.js';
+import { readCall, recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
+import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalRow, type RefusalJournal } from '../src/om/refusal-journal.js';
+import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORIGIN_DECISION_KIND, readDefinitions } from '../src/om/repeat-gate.js';
 import { prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
+import { deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const clone = structuredClone;
+const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 const ordered = <T>(values: readonly T[]) => [...values].sort((a, b) => canonical(a).localeCompare(canonical(b)));
 function ok<T>(result: OmResult<T>): T {
@@ -579,7 +581,7 @@ function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1) 
 
 function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<typeof writeQuestionPacket> extends OmResult<infer T> ? T : never,
   modify?: (body: Omit<LayerProposal, 'base' | 'level' | 'source' | 'status'>) => void,
-  options: { pending?: boolean; commit?: boolean } = {}) {
+  options: { pending?: boolean; commit?: boolean; attempt?: { series: Ref; ordinal: number } } = {}) {
   const { f } = p, record = packet.record, plan = record.value.plan!;
   const ids = plan.assignments[plan.position]!.obligations;
   const assigned = p.obligations.filter(obligation => ids.includes(obligation.id));
@@ -601,7 +603,7 @@ function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<t
     value: { projectId: f.project, model: 'fixture' } });
   const call = ok(recordCall(f.store, f.project, { call: String((record.value.packet as Record<string, Json>).requestId), purpose: 'model-design', basis: null,
     block: p.block, gaps: p.batch.items.filter(item => ids.includes(item.target)).flatMap(item => item.consumers.map(consumer => ({
-      id: item.target, goal: item.target, field: item.field, consumer }))), series: reference(p.series), attempt: 1, goal: p.goal,
+      id: item.target, goal: item.target, field: item.field, consumer }))), series: options.attempt?.series ?? reference(p.series), attempt: options.attempt?.ordinal ?? 1, goal: p.goal,
     dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(record.value.packet) as Json })).call;
   const requestId = (record.value.packet as Record<string, Json>).requestId as string;
   assert.equal(typeof requestId, 'string');
@@ -902,45 +904,53 @@ test('E2 part-result admission rejects a foreign purpose, another declared attem
     rejected(normalizePartAnswer({ ...result.body, ...service }), 'part_answer_invalid');
 });
 
-test('E2 retry context contains only addressed refusals from the preceding attempt of the same exact goal', t => {
-  const p = packetFixture(t), { f } = p;
-  let nextSource = 0;
-  function refusal(code: string, goal: string) {
-    const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}packet-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-      value: { gate: 'G4', refusals: [{ code, goal, remedy: 'Resolve the addressed question',
-        origin: { name: code, stage: 'question-packet', subject: goal, sources: [{ role: 'input', ref: reference(f.input) }] } }] } });
-    const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
-    const row = journal.value.rows.find(row => row.source.id === source.id)!;
-    return { row: row.id, name: row.code, goal: row.goal };
-  }
-  const address = { project: f.project, block: p.block, line: 1 };
-  const older = refusal('older-own-refusal', p.batch.items[0]!.target);
-  ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [older] } }));
-  ok(beginAttempt(f.store, { ...address, attempt: 2, goal: p.goal }));
-  const own = refusal('latest-own-refusal', p.batch.items[0]!.target), foreign = refusal('foreign-refusal', 'unrelated-question');
-  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [own, foreign] } }));
-  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
-  const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
-  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [{ code: own.name, target: own.goal }]);
-  assert.ok(packet.value.journal);
-  const payload = canonical(packet.value.packet);
-  assert.equal(payload.includes(older.name), false); assert.equal(payload.includes(foreign.name), false);
-  assert.equal(payload.includes('Resolve the addressed question'), false);
-  const other = { project: f.project, block: 'packet-new-goal', line: 1 };
-  ok(openSeries(f.store, { ...other, slice: 'changed-goal', predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { ...other, attempt: 1, goal: p.goal }));
-  ok(completeAttempt(f.store, { ...other, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [own] } }));
-  const changed = ok(beginAttempt(f.store, { ...other, attempt: 2, goal: { ...p.goal, result: 'A different agreed result' } }));
-  rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(changed), ordinal: 2 } }), 'packet_attempt_invalid');
-  refusal('later-unrelated-history', p.batch.items[0]!.target);
-  f.restart();
-  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-});
+type ModelEnd = { code: string; message: string; reason?: 'refused' | 'off-form' | 'interrupted' | 'awaiting-owner' };
+/**
+ * One attempt paid and ended by the model through the real producers: its E2 packet, its admitted E1 (the call of this
+ * packet with the gaps it sends) and the E4 finish of the common producer, which writes the diagnostic, records its rows
+ * in the journal and completes the legacy attempt claiming them. The E2.2 expectation is derived from that chain, not
+ * from E2: for a refusal of the model, one element per row and per exact (target, field) of the admitted call it names.
+ */
+function refusedByModel(f: ReturnType<typeof questionFixture>, spec: { series: Revision<RepairSeries>; ordinal: number; request: QuestionPacketRequest;
+  batch: { items: readonly { gap: string; target: string; field: string; consumers: readonly string[] }[] }; adapter: Revision<unknown>; config: Revision<unknown>; end: ModelEnd }) {
+  const { series, ordinal, end } = spec;
+  const packet = ok(writeQuestionPacket(f.store, { ...spec.request, attempt: { series: reference(series), ordinal } })).record;
+  const payload = packet.value.packet as Record<string, any>, assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
+  const attempt = series.value.attempts.find(item => item.ordinal === ordinal)!;
+  const gaps = spec.batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+    id: item.target, goal: item.target, field: item.field, consumer })));
+  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
+    block: series.value.block, series: reference(series), attempt: ordinal, goal: attempt.goal, gaps,
+    dispatch: { adapter: reference(spec.adapter), config: reference(spec.config) }, packet: clone(payload) as Json })).call;
+  const finished = ok(finishModelAttempt(f.store, { project: f.project, packet: reference(packet), call: reference(call), response: null,
+    code: end.code, message: end.message, reason: end.reason ?? 'refused' }));
+  const journal = f.store.get<RefusalJournal>(journalId(f.project))!;
+  const rows = journal.value.rows.filter(row => same(row.source, finished.diagnostic)) as JournalRow[];
+  assert.ok(rows.length >= 1, 'The finish recorded the diagnostic rows');
+  const closed = f.store.get<RepairSeries>(series.id)!.value.attempts.find(item => item.ordinal === ordinal)!;
+  assert.deepEqual(closed.outcome?.refusals.map(link => link.row).sort(), rows.map(row => row.id).sort(), 'The attempt claims exactly the diagnostic rows');
+  const expected = end.reason && end.reason !== 'refused' ? [] : rows.flatMap(row => gaps.filter(gap => gap.goal === row.goal)
+    .map(gap => ({ row: row.id, code: row.code, target: gap.goal, field: gap.field, remedy: row.remedy })))
+    .filter((item, index, all) => all.findIndex(other => canonical(other) === canonical(item)) === index)
+    .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  return { packet, call, diagnostic: finished.diagnostic, rows, gaps, expected, message: end.message };
+}
 
-/** S1.1: a real retry history of the packet fixture — two refused attempts of the same goal, then the running attempt 3. */
-function retryHistory(t: TestContext) {
+/**
+ * E2.2: a real retry history of the packet fixture on a legacy series. Every refused attempt is refused by the model
+ * itself — its E2 packet, its admitted E1 and the E4 finish through the common producer (`finishModelAttempt`), which
+ * writes the diagnostic, records its rows in the journal and completes the attempt claiming them. Nothing is written
+ * by hand into the journal but unclaimed noise rows of another gate, to move its head.
+ */
+function retryHistory(t: TestContext, ends: ModelEnd[] = [
+  { code: 'cannot_answer', message: 'The requested value is not in the sources' },
+  { code: 'cannot_answer', message: 'The requested value is still not in the sources' }]) {
   const p = packetFixture(t), { f } = p;
+  const address = { project: f.project, block: p.block, line: 1 };
+  const adapter = f.store.write({ id: `adapter:${f.project}:retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:retry`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
   let nextSource = 0;
+  /** An unclaimed row of another gate: journal noise that moves the head and is never a cause of any attempt. */
   function refusal(code: string, goal: string) {
     const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}s11-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
       value: { gate: 'G4', refusals: [{ code, goal, remedy: 'Resolve the addressed question',
@@ -949,17 +959,322 @@ function retryHistory(t: TestContext) {
     const row = journal.value.rows.find(row => row.source.id === source.id)!;
     return { row: row.id, name: row.code, goal: row.goal };
   }
-  const address = { project: f.project, block: p.block, line: 1 };
-  const older = refusal('older-own-refusal', p.batch.items[0]!.target);
-  ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [older] } }));
-  ok(beginAttempt(f.store, { ...address, attempt: 2, goal: p.goal }));
-  const own = refusal('latest-own-refusal', p.batch.items[0]!.target), foreign = refusal('foreign-refusal', 'unrelated-question');
-  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [own, foreign] } }));
-  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
-  const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(third), ordinal: 3 } };
-  return { p, f, refusal, own, request };
+  const refuse = (series: Revision<RepairSeries>, ordinal: number, end: ModelEnd) =>
+    refusedByModel(f, { series, ordinal, request: p.request, batch: p.batch, adapter, config, end });
+  const attempts = [] as ReturnType<typeof refuse>[];
+  let series = p.series as Revision<RepairSeries>;
+  ends.forEach((end, index) => {
+    if (index > 0) series = ok(beginAttempt(f.store, { ...address, attempt: index + 1, goal: p.goal }));
+    attempts.push(refuse(series, index + 1, end));
+  });
+  const running = ok(beginAttempt(f.store, { ...address, attempt: ends.length + 1, goal: p.goal }));
+  const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(running), ordinal: ends.length + 1 } };
+  return { p, f, address, refusal, refuse, attempts, older: attempts[0]!, own: attempts.at(-1)!, running, request };
 }
-/** Every read of an exact record through any Store, by id, while the returned function is installed. */
+
+test('E2.2 rows 5, 7, 10: the repeated packet delivers the causes of the last preceding attempt of the same goal — a genuine E4 refusal of the model, at the exact (target, field) of its admitted call, with its own code and remedy; an older attempt is never substituted; a saved packet keeps its context after the journal moved on', t => {
+  const { p, f, refusal, older, own, request } = retryHistory(t);
+  assert.ok(own.expected.length >= 1); assert.notDeepEqual(own.expected, older.expected);
+  const packet = ok(writeQuestionPacket(f.store, request)).record;
+  const refusals = (packet.value.packet as Record<string, Json>).refusals as Json[];
+  assert.deepEqual(refusals, own.expected);
+  for (const item of refusals as { row: string; code: string; target: string; field: string; remedy: string }[]) {
+    assert.ok(p.batch.items.some(question => question.target === item.target && question.field === item.field), 'Every delivered address is a question of this packet');
+    assert.equal(item.code, 'cannot_answer'); assert.equal(item.remedy, own.message);
+    assert.ok(own.rows.some(row => row.id === item.row), 'The row is the one the preceding attempt claimed');
+  }
+  assert.ok(packet.value.journal);
+  const payload = canonical(packet.value.packet);
+  assert.equal(payload.includes(older.message), false, 'The older attempt is not substituted');
+  assert.equal(payload.includes(own.message), true, 'The remedy of the proved source reaches the model, not a code alone');
+  // Row 10: the journal moves on; the saved packet is read on its own journal revision, cold and after a restart.
+  refusal('later-unrelated-history', p.batch.items[0]!.target);
+  refusal('another-later-history', 'unrelated-question');
+  assert.ok(f.store.get(journalId(f.project))!.revision > packet.value.journal!.revision);
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  // A changed goal on another block is not the same goal: the former attempt refusal stays (packet_attempt_invalid).
+  const other = { project: f.project, block: 'packet-new-goal', line: 1 };
+  ok(openSeries(f.store, { ...other, slice: 'changed-goal', predecessor: null, basis: null }));
+  ok(beginAttempt(f.store, { ...other, attempt: 1, goal: p.goal }));
+  ok(completeAttempt(f.store, { ...other, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: own.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })) } }));
+  const changed = ok(beginAttempt(f.store, { ...other, attempt: 2, goal: { ...p.goal, result: 'A different agreed result' } }));
+  rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(changed), ordinal: 2 } }), 'packet_attempt_invalid');
+});
+
+test('E2.2 row 1: no preceding attempt of the same goal, or one without refusals, gives no journal and no refusals — the older refused attempt is never substituted', t => {
+  const { p, f, address, older, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'The requested value is not in the sources' }]);
+  // The running attempt 2 stands after the refused attempt 1: its packet carries attempt 1's causes.
+  const second = ok(writeQuestionPacket(f.store, request)).record;
+  assert.deepEqual((second.value.packet as Record<string, Json>).refusals, older.expected); assert.ok(second.value.journal);
+  // Attempt 2 ends without refusals; attempt 3 has a preceding attempt of the same goal with an empty outcome.refusals.
+  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+  const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, []); assert.equal(packet.value.journal, null);
+  assert.equal(canonical(packet.value.packet).includes(older.message), false);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+});
+
+test('E2.2 row 8: a technical or control end of the preceding attempt (interrupted, off-form, awaiting the owner) is kept in the history but is no task for the model — the journal stays named, the refusals are empty', t => {
+  for (const end of [{ code: 'process_lost', message: 'The adapter process died', reason: 'interrupted' as const },
+    { code: 'answer_off_form', message: 'The reply was not the agreed form', reason: 'off-form' as const },
+    { code: 'need_owner', message: 'Name the operation', reason: 'awaiting-owner' as const }]) {
+    const { f, own, request } = retryHistory(t, [end]);
+    assert.deepEqual(own.expected, []); assert.ok(own.rows.length >= 1, 'The diagnostic rows stand in the journal');
+    const packet = ok(writeQuestionPacket(f.store, request)).record;
+    assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [], end.reason + ': not a task for the model');
+    assert.ok(packet.value.journal, end.reason + ': the saved journal is not lost');
+    // Return №2 (table row E4 T): the exclusion is decided by the producer's own stage proved with the record — no reader is
+    // applied: with the admitted call hidden the same packet still prepares (nothing to prove for an excluded row).
+    assert.deepEqual(ok(prepareQuestionPacket(hiding(f.store, own.call.id), request)).record.value.packet, packet.value.packet, end.reason + ': excluded without readers');
+    assert.equal(canonical(packet.value.packet).includes(end.message), false);
+    f.restart();
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  }
+});
+
+test('E2.2 row 6: a claimed row whose source is of no proved kind and has no saved class, or whose genuine source belongs to another attempt, is a typed refusal at the packet\'s refusals — never an empty context', t => {
+  const end = { code: 'cannot_answer', message: 'The requested value is not in the sources' };
+  // A row of another gate claimed straight into the outcome (no G7 class, no E5/E4 proof): the context is unavailable.
+  {
+    const { p, f, address, refusal, own, request } = retryHistory(t, [end]);
+    assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected, 'The lawful packet before the claim');
+    const foreign = refusal('gate-refusal-of-another-kind', p.batch.items[0]!.target);
+    ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [foreign] } }));
+    const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+    const before = f.store.list('question-packet').length;
+    const unplaced = rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
+    assert.deepEqual([unplaced.at.unit, unplaced.at.target, unplaced.at.field], ['E2', foreign.row, 'refusals']);
+    assert.equal(f.store.list('question-packet').length, before, 'Nothing is written');
+  }
+  // The genuine E4 rows of attempt 1 claimed by attempt 2 of the same line and goal: a source of another attempt is
+  // foreign to the claim, however exactly its goal and address match — the typed refusal names the row.
+  {
+    const { p, f, address, own, request } = retryHistory(t, [end]);
+    assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected);
+    ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [],
+      refusals: own.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })) } }));
+    const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+    const crossed = rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
+    assert.deepEqual([crossed.at.unit, crossed.at.field], ['E2', 'refusals']);
+    assert.ok(own.rows.some(row => row.id === crossed.at.target), 'The refusal names the claimed row of the other attempt');
+    assert.equal(canonical(crossed).includes(own.message), false, 'No context of the foreign source leaks into the refusal');
+  }
+});
+
+test('E2.2 row 4: a part of a split node carries the causes of the questions it actually sends — the whole node\'s refusal of the preceding attempt reaches each part for its own questions only, and nothing of it is lost between the parts', t => {
+  const p = expansionFixture(t), { f } = p;
+  const adapter = f.store.write({ id: `adapter:${f.project}:parts-retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:parts-retry`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  // Attempt 1: the whole node fits and the model refuses it; its E4 rows name every question of the node.
+  const one = refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter, config,
+    end: { code: 'cannot_answer', message: 'The requested design is not available' } });
+  assert.equal(one.packet.value.plan!.mode, 'whole');
+  assert.ok(new Set(one.expected.map(item => item.target)).size >= 2, 'The refused whole names several questions');
+  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const wholeRequest = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
+  const whole = ok(prepareQuestionPacket(f.store, wholeRequest)).record.value;
+  assert.ok(whole.fingerprint && whole.plan!.mode === 'whole');
+  assert.deepEqual((whole.packet as Record<string, Json>).refusals, one.expected, 'A whole packet of attempt 2 carries every cause');
+  // Attempt 2 at a capacity the whole does not fit: the first part sends the questions of its connector alone.
+  const environment = p.environment(whole.fingerprint.chars - 1);
+  const first = ok(writeQuestionPacket(f.store, { ...wholeRequest, environment: reference(environment) })).record;
+  const plan = first.value.plan!;
+  assert.equal(first.value.state, 'ready'); assert.equal(plan.mode, 'parts'); assert.equal(plan.position, 0); assert.equal(plan.assignments.length, 2);
+  const payload = first.value.packet as Record<string, any>;
+  const sent = payload.questions as { target: string; field: string }[];
+  const own = one.expected.filter(item => sent.some(question => question.target === item.target && question.field === item.field));
+  const others = one.expected.filter(item => !own.includes(item));
+  assert.ok(own.length >= 1 && others.length >= 1, 'The causes split between the parts');
+  assert.deepEqual(payload.refusals, own, 'The first part carries the causes of the questions it sends');
+  assert.ok(others.every(item => plan.assignments[1]!.obligations.includes(item.target)), 'Every other cause belongs to the questions of the second part');
+  assert.equal(canonical(payload.refusals).includes(others[0]!.target), false);
+  assert.ok(first.value.journal, 'The part names the journal its causes stand in');
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(first) })), first);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(first) })), first);
+});
+
+// ---- Return №1 of E2.2 (verdict №2070): a delivered cause stands on a PROVED exact basis, and a source's refusal is kept as is ----
+
+/** A read-only view of the Store that hides one exact record (a missing source), writing nothing and forging nothing. */
+function hiding(store: Store, id: string): Store {
+  return new Proxy(store, { get(target, property) {
+    if (property === 'get') return (key: string, revision?: number) => key === id ? undefined : target.get(key, revision);
+    const value = Reflect.get(target, property, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+
+test('E2.2 rows 6–7 (return №1, P2-1): a refusal of another gate G7 classified as a proposal is delivered only while its exact sources read through the common origin reader — a hidden proposal is the reader\'s own refusal, never a delivered cause', t => {
+  const p = packetFixture(t), { f } = p, frame = f.request.gaps.sources.operations.frame;
+  const proposal = f.store.write({ id: `om-proposal:${f.project}:e22-return-1`, kind: 'layer-proposal', expected: 0, value: {
+    base: { graph: frame.graph, frame: frame.frame }, level: 2, source: 'decision', status: 'proposed', nodes: [], fills: [], localConnectors: [],
+    artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] } });
+  const proposalSource = { role: 'proposal' as const, ref: reference(proposal), context: { kind: 'proposal' as const, request: { frame, proposals: [reference(proposal)] } } };
+  const target = p.batch.items[0]!.target;
+  // A real G3 refusal of the proposal with its exact base and proposal sources; the real close classifies it (proposal).
+  const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}g3:e22-return-1`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: 'G3', refusals: [{ code: 'graph_invalid', goal: p.goal.result, remedy: 'Supply this question in the proposed design',
+      origin: { name: 'missing-subject', stage: 'layer-check', subject: target,
+        sources: [{ role: 'base', ref: frame.graph, context: { kind: 'frame', request: frame } }, proposalSource] } }] } });
+  const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+  const row = journal.value.rows.find(item => item.source.id === source.id)!;
+  const closed = ok(closeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
+    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  assert.equal(closed.routed[0]!.class, 'proposal');
+  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
+  const good = ok(prepareQuestionPacket(f.store, request)).record;
+  assert.deepEqual((good.value.packet as Record<string, Json>).refusals, p.batch.items.filter(item => item.target === target)
+    .map(item => ({ row: row.id, code: 'graph_invalid', target, field: item.field, remedy: 'Supply this question in the proposed design' })),
+  'With its sources readable the classified cause reaches the model at the addressee node G7 saved');
+  // The proposal becomes unreadable (a view, no record changed): the common origin reader refuses, and E2 carries that
+  // refusal as it is — code, unit, field and ref — instead of delivering the cause on the strength of the saved class.
+  const view = hiding(f.store, proposal.id);
+  const direct = readDefinitions(view, { project: f.project, source: proposalSource });
+  assert.equal(direct.ok, false);
+  const result = prepareQuestionPacket(view, request);
+  assert.equal(result.ok, false, 'E2 must not treat a saved class as proof of a missing proposal');
+  if (!result.ok && !direct.ok) {
+    assert.equal(result.refusal.code, direct.refusal.code);
+    assert.deepEqual([result.refusal.at.unit, result.refusal.at.field, result.refusal.at.ref], [direct.refusal.at.unit, direct.refusal.at.field, direct.refusal.at.ref]);
+    assert.equal(result.refusal.route, direct.refusal.route);
+  }
+  const written = writeQuestionPacket(view, request);
+  assert.equal(written.ok, false); if (!written.ok && !direct.ok) assert.equal(written.refusal.code, direct.refusal.code);
+  assert.deepEqual(ok(prepareQuestionPacket(f.store, request)).record.value.packet, good.value.packet, 'The real Store still delivers');
+});
+
+test('E2.2 row 6 (return №1, P2-3): the typed refusal of a common reader keeps its own code, address and route through E2 — an admitted call that does not read is call_unresolved at the admission gate, not a packet refusal', t => {
+  const { f, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'Need specific source' }]);
+  const view = hiding(f.store, own.call.id);
+  const source = readCall(view, f.project, reference(own.call));
+  assert.equal(source.ok, false);
+  const prepared = prepareQuestionPacket(view, request);
+  assert.equal(prepared.ok, false);
+  if (!prepared.ok && !source.ok) {
+    assert.equal(prepared.refusal.code, source.refusal.code);
+    assert.deepEqual(prepared.refusal.at, source.refusal.at);
+    assert.equal(prepared.refusal.route, source.refusal.route);
+    assert.notEqual(prepared.refusal.code, 'packet_record_invalid');
+  }
+  assert.deepEqual((ok(prepareQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected, 'The real Store delivers the cause');
+});
+
+test('E2.2 row 11 (return №1, P2-2): the next part of a split node stands on the journal of its chain root, not on today\'s head — after an unrelated row moved the head, the second part names the first part\'s journal, delivers its own share of the causes, and reads the same after a restart', t => {
+  const p = expansionFixture(t), { f } = p;
+  const adapter = f.store.write({ id: `adapter:${f.project}:parts-root`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:parts-root`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const one = refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter, config,
+    end: { code: 'cannot_answer', message: 'Need a different node design' } });
+  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
+  const whole = ok(prepareQuestionPacket(f.store, request)).record.value;
+  const environment = p.environment(whole.fingerprint!.chars - 1), partRequest = { ...request, environment: reference(environment) };
+  const firstWrite = ok(writeQuestionPacket(f.store, partRequest)), first = firstWrite.record;
+  assert.equal(first.value.plan!.mode, 'parts'); assert.ok(first.value.journal);
+  const result = partResult(p, firstWrite, undefined, { attempt: { series: reference(series), ordinal: 2 } });
+  // An unrelated, unclaimed row moves the journal head between the parts.
+  const noise = f.store.write({ id: `${unitRefusalNamespace(f.project)}noise-between-parts`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: 'G4', refusals: [{ code: 'unrelated', goal: 'unrelated', remedy: 'unrelated', origin: { name: 'noise', stage: 'noise', subject: 'noise', sources: [] } }] } });
+  ok(recordRefusal(f.store, { project: f.project, source: reference(noise) }));
+  assert.ok(f.store.get(journalId(f.project))!.revision > first.value.journal!.revision);
+  const nextRequest = { ...partRequest, previous: [{ packet: reference(first), proposal: reference(result.proposal), result: reference(result.record) }] };
+  const nextWrite = writeQuestionPacket(f.store, nextRequest);
+  if (!nextWrite.ok) assert.fail('The next part must write after an unrelated head movement: ' + JSON.stringify(nextWrite.refusal));
+  const next = nextWrite.value.record;
+  assert.equal(next.value.state, 'ready'); assert.equal(next.value.plan!.position, 1);
+  assert.deepEqual(next.value.journal, first.value.journal, 'The next part keeps the root basis of its chain');
+  const sentOf = (record: typeof next) => (record.value.packet as Record<string, any>).questions as { target: string; field: string }[];
+  const shareOf = (record: typeof next) => one.expected.filter(item => sentOf(record).some(question => question.target === item.target && question.field === item.field));
+  assert.deepEqual((next.value.packet as Record<string, Json>).refusals, shareOf(next), 'The next part carries the causes of the questions it sends');
+  assert.deepEqual((first.value.packet as Record<string, Json>).refusals, shareOf(first));
+  const order = (items: Json[]) => [...items].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  assert.deepEqual(order([...(first.value.packet as Record<string, any>).refusals, ...(next.value.packet as Record<string, any>).refusals]), one.expected, 'The parts together carry every cause once');
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(next) })), next);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(next) })), next);
+  const firstAgain = readQuestionPacket(f.store, { project: f.project, record: reference(first) });
+  if (!firstAgain.ok) assert.fail('The first part must read after the head moved: ' + JSON.stringify(firstAgain.refusal));
+  assert.deepEqual(firstAgain.value, first);
+  // The chain root itself is no continuation: preparing the same root request again on the moved head is a repeat of a
+  // saved preparation whose journal guard moved — input_stale, as S1.1 rules (rows 8, 10 of №1759) — never a silent
+  // re-basing of the root on today's journal.
+  rejected(prepareQuestionPacket(f.store, partRequest), 'input_stale');
+});
+
+// ---- Return №2 of E2.2 (verdict №2080): one decision per kind of journal row — exclude without readers, deliver on proved exact bases ----
+
+test('E2.2 table row «other gate, class unknown» (return №2, P2-1): a lawfully lifted unknown origin stays excluded from the retry context — no reader is applied to a role G7 does not read, the journal is kept, the packet reads the same after a restart', t => {
+  const p = packetFixture(t), { f } = p;
+  // A real G4 refusal whose only source has a role the gate does not classify (the input in the role of a workspace).
+  const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}g4:unknown-source`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: 'G4', refusals: [{ code: 'source_unplaced', goal: p.goal.result, remedy: 'Do not assign an unplaced cause to the model',
+      origin: { name: 'unplaced', stage: 'layer-check', subject: p.batch.items[0]!.target, sources: [{ role: 'workspace', ref: reference(f.input) }] } }] } });
+  const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+  const row = journal.value.rows.find(item => item.source.id === source.id)!;
+  const closed = ok(closeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
+    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  assert.equal(closed.routed[0]!.class, 'unknown'); assert.equal(closed.holds.length, 1);
+  // The hold is lifted by the owner's decision through the regular transition; attempt 2 opens with the same goal.
+  const holdRef = closed.holds[0]!, hold = f.store.get<{ attempt: number; row: string }>(holdRef.id, holdRef.revision)!.value;
+  const decision = f.store.write({ id: `${originDecisionNamespace(f.project)}allow-retry`, kind: ORIGIN_DECISION_KIND, expected: 0,
+    value: { projectId: f.project, block: p.block, attempt: hold.attempt, row: hold.row, decided: 'Continue this legacy series after reviewing the unplaced cause' } });
+  ok(liftOriginHold(f.store, { project: f.project, hold: holdRef, ground: 'owner-decision', record: { ref: reference(decision) } }));
+  ok(openAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const series = f.store.get(p.series.id)!;
+  const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
+  const direct = readDefinitions(f.store, { project: f.project, source: { role: 'workspace', ref: reference(f.input) } as never });
+  assert.equal(direct.ok, false, 'The origin reader does not read this role as a definition — so E2 must not ask it');
+  const prepared = ok(prepareQuestionPacket(f.store, request)).record;
+  assert.deepEqual((prepared.value.packet as Record<string, Json>).refusals, [], 'A saved unknown class is excluded, not read as a map definition');
+  assert.ok(prepared.value.journal, 'The journal with the excluded row is kept');
+  assert.deepEqual(f.store.get<RefusalJournal>(prepared.value.journal!.id, prepared.value.journal!.revision)!.value.classifications.map(item => [item.row, item.class]), [[row.id, 'unknown']]);
+  const written = ok(writeQuestionPacket(f.store, request)).record;
+  assert.deepEqual(written.value.packet, prepared.value.packet);
+  f.restart();
+  assert.deepEqual(ok(prepareQuestionPacket(f.store, request)).record.value.packet, prepared.value.packet);
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(written) })), written);
+});
+
+test('E2.2 table row «E4 refused, legacy series» (return №2, P2-2): a legacy E4 cause is delivered only with its exact E2 source readable — with the packet of the refused attempt hidden, the packet reader\'s own refusal is carried as it is by the new preparation and by the historical read of the saved retry packet', t => {
+  const { f, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'Need original source' }]);
+  const good = ok(writeQuestionPacket(f.store, request)).record;
+  assert.deepEqual((good.value.packet as Record<string, Json>).refusals, own.expected);
+  const view = hiding(f.store, own.packet.id);
+  const direct = readQuestionPacket(view, { project: f.project, record: reference(own.packet) });
+  assert.equal(direct.ok, false);
+  const prepared = prepareQuestionPacket(view, request);
+  assert.equal(prepared.ok, false, 'The source packet of a claimed legacy E4 refusal is required');
+  const historical = readQuestionPacket(view, { project: f.project, record: reference(good) });
+  assert.equal(historical.ok, false, 'The saved retry packet does not read without the exact source of its cause');
+  if (!direct.ok && !prepared.ok && !historical.ok) {
+    assert.equal(prepared.refusal.code, direct.refusal.code); assert.deepEqual(prepared.refusal.at, direct.refusal.at); assert.equal(prepared.refusal.route, direct.refusal.route);
+    assert.equal(historical.refusal.code, direct.refusal.code); assert.deepEqual(historical.refusal.at, direct.refusal.at);
+    assert.notEqual(prepared.refusal.code, 'packet_record_invalid');
+  }
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(good) })), good, 'The real Store still reads the saved packet');
+});
+
+test('E2.2 table row «E4 without its packet» (return №2, masquerade): an E4-looking record of the E4 namespace claimed without the packet source of a diagnostic is E2\'s own typed refusal, never a delivered cause', t => {
+  const { p, f, address, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'The requested value is not in the sources' }]);
+  assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected);
+  const imitation = f.store.write({ id: `${unitRefusalNamespace(f.project)}e4:imitation`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: 'E4', refusals: [{ code: 'cannot_answer', goal: p.batch.items[0]!.target, remedy: 'An imitated diagnostic', origin: { name: 'cannot_answer',
+      stage: 'model-call:refused', subject: own.call.value.call, sources: [{ role: 'call', ref: reference(own.call) }] } }] } });
+  const recorded = recordRefusal(f.store, { project: f.project, source: reference(imitation) });
+  if (!recorded.ok) { t.diagnostic('The journal itself refuses the imitation: ' + recorded.refusal.code); return; }
+  const row = recorded.value.value.rows.find(item => item.source.id === imitation.id)!;
+  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+  const refused = rejected(prepareQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
+  assert.deepEqual([refused.at.unit, refused.at.target, refused.at.field], ['E2', row.id, 'refusals']);
+});
+
 function countingReads(t: TestContext, ids: readonly string[]) {
   const originalGet = Store.prototype.get, reads = new Map<string, number>();
   Store.prototype.get = function (this: Store, id: string, revision?: number) {
@@ -972,15 +1287,15 @@ function countingReads(t: TestContext, ids: readonly string[]) {
 test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation or a new Store prove it again', t => {
   const { p, f, refusal, own, request } = retryHistory(t);
   const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
-  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [{ code: own.name, target: own.goal }]);
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, own.expected);
   // The head moves on after the packet was saved: the packet stands on the saved revision, never on today's head.
   refusal('later-unrelated-history', p.batch.items[0]!.target);
   refusal('another-later-history', 'unrelated-question');
   assert.ok(f.store.get(journalId(project))!.revision > journal.revision);
   f.restart();
   const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows;
-  assert.equal(rows.length, 3);
-  const count = countingReads(t, [journal.id, ...rows.map(row => row.source.id)]);
+  assert.ok(rows.length >= 2, 'The saved revision holds the rows of both refused attempts');
+  const count = countingReads(t, [journal.id, ...new Set(rows.map(row => row.source.id))]);
   const read = () => ok(readQuestionPacket(f.store, { project, record: reference(packet) }));
   withHistoricalReads(() => {
     assert.deepEqual(read(), packet);

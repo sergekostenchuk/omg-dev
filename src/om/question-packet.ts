@@ -2,7 +2,9 @@ import { Ajv } from 'ajv';
 import type { Selector } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall, type AnyCallRecord } from './call-record.js';
-import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore } from './model-call.js';
+import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic } from './model-call.js';
+import { readAssessmentRefusalAt } from './assessment.js';
+import { readDefinitions } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { boundedContext } from '../compiler/context.js';
 import { Discovery } from '../discovery/discovery.js';
@@ -21,8 +23,8 @@ import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
-import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
-import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, type RefusalJournal } from './refusal-journal.js';
+import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
+import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
 import { historicalRead, historicalProof, withHistoricalReads } from './input.js';
@@ -229,12 +231,18 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   // A3 owns goal identity. E2 only carries refusals from the preceding attempt of that same declared goal.
   const prior = [...checked.value.inherited, ...checked.value.attempts].filter(item => item.ordinal < attempt.ordinal
     && same(item.goal, attempt.goal)).at(-1);
+  // E2.2 (№1801 row 11, return №1): a later part of a split node continues the chosen task — it stands on the journal of
+  // its chain root (the first part, proved at its exact reference), never on today's head; only a new preparation of a
+  // chain root takes the current head and guards it.
+  const root = request.previous.length ? loadPacket(store, request.project, request.previous[0]!.packet) : null;
+  if (root) references.push(reference(root));
   const rows = prior?.outcome?.refusals ?? [];
   if (!rows.length) {
     if (savedJournal) fail('packet_record_invalid', batch.id, 'journal', 'An unused journal cannot be added to a packet');
+    if (root?.value.journal) fail('packet_record_invalid', batch.id, 'journal', 'A part cannot name a journal its chain root has no preceding refusals for');
     return { journal: null, refusals: [] };
   }
-  const journalRef = savedJournal === undefined ? reference(take(readJournal(store, { project: request.project }))) : savedJournal;
+  const journalRef = root ? root.value.journal : savedJournal === undefined ? reference(take(readJournal(store, { project: request.project }))) : savedJournal;
   if (!journalRef) fail('packet_record_invalid', batch.id, 'journal', 'A repeated question must preserve its refusal source');
   const journal = take(readRecord<RefusalJournal>(store, journalRef, { unit: 'E2', target: batch.id,
     id: journalId(request.project), kind: 'om-refusal-journal' }));
@@ -242,14 +250,147 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   // operation — never today's head, and never through a view of its own that would derive the history again.
   const checkedJournal = take(readJournalAt(store, request.project, reference(journal)));
   references.push(journalRef);
-  if (current) { head(store, journalRef); guards.push(journalRef); }
-  const addresses = new Set(batch.items.flatMap(item => [item.target, item.gap]));
-  const refusals = rows.map(link => {
-    const row = checkedJournal.value.rows.find(row => row.id === link.row);
+  if (current && !root) { head(store, journalRef); guards.push(journalRef); }
+  // The line this series continues: the exact original series of a claimed cause must be this one or one it inherits
+  // from — a cause of another line of the same block is foreign, however alike its goal reads (№1801, rows 5–6).
+  const line = new Set<string>([checked.id]);
+  for (let cursor = checked; cursor.value.predecessor;) {
+    cursor = take(readAnySeriesAt(store, request.project, cursor.value.predecessor));
+    references.push(reference(cursor)); line.add(cursor.id);
+  }
+  return { journal: journalRef, refusals: retryRefusals(store, request.project, batch, checkedJournal.value, rows, prior!, mechanism,
+    mechanism ? null : (checked.value as RepairSeries).block, line, references) };
+}
+
+/**
+ * One cause of the preceding attempt delivered to the model with the repeated question (E2.2, №1801): the journal row
+ * it stands in, its typed refusal, the exact question address of THIS packet it concerns, and the remedy of its proved
+ * source. Nothing is invented for the model: the code and the remedy are the source's own, the address is the question's.
+ */
+export interface RetryRefusal { row: string; code: string; target: string; field: string; remedy: string }
+
+/** The kinds of journal rows E2 tells apart, by the gate and the namespace of the row's source (№1801, return №2 table). */
+type CauseKind = 'g4b' | 'e5' | 'e4' | 'gate';
+function causeKind(project: string, row: JournalRow): CauseKind {
+  const namespace = unitRefusalNamespace(project);
+  if (row.gate === 'G4b' || row.source.id.startsWith(`${namespace}g4b:`)) return 'g4b';
+  if (row.gate === 'E5' || row.source.id.startsWith(`${namespace}e5:`)) return 'e5';
+  if (row.gate === 'E4' || row.source.id.startsWith(`${namespace}e4:`)) return 'e4';
+  return 'gate';
+}
+/** The source roles G7 weighs for a class through the origin reader; every other role is never read as a definition. */
+const DEFINITION_ROLES: readonly string[] = ['proposal', 'base', 'derived'];
+
+/**
+ * E2.2 (№1801, returns №1 and №2): which claimed causes of the preceding attempt of the same full goal reach the repeated
+ * packet, and at which question address — ONE decision per journal row, by the table of row kinds:
+ *
+ *   kind of row                      decision   exact bases and their common reader (a refusal of the reader is carried as it is)
+ *   G4b observation                  refuse     none — an observation of the check is never a subject; a claim of it is E2's own refusal
+ *   E5 N (insufficient/conflicting)  deliver    readAssessmentRefusalAt: refusal record → exact result → intent → MC1 question; own line, attempt, goal, block, consumer
+ *   E5 T / supported                 —          no journal row exists for them: nothing to exclude, the technical outcome lives in the completion snapshot
+ *   E4, stage not "refused"          exclude    none — a technical or owner-control end (off-form, interrupted, awaiting-owner) is no task for the model; the stage is the producer's own, proved with the record by the journal
+ *   E4 refused, legacy series        deliver    readCall (exact admitted E1: line, attempt, goal, subject, block) and readQuestionPacket (the exact E2 the E1 names: requestId, attempt, body or fingerprint); address = the gaps of the E1
+ *   E4 refused, managed attempt      deliver    readCall, readCompletionBinding, readManagedModelDiagnostic (the whole diagnostic by its exact physical derivation, reason from the reader)
+ *   other gate, no saved class       refuse     none — an unclassified claimed row has no context; E2's own refusal
+ *   other gate, class unknown/input/derivation/conditions/readiness   exclude   none — the class G7 saved excludes the row from the task of the model; no reader is applied to a role it does not read
+ *   other gate, class proposal       deliver    the bases G7 weighed: definition roles (proposal, base, derived) through readDefinitions, an environment role at its exact reference; address = the node G7 named as addressee
+ *   a part of a split node           —          the same table on the journal of the chain root, delivered for the questions the part sends
+ *   a need_source continuation       —          a copy of the root packet's context
+ *
+ * E2's OWN findings about the link — a missing row, a G4b claim, a row of no class, a source of another line, attempt, goal,
+ * block or consumer, an E4 without its stage, call or packet, a proposal without a node addressee, an environment source
+ * away from its exact reference — are packet_record_invalid at this packet's refusals; nothing is ever turned into an
+ * empty context. The classification is G7's record: it is read, never re-derived here. The delivery is per exact
+ * (target, field) the packet actually sends, in canonical order, one element per row and address.
+ */
+function retryRefusals(store: Store, project: string, batch: RoutedBatch, journal: RefusalJournal, links: readonly { row: string }[],
+  prior: Attempt, mechanism: boolean, block: string | null, line: ReadonlySet<string>, references: Ref[]): RetryRefusal[] {
+  const questions = batch.items.map(item => ({ target: item.target, field: item.field, consumers: item.consumers }));
+  const addressed = (target: string, field: string, consumer: string | null) => questions.some(question =>
+    question.target === target && question.field === field && (mechanism || consumer === null || question.consumers.includes(consumer)));
+  const invalid = (row: JournalRow, message: string, ref: Ref = row.source): never => fail('packet_record_invalid', row.id, 'refusals', message, ref);
+  const classes = new Map(journal.classifications.map(item => [item.row, item]));
+  const delivered = new Map<string, RetryRefusal>();
+  const deliver = (row: JournalRow, target: string, field: string) => {
+    const key = canonical([row.id, target, field]);
+    if (!delivered.has(key)) delivered.set(key, { row: row.id, code: row.code, target, field, remedy: row.remedy });
+  };
+  for (const link of links) {
+    const row = journal.rows.find(item => item.id === link.row);
     if (!row) fail('packet_record_invalid', link.row, 'refusals', 'The preceding attempt names a missing journal row');
-    return row;
-  }).filter(row => addresses.has(row.goal)).map(row => ({ code: row.code, target: row.goal }));
-  return { journal: journalRef, refusals: sorted(refusals) };
+    const kind = causeKind(project, row);
+    if (kind === 'g4b') invalid(row, 'A G4b finding is an observation of the check, not a refusal of the proposal the model can answer for');
+    if (kind === 'e5') {
+      // The common E5 reader proves the verdict, the exact result and intent, the original attempt and the question.
+      const proof = take(readAssessmentRefusalAt(store, project, row.source));
+      const intent = proof.intent;
+      if (mechanism) invalid(row, 'E5 fact assessments belong to block attempts', reference(proof.result));
+      if (!line.has(intent.originalSeries.id) || intent.attempt !== prior.ordinal || !same(intent.goal, prior.goal) || intent.block !== block || proof.consumer !== block)
+        invalid(row, 'The claimed E5 refusal belongs to another line, attempt, goal or block', reference(proof.result));
+      references.push(...proof.guards);
+      if (addressed(intent.question.target, intent.question.field, proof.consumer)) deliver(row, intent.question.target, intent.question.field);
+      continue;
+    }
+    if (kind === 'e4') {
+      const stage = /^model-call:(.+)$/.exec(row.origin.stage)?.[1];
+      const callSource = row.origin.sources.find(item => item.role === 'call'), packetSource = row.origin.sources.find(item => item.role === 'packet');
+      if (!stage || !callSource || !packetSource) invalid(row, 'An E4 diagnostic names its producer stage, the admitted call and the packet');
+      // A technical or owner-control end is excluded from the task of the model without any reader.
+      if (stage !== 'refused') continue;
+      const call = take(readCall(store, project, callSource!.ref));
+      if (!line.has(call.value.series.id) || call.value.attempt !== prior.ordinal || !same(call.value.goal, prior.goal) || call.value.call !== row.origin.subject
+        || (block !== null && ('owner' in call.value || call.value.block !== block)) || (block === null && !('owner' in call.value)))
+        invalid(row, 'The claimed E4 diagnostic belongs to a call of another line, attempt, goal or block', callSource!.ref);
+      references.push(callSource!.ref);
+      const binding = take(readCompletionBinding(store, project, call.value.series, call.value.attempt));
+      if (binding) {
+        // A managed attempt proves the whole diagnostic by its exact physical derivation; the reason is the reader's.
+        const diagnostic = take(readManagedModelDiagnostic(store, binding, row.source));
+        if (diagnostic.request.code !== row.code || diagnostic.request.message !== row.remedy || !same(diagnostic.request.call, callSource!.ref))
+          invalid(row, 'The claimed E4 row must be the diagnostic of its own admitted call');
+        references.push(reference(binding));
+        if (diagnostic.reason !== 'refused') continue;
+      } else {
+        // A legacy series has no binding: the exact E2 the E1 names is read by its own reader and must be the packet of
+        // this call and attempt — the E1 carries its requestId and its body or fingerprint (the mechanism E1 stores).
+        const packet = take(readQuestionPacket(store, { project, record: packetSource!.ref }));
+        const payload = packet.value.packet as Record<string, Json> | null, attempt = packet.value.request.attempt;
+        if (!payload || payload.requestId !== call.value.call || !attempt || attempt.series.id !== call.value.series.id || attempt.ordinal !== call.value.attempt)
+          invalid(row, 'The packet source of the claimed E4 diagnostic is not the E2 of its admitted call and attempt', packetSource!.ref);
+        const bytes = canonical(payload);
+        if (!same(call.value.packet, payload) && !same(call.value.packet, packet.value.fingerprint)
+          && !same(call.value.packet, { hash: hashJson(payload), chars: bytes.length, bytes: Buffer.byteLength(bytes) }))
+          invalid(row, 'The admitted call must carry the body or the fingerprint of its exact E2', packetSource!.ref);
+        references.push(packetSource!.ref);
+      }
+      for (const gap of call.value.gaps) {
+        if (gap.goal !== row.goal) continue;
+        const consumer = typeof gap.consumer === 'string' ? gap.consumer : null;
+        if (addressed(gap.goal, gap.field, consumer)) deliver(row, gap.goal, gap.field);
+      }
+      continue;
+    }
+    // Any other gate: the class G7 saved beside the row decides; an excluded class reads nothing further.
+    const placed = classes.get(row.id);
+    if (!placed) invalid(row, 'A claimed refusal of another gate has neither a proved subject kind nor a saved class: its context is unavailable');
+    if (placed!.class !== 'proposal') continue;
+    const addressee = /^node:(.+)$/.exec(placed!.addressee)?.[1];
+    if (!addressee) invalid(row, 'A refusal of the proposal must be addressed to a node by its saved class');
+    // The bases G7 weighed for the proposal must read now, each through the reader of its role; the reader's refusal is
+    // carried as it is. A role G7 does not read as a definition is not read here either.
+    for (const source of unique(placed!.basis)) {
+      if (source.role === 'environment') {
+        const found = store.get(source.ref.id, source.ref.revision);
+        if (!found || found.hash !== source.ref.hash) invalid(row, 'An environment source of the claimed refusal does not stand at its exact reference', source.ref);
+        references.push(source.ref);
+      } else if (DEFINITION_ROLES.includes(source.role)) references.push(...take(readDefinitions(store, { project, source })).references, source.ref);
+    }
+    for (const question of questions) {
+      if (question.target === addressee && (mechanism || block === null || question.consumers.includes(block))) deliver(row, question.target, question.field);
+    }
+  }
+  return sorted([...delivered.values()]);
 }
 
 /** Capture the native producer's writes. The real Store sees them only in E2's guarded transaction. */
@@ -540,7 +681,10 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
         return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
       const assignment = assignments[request.previous.length]!;
       const assigned = open.filter(item => assignment.obligations.includes(item.id));
-      packet = json({ ...common, questions: questions.filter(item => assignment.obligations.includes(item.target)),
+      // E2.2 (№1801, row 4): a part carries the causes of the questions it actually sends, never of the whole node.
+      const sent = questions.filter(item => assignment.obligations.includes(item.target));
+      packet = json({ ...common, questions: sent,
+        refusals: retry.refusals.filter(item => sent.some(question => question.target === item.target && question.field === item.field)),
         expansion: { ...context, assigned: assignment.obligations,
         connections: connectionContext(frame.frame.upper, assigned) },
         ...(works ? { works: { ...works, assigned: request.previous.length === assignments.length - 1 ? works.nodeAssignments : [] } } : {}) });
