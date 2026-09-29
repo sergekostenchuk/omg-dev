@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { types } from "node:util";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -240,7 +241,9 @@ import type { Graph, Node } from '../src/graph/model.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
-import { writeOmInput } from '../src/om/input.js';
+import { historicalProof, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
+import { storeView } from '../src/storage/store-view.js';
+import { transactionForTests } from '../src/om/atomic-gate.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
@@ -262,7 +265,7 @@ import { readCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
 
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
-import { checkCompletionLedger, readCompletionWorkAt } from '../src/om/model-call.js';
+import { checkCompletionLedger, pendingCallStore, readCompletionWorkAt } from '../src/om/model-call.js';
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-dispatch-')), database = join(root, 'state.sqlite');
@@ -737,6 +740,72 @@ test('E4 cycle assembles all node parts after a source continuation with exact c
   valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
   assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: cycle.record.value.results as Ref[] })).record, assembly.record);
   valueOf(await runModelCycle(f.store, request)); assert.deepEqual(f.store.list().map(reference), snapshot);
+});
+
+test('S1.1 a saved assembly is proved once per operation on its original source: a repeat reuses the proof, the historical path opens no pending view, the current assembly keeps its pending proposal, a re-entry is a cycle', async t => {
+  const f = e4Fixture(t, 'node'), config = f.environment(f.packet.value.fullChars! - 1);
+  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+  const total = packet.value.plan!.assignments.length;
+  f.steps(Array.from({ length: total }, (_, position) => ({ research: e4Node(f, { ...packet,
+    value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>) })));
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  const cycle = valueOf(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.ok(cycle.assembly);
+  const read = (store: Store) => valueOf(readPartAssembly(store, { project: f.project, record: cycle.assembly! }));
+  const assembly = read(f.store);
+  const parts = assembly.record.value.results.map(record => valueOf(readPartResult(f.store, { project: f.project, record })));
+  // Every exact read of the assembly, its proposal, its parts and their packets, through any Store; and every pending view
+  // the producer builds (a frozen overlay that is itself a Store), observed where it is made.
+  const originalGet = Store.prototype.get, reads = new Map<string, number>(), freeze = Object.freeze, views: unknown[] = [];
+  const watched = new Set([cycle.assembly.id, assembly.proposal.id, ...assembly.record.value.results.map(ref => ref.id),
+    ...parts.map(part => part.record.value.request.packet.id)]);
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    if (watched.has(id)) reads.set(id, (reads.get(id) ?? 0) + 1); return originalGet.call(this, id, revision);
+  } as typeof Store.prototype.get;
+  Object.freeze = (<T>(value: T): T => { if (value instanceof Store) views.push(value); return freeze(value); }) as typeof Object.freeze;
+  t.after(() => { Store.prototype.get = originalGet; Object.freeze = freeze; });
+  const count = () => [...reads.values()].reduce((sum, value) => sum + value, 0);
+  withHistoricalReads(() => {
+    const first = read(f.store), cold = count();
+    assert.ok(cold > 0); assert.deepEqual(first, assembly);
+    assert.equal(views.length, 0, 'The historical derivation of a saved assembly proves its frame on the original source, without a pending view');
+    const again = read(f.store);
+    assert.deepEqual(again, first);
+    assert.equal(count(), cold, 'The repeat is served by the proof: nothing of the assembly, its parts, packets or proposal is read again');
+    assert.deepEqual(again.references, first.references);
+  });
+  const outside = count();
+  assert.deepEqual(read(f.store), assembly);
+  assert.ok(count() > outside, 'A new operation proves the saved assembly again');
+  assert.equal(views.length, 0);
+  // The current assembly of the same parts still checks its pending proposal on a pending view, and writes nothing new.
+  const snapshot = f.store.list().map(reference);
+  assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
+  assert.deepEqual(f.store.list().map(reference), snapshot);
+  const fresh = e4Fixture(t, 'node'), freshConfig = fresh.environment(fresh.packet.value.fullChars! - 1);
+  const freshPacket = valueOf(writeQuestionPacket(fresh.store, { ...fresh.packetRequest, environment: reference(freshConfig) })).record;
+  const freshTotal = freshPacket.value.plan!.assignments.length;
+  fresh.steps(Array.from({ length: freshTotal }, (_, position) => ({ research: e4Node(fresh, { ...freshPacket,
+    value: { ...freshPacket.value, plan: { ...freshPacket.value.plan!, position } } } as Revision<QuestionPacketRecord>) })));
+  const before = views.length;
+  const freshCycle = valueOf(await runModelCycle(fresh.store, { ...fresh.request, packet: reference(freshPacket), dispatch: { ...fresh.request.dispatch, config: reference(freshConfig) } }));
+  assert.equal(freshCycle.record.value.terminal, 'assembled');
+  assert.ok(views.length > before, 'A new current assembly still stands on its pending proposal before it is written');
+  // A re-entry into the same active exact key is a cyclic derivation, addressed at the assembly; the outer read completes.
+  let inner: OmResult<unknown> | null = null, probe = true;
+  const view: Store = new Proxy(f.store, { get(target, key) {
+    if (key === 'get') return (id: string, revision?: number) => {
+      if (probe && id === assembly.record.value.results[0]!.id) { probe = false; inner = readPartAssembly(view, { project: f.project, record: cycle.assembly! }); }
+      return target.get(id, revision);
+    };
+    const member = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    assert.deepEqual(read(view).record, assembly.record);
+    assert.ok(inner !== null && !(inner as OmResult<unknown>).ok);
+    const refusal = (inner as OmResult<unknown> & { ok: false }).refusal;
+    assert.deepEqual([refusal.code, refusal.at.target, refusal.at.field, refusal.at.ref], ['model_parts_invalid', cycle.assembly!.id, 'history', cycle.assembly]);
+  });
 });
 
 test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', async t => {
@@ -3380,4 +3449,133 @@ test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', a
       assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
     }
   });
+});
+
+test('S1.1 the basis of a rejected application is collected through the common transparent trace: the rejection reads the same cold, hot inside one operation, and after its nested proofs were warmed before the collector attached', async t => {
+  const f = e4Fixture(t);
+  f.steps([{ research: e4Fact(f), usage }]);
+  const writeMany = f.store.writeMany.bind(f.store);
+  let completed: Revision<unknown> | null = null;
+  f.store.writeMany = ((writes, guards) => {
+    // Another Store completes the attempt while the application is being written: the application is rejected input_stale.
+    if (!completed && writes.some(write => write.kind === 'part-response')) {
+      const other = new Store(f.database);
+      try { completed = valueOf(completeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
+        outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } })); }
+      finally { other.close(); }
+    }
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  const actual = valueOf(await runModelCall(f.store, f.request));
+  f.store.writeMany = writeMany;
+  assert.ok(completed); assert.equal(actual.record.value.status, 'failed'); assert.ok(actual.record.value.om.rejection);
+  const rejection = actual.record.value.om.rejection!;
+  const read = () => valueOf(readModelApplicationRejection(f.store, { project: f.project, record: rejection }));
+  const cold = read();
+  assert.equal(cold.failure.code, 'input_stale');
+  const hot = withHistoricalReads(() => { read(); return read(); });
+  const warmed = withHistoricalReads(() => {
+    valueOf(readQuestionPacket(f.store, { project: f.project, record: f.request.packet }));
+    valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
+    return read();
+  });
+  assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
+  f.restart();
+  assert.deepEqual(read(), cold);
+});
+
+test('S1.1 the collected application basis alone proves a rejection: a dispatch adapter that moved during the application is a stale relevant source only through the transparent collector; the rejection reads the same cold, hot, warmed and after restart', async t => {
+  const f = e4Fixture(t);
+  f.steps([{ research: e4Fact(f), usage }]);
+  const adapter = f.request.dispatch.adapter, writeMany = f.store.writeMany.bind(f.store);
+  let moved: Revision<unknown> | null = null;
+  f.store.writeMany = ((writes, guards) => {
+    // Another Store re-registers the dispatch adapter while the application is being written: only the adapter guard moves.
+    if (!moved && writes.some(write => write.kind === 'part-response')) {
+      const other = new Store(f.database);
+      try {
+        const current = other.get(adapter.id)!;
+        moved = other.write({ id: adapter.id, kind: current.kind, expected: current.revision, value: { ...(current.value as Record<string, unknown>), registered: 'again' } });
+      } finally { other.close(); }
+    }
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  const actual = valueOf(await runModelCall(f.store, f.request));
+  f.store.writeMany = writeMany;
+  assert.ok(moved); assert.equal(actual.record.value.status, 'failed'); assert.ok(actual.record.value.om.rejection);
+  const rejection = actual.record.value.om.rejection!;
+  const read = () => valueOf(readModelApplicationRejection(f.store, { project: f.project, record: rejection }));
+  const cold = read();
+  assert.equal(cold.failure.code, 'input_stale');
+  assert.equal(cold.record.value.completion, null, 'No completion: the adapter guard alone proves the rejected class');
+  assert.ok(cold.record.value.guards.some(ref => canonical(ref) === canonical(adapter)), 'The admitted adapter is a guard of the rejected application');
+  assert.deepEqual(cold.record.value.heads.find(row => row.id === adapter.id)!.head, reference(moved!), 'The observed head is the re-registered adapter');
+  const hot = withHistoricalReads(() => { read(); return read(); });
+  const warmed = withHistoricalReads(() => {
+    valueOf(readQuestionPacket(f.store, { project: f.project, record: f.request.packet }));
+    valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
+    return read();
+  });
+  assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
+  f.restart();
+  assert.deepEqual(read(), cold);
+});
+
+test('S1.1 (№2012) the pending overlay of E4 is frozen only over proved reads: a genuine Store, a write-only guarded view, its own overlay and a preview of the acceptance transaction reuse a proof; a frozen shell on Store.prototype over a traced Store keeps the opaque Proxy and the lower collector sees both readings; pending rows by head and exact next revision, list and history lower, both write forms through the guarded view, no physical write', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-s11-pending-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const row = store.write({ id: 'base', kind: 'fixture', expected: 0, value: { v: 1 } });
+  const pendingWrite: Write = { id: 'new', kind: 'fixture', expected: 0, value: { v: 'n' } };
+  const pendingRow = { id: 'new', kind: 'fixture', revision: 1, hash: hashJson(pendingWrite.value), value: pendingWrite.value };
+  const shell = (target: Store): Store => {
+    const view = Object.create(Store.prototype) as Record<string, unknown>;
+    Object.defineProperties(view, { path: { value: target.path }, databaseId: { get: () => target.databaseId } });
+    for (const name of ['get', 'list', 'history', 'write', 'writeMany'] as const)
+      Object.defineProperty(view, name, { get: () => (target[name] as (...args: never[]) => unknown).bind(target) });
+    return Object.freeze(view) as unknown as Store;
+  };
+  const key = { reader: 'S1.1.pending', project: 'p', ref: reference(row) };
+  const probe = (view: Store) => withHistoricalReads(() => {
+    let bodies = 0;
+    const read = () => historicalProof(view, key, seen => { bodies++; return { base: seen.get(row.id, 1), head: seen.get('new'), exact: seen.get('new', 1), later: seen.get('new', 2) }; },
+      () => assert.fail('The pending read is not cyclic'));
+    const first = read(); assert.deepEqual(read(), first);
+    return { bodies, first };
+  });
+  // Proved reads by construction: the frozen overlay, one body per operation, the pending row by head and exact revision.
+  const guarded = storeView(store, { write: (writes, guards) => store.writeMany(writes, guards) });
+  for (const [label, lower] of [['a genuine Store', store], ['a write-only guarded view', guarded], ['its own overlay', pendingCallStore(store, [])],
+    ['a preview of the acceptance transaction', transactionForTests(store).view]] as const) {
+    const view = pendingCallStore(lower, [pendingWrite]);
+    assert.equal(types.isProxy(view), false, label + ' keeps the frozen overlay'); assert.ok(Object.isFrozen(view)); assert.ok(view instanceof Store);
+    const { bodies, first } = probe(view);
+    assert.equal(bodies, 1, label + ': the proof is reused');
+    assert.deepEqual(first, { base: row, head: pendingRow, exact: pendingRow, later: null });
+  }
+  const view = pendingCallStore(store, [pendingWrite]);
+  assert.deepEqual(view.list().map(item => item.id), ['base'], 'list stays the lower Store\'s'); assert.deepEqual(view.history('new'), [], 'history stays the lower Store\'s');
+  assert.equal(store.get('new'), null, 'No physical write'); assert.equal(view.path, store.path);
+  // The reviewer's shell (№2012-1): not a Proxy, Store.prototype beneath, own reading accessors reaching a traced Store —
+  // the overlay stays opaque and the lower collector sees both readings.
+  let observed = 0;
+  const lower = shell(historicalTrace(store, () => observed++));
+  assert.equal(types.isProxy(lower), false); assert.equal(Object.getPrototypeOf(lower), Store.prototype);
+  const opaque = pendingCallStore(lower, [pendingWrite]);
+  assert.equal(types.isProxy(opaque), true, 'A shell of unknown reads keeps the opaque Proxy');
+  const shellProbe = probe(opaque);
+  assert.equal(shellProbe.bodies, 2); assert.equal(observed, 2, 'The lower collector sees both readings');
+  assert.deepEqual(shellProbe.first, { base: row, head: pendingRow, exact: pendingRow, later: null }, 'The same answers through the opaque branch');
+  // A traced Store and a genuine Store with an own reading override: opaque as well.
+  assert.equal(types.isProxy(pendingCallStore(historicalTrace(store), [pendingWrite])), true);
+  const overridden = new Store(store.path); t.after(() => overridden.close());
+  Object.defineProperty(overridden, 'get', { value: overridden.get.bind(overridden) });
+  assert.equal(types.isProxy(pendingCallStore(overridden, [pendingWrite])), true);
+  // Both write forms through the guarded view beneath reach its policy with their guards; the overlay writes nothing itself.
+  const calls: [number, number][] = [];
+  const policed = storeView(store, { write: (writes, guards) => { calls.push([writes.length, guards.length]); return store.writeMany(writes, guards); } });
+  const over = pendingCallStore(policed, [pendingWrite]);
+  assert.equal(types.isProxy(over), false);
+  over.write({ id: 'w1', kind: 'fixture', expected: 0, value: { v: 'w1' } });
+  over.writeMany([{ id: 'w2', kind: 'fixture', expected: 0, value: { v: 'w2' } }], [reference(row)]);
+  assert.deepEqual(calls, [[1, 0], [1, 1]]); assert.ok(store.get('w1')); assert.ok(store.get('w2')); assert.equal(store.get('new'), null);
 });

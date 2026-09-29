@@ -1,6 +1,7 @@
+import { types } from 'node:util';
 import { EngineError, requireCondition } from '../errors.js';
 import { canonical, hashJson } from '../canonical.js';
-import type { Revision, Store, TransactionGuard, Write } from './store.js';
+import { Store, type Revision, type TransactionGuard, type Write } from './store.js';
 
 /** One storage view over a Store or a nearer view (№1728): the single
  * interception of BOTH write methods. One public call is exactly one policy
@@ -13,7 +14,37 @@ export interface StoreViewPolicy {
   /** The consumer's read overlay (pending rows, substitutions, read
    * observation). Returning undefined falls through to the nearest target. */
   get?(id: string, revision?: number): Revision | null | undefined;
+  /** A capture keeps the opaque Proxy whatever its target (S1.1, №1887-2):
+   * its pending rows are a read projection of the caller's own writes. */
+  capture?: true;
 }
+
+/** The write-only views this helper built over a genuine Store (or over one
+ * another): the one category whose reads are exactly the target's, proved as
+ * such by this module — never by a frozen shell or a caller's claim. */
+const writeOnlyViews = new WeakSet<object>();
+
+/** A genuine Store instance (№2008-1): no Proxy, the Store prototype itself, and no own member but the constructor's
+ * own `path` data property — so every reading member is the prototype's own. A frozen shell built on Store.prototype
+ * with own accessors or methods (reads delegated elsewhere, added before or after), or any object of unknown origin,
+ * is not one: its reads may reach another source beneath it. Neither !isProxy nor Object.isFrozen proves anything. */
+export function genuineStore(candidate: unknown): candidate is Store {
+  if (typeof candidate !== 'object' || candidate === null || types.isProxy(candidate)) return false;
+  if (Object.getPrototypeOf(candidate) !== Store.prototype || Object.getOwnPropertySymbols(candidate).length) return false;
+  const own = Object.getOwnPropertyNames(candidate), path = Object.getOwnPropertyDescriptor(candidate, 'path');
+  return own.length === 1 && own[0] === 'path' && path !== undefined && !path.get && !path.set && typeof path.value === 'string';
+}
+/** The one rule of the fast branches (№2008-1, №2012-2): reads proved to be a genuine Store's — the instance itself, or
+ * a write-only view of this module's own making over such reads. This narrow category is what storeView and the
+ * acceptance's Transaction admit. */
+export const provenReads = (candidate: unknown): candidate is Store => genuineStore(candidate) || writeOnlyViews.has(candidate as object);
+
+/** The frozen source overlays other helpers build over proved reads — the pending overlays of E4 and the previews of
+ * the acceptance's Transaction (№1942) — registered by their own constructors, never by a caller's claim or a flag.
+ * The pending overlay of E4 admits them beneath itself (№2012-2): their reads are the proved reads they were built on. */
+const sourceOverlays = new WeakSet<object>();
+export function registerSourceOverlay(view: Store): void { sourceOverlays.add(view); }
+export const provenSourceReads = (candidate: unknown): candidate is Store => provenReads(candidate) || sourceOverlays.has(candidate as object);
 
 const READ_METHODS = new Set(['get', 'list', 'history']);
 const READ_PROPERTIES = new Set(['path', 'databaseId']);
@@ -40,6 +71,11 @@ export function storeView(target: Store, policy: StoreViewPolicy): Store {
     throw new EngineError('store_view_method_unsupported',
       `The store view does not expose method '${prop}'`, { method: prop });
   };
+  // S1.1 (№1887-2): a view that intercepts ONLY the writes, directly over a plain Store or over such a view of this
+  // module's own making, is not a Proxy: an opaque Proxy makes every proof read through it unrepeatable, so the same
+  // history was derived again on each path. Its region stays separate; the raw Store is never handed out. A capture,
+  // a read projection, a historicalTrace, an arbitrary Proxy or an unknown lower view keep the opaque Proxy below.
+  if (!policy.get && !policy.capture && provenReads(target)) return writeOnlyView(target, policy, unsupported);
   const view: Store = new Proxy(target, {
     get(target, prop, _receiver) {
       if (typeof prop !== 'string') return Reflect.get(target, prop, target);
@@ -72,6 +108,40 @@ export function storeView(target: Store, policy: StoreViewPolicy): Store {
   // captureView refuses before any accumulation. The raw Store is never
   // unwrapped and no nested-transaction machinery is introduced; a capture over
   // a guard of a plain Store stays lawful because that guard is untainted.
+  if (captureViews.has(target)) captureViews.add(view);
+  return view;
+}
+
+/** The write-only facade: an ordinary frozen object whose own surface is the declared one (bound reads, the policy's
+ * writes, the forwarded read properties) and whose prototype chain ends in a refusing gate before Store.prototype.
+ * The gate answers every undeclared member exactly as the Proxy above does — resolved against the NEAREST TARGET at
+ * the moment of access (№2008-2): a method of the target, own or inherited, added before or after the view, is a
+ * refusing function (typeof stays 'function'); an accessor of the target refuses before its getter runs; an absent
+ * property reads undefined — while `instanceof Store` holds through the gate's prototype. Nothing about the target's
+ * behaviour is assumed: its reads run with the target as receiver, exactly as through the Proxy. */
+function writeOnlyView(target: Store, policy: StoreViewPolicy, unsupported: (prop: string) => () => never): Store {
+  const gate = new Proxy(Object.create(Store.prototype) as object, {
+    get(_proto, prop, _receiver) {
+      if (typeof prop !== 'string') return Reflect.get(target, prop, target);
+      const descriptor = descriptorOf(target, prop);
+      if (descriptor && typeof descriptor.get === 'function')
+        throw new EngineError('store_view_method_unsupported',
+          `The store view does not expose accessor '${prop}'`, { method: prop });
+      if (descriptor && typeof descriptor.value === 'function') return unsupported(prop);
+      const member: unknown = Reflect.get(target, prop, target);
+      return typeof member === 'function' ? unsupported(prop) : member;
+    },
+  });
+  const members = Object.create(gate) as Record<string, unknown>;
+  Object.defineProperty(members, 'write', { value: <T,>(input: Write): Revision<T> => policy.write([input], [])[0] as Revision<T> });
+  Object.defineProperty(members, 'writeMany', { value: <T,>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] =>
+    policy.write(inputs, guards) as Revision<T>[] });
+  for (const name of READ_METHODS)
+    Object.defineProperty(members, name, { value: (Reflect.get(target, name, target) as (...args: never[]) => unknown).bind(target) });
+  for (const name of READ_PROPERTIES) Object.defineProperty(members, name, { get: () => Reflect.get(target, name, target) });
+  Object.freeze(members);
+  const view = Object.freeze(Object.create(members)) as Store;
+  writeOnlyViews.add(view);
   if (captureViews.has(target)) captureViews.add(view);
   return view;
 }
@@ -136,7 +206,7 @@ export function captureView(target: Store, hooks: CaptureHooks = {}): { view: St
     }
     : undefined);
   const policy: StoreViewPolicy = {
-    ...(overlay ? { get: overlay } : {}),
+    ...(overlay ? { get: overlay } : {}), capture: true,
     write(inputs, callerGuards) {
       callerGuards.forEach(validateGuardForm);
       // Validate the whole batch before publishing any element (№1728-2).

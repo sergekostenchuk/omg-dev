@@ -6,6 +6,7 @@ import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type 
 import { readRecord, writeGuarded } from "./refs.js";
 import type { FrameRequest } from "./frame-obligations.js";
 import type { ProposalRequest } from "./frame-proposals.js";
+import type { historicalProof } from "./input.js";
 
 /**
  * The project's journal of gate refusals. A gate that refuses writes a record of its own; this unit reads that record
@@ -262,6 +263,28 @@ export function registerAnswersSourceReader(reader: AnswersSourceReader): void {
       { unit: UNIT, target: REFUSAL_JOURNAL_KIND, field: "reader" });
   }
   answersSourceReader = reader;
+}
+
+/**
+ * S1.1 (№1773): the executor of an exact historical proof — the common historicalProof of input.ts, handed in by
+ * question-packet.ts when it loads. The journal imports nothing of input.ts at runtime: that import closes an ESM
+ * cycle (input → product/engine → model-call → answers-gate → this module) and reaches `answersSourceReader` before
+ * this module has evaluated. The executor is only kept here — never called at registration, no Store is opened and
+ * no reader of G4b is registered — and without one readJournalAt performs the same complete derivation directly:
+ * the value and every refusal are the same, only the cost of a repeat differs.
+ */
+export type JournalProofExecutor = typeof historicalProof;
+const JOURNAL_PROOF_READER = "A2.readJournalAt";
+let journalProofExecutor: JournalProofExecutor | null = null;
+
+export function registerJournalProofExecutor(executor: JournalProofExecutor): void {
+  requireCondition(typeof executor === "function", "journal_request_invalid", "The executor of a historical journal proof is a function");
+  if (journalProofExecutor === executor) return;
+  if (journalProofExecutor !== null) {
+    throw new EngineError("journal_proof_conflict", "An executor of historical journal proofs is registered already, and another one does not replace it",
+      { unit: UNIT, target: REFUSAL_JOURNAL_KIND, field: "proof" });
+  }
+  journalProofExecutor = executor;
 }
 
 /** The marks of G4b on a refusal record at its reference. The value is data and may be malformed: it is only looked at. */
@@ -682,10 +705,20 @@ export function readJournalAt(store: Store, project: string, ref: Ref): OmResult
   catch (error) { if (error instanceof EngineError && error.code === "journal_request_invalid") invalid("project"); throw error; }
   if (!isRef(ref)) invalid("reference");
   const target = journalId(project);
-  const read = readRecord<RefusalJournal>(store, ref, { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
-  if (!read.ok) return read;
-  const broken = checkJournal(store, read.value.value, project, { target, ref });
-  return broken ?? read;
+  // S1.1 (№1773): ONE complete derivation — the record and the whole checkJournal — on the source it is given, so a
+  // hot proof replays every transitive read, G4b readers included. The key is this reader, the checked project and
+  // the exact {id, revision, hash}; the refusal context keeps the reference as it was received. Only a successful
+  // result is reused, a refusal or a fault runs again; a repeated entry into the same active key is a cyclic proof.
+  const derive = (source: Store): OmResult<Sealed<Revision<RefusalJournal>>> => {
+    const read = readRecord<RefusalJournal>(source, ref, { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
+    if (!read.ok) return read;
+    const broken = checkJournal(source, read.value.value, project, { target, ref });
+    return broken ?? read;
+  };
+  if (journalProofExecutor === null) return derive(store);
+  const exact: Ref = { id: ref.id, revision: ref.revision, hash: ref.hash };
+  return journalProofExecutor(store, { reader: JOURNAL_PROOF_READER, project, ref: exact }, derive,
+    () => problem("journal_invalid", "A historical journal proof is cyclic: this exact revision is derived through itself", { target, ref: exact }, "derivation"));
 }
 
 function currentJournal(store: Store, project: string, target: string): OmResult<Sealed<Revision<RefusalJournal>>> | null {

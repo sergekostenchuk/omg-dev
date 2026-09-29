@@ -8,7 +8,7 @@ import { gapId, prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, typ
 import { readAcceptedFrame, type AcceptedFrameRequest } from './frame-accept.js';
 import { readCandidate } from './frame-candidate.js';
 import { prepareFrame, readFrame, type FrameObligation, type PreparedFrame, type FrameRequest } from './frame-obligations.js';
-import { readSeries, prepareSeriesLineAdmission, REPAIR_SERIES_KIND, type AttemptGoal, type RepairSeries } from './series.js';
+import { readAnySeriesAt, prepareSeriesLineAdmission, REPAIR_SERIES_KIND, type AttemptGoal, type RepairSeries } from './series.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import type { AcceptanceContext, Confirmation } from './achievements.js';
@@ -262,16 +262,14 @@ function seriesGoal(store: Store, project: string, line: GapLine, link: GapLineA
   if (link === null) return null;
   const exact = take(readRecord<RepairSeries>(store, link.series, { unit: 'F5.2', target: line.id,
     idPrefix: `repair-series:${project}:`, kind: REPAIR_SERIES_KIND }));
-  // A3 remains the sole validator of its history. Only the requested historical head is substituted.
-  const historical = new Proxy(store, { get(target, property) {
-    if (property === 'get') return (id: string, revision?: number) => id === link.series.id && revision === undefined ? exact : target.get(id, revision);
-    const value: unknown = Reflect.get(target, property, target);
-    return typeof value === 'function' ? value.bind(target) : value;
-  } });
   if (!object(exact.value) || !text(exact.value.block) || !positive(exact.value.line))
     fail('closure_unconfirmed', line.id, 'attempt', 'The named attempt needs a readable series');
-  const checked = take(readSeries(historical, { project, block: exact.value.block, line: exact.value.line }));
+  // A3 remains the sole validator of its history: the exact saved revision is checked by its own exact reader (S1.1,
+  // №1878), never through a view substituting the head — such a view proved nothing again on every path to this line.
+  const checked = take(readAnySeriesAt(store, project, link.series)) as Revision<RepairSeries>;
   if (!same(reference(checked), link.series)) fail('closure_unconfirmed', line.id, 'attempt.series', 'The attempt must belong to this exact series');
+  if ('owner' in checked.value || checked.value.block !== exact.value.block || checked.value.line !== exact.value.line)
+    fail('closure_unconfirmed', line.id, 'attempt', 'The named attempt needs a readable series');
   const attempt = checked.value.attempts.find(item => item.ordinal === link.attempt);
   if (!attempt || attempt.outcome !== null || !attempt.goal.questions.includes(gapLineKey(project, line.target, line.field))
     || attempt.goal.result !== gapLineExpectedResult(project, line.target, line.field))

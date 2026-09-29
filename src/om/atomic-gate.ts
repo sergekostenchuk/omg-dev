@@ -15,6 +15,7 @@ import { safeRelativePath } from '../graph/topology.js';
 import { validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
+import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity } from './capacity.js';
 import { readDeliveries } from './deliveries.js';
 import { prepareSettleCandidate, readAcceptedFrame, readRejectedCandidate, type AcceptedFrameRequest } from './frame-accept.js';
@@ -95,17 +96,43 @@ class Transaction {
   constructor(readonly store: Store) {
     const row = (write: Write): Revision<unknown> => ({ id: write.id, kind: write.kind, revision: write.expected + 1,
       hash: hashJson(write.value), value: write.value });
+    const get = (id: string, revision?: number) => {
+      const pending = this.writes.get(id);
+      return pending && (revision === undefined || revision === pending.expected + 1) ? row(pending) : store.get(id, revision);
+    };
+    const list = (kind?: string) => {
+      const records = new Map(store.list<unknown>(kind).map(record => [record.id, record]));
+      for (const write of this.writes.values()) { records.delete(write.id); if (!kind || write.kind === kind) records.set(write.id, row(write)); }
+      return [...records.values()].sort((a, b) => order(a.id, b.id));
+    };
+    const history = (id: string) => { const pending = this.writes.get(id); return [...store.history(id), ...(pending ? [row(pending)] : [])]; };
+    if (provenReads(store)) {
+      // S1.1 (№1942-2, №2008-1): over reads proved to be a genuine Store's (the instance, or a write-only view of the
+      // storage helper's own making) the preview is a frozen source view of its own, no Proxy — the common cache keeps
+      // each proof of the acceptance once per transaction; the region is the transaction's, never the Store's or another
+      // transaction's. The reading members live on the prototype, so an outer historicalTrace may wrap the view lawfully.
+      const methods = Object.create(Store.prototype) as Store;
+      const view = Object.create(methods) as Store;
+      Object.defineProperty(view, 'path', { value: store.path });
+      for (const name of Object.getOwnPropertyNames(Store.prototype)) {
+        if (name === 'constructor') continue;
+        const descriptor = Object.getOwnPropertyDescriptor(Store.prototype, name)!;
+        if (descriptor.get) { Object.defineProperty(methods, name, { get: () => Reflect.get(store, name, store) }); continue; }
+        const member: unknown = Reflect.get(store, name, store);
+        if (typeof member === 'function') Object.defineProperty(methods, name,
+          { value: name === 'get' ? get : name === 'list' ? list : name === 'history' ? history : member.bind(store) });
+      }
+      Object.freeze(methods);
+      this.view = Object.freeze(view) as Store;
+      registerSourceOverlay(this.view);
+      return;
+    }
+    // Over a traced Store, a caller's Proxy, a frozen shell with its own reading members or any unknown lower view the
+    // preview stays opaque: their reads may reach another source beneath it.
     this.view = new Proxy(store, { get: (target, key) => {
-      if (key === 'get') return (id: string, revision?: number) => {
-        const pending = this.writes.get(id);
-        return pending && (revision === undefined || revision === pending.expected + 1) ? row(pending) : target.get(id, revision);
-      };
-      if (key === 'list') return (kind?: string) => {
-        const records = new Map(target.list<unknown>(kind).map(record => [record.id, record]));
-        for (const write of this.writes.values()) { records.delete(write.id); if (!kind || write.kind === kind) records.set(write.id, row(write)); }
-        return [...records.values()].sort((a, b) => order(a.id, b.id));
-      };
-      if (key === 'history') return (id: string) => { const pending = this.writes.get(id); return [...target.history(id), ...(pending ? [row(pending)] : [])]; };
+      if (key === 'get') return get;
+      if (key === 'list') return list;
+      if (key === 'history') return history;
       const member: unknown = Reflect.get(target, key, target);
       return typeof member === 'function' ? member.bind(target) : member;
     } });
@@ -114,6 +141,13 @@ class Transaction {
     for (const write of value.writes) {
       const old = this.writes.get(write.id);
       if (old && !same(old, write)) fail('atomic_gate_transaction_conflict', write.id, 'writes', 'One acceptance cannot write two different versions of a source');
+      if (!old) {
+        // №1942-3: a new pending id is published only while the lower Store still stands where the write expects it — its
+        // pending exact revision then never existed below, so no proof of this region could have read another body under it.
+        const head = this.store.get(write.id);
+        if ((head?.revision ?? 0) !== write.expected)
+          fail('atomic_gate_transaction_conflict', write.id, 'writes', 'A source moved beneath the acceptance before its pending revision was published');
+      }
       this.writes.set(write.id, copy(write));
     }
     this.guards.push(...value.guards);
@@ -125,6 +159,9 @@ class Transaction {
     }));
   }
 }
+
+/** Test access only (№1942-4): the preview transaction of one acceptance, for the regressions of its view; not a product API. */
+export const transactionForTests = (store: Store): { view: Store; writes: Map<string, Write>; add(value: { writes: readonly Write[]; guards: readonly Ref[] }): void } => new Transaction(store);
 
 function modelSources(store: Store, project: string, results: readonly WorkProposalSource[]) {
   const outputs = results.map(source => historicalRead(store, { reader: `G5.model-source.${source.kind}`, project, ref: source.record },

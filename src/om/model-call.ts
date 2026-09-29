@@ -1,7 +1,6 @@
 import type { AnswerGround } from './accepted-answer.js';
 import { readAcceptedFrameLayer, readLayerAcceptance, readLayerEnvelope, readUnacceptedLayer } from './layer-basis.js';
 import { readCompletionCloseAt, mechanismAttemptResults, prepareFinishClose } from './repeat-gate.js';
-import { isProxy } from 'node:util/types';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -10,7 +9,7 @@ import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readMo
   prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
-import { storeView } from '../storage/store-view.js';
+import { provenSourceReads, registerSourceOverlay, storeView } from '../storage/store-view.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
 import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
@@ -26,7 +25,7 @@ import { readPacketResponse, readPartResult, readQuestionPacket, writeQuestionPa
 import { readRoutes } from './routes.js';
 import { readFrameProposals, prepareFrameProposals, type LayerProposal } from './frame-proposals.js';
 import { WORKS_FRAME_CONTRACT, readFrameBasis, prepareFrame, type FrameRequest } from './frame-obligations.js';
-import { withHistoricalReads, historicalRead } from './input.js';
+import { withHistoricalReads, historicalRead, historicalTrace } from './input.js';
 import { prepareAssessmentAdmission, readAssessmentIntentAt } from './assessment.js';
 
 export const MODEL_CALL_CODES = Object.freeze([
@@ -314,7 +313,14 @@ function requireAssembly(store: Store, value: unknown): asserts value is PartAss
   if (!(store instanceof Store) || !object(value) || !text(value.project) || !Array.isArray(value.results)
     || !value.results.length || !value.results.every(isRef) || !exactKeys(value, ['project', 'results'])) invalid('parts');
 }
-function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boolean) {
+/**
+ * The one derivation of a node assembly from its exact part results. `current` prepares a new assembly (a pending
+ * proposal, its frame preparation and the final guards); `saved` names the stored proposal of an already saved assembly
+ * (S1.1, №1863): it is read at that exact reference, compared with the derivation, and the frame is proved on the
+ * original source — never on a fresh view that would derive the same history again on every path to the assembly.
+ * Without either (the check of a failed assembly whose proposal was never written) the pending view stays.
+ */
+function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boolean, saved: Ref | null = null) {
   const parts = request.results.map(record => take(readPartResult(store, { project: request.project, record })));
   const packets = parts.map(part => take(readQuestionPacket(store, { project: request.project, record: part.record.value.request.packet })));
   const first = packets[0]!, last = packets.at(-1)!, plan = last.value.plan;
@@ -377,8 +383,14 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   const source = proposalValue.level === 2 ? routes.record.value.request.gaps.sources.operations : routes.record.value.request.gaps.sources.works;
   if ('state' in source) fail('model_parts_invalid', record.id, 'frame', 'The assigned frame must have its accepted upper source');
   const write: Write = { id: proposal.id, kind: proposal.kind, expected: 0, value: proposal.value };
-  const view = pendingCallStore(store, [write]);
   const proposalRequest = { frame: source.frame, proposals: [...source.proposals, reference(proposal)] };
+  let view = store;
+  if (saved) {
+    if (!same(saved, reference(proposal)))
+      fail('model_parts_invalid', record.id, 'proposal', 'A saved assembly names exactly the proposal its parts assemble', saved);
+    const standing = take(readRecord<LayerProposal>(store, saved, { unit: 'E4', target: record.id, id: proposal.id, kind: 'layer-proposal' }));
+    if (!same(standing, proposal)) fail('model_parts_invalid', record.id, 'proposal', 'The stored proposal must equal the verified assembly', saved);
+  } else view = pendingCallStore(store, [write]);
   const historical = take(readFrameProposals(view, proposalRequest));
   const remaining = new Set(historical.result.open.map(item => item.id));
   if (allAssigned.some(id => remaining.has(id))) fail('model_parts_invalid', record.id, 'coverage', 'The assembled proposal leaves an assigned obligation open');
@@ -395,19 +407,22 @@ export function readPartAssembly(store: Store, request: { project: string; recor
 }>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('assembly.read');
-  return result(() => {
+  // S1.1 (№1863): one exact historical proof of the WHOLE derivation — the saved assembly, its composition, the assembled
+  // proposal at its exact reference and both final comparisons — shared inside an operation on the source it is given;
+  // a repeat is served by the proof, and a repeated entry into the same active key is a cyclic derivation.
+  return result(() => historicalRead(store, { reader: 'E4.part-assembly', project: request.project, ref: request.record }, () => {
     const saved = take(readRecord<PartAssemblyRecord>(store, request.record, { unit: 'E4', target: request.record.id,
       idPrefix: `om-part-assembly:${request.project}:`, kind: PART_ASSEMBLY_KIND }));
     if (!object(saved.value) || saved.value.project !== request.project || !Array.isArray(saved.value.results) || !saved.value.results.length
       || !saved.value.results.every(isRef) || !isRef(saved.value.proposal))
       fail('model_parts_invalid', saved.id, 'record', 'An assembly retains every exact part result');
-    const derived = deriveAssembly(store, { project: request.project, results: saved.value.results as Ref[] }, false);
+    const derived = deriveAssembly(store, { project: request.project, results: saved.value.results as Ref[] }, false, saved.value.proposal as Ref);
     const proposal = take(readRecord<LayerProposal>(store, saved.value.proposal, { unit: 'E4', target: saved.id,
       id: derived.proposal.id, kind: 'layer-proposal' }));
     if (!same(saved, derived.record) || !same(proposal, derived.proposal))
       fail('model_parts_invalid', saved.id, 'record', 'The assembly and original proposal must match the verified part chain');
     return { record: derived.record, proposal: derived.proposal, references: derived.references };
-  });
+  }, () => fail('model_parts_invalid', request.record.id, 'history', 'An assembly cannot derive through itself', request.record)));
 }
 export function assembleModelParts(store: Store, request: PartAssemblyRequest): OmResult<Sealed<{
   record: Revision<PartAssemblyRecord>; proposal: Revision<LayerProposal>; references: Ref[];
@@ -764,9 +779,11 @@ export function pendingCallStore(store: Store, writes: readonly Write[]): Store 
     const value = pending.get(id);
     return value && (revision === undefined || revision === value.revision) ? value : store.get(id, revision);
   };
-  // A frozen locally constructed overlay over a real Store is an immutable source view.
-  // Keep opaque caller proxies opaque: their exact reads may intentionally change beneath a test or transaction.
-  if (!isProxy(store)) {
+  // A frozen locally constructed overlay over proved reads is an immutable source view (№2012-2): a genuine Store, a
+  // write-only guarded view of the storage helper, an overlay of this function or a preview of the acceptance's
+  // Transaction — each registered by its own constructor. A caller's Proxy, a traced Store, a frozen shell with its own
+  // reading members or any unknown lower view keeps the opaque Proxy: their reads may reach another source beneath.
+  if (provenSourceReads(store)) {
     const methods = Object.create(Store.prototype) as Store;
     const view = Object.create(methods) as Store;
     Object.defineProperty(view, 'path', { value: store.path });
@@ -781,7 +798,9 @@ export function pendingCallStore(store: Store, writes: readonly Write[]): Store 
       if (typeof member === 'function') Object.defineProperty(methods, name, { value: name === 'get' ? get : member.bind(store) });
     }
     Object.freeze(methods);
-    return Object.freeze(view) as Store;
+    const overlay = Object.freeze(view) as Store;
+    registerSourceOverlay(overlay);
+    return overlay;
   }
   return new Proxy(store, { get(target, key) {
     if (key === 'get') return get;
@@ -1764,12 +1783,9 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
  * This deliberately observes their reads rather than keeping another, inevitably incomplete admission list. */
 function historicalApplicationBasis(store: Store, request: ModelCallRequest, call: Ref, transport: AdapterResult): Ref[] {
   const seen: Ref[] = [];
-  const observed = new Proxy(store, { get(target, key) {
-    if (key === 'get') return (id: string, revision?: number) => {
-      const value = target.get(id, revision); if (value) seen.push(reference(value)); return value;
-    };
-    const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
+  // S1.1 (№1887-5): the common transparent collector, not an opaque Proxy of its own — the readers' proofs stay shared
+  // with the operation and a hot proof replays the same references to this collector. Only gets count, as before.
+  const observed = historicalTrace(store, (ref, _head, method) => { if (method === 'get') seen.push(ref); });
   modelAssignment(observed, request);
   take(readCall(observed, request.project, call));
   if (transport.kind === 'answered') checkAnswerForm(observed, { project: request.project, packet: request.packet, raw: transport.raw });

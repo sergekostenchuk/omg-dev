@@ -5,11 +5,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { types } from 'node:util';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
-import { captureView, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { captureView, genuineStore, provenReads, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { Discovery, type Question } from '../src/discovery/discovery.js';
@@ -17,7 +18,7 @@ import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { Selector } from '../src/evidence/evidence.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { writeOmInput } from '../src/om/input.js';
+import { historicalProof, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
@@ -31,7 +32,7 @@ import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, prepareAnswerInval
   type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
 import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   type QuestionTaskRequest, type QuestionPacketRequest } from '../src/om/question-packet.js';
-import { runModelCall, type ModelCallRequest } from '../src/om/model-call.js';
+import { pendingCallStore, runModelCall, type ModelCallRequest } from '../src/om/model-call.js';
 import { readLegacyOperation, recoverLegacyOperation } from '../src/product/preparation-run.js';
 import { acquire, release } from '../src/execution/lock.js';
 import type { ExecutionLock } from '../src/execution/model.js';
@@ -43,6 +44,7 @@ import { preparedField } from './preparation-fixture.js';
 import { executionFixture } from './execution-fixture.js';
 
 const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
+const isProxyObject = (value: unknown): boolean => types.isProxy(value);
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-store-view-'));
@@ -979,4 +981,128 @@ test('X19 two recoveries that read one basis before acquire cannot both acquire:
   const released = await recoverLegacyOperation(f.engine, { project: 'p', operation: reference(lease), token: lease.value.token });
   assert.equal(released.value.state, 'released');
   assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'parked');
+});
+
+// ── S1.1 (№1887): the write-only view over a plain Store is a frozen facade, not a Proxy ──
+
+test('S1.1 a write-only view over a plain Store is no Proxy: one history proves once per operation through it, other views keep their own proofs, a record that appears re-proves, a collector sees the same references cold, hot and warmed, a view over a lower collector stays correct uncached, both write forms from pendingCallStore reach the policy, and the refusals of 12/X4 hold', t => {
+  const { store } = fixture(t);
+  const { view, passes } = guardView(store, []);
+  assert.equal(isProxyObject(view), false); assert.ok(view instanceof Store); assert.ok(Object.isFrozen(view));
+  const other = guardView(store, []).view, capture = captureView(store, {}).view, nested = guardView(view as Store, []).view;
+  assert.equal(isProxyObject(other), false); assert.equal(isProxyObject(nested), false, 'a write-only view over a write-only view of this module stays a facade');
+  assert.equal(isProxyObject(capture), true, 'a capture keeps its opaque Proxy');
+  store.write(w('base'));
+  let runs = 0;
+  const key = { reader: 'S1.1.store-view', project: 'garden', ref: reference(store.get('base')!) };
+  const prove = (source: Store) => historicalProof(source, key, s => { runs++; return { base: reference(s.get('base')!), absent: s.get('absent') === null }; },
+    () => { throw new Error('cyclic'); });
+  withHistoricalReads(() => {
+    const first = prove(view); assert.equal(runs, 1); assert.deepEqual(first, { base: key.ref, absent: true });
+    assert.deepEqual(prove(view), first); assert.equal(runs, 1, 'one full derivation per key inside the operation through the write-only view');
+    prove(other); assert.equal(runs, 2, 'another write-only view over the same Store keeps its own proof');
+    prove(nested); assert.equal(runs, 3, 'a view over a view keeps its own region');
+    prove(capture); assert.equal(runs, 4, 'a capture keeps its own proof');
+    // The absent record appears: the kept proof's footprint moved, so the next read through the view derives again.
+    store.write(w('absent'));
+    assert.deepEqual(prove(view), { base: key.ref, absent: false }); assert.equal(runs, 5);
+    assert.equal(prove(view).absent, false); assert.equal(runs, 5);
+  });
+  withHistoricalReads(() => { prove(view); assert.equal(runs, 6, 'a new operation proves again'); });
+  // The collector attached above the view: the same references cold, hot, and when the proof was warmed before it attached.
+  const cold: Ref[] = [], hot: Ref[] = [], warmed: Ref[] = [];
+  withHistoricalReads(() => {
+    prove(historicalTrace(view, ref => cold.push(ref)));
+    prove(historicalTrace(view, ref => hot.push(ref)));
+  });
+  withHistoricalReads(() => { prove(view); prove(historicalTrace(view, ref => warmed.push(ref))); });
+  assert.equal(cold.length, 2); assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
+  // A view over a lower collector keeps the opaque Proxy: the collector below sees every read, nothing is served hot past it.
+  const below: Ref[] = [];
+  const overCollector = guardView(historicalTrace(store, ref => below.push(ref)), []).view;
+  assert.equal(isProxyObject(overCollector), true);
+  withHistoricalReads(() => { const before = runs; prove(overCollector); prove(overCollector); assert.equal(runs, before + 2); });
+  assert.equal(below.length, 4, 'the lower collector observed both derivations');
+  // Both write forms from pendingCallStore over the facade reach the policy; the pending row reads through the overlay.
+  const pending = pendingCallStore(view, [w('pending-row')]);
+  assert.equal(isProxyObject(pending), false); assert.equal(pending.get('pending-row')!.revision, 1); assert.equal(store.get('pending-row'), null);
+  const before = passes.length;
+  pending.write(w('via-write')); pending.writeMany([w('via-many')], []);
+  assert.equal(passes.length, before + 2); assert.ok(store.get('via-write') && store.get('via-many'));
+  // The refusals of 12/X4 on the facade: refused members and later additions, declared members readable.
+  assert.equal(typeof view.close, 'function'); assert.throws(() => view.close(), code('store_view_method_unsupported'));
+  assert.throws(() => new (view.constructor as new (p: string) => Store)('x'), code('store_view_method_unsupported'));
+  (Store.prototype as unknown as Record<string, unknown>)['laterMethod'] = function () { return 1; };
+  Object.defineProperty(Store.prototype, 'laterAccessor', { configurable: true, get() { return 1; } });
+  try {
+    assert.equal(typeof (view as unknown as Record<string, unknown>)['laterMethod'], 'function');
+    assert.throws(() => (view as unknown as { laterMethod: () => void }).laterMethod(), code('store_view_method_unsupported'));
+    assert.throws(() => (view as unknown as Record<string, unknown>)['laterAccessor'], code('store_view_method_unsupported'));
+  } finally {
+    delete (Store.prototype as unknown as Record<string, unknown>)['laterMethod'];
+    delete (Store.prototype as unknown as Record<string, unknown>)['laterAccessor'];
+  }
+  assert.equal(view.path, store.path); assert.equal(view.databaseId, store.databaseId);
+  assert.equal((view as unknown as Record<string, unknown>)['neverDeclared'], undefined);
+  store.write(w('still-open')); assert.ok(store.get('still-open'));
+});
+
+test('S1.1 (№2008) the fast branch needs proved reads and the facade resolves unknown members against the nearest target: a frozen shell on Store.prototype with own reading accessors over a traced Store keeps the opaque Proxy (two bodies, two observations), an own reading override forbids the facade, own and later members of the instance refuse before running', t => {
+  const { store } = fixture(t);
+  const row = store.write(w('base'));
+  const shell = (target: Store): Store => {
+    const view = Object.create(Store.prototype) as Record<string, unknown>;
+    Object.defineProperties(view, { path: { value: target.path }, databaseId: { get: () => target.databaseId } });
+    for (const name of ['get', 'list', 'history', 'write', 'writeMany'] as const)
+      Object.defineProperty(view, name, { get: () => (target[name] as (...args: never[]) => unknown).bind(target) });
+    return Object.freeze(view) as unknown as Store;
+  };
+  const policy = (target: Store): StoreViewPolicy => ({ write: (writes, guards) => target.writeMany(writes, guards) });
+  const key = { reader: 'S1.1.shell', project: 'garden', ref: reference(row) };
+  const probe = (view: Store) => withHistoricalReads(() => {
+    let bodies = 0;
+    const read = () => historicalProof(view, key, seen => { bodies++; return seen.get(row.id, 1); }, () => { throw new Error('cyclic'); });
+    assert.deepEqual(read(), row); assert.deepEqual(read(), row);
+    return bodies;
+  });
+  // The rule itself: a genuine instance (exactly its own `path`), never a shell — with or without own members.
+  assert.equal(genuineStore(store), true); assert.equal(provenReads(store), true);
+  assert.equal(genuineStore(Object.create(Store.prototype)), false, 'A bare object on Store.prototype is no Store');
+  assert.equal(genuineStore(shell(store)), false); assert.equal(provenReads(shell(store)), false);
+  assert.equal(genuineStore(historicalTrace(store)), false);
+  const writeOnly = storeView(store, policy(store));
+  assert.equal(isProxyObject(writeOnly), false); assert.equal(genuineStore(writeOnly), false); assert.equal(provenReads(writeOnly), true, 'A write-only view of this module is proved reads');
+  assert.equal(provenReads(captureView(store, {}).view), false);
+  // The reviewer's shell (№2008-1): not a Proxy, Store.prototype beneath, own reading accessors reaching a traced Store.
+  let observed = 0;
+  const lower = shell(historicalTrace(store, () => observed++));
+  assert.equal(isProxyObject(lower), false); assert.equal(Object.getPrototypeOf(lower), Store.prototype);
+  const opaque = storeView(lower, policy(lower));
+  assert.equal(isProxyObject(opaque), true, 'A shell of unknown reads keeps the opaque Proxy');
+  assert.equal(probe(opaque), 2); assert.equal(observed, 2, 'The lower collector sees both readings');
+  // A genuine Store carrying an own reading override is not proved any more: the opaque Proxy again.
+  const overridden = new Store(store.path); t.after(() => overridden.close());
+  Object.defineProperty(overridden, 'get', { value: overridden.get.bind(overridden) });
+  assert.equal(genuineStore(overridden), false); assert.equal(isProxyObject(storeView(overridden, policy(overridden))), true);
+  // An own member added before the view: no facade; the Proxy refuses it as before.
+  const early = new Store(store.path); t.after(() => early.close());
+  (early as unknown as Record<string, unknown>)['earlyOwn'] = () => 'ran';
+  const earlyView = storeView(early, policy(early)) as unknown as Record<string, () => unknown>;
+  assert.equal(isProxyObject(earlyView), true); assert.equal(typeof earlyView['earlyOwn'], 'function');
+  assert.throws(() => earlyView['earlyOwn']!(), (error: unknown) => error instanceof EngineError && error.code === 'store_view_method_unsupported');
+  // №2008-2: own and later members of the instance beneath the facade — resolved against the nearest target at access,
+  // the method is a refusing function (typeof stays 'function'), the accessor refuses before its getter runs.
+  let touched = 0;
+  const facade = writeOnly as unknown as Record<string, unknown>;
+  (store as unknown as Record<string, unknown>)['laterOwn'] = () => { touched++; return 'ran'; };
+  Object.defineProperty(store, 'ownAccessor', { get: () => { touched++; return 1; }, configurable: true });
+  assert.equal(typeof facade['laterOwn'], 'function');
+  assert.throws(() => (facade['laterOwn'] as () => unknown)(), (error: unknown) => error instanceof EngineError && error.code === 'store_view_method_unsupported');
+  assert.throws(() => facade['ownAccessor'], (error: unknown) => error instanceof EngineError && error.code === 'store_view_method_unsupported');
+  assert.equal(touched, 0, 'Neither the own method nor the own getter ran');
+  assert.equal(facade['absentMember'], undefined);
+  assert.equal(typeof facade['snapshot'], 'function'); assert.throws(() => (facade['snapshot'] as () => unknown)(), (error: unknown) => error instanceof EngineError && error.code === 'store_view_method_unsupported');
+  assert.ok(writeOnly instanceof Store); assert.deepEqual(writeOnly.get('base'), row);
+  // The proved fast branch is unchanged: one body per operation through the facade, and the same through a facade over it.
+  assert.equal(probe(writeOnly), 1); assert.equal(probe(storeView(writeOnly, policy(writeOnly))), 1);
 });

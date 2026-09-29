@@ -22,10 +22,10 @@ import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, 
 import { prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type RepairSeries, type AnyRepairSeries } from './series.js';
-import { readJournal, journalId, type RefusalJournal } from './refusal-journal.js';
+import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
-import { historicalRead, withHistoricalReads } from './input.js';
+import { historicalRead, historicalProof, withHistoricalReads } from './input.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareOmObligations, readOmObligations, type ObligationRequest, type OmObligations, type OmObligationHandoff } from './obligations.js';
@@ -188,14 +188,6 @@ function head(store: Store, ref: Ref) {
   const found = store.get(ref.id);
   if (!found || !same(reference(found), ref)) fail('input_stale', ref.id, 'head', 'A packet source changed before this preparation');
 }
-function pinned(store: Store, record: Revision<unknown>): Store {
-  return new Proxy(store, { get(target, key) {
-    if (key === 'get') return (id: string, revision?: number) => id === record.id
-      && (revision === undefined || revision === record.revision) ? record : target.get(id, revision);
-    const member: unknown = Reflect.get(target, key, target);
-    return typeof member === 'function' ? member.bind(target) : member;
-  } });
-}
 function previousRefusals(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, gaps: GapRecords, current: boolean,
   savedJournal: Ref | null | undefined, guards: TransactionGuard[], references: Ref[], contract: QuestionPacketRecord['packetContract']) {
   if (!request.attempt) fail('packet_attempt_invalid', batch.id, 'attempt', 'A model packet needs the attempt declared before assembly');
@@ -246,7 +238,9 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   if (!journalRef) fail('packet_record_invalid', batch.id, 'journal', 'A repeated question must preserve its refusal source');
   const journal = take(readRecord<RefusalJournal>(store, journalRef, { unit: 'E2', target: batch.id,
     id: journalId(request.project), kind: 'om-refusal-journal' }));
-  const checkedJournal = take(readJournal(pinned(store, journal), { project: request.project }));
+  // S1.1 (№1773): the saved revision is proved at its exact reference, inside the common proof scope of this
+  // operation — never today's head, and never through a view of its own that would derive the history again.
+  const checkedJournal = take(readJournalAt(store, request.project, reference(journal)));
   references.push(journalRef);
   if (current) { head(store, journalRef); guards.push(journalRef); }
   const addresses = new Set(batch.items.flatMap(item => [item.target, item.gap]));
@@ -913,6 +907,9 @@ function partProposal(store: Store, project: string, packet: Revision<QuestionPa
   if (worksContract) {
     // Reuse C3 for the native work-end contract, including exact membership in Node.code.
     // Prior nodes may be reused by the next part; the temporary observation proves content only.
+    // S1.1 (№1915): the unwritten preview is read through the common pending overlay — a replayable
+    // source view over a plain Store, the opaque branch over a caller's Proxy — never through an ad-hoc Proxy
+    // that would make every proof of the history under it unrepeatable.
     const previous = value.request.previous.map(item => checkedPart(store, project, item.result).proposal.value as LayerProposal);
     const reuse = <T>(prior: T[], supplied: T[]) => [...unique(prior).filter(item => !supplied.some(value => same(item, value))), ...supplied];
     const contextual: LayerProposal = { ...proposalValue, nodes: reuse(previousNodes, body.nodes),
@@ -921,7 +918,8 @@ function partProposal(store: Store, project: string, packet: Revision<QuestionPa
     const preview: Revision<LayerProposal> = { id: `om-proposal:${project}:answer-content:${hashJson(contextual)}`,
       kind: 'layer-proposal', revision: 1, hash: hashJson(contextual), value: contextual };
     historicalRead(store, { reader: 'E2.works-proposal-content', project, ref: reference(preview), parameters: json(frameSource) },
-      () => take(readFrameProposals(pinned(store, preview), { frame: frameSource.frame,
+      () => take(readFrameProposals(pendingCallStore(store, [{ id: preview.id, kind: preview.kind, expected: 0, value: preview.value }]),
+        { frame: frameSource.frame,
         proposals: [...frameSource.proposals, reference(preview)] })),
       () => fail('packet_chain_invalid', packet.id, 'proposal', 'The work-part content has a cyclic source derivation'));
     const assignment = (packet.value.packet as Record<string, Json>).works as unknown as WorksPacketContext;
@@ -1065,12 +1063,10 @@ export function preparePartResult(store: Store, request: PreparePartResultReques
     if (stored && !same(stored, response))
       fail('part_result_invalid', stored.id, 'response', 'A saved response cannot be replaced under its original identity');
     const source: PartResultRequest = { ...request, response: response ? reference(response) : request.response as Ref };
-    const view = response && !stored ? new Proxy(store, { get(target, key) {
-      if (key === 'get') return (id: string, revision?: number) => id === response.id && (revision === undefined || revision === 1)
-        ? response : target.get(id, revision);
-      const member: unknown = Reflect.get(target, key, target);
-      return typeof member === 'function' ? member.bind(target) : member;
-    } }) : store;
+    // S1.1 (№1915): the unwritten response is read through the common pending overlay (a replayable source view
+    // over a plain Store; the opaque branch over a caller's Proxy). A matching saved response keeps the plain Store;
+    // a differing one was refused above — the overlay never hides a saved record.
+    const view = response && pending && !stored ? pendingCallStore(store, [pending]) : store;
     const expected = partSource(view, source);
     const old = store.get(expected.record.id);
     if (old) {
@@ -1109,3 +1105,8 @@ function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNu
       ...(contract === WORKS_PACKET_CONTRACT ? { tests: checked.proposal.value.tests, edges: checked.proposal.value.edges } : {}) });
   });
 }
+
+// S1.1 (№1773): the journal proves an exact historical revision through the common proof scope of this operation.
+// The journal must not import input.ts itself (an ESM cycle would reach its reader registry before it has evaluated),
+// so this module, which already imports both, hands the existing executor in once; nothing is called here.
+registerJournalProofExecutor(historicalProof);

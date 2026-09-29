@@ -2,6 +2,7 @@ import test, { after, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { types } from 'node:util';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
@@ -23,7 +24,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
 import { checkAtomicWorks, prepareWorksAcceptance, writeWorksAcceptance, readAtomicGate, prepareAtomicGate, writeAtomicGate,
-  readWorksAcceptance, type AtomicGateRecord, type AtomicGateRequest, type PreparedWorksAcceptance } from '../src/om/atomic-gate.js';
+  readWorksAcceptance, transactionForTests, type AtomicGateRecord, type AtomicGateRequest, type PreparedWorksAcceptance } from '../src/om/atomic-gate.js';
 import { readAcceptedFrame, settleCandidate } from '../src/om/frame-accept.js';
 import { writeCandidate, readCandidate, type FrameCandidateRecord } from '../src/om/frame-candidate.js';
 import { fillObligations, prepareFrame, type FrameScope, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
@@ -31,12 +32,13 @@ import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.j
 import { writeGaps, readGaps, type Gap, type GapRequest, type GapReadRequest } from '../src/om/gaps.js';
 import { gapLineKey, gapLineExpectedResult, prepareGapLines, writeGapLines, readGapLines, type GapLinesRecord, type GapLinesRequest } from '../src/om/gap-lines.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { writeOmInput } from '../src/om/input.js';
+import { historicalProof, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
 import { runModelCycle, readPartAssembly, readModelCycle, type ModelCallRequest } from '../src/om/model-call.js';
 import { readNeighbors, writeNeighbors, type NeighborCollection } from '../src/om/neighbors.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND,
   writeOmObligations, readOmObligations, type OmObligationHandoff } from '../src/om/obligations.js';
 import { writeQuestionPacket, readPartResult, type PartProposalBody, type QuestionPacketRequest } from '../src/om/question-packet.js';
+import { storeView } from '../src/storage/store-view.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { writeRoutes } from '../src/om/routes.js';
@@ -756,6 +758,151 @@ function externalCandidate(t: TestContext) {
 }
 
 const engineFailure = (code: string) => (error: unknown) => error instanceof EngineError && error.code === code;
+
+const transactionConflict = (error: unknown) => (error as { refusal?: { code?: string } }).refusal?.code === 'atomic_gate_transaction_conflict';
+
+test('S1.1 the preview transaction over a plain Store is its own frozen source view: pending rows by head, exact next revision, list and history; old exact revisions and the lower Store untouched; the same add is idempotent, two versions conflict, a moved head refuses before publishing', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-s11-tx-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const existing = store.write({ id: 'kept', kind: 'fixture', expected: 0, value: { v: 1 } });
+  store.write({ id: 'other', kind: 'another', expected: 0, value: { v: 'o' } });
+  const tx = transactionForTests(store);
+  assert.equal(types.isProxy(tx.view), false); assert.ok(tx.view instanceof Store); assert.ok(Object.isFrozen(tx.view)); assert.notEqual(tx.view, store);
+  assert.equal(tx.view.path, store.path);
+  assert.deepEqual(tx.view.get('kept'), existing); assert.equal(tx.view.get('new'), null); assert.equal(tx.view.get('new', 1), null);
+  assert.deepEqual(tx.view.list().map(row => row.id), ['kept', 'other']); assert.deepEqual(tx.view.history('new'), []);
+  // An existing record and its next pending revision; the old exact revision stays readable.
+  const next: Write = { id: 'kept', kind: 'fixture', expected: 1, value: { v: 2 } };
+  tx.add({ writes: [next], guards: [reference(existing)] });
+  const pendingKept = { id: 'kept', kind: 'fixture', revision: 2, hash: hashJson(next.value), value: next.value };
+  assert.deepEqual(tx.view.get('kept'), pendingKept); assert.deepEqual(tx.view.get('kept', 2), pendingKept);
+  assert.deepEqual(tx.view.get('kept', 1), existing, 'Old exact revisions stay'); assert.equal(tx.view.get('kept', 3), null);
+  assert.deepEqual(tx.view.history('kept'), [existing, pendingKept]);
+  // Absence becomes a pending row at its exact Ref.
+  const fresh: Write = { id: 'new', kind: 'fixture', expected: 0, value: { v: 'n' } };
+  tx.add({ writes: [fresh], guards: [] });
+  const pendingNew = { id: 'new', kind: 'fixture', revision: 1, hash: hashJson(fresh.value), value: fresh.value };
+  assert.deepEqual(tx.view.get('new'), pendingNew); assert.deepEqual(tx.view.get('new', 1), pendingNew); assert.equal(tx.view.get('new', 2), null);
+  assert.deepEqual(tx.view.history('new'), [pendingNew]);
+  assert.deepEqual(tx.view.list().map(row => [row.id, row.revision]), [['kept', 2], ['new', 1], ['other', 1]]);
+  assert.deepEqual(tx.view.list('fixture').map(row => row.id), ['kept', 'new']); assert.deepEqual(tx.view.list('another').map(row => row.id), ['other']);
+  // The lower Store is untouched.
+  assert.deepEqual(store.get('kept'), existing); assert.equal(store.get('new'), null); assert.deepEqual(store.list().map(row => row.id), ['kept', 'other']);
+  assert.deepEqual(store.history('kept'), [existing]);
+  // The same add changes nothing; a second version of one id is the former conflict.
+  const size = tx.writes.size; tx.add({ writes: [fresh, next], guards: [] }); assert.equal(tx.writes.size, size); assert.deepEqual(tx.view.get('new'), pendingNew);
+  assert.throws(() => tx.add({ writes: [{ ...fresh, value: { v: 'changed' } }], guards: [] }), transactionConflict);
+  assert.deepEqual(tx.view.get('new'), pendingNew);
+  // №1942-3: a head that moved beneath the acceptance refuses before its pending revision is published — nothing is shadowed.
+  const rival = new Store(store.path);
+  const raced = rival.write({ id: 'raced', kind: 'fixture', expected: 0, value: { v: 'other-process' } });
+  const movedKept = rival.write({ id: 'kept', kind: 'fixture', expected: 1, value: { v: 'moved' } });
+  rival.close();
+  assert.throws(() => tx.add({ writes: [{ id: 'raced', kind: 'fixture', expected: 0, value: { v: 'prepared-before-race' } }], guards: [] }), transactionConflict);
+  assert.equal(tx.writes.has('raced'), false); assert.deepEqual(tx.view.get('raced'), raced); assert.deepEqual(tx.view.get('raced', 1), raced);
+  const late = transactionForTests(store);
+  assert.throws(() => late.add({ writes: [next], guards: [] }), transactionConflict, 'A stale expected revision is refused as well');
+  assert.deepEqual(late.view.get('kept'), movedKept); assert.equal(late.writes.size, 0);
+});
+
+test('S1.1 a positive exact read cached under the preview is never shadowed; two transactions share no answers; over a traced Store the preview stays opaque and the lower collector sees every reading', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-s11-tx-race-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const rival = new Store(store.path), current = rival.write({ id: 'row', kind: 'fixture', expected: 0, value: 'other-process' }); rival.close();
+  const tx = transactionForTests(store), key = { reader: 'S1.1.exact', project: 'p', ref: reference(current) };
+  // The race of №1942-3: the proof read the rival's revision 1 under the preview; the prepared write expected:0 for the same
+  // id is refused when published — the direct read and the hot proof keep agreeing on the one real body.
+  withHistoricalReads(() => {
+    let bodies = 0;
+    const read = () => historicalProof(tx.view, key, view => { bodies++; return view.get('row', 1); }, () => assert.fail('The exact read is not cyclic'));
+    assert.deepEqual(read(), current); assert.deepEqual(read(), current); assert.equal(bodies, 1);
+    assert.throws(() => tx.add({ writes: [{ id: 'row', kind: 'fixture', expected: 0, value: 'prepared-before-race' }], guards: [] }), transactionConflict);
+    assert.deepEqual(tx.view.get('row', 1), read()); assert.deepEqual(tx.view.get('row'), current); assert.equal(bodies, 1);
+  });
+  // Two transactions with the same proof key share no answers: each preview is its own region.
+  const one = transactionForTests(store), two = transactionForTests(store), keyNew = { reader: 'S1.1.pending', project: 'p', ref: reference(current) };
+  one.add({ writes: [{ id: 'new', kind: 'fixture', expected: 0, value: 'one' }], guards: [] });
+  withHistoricalReads(() => {
+    let bodies = 0;
+    const readOn = (view: Store) => historicalProof(view, keyNew, seen => { bodies++; return seen.get('new'); }, () => assert.fail('not cyclic'));
+    assert.equal(readOn(one.view)?.value, 'one'); assert.equal(readOn(two.view), null); assert.equal(bodies, 2);
+    assert.equal(readOn(one.view)?.value, 'one'); assert.equal(readOn(two.view), null); assert.equal(bodies, 2, 'Each region keeps its own proof');
+  });
+  // A growing pending set moves the head and list/history of the preview: the proof that read the head is derived again.
+  withHistoricalReads(() => {
+    let bodies = 0; const grown = transactionForTests(store);
+    const read = () => historicalProof(grown.view, keyNew, view => { bodies++; return { head: view.get('new'), rows: view.list('fixture').length, history: view.history('new').length }; }, () => assert.fail('not cyclic'));
+    assert.deepEqual(read(), { head: null, rows: 1, history: 0 }); read(); assert.equal(bodies, 1);
+    grown.add({ writes: [{ id: 'new', kind: 'fixture', expected: 0, value: 'grown' }], guards: [] });
+    assert.deepEqual(read().rows, 2); assert.equal(bodies, 2); read(); assert.equal(bodies, 2);
+  });
+  // Over a traced Store the preview keeps its opaque branch: two bodies, and the lower collector sees both readings.
+  withHistoricalReads(() => {
+    let observed = 0, bodies = 0;
+    const lower = historicalTrace(store, () => observed++), opaque = transactionForTests(lower);
+    assert.equal(types.isProxy(opaque.view), true);
+    const read = () => historicalProof(opaque.view, key, view => { bodies++; return view.get('row', 1); }, () => assert.fail('not cyclic'));
+    assert.deepEqual(read(), current); assert.deepEqual(read(), current);
+    assert.deepEqual([bodies, observed], [2, 2]);
+  });
+});
+
+test('S1.1 (№2008-1) the preview transaction takes the fast branch only over proved reads: a frozen shell on Store.prototype with own reading accessors over a traced Store stays opaque (two bodies, two observations), a genuine Store with an own reading override stays opaque, a write-only view of the storage helper is fast', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-s11-tx-shell-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const row = store.write({ id: 'base', kind: 'fixture', expected: 0, value: { v: 1 } });
+  const shell = (target: Store): Store => {
+    const view = Object.create(Store.prototype) as Record<string, unknown>;
+    Object.defineProperties(view, { path: { value: target.path }, databaseId: { get: () => target.databaseId } });
+    for (const name of ['get', 'list', 'history', 'write', 'writeMany'] as const)
+      Object.defineProperty(view, name, { get: () => (target[name] as (...args: never[]) => unknown).bind(target) });
+    return Object.freeze(view) as unknown as Store;
+  };
+  const key = { reader: 'S1.1.shell', project: 'p', ref: reference(row) };
+  const probe = (view: Store, expectedBodies: number, observedTrace?: () => number) => withHistoricalReads(() => {
+    let bodies = 0;
+    const read = () => historicalProof(view, key, seen => { bodies++; return seen.get(row.id, 1); }, () => assert.fail('not cyclic'));
+    assert.deepEqual(read(), row); assert.deepEqual(read(), row);
+    assert.equal(bodies, expectedBodies);
+    if (observedTrace) assert.equal(observedTrace(), expectedBodies, 'The lower collector sees every reading');
+  });
+  // The reviewer's shell: not a Proxy, Store.prototype beneath, but its own reading members reach a traced Store.
+  let observed = 0;
+  const lower = shell(historicalTrace(store, () => observed++));
+  assert.equal(types.isProxy(lower), false); assert.equal(Object.getPrototypeOf(lower), Store.prototype);
+  const opaque = transactionForTests(lower);
+  assert.equal(types.isProxy(opaque.view), true, 'A shell of unknown reads keeps the opaque preview');
+  probe(opaque.view, 2, () => observed);
+  // A genuine Store whose instance carries an own reading override is not a genuine Store any more.
+  const overridden = new Store(store.path); t.after(() => overridden.close());
+  Object.defineProperty(overridden, 'get', { value: overridden.get.bind(overridden) });
+  assert.equal(types.isProxy(transactionForTests(overridden).view), true, 'An own reading member forbids the fast branch');
+  // The genuine Store and a write-only view of the storage helper over it: proved reads, the fast branch.
+  assert.equal(types.isProxy(transactionForTests(store).view), false);
+  const writeOnly = storeView(store, { write: (writes, guards) => store.writeMany(writes, guards) });
+  assert.equal(types.isProxy(writeOnly), false);
+  assert.equal(types.isProxy(transactionForTests(writeOnly).view), false, 'A write-only view of the helper is proved reads');
+  probe(transactionForTests(store).view, 1); probe(transactionForTests(writeOnly).view, 1);
+});
+
+test('S1.1 the works acceptance over a plain Store proves each key of its history once per transaction: it costs less than the opaque preview over an unknown lower view of the same database and accepts the same', async t => {
+  const f = await atomicFixture(t), before = heads(f.store), started = Date.now();
+  const stamp = (label: string) => process.stderr.write(`# S11 ${label} at ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+  class UnknownLower extends Store {}
+  const lower = new UnknownLower(f.database); t.after(() => lower.close());
+  const originalGet = Store.prototype.get; let reads = 0;
+  Store.prototype.get = function (this: Store, id: string, revision?: number) { reads++; return originalGet.call(this, id, revision); } as typeof Store.prototype.get;
+  t.after(() => { Store.prototype.get = originalGet; });
+  const measure = (store: Store) => withHistoricalReads(() => { reads = 0; const prepared = ok(prepareWorksAcceptance(store, f.request)); return { prepared, reads }; });
+  stamp('fixture ready');
+  const fast = measure(f.store); stamp(`plain preview: ${fast.reads} reads`);
+  assert.equal(fast.prepared.state, 'accepted', JSON.stringify({ seed: f.seedRoot, findings: gateWrite(fast.prepared).value.result.findings }));
+  const opaque = measure(lower); stamp(`opaque preview: ${opaque.reads} reads`);
+  assert.deepEqual(opaque.prepared, fast.prepared, 'The opaque preview of an unknown lower view accepts the same');
+  assert.ok(fast.reads < opaque.reads, `The plain preview keeps each proof once per transaction: ${fast.reads} physical reads against ${opaque.reads} over the opaque preview`);
+  t.diagnostic(`S11 plain ${fast.reads} < opaque ${opaque.reads} physical reads`);
+  assert.deepEqual(heads(f.store), before, 'Neither preview writes');
+});
 
 test('F5 external Source shares the real compiler current and sealed paths, including malformed and corrupt sources', t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-source-')), store = new Store(join(root, 'state.sqlite'));

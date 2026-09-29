@@ -13,10 +13,10 @@ import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
-import { writeOmInput } from '../src/om/input.js';
+import { historicalRead, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { readAnswerTask, readMc1Question, writeAcceptedAnswer, readAcceptedAnswer, type AnswerTaskBasis } from '../src/om/accepted-answer.js';
 import { confirmResults } from '../src/om/achievements.js';
@@ -35,11 +35,11 @@ import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQ
   normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, WORKS_PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from '../src/om/refusal-journal.js';
-import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
+import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type RefusalJournal } from '../src/om/refusal-journal.js';
+import { prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { deliverModelSources, assembleModelParts, readPartAssembly } from '../src/om/model-call.js';
+import { deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -937,6 +937,159 @@ test('E2 retry context contains only addressed refusals from the preceding attem
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
 });
 
+/** S1.1: a real retry history of the packet fixture — two refused attempts of the same goal, then the running attempt 3. */
+function retryHistory(t: TestContext) {
+  const p = packetFixture(t), { f } = p;
+  let nextSource = 0;
+  function refusal(code: string, goal: string) {
+    const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}s11-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
+      value: { gate: 'G4', refusals: [{ code, goal, remedy: 'Resolve the addressed question',
+        origin: { name: code, stage: 'question-packet', subject: goal, sources: [{ role: 'input', ref: reference(f.input) }] } }] } });
+    const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+    const row = journal.value.rows.find(row => row.source.id === source.id)!;
+    return { row: row.id, name: row.code, goal: row.goal };
+  }
+  const address = { project: f.project, block: p.block, line: 1 };
+  const older = refusal('older-own-refusal', p.batch.items[0]!.target);
+  ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [older] } }));
+  ok(beginAttempt(f.store, { ...address, attempt: 2, goal: p.goal }));
+  const own = refusal('latest-own-refusal', p.batch.items[0]!.target), foreign = refusal('foreign-refusal', 'unrelated-question');
+  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [own, foreign] } }));
+  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+  const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(third), ordinal: 3 } };
+  return { p, f, refusal, own, request };
+}
+/** Every read of an exact record through any Store, by id, while the returned function is installed. */
+function countingReads(t: TestContext, ids: readonly string[]) {
+  const originalGet = Store.prototype.get, reads = new Map<string, number>();
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    reads.set(id, (reads.get(id) ?? 0) + 1); return originalGet.call(this, id, revision);
+  } as typeof Store.prototype.get;
+  t.after(() => { Store.prototype.get = originalGet; });
+  return () => ids.reduce((sum, id) => sum + (reads.get(id) ?? 0), 0);
+}
+
+test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation or a new Store prove it again', t => {
+  const { p, f, refusal, own, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [{ code: own.name, target: own.goal }]);
+  // The head moves on after the packet was saved: the packet stands on the saved revision, never on today's head.
+  refusal('later-unrelated-history', p.batch.items[0]!.target);
+  refusal('another-later-history', 'unrelated-question');
+  assert.ok(f.store.get(journalId(project))!.revision > journal.revision);
+  f.restart();
+  const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows;
+  assert.equal(rows.length, 3);
+  const count = countingReads(t, [journal.id, ...rows.map(row => row.source.id)]);
+  const read = () => ok(readQuestionPacket(f.store, { project, record: reference(packet) }));
+  withHistoricalReads(() => {
+    assert.deepEqual(read(), packet);
+    const cold = count();
+    assert.ok(cold > rows.length, 'The cold proof reads the saved revision and every source its rows name');
+    assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
+    assert.equal(count(), cold, 'The exact proof E2 executed serves a direct exact read of the same revision');
+    assert.deepEqual(read(), packet);
+    assert.deepEqual(reference(ok(readJournalAt(f.store, project, { ...journal, kind: 'om-refusal-journal' } as Ref))), journal);
+    assert.equal(count(), cold, 'Repeats, and a reference carrying extra fields, reuse the one proof of the exact {id, revision, hash}');
+  });
+  const outside = count();
+  assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
+  assert.ok(count() > outside, 'A new operation proves the exact revision again');
+  const before = count();
+  f.restart();
+  assert.deepEqual(read(), packet);
+  assert.ok(count() > before, 'A new Store proves again');
+  // A direct read keeps its former refusal context: the reference it received, addressed as every refusal is.
+  const raw = { ...reference(f.input), note: 'read as received' };
+  const foreign = readJournalAt(f.store, project, raw as Ref);
+  assert.equal(foreign.ok, false);
+  if (!foreign.ok) {
+    assert.deepEqual([foreign.refusal.code, foreign.refusal.at.target, foreign.refusal.at.ref], ['record_foreign', journalId(project), reference(f.input)]);
+  }
+});
+
+test('S1.1 a new preparation takes the current journal head and guards it: a head moved before the write refuses the packet', t => {
+  const { f, refusal, request } = retryHistory(t);
+  const prepared = ok(prepareQuestionPacket(f.store, request)), head = f.store.get(journalId(f.project))!;
+  assert.deepEqual(prepared.record.value.journal, reference(head));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(head))), 'The current journal head guards the write');
+  refusal('moved-before-write', 'unrelated-question');
+  rejected(writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.equal(f.store.get(prepared.record.id), null, 'Nothing of the stale packet is written');
+  const fresh = ok(prepareQuestionPacket(f.store, request)), moved = f.store.get(journalId(f.project))!;
+  assert.ok(moved.revision > head.revision);
+  assert.deepEqual(fresh.record.value.journal, reference(moved));
+  assert.deepEqual(fresh.record.value.packet, prepared.record.value.packet, 'An unrelated later row changes no refusal of the packet');
+  // Inside one operation the second preparation finds the journal proof hot: its guard and reference are the same.
+  withHistoricalReads(() => {
+    const cold = ok(prepareQuestionPacket(f.store, request)), hot = ok(prepareQuestionPacket(f.store, request));
+    const journalRefs = (refs: readonly Ref[]) => refs.filter(ref => ref.id === journalId(f.project));
+    assert.deepEqual([hot.record.value.journal, journalRefs(hot.references), journalRefs(hot.guards.filter(isRef))],
+      [reference(moved), journalRefs(cold.references), journalRefs(cold.guards.filter(isRef))]);
+    assert.equal(journalRefs(hot.guards.filter(isRef)).length, 1);
+  });
+  assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record.value.journal, reference(moved));
+});
+
+test('S1.1 an unavailable journal source is the former typed refusal and is never cached; a storage fault propagates and releases the proof', t => {
+  const { f, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
+  const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows, source = rows[0]!.source.id;
+  let hidden: string | null = null, fault: Error | null = null;
+  const view: Store = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      if (fault && id === source) throw fault;
+      return id === hidden ? null : target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const read = () => readQuestionPacket(view, { project, record: reference(packet) });
+  withHistoricalReads(() => {
+    hidden = source;
+    const broken = rejected(read(), 'journal_invalid');
+    assert.deepEqual([broken.at.unit, broken.at.target, broken.at.ref], ['store-refusals', journalId(project), journal]);
+    assert.match(broken.at.field!, /^rows\.\d+\.source$/);
+    hidden = journal.id;
+    const missing = rejected(read(), 'record_missing');
+    assert.deepEqual([missing.at.unit, missing.at.ref], ['E2', journal]);
+    hidden = null;
+    assert.deepEqual(ok(read()), packet, 'A refused proof is not cached: the restored source proves again');
+    fault = new TypeError('journal source unavailable');
+    assert.throws(() => read(), error => error === fault);
+    fault = null;
+    assert.deepEqual(ok(read()), packet, 'The active key is released after the fault');
+  });
+});
+
+test('S1.1 a repeated entry into the same active journal proof is journal_invalid at its derivation; an earlier revision is another key', t => {
+  const { f, request } = retryHistory(t);
+  const packet = ok(writeQuestionPacket(f.store, request)).record, later = packet.value.journal!, project = f.project;
+  const earlier = reference(f.store.history<RefusalJournal>(later.id).find(row => row.revision === later.revision - 1)!);
+  const source = f.store.get<RefusalJournal>(later.id, later.revision)!.value.rows.at(-1)!.source.id;
+  let inner: OmResult<Sealed<Revision<RefusalJournal>>> | null = null, probe: Ref | null = null;
+  const view: Store = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => {
+      if (probe && id === source) { const ref = probe; probe = null; inner = readJournalAt(view, project, ref); }
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  withHistoricalReads(() => {
+    probe = later;
+    assert.deepEqual(reference(ok(readJournalAt(view, project, later))), later, 'The outer proof completes');
+    assert.ok(inner !== null && !inner.ok);
+    const cyclic = rejected(inner!, 'journal_invalid');
+    assert.deepEqual(cyclic.at, { unit: 'store-refusals', target: journalId(project), field: 'derivation', ref: later });
+    assert.match(cyclic.message, /cyclic/);
+  });
+  withHistoricalReads(() => {
+    inner = null; probe = earlier;
+    assert.deepEqual(reference(ok(readJournalAt(view, project, later))), later);
+    assert.ok(inner !== null);
+    assert.deepEqual(reference(ok(inner!)), earlier, 'An earlier revision inside the active proof is another key, not a cycle');
+  });
+});
+
 test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-packet-accepted-')), database = join(root, 'state.sqlite');
   const store = new Store(database), engine = new ProductEngine(store), project = 'garden';
@@ -1537,6 +1690,124 @@ for (const late of ['multiple', 'initial-realizes'] as const) test(`E2.1 initial
   assert.deepEqual(snapshot(f.store), snapshotBeforeRestart);
 });
 
+/** Physical reads of the real Store by id — one hook, read per id, restored after the test. */
+function readsById(t: TestContext) {
+  const originalGet = Store.prototype.get, reads = new Map<string, number>();
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    reads.set(id, (reads.get(id) ?? 0) + 1); return originalGet.call(this, id, revision);
+  } as typeof Store.prototype.get;
+  t.after(() => { Store.prototype.get = originalGet; });
+  return { of: (id: string) => reads.get(id) ?? 0, reset: () => reads.clear() };
+}
+
+test('S1.1 the unwritten response and the works preview are read through the common pending overlay: the derivation costs one unfolding per key under it, the same part cold, hot, saved and traced; a differing saved response is refused without writes', async t => {
+  const f = await worksPacketFixture(t, 'multiple', true), request = f.request(), packet = ok(writeQuestionPacket(f.store, request)).record;
+  const payload = packet.value.packet as Record<string, any>, answer = f.answer(packet), raw = JSON.stringify(answer);
+  const routes = ok(readRoutes(f.store, { project: f.project, record: request.routes })).record;
+  const frameSource = routes.value.request.gaps.sources.works; assert.ok(!('state' in frameSource));
+  const graph = frameSource.frame.graph, prior = frameSource.proposals[0]!;
+  const series = f.store.get<RepairSeries>(request.attempt.series.id, request.attempt.series.revision)!;
+  const adapter = f.store.write({ id: `adapter:${f.project}:overlay`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:overlay`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
+  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: 'model-design', basis: null,
+    block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0]!.goal,
+    gaps: f.batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+      id: item.target, goal: item.target, field: item.field, consumer }))),
+    dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(packet.value.packet) as Json })).call;
+  const responseValue = { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId, raw };
+  const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0, value: responseValue };
+  const response = { id: responseWrite.id, kind: responseWrite.kind, revision: 1, hash: hashJson(responseValue), value: responseValue };
+  const partRequest = { project: f.project, packet: reference(packet), call: reference(call), response: { pending: responseWrite } };
+  const before = snapshot(f.store), reads = readsById(t);
+  // Cold and hot in one operation: the same record, proposal, writes, guards and references; the unwritten response is
+  // carried as a write and never read from the Store.
+  const { cold, hot, graphReads, hotReads } = withHistoricalReads(() => {
+    reads.reset();
+    const cold = ok(preparePartResult(f.store, partRequest)), graphReads = reads.of(graph.id); reads.reset();
+    const hot = ok(preparePartResult(f.store, partRequest));
+    return { cold, hot, graphReads, hotReads: reads.of(graph.id) };
+  });
+  assert.deepEqual(hot, cold, 'Cold and hot give the same record, proposal, writes, guards and references');
+  assert.ok(cold.writes.some(write => write.id === responseWrite.id), 'The unwritten response is carried as a write');
+  assert.equal(f.store.get(responseWrite.id), null); assert.deepEqual(snapshot(f.store), before);
+  // The cost is a structure of proofs, not a constant (№1915-5). Measured by the physical reads of the graph, which every
+  // derivation of the frame reads: (1) over a plain Store the overlay E2 makes for the unwritten response is replayable,
+  // so the derivation costs less than over a traced base, where the overlay keeps its opaque branch and every proof under
+  // it unfolds again on each request, and a hot repeat of E2 — its own new overlay, the plain-Store proofs cached — costs
+  // exactly a derivation over a caller-made common overlay; (2) the works-content proof inside E2 costs exactly one derivation of the same frame
+  // proposals over the common overlay of the same preview — its key is the same, so a caller who proved it first leaves
+  // E2 only the rest, measured on caller-made overlays of the same unwritten response.
+  const preview = { id: `om-proposal:${f.project}:answer-content:${cold.proposal.hash}`, kind: 'layer-proposal', revision: 1, hash: cold.proposal.hash, value: cold.proposal.value };
+  const previewWrite: Write = { id: preview.id, kind: preview.kind, expected: 0, value: preview.value as unknown as Json };
+  const tracedReads = withHistoricalReads(() => {
+    reads.reset(); assert.deepEqual(ok(preparePartResult(historicalTrace(f.store), partRequest)), cold); return reads.of(graph.id);
+  });
+  assert.ok(graphReads < tracedReads, 'Over a plain Store the overlay is replayable: ' + graphReads + ' graph reads against ' + tracedReads + ' over a traced base');
+  const { callerMade, rest, worksAlone } = withHistoricalReads(() => {
+    const outer = pendingCallStore(f.store, [responseWrite]); reads.reset();
+    const viaCaller = ok(preparePartResult(outer, { ...partRequest, response: reference(response) })), callerMade = reads.of(graph.id);
+    assert.deepEqual([viaCaller.record, viaCaller.proposal], [cold.record, cold.proposal]);
+    const inner = pendingCallStore(f.store, [responseWrite]); reads.reset();
+    historicalRead(inner, { reader: 'E2.works-proposal-content', project: f.project, ref: reference(preview), parameters: clone(frameSource) as unknown as Json },
+      () => ok(readFrameProposals(pendingCallStore(inner, [previewWrite]), { frame: frameSource.frame, proposals: [...frameSource.proposals, reference(preview)] })),
+      () => assert.fail('The works-content proof is not cyclic'));
+    const worksAlone = reads.of(graph.id); reads.reset();
+    assert.deepEqual(ok(preparePartResult(inner, { ...partRequest, response: reference(response) })).record, cold.record);
+    return { callerMade, rest: reads.of(graph.id), worksAlone };
+  });
+  assert.equal(hotReads, callerMade, 'The overlay E2 makes for the unwritten response is the common replayable overlay: a hot repeat of E2 (its own new overlay, the rest cached) costs exactly a derivation over a caller-made common overlay');
+  assert.ok(worksAlone > 0 && rest < callerMade, 'The works-content proof proved first by the caller is hit inside E2');
+  assert.equal(callerMade, rest + worksAlone, 'The works-content derivation inside E2 costs exactly one derivation of the same frame proposals over the common overlay of the same preview');
+  // Different temporary content is another proof: its own preview, its own derivation, nothing inherited.
+  const other = clone(answer), extra = other.proposal.nodes[0]!; extra.id += '-additional';
+  extra.code = extra.code.map(code => ({ ...code, path: 'src/additional-work.ts' })); extra.tests = extra.tests.map(id => `${id}-additional`);
+  other.proposal.tests = other.proposal.tests.map(test => ({ ...test, id: `${test.id}-additional`, node: extra.id,
+    contract: { ...test.contract!, entrypoint: { ...test.contract!.entrypoint, path: extra.code[0]!.path } } }));
+  other.proposal.fills = other.proposal.fills.map(fill => ({ ...fill, node: extra.id, ...(fill.codeRef ? { codeRef: extra.code[0]! } : {}) }));
+  other.bindings = other.bindings.map(binding => ({ ...binding, consumers: binding.consumers.map(consumer => ({ ...consumer, node: extra.id, tests: [...extra.tests] })) }));
+  const otherWrite: Write = { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(other) } };
+  const different = withHistoricalReads(() => {
+    ok(preparePartResult(f.store, partRequest)); reads.reset();
+    const different = ok(preparePartResult(f.store, { ...partRequest, response: { pending: otherWrite } }));
+    assert.equal(reads.of(graph.id), hotReads, 'Another content over its own overlay costs what a repeat of the first costs: nothing inherited, nothing lost');
+    return different;
+  });
+  assert.notDeepEqual(different.proposal.value, cold.proposal.value); assert.notEqual(different.record.id, cold.record.id);
+  // The former negative checks of works content stay: a consumer outside this node assignment is refused, without writes.
+  const foreign = clone(answer); foreign.bindings[0]!.consumers[0]!.node = 'garden-consume-work';
+  rejected(preparePartResult(f.store, { ...partRequest, response: { pending: { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(foreign) } } } }), 'part_result_invalid');
+  assert.deepEqual(snapshot(f.store), before);
+  // A lower transparent collector receives the dependencies on both readings — cold, and after the proof was warmed on
+  // the plain Store before the collector was attached: over a traced Store the overlay keeps its opaque branch.
+  const collect = (warm: boolean) => withHistoricalReads(() => {
+    if (warm) ok(preparePartResult(f.store, partRequest));
+    const seen: string[] = [];
+    const traced = historicalTrace(f.store, (ref, _head, method) => { if (method === 'get') seen.push(canonical(ref)); });
+    assert.deepEqual(ok(preparePartResult(traced, partRequest)), cold);
+    return [...new Set(seen)].sort();
+  });
+  const coldSeen = collect(false), warmedSeen = collect(true);
+  assert.deepEqual(warmedSeen, coldSeen, 'The warmed reading reports the same dependencies to the lower collector');
+  for (const ref of [reference(packet), reference(call), reference(series), graph, prior])
+    assert.ok(coldSeen.includes(canonical(ref)), 'The collector saw ' + ref.id);
+  assert.ok(!coldSeen.includes(canonical(reference(response))), 'The unwritten response is no dependency of the Store');
+  // Saved by its E4 owner: the exact repeat stands on the saved record, with no writes and the saved record as its guard.
+  ok(writeGuarded(f.store, { unit: 'E2.1-overlay', target: cold.record.id, writes: cold.writes, guards: cold.guards }));
+  const saved = f.store.get(cold.record.id)!, again = ok(preparePartResult(f.store, partRequest));
+  assert.deepEqual(again.record, cold.record); assert.deepEqual(again.proposal, cold.proposal); assert.deepEqual(again.writes, []); assert.deepEqual(again.guards, [reference(saved)]);
+  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(cold.record) })).record, cold.record);
+  // A differing response under the saved identity is refused as before — the overlay never hides a saved record.
+  const afterSave = snapshot(f.store);
+  rejected(preparePartResult(f.store, { ...partRequest, response: { pending: otherWrite } }), 'part_result_invalid');
+  assert.deepEqual(snapshot(f.store), afterSave);
+  f.restart();
+  assert.deepEqual(ok(preparePartResult(f.store, partRequest)).record, cold.record);
+  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(cold.record) })).record, cold.record);
+  rejected(preparePartResult(f.store, { ...partRequest, response: { pending: otherWrite } }), 'part_result_invalid');
+  assert.deepEqual(snapshot(f.store), afterSave);
+});
+
 test('E2 declares every new content and control branch before dispatch and shares its exact reply parser', t => {
   const p = expansionFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
   const payload = packet.value.packet as Record<string, any>, before = snapshot(f.store);
@@ -2073,3 +2344,4 @@ test('E2 continuation preserves duplicate read positions using the same immutabl
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(continued) })), continued);
 });
+

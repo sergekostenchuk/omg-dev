@@ -989,3 +989,44 @@ export async function load(url, context, next) {
     } finally { store.close(); }
   }
 });
+
+test("S1.1 a saved closure's attempt is checked by the exact series reader: a repeat in one operation reads no series again, a new operation and a moved head prove again, the current preparation with the old reference still refuses", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const oldGap = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
+  const obligation = ok(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === oldGap.target)!;
+  const address: SeriesRequest = { project: "garden", block: obligation.upper.node, line: 1 };
+  const goal = goalFor(oldGap), attempt = openAttempt(f.store, address, goal), next = acceptOperations(f);
+  const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
+    closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
+  const saved = ok(writeGapLines(f.store, request));
+  // The series moves on: the attempt closes with the result and a second attempt begins, so the saved link is historical.
+  ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "result", accepting: [reference(saved)], cancelling: [], refusals: [] } }));
+  ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
+  const head = ok(readSeries(f.store, address));
+  assert.ok(head.revision > attempt.revision);
+  // Every read of the series and of the OM input through any Store, while installed.
+  const originalGet = Store.prototype.get, reads = new Map<string, number>();
+  const watched = new Set([attempt.id, "om-input:garden"]);
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    if (watched.has(id)) reads.set(id, (reads.get(id) ?? 0) + 1); return originalGet.call(this, id, revision);
+  } as typeof Store.prototype.get;
+  t.after(() => { Store.prototype.get = originalGet; });
+  const count = () => [...reads.values()].reduce((sum, value) => sum + value, 0);
+  const read = () => ok(readGapLines(f.store, { project: "garden", record: reference(saved) }));
+  withHistoricalReads(() => {
+    assert.deepEqual(read(), saved);
+    const cold = count();
+    assert.ok((reads.get(attempt.id) ?? 0) > 0, "The cold derivation reads the exact saved series revision");
+    assert.deepEqual(read(), saved);
+    assert.equal(count(), cold, "The repeat is served by the proofs of the operation: the series and the input are not read again");
+  });
+  const outside = count();
+  assert.deepEqual(read(), saved);
+  assert.ok(count() > outside, "A new operation proves the saved closure again");
+  const reopened = new Store(f.database);
+  try { assert.deepEqual(ok(readGapLines(reopened, { project: "garden", record: reference(saved) })), saved); } finally { reopened.close(); }
+  // The current preparation naming the moved historical revision of the series still refuses as before.
+  const stale = prepareGapLines(f.store, { ...request, previous: reference(saved), pass: 3 });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) assert.equal(stale.refusal.code, "input_stale");
+});
