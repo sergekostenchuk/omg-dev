@@ -719,7 +719,40 @@ export interface AcceptedAnswerChain {
   draftBefore: Ref; draftAfter: Ref; questionBefore: Ref; questionAfter: Ref;
   answer: Ref; assessment: Ref;
 }
-export type ManagedResearchTurn = ResearchTurn & { contract: 'research-consumer-turn/v1'; consumerIntent: Ref; acceptance?: AcceptedAnswerChain };
+/** D8.4e (№2211 §4): the acceptance contract of a managed paid turn is fixed
+ * by the producer of the ORIGINAL turn (O@1) — projectPaidTurnAdmission and
+ * the synthesis handoff — as an explicit field, independent of any later
+ * acceptance record. Readers select the era by this field alone: a turn that
+ * names the binding contract completes only through a proven K; a turn
+ * without it (written before the field existed) keeps the earlier rules.
+ * The field is immutable across the turn's revisions like the paid action. */
+export const ACCEPTANCE_BINDING_CONTRACT = 'research-acceptance-binding/v1' as const;
+export type ManagedResearchTurn = ResearchTurn & { contract: 'research-consumer-turn/v1'; consumerIntent: Ref;
+  acceptanceContract?: typeof ACCEPTANCE_BINDING_CONTRACT;
+  acceptance?: AcceptedAnswerChain;
+  /** D8.4e: the exact K the completed turn was derived from (new era only). */
+  acceptanceBinding?: Ref };
+/** The era of a managed turn, read from its own immutable producer field —
+ * never from the presence of K, a completed acceptance chain or a scan. */
+export function acceptanceEraOf(turn: { acceptanceContract?: unknown }): 'binding' | 'legacy' {
+  return turn.acceptanceContract === ACCEPTANCE_BINDING_CONTRACT ? 'binding' : 'legacy';
+}
+/** D8.4e: K — the acceptance record written atomically with the draft, the
+ * research-answer and the answered question. It names the exact original
+ * turn (O@1), the pending revision actually consumed (P), the producing
+ * intent (I), the adjacent draft/question pair, the answer, the supported
+ * assessment (R) and its managed proof (B). K never references the completed
+ * turn T; T references K. */
+export interface ResearchAcceptanceBinding {
+  contract: typeof ACCEPTANCE_BINDING_CONTRACT; projectId: string;
+  turn: Ref; pending: Ref; intent: Ref;
+  draftBefore: Ref; draftAfter: Ref; questionBefore: Ref; questionAfter: Ref;
+  answer: Ref; assessment: Ref; assessmentProof: Ref;
+}
+export const ACCEPTANCE_BINDING_FIELDS = ['contract', 'projectId', 'turn', 'pending', 'intent',
+  'draftBefore', 'draftAfter', 'questionBefore', 'questionAfter', 'answer', 'assessment', 'assessmentProof'] as const;
+export const acceptanceBindingId = (projectId: string, turnId: string) =>
+  `research-acceptance-binding:v1:${hashJson({ projectId, turnId })}`;
 /** Payload-level failures of a saved paid action/escalation response that
  * terminate as a typed `consumer-invalid` outcome instead of a fabricated
  * action or a transport refusal (C13/C62). Context-level failures that occur
@@ -1067,6 +1100,42 @@ export function matchAcceptedPaidAnswer(input: AcceptedPaidAnswerInputs):
     observation: { verdict: 'supported', reasons: assessment.value.reasons } };
 }
 
+/** D8.4e: the one projection of K shared by the producer (Discovery.#answer,
+ * on the prepared writes) and the historical reader (on the loaded exact
+ * records). It composes the shared acceptance formula with the full-value
+ * checks of R13: the research-answer body is exactly {projectId, question,
+ * assessment, value} at revision 1 under its own address, the assessment is
+ * the content-addressed revision 1, and the adjacent pair is the acceptance's
+ * own. Belonging of O/P/I/B (R12) is the caller's proof; here their links are
+ * checked for form and mutual consistency. */
+export function projectAcceptanceBinding(inputs: AcceptedPaidAnswerInputs,
+  links: { turn: Ref; pending: Ref; intent: Ref; assessmentProof: Ref }): ResearchAcceptanceBinding {
+  const refuse = (reason: string): never => {
+    throw new EngineError('research_acceptance_binding_invalid',
+      `[${links.turn?.id ?? 'research-turn'}] The acceptance record does not derive from its exact sources: ${reason}`,
+      { ref: links.turn ?? null, reason });
+  };
+  if (!isRef(links.turn) || !isRef(links.pending) || !isRef(links.intent) || !isRef(links.assessmentProof))
+    refuse('links');
+  if (links.turn.revision !== 1 || links.pending.id !== links.turn.id || links.pending.revision < 1
+    || links.intent.revision !== 1) refuse('turn-links');
+  const { projectId, answer, assessment, draftAfter, questionAfter } = inputs;
+  if (!matchAcceptedPaidAnswer(inputs)) refuse('acceptance-formula');
+  if (answer.revision !== 1 || !answer.id.startsWith(`research-answer:${projectId}:`)
+    || hashJson(answer.value) !== answer.hash
+    || Object.keys(answer.value).sort().join(',') !== 'assessment,projectId,question,value') refuse('answer-form');
+  if (assessment.revision !== 1 || assessment.id !== `research-assessment:${hashJson(assessment.value)}`
+    || assessment.hash !== hashJson(assessment.value)) refuse('assessment-form');
+  if (hashJson(draftAfter.value) !== draftAfter.hash || hashJson(questionAfter.value) !== questionAfter.hash
+    || hashJson(inputs.draftBefore.value) !== inputs.draftBefore.hash
+    || hashJson(inputs.questionBefore.value) !== inputs.questionBefore.hash) refuse('pair-form');
+  return { contract: ACCEPTANCE_BINDING_CONTRACT, projectId,
+    turn: links.turn, pending: links.pending, intent: links.intent,
+    draftBefore: exactRef(inputs.draftBefore), draftAfter: exactRef(draftAfter),
+    questionBefore: exactRef(inputs.questionBefore), questionAfter: exactRef(questionAfter),
+    answer: exactRef(answer), assessment: exactRef(assessment), assessmentProof: links.assessmentProof };
+}
+
 /** Analyst/planner application writes this run and pending turn together. The
  * number and request charge derive from the exact prior run and saved context. */
 export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdmission):
@@ -1082,11 +1151,26 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     requestChars: before.requestChars + canonical(input.context).length,
     error: null, pauseCode: null };
   const turn: ManagedResearchTurn = { contract: 'research-consumer-turn/v1',
-    consumerIntent: input.intent, run: input.runId, number: next,
+    consumerIntent: input.intent, acceptanceContract: ACCEPTANCE_BINDING_CONTRACT,
+    run: input.runId, number: next,
     action, assessment: null, observation: null, error: null,
     status: 'pending', question: input.question,
     ...(input.mode ? { dispatchMode: input.mode } : {}) };
   return { run, turn };
+}
+
+/** D8.4e: the synthesis handoff's original turn — the second producer of O.
+ * The same immutable fields and the same acceptance era marker as the runner
+ * application; the caller supplies only the exact handoff sources. */
+export function projectSynthesisHandoffTurn(input: { intent: Ref; runId: string; number: number;
+  action: unknown; question: Ref | null }): ManagedResearchTurn {
+  requireCondition(isRef(input.intent) && input.intent.revision === 1 && typeof input.runId === 'string'
+    && !!input.runId && Number.isSafeInteger(input.number) && input.number > 0,
+  'research_consumer_intent_invalid', 'A synthesis handoff needs its original intent and exact turn position');
+  return { contract: 'research-consumer-turn/v1', consumerIntent: input.intent,
+    acceptanceContract: ACCEPTANCE_BINDING_CONTRACT, run: input.runId, number: input.number,
+    action: input.action, assessment: null, observation: null, error: null,
+    status: 'pending', question: input.question, dispatchMode: 'synthesis' };
 }
 
 export type TurnTransitionProof =
@@ -1113,7 +1197,9 @@ export type TurnTransitionProof =
   | { kind: 'owner-review'; verdict: { necessary: boolean; reason: string; [key: string]: unknown } }
   | { kind: 'assessed-answer'; question: Revision<Question>;
       assessment: Revision<ResearchAssessment>; expandedProposal?: unknown }
-  | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs }
+  | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs;
+      /** D8.4e: the proven K; mandatory for a turn of the binding era. */
+      binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
   | { kind: 'question-reopened'; original: Revision<Question>;
       reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
   | { kind: 'repeat-context'; current: ContextReadIdentityInput;
@@ -1343,14 +1429,45 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     const matched = matchAcceptedPaidAnswer(proof.inputs);
     requireCondition(matched, 'research_consumer_intent_invalid',
       'The checked acceptance does not derive from the paid answer');
+    // D8.4e: a turn whose producer fixed the binding contract completes only
+    // from its proven K; the era is the turn's own immutable field, never the
+    // presence of a record. K names this exact pending revision (P), the
+    // original turn and intent of `before`, and the same chain the completed
+    // turn persists. A legacy-era turn accepted by new code links its K too.
+    requireCondition(acceptanceEraOf(before) === 'legacy' || proof.binding,
+      'research_acceptance_binding_invalid',
+      `[${before.run}] A managed turn of the binding era completes only through its exact acceptance record`);
+    const chain: AcceptedAnswerChain = {
+      draftBefore: exactRef(proof.inputs.draftBefore), draftAfter: exactRef(proof.inputs.draftAfter),
+      questionBefore: exactRef(proof.inputs.questionBefore), questionAfter: exactRef(proof.inputs.questionAfter),
+      answer: exactRef(proof.inputs.answer), assessment: exactRef(proof.inputs.assessment) };
+    let bindingRef: Ref | undefined;
+    if (proof.binding) {
+      const saved = proof.binding.value;
+      // The supplied K must be the exact record of THIS pending revision: its
+      // address, revision 1, its hash, P = `before` (by value hash; the
+      // caller's CAS names the revision), I = before.consumerIntent, O = the
+      // first revision of this turn, and a value that re-derives from the same
+      // inputs (chain and links alike).
+      const expected = projectAcceptanceBinding(proof.inputs, { turn: saved.turn, pending: saved.pending,
+        intent: saved.intent, assessmentProof: saved.assessmentProof });
+      requireCondition(isRef(proof.binding.ref) && proof.binding.ref.revision === 1
+        && proof.binding.ref.id === acceptanceBindingId(saved.projectId, saved.turn.id)
+        && proof.binding.ref.hash === hashJson(saved)
+        && canonical(saved) === canonical(expected)
+        && saved.pending.id === saved.turn.id && saved.turn.revision === 1
+        && canonical(saved.intent) === canonical(before.consumerIntent)
+        && saved.pending.hash === hashJson(before)
+        && saved.turn.id === managedTurnId(before.run, before.number),
+      'research_acceptance_binding_invalid',
+      `[${saved.turn?.id ?? before.run}] The acceptance record names another pending turn, intent or chain`);
+      bindingRef = proof.binding.ref;
+    }
     // Persist the exact chain: later readers consume these references instead
     // of rescanning a draft that may have accepted further answers since.
     return { ...before, status: 'completed', assessment: matched.assessment,
-      observation: matched.observation, error: null,
-      acceptance: {
-        draftBefore: exactRef(proof.inputs.draftBefore), draftAfter: exactRef(proof.inputs.draftAfter),
-        questionBefore: exactRef(proof.inputs.questionBefore), questionAfter: exactRef(proof.inputs.questionAfter),
-        answer: exactRef(proof.inputs.answer), assessment: exactRef(proof.inputs.assessment) } };
+      observation: matched.observation, error: null, acceptance: chain,
+      ...(bindingRef ? { acceptanceBinding: bindingRef } : {}) };
   }
   if (proof.kind === 'question-reopened') {
     const { original, reopened, draft } = proof;

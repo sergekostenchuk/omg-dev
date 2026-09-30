@@ -1,6 +1,6 @@
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
-import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -14,6 +14,11 @@ import type { TechnicalReport } from '../graph/research-contracts.js';
 import { Environments, uniqueTransactionGuards } from '../runtime/environment.js';
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
+import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
+import { readResearchConsumerTurn, readResearchAcceptanceBinding, pinnedLayerDeltaStore } from './response-recovery.js';
+import { researchAction, projectAcceptanceBinding, acceptanceBindingId,
+  type ManagedResearchTurn, type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
+import { expandLayerDelta } from './layer-delta.js';
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
 export interface FieldSpec { field: string; kind: "fact" | "decision" | "design"; prompt: string; risk: string; schema: Json; proof?: "extraction" | "assessment";
@@ -38,6 +43,11 @@ export interface Question {
   answer: Ref | null;
 }
 export interface Decision { projectId: string; actor: string; question: string; value: Json }
+/** D8.4e: the proven managed provenance of one acceptance (see #managedAcceptance). */
+interface ManagedAcceptance {
+  turn: Ref; pending: Ref; intent: Ref; assessment: Revision<ResearchAssessment>; assessmentProof: Ref;
+  action: unknown; expandedProposal?: unknown;
+}
 export interface Fact { projectId: string; question: string; observation: Observation }
 
 const ajv = new Ajv({ strict: true, allowUnionTypes: true });
@@ -86,7 +96,8 @@ export class Discovery {
     requireCondition(question.value.status !== "answered", "question_already_answered", "Reopen the question before changing an answer");
     return question;
   }
-  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "design" | "fact" | "research-answer", guards: TransactionGuard[]): Revision<DiscoveryDraft> {
+  #answer(question: Revision<Question>, value: Json, answer: Decision | Fact | ResearchAnswer, kind: "decision" | "design" | "fact" | "research-answer", guards: TransactionGuard[],
+    managed?: ManagedAcceptance): Revision<DiscoveryDraft> {
     const q = question.value; const draft = this.store.get<DiscoveryDraft>(q.draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.projectId === q.projectId
       && draft.value.questions.includes(question.id), "question_unbound", "Question must belong to this draft");
@@ -96,11 +107,42 @@ export class Discovery {
     requireCondition(validate(value), "answer_invalid", "The answer does not satisfy the field contract");
     const id = `${kind}:${q.projectId}:${randomUUID()}`;
     const answerRef: Ref = { id, revision: 1, hash: hashJson(answer) };
-    return this.store.writeMany<DiscoveryDraft>([
-      { id: draft.id, kind: draft.kind, expected: draft.revision, value: { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } } },
+    const draftAfter = { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } };
+    const questionAfter = { ...q, status: "answered" as const, answer: answerRef };
+    const writes: Write[] = [
+      { id: draft.id, kind: draft.kind, expected: draft.revision, value: draftAfter },
       { id, kind, expected: 0, value: answer },
-      { id: question.id, kind: question.kind, expected: question.revision, value: { ...q, status: "answered", answer: answerRef } },
-    ], uniqueTransactionGuards([...guards, ...draft.value.inputs, reference(question), reference(draft)]))[0]!;
+      { id: question.id, kind: question.kind, expected: question.revision, value: questionAfter },
+    ];
+    const bindingGuards: TransactionGuard[] = [];
+    if (managed) {
+      // D8.4e: K is derived from the PREPARED writes by the shared projection
+      // — the future draft, answer and question revisions are named before
+      // they exist — and rides the same transaction. Its current-state guards
+      // are the consumed pending revision P, the managed proof B and the
+      // supported assessment R; expected:0 is the absence of any earlier K.
+      requireCondition(kind === "research-answer", "research_acceptance_binding_invalid",
+        "Only a paid research answer takes an acceptance record");
+      const inputs: AcceptedPaidAnswerInputs = { projectId: q.projectId,
+        draftBefore: draft,
+        draftAfter: { id: draft.id, kind: draft.kind, revision: draft.revision + 1, hash: hashJson(draftAfter), value: draftAfter },
+        questionBefore: question,
+        questionAfter: { id: question.id, kind: question.kind, revision: question.revision + 1,
+          hash: hashJson(questionAfter), value: questionAfter },
+        answer: { id, kind, revision: 1, hash: answerRef.hash, value: answer as ResearchAnswer },
+        assessment: managed.assessment, action: managed.action,
+        ...(managed.expandedProposal !== undefined ? { expandedProposal: managed.expandedProposal } : {}) };
+      const binding = projectAcceptanceBinding(inputs, { turn: managed.turn, pending: managed.pending,
+        intent: managed.intent, assessmentProof: managed.assessmentProof });
+      writes.push({ id: acceptanceBindingId(q.projectId, managed.turn.id), kind: "research-acceptance-binding",
+        expected: 0, value: binding });
+      // O@1 and I are proven immutable revisions (their heads lawfully move
+      // on); the current-state guards are P, B and R plus the CAS of the
+      // three records and the absence of K.
+      bindingGuards.push(managed.pending, managed.assessmentProof, reference(managed.assessment));
+    }
+    return this.store.writeMany<DiscoveryDraft>(writes,
+      uniqueTransactionGuards([...guards, ...draft.value.inputs, reference(question), reference(draft), ...bindingGuards]))[0]!;
   }
   decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
@@ -115,7 +157,42 @@ export class Discovery {
     const observation = this.evidence.observe(question.value.projectId, source, selector);
     return this.#answer(question, observation.value, { projectId: question.value.projectId, question: id, observation }, "fact", [source]);
   }
-  researched(id: string, expected: number, assessmentRef: Ref): Revision<DiscoveryDraft> {
+  /** Accept a supported assessment as the question's answer. `managedPending`
+   * (D8.4e) is the exact pending revision P of the managed paid turn whose
+   * answer this is: the managed runner branches must pass it. Standalone and
+   * reuse callers keep the three-record acceptance without a record.
+   *
+   * D8.4e круг 3 (№2259, table W1–W6): the managed attempt is ONE wrapped
+   * unit. After the initial check of the acceptance record at the turn's
+   * address, the whole attempt — question, current bases and admission,
+   * provenance preparation, the four-record write — runs under one handler.
+   * Any TYPED refusal of that path re-reads the record before it is passed
+   * on: W1 no record → the original refusal as is; W2 a record proven wholly
+   * with the same P, R and question revision → the winner's saved result,
+   * no write, no spend, no admission on today's bases; W3 a proven record of
+   * another acceptance → research_acceptance_binding_invalid; W4 a damaged
+   * or unprovable record → the common reader's refusal as is, with address;
+   * W5 a non-typed exception → thrown as is, the record is not read; W6
+   * success — the write's expected:0 is the final protection of K. */
+  researched(id: string, expected: number, assessmentRef: Ref, managedPending?: Ref): Revision<DiscoveryDraft> {
+    if (managedPending === undefined) return this.#acceptSupported(id, expected, assessmentRef);
+    requireCondition(isRef(managedPending), 'research_acceptance_binding_invalid',
+      'A managed acceptance needs the exact pending paid turn');
+    const won = this.#winningAcceptance(id, expected, assessmentRef, managedPending);
+    if (won) return won;
+    try { return this.#acceptSupported(id, expected, assessmentRef, managedPending); }
+    catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      const winner = this.#winningAcceptance(id, expected, assessmentRef, managedPending);
+      if (winner) return winner;
+      throw error;
+    }
+  }
+  /** The acceptance attempt on today's bases: the open question at its
+   * expected revision, the exact supported assessment with current evidence,
+   * the draft's contracts, the typed basis and runtime provenance, then the
+   * write — with K when the attempt is managed. */
+  #acceptSupported(id: string, expected: number, assessmentRef: Ref, managedPending?: Ref): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
     const assessment = this.store.get<ResearchAssessment>(assessmentRef.id);
     requireCondition(assessment?.kind === "research-assessment" && assessment.hash === assessmentRef.hash && assessment.revision === assessmentRef.revision
@@ -142,8 +219,81 @@ export class Discovery {
       if (obligations.length) throw new EngineError('research_obligation_evidence_invalid','An assessed value still must satisfy its assigned knowledge kind',obligations);
     }
     const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
-    return this.#answer(question, answer.value, answer, "research-answer", [assessmentRef, assessment.value.environment,
-      ...assessment.value.observations.map(item => item.source),...runtimeGuards]);
+    const guards: TransactionGuard[] = [assessmentRef, assessment.value.environment,
+      ...assessment.value.observations.map(item => item.source), ...runtimeGuards];
+    if (managedPending === undefined) return this.#answer(question, answer.value, answer, "research-answer", guards);
+    const managed = this.#managedAcceptance(question, assessment, managedPending);
+    return this.#answer(question, answer.value, answer, "research-answer", guards, managed);
+  }
+  /** D8.4e (№2259 W2–W4): the acceptance already made for this exact managed
+   * turn, read at the turn's own address and proven wholly from its own K —
+   * or null when no record exists there (W1). The same pending revision P,
+   * the same supported assessment R and the same question revision return
+   * the winner's saved draft (W2); a proven record of another acceptance is
+   * the addressed refusal (W3); a damaged or unprovable record is the common
+   * reader's refusal as thrown (W4). Nothing here depends on today's Source,
+   * files or heads: a made acceptance is historical. */
+  #winningAcceptance(questionId: string, expected: number, assessmentRef: Ref,
+    managedPending: Ref): Revision<DiscoveryDraft> | null {
+    const head = this.store.get<Question>(questionId);
+    if (head?.kind !== 'question') return null;
+    const proven = readResearchAcceptanceBinding(this.store, head.value.projectId, managedPending.id);
+    if (!proven) return null;
+    requireCondition(canonical(reference(proven.pending)) === canonical(managedPending)
+      && canonical(reference(proven.assessment)) === canonical(assessmentRef)
+      && proven.inputs.questionBefore.id === questionId && proven.inputs.questionBefore.revision === expected,
+    'research_acceptance_binding_invalid',
+    `[${managedPending.id}] The paid turn already carries another acceptance than this one`);
+    const draftAfter = this.store.get<DiscoveryDraft>(proven.inputs.draftAfter.id, proven.inputs.draftAfter.revision);
+    requireCondition(draftAfter && canonical(reference(draftAfter)) === canonical(reference(proven.inputs.draftAfter)),
+      'research_acceptance_binding_invalid', `[${managedPending.id}] The winning acceptance lost its exact accepted draft`);
+    return draftAfter;
+  }
+  /** D8.4e boundary 1: prove the managed provenance of an acceptance before
+   * any write — P is the pending managed turn of this exact question (its
+   * reader proves O@1, I and every earlier revision), R is proven under its
+   * managed proof B whose pending revision precedes P on the same lawful
+   * chain. An existing K is never rewritten: the write's expected:0 refuses
+   * it and the winner is then proven by #winningAcceptance (W2–W4). */
+  #managedAcceptance(question: Revision<Question>, assessment: Revision<ResearchAssessment>,
+    managedPending: Ref): ManagedAcceptance {
+    const projectId = question.value.projectId;
+    requireCondition(isRef(managedPending), 'research_acceptance_binding_invalid',
+      'A managed acceptance needs the exact pending paid turn');
+    const rawPending = this.store.get<ManagedResearchTurn>(managedPending.id, managedPending.revision);
+    requireCondition(rawPending?.kind === 'research-turn' && rawPending.value.status === 'pending'
+      && canonical(reference(rawPending)) === canonical(managedPending),
+    'research_acceptance_binding_invalid', `[${managedPending.id}] The managed acceptance needs a pending revision of the paid turn`);
+    const pending = readResearchConsumerTurn(this.store, managedPending) as Revision<ManagedResearchTurn>;
+    const first = this.store.get<ManagedResearchTurn>(pending.id, 1);
+    requireCondition(first?.kind === 'research-turn' && hashJson(first.value) === first.hash
+      && pending.value.contract === 'research-consumer-turn/v1' && pending.value.status === 'pending'
+      && canonical(pending.value.question) === canonical(reference(question))
+      && canonical(first.value.consumerIntent) === canonical(pending.value.consumerIntent),
+    'research_acceptance_binding_invalid', `[${managedPending.id}] The pending paid turn does not carry this exact question`);
+    const action = researchAction(pending.value.action);
+    requireCondition((action.action === 'answer' || action.action === 'answer_delta') && action.question === question.id,
+      'research_acceptance_binding_invalid', `[${managedPending.id}] The pending paid turn is not an answer to this question`);
+    const checked = readResearchAssessmentAt(this.store, projectId, pending.id, reference(assessment));
+    requireCondition(canonical(reference(checked)) === canonical(reference(assessment)),
+      'research_assessment_binding_invalid', `[${managedPending.id}] The managed assessment is not the accepted one`);
+    const proof = this.store.get<{ pending: Ref }>(assessmentBindingId(projectId, pending.id));
+    requireCondition(proof && isRef(proof.value.pending) && proof.value.pending.id === pending.id
+      && proof.value.pending.revision <= pending.revision,
+    'research_assessment_binding_invalid', `[${managedPending.id}] The managed assessment proof precedes no lawful pending chain`);
+    for (let revision = proof.value.pending.revision; revision < pending.revision; revision += 1) {
+      const step = this.store.get<ManagedResearchTurn>(pending.id, revision);
+      requireCondition(step?.kind === 'research-turn' && step.value.status === 'pending'
+        && (revision !== proof.value.pending.revision || canonical(reference(step)) === canonical(proof.value.pending)),
+      'research_assessment_binding_invalid', `[${managedPending.id}] The assessed pending revision is not on this turn's pending chain`);
+    }
+    const expandedProposal = action.action === 'answer_delta'
+      ? expandLayerDelta(pinnedLayerDeltaStore(this.store, action),
+        this.store.get<DiscoveryDraft>(question.value.draftId)!, question, action)
+      : undefined;
+    return { turn: reference(first), pending: reference(pending), intent: pending.value.consumerIntent,
+      assessment, assessmentProof: reference(proof), action,
+      ...(expandedProposal !== undefined ? { expandedProposal } : {}) };
   }
   observations(questionId: string): Observation[] {
     const question = this.store.get<Question>(questionId);

@@ -14,9 +14,11 @@ import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { readBundle, readReaderResultAt, resumeReadBundleIntent, type ReaderResult } from '../src/discovery/reader.js';
 import { readResearchConsumerIntent, readResearchConsumerExecution, readResearchConsumerTurn,
   prepareResearchConsumerApplication, refuseResearchConsumerIntent, captureResearchConsumerRetryPermits,
-  assessmentReadView } from '../src/discovery/response-recovery.js';
-import { readResearchAssessmentAt } from '../src/discovery/research-assessment.js';
+  assessmentReadView, readResearchAcceptanceBinding, readContextTurnHistoryAt,
+  type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { readResearchAssessmentAt, assessmentBindingId } from '../src/discovery/research-assessment.js';
 import { readAssessmentPaidOrigin } from '../src/discovery/assessment-session.js';
+import { processStart } from '../src/runtime/process-identity.js';
 import { Evidence , type Source, type Observation } from '../src/evidence/evidence.js';
 import { withTypedBasis } from '../src/graph/research-basis.js';
 import { technicalProposalFindings, type LegacyPathResolution } from '../src/graph/research-evidence.js';
@@ -37,11 +39,11 @@ import { ResearchSources } from '../src/discovery/research-sources.js';
 import { prepareLateModelReceipt, readLateModelReceipt, readModelCallRecovery,
   type LateModelReceipt } from '../src/discovery/model-call-recovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
-import { canonical, hashJson } from '../src/canonical.js';
+import { canonical, digest, hashJson } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import type { Question } from '../src/discovery/discovery.js';
-import type { ResearchTurn } from '../src/discovery/research-model.js';
+import type { ResearchTurn, ResearchAssessment } from '../src/discovery/research-model.js';
 
 for (const planning of [false, true]) for (const afterApplied of [false, true])
 test(`reader consumer ${planning ? 'planned' : 'ordinary'} resumes ${afterApplied ? 'completed R before current files' : 'paid stale child twice'} by exact membership`, async t => {
@@ -1012,7 +1014,9 @@ test('paid preview recovers only its isolated copy and completed preview does no
 import { synthesisSession, readSynthesisSession } from '../src/discovery/synthesis-session.js';
 import { projectPaidSynthesisTransition } from '../src/discovery/response-recovery.js';
 import { recoverContextSession } from '../src/discovery/context-recovery.js';
-import { CONTEXT_RECOVERY_SUPERSEDE_REASON } from '../src/discovery/research-consumer-transition.js';
+import { CONTEXT_RECOVERY_SUPERSEDE_REASON, acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding,
+  projectSynthesisHandoffTurn, ACCEPTANCE_BINDING_CONTRACT,
+  type ManagedResearchTurn, type ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { pilotContext } from '../src/discovery/pilot-context.js';
 import { pilotEnvironment } from '../src/discovery/reader-pilot.js';
 import { readResearchContext } from '../src/discovery/research-limits.js';
@@ -4269,3 +4273,1209 @@ test('D8.4d-5 three outcomes: the authorization and the environment of an observ
   assert.throws(() => readRuntimeEvidenceAt(f.hiding(f.open(), foreign.observation.id), 'p', f.spec, mixed, [cited, foreignCitation], selection.runtime, selection.admission),
     { code: 'runtime_evidence_invalid' }, 'the excluded candidate\'s lost record is still a lost basis');
 });
+
+/** D8.4e R2: the L3 answer_delta setup of 'a paid L3 terminal binds from its exact original graph after the head moved', up to the scripted replies — the run itself is the test's. */
+function l3DeltaFixture(t: test.TestContext) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84-layer-graph-')));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  const full = enrichedGraph(exampleGraph('p'), 'p');
+  preparedFeatures(engine, 'p', full);
+  const { level: _level, ...initial } = projectGraph(full, 1);
+  engine.graphs.save('p', initial, store.get('graph:p')!.revision, 'fixture');
+  writeFileSync(join(root, 'README.md'), 'A local scoped transformation with an atomic result and recovery.\n');
+  const adapter = join(root, 'adapter.mjs'), replies = join(root, 'replies.json'), wire = join(root, 'wire.ndjson');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,f=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role,mode:s.dispatchMode,previous:s.previousProposalRef??null})+'\\n');
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :s.dispatchMode==='planning'?{action:'synthesize',question:s.question.id}
+ :{action:'answer_delta',question:s.question.id,base:s.graphBase,
+   ...(s.previousProposalRef?{...f.correction,revises:s.previousProposalRef}:f.first),citations:f.citations};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
+ usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const pilot = configureReaderPilot(store, engine.environments, 'p', {
+    experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command },
+    agentCommand: command, maxRequestChars: 100000, maxReadChars: 60000,
+    maxReplyChars: 100000, maxCalls: 12, maxReportedTokens: 100000,
+    planning: { fields: ['layerDesign'], maxRequestChars: 100000, maxRounds: 3 } }, 0);
+  configurePhasePolicy(store, 'p', 'L3', 'layer-refusal', 0);
+  const calibrated = pilotEnvironment(engine.environments.get('p').value, pilot.value);
+  for (const [purpose, role] of [['reading-planner', calibrated.implementer],
+    ['analyst', calibrated.implementer], ['assessor', calibrated.reviewer]] as const) {
+    store.write({ id: `model-call:layer-calibration-${purpose}`, kind: 'model-call', expected: 0,
+      value: { projectId: 'p', draftId: 'fixture', purpose, requestId: `layer-calibration-${purpose}`,
+        startedAt: 0, finishedAt: 1, status: 'succeeded', requested: role,
+        confirmed: { model: null, effort: null, speed: null },
+        request: { chars: 1000, bytes: 1000, hash: hashJson(purpose) }, response: null,
+        usage: { inputTokens: 100, outputTokens: 25, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+        usageSource: 'adapter', error: null } });
+  }
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+  engine.refinement.sealLayer('p', 1, 0);
+  const r1 = engine.refinement.begin('p', 'R1');
+  answerTechnicalFixture(engine, 'p', r1);
+  engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
+  const l2 = engine.refinement.prepareLayer('p', 2);
+  const ready2 = answerLayerFixture(engine, 'p', l2, 2, full);
+  engine.refinement.buildLayer('p', 2, reference(ready2), store.get('graph:p')!.revision, 'fixture');
+  engine.refinement.sealLayer('p', 2, 0);
+  configureResearchScope(store, { projectId: 'p', layer: reference(store.get('graph-layer:p:2')!),
+    r1: reference(store.get('phase:p:R1')!), outcome: 'Validated local output',
+    nodes: full.nodes.filter(node => node.kind === 'operation').map(node => node.id),
+    boundaries: [], expansions: [], obligations: [], changedPaths: [], uiRequired: false }, 0);
+  const r2 = engine.refinement.begin('p', 'R2');
+  answerTechnicalFixture(engine, 'p', r2);
+  engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
+  const draft = engine.refinement.prepareLayer('p', 3);
+  configureBudgetSegment(store, 'p', 'layer-refusal');
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const source = engine.discovery.evidence.document('p', 'design-source',
+    'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
+  const citations = [{ source: reference(source), selector: { kind: 'text-range' as const, start: 0, end: source.value.content.length } }];
+  const delta = layerDeltaView(store, 'p', layerDesignOf(full, 3, question.value.spec.layerAssembly), 3,
+    question.value.spec.layerAssembly);
+  writeFileSync(replies, JSON.stringify({ first: { horizon: delta.horizon, upserts: delta.upserts, removes: delta.removes },
+    correction: { upserts: {}, removes: {} }, citations }));
+  return { root, database, store, engine, draft, question, open, replies, wire, full };
+}
+
+// ===========================================================================
+// D8.4e (№2211): the acceptance record K, the era marker of §4 and the
+// completion of the original paid turn — rows R1–R17 of the reviewer's table.
+// Every fixture drives the real producers (runner, assessor, Discovery) with
+// a scripted adapter; interruptions are the fixture's own thrown errors after
+// (or before) a named durable write, never edited records — except where a
+// row is about damaged or substituted records, which are rewritten in place
+// with recalculated hashes and restored afterwards.
+// ===========================================================================
+function acceptanceFixture(t: test.TestContext, options: { neighbor?: boolean; second?: boolean; prefix?: string } = {}) {
+  const root = mkdtempSync(join(tmpdir(), `omg-d84e-${options.prefix ?? 'acceptance'}-`));
+  const database = join(root, 'state.sqlite'), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Acceptance record' });
+  const source = engine.discovery.evidence.document('p', 'proof', 'Grounded local condition', 'text/plain', 0);
+  const wire = join(root, 'wire.ndjson'), adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+appendFileSync(${JSON.stringify(wire)},JSON.stringify({role:s.role??null})+'\\n');
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:s.questions[0].id,value:{ok:true},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:24}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation', [
+    { field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } },
+    ...(options.second ? [{ field: 'second', kind: 'design' as const, prompt: 'Resolve second', risk: 'Missing second', schema: { type: 'object' } }] : []),
+    ...(options.neighbor === false ? [] : [{ field: 'neighbor', kind: 'decision' as const, prompt: 'Owner chooses neighbor',
+      risk: 'Undecided neighbor', schema: { type: 'object' } }])]);
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const calls = (db: Store = store) => db.list('model-call').length;
+  const counts = (db: Store = store) => ({ calls: db.list('model-call').length, answers: db.list('research-answer').length,
+    assessments: db.list('research-assessment').length, bindings: db.list('research-acceptance-binding').length,
+    turns: db.list('research-turn').length });
+  const paidTurn = (db: Store = store) => db.list<ResearchTurn>('research-turn')
+    .filter(turn => turn.id.startsWith('research-turn:v1:')).sort((a, b) => a.value.number - b.value.number)[0]!;
+  const binding = (db: Store = store) => db.get<ResearchAcceptanceBinding>(acceptanceBindingId('p', paidTurn(db).id));
+  const hook = (db: Store, predicate: (writes: Write[]) => boolean, act: (writes: Write[]) => void,
+    label: string, when: 'before' | 'after' = 'after') => {
+    const original = db.writeMany.bind(db); let hit = false;
+    db.writeMany = ((writes: Write[], guards: any = []) => {
+      if (when === 'before' && !hit && predicate(writes)) { hit = true; act(writes); }
+      const rows = original(writes, guards);
+      if (when === 'after' && !hit && predicate(writes)) { hit = true; act(writes); }
+      return rows;
+    }) as typeof db.writeMany;
+    return () => { db.writeMany = original; assert.ok(hit, `the fixture hook fired (${label})`); };
+  };
+  // A typed interruption stands for a refusal of the path; a CRASH after a
+  // durable write (the process dying) is a plain Error — D8.4e-3 W5: never a
+  // typed refusal that the managed wrapper could resolve into the own record.
+  const interruptAfter = (db: Store, predicate: (writes: Write[]) => boolean, code: string, crash = false) =>
+    hook(db, predicate, () => {
+      if (crash) throw Object.assign(new Error(`Fixture crashed after the durable write (${code})`), { code });
+      throw new EngineError(code, 'Fixture interrupted after the durable write');
+    }, code, 'after');
+  const rewrite = (id: string, revision: number, value: unknown) => {
+    const raw = new DatabaseSync(database);
+    try {
+      raw.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+      raw.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?')
+        .run(canonical(value), hashJson(value), id, revision);
+    } finally { raw.close(); }
+  };
+  const decideNeighbor = (db: Store = store) => {
+    const neighbor = db.get<Question>(draft.value.questions.at(-1)!)!;
+    return new ProductEngine(db).discovery.decision(neighbor.id, neighbor.revision, 'owner', { ready: true });
+  };
+  return { root, database, store, engine, source, environment, draft, question, adapter, wire, open, calls, counts,
+    paidTurn, binding, hook, interruptAfter, rewrite, decideNeighbor };
+}
+type AcceptanceFixture = ReturnType<typeof acceptanceFixture>;
+const K_WRITE = (writes: Write[]) => writes.some(write => write.kind === 'research-acceptance-binding');
+const B_WRITE = (writes: Write[]) => writes.some(write => write.kind === 'research-assessment-binding');
+const T_WRITE = (writes: Write[]) => writes.some(write => write.kind === 'research-turn'
+  && (write.value as ResearchTurn).status === 'completed'
+  && (write.value as { acceptanceBinding?: unknown }).acceptanceBinding !== undefined);
+const managedOf = (turn: Revision<ResearchTurn>) => turn.value as ManagedResearchTurn;
+
+test('D8.4e §4 era: the runner application fixes the acceptance contract on O@1; the validator refuses a turn write without it or with another; readers keep it immutable', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'era' });
+  const outcomes: string[] = [];
+  const restore = f.hook(f.store, writes => writes.some(write => write.kind === 'research-turn' && write.expected === 0
+    && (write.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'), writes => {
+    const turnWrite = writes.find(write => write.kind === 'research-turn')!;
+    const runWrite = writes.find(write => write.kind === 'research-run')!;
+    const intent = f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+      .find(item => item.value.kind === 'analyst' && item.value.state === 'running')!;
+    const paid = readResearchConsumerExecution(f.store, 'p', reference(intent));
+    const guards = [reference(f.store.get(runWrite.id)!), { id: turnWrite.id, absent: true as const },
+      reference(f.store.get('environment:p')!)];
+    const attempt = (turn: unknown) => {
+      try {
+        prepareResearchConsumerApplication(f.store, reference(intent), reference(paid.call),
+          [runWrite, { ...turnWrite, value: turn }], guards);
+        return 'accepted';
+      } catch (error) { return error instanceof EngineError ? error.code : 'other'; }
+    };
+    const { acceptanceContract, ...without } = turnWrite.value as ManagedResearchTurn;
+    outcomes.push(String(acceptanceContract), attempt(turnWrite.value), attempt(without),
+      attempt({ ...without, acceptanceContract: 'research-acceptance-binding/v0' }));
+  }, 'era-application', 'before');
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  assert.deepEqual(outcomes, [ACCEPTANCE_BINDING_CONTRACT, 'accepted',
+    'research_consumer_intent_invalid', 'research_consumer_intent_invalid']);
+  const turn = f.paidTurn(), original = f.store.get<ManagedResearchTurn>(turn.id, 1)!;
+  assert.equal(original.value.acceptanceContract, ACCEPTANCE_BINDING_CONTRACT);
+  assert.equal(acceptanceEraOf(original.value), 'binding');
+  assert.equal(managedOf(turn).acceptanceContract, ACCEPTANCE_BINDING_CONTRACT,
+    'the completed revision carries the producer marker unchanged');
+  // A later revision that drops or rewrites the marker is refused like a rewritten paid action.
+  const { acceptanceContract: _dropped, ...stripped } = managedOf(turn);
+  f.rewrite(turn.id, turn.revision, stripped);
+  assert.throws(() => readResearchConsumerTurn(f.open(), { id: turn.id, revision: turn.revision, hash: hashJson(stripped) }),
+    { code: 'research_consumer_intent_invalid' });
+  f.rewrite(turn.id, turn.revision, turn.value);
+  // An unknown contract on the original is a refusal, not another era.
+  f.rewrite(turn.id, 1, { ...original.value, acceptanceContract: 'research-acceptance-binding/v0' });
+  assert.throws(() => readResearchConsumerTurn(f.open(), reference(turn)), { code: 'research_consumer_intent_invalid' });
+  f.rewrite(turn.id, 1, original.value);
+  // A legacy-address turn cannot claim the marker or a binding link.
+  for (const claim of [{ acceptanceContract: ACCEPTANCE_BINDING_CONTRACT }, { acceptanceBinding: reference(f.binding()!) }]) {
+    const legacy = f.store.write<ResearchTurn>({ id: `research-turn:${hashJson(['legacy', Object.keys(claim)[0]])}`,
+      kind: 'research-turn', expected: 0,
+      value: { run: 'research-run:legacy', number: 1, action: { action: 'pause', reason: 'legacy' }, assessment: null,
+        observation: null, error: null, status: 'pending', question: null, ...claim } as ResearchTurn });
+    assert.throws(() => readResearchConsumerTurn(f.store, reference(legacy)), { code: 'research_consumer_intent_invalid' });
+  }
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e §4 era: the synthesis handoff fixes the same acceptance contract on its original turn through the shared projection', async t => {
+  const f = await synthesisV2Fixture(t, `
+if(c.dispatchMode==='planning')research={action:'synthesize',question:c.question.id};
+else research={action:'pause',reason:'Hold the run'};`);
+  const siblingValue = { applicability: 'applicable', reason: 'Settled by the owner', facts: [],
+    designs: [{ id: 'sibling-design', decision: 'A settled sibling', benefit: 'Focus', consumer: 'compilation' }], gaps: [] };
+  for (const id of f.draft.value.questions.slice(1)) {
+    const sibling = f.store.get<Question>(id)!;
+    f.engine.discovery.decision(sibling.id, sibling.revision, 'owner', siblingValue);
+  }
+  const { projectId: _p, ...settings } = f.pilot.value;
+  configureReaderPilot(f.store, f.engine.environments, 'p', { ...settings,
+    planning: { fields: [f.question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, f.pilot.revision);
+  const run = await f.engine.researcher.run('p', f.draft.id, 4);
+  assert.equal(run.value.status, 'paused', JSON.stringify(run.value));
+  const handoff = f.store.list<ResearchTurn>('research-turn')
+    .find(turn => turn.id.startsWith('research-turn:v1:') && turn.value.dispatchMode === 'synthesis')!;
+  assert.ok(handoff, 'the synthesis outcome was handed off to a managed turn');
+  const original = f.store.get<ManagedResearchTurn>(handoff.id, 1)!;
+  assert.equal(original.value.acceptanceContract, ACCEPTANCE_BINDING_CONTRACT);
+  assert.equal(acceptanceEraOf(original.value), 'binding');
+  assert.deepEqual(original.value, projectSynthesisHandoffTurn({ intent: original.value.consumerIntent,
+    runId: original.value.run, number: original.value.number, action: original.value.action, question: original.value.question }));
+  readResearchConsumerTurn(f.open(), reference(handoff));
+});
+
+test('D8.4e R1: a supported managed answer writes draft, answer, question and K in one transaction and completes the turn from K', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r1' });
+  const transactions: string[][] = [];
+  const original = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes: Write[], guards: any = []) => {
+    transactions.push(writes.map(write => write.kind).sort()); return original(writes, guards);
+  }) as typeof f.store.writeMany;
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  f.store.writeMany = original;
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  assert.deepEqual(transactions.find(kinds => kinds.includes('research-acceptance-binding')),
+    ['discovery-draft', 'question', 'research-acceptance-binding', 'research-answer']);
+  const turn = f.paidTurn(), k = f.binding()!;
+  assert.ok(k); assert.equal(k.revision, 1); assert.equal(k.kind, 'research-acceptance-binding');
+  assert.equal(turn.value.status, 'completed'); assert.equal(turn.revision, 2);
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(k));
+  assert.equal(managedOf(turn).acceptanceContract, ACCEPTANCE_BINDING_CONTRACT);
+  const chain = managedOf(turn).acceptance!;
+  assert.deepEqual([chain.draftBefore, chain.draftAfter, chain.questionBefore, chain.questionAfter, chain.answer, chain.assessment],
+    [k.value.draftBefore, k.value.draftAfter, k.value.questionBefore, k.value.questionAfter, k.value.answer, k.value.assessment]);
+  assert.deepEqual(k.value.turn, reference(f.store.get(turn.id, 1)!));
+  assert.deepEqual(k.value.pending, k.value.turn, 'P is O@1: no pending revision followed the original');
+  assert.deepEqual(k.value.intent, managedOf(turn).consumerIntent);
+  assert.deepEqual(k.value.assessmentProof, reference(f.store.get(assessmentBindingId('p', turn.id))!));
+  assert.deepEqual(Object.keys(k.value).sort(), ['answer', 'assessment', 'assessmentProof', 'contract', 'draftAfter',
+    'draftBefore', 'intent', 'pending', 'projectId', 'questionAfter', 'questionBefore', 'turn']);
+  const proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  assert.deepEqual(reference(proven.pending), k.value.pending);
+  assert.deepEqual(reference(proven.assessment), k.value.assessment);
+  assert.deepEqual(Object.keys(proven.inputs.answer.value).sort(), ['assessment', 'projectId', 'question', 'value']);
+  assert.deepEqual(readResearchConsumerTurn(f.open(), reference(turn)).value, turn.value);
+  const counts = f.counts();
+  assert.deepEqual([counts.answers, counts.assessments, counts.bindings, counts.turns], [1, 1, 1, 1]);
+  assert.equal(f.store.get<Question>(f.question.id)!.revision, 2);
+});
+
+test('D8.4e R2: an accepted answer_delta records K with the exact original proposal bases; the history stays readable after the graph head moved', async t => {
+  const f = l3DeltaFixture(t);
+  const run = await f.engine.researcher.run('p', f.draft.id, 4);
+  const turn = f.store.list<ResearchTurn>('research-turn')
+    .find(item => item.id.startsWith('research-turn:v1:') && (item.value.action as { action?: string })?.action === 'answer_delta')!;
+  assert.ok(turn, JSON.stringify(run.value));
+  assert.equal(turn.value.status, 'completed', JSON.stringify({ run: run.value, turn: turn.value }));
+  const k = f.store.get<ResearchAcceptanceBinding>(acceptanceBindingId('p', turn.id))!;
+  assert.ok(k, 'the delta acceptance wrote its record');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(k));
+  const proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  assert.notEqual(proven.inputs.expandedProposal, undefined);
+  assert.deepEqual(proven.inputs.expandedProposal, proven.assessment.value.value);
+  const graph = f.store.get<Graph>('graph:p')!, block = graph.value.nodes.find(node => node.kind === 'block')!;
+  f.engine.graphs.save('p', { ...graph.value,
+    nodes: graph.value.nodes.map(node => node.id === block.id ? { ...node, purpose: `${node.purpose} moved after acceptance` } : node) },
+    graph.revision, 'fixture');
+  const again = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  assert.deepEqual(again.inputs.expandedProposal, proven.inputs.expandedProposal,
+    'the delta expands against its exact original bases, not today\'s graph');
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e R3: the shared projection accepts a lawful later pending revision of the same turn and refuses foreign or later original links', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r3' });
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  const turn = f.paidTurn(), k = f.binding()!, proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  const links = { turn: k.value.turn, pending: k.value.pending, intent: k.value.intent, assessmentProof: k.value.assessmentProof };
+  assert.deepEqual(projectAcceptanceBinding(proven.inputs, links), k.value, 'the producer projection re-derives the saved record');
+  const later = projectAcceptanceBinding(proven.inputs, { ...links, pending: { ...k.value.pending, revision: 3, hash: hashJson({ later: true }) } });
+  assert.deepEqual([later.turn, later.intent, later.pending.revision], [k.value.turn, k.value.intent, 3],
+    'O and I are preserved while P is the consumed later revision');
+  for (const [name, bad] of [
+    ['a pending of another turn', { ...links, pending: { ...k.value.pending, id: 'research-turn:v1:other' } }],
+    ['an original beyond revision 1', { ...links, turn: { ...k.value.turn, revision: 2 } }],
+    ['an intent beyond revision 1', { ...links, intent: { ...k.value.intent, revision: 2 } }],
+  ] as const) assert.throws(() => projectAcceptanceBinding(proven.inputs, bad), { code: 'research_acceptance_binding_invalid' }, name);
+});
+
+test('D8.4e R4: a failure after the paid assessment and before the acceptance reuses the same assessment; a stale target refuses without the four writes or new payment', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r4' });
+  const restore = f.interruptAfter(f.store, B_WRITE, 'fixture_after_assessment');
+  const first = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(first.value.pauseCode, 'fixture_after_assessment');
+  const before = f.counts();
+  assert.deepEqual([before.answers, before.bindings, before.assessments], [0, 0, 1]);
+  const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  assert.deepEqual(f.counts(db), { ...before, answers: 1, bindings: 1 }, 'the same paid assessment is accepted without a new call');
+  assert.equal(f.paidTurn(db).value.status, 'completed');
+  const g = acceptanceFixture(t, { neighbor: false, prefix: 'r4-stale' });
+  const restoreG = g.interruptAfter(g.store, B_WRITE, 'fixture_after_assessment');
+  await g.engine.researcher.run('p', g.draft.id, 1);
+  restoreG();
+  const draft = g.store.get<any>(g.draft.id)!;
+  g.store.write({ id: draft.id, kind: draft.kind, expected: draft.revision,
+    value: { ...draft.value, fields: { ...draft.value.fields, result: { moved: true } } } });
+  const beforeG = g.counts();
+  const stale = await new ProductEngine(g.open()).researcher.run('p', g.draft.id, 1);
+  assert.equal(stale.value.status, 'paused', JSON.stringify(stale.value));
+  assert.equal(stale.value.pauseCode, 'target_stale');
+  assert.deepEqual(g.counts(), beforeG, 'no acceptance write, no new payment');
+  assert.equal(g.paidTurn().value.status, 'pending');
+});
+
+test('D8.4e R5: a crash after the atomic acceptance and before the completed turn is finished by a new Store from K without new work', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r5' });
+  const restore = f.interruptAfter(f.store, K_WRITE, 'fixture_after_acceptance', true);
+  const first = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(first.value.pauseCode, 'research_interrupted', 'a crash after the durable acceptance');
+  const before = f.counts();
+  assert.deepEqual([before.answers, before.bindings, before.assessments], [1, 1, 1]);
+  assert.equal(f.paidTurn().value.status, 'pending');
+  const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  const turn = f.paidTurn(db);
+  assert.equal(turn.value.status, 'completed'); assert.equal(turn.revision, 2);
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding(db)!));
+  assert.deepEqual(f.counts(db), before, 'answer, K, assessment and model-call counts do not grow');
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e R6: an independent neighbour accepted before our acceptance stays in our own adjacent pair; the assessment draft is not imposed as the head', async t => {
+  const f = acceptanceFixture(t, { neighbor: true, prefix: 'r6' });
+  const restore = f.interruptAfter(f.store, B_WRITE, 'fixture_after_assessment');
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const assessed = f.store.get<any>(f.draft.id)!;
+  const advanced = f.decideNeighbor();
+  assert.equal(advanced.revision, assessed.revision + 1);
+  const calls = f.calls();
+  const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  assert.equal(f.calls(db), calls);
+  const k = f.binding(db)!, turn = f.paidTurn(db);
+  assert.equal(k.value.draftBefore.revision, advanced.revision);
+  assert.equal(k.value.draftAfter.revision, advanced.revision + 1);
+  const proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  assert.deepEqual(proven.inputs.draftBefore.value.fields['neighbor'], { ready: true });
+  assert.deepEqual(proven.inputs.draftAfter.value.fields['neighbor'], { ready: true });
+  const proof = db.get<Record<string, any>>(assessmentBindingId('p', turn.id))!;
+  assert.equal(proof.value.draft.revision, assessed.revision, 'the assessment keeps its own captured draft');
+  assert.equal(turn.value.status, 'completed');
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e R7: after K a neighbour decision, a re-configured environment or a moved Source head leave the history readable by its exact sources; the turn completes without new work and the new admission is separate', async t => {
+  const f = acceptanceFixture(t, { neighbor: true, prefix: 'r7' });
+  const restore = f.interruptAfter(f.store, K_WRITE, 'fixture_after_acceptance', true);
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const before = f.counts();
+  f.decideNeighbor();
+  const environment = f.store.get<any>('environment:p')!;
+  f.engine.environments.configure('p', { ...environment.value, timeoutMs: 6000 }, environment.revision);
+  const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  assert.deepEqual(f.counts(db), before, 'no repeated researched, assessment or dispatch');
+  const turn = f.paidTurn(db);
+  assert.equal(turn.value.status, 'completed');
+  readResearchConsumerTurn(f.open(), reference(turn));
+  // A moved head of the cited Source after K: the turn still completes from K on the restart and the history reads by
+  // its exact captured source. The new admission is separate: the gate finds the accepted evidence stale, reopens the
+  // question and the new research refuses on the moved head — without touching the completed turn or its record.
+  const g = acceptanceFixture(t, { neighbor: false, prefix: 'r7-source' });
+  const restoreG = g.interruptAfter(g.store, K_WRITE, 'fixture_after_acceptance', true);
+  await g.engine.researcher.run('p', g.draft.id, 1);
+  restoreG();
+  const pending = g.paidTurn(), beforeG = g.counts();
+  const source = g.store.get<any>(g.source.id)!;
+  g.store.write({ id: source.id, kind: source.kind, expected: source.revision,
+    value: { ...source.value, content: 'Later unrelated source head', sha256: digest('Later unrelated source head') } });
+  const dbG = g.open(), resumedG = await new ProductEngine(dbG).researcher.run('p', g.draft.id, 1);
+  const completed = dbG.get<ResearchTurn>(pending.id)!;
+  assert.equal(completed.revision, pending.revision + 1);
+  assert.equal(completed.value.status, 'completed');
+  assert.deepEqual(managedOf(completed).acceptanceBinding, reference(g.binding(dbG)!));
+  const after = g.counts(dbG);
+  assert.deepEqual([after.answers, after.bindings, after.assessments], [beforeG.answers, beforeG.bindings, beforeG.assessments],
+    'the completed acceptance is not repeated');
+  assert.equal(resumedG.value.status, 'paused', JSON.stringify(resumedG.value));
+  assert.equal(resumedG.value.pauseCode, 'source_stale', 'the new admission on the moved head is a separate typed outcome');
+  const proven = readResearchAcceptanceBinding(g.open(), 'p', pending.id)!;
+  assert.deepEqual(proven.inputs.answer.value.value, { ok: true });
+  readResearchConsumerTurn(g.open(), reference(completed));
+  // The accepted question reopened after K and before T: the completion still derives from K on the restart (the
+  // question head is not a condition of it); the reopened question is then new work of the run, counted apart.
+  const r = acceptanceFixture(t, { neighbor: false, prefix: 'r7-reopen' });
+  const restoreR = r.interruptAfter(r.store, K_WRITE, 'fixture_after_acceptance', true);
+  await r.engine.researcher.run('p', r.draft.id, 1);
+  restoreR();
+  const pendingR = r.paidTurn(), k1 = r.binding()!, answered = r.store.get<Question>(r.question.id)!;
+  assert.equal(answered.value.status, 'answered');
+  r.engine.discovery.reopen(answered.id, answered.revision);
+  const dbR = r.open(), resumedR = await new ProductEngine(dbR).researcher.run('p', r.draft.id, 1);
+  const completedR = dbR.get<ResearchTurn>(pendingR.id, pendingR.revision + 1)!;
+  assert.ok(completedR, JSON.stringify(resumedR.value));
+  assert.equal(completedR.value.status, 'completed');
+  assert.deepEqual(managedOf(completedR).acceptanceBinding, reference(k1));
+  assert.deepEqual(readResearchConsumerTurn(r.open(), reference(completedR)).value, completedR.value);
+  assert.deepEqual(dbR.get(k1.id)!.value, k1.value, 'K of the first acceptance is untouched by the reopened question');
+});
+
+test('D8.4e R8: a repeat after the completed turn, on the same and on new Stores, returns the same proven completion without new revisions or spend', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r8' });
+  const first = await f.engine.researcher.run('p', f.draft.id, 1);
+  assert.equal(first.value.status, 'completed', JSON.stringify(first.value));
+  const turn = f.paidTurn(), before = f.counts();
+  for (const db of [f.store, f.open(), f.open()]) {
+    const again = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+    assert.equal(again.value.status, 'completed');
+    assert.deepEqual(f.paidTurn(db), turn);
+    assert.deepEqual(f.counts(db), before);
+  }
+});
+
+test('D8.4e R9: two Stores accepting one paid turn write one K and one answer; the loser proves the winner and completes the same turn once', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r9-accept' });
+  const rival = f.open();
+  let rivalAccepted: Revision<unknown> | null = null;
+  const restore = f.hook(f.store, K_WRITE, writes => {
+    const k = writes.find(write => write.kind === 'research-acceptance-binding')!.value as ResearchAcceptanceBinding;
+    const question = rival.get<Question>(k.questionBefore.id)!;
+    rivalAccepted = new ProductEngine(rival).discovery.researched(question.id, question.revision, k.assessment, k.pending);
+  }, 'rival-acceptance', 'before');
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  assert.ok(rivalAccepted, 'the rival Store accepted first');
+  const counts = f.counts();
+  assert.deepEqual([counts.answers, counts.bindings, f.store.get<Question>(f.question.id)!.revision], [1, 1, 2]);
+  const turn = f.paidTurn();
+  assert.equal(turn.revision, 2); assert.equal(turn.value.status, 'completed');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e R9: two Stores completing one accepted turn keep one completed revision; a different completion is the conflict as thrown', async t => {
+  for (const forged of [false, true]) {
+    const f = acceptanceFixture(t, { neighbor: false, prefix: forged ? 'r9-forged' : 'r9-complete' });
+    const rival = f.open();
+    const restore = f.hook(f.store, T_WRITE, writes => {
+      const turnWrite = writes.find(write => write.kind === 'research-turn')!;
+      const pending = rival.get<ResearchTurn>(turnWrite.id)!;
+      const value = forged
+        ? { ...(turnWrite.value as object), observation: { verdict: 'supported', reasons: ['forged by the rival'] } }
+        : turnWrite.value;
+      rival.writeMany([{ id: turnWrite.id, kind: 'research-turn', expected: pending.revision, value }], [reference(pending)]);
+    }, 'rival-completion', 'before');
+    const run = await f.engine.researcher.run('p', f.draft.id, 1);
+    restore();
+    const turn = f.paidTurn();
+    assert.equal(turn.revision, 2, 'one completed revision');
+    if (forged) {
+      assert.equal(run.value.status, 'paused');
+      assert.ok(['input_stale', 'revision_conflict'].includes(run.value.pauseCode ?? ''), String(run.value.pauseCode));
+    } else {
+      assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+      readResearchConsumerTurn(f.open(), reference(turn));
+    }
+    const counts = f.counts();
+    assert.deepEqual([counts.answers, counts.bindings], [1, 1]);
+  }
+});
+
+test('D8.4e R10: every guarded basis of the acceptance moving between the check and the write is a CAS refusal without a partial acceptance', async t => {
+  const probes: [string, (f: AcceptanceFixture) => void][] = [
+    ['question head', f => { const q = f.store.get<Question>(f.question.id)!;
+      f.store.write({ id: q.id, kind: 'question', expected: q.revision, value: q.value }); }],
+    ['draft head (neighbour decision)', f => { f.decideNeighbor(); }],
+    ['pending turn P', f => { const p = f.paidTurn();
+      f.store.write({ id: p.id, kind: 'research-turn', expected: p.revision, value: p.value }); }],
+    ['environment head', f => { const e = f.store.get<any>('environment:p')!;
+      f.engine.environments.configure('p', { ...e.value, timeoutMs: 6000 }, e.revision); }],
+    ['observation source head', f => { const s = f.store.get<any>(f.source.id)!;
+      f.store.write({ id: s.id, kind: s.kind, expected: s.revision,
+        value: { ...s.value, content: 'Grounded local condition moved', sha256: digest('Grounded local condition moved') } }); }],
+  ];
+  for (const [name, move] of probes) {
+    const f = acceptanceFixture(t, { neighbor: name.includes('neighbour'), prefix: 'r10' });
+    let calls = -1;
+    const restore = f.hook(f.store, K_WRITE, () => { calls = f.calls(); move(f); }, `r10 ${name}`, 'before');
+    const run = await f.engine.researcher.run('p', f.draft.id, 1);
+    restore();
+    assert.equal(run.value.status, 'paused', name);
+    assert.ok(['input_stale', 'revision_conflict'].includes(run.value.pauseCode ?? ''), `${name}: ${run.value.pauseCode}`);
+    const counts = f.counts();
+    assert.deepEqual([counts.answers, counts.bindings, counts.calls], [0, 0, calls], name);
+    assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'open', name);
+    assert.equal(f.paidTurn().value.status, 'pending', name);
+  }
+});
+
+test('D8.4e R11: in the binding era a research answer on the question without K is a refusal, never a scan; a damaged K is a refusal, never the legacy chain', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r11-missing' });
+  const restore = f.interruptAfter(f.store, B_WRITE, 'fixture_after_assessment');
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(f.paidTurn().value.status, 'pending');
+  const assessment = f.store.list<ResearchAssessment>('research-assessment')[0]!;
+  const question = f.store.get<Question>(f.question.id)!;
+  // The same paid answer accepted by the standalone route: a similar pair exists, no K.
+  f.engine.discovery.researched(question.id, question.revision, reference(assessment));
+  assert.deepEqual([f.counts().answers, f.counts().bindings], [1, 0]);
+  const calls = f.calls();
+  for (const db of [f.open(), f.open()]) {
+    const resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+    assert.equal(resumed.value.status, 'paused', JSON.stringify(resumed.value));
+    assert.equal(resumed.value.pauseCode, 'research_acceptance_binding_invalid');
+    assert.equal(f.paidTurn(db).value.status, 'pending');
+    assert.equal(f.calls(db), calls);
+    assert.equal(db.list('research-acceptance-binding').length, 0, 'no fictitious K');
+  }
+  // A K planted at the address of a pending turn that names no real acceptance is a damaged mandatory source of a
+  // claimed acceptance — an addressed refusal, never a completion and never a new acceptance under it.
+  const h = acceptanceFixture(t, { neighbor: false, prefix: 'r11-planted' });
+  const restoreH = h.interruptAfter(h.store, B_WRITE, 'fixture_after_assessment');
+  await h.engine.researcher.run('p', h.draft.id, 1);
+  restoreH();
+  const pendingH = h.paidTurn(), proofH = h.store.get<Record<string, any>>(assessmentBindingId('p', pendingH.id))!;
+  const assessmentH = h.store.list<ResearchAssessment>('research-assessment')[0]!;
+  const questionH = h.store.get<Question>(h.question.id)!, draftH = h.store.get<any>(h.draft.id)!;
+  h.store.write({ id: acceptanceBindingId('p', pendingH.id), kind: 'research-acceptance-binding', expected: 0,
+    value: { contract: ACCEPTANCE_BINDING_CONTRACT, projectId: 'p', turn: reference(pendingH), pending: reference(pendingH),
+      intent: managedOf(pendingH).consumerIntent, draftBefore: reference(draftH),
+      draftAfter: { id: draftH.id, revision: draftH.revision + 1, hash: hashJson({ planted: true }) },
+      questionBefore: reference(questionH), questionAfter: { id: questionH.id, revision: questionH.revision + 1, hash: hashJson({ planted: 2 }) },
+      answer: { id: 'research-answer:p:planted', revision: 1, hash: hashJson({ planted: 3 }) },
+      assessment: reference(assessmentH), assessmentProof: reference(proofH) } });
+  const beforeH = h.counts();
+  const plantedRun = await new ProductEngine(h.open()).researcher.run('p', h.draft.id, 1);
+  assert.equal(plantedRun.value.pauseCode, 'research_acceptance_binding_invalid', JSON.stringify(plantedRun.value));
+  assert.equal(h.paidTurn().value.status, 'pending');
+  assert.deepEqual(h.counts(), beforeH, 'no completion and no new acceptance under a planted record');
+  const g = acceptanceFixture(t, { neighbor: false, prefix: 'r11-damaged' });
+  await g.engine.researcher.run('p', g.draft.id, 1);
+  const turn = g.paidTurn(), k = g.binding()!;
+  assert.ok(managedOf(turn).acceptance, 'the completed turn also persists its chain');
+  g.rewrite(k.id, 1, { ...k.value, turn: { ...k.value.turn, revision: 2 } });
+  assert.throws(() => readResearchConsumerTurn(g.open(), reference(turn)), { code: 'research_acceptance_binding_invalid' });
+  assert.throws(() => readResearchAcceptanceBinding(g.open(), 'p', turn.id), { code: 'research_acceptance_binding_invalid' });
+  await assert.rejects(new ProductEngine(g.open()).researcher.run('p', g.draft.id, 1), { code: 'research_acceptance_binding_invalid' });
+  g.rewrite(k.id, 1, k.value);
+  readResearchConsumerTurn(g.open(), reference(turn));
+  // A completed turn of the binding era that lost its link to K is refused although its stored chain is intact.
+  const { acceptanceBinding: _link, ...unlinked } = managedOf(turn);
+  g.rewrite(turn.id, turn.revision, unlinked);
+  assert.throws(() => readResearchConsumerTurn(g.open(), { id: turn.id, revision: turn.revision, hash: hashJson(unlinked) }),
+    { code: 'research_acceptance_binding_invalid' });
+  g.rewrite(turn.id, turn.revision, turn.value);
+  readResearchConsumerTurn(g.open(), reference(turn));
+});
+
+test('D8.4e R12: a K naming other records of the same values — another turn, pending, intent, proof, assessment, question, answer or draft pair — is refused by belonging', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, second: true, prefix: 'r12' });
+  const run = await f.engine.researcher.run('p', f.draft.id, 2);
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const turns = f.store.list<ResearchTurn>('research-turn').filter(turn => turn.id.startsWith('research-turn:v1:'))
+    .sort((a, b) => a.value.number - b.value.number);
+  assert.equal(turns.length, 2);
+  const [first, second] = turns as [Revision<ResearchTurn>, Revision<ResearchTurn>];
+  const k1 = f.store.get<ResearchAcceptanceBinding>(acceptanceBindingId('p', first.id))!;
+  const k2 = f.store.get<ResearchAcceptanceBinding>(acceptanceBindingId('p', second.id))!;
+  assert.ok(k1 && k2);
+  const substitutions: [string, Partial<ResearchAcceptanceBinding>, string][] = [
+    ['pending of the other turn', { pending: k2.value.pending }, 'research_acceptance_binding_invalid'],
+    ['intent of the other turn', { intent: k2.value.intent }, 'research_acceptance_binding_invalid'],
+    ['a later revision of the own intent', { intent: { ...k1.value.intent, revision: 3, hash: f.store.get(k1.value.intent.id, 3)!.hash } },
+      'research_acceptance_binding_invalid'],
+    ['proof B of the other turn', { assessmentProof: k2.value.assessmentProof }, 'research_acceptance_binding_invalid'],
+    ['assessment R of the other turn', { assessment: k2.value.assessment }, 'research_assessment_binding_invalid'],
+    ['question pair of the other turn', { questionBefore: k2.value.questionBefore, questionAfter: k2.value.questionAfter },
+      'research_acceptance_binding_invalid'],
+    ['answer of the other turn', { answer: k2.value.answer }, 'research_acceptance_binding_invalid'],
+    ['draft pair of the other turn', { draftBefore: k2.value.draftBefore, draftAfter: k2.value.draftAfter },
+      'research_acceptance_binding_invalid'],
+    ['a pending revision beyond the pending chain', { pending: { ...k1.value.pending, revision: 2, hash: first.hash } },
+      'research_acceptance_binding_invalid'],
+  ];
+  for (const [name, patch, code] of substitutions) {
+    f.rewrite(k1.id, 1, { ...k1.value, ...patch });
+    assert.throws(() => readResearchAcceptanceBinding(f.open(), 'p', first.id),
+      (error: unknown) => error instanceof EngineError && error.code === code, name);
+    assert.throws(() => readResearchConsumerTurn(f.open(), reference(first)), (error: unknown) => error instanceof EngineError
+      && ['research_acceptance_binding_invalid', 'research_assessment_binding_invalid'].includes(error.code), name);
+    f.rewrite(k1.id, 1, k1.value);
+  }
+  readResearchAcceptanceBinding(f.open(), 'p', first.id);
+  readResearchConsumerTurn(f.open(), reference(first));
+});
+
+test('D8.4e R13: a neighbouring draft field, a question field or an answer body changed inside the own pair is refused by the shared projection on production and on reading', async t => {
+  const f = acceptanceFixture(t, { neighbor: true, prefix: 'r13' });
+  f.decideNeighbor();
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  const turn = f.paidTurn(), k = f.binding()!;
+  const proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id)!;
+  const links = { turn: k.value.turn, pending: k.value.pending, intent: k.value.intent, assessmentProof: k.value.assessmentProof };
+  assert.deepEqual(projectAcceptanceBinding(proven.inputs, links), k.value);
+  const revised = <T extends Record<string, any>>(record: Revision<T>, value: T): Revision<T> => ({ ...record, value, hash: hashJson(value) });
+  const alteredDraft = revised(proven.inputs.draftAfter, { ...proven.inputs.draftAfter.value,
+    fields: { ...proven.inputs.draftAfter.value.fields, neighbor: { forged: true } } });
+  assert.throws(() => projectAcceptanceBinding({ ...proven.inputs, draftAfter: alteredDraft }, links),
+    { code: 'research_acceptance_binding_invalid' }, 'neighbour field on production');
+  const alteredQuestion = revised(proven.inputs.questionAfter, { ...proven.inputs.questionAfter.value,
+    spec: { ...proven.inputs.questionAfter.value.spec, prompt: 'Rewritten prompt' } });
+  assert.throws(() => projectAcceptanceBinding({ ...proven.inputs, questionAfter: alteredQuestion }, links),
+    { code: 'research_acceptance_binding_invalid' }, 'question field on production');
+  const extraAnswer = revised(proven.inputs.answer, { ...proven.inputs.answer.value, extra: true } as any);
+  const answeredWithExtra = revised(proven.inputs.questionAfter, { ...proven.inputs.questionAfter.value, answer: reference(extraAnswer) });
+  assert.throws(() => projectAcceptanceBinding({ ...proven.inputs, answer: extraAnswer, questionAfter: answeredWithExtra }, links),
+    { code: 'research_acceptance_binding_invalid' }, 'answer body on production');
+  f.rewrite(alteredDraft.id, alteredDraft.revision, alteredDraft.value);
+  f.rewrite(k.id, 1, { ...k.value, draftAfter: reference(alteredDraft) });
+  assert.throws(() => readResearchAcceptanceBinding(f.open(), 'p', turn.id), { code: 'research_acceptance_binding_invalid' },
+    'neighbour field on reading');
+  f.rewrite(alteredDraft.id, alteredDraft.revision, proven.inputs.draftAfter.value);
+  f.rewrite(k.id, 1, k.value);
+  f.rewrite(extraAnswer.id, 1, extraAnswer.value);
+  f.rewrite(answeredWithExtra.id, answeredWithExtra.revision, answeredWithExtra.value);
+  f.rewrite(k.id, 1, { ...k.value, answer: reference(extraAnswer), questionAfter: reference(answeredWithExtra) });
+  assert.throws(() => readResearchAcceptanceBinding(f.open(), 'p', turn.id), { code: 'research_acceptance_binding_invalid' },
+    'answer body on reading');
+  f.rewrite(extraAnswer.id, 1, proven.inputs.answer.value);
+  f.rewrite(answeredWithExtra.id, answeredWithExtra.revision, proven.inputs.questionAfter.value);
+  f.rewrite(k.id, 1, k.value);
+  readResearchAcceptanceBinding(f.open(), 'p', turn.id);
+});
+
+test('D8.4e R14: a lost mandatory exact source — B, M — is a typed addressed refusal on the pending and on the completed turn; no new acceptance is written', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r14' });
+  const restore = f.interruptAfter(f.store, K_WRITE, 'fixture_after_acceptance', true);
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const turn = f.paidTurn();
+  assert.equal(turn.value.status, 'pending');
+  const proof = f.store.get<Record<string, any>>(assessmentBindingId('p', turn.id))!;
+  const origin = readAssessmentPaidOrigin(f.store, 'p', reference(turn))!;
+  const before = f.counts();
+  for (const [name, record, altered, code] of [
+    ['assessment proof B (session)', proof, { ...proof.value, session: null }, 'research_assessment_binding_invalid'],
+    ['assessment proof B (reads)', proof, { ...proof.value, reads: null }, 'research_assessment_binding_invalid'],
+    ['paid origin M', origin, { ...origin.value, application: 'foreign-assessment-application' }, 'research_context_application_invalid'],
+  ] as const) {
+    f.rewrite(record.id, record.revision, altered);
+    assert.throws(() => readResearchAcceptanceBinding(f.open(), 'p', turn.id),
+      (error: unknown) => error instanceof EngineError && error.code === code, name);
+    const resumed = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 1);
+    assert.equal(resumed.value.pauseCode, code, `${name}: ${JSON.stringify(resumed.value)}`);
+    assert.equal(f.paidTurn().value.status, 'pending', name);
+    assert.deepEqual(f.counts(), before, name);
+    f.rewrite(record.id, record.revision, record.value);
+  }
+  const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  const completed = f.paidTurn(db);
+  f.rewrite(proof.id, proof.revision, { ...proof.value, session: null });
+  assert.throws(() => readResearchConsumerTurn(f.open(), reference(completed)), { code: 'research_assessment_binding_invalid' },
+    'the completed turn keeps the common reader refusal');
+  f.rewrite(proof.id, proof.revision, proof.value);
+  readResearchConsumerTurn(f.open(), reference(completed));
+});
+
+test('D8.4e R15: insufficient and conflicting assessments and the standalone acceptance keep their previous outcomes without a fictitious K', async t => {
+  for (const verdict of ['insufficient', 'conflicting'] as const) {
+    const f = acceptanceFixture(t, { neighbor: false, prefix: `r15-${verdict}` });
+    writeFileSync(f.adapter, readFileSync(f.adapter, 'utf8').replace("{verdict:'supported',reasons:[]}",
+      `{verdict:'${verdict}',reasons:['The fixture did not support acceptance']}`));
+    await f.engine.researcher.run('p', f.draft.id, 1);
+    const turn = f.paidTurn();
+    assert.equal(turn.value.status, 'completed');
+    assert.equal((turn.value.observation as { verdict?: string }).verdict, verdict);
+    assert.deepEqual([f.counts().bindings, f.counts().answers], [0, 0]);
+    assert.equal(managedOf(turn).acceptanceBinding, undefined);
+    readResearchConsumerTurn(f.open(), reference(turn));
+  }
+  const g = acceptanceFixture(t, { neighbor: false, prefix: 'r15-standalone' });
+  const restore = g.interruptAfter(g.store, B_WRITE, 'fixture_after_assessment');
+  await g.engine.researcher.run('p', g.draft.id, 1);
+  restore();
+  const assessment = g.store.list<ResearchAssessment>('research-assessment')[0]!, question = g.store.get<Question>(g.question.id)!;
+  g.engine.discovery.researched(question.id, question.revision, reference(assessment));
+  assert.deepEqual([g.counts().answers, g.counts().bindings], [1, 0], 'the standalone route writes no K');
+});
+
+const OLD_PRODUCER_LOADER = String.raw`
+import ts from TYPESCRIPT;
+import { execFileSync } from 'node:child_process';
+let root, repository, baseline;
+export function initialize(data) { root = data.root; repository = data.repository; baseline = data.baseline; }
+export async function load(url, context, nextLoad) {
+  if (url.startsWith(root) && url.endsWith('.js')) {
+    const path = decodeURIComponent(url.slice(root.length)).replace(/\.js$/, '.ts');
+    const body = execFileSync('git', ['show', baseline + ':' + path], { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(body,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return nextLoad(url, context);
+}
+`;
+const OLD_PRODUCER_SCENARIO = String.raw`
+import { register } from 'node:module';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const config = CONFIG;
+register(config.loader, { data: { root: config.dist, repository: config.repository, baseline: config.baseline } });
+const { Store } = await import(config.dist + 'src/storage/store.js');
+const { ProductEngine } = await import(config.dist + 'src/product/engine.js');
+const { EngineError } = await import(config.dist + 'src/errors.js');
+const results = [];
+for (const [name, stop] of config.scenarios) {
+  const root = join(config.directory, name); mkdirSync(root, { recursive: true });
+  const database = join(root, 'state.sqlite');
+  const store = new Store(database), engine = new ProductEngine(store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Old producer ' + name });
+  const source = engine.discovery.evidence.document('p', 'proof', 'Grounded local condition', 'text/plain', 0);
+  const sourceRef = { id: source.id, revision: source.revision, hash: source.hash };
+  const adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, "import{readFileSync}from'node:fs';\nconst r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;\n"
+    + "const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:{action:'answer',question:s.questions[0].id,value:{ok:true},citations:[{source:"
+    + JSON.stringify(sourceRef) + ",selector:{kind:'text-range',start:0,end:24}}]};\n"
+    + "console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));\n");
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
+    [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = (writes, guards = []) => {
+    const rows = original(writes, guards);
+    if (!hit && stop && writes.some(write => write.kind === stop)) {
+      hit = true; throw new EngineError('fixture_old_' + name, 'The old producer stopped after ' + stop);
+    }
+    return rows;
+  };
+  const run = await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = original;
+  const turn = store.list('research-turn')[0] ?? null;
+  results.push({ name, root, database, draft: draft.id, status: run.value.status, pauseCode: run.value.pauseCode, hit,
+    turn: turn && { id: turn.id, revision: turn.revision, status: turn.value.status, keys: Object.keys(turn.value).sort() },
+    calls: store.list('model-call').length, answers: store.list('research-answer').length,
+    bindings: store.list('research-acceptance-binding').length });
+  store.close();
+}
+console.log(JSON.stringify(results));
+`;
+
+test('D8.4e R16: records of the previous producer (479b307) are read and restored by the old contract without a retroactive K; an old un-accepted pending turn is accepted by new code with K', async t => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-d84e-r16-')));
+  const stores: Store[] = [];
+  t.after(() => { for (const db of stores) db.close(); rmSync(directory, { recursive: true, force: true }); });
+  const loaderFile = join(directory, 'old-loader.mjs'), script = join(directory, 'old-producer.mjs');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  const dist = pathToFileURL(fileURLToPath(new URL('../', import.meta.url))).href;
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  writeFileSync(loaderFile, OLD_PRODUCER_LOADER.replace('TYPESCRIPT', JSON.stringify(typescript)));
+  writeFileSync(script, OLD_PRODUCER_SCENARIO.replace('CONFIG', JSON.stringify({ directory, repository, dist,
+    loader: pathToFileURL(loaderFile).href, baseline: '479b307f8aa3d43745f5313c1f5c8a712bd7d55a',
+    scenarios: [['completed', null], ['accepted-not-completed', 'research-answer'], ['assessed-not-accepted', 'research-assessment-binding']] })));
+  const output = execFileSync(process.execPath, [script], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim().split('\n').at(-1)!;
+  type Produced = { name: string; root: string; database: string; draft: string; status: string; pauseCode: string | null; hit: boolean;
+    turn: { id: string; revision: number; status: string; keys: string[] } | null; calls: number; answers: number; bindings: number };
+  const produced = Object.fromEntries((JSON.parse(output) as Produced[]).map(row => [row.name, row]));
+  const open = (database: string) => { const db = new Store(database); stores.push(db); return db; };
+  const rewrite = (database: string, id: string, revision: number, value: unknown) => {
+    const raw = new DatabaseSync(database);
+    try {
+      raw.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+      raw.prepare('UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?').run(canonical(value), hashJson(value), id, revision);
+    } finally { raw.close(); }
+  };
+  // (a) completed by the old producer: legacy era, stored chain, no K; read and repeated by the old contract.
+  const completed = produced['completed']!;
+  assert.equal(completed.status, 'completed', JSON.stringify(completed));
+  assert.equal(completed.turn!.status, 'completed');
+  assert.ok(completed.turn!.keys.includes('acceptance') && !completed.turn!.keys.includes('acceptanceContract')
+    && !completed.turn!.keys.includes('acceptanceBinding'), JSON.stringify(completed.turn));
+  assert.equal(completed.bindings, 0);
+  {
+    const db = open(completed.database), turn = db.get<ResearchTurn>(completed.turn!.id)!;
+    assert.equal(acceptanceEraOf(managedOf(turn)), 'legacy');
+    assert.deepEqual(readResearchConsumerTurn(db, reference(turn)).value, turn.value);
+    assert.equal(readResearchAcceptanceBinding(db, 'p', turn.id), null);
+    const again = await new ProductEngine(open(completed.database)).researcher.run('p', completed.draft, 1);
+    assert.equal(again.value.status, 'completed', JSON.stringify(again.value));
+    assert.equal(db.get<ResearchTurn>(turn.id)!.revision, turn.revision);
+    assert.equal(db.list('research-acceptance-binding').length, 0, 'no retroactive K');
+    assert.equal(db.list('model-call').length, completed.calls);
+  }
+  // (b) accepted by the old producer, turn still pending: the old contract (bounded scan) completes it; no retroactive K.
+  const window = produced['accepted-not-completed']!;
+  assert.ok(window.hit, JSON.stringify(window));
+  assert.equal(window.turn!.status, 'pending'); assert.equal(window.answers, 1);
+  {
+    const db = open(window.database);
+    const resumed = await new ProductEngine(db).researcher.run('p', window.draft, 1);
+    assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+    const turn = db.get<ResearchTurn>(window.turn!.id)!;
+    assert.equal(turn.value.status, 'completed');
+    assert.ok(managedOf(turn).acceptance);
+    assert.equal(managedOf(turn).acceptanceBinding, undefined);
+    assert.equal(acceptanceEraOf(managedOf(turn)), 'legacy');
+    assert.equal(db.list('research-acceptance-binding').length, 0);
+    assert.equal(db.list('model-call').length, window.calls);
+    readResearchConsumerTurn(open(window.database), reference(turn));
+  }
+  // (c) assessed by the old producer, not accepted: new code accepts it with K; the completed turn links K although O has no marker.
+  const pendingOld = produced['assessed-not-accepted']!;
+  assert.ok(pendingOld.hit, JSON.stringify(pendingOld));
+  assert.equal(pendingOld.turn!.status, 'pending'); assert.equal(pendingOld.answers, 0);
+  {
+    const db = open(pendingOld.database);
+    const resumed = await new ProductEngine(db).researcher.run('p', pendingOld.draft, 1);
+    assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+    const turn = db.get<ResearchTurn>(pendingOld.turn!.id)!;
+    const k = db.get<ResearchAcceptanceBinding>(acceptanceBindingId('p', turn.id))!;
+    assert.ok(k, 'the old pending turn was accepted with K');
+    assert.equal(acceptanceEraOf(managedOf(turn)), 'legacy');
+    assert.deepEqual(managedOf(turn).acceptanceBinding, reference(k));
+    assert.deepEqual(k.value.turn, reference(db.get(turn.id, 1)!));
+    assert.equal(db.list('model-call').length, pendingOld.calls, 'the old paid assessment is reused');
+    assert.ok(readResearchAcceptanceBinding(open(pendingOld.database), 'p', turn.id));
+    readResearchConsumerTurn(open(pendingOld.database), reference(turn));
+    // A K on an old turn is checked, not silenced: damaged, it refuses the completed turn although the stored chain is intact.
+    rewrite(pendingOld.database, k.id, 1, { ...k.value, turn: { ...k.value.turn, revision: 2 } });
+    assert.throws(() => readResearchConsumerTurn(open(pendingOld.database), reference(turn)), { code: 'research_acceptance_binding_invalid' });
+    rewrite(pendingOld.database, k.id, 1, k.value);
+    readResearchConsumerTurn(open(pendingOld.database), reference(turn));
+  }
+});
+
+test('D8.4e R17: the next turn and the context history reader consume the completed turn through K without a cycle', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, second: true, prefix: 'r17' });
+  const run = await f.engine.researcher.run('p', f.draft.id, 2);
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const turns = f.store.list<ResearchTurn>('research-turn').filter(turn => turn.id.startsWith('research-turn:v1:'))
+    .sort((a, b) => a.value.number - b.value.number);
+  assert.equal(turns.length, 2);
+  for (const turn of turns) { assert.equal(turn.value.status, 'completed'); assert.ok(managedOf(turn).acceptanceBinding); }
+  const db = f.open(), draft = db.get<any>(f.draft.id)!;
+  const history = readContextTurnHistoryAt(db, 'p', draft, turns[1]!.value.question!,
+    turns.map(turn => readResearchConsumerTurn(db, reference(turn)) as Revision<ResearchTurn>), 2);
+  assert.equal(history.length, 1);
+  assert.deepEqual(reference(history[0]!.turn), reference(turns[0]!));
+  const again = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 1);
+  assert.equal(again.value.status, 'completed');
+  assert.equal(f.counts().bindings, 2);
+});
+
+// ---------------------------------------------------------------------------
+// D8.4e круг 2 (№2242): окна конкуренции — владение и актуальный run при
+// завершении через K на обоих участках записи; победивший K на каждом
+// участке managed-принятия. Пробы ревьюера перенесены постоянными.
+// ---------------------------------------------------------------------------
+test('D8.4e-2 (№2242-1): K-first never completes the turn of a live foreign owner — the contender refuses research_busy without a write, the owner finishes its own turn', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r2-live-owner' });
+  type Rival = { code: string | null; before: { revision: number; status: string }; after: { revision: number; status: string }; bindings: number };
+  let rival: Rival | null = null;
+  const restore = f.hook(f.store, K_WRITE, () => {
+    const turn = f.paidTurn();
+    const script = `import { Store } from ${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
+import { ProductEngine } from ${JSON.stringify(new URL('../src/product/engine.js', import.meta.url).href)};
+const db = new Store(${JSON.stringify(f.database)}); let code = null;
+const before = db.get(${JSON.stringify(turn.id)});
+try { await new ProductEngine(db).researcher.run('p', ${JSON.stringify(f.draft.id)}, 1); } catch (error) { code = error.code ?? String(error); }
+const after = db.get(${JSON.stringify(turn.id)});
+process.stdout.write(JSON.stringify({ code, before: { revision: before.revision, status: before.value.status },
+  after: { revision: after.revision, status: after.value.status }, bindings: db.list('research-acceptance-binding').length })); db.close();`;
+    rival = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60000 })) as Rival;
+  }, 'rival-live-owner', 'after');
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const contender = rival as Rival | null;
+  assert.ok(contender, 'the contender ran');
+  assert.equal(contender.code, 'research_busy');
+  assert.deepEqual(contender.before, { revision: 1, status: 'pending' });
+  assert.deepEqual(contender.after, contender.before, 'the contender must not change the live owner turn before reporting busy');
+  assert.equal(contender.bindings, 1);
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const turn = f.paidTurn();
+  assert.equal(turn.revision, 2); assert.equal(turn.value.status, 'completed');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  assert.equal(f.counts().bindings, 1);
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e-2 (№2242-1): the completion through K keeps the current run in its own transaction — a run taken over or moved between the admission and the write refuses on both sites; the next lawful entry completes the same turn', async t => {
+  // (a) the loop-end site: the run is taken over by a live foreign owner after our K and before our T.
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r2-loop-owner' });
+  const foreign = { pid: process.ppid, started: processStart(process.ppid) };
+  assert.ok(foreign.started, 'the parent process identifies a live foreign owner');
+  const restore = f.hook(f.store, T_WRITE, () => {
+    const run = f.store.list<any>('research-run')[0]!;
+    f.store.write({ id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, owner: foreign } });
+  }, 'takeover-before-completion', 'before');
+  await assert.rejects(f.engine.researcher.run('p', f.draft.id, 1), { code: 'research_busy' });
+  restore();
+  assert.equal(f.paidTurn().value.status, 'pending', 'the taken-over run keeps its turn pending');
+  assert.equal(f.paidTurn().revision, 1);
+  assert.equal(f.counts().bindings, 1);
+  const taken = f.store.list<any>('research-run')[0]!;
+  f.store.write({ id: taken.id, kind: taken.kind, expected: taken.revision, value: { ...taken.value, status: 'paused' } });
+  const resumed = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  assert.deepEqual(managedOf(f.paidTurn()).acceptanceBinding, reference(f.binding()!));
+  readResearchConsumerTurn(f.open(), reference(f.paidTurn()));
+  // (b) both sites: the run moved (same owner) between the admission read and the write — the transaction refuses
+  // by the run guard, nothing is completed, and the next entry completes the turn from K.
+  for (const site of ['loop', 'prologue'] as const) {
+    const g = acceptanceFixture(t, { neighbor: false, prefix: `r2-moved-${site}` });
+    let engine = g.engine, db = g.store;
+    if (site === 'prologue') {
+      const stop = g.interruptAfter(g.store, K_WRITE, 'fixture_after_acceptance', true);
+      await g.engine.researcher.run('p', g.draft.id, 1);
+      stop();
+      db = g.open(); engine = new ProductEngine(db);
+    }
+    const restoreG = g.hook(db, T_WRITE, () => {
+      const run = db.list<any>('research-run')[0]!;
+      db.write({ id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, limit: run.value.limit + 1 } });
+    }, `moved-run-${site}`, 'before');
+    const first = await engine.researcher.run('p', g.draft.id, 1);
+    restoreG();
+    assert.equal(first.value.status, 'paused', `${site}: ${JSON.stringify(first.value)}`);
+    assert.equal(first.value.pauseCode, 'input_stale', site);
+    assert.equal(g.paidTurn(db).value.status, 'pending', site);
+    assert.equal(g.counts(db).bindings, 1, site);
+    const again = await new ProductEngine(g.open()).researcher.run('p', g.draft.id, 1);
+    assert.equal(again.value.status, 'completed', `${site}: ${JSON.stringify(again.value)}`);
+    assert.deepEqual(managedOf(g.paidTurn()).acceptanceBinding, reference(g.binding()!), site);
+    readResearchConsumerTurn(g.open(), reference(g.paidTurn()));
+  }
+});
+
+test('D8.4e-2 (№2242-2): a winning K that appears at the first read of the managed entry is proven and its result returned — the run completes with one K and one answer', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r2-early-winner' });
+  let armed = false, hit = false;
+  const restore = f.hook(f.store, B_WRITE, () => { armed = true; }, 'arm-after-assessment', 'after');
+  const original = f.store.get.bind(f.store);
+  f.store.get = ((id: string, revision?: number) => {
+    if (armed && !hit && id.startsWith('research-acceptance-binding:')) {
+      hit = true;
+      const db = f.open(), p = f.paidTurn(db), b = db.get<Record<string, any>>(assessmentBindingId('p', p.id))!;
+      const q = db.get<Question>(p.value.question!.id, p.value.question!.revision)!;
+      new ProductEngine(db).discovery.researched(q.id, q.revision, b.value.assessment, reference(p));
+    }
+    return original(id, revision);
+  }) as typeof f.store.get;
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  f.store.get = original;
+  restore();
+  assert.equal(hit, true, 'the rival accepted at the first read of the record address');
+  assert.equal(run.value.status, 'completed', 'an exact winning acceptance is not an integrity failure: ' + JSON.stringify(run.value));
+  const counts = f.counts();
+  assert.deepEqual([counts.answers, counts.bindings, counts.assessments], [1, 1, 1]);
+  const turn = f.paidTurn();
+  assert.equal(turn.revision, 2); assert.equal(turn.value.status, 'completed');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  assert.equal(f.store.get<Question>(f.question.id)!.revision, 2);
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e-2 (№2242-2): an acceptance already made before the managed entry returns the saved result without writes; another assessment claimed for the same turn is an addressed refusal', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'r2-entry-winner' });
+  const restore = f.interruptAfter(f.store, B_WRITE, 'fixture_after_assessment');
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const pending = f.paidTurn(), proof = f.store.get<Record<string, any>>(assessmentBindingId('p', pending.id))!;
+  const question = f.store.get<Question>(f.question.id)!;
+  const won = new ProductEngine(f.open()).discovery.researched(question.id, question.revision, proof.value.assessment, reference(pending));
+  const before = f.counts();
+  assert.deepEqual([before.answers, before.bindings], [1, 1]);
+  const same = f.engine.discovery.researched(question.id, question.revision, proof.value.assessment, reference(pending));
+  assert.deepEqual(same, won, 'the whole managed entry returns the winner\'s saved result');
+  assert.deepEqual(f.counts(), before, 'no new revision, answer or record');
+  const other = { id: 'research-assessment:other', revision: 1, hash: hashJson({ other: true }) };
+  assert.throws(() => f.engine.discovery.researched(question.id, question.revision, other, reference(pending)),
+    { code: 'research_acceptance_binding_invalid' }, 'another assessment on the same paid turn is not the winner');
+  assert.deepEqual(f.counts(), before);
+  const resumed = await new ProductEngine(f.open()).researcher.run('p', f.draft.id, 1);
+  assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
+  const turn = f.paidTurn();
+  assert.equal(turn.value.status, 'completed');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  assert.deepEqual(f.counts(), { ...before, turns: before.turns });
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+// ---------------------------------------------------------------------------
+// D8.4e круг 3 (№2259): ОДНА обёртка на всю managed-попытку нового принятия —
+// таблица исхода W1–W6, по строке тест; пробы ревьюера — постоянные регрессии.
+// ---------------------------------------------------------------------------
+/** A managed acceptance fixture stopped right after the paid assessment (R and B written, no acceptance yet). */
+async function assessedFixture(t: test.TestContext, prefix: string) {
+  const f = acceptanceFixture(t, { neighbor: false, prefix });
+  const restore = f.interruptAfter(f.store, B_WRITE, 'fixture_after_assessment');
+  await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  const pending = f.paidTurn(), proof = f.store.get<Record<string, any>>(assessmentBindingId('p', pending.id))!;
+  const question = f.store.get<Question>(f.question.id)!;
+  const assessment = proof.value.assessment as Ref;
+  const attempt = (db: Store = f.store, ref: Ref = assessment) =>
+    new ProductEngine(db).discovery.researched(question.id, question.revision, ref, reference(pending));
+  return { ...f, pending, question, assessment, attempt };
+}
+
+test('D8.4e-3 W1 (№2259): a typed refusal of the managed attempt with no record at the address is the original refusal as is', async t => {
+  const f = await assessedFixture(t, 'w1-target');
+  const draft = f.store.get<any>(f.draft.id)!;
+  f.store.write({ id: draft.id, kind: draft.kind, expected: draft.revision,
+    value: { ...draft.value, fields: { ...draft.value.fields, result: { moved: true } } } });
+  const before = f.counts();
+  assert.throws(() => f.attempt(), { code: 'target_stale' }, 'the target moved without any acceptance');
+  assert.deepEqual(f.counts(), before);
+  const g = await assessedFixture(t, 'w1-source');
+  g.engine.discovery.evidence.document('p', 'proof', 'Changed without any acceptance', 'text/plain', g.source.revision);
+  assert.throws(() => g.attempt(), { code: 'research_not_supported' }, 'a moved Source without any acceptance is the current-admission refusal');
+  assert.equal(g.counts().bindings, 0);
+  const h = await assessedFixture(t, 'w1-question');
+  h.store.write({ id: h.question.id, kind: 'question', expected: h.question.revision, value: h.question.value });
+  assert.throws(() => h.attempt(), { code: 'question_stale' }, 'a moved question without any acceptance');
+  assert.equal(h.counts().bindings, 0);
+});
+
+test('D8.4e-3 W2 (№2259-1, reviewer probe): the winner accepts after the last absence read and before the write — the target moved by the winner is not a refusal but the winner\'s saved result; the run completes', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'w2-late-preparation' });
+  let inAcceptance = false, hit = false;
+  const researched = f.engine.discovery.researched.bind(f.engine.discovery), get = f.store.get.bind(f.store);
+  f.engine.discovery.researched = ((...args: Parameters<typeof researched>) => {
+    inAcceptance = true;
+    try { return researched(...args); } finally { inAcceptance = false; }
+  }) as typeof researched;
+  f.store.get = ((id: string, revision?: number) => {
+    const value = get(id, revision);
+    if (inAcceptance && !hit && id === f.draft.id && revision === undefined) {
+      // The attempt has passed its initial record check and read the question; the winner accepts now.
+      hit = true;
+      const db = f.open(), p = f.paidTurn(db), b = db.get<Record<string, any>>(assessmentBindingId('p', p.id))!;
+      const q = db.get<Question>(p.value.question!.id, p.value.question!.revision)!;
+      new ProductEngine(db).discovery.researched(q.id, q.revision, b.value.assessment, reference(p));
+    }
+    return value;
+  }) as typeof f.store.get;
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  f.store.get = get; f.engine.discovery.researched = researched;
+  assert.equal(hit, true, 'the winner accepted inside the attempt');
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const turn = f.paidTurn();
+  assert.equal(turn.value.status, 'completed');
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  const counts = f.counts();
+  assert.deepEqual([counts.answers, counts.bindings, counts.assessments], [1, 1, 1]);
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e-3 W2 (№2259-2, reviewer probe): the winner accepts during the current admission and the cited Source then moves — the stale-source refusal is not passed on, the made acceptance completes historically', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'w2-current-admission' });
+  let inAcceptance = false, hit = false;
+  const researched = f.engine.discovery.researched.bind(f.engine.discovery), get = f.store.get.bind(f.store);
+  f.engine.discovery.researched = ((...args: Parameters<typeof researched>) => {
+    inAcceptance = true;
+    try { return researched(...args); } finally { inAcceptance = false; }
+  }) as typeof researched;
+  f.store.get = ((id: string, revision?: number) => {
+    const value = get(id, revision);
+    if (inAcceptance && !hit && id.startsWith('research-assessment:')) {
+      hit = true;
+      const db = f.open(), engine = new ProductEngine(db), p = f.paidTurn(db), b = db.get<Record<string, any>>(assessmentBindingId('p', p.id))!;
+      const q = db.get<Question>(p.value.question!.id, p.value.question!.revision)!;
+      engine.discovery.researched(q.id, q.revision, b.value.assessment, reference(p));
+      engine.discovery.evidence.document('p', 'proof', 'Changed after valid acceptance', 'text/plain', f.source.revision);
+    }
+    return value;
+  }) as typeof f.store.get;
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  f.store.get = get; f.engine.discovery.researched = researched;
+  assert.equal(hit, true);
+  const turn = f.paidTurn(), proven = readResearchAcceptanceBinding(f.open(), 'p', turn.id);
+  assert.ok(proven, 'the winner\'s record proves wholly by its exact captured sources');
+  assert.equal(turn.value.status, 'completed', 'K completion is historical; any later stale-source pause belongs to new admission: ' + JSON.stringify(run.value));
+  assert.deepEqual(managedOf(turn).acceptanceBinding, reference(f.binding()!));
+  const counts = f.counts();
+  assert.deepEqual([counts.answers, counts.bindings, counts.assessments], [1, 1, 1]);
+  readResearchConsumerTurn(f.open(), reference(turn));
+});
+
+test('D8.4e-3 W2/W3 (№2259): a direct managed attempt after the winner returns the saved result at every window; another assessment claimed for the same turn is the addressed refusal', async t => {
+  const f = await assessedFixture(t, 'w2-w3-direct');
+  const won = f.attempt(f.open());
+  const before = f.counts();
+  assert.deepEqual([before.answers, before.bindings], [1, 1]);
+  assert.deepEqual(f.attempt(), won, 'W2 at the initial check: the winner\'s saved draft, no write');
+  // W2 inside the attempt: the initial check sees no record, the winner accepts during the attempt, the attempt's
+  // typed refusal (target_stale) is replaced by the proven winner.
+  const g = await assessedFixture(t, 'w2-inside');
+  const get = g.store.get.bind(g.store); let hit = false;
+  g.store.get = ((id: string, revision?: number) => {
+    const value = get(id, revision);
+    if (!hit && id === g.draft.id && revision === undefined) { hit = true; g.attempt(g.open()); }
+    return value;
+  }) as typeof g.store.get;
+  const inside = g.attempt();
+  g.store.get = get;
+  assert.equal(hit, true);
+  assert.deepEqual(inside, g.store.get<any>(g.draft.id, g.store.get<any>(g.draft.id)!.revision));
+  assert.deepEqual([g.counts().answers, g.counts().bindings], [1, 1]);
+  // W3: a proven record of the same turn with another assessment is not this attempt's winner.
+  const other = { id: 'research-assessment:other', revision: 1, hash: hashJson({ other: true }) };
+  assert.throws(() => f.attempt(f.store, other), { code: 'research_acceptance_binding_invalid' });
+  assert.deepEqual(f.counts(), before);
+});
+
+test('D8.4e-3 W4 (№2259): a damaged record at the address is the common reader\'s refusal as is — at the initial check and after a typed refusal of the attempt', async t => {
+  const plant = (f: Awaited<ReturnType<typeof assessedFixture>>) => f.store.write({
+    id: acceptanceBindingId('p', f.pending.id), kind: 'research-acceptance-binding', expected: 0,
+    value: { contract: ACCEPTANCE_BINDING_CONTRACT, projectId: 'p', turn: { ...reference(f.pending), revision: 2 }, pending: reference(f.pending),
+      intent: managedOf(f.pending).consumerIntent, draftBefore: reference(f.store.get<any>(f.draft.id)!),
+      draftAfter: { id: f.draft.id, revision: 99, hash: hashJson({ planted: 1 }) }, questionBefore: reference(f.question),
+      questionAfter: { id: f.question.id, revision: 99, hash: hashJson({ planted: 2 }) },
+      answer: { id: 'research-answer:p:planted', revision: 1, hash: hashJson({ planted: 3 }) },
+      assessment: f.assessment, assessmentProof: { id: assessmentBindingId('p', f.pending.id), revision: 1, hash: hashJson({ planted: 4 }) } } });
+  const f = await assessedFixture(t, 'w4-initial');
+  plant(f);
+  const before = f.counts();
+  assert.throws(() => f.attempt(), (error: unknown) => error instanceof EngineError && error.code === 'research_acceptance_binding_invalid'
+    && (error.details as { reason?: string })?.reason === 'form', 'the reader\'s addressed refusal, not a completion');
+  assert.deepEqual(f.counts(), before);
+  const g = await assessedFixture(t, 'w4-after-refusal');
+  const get = g.store.get.bind(g.store); let hit = false;
+  g.store.get = ((id: string, revision?: number) => {
+    const value = get(id, revision);
+    if (!hit && id === g.draft.id && revision === undefined) { hit = true; plant(g); }
+    return value;
+  }) as typeof g.store.get;
+  assert.throws(() => g.attempt(), (error: unknown) => error instanceof EngineError && error.code === 'research_acceptance_binding_invalid'
+    && (error.details as { reason?: string })?.reason === 'form', 'the write refused by expected:0, then the damaged record is the reader\'s refusal');
+  g.store.get = get;
+  assert.equal(hit, true);
+  assert.equal(g.counts().answers, 0);
+});
+
+test('D8.4e-3 W5 (№2259): a non-typed exception inside the attempt is thrown as is and the record is not read', async t => {
+  const f = await assessedFixture(t, 'w5');
+  const get = f.store.get.bind(f.store); let thrown = false, readsAfter = 0;
+  f.store.get = ((id: string, revision?: number) => {
+    if (thrown && id.startsWith('research-acceptance-binding:')) readsAfter += 1;
+    if (!thrown && id === f.question.id) { thrown = true; throw new TypeError('fixture programmatic failure'); }
+    return get(id, revision);
+  }) as typeof f.store.get;
+  assert.throws(() => f.attempt(), (error: unknown) => error instanceof TypeError && !(error instanceof EngineError)
+    && error.message === 'fixture programmatic failure');
+  f.store.get = get;
+  assert.equal(thrown, true); assert.equal(readsAfter, 0, 'no record read masks a programmatic failure');
+  assert.deepEqual([f.counts().answers, f.counts().bindings], [0, 0]);
+});
+
+test('D8.4e-3 W6 (№2259): the successful attempt writes the four records once; expected:0 is the final protection of the record', async t => {
+  const f = await assessedFixture(t, 'w6');
+  const accepted = f.attempt();
+  assert.equal(accepted.revision, 2);
+  const k = f.binding()!;
+  assert.ok(k); assert.deepEqual(k.value.pending, reference(f.pending));
+  assert.deepEqual([f.counts().answers, f.counts().bindings], [1, 1]);
+  assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'answered');
+  assert.throws(() => f.store.write({ id: k.id, kind: k.kind, expected: 0, value: k.value }), { code: 'revision_conflict' },
+    'a second record at the address is refused by expected:0');
+  assert.deepEqual(f.attempt(), accepted, 'the repeated attempt is the saved result (W2)');
+});
+

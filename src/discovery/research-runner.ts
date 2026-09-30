@@ -12,14 +12,16 @@ import { researchAction, researchCall } from "./research-protocol.js";
 import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES,
-  type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState } from "./research-consumer-transition.js";
+  projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId,
+  type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
+  type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents,
   prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
   PreparedManagedProposalRefusal,
-  refuseResearchConsumerIntent, pinnedLayerDeltaStore,
+  refuseResearchConsumerIntent, pinnedLayerDeltaStore, readResearchAcceptanceBinding,
   type ManagedProposalRefusal,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
@@ -111,6 +113,48 @@ export class Researcher {
       "The run has several unfinished paid turns");
     let forcedPendingTurn = pendingPaidTurns[0] ?? null;
     let restoredPaidTerminal = false;
+    const owner = { pid: process.pid, started: processStart(process.pid) };
+    requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
+    // D8.4e (№2211, boundary 2): an acceptance already made for this pending
+    // paid turn — K written atomically with draft, answer and question — is
+    // completed FIRST, from the proven K alone. Today's environment, root,
+    // pilot, filesystem, question head or gate are not conditions for
+    // finishing an acceptance the project already paid for. A refusal here is
+    // the addressed pause of the run; a missing K in the binding era with a
+    // research answer on the question is a refusal, never a scan.
+    if (forcedPendingTurn && forcedPendingTurn.id.startsWith("research-turn:v1:")
+      // The era is the turn's own field; a legacy-era turn is consulted here
+      // only when an acceptance record exists at its address (an old pending
+      // turn accepted by new code) — such a K is checked, never silenced.
+      && (acceptanceEraOf(forcedPendingTurn.value as ManagedResearchTurn) === 'binding'
+        || this.store.get(acceptanceBindingId(project, forcedPendingTurn.id)) !== null)) {
+      const paid = researchAction(forcedPendingTurn.value.action);
+      if (paid.action === 'answer' || paid.action === 'answer_delta') {
+        const pendingRun = this.store.get<ResearchRun>(id);
+        try {
+          const originalQuestion = isRef(forcedPendingTurn.value.question)
+            ? this.store.get<Question>(forcedPendingTurn.value.question.id, forcedPendingTurn.value.question.revision) : null;
+          const answeredQuestion = isRef(forcedPendingTurn.value.question)
+            ? this.store.get<Question>(forcedPendingTurn.value.question.id) : null;
+          const accepted = originalQuestion?.kind === 'question' && answeredQuestion?.kind === 'question'
+            ? this.acceptedPaidAnswer(project, forcedPendingTurn, originalQuestion, answeredQuestion) : null;
+          if (accepted?.binding) {
+            const completed = projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
+              { kind: 'accepted-answer', inputs: accepted.inputs, binding: accepted.binding });
+            this.completeAcceptedTurn(forcedPendingTurn, completed, accepted.guards, owner);
+            forcedPendingTurn = null;
+          }
+        } catch (failure) {
+          // A run held by a live foreign owner is never written here — the
+          // refusal (research_busy or the reading refusal) is thrown as is.
+          const current = this.store.get<ResearchRun>(id) ?? pendingRun;
+          if (!(failure instanceof EngineError) || !current || current.kind !== 'research-run'
+            || current.value.status === 'running' && !(canonical(current.value.owner) === canonical(owner)
+              || processStart(current.value.owner.pid) !== current.value.owner.started)) throw failure;
+          return this.save(current, { status: "paused", error: failure.message, pauseCode: failure.code });
+        }
+      }
+    }
     if (forcedPendingTurn) {
       const savedOrigin = readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn));
       if (savedOrigin && paidAssessmentTerminal(this.store, project, reference(forcedPendingTurn))) {
@@ -268,8 +312,6 @@ export class Researcher {
     const checked = outstanding || forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
     if (run?.value.status === "completed" && checked?.findings.length === 0) return run;
     requireCondition(!checked?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
-    const owner = { pid: process.pid, started: processStart(process.pid) };
-    requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
     if (outstanding || forcedPendingTurn) requireCondition(run?.kind === "research-run" && run.value.projectId === project && run.value.draftId === draftId,
       "research_consumer_intent_invalid", "The original research run is missing");
     else run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: run?.revision ?? 0,
@@ -414,16 +456,20 @@ export class Researcher {
           && canonical(reference(forcedQuestion)) !== canonical(forcedQuestionRef)) {
           const originalQuestion = this.store.get<Question>(forcedQuestionRef!.id, forcedQuestionRef!.revision);
           const accepted = originalQuestion?.kind === "question" && forcedQuestion.value.status === "answered"
-            ? this.acceptedPaidAnswer(project, draft, forcedPendingTurn, originalQuestion, forcedQuestion) : null;
+            ? this.acceptedPaidAnswer(project, forcedPendingTurn, originalQuestion, forcedQuestion) : null;
           if (accepted) {
+            requireCondition(accepted.binding || draft.id === accepted.inputs.draftAfter.id,
+              'research_consumer_intent_invalid', 'The accepted paid answer lost its exact pending turn or draft');
+            const completed = projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
+              { kind: 'accepted-answer', inputs: accepted.inputs,
+                ...(accepted.binding ? { binding: accepted.binding } : {}) });
             const saved = this.store.writeMany<ResearchRun | ResearchTurn>([
               { id: run.id, kind: run.kind, expected: run.revision,
                 value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
               { id: forcedPendingTurn.id, kind: forcedPendingTurn.kind, expected: forcedPendingTurn.revision,
-                value: projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
-                  { kind: 'accepted-answer', inputs: accepted.inputs }) }
-            ], uniqueTransactionGuards([reference(run), reference(forcedPendingTurn), reference(draft),
-              reference(forcedQuestion), ...accepted.guards]));
+                value: completed }
+            ], uniqueTransactionGuards([reference(run), reference(forcedPendingTurn),
+              ...(accepted.binding ? [] : [reference(draft)]), reference(forcedQuestion), ...accepted.guards]));
             run = saved[0]! as Revision<ResearchRun>;
             forcedPendingTurn = null;
             turn--;
@@ -820,15 +866,22 @@ export class Researcher {
                   pilot ?? undefined, managedPending);
                 assessment = reference(result); observation = { verdict: result.value.verdict, reasons: result.value.reasons };
                 if (result.value.verdict === "supported") {
-                  const acceptedDraft = this.discovery.researched(question.id, question.revision, assessment);
+                  // D8.4e: a managed turn passes its exact pending revision P;
+                  // the acceptance writes K with the three records, and the
+                  // completed turn derives from that proven K. A legacy turn
+                  // keeps the three-record acceptance and its named pair.
+                  const acceptedDraft = this.discovery.researched(question.id, question.revision, assessment, managedPending);
                   const answered = this.store.get<Question>(question.id)!;
-                  // The acceptance just written names its own exact adjacent
-                  // draft pair — proof never scans today's moving head.
-                  const accepted = this.acceptedPaidAnswer(project, acceptedDraft, pendingTurn, question, answered,
-                    { before: acceptedDraft.revision - 1, after: acceptedDraft.revision });
-                  requireCondition(accepted, 'research_consumer_intent_invalid',
-                    'The accepted answer lost its exact paid action and transition');
-                  turnProof = { kind: 'accepted-answer', inputs: accepted.inputs };
+                  const accepted = this.acceptedPaidAnswer(project, pendingTurn, question, answered,
+                    managedPending ? undefined : { before: acceptedDraft.revision - 1, after: acceptedDraft.revision });
+                  requireCondition(accepted && (!managedPending || accepted.binding)
+                    && (accepted.binding || acceptedDraft.id === accepted.inputs.draftAfter.id),
+                  managedPending ? 'research_acceptance_binding_invalid' : 'research_consumer_intent_invalid',
+                  'The accepted answer lost its exact paid action and transition');
+                  requireCondition(!accepted.binding || canonical(reference(accepted.inputs.assessment)) === canonical(assessment),
+                    'research_acceptance_binding_invalid', 'The acceptance record names another assessment than the one just paid');
+                  turnProof = { kind: 'accepted-answer', inputs: accepted.inputs,
+                    ...(accepted.binding ? { binding: accepted.binding } : {}) };
                 } else if (managedPending) {
                   const checked = readResearchAssessmentAt(this.store, project, pendingTurn.id, reference(result));
                   turnProof = { kind: 'assessed-answer', question, assessment: checked,
@@ -886,6 +939,7 @@ export class Researcher {
               // refusals, never a coincidental completed-error match — they
               // escape before any local or layer-design proof is selected.
               if (['research_assessment_materials_invalid', 'research_assessment_binding_invalid',
+                'research_acceptance_binding_invalid',
                 'research_context_application_invalid', 'research_context_application_refused',
                 'research_context_application_running', 'research_proposal_refusal_invalid',
                 'research_context_read_proof_invalid', 'layer_delta_base_invalid',
@@ -956,6 +1010,9 @@ export class Researcher {
         } else if (capturedProposalRefusal) {
           this.store.writeMany([capturedProposalRefusal.prepared.write, completedTurn],
             uniqueTransactionGuards([reference(pendingTurn), ...capturedProposalRefusal.prepared.guards]));
+        } else if (turnProof?.kind === 'accepted-answer' && turnProof.binding) {
+          this.completeAcceptedTurn(pendingTurn, completedTurn.value as ManagedResearchTurn,
+            [turnProof.binding.ref], owner);
         } else this.store.write<ResearchTurn>(completedTurn);
         // C32: the derived reading is retained only after its completed turn
         // is durable; a crash between the two is repaired from the turn on
@@ -1030,23 +1087,81 @@ export class Researcher {
       "The original physical call did not return a usable research response");
     return paid;
   }
-  /** Finish the original paid turn only when one exact accepted-answer chain
-   * exists (№1745-2). The revision scan is candidate search only; the proof is
-   * the single complete chain of exact references from the shared formula. */
-  private acceptedPaidAnswer(project: string, draft: Revision<DiscoveryDraft>, turn: Revision<ResearchTurn>,
+  /** The acceptance of the original paid turn, by era (D8.4e №2211 §4):
+   * a proven K at the turn's own address is the acceptance whatever the era
+   * (an old pending turn lawfully accepted by new code links its K); a turn
+   * whose producer fixed the binding contract has no other source — without
+   * K, a research answer on its question is an addressed refusal, never a
+   * scan; a legacy-era turn without K keeps №1745-2: the revision scan is
+   * candidate search only, the proof is the single complete chain of exact
+   * references from the shared formula. */
+  private acceptedPaidAnswer(project: string, turn: Revision<ResearchTurn>,
     original: Revision<Question>, answered: Revision<Question>,
     pair?: { before: number; after: number }):
     { assessment: Ref; observation: { verdict: ResearchAssessment['verdict']; reasons: string[] };
-      guards: Ref[]; inputs: import("./research-consumer-transition.js").AcceptedPaidAnswerInputs } | null {
+      guards: Ref[]; inputs: import("./research-consumer-transition.js").AcceptedPaidAnswerInputs;
+      binding?: { ref: Ref; value: ResearchAcceptanceBinding } } | null {
+    requireCondition(turn.value.status === 'pending' && canonical(turn.value.question) === canonical(reference(original)),
+      'research_consumer_intent_invalid', 'The accepted paid answer lost its exact pending turn');
+    const managed = turn.id.startsWith("research-turn:v1:");
+    const proven = managed ? readResearchAcceptanceBinding(this.store, project, turn.id) : null;
+    if (proven) {
+      requireCondition(canonical(reference(proven.pending)) === canonical(reference(turn)),
+        'research_acceptance_binding_invalid',
+        `[${turn.id}] The acceptance record consumed another pending revision of this turn`);
+      // Boundary 2 (№2211): today's question, draft, Source or FS heads are
+      // not conditions for completing an already-made acceptance — the
+      // completion is guarded by the pending revision's CAS and the exact
+      // immutable K alone.
+      return { ...proven.proof, inputs: proven.inputs,
+        binding: { ref: reference(proven.binding), value: proven.binding.value },
+        guards: [reference(proven.binding)] };
+    }
+    if (managed && acceptanceEraOf(turn.value as ManagedResearchTurn) === 'binding') {
+      const answerRef = answered.value.status === 'answered' && isRef(answered.value.answer) ? answered.value.answer : null;
+      const answer = answerRef ? this.store.get(answerRef.id, answerRef.revision) : null;
+      if (answer?.kind === 'research-answer')
+        throw new EngineError('research_acceptance_binding_invalid',
+          `[${turn.id}] The question carries a research answer but the paid turn has no acceptance record`,
+          { ref: { id: acceptanceBindingId(project, turn.id), revision: 1 }, reason: 'missing' });
+      return null;
+    }
     const deltaStore = researchAction(turn.value.action).action === 'answer_delta'
       ? pinnedLayerDeltaStore(this.store, researchAction(turn.value.action) as LayerDelta) : undefined;
     const bound = findAcceptedPaidAnswerChain(this.store, project, turn, original, answered, deltaStore, pair);
     if (!bound) return null;
-    requireCondition(turn.value.status === 'pending' && draft.id === bound.inputs.draftAfter.id
-      && canonical(turn.value.question) === canonical(reference(original)),
-      'research_consumer_intent_invalid', 'The accepted paid answer lost its exact pending turn or draft');
     return { ...bound.proof, inputs: bound.inputs,
       guards: uniqueRefs([reference(answered), reference(bound.answer), reference(bound.assessment)]) };
+  }
+  /** D8.4e boundary 2 (№2242-1): write the completed turn T from its proven
+   * K. The historical acceptance is proven before today's prologue, but the
+   * completion itself keeps ownership and the current CAS of run and turn:
+   * only a lawful completer writes — the run is not running, is owned by
+   * this process, or its owner is dead (the same rule as the run claim and
+   * the outer refusal) — and the run revision that admitted the write rides
+   * the transaction as a guard, so a claim taken between the admission and
+   * the write refuses instead of completing a live owner's turn. The loser of
+   * a concurrent completion re-reads the turn: the same proven completion
+   * already saved is this result without a write; anything else is the
+   * conflict as thrown. Today's Source/FS/draft/question heads stay outside. */
+  private completeAcceptedTurn(pending: Revision<ResearchTurn>, completed: ManagedResearchTurn,
+    guards: Ref[], owner: ResearchRun["owner"]): Revision<ResearchTurn> {
+    const run = this.store.get<ResearchRun>(pending.value.run);
+    requireCondition(run?.kind === 'research-run', 'research_consumer_intent_invalid',
+      'The original research run of the accepted paid turn is missing');
+    requireCondition(run.value.status !== 'running' || canonical(run.value.owner) === canonical(owner)
+      || processStart(run.value.owner.pid) !== run.value.owner.started,
+    'research_busy', 'Another researcher owns the current run');
+    try {
+      return this.store.writeMany<ResearchTurn>([{ id: pending.id, kind: pending.kind, expected: pending.revision,
+        value: completed }], uniqueTransactionGuards([reference(pending), reference(run), ...guards]))[0]!;
+    } catch (error) {
+      if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
+      const head = this.store.get<ResearchTurn>(pending.id);
+      if (!head || head.revision !== pending.revision + 1 || canonical(head.value) !== canonical(completed)) throw error;
+      readResearchConsumerTurn(this.store, reference(head));
+      return head;
+    }
   }
   private async applyActionIntent(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
     dispatch: Environment, pilot: Revision<ReaderPilot> | null, owner: ResearchRun["owner"], limit: number,
@@ -1176,9 +1291,10 @@ export class Researcher {
     const session = sessionRef
       ? this.store.get<SynthesisSessionState>(sessionRef.id, sessionRef.revision) : null;
     const turnId = paidTurnId(run.id, run.value.turns);
-    const turnValue = { contract: "research-consumer-turn/v1", consumerIntent: reference(original),
-      run: run.id, number: run.value.turns, action, assessment: null, observation: null, error: null,
-      status: "pending", question: current.value.question, dispatchMode: "synthesis" };
+    // D8.4e: the second producer of O uses the shared projection, so the
+    // acceptance era marker is fixed identically by both producers.
+    const turnValue = projectSynthesisHandoffTurn({ intent: reference(original), runId: run.id,
+      number: run.value.turns, action, question: current.value.question });
     const turnRef: Ref = { id: turnId, revision: 1, hash: hashJson(turnValue) };
     const writes: Write[] = [
       { id: run.id, kind: run.kind, expected: run.revision,

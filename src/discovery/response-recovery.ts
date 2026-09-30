@@ -37,9 +37,11 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
   projectAddressedWorkspace, projectResearchTurnRevision, isCorrectableLayerDesignFailure,
   managedTurnId, matchAcceptedPaidAnswer, ACTION_RESPONSE_REFUSAL_CODES,
+  acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding,
+  ACCEPTANCE_BINDING_CONTRACT, ACCEPTANCE_BINDING_FIELDS,
   type SynthesisSessionState, type SynthesisTransitionInput,
   type ManagedResearchTurn, type TurnTransitionProof, type LayerDesignRefusalProof,
-  type AcceptedPaidAnswerInputs,
+  type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding,
   type ContextReadIdentityInput, type ContextTurnHistoryProof } from './research-consumer-transition.js';
 import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
 import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
@@ -310,7 +312,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
             consumerInvalid(saved.id, `An exact applied output is missing: ${output.id}`);
           return { id: record.id, kind: record.kind, expected: record.revision - 1, value: record.value };
         });
-        validateConsumerApplicationWrites(store, step, writes);
+        validateConsumerApplicationWrites(store, step, writes, undefined, 'historical');
       } else if (step.value.outputs !== null)
         consumerInvalid(saved.id, 'A refused consumer cannot claim an applied output');
     } else if (previous?.value.state === 'applied') {
@@ -947,6 +949,31 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
         || assessment.hash !== hashJson(assessment.value))
         consumerInvalid(before.id, 'The paid answer lost its exact original assessment');
       if (assessment.value.verdict === 'supported') {
+        // D8.4e: a turn of the binding era — or any turn whose completion
+        // names an acceptance record — completes only through the proven K.
+        // The era is the turn's own immutable field; a missing or damaged K
+        // is a typed refusal, never a fall-through to the stored chain or
+        // the bounded scan.
+        const bindingLink = (after.value as { acceptanceBinding?: unknown }).acceptanceBinding;
+        if (acceptanceEraOf(before.value) === 'binding' || bindingLink !== undefined) {
+          if (!isRef(bindingLink))
+            throw new EngineError('research_acceptance_binding_invalid',
+              `[${before.id}] The completed managed turn lost the link to its acceptance record`,
+              { ref: { id: acceptanceBindingId(producer.value.projectId, before.id), revision: 1 }, reason: 'link' });
+          const proven = readResearchAcceptanceBinding(store, producer.value.projectId, before.id);
+          if (!proven)
+            throw new EngineError('research_acceptance_binding_invalid',
+              `[${before.id}] The completed managed turn names a missing acceptance record`,
+              { ref: bindingLink, reason: 'missing' });
+          if (canonical(reference(proven.binding)) !== canonical(bindingLink)
+            || canonical(reference(proven.pending)) !== canonical(reference(before))
+            || canonical(reference(proven.assessment)) !== canonical(reference(assessment)))
+            throw new EngineError('research_acceptance_binding_invalid',
+              `[${before.id}] The completed managed turn names another acceptance record, pending revision or assessment`,
+              { ref: bindingLink, reason: 'link' });
+          return { kind: 'accepted-answer', inputs: proven.inputs,
+            binding: { ref: reference(proven.binding), value: proven.binding.value } };
+        }
         // №1745-2: the completed turn persists the exact acceptance chain;
         // consume those references instead of rescanning a draft that may
         // have accepted further identical answers since.
@@ -1020,7 +1047,8 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
   const managed = saved.id.startsWith('research-turn:v1:');
   if (!managed) {
     if (Object.hasOwn(saved.value, 'contract') && saved.value.contract === 'research-consumer-turn/v1'
-      || Object.hasOwn(saved.value, 'consumerIntent'))
+      || Object.hasOwn(saved.value, 'consumerIntent') || Object.hasOwn(saved.value, 'acceptanceContract')
+      || Object.hasOwn(saved.value, 'acceptanceBinding'))
       consumerInvalid(saved.id, 'A legacy turn address cannot claim a new consumer producer');
     if (saved.revision > 1 && saved.value.status === 'completed') {
       const first = store.get<Record<string, any>>(saved.id, 1);
@@ -1059,6 +1087,17 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     || !object(original.value) || original.value.contract !== 'research-consumer-turn/v1'
     || canonical(original.value.consumerIntent) !== canonical(saved.value.consumerIntent))
     consumerInvalid(saved.id, 'The new turn changed its original consumer binding');
+  // D8.4e: the acceptance era is the producer's own field on the original
+  // turn. Its only lawful form is the binding contract; the field belongs to
+  // O@1 and is carried unchanged by every later revision (checked below with
+  // the other immutable fields). A record without it is the earlier era.
+  if (Object.hasOwn(original.value, 'acceptanceContract')
+    && original.value.acceptanceContract !== ACCEPTANCE_BINDING_CONTRACT)
+    consumerInvalid(saved.id, 'The new turn names an unknown acceptance contract');
+  if (original.value.status !== 'pending' || original.value.assessment !== null
+    || original.value.observation !== null || original.value.error !== null
+    || Object.hasOwn(original.value, 'acceptance') || Object.hasOwn(original.value, 'acceptanceBinding'))
+    consumerInvalid(saved.id, 'The original managed turn is not a plain pending paid turn');
   const originIntent = readResearchConsumerIntent(store, saved.value.consumerIntent);
   // The original turn is written either in the runner application at @3 or in
   // the synthesis handoff at @4. A later intent HEAD is not evidence for this
@@ -1094,7 +1133,8 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     const immutable = (value: Record<string, any>) => ({ contract: value.contract,
       consumerIntent: value.consumerIntent, run: value.run, number: value.number,
       question: value.question, action: value.action,
-      ...(Object.hasOwn(value, 'dispatchMode') ? { dispatchMode: value.dispatchMode } : {}) });
+      ...(Object.hasOwn(value, 'dispatchMode') ? { dispatchMode: value.dispatchMode } : {}),
+      ...(Object.hasOwn(value, 'acceptanceContract') ? { acceptanceContract: value.acceptanceContract } : {}) });
     if (canonical(immutable(after.value)) !== canonical(immutable(original.value)))
       consumerInvalid(saved.id, 'A later turn rewrote its paid action or original binding');
     const proof = historicalTurnTransitionProof(store, intent, before, after);
@@ -1853,6 +1893,106 @@ function reboundUnclaimedReader(store: Store, a: ResearchConsumerIntent,
   return !!to && queuedChildReached(store, oldTurn, to);
 }
 
+/** D8.4e: the common reader of K. It proves the whole chain from the record's
+ * own exact references — O@1 and P through the managed turn reader, R under
+ * its managed proof B (which must be the record's assessmentProof), the
+ * adjacent draft/question pair, the answer — and re-derives the record with
+ * the shared projection. The reader ends at P: it never consults the
+ * completed turn, so a completed turn that references K has no cycle.
+ * `null` only when no record exists at the address; every damaged or foreign
+ * mandatory source is an addressed refusal with the exact ref and reason. */
+export function readResearchAcceptanceBinding(store: Store, projectId: string, turnId: string): {
+  binding: Revision<ResearchAcceptanceBinding>; turn: Revision<ManagedResearchTurn>;
+  pending: Revision<ManagedResearchTurn>; intent: Revision<ResearchConsumerIntent>;
+  assessment: Revision<ResearchAssessment>; inputs: AcceptedPaidAnswerInputs;
+  proof: NonNullable<ReturnType<typeof matchAcceptedPaidAnswer>> } | null {
+  requireCondition(store && typeof store.get === 'function' && typeof projectId === 'string' && projectId.trim()
+    && typeof turnId === 'string' && turnId.trim(), 'research_acceptance_binding_invalid',
+  'An acceptance record needs its exact project and turn');
+  const id = acceptanceBindingId(projectId, turnId);
+  const lost = (ref: unknown, reason: string): never => {
+    throw new EngineError('research_acceptance_binding_invalid',
+      `[${id}] The acceptance record or a mandatory exact source is missing, foreign or changed: ${reason}`,
+      { ref, reason });
+  };
+  const saved = store.get<ResearchAcceptanceBinding>(id);
+  if (!saved) return null;
+  const value = saved.value;
+  if (saved.kind !== 'research-acceptance-binding' || saved.revision !== 1 || !object(value)
+    || hashJson(value) !== saved.hash
+    || Object.keys(value).sort().join(',') !== [...ACCEPTANCE_BINDING_FIELDS].sort().join(',')
+    || value.contract !== ACCEPTANCE_BINDING_CONTRACT || value.projectId !== projectId
+    || !isRef(value.turn) || !isRef(value.pending) || !isRef(value.intent)
+    || !isRef(value.draftBefore) || !isRef(value.draftAfter) || !isRef(value.questionBefore)
+    || !isRef(value.questionAfter) || !isRef(value.answer) || !isRef(value.assessment)
+    || !isRef(value.assessmentProof)
+    || value.turn.id !== turnId || value.turn.revision !== 1 || value.pending.id !== turnId)
+    lost(reference(saved), 'form');
+  // O and P through the common managed-turn reader (their own refusals as is).
+  // P is required to be a pending revision BEFORE the full reader runs: the
+  // reader of a completed revision would prove its own completion through
+  // this very record (T → K → T). A record naming a completed revision as
+  // its P is refused here, so the reader of K always ends at a pending P.
+  const rawPending = store.get<Record<string, any>>(value.pending.id, value.pending.revision);
+  if (!rawPending || rawPending.kind !== 'research-turn' || !object(rawPending.value)
+    || rawPending.value.status !== 'pending' || canonical(reference(rawPending)) !== canonical(value.pending))
+    lost(value.pending, 'pending-turn');
+  const turn = readResearchConsumerTurn(store, value.turn) as Revision<ManagedResearchTurn>;
+  const pending = readResearchConsumerTurn(store, value.pending) as Revision<ManagedResearchTurn>;
+  if (pending.value.status !== 'pending' || canonical(pending.value.consumerIntent) !== canonical(value.intent)
+    || canonical(turn.value.consumerIntent) !== canonical(value.intent)
+    || canonical(pending.value.question) !== canonical(value.questionBefore))
+    lost(value.pending, 'pending-turn');
+  const intent = readResearchConsumerIntent(store, value.intent);
+  let action: ResearchAction;
+  try { action = researchAction(pending.value.action); }
+  catch { return lost(value.pending, 'action'); }
+  if ((action.action !== 'answer' && action.action !== 'answer_delta') || action.question !== value.questionBefore.id)
+    lost(value.pending, 'action');
+  // R under its managed proof B; B is the record's own assessmentProof, and
+  // its pending revision precedes P on the same lawful pending chain.
+  const assessment = readResearchAssessmentAt(store, projectId, turnId, value.assessment);
+  const proofRecord = store.get<{ pending: Ref }>(assessmentBindingId(projectId, turnId));
+  if (!proofRecord || canonical(reference(proofRecord)) !== canonical(value.assessmentProof))
+    return lost(value.assessmentProof, 'assessment-proof');
+  const assessedPending = proofRecord.value.pending;
+  if (!isRef(assessedPending) || assessedPending.id !== turnId || assessedPending.revision > pending.revision)
+    lost(value.assessmentProof, 'assessment-pending');
+  for (let revision = assessedPending.revision; revision < pending.revision; revision += 1) {
+    const step = store.get<Record<string, any>>(turnId, revision);
+    if (!step || step.kind !== 'research-turn' || step.value.status !== 'pending'
+      || revision === assessedPending.revision && canonical(reference(step)) !== canonical(assessedPending))
+      lost(value.assessmentProof, 'assessment-pending');
+  }
+  const load = <T extends Record<string, any>>(ref: Ref, kind: string): Revision<T> => {
+    const record = store.get<T>(ref.id, ref.revision);
+    if (!record || record.kind !== kind || hashJson(record.value) !== record.hash
+      || canonical(reference(record)) !== canonical(ref)) lost(ref, kind);
+    return record!;
+  };
+  const draftBefore = load<DiscoveryDraft>(value.draftBefore, 'discovery-draft');
+  const draftAfter = load<DiscoveryDraft>(value.draftAfter, 'discovery-draft');
+  const questionBefore = load<Question>(value.questionBefore, 'question');
+  const questionAfter = load<Question>(value.questionAfter, 'question');
+  const answer = load<ResearchAnswer>(value.answer, 'research-answer');
+  let expandedProposal: unknown;
+  if (action.action === 'answer_delta') {
+    try { expandedProposal = expandLayerDelta(pinnedLayerDeltaStore(store, action), draftBefore, questionBefore, action); }
+    catch (error) {
+      if (error instanceof EngineError) lost(value.draftBefore, `delta:${error.code}`);
+      throw error;
+    }
+  }
+  const inputs: AcceptedPaidAnswerInputs = { projectId, draftBefore, draftAfter, questionBefore, questionAfter,
+    answer, assessment, action, ...(action.action === 'answer_delta' ? { expandedProposal } : {}) };
+  const expected = projectAcceptanceBinding(inputs, { turn: value.turn, pending: value.pending,
+    intent: value.intent, assessmentProof: value.assessmentProof });
+  if (canonical(expected) !== canonical(value)) lost(reference(saved), 'derivation');
+  const proof = matchAcceptedPaidAnswer(inputs);
+  if (!proof) lost(reference(saved), 'acceptance-formula');
+  return { binding: saved, turn, pending, intent, assessment, inputs, proof: proof! };
+}
+
 /** №1745-2: load the acceptance chain persisted on the completed turn. Every
  * named record must exist exactly as referenced, agree with the pending
  * turn's own question and paid assessment, and still satisfy the shared
@@ -1964,8 +2104,12 @@ export function projectPaidSynthesisTransition(store: Store, intent: Revision<Re
     produced ? produced.revision - 1 : undefined));
 }
 
+/** `mode` (D8.4e §4): a live 'application' must carry the producer's era
+ * marker on its original turn; a 'historical' replay of a saved application
+ * is checked by the form its own producer saved — a turn written before the
+ * marker existed is the earlier era, never rewritten. */
 function validateConsumerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>, writes: Write[],
-  physical?: ResearchConsumerExecution): void {
+  physical?: ResearchConsumerExecution, mode: 'application' | 'historical' = 'historical'): void {
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     const paid = physical ?? readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
     if (paid.kind !== 'response') consumerInvalid(intent.id, 'An applied synthesis step needs the paid response');
@@ -2037,7 +2181,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
           || canonical(turn.value.consumerIntent) !== canonical(reference(origin))
           || turn.value.status !== 'pending' || run.value.turns !== intent.value.cursor.turn))
       consumerInvalid(intent.id, 'The runner may apply only its exact run and turn transition');
-    try { validateRunnerApplicationWrites(store, intent, run, turn, origin); }
+    try { validateRunnerApplicationWrites(store, intent, run, turn, origin, mode); }
     catch (error) {
       if (error instanceof EngineError && error.code === 'research_consumer_intent_invalid') throw error;
       consumerInvalid(intent.id, 'The runner application cannot be derived from its exact paid response');
@@ -2060,7 +2204,8 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
 }
 
 function validateRunnerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>,
-  runWrite: Write, turnWrite: Write, origin: Revision<ResearchConsumerIntent>): void {
+  runWrite: Write, turnWrite: Write, origin: Revision<ResearchConsumerIntent>,
+  mode: 'application' | 'historical' = 'historical'): void {
   const priorRun = store.get<Record<string, any>>(runWrite.id, runWrite.expected);
   if (!priorRun || priorRun.kind !== 'research-run' || hashJson(priorRun.value) !== priorRun.hash
     || priorRun.id !== intent.value.owner.id || !object(priorRun.value)
@@ -2112,7 +2257,12 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       owner: runWrite.value.owner as ResearchRun['owner'], limit: runWrite.value.limit,
       context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}) });
     expectedRun = projected.run;
-    expectedTurn = projected.turn;
+    // D8.4e: the era of a SAVED application is its own producer's form — a
+    // turn written without the acceptance marker is the earlier era. A live
+    // application is always the current producer's full projection.
+    const { acceptanceContract: _marker, ...earlierEra } = projected.turn;
+    expectedTurn = mode === 'historical' && object(turnWrite.value)
+      && !Object.hasOwn(turnWrite.value, 'acceptanceContract') ? earlierEra : projected.turn;
   }
   if (canonical(runWrite.value) !== canonical(expectedRun)
     || canonical(turnWrite.value) !== canonical(expectedTurn))
@@ -2127,7 +2277,7 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
   const intent = paid.intent;
   if (intent.value.state !== 'running' || paid.kind !== 'response' || canonical(reference(paid.call)) !== canonical(callRef))
     consumerInvalid(intent.id, 'Only one proved received response may be applied to this unfinished intent');
-  validateConsumerApplicationWrites(store, intent, writes, paid);
+  validateConsumerApplicationWrites(store, intent, writes, paid, 'application');
   const currentOwner = store.get(intent.value.owner.id);
   if (!currentOwner || !guards.some(guard => canonical(guard) === canonical(reference(currentOwner)))
     || !writes.some(write => write.id === currentOwner.id && write.expected === currentOwner.revision)
