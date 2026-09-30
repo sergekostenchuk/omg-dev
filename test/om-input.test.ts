@@ -2,6 +2,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { Ajv } from "ajv";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, digest, hashJson, type Json } from "../src/canonical.js";
@@ -33,6 +34,7 @@ import { projectGraph } from "../src/graph/project.js";
 import type { Graph } from "../src/graph/model.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
+import { acceptanceBindingId } from "../src/discovery/research-consumer-transition.js";
 
 type Row = Record<string, any>;
 const clone = <T>(value: T): T => structuredClone(value);
@@ -1895,4 +1897,60 @@ test('B1.1 deadline policy survives exported-table mutation across producer B1 a
       if (!Object.isFrozen(exported)) exported.splice(0, exported.length, ...original);
     }
   }
+});
+
+// ── D8.4.2 (договор №2230): B1 через общий читатель принятого ответа ──
+
+test("D8.4.2 R13: a stage accepted on a managed answer carries K in its proofs; B1 builds and reads historically on the same trail; a lost K refuses", async t => {
+  const f = await createOmFixture(t);
+  const draftRef = (f.stages.features.value.content as Row).draft as Ref;
+  const draft = f.store.get<DiscoveryDraft>(draftRef.id, draftRef.revision)!;
+  const answered = draft.value.questions.map(id => f.store.get<Question>(id)!)
+    .find(question => question.value.spec.field === "features")!;
+  const issued = f.engine.discovery.reopen(answered.id, answered.revision);
+  // The paid runner answers the reopened question with the current field content: a managed acceptance.
+  writeFileSync(join(f.root, "features-answer.json"), JSON.stringify(draft.value.fields['features']));
+  const adapter = join(f.root, "two-role-adapter.mjs");
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:s.questions[0].id,value:JSON.parse(readFileSync(${JSON.stringify(join(f.root, "features-answer.json"))},'utf8')),citations:[{source:${JSON.stringify(reference(f.store.get("source:garden:brief")!))},selector:{kind:'text-range',start:0,end:12}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = f.engine.environments.get(f.project);
+  f.engine.environments.configure(f.project, { workspace: environment.value.workspace,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 5000 }, environment.revision);
+  const run = await f.engine.researcher.run(f.project, draft.id, 1);
+  assert.equal(run.value.status, "completed", JSON.stringify(run.value));
+  const question = f.store.get<Question>(issued.id)!;
+  assert.equal(question.value.status, "answered");
+  const answerRef = question.value.answer!;
+  assert.ok(answerRef.id.includes(":managed-v1:"), "the answer sits at the managed address");
+  const bindingId = acceptanceBindingId(f.project, decodeURIComponent(answerRef.id.split(":managed-v1:")[1]!));
+  assert.ok(f.store.get(bindingId), "K is written");
+  // Re-accept the features stage: the gate's guards carry K into the stage's proofs.
+  const produced = f.engine.draft(f.project, "features", f.store.get(draft.id)!.id, f.stages.features.revision);
+  const accepted = f.engine.pipeline.accept(f.project, "features", produced.revision);
+  assert.ok(accepted.value.proofs.some(ref => ref.id === bindingId), "K is an immutable basis of the stage's proofs");
+  const req = currentRequest(f);
+  req.stages.features = reference(accepted);
+  const prepared = delivered(prepareOmInput(f.store, req));
+  assert.ok(prepared.guards.some(guard => guard.id === bindingId), "the B1 trail keeps the exact K");
+  delivered(writeOmInput(f.store, req));
+  f.reopen();
+  delivered(prepareOmInput(f.store, req));
+  // A lost K: B1 refuses instead of silently reading the managed answer.
+  const raw = new DatabaseSync(join(f.root, "state.sqlite"));
+  try {
+    raw.exec("PRAGMA foreign_keys=OFF");
+    raw.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+    raw.exec("DROP TRIGGER IF EXISTS revisions_no_delete");
+    raw.prepare("DELETE FROM revisions WHERE entity_id=?").run(bindingId);
+    raw.prepare("DELETE FROM heads WHERE entity_id=?").run(bindingId);
+  } finally { raw.close(); }
+  f.reopen();
+  const lost = refusal(prepareOmInput(f.store, req), "stage_not_accepted");
+  assert.equal(lost.code, "stage_not_accepted");
+  assert.ok(lost.message.includes("acceptance"), JSON.stringify(lost));
 });

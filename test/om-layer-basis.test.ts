@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
@@ -24,6 +25,11 @@ import { writeCandidate, gateCandidate, type FrameCandidateRecord, type Candidat
 import type { Revision, Write } from "../src/storage/store.js";
 import { prepareSettleCandidate, settleCandidate, type SettleCandidateRequest } from "../src/om/frame-accept.js";
 import type { Graph } from "../src/graph/model.js";
+import { preparedFeatures } from "./product-fixture.js";
+import { answerTechnicalFixture } from "./technical-research-fixture.js";
+import { layerDesignOf } from "../src/graph/layer-design.js";
+import { acceptanceBindingId } from "../src/discovery/research-consumer-transition.js";
+import { paidOriginId } from "../src/discovery/assessment-session.js";
 
 type LayerBasisRequest = Parameters<typeof readLayerBasis>[1];
 const levels = [2, 3] as const;
@@ -538,3 +544,104 @@ test("a claimed G5 work acceptance never falls back to the native or rebase prod
     assert.deepEqual(revisions(f.store), before);
   }
 });
+
+// ── D8.4.2 (договор №2230): proveLayer идёт через общий читатель (ветка gate) — повреждение отвергается ──
+
+test("D8.4.2: a damaged assessment inside the layer's saved proof refuses the historical read, and restoring it reads again", async t => {
+  const { f } = await fixture(t);
+  const request = basisRequest(f, 2);
+  const baseline = delivered(readLayerBasis(f.store, request));
+  const assessment = baseline.references.find(ref => ref.id.startsWith("research-assessment:"))!;
+  const saved = f.store.get<ResearchAssessment>(assessment.id, assessment.revision)!;
+  const damaged = { ...saved.value, verdict: "insufficient" as const };
+  const raw = new DatabaseSync(join(f.root, "state.sqlite"));
+  try {
+    raw.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+    raw.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
+      .run(canonical(damaged), hashJson(damaged), assessment.id, assessment.revision);
+  } finally { raw.close(); }
+  f.reopen();
+  refusedAs(readLayerBasis(f.store, request), "layer_basis_unproven");
+  const raw2 = new DatabaseSync(join(f.root, "state.sqlite"));
+  try {
+    raw2.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+    raw2.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
+      .run(canonical(saved.value), hashJson(saved.value), assessment.id, assessment.revision);
+  } finally { raw2.close(); }
+  f.reopen();
+  assert.deepEqual(delivered(readLayerBasis(f.store, request)).references, baseline.references);
+});
+
+// ── D8.4.2 круг 2 (№2276-2): managed-ответ в основании слоя достижим и читается исторически ──
+
+test("D8.4.2-2 P2-2 (№2276-2): a layer built on a managed layerDesign answer is historically readable — its K chain is proven on the original store and joins the trail; a damaged K or paid origin refuses, the restored record reads again", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-d842-managed-layer-"));
+  const database = join(root, "state.sqlite"), stores: Store[] = [];
+  const open = () => { const db = new Store(database); stores.push(db); return db; };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = open(), engine = new ProductEngine(store), project = "garden";
+  writeFileSync(join(root, "README.md"), "Garden design evidence.\n");
+  preparedFeatures(engine, project);
+  const source = engine.discovery.evidence.document(project, "layer-proof", "Grounded layer design", "text/plain", 0);
+  const adapter = join(root, "layer-adapter.mjs");
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure(project, { workspace: root,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 5000 }, 0);
+  const r0 = engine.refinement.begin(project, "R0");
+  engine.refinement.finishResearch(project, "R0", reference(store.get(r0.id)!), 0);
+  engine.refinement.sealLayer(project, 1, 0);
+  const r1 = engine.refinement.begin(project, "R1");
+  answerTechnicalFixture(engine, project, r1);
+  engine.refinement.finishResearch(project, "R1", reference(store.get(r1.id)!), 0);
+  const draft = engine.refinement.prepareLayer(project, 2), graph = store.get<Graph>(`graph:${project}`)!;
+  const question = store.get<Question>(draft.value.questions[0]!)!;
+  const value = layerDesignOf(graph.value, 2, question.value.spec.layerAssembly);
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:s.questions[0].id,value:${JSON.stringify(value)},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const run = await engine.researcher.run(project, draft.id, 1);
+  assert.equal(run.value.status, "completed", JSON.stringify(run.value));
+  const answered = store.get<Question>(question.id)!, answer = store.get<ResearchAnswer>(answered.value.answer!.id)!;
+  assert.ok(answer.id.includes(":managed-v1:"), "the layer design answer is a managed acceptance");
+  const turnId = decodeURIComponent(answer.id.split(":managed-v1:")[1]!);
+  const bindingId = acceptanceBindingId(project, turnId), originId = paidOriginId(project, turnId);
+  const built = engine.refinement.buildLayer(project, 2, reference(store.get(draft.id)!), graph.revision, "fixture");
+  const layer = store.get(`graph-layer:${project}:2`)!, upper = store.get(`graph-layer:${project}:1`)!;
+  const request = { project, level: 2 as const, graph: reference(built), layer: reference(layer), upper: reference(upper) };
+  assert.ok((layer.value as unknown as { layerProofs: { level: number; inputs: Ref[] }[] }).layerProofs.find(item => item.level === 2)!.inputs
+    .some(ref => ref.id === bindingId), "the exact K is a saved basis of the layer proof");
+  const baseline = delivered(readLayerBasis(open(), request));
+  assert.ok(baseline.references.some(ref => ref.id === bindingId), "the K joins the historical trail");
+  assert.ok(baseline.references.some(ref => ref.id === originId), "the K chain's paid origin joins the historical trail");
+  const damage = (id: string, mutate: (value: Record<string, unknown>) => Record<string, unknown>) => {
+    const saved = store.get<Record<string, unknown>>(id)!;
+    const raw = new DatabaseSync(database);
+    try {
+      raw.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+      raw.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
+        .run(canonical(mutate(saved.value)), hashJson(mutate(saved.value)), id, saved.revision);
+    } finally { raw.close(); }
+    return () => {
+      const raw2 = new DatabaseSync(database);
+      try {
+        raw2.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+        raw2.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?").run(canonical(saved.value), hashJson(saved.value), id, saved.revision);
+      } finally { raw2.close(); }
+    };
+  };
+  for (const [name, id, mutate, address] of [
+    // K is itself a saved prerequisite of the layer proof: its change refuses at the exact-inputs check; the paid origin
+    // M is a source of the K chain proven on the original store: its change refuses through the common reader by address.
+    ["K", bindingId, (value: Record<string, unknown>) => ({ ...value, turn: { ...(value['turn'] as Ref), revision: 2 } }), "exact saved research prerequisites"],
+    ["paid origin M", originId, (value: Record<string, unknown>) => ({ ...value, application: "foreign-assessment-application" }), "assessment-paid-origin:"],
+  ] as const) {
+    const restore = damage(id, mutate);
+    const refusal = refusedAs(readLayerBasis(open(), request), "layer_basis_unproven");
+    assert.ok(refusal.message.includes(address), `${name}: ${refusal.message}`);
+    restore();
+    assert.deepEqual(delivered(readLayerBasis(open(), request)).references, baseline.references, `${name}: restored`);
+  }
+});
+

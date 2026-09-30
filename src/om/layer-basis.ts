@@ -1,7 +1,7 @@
 import { Ajv } from "ajv";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { Discovery } from "../discovery/discovery.js";
+import { Discovery, readAcceptedResearchAnswer } from "../discovery/discovery.js";
 import { LEVEL, type Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { projectGraph } from "../graph/project.js";
@@ -717,6 +717,30 @@ function proveLayer(store: Store, project: string, graph: Graph, lower: Revision
     && assessment['runtimeProofs'].every(item => object(item) && text(item['obligation']) && text(item['document'])
       && isRef(item['observation']) && isRef(item['source']) && isRef(item['authorization']) && Array.isArray(item['code']) && item['code'].every(isRef)),
   "runtimeProofs", "Runtime evidence needs its explicit exact dependencies");
+  // D8.4.2 (№2276-2): the accepted answer's provenance — a managed answer's own K chain (O/P/I,
+  // R/B/M/S/A, the pair), a rebound's source chain — is proven on the ORIGINAL store by exact
+  // records through the common reader. Every record that proof read joins the historical view and
+  // the basis trail, so the gate below re-proves the same chain from saved records; today's heads
+  // never replace a missing historical source (a head read here is only the immutable
+  // single-revision record the chain itself names, and it is proven by the chain).
+  const traced = new Proxy(store, { get(target, key) {
+    if (key === "get") return (id: string, revision?: number) => {
+      const record = target.get<Record<string, unknown>>(id, revision);
+      if (record && object(record.value)) {
+        if (revision === undefined) { if (!records.has(id)) records.set(id, record); }
+        else historical.set(canonical([id, revision]), record as Revision);
+        refs.push(reference(record));
+      }
+      return record;
+    };
+    const value: unknown = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  try { readAcceptedResearchAnswer(traced, project, question['answer'] as Ref); }
+  catch (error) {
+    if (error instanceof EngineError && error.code.startsWith("research_")) reject(lower.id, "research.acceptance", error.message);
+    throw error;
+  }
   const view = new Proxy(store, { get(target, key) {
     if (key === "get") return (id: string, revision?: number) => revision === undefined ? records.get(id) ?? null
       : historical.get(canonical([id, revision])) ?? null;

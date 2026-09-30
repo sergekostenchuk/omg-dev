@@ -16,8 +16,8 @@ import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { readResearchConsumerTurn, readResearchAcceptanceBinding, pinnedLayerDeltaStore } from './response-recovery.js';
-import { researchAction, projectAcceptanceBinding, acceptanceBindingId,
-  type ManagedResearchTurn, type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
+import { researchAction, projectAcceptanceBinding, acceptanceBindingId, managedAnswerId, managedAnswerTurn,
+  type ManagedResearchTurn, type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding } from './research-consumer-transition.js';
 import { expandLayerDelta } from './layer-delta.js';
 
 export type ResearchLevel = "R0" | "R1" | "R2" | "R3";
@@ -105,7 +105,10 @@ export class Discovery {
       "target_stale", "The target field changed since this question was issued");
     const validate = ajv.compile(q.spec.schema as object);
     requireCondition(validate(value), "answer_invalid", "The answer does not satisfy the field contract");
-    const id = `${kind}:${q.projectId}:${randomUUID()}`;
+    // D8.4.2 (№2230-1): a managed acceptance writes its answer at the address of its own paid
+    // turn — consumers without a saved turn learn the provenance from the record itself; every
+    // other acceptance keeps the random UUID address of its era.
+    const id = managed ? managedAnswerId(q.projectId, managed.turn.id) : `${kind}:${q.projectId}:${randomUUID()}`;
     const answerRef: Ref = { id, revision: 1, hash: hashJson(answer) };
     const draftAfter = { ...draft.value, fields: { ...draft.value.fields, [q.spec.field]: value } };
     const questionAfter = { ...q, status: "answered" as const, answer: answerRef };
@@ -304,10 +307,9 @@ export class Discovery {
       "answer_foreign", "The question's exact answer is unavailable");
     if (answer.kind === "fact") return [(answer.value as Fact).observation];
     if (answer.kind === "research-answer") {
-      const ref = (answer.value as ResearchAnswer).assessment;
-      const assessment = this.store.get<ResearchAssessment>(ref.id);
-      requireCondition(assessment?.kind === "research-assessment" && assessment.hash === ref.hash && assessment.revision === ref.revision
-        && assessment.value.verdict === "supported", "research_not_supported", "Research evidence has no supported assessment");
+      const accepted = readAcceptedResearchAnswer(this.store, question.value.projectId, question.value.answer);
+      const assessment = accepted.assessment;
+      requireCondition(assessment?.value.verdict === "supported", "research_not_supported", "Research evidence has no supported assessment");
       return assessment.value.observations;
     }
     return [];
@@ -358,7 +360,18 @@ export class Discovery {
       let value: Json;
       if (answer.kind === "research-answer") {
         const research = answer.value as ResearchAnswer;
-        const assessment = this.store.get<ResearchAssessment>(research.assessment.id);
+        // D8.4.2 (№2230): provenance first — the common reader (a managed address must name its
+        // own turn's K, damaged/missing K is a finding, not a silent pass); the checks after it
+        // are today's admission for new work, unchanged by the historical proof.
+        let accepted: ReturnType<typeof readAcceptedResearchAnswer>;
+        try { accepted = readAcceptedResearchAnswer(this.store, projectId, ref); }
+        catch (error) {
+          if (error instanceof EngineError && error.code.startsWith('research_')) {
+            fail(error.code, id, error.message); continue;
+          }
+          throw error;
+        }
+        const assessment = accepted.assessment;
         const issued = assessment ? this.store.get<Question>(assessment.value.question.id, assessment.value.question.revision) : null;
         if (assessment?.kind !== "research-assessment" || assessment.hash !== research.assessment.hash
           || assessment.revision !== research.assessment.revision || assessment.value.verdict !== "supported"
@@ -374,7 +387,11 @@ export class Discovery {
             fail('research_evidence_stale',id,'A runtime evidence dependency changed');
           else guards.push(dependency);
         }
-        guards.push(reference(assessment), ...assessment.value.observations.map(item => item.source)); value = research.value;
+        guards.push(reference(assessment), ...assessment.value.observations.map(item => item.source));
+        // The exact K of a managed answer is an immutable base of the gate's result: it lands in
+        // stage.proofs / layerProof.inputs through the guards of this gate (№2230-3).
+        if (accepted.binding) guards.push(reference(accepted.binding));
+        value = research.value;
       } else if (answer.kind === "fact") {
         const observation = (answer.value as Fact).observation;
         if (!this.evidence.verify(observation)) { fail("evidence_stale", id, "Source evidence is missing or changed"); continue; }
@@ -388,4 +405,79 @@ export class Discovery {
     }
     return { findings, guards: uniqueRefs(guards) };
   }
+}
+
+/** D8.4.2 (№2230-2, №2276): the common reader of an accepted research answer for every consumer.
+ * The exact answer record is read at its Ref; its address (the producer's saved form) decides the
+ * era. A legacy address of this project keeps its producer's contract: the assessment is returned
+ * as read by the exact Ref (its absence or change is the caller's legacy finding, not a refusal
+ * here) — and when that assessment is a rebound (reusedFrom), its source chain is proven to the
+ * end: every source is the assessment of an exact historical acceptance of its own question
+ * revision (a managed source through its own K), and each rebound differs from its source only in
+ * question and reusedFrom. A managed address names the exact paid turn: K is read by the shared
+ * D8.4e reader — which proves O/P/I, the pair and R/B/M/S/A — and must name this very answer and
+ * its assessment. A foreign, malformed, missing or damaged address or record is an addressed
+ * refusal — never a scan, never a legacy branch. The read ends at P: a written K without a
+ * completed turn is lawful. */
+export function readAcceptedResearchAnswer(store: Store, projectId: string, answerRef: Ref): {
+  answer: Revision<ResearchAnswer>; assessment: Revision<ResearchAssessment> | null;
+  binding: Revision<ResearchAcceptanceBinding> | null } {
+  return readAcceptedAnswerChain(store, projectId, answerRef, new Set<string>());
+}
+function readAcceptedAnswerChain(store: Store, projectId: string, answerRef: Ref, seen: Set<string>): {
+  answer: Revision<ResearchAnswer>; assessment: Revision<ResearchAssessment> | null;
+  binding: Revision<ResearchAcceptanceBinding> | null } {
+  requireCondition(isRef(answerRef), 'research_acceptance_binding_invalid',
+    'An accepted research answer needs its exact reference');
+  const answer = store.get<ResearchAnswer>(answerRef.id, answerRef.revision);
+  requireCondition(answer?.kind === 'research-answer' && answer.hash === answerRef.hash
+    && answer.value.projectId === projectId && isRef(answer.value.assessment),
+    'research_acceptance_binding_invalid', `[${answerRef.id}] The accepted research answer is missing, foreign or changed`);
+  const turnId = managedAnswerTurn(answer.id, projectId);
+  if (turnId === null) {
+    const ref = answer.value.assessment;
+    const assessment = store.get<ResearchAssessment>(ref.id, ref.revision);
+    if (assessment?.kind !== 'research-assessment' || assessment.hash !== ref.hash) return { answer, assessment: null, binding: null };
+    if (assessment.value.reusedFrom !== undefined) proveReboundSource(store, projectId, assessment, seen);
+    return { answer, assessment, binding: null };
+  }
+  const proven = readResearchAcceptanceBinding(store, projectId, turnId);
+  requireCondition(proven !== null, 'research_acceptance_binding_invalid',
+    `[${answerRef.id}] The managed research answer has no acceptance record of its turn`);
+  requireCondition(canonical(proven.binding.value.answer) === canonical(answerRef)
+    && canonical(proven.binding.value.assessment) === canonical(answer.value.assessment),
+    'research_acceptance_binding_invalid',
+    `[${answerRef.id}] The acceptance record of this turn names another answer or assessment`);
+  return { answer, assessment: proven.assessment, binding: proven.binding };
+}
+/** D8.4.2 (№2276-3): the finite common derivation of a rebound's source. The source named by
+ * reusedFrom is read exactly; its own question revision must have been accepted historically —
+ * the next revision of that exact question is answered, and that answer (read through the common
+ * reader: a managed source proves its own K, a legacy source its own assessment and chain) carries
+ * exactly this source as its assessment; the rebound equals the source with only question and
+ * reusedFrom changed. A cyclic, lost, foreign or non-derivable source is an addressed refusal —
+ * at reading (observations, gate) as before a new reuse write. */
+function proveReboundSource(store: Store, projectId: string, rebound: Revision<ResearchAssessment>, seen: Set<string>): void {
+  const refuse = (reason: string): never => {
+    throw new EngineError('research_reuse_source_invalid',
+      `[${rebound.id}] The rebound assessment does not derive from an exact accepted source: ${reason}`,
+      { ref: reference(rebound), reason });
+  };
+  const link = rebound.value.reusedFrom;
+  if (!isRef(link)) return refuse('source-link');
+  if (seen.has(rebound.id) || seen.has(link.id)) return refuse('source-cycle');
+  seen.add(rebound.id);
+  const source = store.get<ResearchAssessment>(link.id, link.revision);
+  if (!source || source.kind !== 'research-assessment' || source.hash !== link.hash || hashJson(source.value) !== source.hash
+    || source.value.projectId !== projectId) return refuse('source-lost');
+  if (canonical({ ...source.value, question: rebound.value.question, reusedFrom: link }) !== canonical(rebound.value)) return refuse('rebound-formula');
+  const issuedRef = source.value.question;
+  const issued = isRef(issuedRef) ? store.get<Question>(issuedRef.id, issuedRef.revision) : null;
+  const accepted = issued ? store.get<Question>(issuedRef.id, issuedRef.revision + 1) : null;
+  const acceptedAnswer = accepted?.value.answer;
+  if (!issued || issued.kind !== 'question' || issued.hash !== issuedRef.hash || issued.value.projectId !== projectId
+    || !accepted || accepted.kind !== 'question' || accepted.value.status !== 'answered' || !isRef(acceptedAnswer)
+    || canonical({ ...issued.value, status: 'answered', answer: acceptedAnswer }) !== canonical(accepted.value)) return refuse('source-acceptance');
+  const sourceAnswer = readAcceptedAnswerChain(store, projectId, acceptedAnswer, seen);
+  if (!sourceAnswer.assessment || canonical(reference(sourceAnswer.assessment)) !== canonical(link)) refuse('source-assessment');
 }

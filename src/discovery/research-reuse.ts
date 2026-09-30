@@ -1,8 +1,9 @@
 import { Store, type Revision } from "../storage/store.js";
 import { canonical, hashJson } from "../canonical.js";
+import { requireCondition } from "../errors.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
-import { Discovery, type DiscoveryDraft, type Question } from "./discovery.js";
+import { Discovery, readAcceptedResearchAnswer, type DiscoveryDraft, type Question } from "./discovery.js";
 
 export function reuseResearch(store: Store, discovery: Discovery, draft: Revision<DiscoveryDraft>, environment: Ref): number {
   let reused = 0;
@@ -27,6 +28,14 @@ export function reuseResearch(store: Store, discovery: Discovery, draft: Revisio
         || issued.value.level !== question.value.level || issued.value.stage !== question.value.stage
         || canonical(issued.value.spec) !== canonical(question.value.spec)
         || canonical(priorDraft.value.inputs) !== canonical(draft.value.inputs)) continue;
+      // D8.4.2 (№2230-4, №2276-3): the source is proven BEFORE the rebound is written — by its
+      // exact accepted answer through the common reader, which also derives a rebound source's
+      // own chain to the end (a managed source needs its own K; each rebound differs from its
+      // source only in question/reusedFrom). A forged, lost or cyclic source is an addressed
+      // refusal, not a skipped candidate. The rebound inherits no B/M/K of the source's turn.
+      const proven = readAcceptedResearchAnswer(store, draft.value.projectId, reference(activeAnswer));
+      requireCondition(proven.assessment !== null && canonical(reference(proven.assessment)) === canonical(reference(prior)),
+        'research_reuse_source_invalid', `[${prior.id}] The reuse source is not the assessment of its accepted answer`);
       const rebound: ResearchAssessment = { ...value, question: reference(question), reusedFrom: reference(prior) };
       const id = `research-assessment:${hashJson(rebound)}`;
       const assessment = store.get<ResearchAssessment>(id) ?? store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value: rebound }],

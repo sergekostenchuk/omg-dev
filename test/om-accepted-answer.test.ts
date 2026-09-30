@@ -1,6 +1,8 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import type { ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
@@ -1170,4 +1172,49 @@ test('D5 grounds era preserves legacy document hashes while new acceptances use 
   f.restart();
   assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(legacy) })), legacyRead);
   assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(modern) })).record, modern);
+});
+
+// ── D8.4.2 (договор №2230): deriveAnswerHistory через общий читатель принятого ответа ──
+
+test('D8.4.2 R1 R4 R5 D5: a managed MC1 answer is proven through its own K; a lost K is an addressed refusal; restart keeps the read', async t => {
+  const f = factFixture(t);
+  const q = f.issue();
+  // The paid runner answers the MC1 draft's question: a managed acceptance with its own K.
+  const adapter = join(f.root, 'two-role-adapter.mjs');
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
+ :{action:'answer',question:s.questions[0].id,value:'JSON',citations:[{source:${JSON.stringify(reference(f.source))},selector:{kind:'json-pointer',pointer:'/answer'}}]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'fact-researcher', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'fact-assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000 }, f.environment.revision);
+  const run = await f.engine.researcher.run(f.project, q.draft.id, 1);
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const answered = f.store.get<Question>(q.issued.id)!;
+  const draftAfter = f.store.get(q.draft.id)!;
+  const answerRef = answered.value.answer!;
+  assert.ok(answerRef.id.includes(':managed-v1:'), 'the answer sits at the managed address');
+  const binding = f.store.list<ResearchAcceptanceBinding>('research-acceptance-binding')[0]!;
+  assert.equal(binding.value.answer.id, answerRef.id);
+  const request: AnswerRequest = { project: f.project, question: reference(q.question), answer: answerRef,
+    answeredQuestion: reference(answered), draft: reference(draftAfter), attempt: null };
+  const accepted = ok(writeAcceptedAnswer(f.store, request));
+  const read = () => ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(accepted) }));
+  read();
+  f.restart();
+  assert.deepEqual(read().record, read().record, 'the managed acceptance reads the same after a restart');
+  // A lost K: the addressed refusal, not a silent legacy read.
+  const raw = new DatabaseSync(join(f.root, 'state.sqlite'));
+  try {
+    raw.exec('PRAGMA foreign_keys=OFF');
+    raw.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    raw.exec('DROP TRIGGER IF EXISTS revisions_no_delete');
+    raw.prepare('DELETE FROM revisions WHERE entity_id=?').run(binding.id);
+    raw.prepare('DELETE FROM heads WHERE entity_id=?').run(binding.id);
+  } finally { raw.close(); }
+  f.restart();
+  rejected(writeAcceptedAnswer(f.store, { ...request, draft: reference(f.store.get(q.draft.id)!) }), 'research_acceptance_binding_invalid');
 });

@@ -5,6 +5,7 @@ import { EngineError } from "../errors.js";
 import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
+import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
@@ -387,6 +388,11 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
         let answered: Json;
         if (answerRecord.kind === "fact") answered = observation(answer.observation);
         else if (answerRecord.kind === "research-answer") {
+          // D8.4.2 (№2230): provenance through the common reader — a managed answer proves its own
+          // turn's K (the transitive reads join this B1 trail through the traced store); the exact
+          // K must already sit in the stage's saved proofs (it lands there from gate's guards).
+          const accepted = readAcceptedResearchAnswer(store, request.project, q.answer);
+          if (accepted.binding) proof(reference(accepted.binding), "research-acceptance-binding");
           const assessment = proof(answer.assessment, "research-assessment").value;
           check(assessment.projectId === request.project && assessment.verdict === "supported" && text(assessment.researcher)
             && text(assessment.assessor) && assessment.researcher !== assessment.assessor && isRef(assessment.question), "assessment", "Research needs an independent supported assessment");

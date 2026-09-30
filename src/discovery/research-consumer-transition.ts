@@ -753,6 +753,40 @@ export const ACCEPTANCE_BINDING_FIELDS = ['contract', 'projectId', 'turn', 'pend
   'draftBefore', 'draftAfter', 'questionBefore', 'questionAfter', 'answer', 'assessment', 'assessmentProof'] as const;
 export const acceptanceBindingId = (projectId: string, turnId: string) =>
   `research-acceptance-binding:v1:${hashJson({ projectId, turnId })}`;
+/** D8.4.2 (№2230-1): the address of a NEW managed research answer names its exact paid turn — the
+ * only lawful way a consumer without a saved turn learns provenance from the record itself. */
+export const managedAnswerId = (projectId: string, turnId: string) =>
+  `research-answer:${projectId}:managed-v1:${encodeURIComponent(turnId)}`;
+/** D8.4.2 (№2276-4): recognition of a research-answer address against the known project. A legacy
+ * address of this project (any tail that is not a managed- form) returns null — the previous era by
+ * its producer's saved form. A managed- form is parsed strictly: another project, an unknown
+ * version, a missing or non-managed turn, a broken or non-canonical encoding — each is an
+ * addressed typed refusal with its reason, never a downgrade to the previous era and never an
+ * untyped exception. An address outside this project's prefix is refused as well. */
+export function managedAnswerTurn(id: string, projectId: string): string | null {
+  const refuse = (reason: string): never => {
+    throw new EngineError('research_acceptance_binding_invalid',
+      `[${id}] The research answer address is not this project's exact address: ${reason}`, { ref: { id }, reason });
+  };
+  if (typeof id !== 'string' || !id.startsWith('research-answer:')) refuse('address-form');
+  const rest = id.slice('research-answer:'.length);
+  const sep = rest.indexOf(':managed-');
+  if (sep === -1) {
+    if (!rest.startsWith(`${projectId}:`) || rest.length === `${projectId}:`.length) refuse('address-project');
+    return null;
+  }
+  if (rest.slice(0, sep) !== projectId) refuse('address-project');
+  const tail = rest.slice(sep + ':managed-'.length);
+  const versionEnd = tail.indexOf(':');
+  if (versionEnd === -1 || tail.slice(0, versionEnd) !== 'v1') refuse('address-version');
+  const encoded = tail.slice(versionEnd + 1);
+  if (!encoded) refuse('address-turn');
+  let turnId: string;
+  try { turnId = decodeURIComponent(encoded); } catch { return refuse('address-encoding'); }
+  if (encodeURIComponent(turnId) !== encoded) refuse('address-encoding');
+  if (!turnId.startsWith('research-turn:v1:') || turnId.length <= 'research-turn:v1:'.length) refuse('address-turn');
+  return turnId;
+}
 /** Payload-level failures of a saved paid action/escalation response that
  * terminate as a typed `consumer-invalid` outcome instead of a fabricated
  * action or a transport refusal (C13/C62). Context-level failures that occur
@@ -1124,6 +1158,14 @@ export function projectAcceptanceBinding(inputs: AcceptedPaidAnswerInputs,
   if (answer.revision !== 1 || !answer.id.startsWith(`research-answer:${projectId}:`)
     || hashJson(answer.value) !== answer.hash
     || Object.keys(answer.value).sort().join(',') !== 'assessment,projectId,question,value') refuse('answer-form');
+  // D8.4.2 (№2276-1): the era of the answer is its producer's saved address. The managed address
+  // is required of the new producer only: a managed- form must name THIS turn. A K of the accepted
+  // D8.4e producer with a UUID answer keeps the previous full contract — no migration, no bypass.
+  let managedTurn: string | null;
+  try { managedTurn = managedAnswerTurn(answer.id, projectId); }
+  catch (error) { return refuse(error instanceof EngineError && typeof (error.details as { reason?: unknown })?.reason === 'string'
+    ? (error.details as { reason: string }).reason : 'answer-address'); }
+  if (managedTurn !== null && answer.id !== managedAnswerId(projectId, links.turn.id)) refuse('answer-address');
   if (assessment.revision !== 1 || assessment.id !== `research-assessment:${hashJson(assessment.value)}`
     || assessment.hash !== hashJson(assessment.value)) refuse('assessment-form');
   if (hashJson(draftAfter.value) !== draftAfter.hash || hashJson(questionAfter.value) !== questionAfter.hash

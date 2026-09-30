@@ -6,6 +6,7 @@ import { delivered, refused, isPlainObject, sealed, type OmResult, type Refusal,
 import { Ajv, MissingRefError } from 'ajv';
 import { basename, dirname } from 'node:path';
 import type { DiscoveryDraft, FieldSpec, Question } from '../discovery/discovery.js';
+import { readAcceptedResearchAnswer } from '../discovery/discovery.js';
 import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-model.js';
 import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -531,7 +532,20 @@ function deriveAnswerHistory(store: Store, request: AnswerRequest, era: GroundsE
   const draft = exact<DiscoveryDraft>(store, request.project, request.draft, 'discovery-draft', `discovery:${request.project}:`);
   check(object(answer.value) && answer.value.projectId === request.project && answer.value.question === context.engine.id && isRef(answer.value.assessment)
     && Object.hasOwn(answer.value, 'value'), 'answer_unconfirmed', answer.id, 'answer', 'The native answer must belong to this exact issued question');
-  const assessment = exact<ResearchAssessment>(store, request.project, answer.value.assessment, 'research-assessment', 'research-assessment:');
+  // D8.4.2 (№2230): provenance through the common reader — a managed answer must bind its own
+  // turn's acceptance record K (damaged or missing K is the addressed refusal, not the legacy
+  // form check); a legacy UUID answer keeps its producer's contract untouched. The reader's own
+  // exact read is the assessment below — no second read (S1.3 counts them). The provenance refusal
+  // keeps its research_* code and address through this unit's refusal channel.
+  let accepted: ReturnType<typeof readAcceptedResearchAnswer>;
+  try { accepted = readAcceptedResearchAnswer(store, request.project, request.answer); }
+  catch (error) {
+    if (error instanceof EngineError && error.code.startsWith('research_'))
+      fail(error.code, request.answer.id, 'acceptance', error.message);
+    throw error;
+  }
+  const assessment = accepted.assessment
+    ?? exact<ResearchAssessment>(store, request.project, answer.value.assessment, 'research-assessment', 'research-assessment:');
   check(object(assessment.value) && assessment.value.projectId === request.project && same(assessment.value.question, reference(context.engine))
     && assessment.value.verdict === 'supported' && text(assessment.value.researcher) && text(assessment.value.assessor)
     && assessment.value.researcher !== assessment.value.assessor && Array.isArray(assessment.value.observations) && assessment.value.observations.length > 0
