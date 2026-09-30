@@ -57,7 +57,12 @@ export interface ExecutionRoot { projectId: string; sourceRoot: string; workspac
 export function git(cwd: string, args: string[], input?: string): string {
   return gitBytes(cwd, args, input === undefined ? undefined : Buffer.from(input)).toString("utf8").trim();
 }
+let gitEntries = 0;
+/** Entries into gitBytes (git goes through it) in this process, whatever their outcome (S1.3, №2217): a historical proof
+ * whose action ran git depends on more than its Store and is never kept beyond its operation. */
+export function gitCalls(): number { return gitEntries; }
 export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
+  gitEntries++;
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
   const result = spawnSync("git", ["--literal-pathspecs", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
   if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });

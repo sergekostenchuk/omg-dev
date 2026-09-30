@@ -951,11 +951,11 @@ function retryHistory(t: TestContext, ends: ModelEnd[] = [
   const config = f.store.write({ id: `config:${f.project}:retry`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
   let nextSource = 0;
   /** An unclaimed row of another gate: journal noise that moves the head and is never a cause of any attempt. */
-  function refusal(code: string, goal: string) {
-    const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}s11-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
+  function refusal(code: string, goal: string, store: Store = f.store) {
+    const source = store.write({ id: `${unitRefusalNamespace(f.project)}s11-retry-${++nextSource}`, kind: UNIT_REFUSAL_KIND, expected: 0,
       value: { gate: 'G4', refusals: [{ code, goal, remedy: 'Resolve the addressed question',
         origin: { name: code, stage: 'question-packet', subject: goal, sources: [{ role: 'input', ref: reference(f.input) }] } }] } });
-    const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
+    const journal = ok(recordRefusal(store, { project: f.project, source: reference(source) }));
     const row = journal.value.rows.find(row => row.source.id === source.id)!;
     return { row: row.id, name: row.code, goal: row.goal };
   }
@@ -1284,7 +1284,7 @@ function countingReads(t: TestContext, ids: readonly string[]) {
   return () => ids.reduce((sum, id) => sum + (reads.get(id) ?? 0), 0);
 }
 
-test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation or a new Store prove it again', t => {
+test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation of the unchanged Store serves the kept proof, a head moved by a second Store keeps the history, a new Store proves it again', t => {
   const { p, f, refusal, own, request } = retryHistory(t);
   const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
   assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, own.expected);
@@ -1309,7 +1309,14 @@ test('S1.1 E2 proves the saved journal at its exact revision once per operation;
   });
   const outside = count();
   assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
-  assert.ok(count() > outside, 'A new operation proves the exact revision again');
+  assert.equal(count(), outside, 'S1.3 (№2201): a new operation of the unchanged Store serves the kept proof of the exact revision without fetching it again');
+  // A later row written through a second Store of the same file moves the head (№2233-3): the saved packet and the exact
+  // journal still stand on their own revisions — history, not a current admission.
+  const second = new Store(f.store.path), headBefore = f.store.get(journalId(project))!.revision;
+  try { refusal('moved-by-second-store', 'unrelated-question', second); } finally { second.close(); }
+  assert.deepEqual(read(), packet);
+  assert.deepEqual(reference(ok(readJournalAt(f.store, project, journal))), journal);
+  assert.ok(f.store.get(journalId(project))!.revision > headBefore, 'The warm Store sees the head the second Store moved');
   const before = count();
   f.restart();
   assert.deepEqual(read(), packet);
@@ -1323,12 +1330,14 @@ test('S1.1 E2 proves the saved journal at its exact revision once per operation;
   }
 });
 
-test('S1.1 a new preparation takes the current journal head and guards it: a head moved before the write refuses the packet', t => {
+test('S1.1 a new preparation takes the current journal head and guards it: a head moved by a second Store before the write refuses the packet', t => {
   const { f, refusal, request } = retryHistory(t);
   const prepared = ok(prepareQuestionPacket(f.store, request)), head = f.store.get(journalId(f.project))!;
   assert.deepEqual(prepared.record.value.journal, reference(head));
   assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(head))), 'The current journal head guards the write');
-  refusal('moved-before-write', 'unrelated-question');
+  // The move comes through a second Store of the same file (S1.3, №2233-3): the warm Store's kept proofs never hide it.
+  const second = new Store(f.store.path);
+  try { refusal('moved-before-write', 'unrelated-question', second); } finally { second.close(); }
   rejected(writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
   assert.equal(f.store.get(prepared.record.id), null, 'Nothing of the stale packet is written');
   const fresh = ok(prepareQuestionPacket(f.store, request)), moved = f.store.get(journalId(f.project))!;

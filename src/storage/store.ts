@@ -7,6 +7,8 @@ import { migrate } from "./schema.js";
 import { createSnapshot, type Snapshot, type SnapshotOptions } from "./snapshots.js";
 
 export interface Revision<T = Json> { id: string; kind: string; revision: number; hash: string; value: T }
+/** A saved revision's identity without its body. */
+export interface RevisionIdentity { id: string; kind: string; revision: number; hash: string }
 export interface Write { id: string; kind: string; expected: number; value: unknown }
 export interface ReadGuard { id: string; revision: number; hash: string }
 export interface AbsentGuard { id: string; absent: true }
@@ -34,6 +36,11 @@ function transactionGuards(value: unknown): TransactionGuard[] {
   });
 }
 
+let physicalReads = 0;
+/** Reads made through get/list/history of every Store in this process (S1.3, №2201): a historical proof counts those it
+ * did not trace itself, so a read from a closure-captured Store keeps that proof inside one operation. */
+export function storeReads(): number { return physicalReads; }
+
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
   requireCondition(digest(body) === row['sha256'], "record_corrupt", "Stored revision checksum mismatch");
@@ -46,6 +53,7 @@ export class Store {
   #db: DatabaseSync;
   #busy = false;
   #closed = false;
+  #commits = 0;
   constructor(path: string) {
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -55,8 +63,29 @@ export class Store {
     this.#db = new DatabaseSync(this.path);
     try { migrate(this.#db); } catch (error) { this.#db.close(); throw error; }
   }
+  /**
+   * Equal stamps prove that nothing this connection can read has changed in between: this Store's own commits are
+   * counted, and SQLite's data_version moves with every commit of any other connection to the file (S1.3, №2185-3).
+   */
+  changeStamp(): string {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    return `${this.#commits}:${String(this.#db.prepare("PRAGMA data_version").get()!['data_version'])}`;
+  }
+  /** The identities get/list/history select, read without decoding bodies: saved revisions never change. */
+  identities(method: 'get' | 'list' | 'history', id?: string, revision?: number): RevisionIdentity[] {
+    const columns = "r.entity_id, r.revision, r.kind, r.sha256";
+    const rows = method === 'get' ? [revision === undefined
+      ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id=?`).get(id!)
+      : this.#db.prepare(`SELECT ${columns} FROM revisions r WHERE entity_id=? AND revision=?`).get(id!, revision)].filter(row => row !== undefined)
+      : method === 'list' ? id === undefined
+        ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) ORDER BY entity_id`).all()
+        : this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE kind=? ORDER BY entity_id`).all(id)
+      : this.#db.prepare(`SELECT ${columns} FROM revisions r WHERE entity_id=? ORDER BY revision`).all(id!);
+    return rows.map(row => ({ id: String(row!['entity_id']), kind: String(row!['kind']), revision: Number(row!['revision']), hash: String(row!['sha256']) }));
+  }
   get databaseId(): string { return String(this.#db.prepare("SELECT database_id FROM identity WHERE id=1").get()!['database_id']); }
   get<T = Json>(id: string, revision?: number): Revision<T> | null {
+    physicalReads++;
     return this.#get<T>(id, revision);
   }
   #get<T = Json>(id: string, revision?: number): Revision<T> | null {
@@ -66,12 +95,14 @@ export class Store {
     return row ? decode<T>(row) : null;
   }
   list<T = Json>(kind?: string): Revision<T>[] {
+    physicalReads++;
     const sql = "SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision)";
     const rows = kind === undefined ? this.#db.prepare(`${sql} ORDER BY entity_id`).all()
       : this.#db.prepare(`${sql} WHERE kind=? ORDER BY entity_id`).all(kind);
     return rows.map(row => decode<T>(row));
   }
   history<T = Json>(id: string): Revision<T>[] {
+    physicalReads++;
     return this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
   }
   write<T = Json>(input: Write): Revision<T> { return this.writeMany<T>([input])[0]!; }
@@ -112,6 +143,7 @@ export class Store {
         results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as T });
       }
       this.#db.exec("COMMIT");
+      this.#commits++;
       return results;
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }

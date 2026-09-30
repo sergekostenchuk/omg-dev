@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { Ajv } from "ajv";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, digest, hashJson, type Json } from "../src/canonical.js";
@@ -11,7 +11,11 @@ import { QUESTION_MOMENTS, preparationMomentSchema, featurePreparationMomentSche
 import { collectGaps, GAP_MOMENTS, type GapSources } from "../src/om/gaps.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
-import { Store, type Revision } from "../src/storage/store.js";
+import { Store, type Revision, type Write } from "../src/storage/store.js";
+import { captureView, storeView } from "../src/storage/store-view.js";
+import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.js";
+import { sealed } from "../src/om/refusal.js";
+import { git, gitBytes, gitCalls } from "../src/runtime/environment.js";
 import {
   buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput, prepareReopenOmInput,
   withHistoricalReads, historicalRead, historicalProof, historicalTrace, type HistoricalReadKey,
@@ -394,22 +398,26 @@ test("historical input reads reuse the same era schema objects after source move
     });
     assert.deepEqual([...new Set(questionSchemas().map(canonical))].sort(), expectedContents);
     const initialIdentities = new Set(questionSchemas());
-    const repeat = () => {
+    // S1.3 (№2185-4): in the same Store the kept complete proof answers without validating again; whatever validation does
+    // run — after a source moved, or cold after a reopen — uses the same schema objects.
+    const repeat = (cold: boolean) => {
       captured.length = 0;
       assert.deepEqual(historical(), saved);
       const schemas = questionSchemas();
-      assert.deepEqual([...new Set(schemas.map(canonical))].sort(), expectedContents);
+      if (cold) assert.deepEqual([...new Set(schemas.map(canonical))].sort(), expectedContents);
+      else assert.ok(schemas.length === 0 || [...new Set(schemas.map(canonical))].sort().join() === expectedContents.join());
       assert.ok(schemas.every(schema => initialIdentities.has(schema)), "Historical reads must not create fresh schema identities");
+      return schemas.length;
     };
-    repeat();
-    repeat();
+    assert.equal(repeat(false), 0, "The kept proof of this Store is not validated again");
+    assert.equal(repeat(false), 0);
     const source = f.store.get<Source>(`source:${f.project}:brief`)!;
     const content = `${source.value.content}\n`;
     f.store.write({ id: source.id, kind: source.kind, expected: source.revision,
       value: { ...clone(source.value), content, sha256: digest(content) } });
-    repeat();
+    repeat(false);
     f.reopen();
-    repeat();
+    assert.ok(repeat(true) > 0, "A reopened Store validates cold, with the same schema objects");
     assert.equal(f.store.history(saved.id).length, 1);
   } finally {
     Ajv.prototype.compile = compile;
@@ -1298,7 +1306,12 @@ test("S1 cold and cached proofs replay nested dependencies to every transparent 
     assert.deepEqual(warmChild, left, 'A nested cached proof replays its own nested proof dependencies too');
     assert.equal(outer, 1); assert.equal(inner, 1);
   });
-  read(first); assert.equal(outer, 2); assert.equal(inner, 2);
+  // S1.3 (№2185-4): the next operation of the same Store reuses the kept complete proofs and still replays them in full.
+  const later: Ref[] = [];
+  read(historicalTrace(first, ref => later.push(ref))); assert.equal(outer, 1); assert.equal(inner, 1);
+  assert.deepEqual(later, [a, b, b, a].map(reference));
+  const reopened = new Store(first.path); t.after(() => reopened.close());
+  read(reopened); assert.equal(outer, 2); assert.equal(inner, 2, 'A new Store instance starts cold and proves again');
 });
 
 test("S1 deep repeated DAG stays compact without external observers", t => {
@@ -1326,8 +1339,14 @@ test("S1 deep repeated DAG stays compact without external observers", t => {
       assert.equal(read(first, depth), 2 ** depth);
       assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'The same DAG expands each exact proof once');
     });
+    // S1.3 (№2185-4): the next operation of the same Store reuses the kept DAG; a new Store instance proves it again.
     assert.equal(read(first, depth), 2 ** depth);
-    assert.deepEqual(calls, Array<number>(depth + 1).fill(2), 'The next external operation proves the DAG again');
+    assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'The next operation reuses the kept DAG of this Store');
+    const reopened = new Store(first.path);
+    try {
+      assert.equal(read(reopened, depth), 2 ** depth);
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(2), 'A new Store instance proves the DAG again');
+    } finally { reopened.close(); }
   } finally { Array.prototype.push = originalPush; }
 });
 
@@ -1377,10 +1396,11 @@ test("S1 distinct collectors traverse a deep repeated DAG once and keep unique r
       assert.deepEqual(fresh, expected, 'A newly registered collector receives the full unique dependency set from the cached DAG');
       assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
     });
+    // S1.3 (№2185-4): a collector of the next operation gets the full unique set from the DAG this Store kept.
     const next: Observation[] = [];
     assert.equal(read(collect(next), depth), 2 ** depth);
     assert.deepEqual(next, expected);
-    assert.deepEqual(calls, Array<number>(depth + 1).fill(2));
+    assert.deepEqual(calls, Array<number>(depth + 1).fill(1));
   } finally { Array.prototype.push = originalPush; }
 });
 
@@ -1477,7 +1497,11 @@ test("S1 exact absence and heads are read afresh and transparent cycles release 
   });
   const failure = new Error('Scope failed');
   assert.throws(() => withHistoricalReads(() => { read(); throw failure; }), error => error === failure);
-  read(); assert.equal(calls, 4);
+  // S1.3 (№2185-4): the kept proof over the unchanged head serves later operations, also after a failed one; a head that
+  // moves makes the next operation derive again.
+  read(); assert.equal(calls, 2);
+  const third = first.write({ id: row.id, kind: row.kind, expected: 2, value: { value: 3 } });
+  assert.deepEqual(read(), [third, first.get(row.id, 2)]); assert.equal(calls, 3);
   for (const operation of [
     () => historicalTrace(null as unknown as Store),
     () => historicalTrace(first, 3 as unknown as (ref: Ref) => void),
@@ -1532,6 +1556,269 @@ test("S1 opaque synthetic reads never become observations of a source collector 
     assert.deepEqual(cold, [reference(row)]);
     assert.deepEqual(warm, cold, 'Synthetic reads behind an opaque boundary were never read through the source collector');
   });
+});
+
+/** Two Store instances — two connections — over one database file. */
+function sameFileStores(t: TestContext) {
+  const directory = mkdtempSync(join(tmpdir(), "om-history-kept-"));
+  const first = new Store(join(directory, "state.sqlite")), second = new Store(join(directory, "state.sqlite"));
+  t.after(() => { first.close(); second.close(); rmSync(directory, { recursive: true, force: true }); });
+  return { first, second };
+}
+const noCycle = (): never => { throw new Error('Unexpected cycle'); };
+
+test("S1.3 kept complete proofs serve later operations of one Store and are derived again when a read head, an absent record, a list or a history moves — through this Store or another connection", t => {
+  const { first, second } = sameFileStores(t);
+  const a = first.write({ id: 'kept:a', kind: 'kept', expected: 0, value: { v: 1 } });
+  const key = { reader: 'S1.3.kept', project: 'garden', ref: reference(a) };
+  let calls = 0;
+  const read = (store: Store) => historicalProof(store, key, source => {
+    calls++;
+    return { head: source.get(a.id), absent: source.get('kept:absent'), list: source.list('kept').map(reference), history: source.history(a.id).map(reference) };
+  }, noCycle);
+  const value = read(first); assert.equal(calls, 1);
+  assert.deepEqual(read(first), value); assert.equal(calls, 1, 'The next operation reuses the kept proof');
+  first.write({ id: 'kept:unrelated', kind: 'other', expected: 0, value: {} });
+  assert.deepEqual(read(first), value); assert.equal(calls, 1, 'A write elsewhere is checked, not derived again');
+  second.write({ id: 'kept:absent', kind: 'other', expected: 0, value: {} });
+  assert.notEqual(read(first).absent, null); assert.equal(calls, 2, 'Absence → presence through another connection');
+  second.write({ id: 'kept:b', kind: 'kept', expected: 0, value: {} });
+  assert.equal(read(first).list.length, 2); assert.equal(calls, 3, 'A new listed record');
+  second.write({ id: a.id, kind: a.kind, expected: 1, value: { v: 2 } });
+  const moved = read(first);
+  assert.deepEqual([moved.head!.revision, moved.history.length, calls], [2, 2, 4], 'A new head and history');
+  assert.deepEqual(read(first), moved); assert.equal(calls, 4);
+  assert.deepEqual(read(second), moved); assert.equal(calls, 5, 'The second Store instance is its own cold source');
+  const reopened = new Store(first.path); t.after(() => reopened.close());
+  assert.deepEqual(read(reopened), moved); assert.equal(calls, 6, 'A reopened Store starts cold');
+});
+
+test("S1.3 incomplete proofs stay within one operation: an untraced read of a plain Store, a closure read inside a traced proof, and a traced proof nesting one; a complete proof outlives it", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'incomplete:a', kind: 'proof', expected: 0, value: {} });
+  const key = { reader: 'S1.3.incomplete', project: 'garden', ref: reference(row) };
+  let untraced = 0, closure = 0, outer = 0, clean = 0;
+  const plain = () => historicalRead(first, { ...key, reader: 'S1.3.untraced' }, () => { untraced++; return first.get(row.id); }, noCycle);
+  const captured = () => historicalProof(first, { ...key, reader: 'S1.3.closure' }, () => { closure++; return first.get(row.id); }, noCycle);
+  const nesting = () => historicalProof(first, { ...key, reader: 'S1.3.outer' }, source => { outer++; return [source.get(row.id, 1), plain()]; }, noCycle);
+  const complete = () => historicalProof(first, { ...key, reader: 'S1.3.complete' }, source => { clean++; return source.get(row.id, 1); }, noCycle);
+  const round = () => withHistoricalReads(() => { plain(); captured(); nesting(); complete(); plain(); nesting(); });
+  round(); assert.deepEqual([untraced, closure, outer, clean], [1, 1, 1, 1], 'Inside one operation every proof is derived once');
+  round(); assert.deepEqual([untraced, closure, outer, clean], [2, 2, 2, 1], 'Only the complete proof outlives its operation');
+  round(); assert.deepEqual([untraced, closure, outer, clean], [3, 3, 3, 1]);
+});
+
+test("S1.3 write-only views of one Store share its kept proofs and keep their own write policies; a capture, a subclass and a view whose target read was replaced keep their own area", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'views:a', kind: 'proof', expected: 0, value: { v: 1 } });
+  const key = { reader: 'S1.3.views', project: 'garden', ref: reference(row) };
+  let runs = 0;
+  const prove = (store: Store) => historicalProof(store, key, source => { runs++; return reference(source.get(row.id)!); }, noCycle);
+  const refused: Write[][] = [];
+  const left = storeView(first, { write: (writes, guards) => first.writeMany(writes, guards) });
+  const right = storeView(first, { write: writes => { refused.push(writes); throw new EngineError('policy_refused', 'This view never writes'); } });
+  const chain = storeView(left, { write: (writes, guards) => left.writeMany(writes, guards) });
+  assert.deepEqual(prove(left), reference(row)); assert.equal(runs, 1);
+  assert.deepEqual([prove(right), prove(chain), prove(first)], [reference(row), reference(row), reference(row)]);
+  assert.equal(runs, 1, 'One derivation serves the Store and every write-only view built over it');
+  assert.throws(() => right.write({ id: row.id, kind: row.kind, expected: 1, value: { v: 2 } }), (error: unknown) => (error as EngineError).code === 'policy_refused');
+  assert.deepEqual([refused.length, first.get(row.id)!.revision], [1, 1], 'A refused write of one view reaches its own policy only and publishes nothing');
+  assert.deepEqual(prove(chain), reference(row)); assert.equal(runs, 1, 'The shared proof stays current after the refused write');
+  const moved = left.write({ id: row.id, kind: row.kind, expected: 1, value: { v: 2 } });
+  assert.deepEqual(prove(right), reference(moved)); assert.equal(runs, 2, 'A write through a neighbour view moves the shared proof');
+  const capture = captureView(first, {}).view;
+  let before = runs;
+  prove(capture); prove(capture); assert.equal(runs, before + 2, 'A capture derives in each operation');
+  class Subclass extends Store {}
+  const subclass = new Subclass(first.path); t.after(() => subclass.close());
+  before = runs; prove(subclass); prove(subclass); assert.equal(runs, before + 2, 'A subclass is no proved Store');
+  const original = Store.prototype.get;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+  try {
+    before = runs; prove(left); prove(left);
+    assert.equal(runs, before + 2, 'A view whose target read was replaced after it was built is no longer that Store');
+  } finally { Store.prototype.get = original; }
+  before = runs; prove(left); assert.equal(runs, before, 'With the original read restored the view is that Store again');
+});
+
+test("S1.3 observers of any view of the Store receive the full ordered and distinct stream from a proof warmed through the Store or a neighbour; a lower collector and a pending overlay are not merged", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'observed:a', kind: 'proof', expected: 0, value: { v: 'a' } });
+  const b = first.write({ id: 'observed:b', kind: 'proof', expected: 0, value: { v: 'b' } });
+  const key = { reader: 'S1.3.observed', project: 'garden', ref: reference(a) };
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  const expected: Observation[] = [
+    { ref: reference(a), head: false, method: 'get' }, { ref: reference(b), head: true, method: 'get' },
+    { ref: reference(a), head: false, method: 'history' }, { ref: reference(a), head: false, method: 'get' },
+  ];
+  let runs = 0;
+  const read = (store: Store) => historicalProof(store, key, source => {
+    runs++; return [source.get(a.id, a.revision), source.get(b.id), source.history(a.id), source.get(a.id, a.revision)].map(row => canonical(row as Json));
+  }, noCycle);
+  const policy = { write: (writes: Write[], guards: Parameters<Store['writeMany']>[1]) => first.writeMany(writes, guards) };
+  const view = storeView(first, policy), neighbour = storeView(first, policy);
+  const observe = (store: Store, sink: Observation[], mode: 'ordered' | 'distinct' = 'ordered') =>
+    historicalTrace(store, (ref, head, method) => { sink.push({ ref, head, method }); }, mode);
+  read(first); assert.equal(runs, 1);
+  const ordered: Observation[] = [], distinct: Observation[] = [], again: Observation[] = [];
+  read(observe(view, ordered)); read(observe(neighbour, distinct, 'distinct'));
+  withHistoricalReads(() => { read(neighbour); read(observe(view, again)); });
+  assert.equal(runs, 1);
+  assert.deepEqual(ordered, expected, 'The ordered stream keeps its order and multiplicity');
+  assert.deepEqual(distinct, expected.slice(0, 3), 'The distinct set keeps each observation once');
+  assert.deepEqual(again, expected);
+  const below: Ref[] = [];
+  const overCollector = storeView(historicalTrace(first, ref => below.push(ref)), policy);
+  read(overCollector); read(overCollector);
+  assert.equal(runs, 3, 'A view over a lower collector derives in each operation');
+  assert.equal(below.length, 8, 'The lower collector saw every read of both derivations');
+  const pending = new Proxy(first, { get(target, member) {
+    const value: unknown = Reflect.get(target, member, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  read(pending); read(pending); assert.equal(runs, 5, 'An arbitrary overlay keeps its own per-operation area');
+});
+
+test("S1.3 the control of a pass is never cached: a proof warmed through RunControlGate stays a read; after a stop from another Store the next guarded write is refused, while an unguarded write of an admitted call goes on", t => {
+  const { first, second } = sameFileStores(t);
+  const project = 'garden';
+  const row = first.write({ id: 'gate:a', kind: 'proof', expected: 0, value: { v: 1 } });
+  const gate = new RunControlGate(first, project), view = gate.view();
+  view.write({ id: 'gate:admitted', kind: 'proof', expected: 0, value: { at: 'admission' } });
+  let runs = 0;
+  const key = { reader: 'S1.3.gate', project, ref: reference(row) };
+  const prove = (store: Store) => historicalProof(store, key, source => { runs++; return reference(source.get(row.id)!); }, noCycle);
+  assert.deepEqual(prove(view), reference(row)); assert.deepEqual(prove(first), reference(row)); assert.equal(runs, 1);
+  const stopped = stopRun(second, { project });
+  assert.ok(stopped.ok && stopped.value.stopped);
+  assert.deepEqual(prove(view), reference(row)); assert.equal(runs, 1, 'Reading a kept proof through the gate view is no admission');
+  assert.throws(() => view.write({ id: 'gate:new', kind: 'proof', expected: 0, value: {} }),
+    (error: unknown) => error instanceof RunControlLost && error.refusal.code === 'run_stopped');
+  assert.equal(first.get('gate:new'), null, 'The refused guarded write published nothing');
+  first.write({ id: 'gate:receipt', kind: 'proof', expected: 0, value: { of: 'gate:admitted' } });
+  assert.ok(first.get('gate:receipt'), 'The accounting of an admitted call is written without today\'s control');
+});
+
+test("S1.3 kept proofs are bounded, and a kept value is never a shared mutable object: a later operation gets an independent copy, a frozen value is shared as is", t => {
+  const { first } = historicalStores(t);
+  const row = first.write({ id: 'bounded:a', kind: 'proof', expected: 0, value: { v: 1 } });
+  const calls = new Map<number, number>();
+  const read = (index: number) => historicalProof(first, { reader: 'S1.3.bounded', project: 'garden', ref: reference(row), parameters: { index } }, source => {
+    calls.set(index, (calls.get(index) ?? 0) + 1); return source.get(row.id, 1)!.revision + index;
+  }, noCycle);
+  for (let index = 0; index <= 600; index++) read(index);
+  read(600); assert.equal(calls.get(600), 1, 'The latest proofs stay kept');
+  read(0); assert.equal(calls.get(0), 2, 'The oldest proof beyond the bound was dropped and is derived again');
+  let mutableRuns = 0, frozenRuns = 0;
+  const mutable = () => historicalProof(first, { reader: 'S1.3.mutable', project: 'garden', ref: reference(row) }, source => {
+    mutableRuns++; return { rows: [reference(source.get(row.id, 1)!)] };
+  }, noCycle);
+  const frozen = () => historicalProof(first, { reader: 'S1.3.frozen', project: 'garden', ref: reference(row) }, source => {
+    frozenRuns++; return sealed({ rows: [reference(source.get(row.id, 1)!)] });
+  }, noCycle);
+  const firstValue = mutable();
+  firstValue.rows.push({ id: 'changed', revision: 9, hash: 'f'.repeat(64) });
+  const secondValue = mutable();
+  assert.equal(mutableRuns, 1);
+  assert.notEqual(secondValue, firstValue);
+  assert.deepEqual(secondValue, { rows: [reference(row)] }, 'A change made by one operation never reaches the next');
+  secondValue.rows.length = 0;
+  assert.deepEqual(mutable(), { rows: [reference(row)] });
+  const shared = frozen();
+  assert.equal(frozen(), shared); assert.equal(frozenRuns, 1, 'A frozen value is shared as is');
+});
+
+/** A temporary Git repository with one commit. */
+function gitRepository(t: TestContext): string {
+  const root = mkdtempSync(join(tmpdir(), "om-history-git-")), repository = join(root, "repo");
+  mkdirSync(repository); t.after(() => rmSync(root, { recursive: true, force: true }));
+  git(repository, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(repository, "README.md"), "one\n");
+  git(repository, ["add", "README.md"]);
+  git(repository, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "one"]);
+  return repository;
+}
+
+test("S1.3 (№2217 а) every entry into git and gitBytes is counted before it runs — success, a nonzero exit, a failed start — and a proof whose action ran git, even catching its error, is not kept", t => {
+  const { first } = historicalStores(t);
+  const repository = gitRepository(t), missing = join(repository, "no-such-directory");
+  const row = first.write({ id: 'git:a', kind: 'proof', expected: 0, value: {} });
+  const cases: [string, () => unknown, boolean][] = [
+    ['git success', () => git(repository, ['rev-parse', 'HEAD']), true],
+    ['gitBytes success', () => gitBytes(repository, ['rev-parse', 'HEAD']), true],
+    ['git nonzero exit', () => git(repository, ['rev-parse', '--verify', 'refs/heads/absent']), false],
+    ['gitBytes nonzero exit', () => gitBytes(repository, ['cat-file', '-e', 'f'.repeat(40)]), false],
+    ['git failed start', () => git(missing, ['rev-parse', 'HEAD']), false],
+    ['gitBytes failed start', () => gitBytes(missing, ['status']), false],
+  ];
+  for (const [name, call, succeeds] of cases) {
+    const before = gitCalls();
+    if (succeeds) call(); else assert.throws(call, (error: unknown) => (error as EngineError).code === 'git_failed', name);
+    assert.equal(gitCalls(), before + 1, name + ' is counted once');
+    let runs = 0;
+    const read = () => historicalProof(first, { reader: 'S1.3.git-case', project: 'garden', ref: reference(row), parameters: { name } }, source => {
+      runs++;
+      try { call(); } catch { /* the action keeps its own answer */ }
+      return reference(source.get(row.id, 1)!);
+    }, noCycle);
+    read(); read();
+    assert.equal(runs, 2, name + ': a proof that ran git is derived again in the next operation');
+  }
+});
+
+test("S1.3 (№2217 б) a proof that runs git is derived in every operation of an unchanged Store: a new commit gives the new result, a vanished repository a refusal, never the saved success", t => {
+  const { first } = historicalStores(t);
+  const repository = gitRepository(t);
+  const row = first.write({ id: 'git:head', kind: 'proof', expected: 0, value: {} });
+  let runs = 0;
+  const head = () => historicalProof(first, { reader: 'S1.3.git-head', project: 'garden', ref: reference(row) }, source => {
+    runs++; source.get(row.id, 1);
+    return git(repository, ['rev-parse', 'HEAD']);
+  }, noCycle);
+  const one = head();
+  assert.equal(head(), one); assert.equal(runs, 2, 'Two operations of an unchanged Store derive it twice');
+  writeFileSync(join(repository, "README.md"), "two\n");
+  git(repository, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-qam", "two"]);
+  assert.notEqual(head(), one, 'A new commit gives the new result'); assert.equal(runs, 3);
+  rmSync(repository, { recursive: true, force: true });
+  assert.throws(head, (error: unknown) => (error as EngineError).code === 'git_failed', 'A vanished repository refuses; no saved success answers');
+  assert.equal(runs, 4);
+});
+
+test("S1.3 (№2217 в) a child that ran git, warmed inside an operation and taken from its cache by a parent, makes the parent incomplete: in the next operation neither is carried over", t => {
+  const { first } = historicalStores(t);
+  const repository = gitRepository(t);
+  const row = first.write({ id: 'git:nested', kind: 'proof', expected: 0, value: {} });
+  const key = { reader: 'S1.3.git-child', project: 'garden', ref: reference(row) };
+  let children = 0, parents = 0;
+  const child = (store: Store) => historicalProof(store, key, source => { children++; source.get(row.id, 1); return git(repository, ['rev-parse', 'HEAD']); }, noCycle);
+  const parent = (store: Store) => historicalProof(store, { ...key, reader: 'S1.3.git-parent' }, source => {
+    parents++; return [reference(source.get(row.id, 1)!), child(source)];
+  }, noCycle);
+  withHistoricalReads(() => {
+    child(first);
+    const before = gitCalls();
+    parent(first);
+    assert.equal(gitCalls(), before, 'The parent took the warmed child from the cache: its own count did not move');
+    assert.deepEqual([children, parents], [1, 1]);
+  });
+  parent(first);
+  assert.deepEqual([children, parents], [2, 2], 'Neither the child nor the parent was kept as complete');
+});
+
+test("S1.3 (№2217 г) a complete Store-only proof is kept, and git calls outside its action — before it, between operations — do not switch the cache off", t => {
+  const { first } = historicalStores(t);
+  const repository = gitRepository(t);
+  const row = first.write({ id: 'git:clean', kind: 'proof', expected: 0, value: {} });
+  let runs = 0;
+  const read = (store: Store) => historicalProof(store, { reader: 'S1.3.git-clean', project: 'garden', ref: reference(row) }, source => {
+    runs++; return reference(source.get(row.id, 1)!);
+  }, noCycle);
+  withHistoricalReads(() => { git(repository, ['rev-parse', 'HEAD']); read(first); });
+  git(repository, ['status', '--porcelain']);
+  assert.deepEqual(read(first), reference(row)); assert.equal(runs, 1, 'The Store-only proof was kept across operations');
+  git(repository, ['rev-parse', 'HEAD']);
+  assert.deepEqual(read(first), reference(row)); assert.equal(runs, 1);
 });
 
 test('B1.1 both v4 question producers require explicit moments before normalization and preserve per-source eras', async t => {

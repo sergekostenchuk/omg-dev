@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Store, type AbsentGuard, type ReadGuard, type TransactionGuard } from "../src/storage/store.js";
+import { Store, storeReads, type AbsentGuard, type ReadGuard, type TransactionGuard } from "../src/storage/store.js";
 import { isRef } from "../src/pipeline/contracts.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
 import { EngineError } from "../src/errors.js";
@@ -286,4 +286,51 @@ process.stdout.write(JSON.stringify({list:store.list(), history:store.history(so
     assert.deepEqual(reopened.writeMany([], [legacy.history[1]!, { id: "missing", absent: true }]), []);
     assert.deepEqual(reopened.list(), legacy.list);
   } finally { reopened.close(); }
+});
+
+test("S1.3 the change stamp moves with every commit this Store or another connection makes, and only then; identities are the rows get, list and history select, without their bodies", t => {
+  const { store, path } = fixture(t);
+  const other = new Store(path);
+  try {
+    const empty = store.changeStamp();
+    assert.equal(store.changeStamp(), empty, "Reads and repeated stamps change nothing");
+    const a = store.write({ id: "stamp:a", kind: "proof", expected: 0, value: { v: 1 } });
+    const own = store.changeStamp();
+    assert.notEqual(own, empty, "An own commit moves the stamp");
+    store.get(a.id); store.list("proof"); store.history(a.id); store.identities("list", "proof");
+    assert.equal(store.changeStamp(), own, "Reads do not move the stamp");
+    assert.throws(() => store.write({ id: a.id, kind: a.kind, expected: 0, value: {} }), code("revision_conflict"));
+    assert.throws(() => store.writeMany([{ id: "stamp:x", kind: "proof", expected: 0, value: {} }], [{ id: a.id, absent: true }]), code("input_stale"));
+    assert.equal(store.changeStamp(), own, "A refused, rolled back transaction moves nothing");
+    const b = other.write({ id: "stamp:b", kind: "proof", expected: 0, value: { v: 2 } });
+    const foreign = store.changeStamp();
+    assert.notEqual(foreign, own, "A commit of another connection moves the stamp too");
+    const a2 = other.write({ id: a.id, kind: a.kind, expected: 1, value: { v: 3 } });
+    assert.notEqual(store.changeStamp(), foreign);
+    const identity = (row: { id: string; kind: string; revision: number; hash: string }) => ({ id: row.id, kind: row.kind, revision: row.revision, hash: row.hash });
+    assert.deepEqual(store.identities("get", a.id), [identity(store.get(a.id)!)]);
+    assert.deepEqual(store.identities("get", a.id, 1), [identity(store.get(a.id, 1)!)]);
+    assert.deepEqual(store.identities("get", "stamp:absent"), [], "An absent head has no identity");
+    assert.deepEqual(store.identities("get", a.id, 9), [], "An absent revision has no identity");
+    assert.deepEqual(store.identities("list", "proof"), store.list("proof").map(identity));
+    assert.deepEqual(store.identities("list"), store.list().map(identity));
+    assert.deepEqual(store.identities("history", a.id), store.history(a.id).map(identity));
+    assert.deepEqual(store.identities("history", a.id).map(row => row.revision), [1, 2]);
+    assert.deepEqual([a2.revision, b.revision], [2, 1]);
+  } finally { other.close(); }
+  assert.throws(() => { const closed = new Store(path); closed.close(); closed.changeStamp(); }, code("store_busy"));
+});
+
+test("S1.3 every Store counts its get, list and history reads in one process-wide count; identities and stamps are not such reads", t => {
+  const { store, path } = fixture(t);
+  const other = new Store(path);
+  try {
+    store.write({ id: "count:a", kind: "proof", expected: 0, value: {} });
+    const start = storeReads();
+    store.get("count:a"); store.get("count:a", 1); store.list("proof"); store.history("count:a"); other.get("count:a");
+    assert.equal(storeReads() - start, 5);
+    const settled = storeReads();
+    store.identities("get", "count:a"); store.identities("list"); store.identities("history", "count:a"); store.changeStamp();
+    assert.equal(storeReads(), settled);
+  } finally { other.close(); }
 });

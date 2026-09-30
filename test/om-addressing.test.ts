@@ -849,7 +849,7 @@ test('D3.1 historical recovery cannot be forged by a stale marker or by retainin
 
 type PhysicalReads = { body: number; footprint: number };
 type ProofSample = { bodies: Map<string, number>; physical: Map<string, PhysicalReads>; all: PhysicalReads };
-interface AddressingCostMonitor { sample: ProofSample | null }
+interface AddressingCostMonitor { sample: ProofSample | null; viewNumber(store: object): number }
 const addressingCost = () => (globalThis as typeof globalThis & { __addressingCost?: AddressingCostMonitor }).__addressingCost;
 // Actual proof entries and physical reads are different counters. The subprocess instruments only
 // these bodies in memory; it does not modify the production modules or run another test's fixture.
@@ -897,9 +897,9 @@ export async function load(url, context, next) {
 register(${JSON.stringify(loader)},import.meta.url);
 const views=new WeakMap();let nextView=0;
 globalThis.__addressingCost={sample:null,view:store=>store,footprint:()=>false,
- hit(reader,store,project,ref){const sample=this.sample;if(!sample)return;const view=this.view(store);
-  if(!views.has(view))views.set(view,++nextView);
-  const key=JSON.stringify({reader,project,ref,view:views.get(view)});sample.bodies.set(key,(sample.bodies.get(key)||0)+1);},
+ viewNumber(store){const view=this.view(store);if(!views.has(view))views.set(view,++nextView);return views.get(view);},
+ hit(reader,store,project,ref){const sample=this.sample;if(!sample)return;
+  const key=JSON.stringify({reader,project,ref,view:this.viewNumber(store)});sample.bodies.set(key,(sample.bodies.get(key)||0)+1);},
  read(store,id,revision,action){const sample=this.sample,category=this.footprint()?'footprint':'body';
   if(sample)sample.all[category]++;
   const row=action();
@@ -1153,28 +1153,34 @@ async function independentFactPrefixes(t: TestContext) {
 test('D3.1 operation history proves unique inputs and answers once per view at one, two and four facts', async t => {
   if (await costSubprocess(t)) return;
   const { f, prefixes } = await independentFactPrefixes(t);
-  function measured<T>(action: () => OmResult<T>) {
-    const result = measureProof(action);
-    assert.ok(result.sample.bodies.size > 0, 'Every external operation must prove its exact history again');
-    assert.ok(result.sample.physical.size > 0, 'Physical reads remain a checked cost, including footprint');
-    return result;
-  }
+  const refOf = (key: string) => canonical((JSON.parse(key) as { ref: Ref }).ref);
+  // Proofs of views other than the Store itself: the pending overlay, never a Store's own reads, so never kept (№2233-2).
+  const overlay = (sample: ProofSample, base: number) =>
+    [...sample.bodies].filter(([key]) => (JSON.parse(key) as { view: number }).view !== base);
+  // The overlay is a new object in every operation, so its view number is too: its proofs compare apart from it.
+  const unviewed = (bodies: [string, number][]) => new Map(bodies.map(([key, count]) => {
+    const { view: _view, ...proof } = JSON.parse(key) as { view: number }; return [canonical(proof as Json), count];
+  }));
   const previousCommon = new Map<string, { proofs: number; counts: PhysicalReads }>();
   for (const prefix of prefixes) {
     writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'value-0' }));
-    const store = new Store(prefix.path), engine = new ProductEngine(store);
+    const store = new Store(prefix.path);
     try {
       const request = { project: f.project, input: prefix.input };
       // Physical instrumentation lives in Store.get, so the ordinary public preparation
       // receives its original semantic Store rather than an artificial overlay.
-      const observed = store;
+      const observed = store, base = addressingCost()!.viewNumber(store);
       // Preparation has a base Store and an explicit pending-source overlay; their proofs stay separate.
-      const idle = measured(() => prepareReopenAnswers(observed, request));
+      // The cold cost belongs to a new Store: every exact foundation is proved once per view.
+      const idle = measureProof(() => prepareReopenAnswers(observed, request));
+      assert.ok(idle.sample.bodies.size > 0, 'A new Store proves its exact history');
+      assert.ok(idle.sample.physical.size > 0, 'Physical reads remain a checked cost, including footprint');
+      assert.ok(overlay(idle.sample, base).length > 0 && overlay(idle.sample, base).length < idle.sample.bodies.size,
+        'The base Store and the pending overlay prove apart');
       assert.equal(idle.value.writes.length, 0);
       assert.equal(idle.value.record.value.input.facts!.length, prefix.count);
       for (const [ref, counts] of idle.sample.physical) {
-        const proofs = [...idle.sample.bodies.keys()].filter(key =>
-          canonical((JSON.parse(key) as { ref: Ref }).ref) === canonical(JSON.parse(ref))).length;
+        const proofs = [...idle.sample.bodies.keys()].filter(key => refOf(key) === canonical(JSON.parse(ref))).length;
         assert.ok(proofs > 0, `Every exact physical foundation belongs to its proven history: ${ref}`);
         assert.equal(counts.body + counts.footprint, proofs,
           `An immutable foundation is fetched once for each distinct proof/view, including footprint cost: ${ref}`);
@@ -1185,19 +1191,36 @@ test('D3.1 operation history proves unique inputs and answers once per view at o
           `More fact paths must not multiply physical body/footprint reads of the same exact foundation: ${ref}`);
         previousCommon.set(ref, { proofs, counts });
       }
-      const again = measured(() => prepareReopenAnswers(observed, request));
-      assert.deepEqual(again.sample.physical, idle.sample.physical);
-      assert.deepEqual(again.sample.all, idle.sample.all, 'A repeated external operation has the same total physical cost');
+      // S1.3 (№2201): the unchanged warm Store serves the kept proofs of its own exact foundations without running them
+      // again; the pending overlay proves anew with the same bodies and fetches as cold.
+      const again = measureProof(() => prepareReopenAnswers(observed, request));
       assert.deepEqual(again.value, idle.value);
+      assert.equal(overlay(again.sample, base).length, again.sample.bodies.size, 'No kept proof of the base Store runs again');
+      assert.deepEqual(unviewed([...again.sample.bodies]), unviewed(overlay(idle.sample, base)), 'The overlay proves anew, once per exact version');
+      for (const ref of idle.sample.physical.keys()) {
+        const proofs = overlay(idle.sample, base).filter(([key]) => refOf(key) === canonical(JSON.parse(ref))).length;
+        const counts = again.sample.physical.get(ref) ?? { body: 0, footprint: 0 };
+        assert.equal(counts.body + counts.footprint, proofs, `The kept base proof fetches nothing; each overlay proof fetches once: ${ref}`);
+      }
+      // №2233-3: the current evidence changes through a second Store of the same file; the next preparation of the warm
+      // Store observes it — the fact goes and the provided write is prepared.
       const source = store.get('source:garden:cost-0')!;
       writeFileSync(join(f.root, 'cost-0.json'), JSON.stringify({ answer: 'changed' }));
-      engine.discovery.evidence.file(f.project, 'cost-0', f.root, 'cost-0.json', 'application/json', source.revision);
-      const prepared = measured(() => prepareReopenAnswers(observed, request));
+      const second = new Store(prefix.path);
+      try { new ProductEngine(second).discovery.evidence.file(f.project, 'cost-0', f.root, 'cost-0.json', 'application/json', source.revision); }
+      finally { second.close(); }
+      const prepared = measureProof(() => prepareReopenAnswers(observed, request));
       assert.equal(prepared.value.writes.length, 1, 'The next operation must observe the changed evidence head');
       assert.equal(prepared.value.record.value.input.facts!.length, prefix.count - 1);
-      const saved = measured(() => writeReopenAnswers(observed, request)).value;
-      assert.deepEqual(measured(() => readOmInput(observed, f.project, reference(saved))).value, saved);
-      assert.deepEqual(measured(() => readOmInput(observed, f.project, reference(saved))).value, saved);
+      assert.ok(overlay(prepared.sample, base).length > 0, 'The pending overlay is proved anew in every operation');
+      const saved = measureProof(() => writeReopenAnswers(observed, request)).value;
+      const proved = measureProof(() => readOmInput(observed, f.project, reference(saved)));
+      assert.deepEqual(proved.value, saved);
+      assert.ok(proved.sample.bodies.size > 0 && proved.sample.physical.size > 0, 'A new exact input is proved and fetched once');
+      const kept = measureProof(() => readOmInput(observed, f.project, reference(saved)));
+      assert.deepEqual(kept.value, saved);
+      assert.deepEqual([kept.sample.bodies.size, kept.sample.physical.size], [0, 0],
+        'The unchanged warm Store serves the kept proof of the exact input: no body runs, no exact foundation is fetched');
     } finally { store.close(); }
   }
 });

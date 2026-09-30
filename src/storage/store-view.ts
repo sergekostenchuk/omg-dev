@@ -38,6 +38,20 @@ export function genuineStore(candidate: unknown): candidate is Store {
  * a write-only view of this module's own making over such reads. This narrow category is what storeView and the
  * acceptance's Transaction admit. */
 export const provenReads = (candidate: unknown): candidate is Store => genuineStore(candidate) || writeOnlyViews.has(candidate as object);
+/** The target each write-only view was built over and the read methods it bound, recorded by writeOnlyView itself. */
+const writeOnlyTargets = new WeakMap<object, { target: Store; reads: Map<string, unknown> }>();
+/** The genuine Store whose reads these are (S1.3, №2185-3, №2194-1): the instance itself, or the Store beneath this
+ * module's own write-only views — as long as every view in the chain still reads through the very methods it bound. Its
+ * changeStamp and identities speak for exactly these reads. A Proxy, a subclass, an overlay, a capture, a trace or a
+ * view whose target's reads were replaced after it was built has none, and keeps the conservative branch. */
+export function provenStore(candidate: unknown): Store | null {
+  for (let cursor = candidate; ;) {
+    if (genuineStore(cursor)) return cursor;
+    const built = typeof cursor === 'object' && cursor !== null ? writeOnlyTargets.get(cursor) : undefined;
+    if (!built || [...built.reads].some(([name, bound]) => Reflect.get(built.target, name, built.target) !== bound)) return null;
+    cursor = built.target;
+  }
+}
 
 /** The frozen source overlays other helpers build over proved reads — the pending overlays of E4 and the previews of
  * the acceptance's Transaction (№1942) — registered by their own constructors, never by a caller's claim or a flag.
@@ -136,12 +150,17 @@ function writeOnlyView(target: Store, policy: StoreViewPolicy, unsupported: (pro
   Object.defineProperty(members, 'write', { value: <T,>(input: Write): Revision<T> => policy.write([input], [])[0] as Revision<T> });
   Object.defineProperty(members, 'writeMany', { value: <T,>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] =>
     policy.write(inputs, guards) as Revision<T>[] });
-  for (const name of READ_METHODS)
-    Object.defineProperty(members, name, { value: (Reflect.get(target, name, target) as (...args: never[]) => unknown).bind(target) });
+  const reads = new Map<string, unknown>();
+  for (const name of READ_METHODS) {
+    const method = Reflect.get(target, name, target) as (...args: never[]) => unknown;
+    reads.set(name, method);
+    Object.defineProperty(members, name, { value: method.bind(target) });
+  }
   for (const name of READ_PROPERTIES) Object.defineProperty(members, name, { get: () => Reflect.get(target, name, target) });
   Object.freeze(members);
   const view = Object.freeze(Object.create(members)) as Store;
   writeOnlyViews.add(view);
+  writeOnlyTargets.set(view, { target, reads });
   if (captureViews.has(target)) captureViews.add(view);
   return view;
 }

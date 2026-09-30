@@ -10,7 +10,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
-import { captureView, genuineStore, provenReads, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { captureView, genuineStore, provenReads, provenStore, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { Discovery, type Question } from '../src/discovery/discovery.js';
@@ -1000,15 +1000,17 @@ test('S1.1 a write-only view over a plain Store is no Proxy: one history proves 
   withHistoricalReads(() => {
     const first = prove(view); assert.equal(runs, 1); assert.deepEqual(first, { base: key.ref, absent: true });
     assert.deepEqual(prove(view), first); assert.equal(runs, 1, 'one full derivation per key inside the operation through the write-only view');
-    prove(other); assert.equal(runs, 2, 'another write-only view over the same Store keeps its own proof');
-    prove(nested); assert.equal(runs, 3, 'a view over a view keeps its own region');
-    prove(capture); assert.equal(runs, 4, 'a capture keeps its own proof');
+    // S1.3 (№2194-1): the write-only views this module built over one Store read exactly that Store and share its proofs.
+    assert.deepEqual(prove(other), first); assert.equal(runs, 1, 'another write-only view over the same Store shares its proof');
+    assert.deepEqual(prove(nested), first); assert.equal(runs, 1, 'a view over a view of this module shares it too');
+    prove(capture); assert.equal(runs, 2, 'a capture keeps its own proof');
     // The absent record appears: the kept proof's footprint moved, so the next read through the view derives again.
     store.write(w('absent'));
-    assert.deepEqual(prove(view), { base: key.ref, absent: false }); assert.equal(runs, 5);
-    assert.equal(prove(view).absent, false); assert.equal(runs, 5);
+    assert.deepEqual(prove(view), { base: key.ref, absent: false }); assert.equal(runs, 3);
+    assert.equal(prove(other).absent, false); assert.equal(runs, 3);
   });
-  withHistoricalReads(() => { prove(view); assert.equal(runs, 6, 'a new operation proves again'); });
+  // S1.3 (№2185-4): the kept complete proof of this Store serves the next operation while its footprint stays current.
+  withHistoricalReads(() => { assert.equal(prove(view).absent, false); assert.equal(runs, 3, 'a new operation reuses the kept proof'); });
   // The collector attached above the view: the same references cold, hot, and when the proof was warmed before it attached.
   const cold: Ref[] = [], hot: Ref[] = [], warmed: Ref[] = [];
   withHistoricalReads(() => {
@@ -1105,4 +1107,32 @@ test('S1.1 (№2008) the fast branch needs proved reads and the facade resolves 
   assert.ok(writeOnly instanceof Store); assert.deepEqual(writeOnly.get('base'), row);
   // The proved fast branch is unchanged: one body per operation through the facade, and the same through a facade over it.
   assert.equal(probe(writeOnly), 1); assert.equal(probe(storeView(writeOnly, policy(writeOnly))), 1);
+});
+
+test('S1.3 (№2194-1) provenStore names the genuine Store beneath the write-only views this module built, only while their bound reads are still its reads', t => {
+  const { store } = fixture(t);
+  const view = guardView(store, []).view, nested = guardView(view, []).view, other = guardView(store, []).view;
+  assert.deepEqual([provenStore(store), provenStore(view), provenStore(nested), provenStore(other)], [store, store, store, store]);
+  const policy: StoreViewPolicy = { write: (writes, guards) => store.writeMany(writes, guards) };
+  assert.equal(provenStore(captureView(store, {}).view), null, 'a capture has its own reads');
+  assert.equal(provenStore(storeView(store, { ...policy, get: () => undefined })), null, 'a read projection is not the Store');
+  assert.equal(provenStore(historicalTrace(store)), null, 'a trace is its own view');
+  assert.equal(provenStore(new Proxy(store, {})), null, 'an arbitrary Proxy proves nothing');
+  assert.equal(provenStore(Object.freeze(Object.create(Object.getPrototypeOf(view)))), null, 'a copy of the facade shape was not built by this module');
+  assert.equal(provenStore(null), null); assert.equal(provenStore({}), null);
+  class Subclass extends Store {}
+  const subclass = new Subclass(store.path);
+  try {
+    assert.equal(provenStore(subclass), null, 'a subclass may read differently');
+    assert.equal(provenStore(storeView(subclass, policy)), null, 'a view over it has no genuine Store beneath');
+  } finally { subclass.close(); }
+  const original = Store.prototype.history;
+  Store.prototype.history = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+  try {
+    assert.equal(provenStore(store), store, 'the Store itself reads through its prototype as it is now');
+    assert.equal(provenStore(view), null, 'a view bound the replaced read: its reads are no longer the Store\'s');
+    assert.equal(provenStore(nested), null);
+    assert.equal(provenStore(guardView(store, []).view), store, 'a view built after the replacement binds the current read');
+  } finally { Store.prototype.history = original; }
+  assert.equal(provenStore(view), store, 'with the original read restored the kinship is proved again');
 });

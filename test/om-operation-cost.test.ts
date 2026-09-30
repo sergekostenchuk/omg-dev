@@ -84,7 +84,7 @@ export async function load(url, context, nextLoad) {
     if (file === 'src/om/input.js') {
       const miss = 'const result = synchronous(() => action(traced ? historicalTrace(store) : store));';
       if (source.split(miss).length !== 2) throw new Error('The common historical proof action was not identified');
-      source = source.replace(miss, 'const costAttempt = globalThis.__operationCost.miss(key, sourceView(store), traced);\n'
+      source = source.replace(miss, 'const costAttempt = globalThis.__operationCost.miss(key, sourceView(store), traced, source);\n'
         + 'const result = globalThis.__operationCost.action(costAttempt, () => synchronous(() => action(traced ? historicalTrace(store) : store)));');
       const replayable = 'const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);';
       if (source.split(replayable).length !== 2) throw new Error('The common historical proof replay decision was not identified');
@@ -98,19 +98,26 @@ export async function load(url, context, nextLoad) {
       source = source.replace(scope, scope + ' globalThis.__operationCost.scope();');
       const cyclic = 'if (view.active.has(exact))';
       if (source.split(cyclic).length !== 2) throw new Error('The cycle decision of the common proof was not identified');
-      source = source.replace(cyclic, 'if (view.active.has(exact) && (globalThis.__operationCost.cycle(key, source), true))');
+      source = source.replace(cyclic, 'if (view.active.has(exact) && (globalThis.__operationCost.cycle(key, sourceView(store)), true))');
       // S1.1: a kept proof without a complete dependency trace is derived again when a traced caller needs one; and a
       // proof whose dependency footprint moved is derived again by design. Both decisions are observed apart.
       const decision = 'const complete = traced || historicalTraces.has(store), previous = view.proven.get(exact);';
       if (source.split(decision).length !== 2) throw new Error('The completeness decision of the common proof was not identified');
-      source = source.replace(decision, decision + ' globalThis.__operationCost.refining(key, source, previous !== undefined && complete && !previous.complete);');
+      // S1.3: the region of a decision is the caller's source view, as for a miss — not the shared identity of its Store.
+      source = source.replace(decision, decision + ' globalThis.__operationCost.refining(key, sourceView(store), previous !== undefined && complete && !previous.complete);');
       const cleared = 'view.proven.clear();';
       if (source.split(cleared).length !== 2) throw new Error('The footprint invalidation of the common proof was not identified');
       source = source.replace(cleared, cleared + ' globalThis.__operationCost.invalidated(key, sourceView(store));');
+      // S1.3: the hook above follows the whole if/else, so a proof dropped from a genuine Store's area is observed as well.
       // S1.1: physical reads made to check a proof's footprint are told apart from reads that unfold a proof.
       const enter = 'checkingFootprint++;', leave = 'checkingFootprint--;';
       if (source.split(enter).length !== 2 || source.split(leave).length !== 2) throw new Error('The footprint check of the common proof was not identified');
       source = source.replace(enter, enter + ' globalThis.__operationCost.footprint(1);').replace(leave, 'globalThis.__operationCost.footprint(-1); ' + leave);
+      // S1.3 (№2185-4): a proof kept by an earlier operation serves this one only after its footprint check; whether it
+      // served or had moved is observed apart. Absent in builds before S1.3, so optional.
+      const kept = 'if (currentFootprint(kept.footprint)) {';
+      if (source.split(kept).length === 2)
+        source = source.replace(kept, 'if (globalThis.__operationCost.kept?.(key, source, currentFootprint(kept.footprint)) ?? currentFootprint(kept.footprint)) {');
       source += '\nglobalThis.__operationCost.sourceView = sourceView;\n';
     }
   }
@@ -457,8 +464,27 @@ function regionOf(store, first) {
   return views.get(store);
 }
 const invalidations = new Set(), refinements = new Set();
+// S1.3: executed proof bodies across ALL measured operations, by exact key and region; reuses of kept proofs and kept
+// proofs found moved, by the same identity.
+const crossExecutions = new Map(), keptServes = new Map(), keptMoves = new Map();
+function crossOperation(readers) {
+  const rows = {};
+  for (const [identity, count] of crossExecutions) {
+    const [key] = JSON.parse(identity);
+    if (!readers.includes(key.reader)) continue;
+    const row = rows[key.reader] ??= { executions: 0, identities: 0, served: 0, moved: 0, repeated: 0 };
+    const moved = keptMoves.get(identity) ?? 0;
+    row.executions += count; row.identities++; row.served += keptServes.get(identity) ?? 0; row.moved += moved;
+    row.repeated += Math.max(0, count - 1 - moved);
+  }
+  return rows;
+}
 const monitor = globalThis.__operationCost = {
   sourceView: store => store,
+  kept(key, store, current) {
+    if (active) { const identity = canonical([key, regionOf(store, key.reader)]), tally = current ? keptServes : keptMoves; tally.set(identity, (tally.get(identity) ?? 0) + 1); }
+    return current;
+  },
   footprint(delta) { footprintDepth += delta; },
   // The common mechanism found the footprint of a kept proof moved and dropped the proofs of that region: the next
   // derivation of that key there is a re-derivation over changed dependencies, not a repeat over unchanged ones.
@@ -478,11 +504,14 @@ const monitor = globalThis.__operationCost = {
     active.bodyAttempts.get(identity).push(actionStack.at(-1) ?? null);
     active.regions.add(view);
   },
-  miss(key, store, traced) {
+  miss(key, store, traced, root = store) {
     if (!active) return null;
     const view = regionOf(store, key.reader);
     const identity = canonical([key, view, traced, scopeId]);
     active.misses.set(identity, (active.misses.get(identity) ?? 0) + 1);
+    // Across operations a proof is one per exact key and SOURCE IDENTITY (S1.3, №2194-3), not per short-lived view.
+    const across = canonical([key, regionOf(root, key.reader)]);
+    crossExecutions.set(across, (crossExecutions.get(across) ?? 0) + 1);
     const attempt = { identity: canonical([key, view, scopeId]), key, view, scope: scopeId, reader: key.reader, replayable: null,
       invalidated: invalidations.delete(canonical([key, view])), refined: refinements.delete(canonical([key, view])),
       chain: actionStack.map(active => active.key) };
@@ -729,7 +758,9 @@ try {
     }
   });
   const external = measured('fixed.readQuestionPacket.external', () => readPacket(fixed));
-  assert.deepEqual(external.result, cold.result); assert.ok(external.report.misses > 0, 'A new operation proves history again');
+  // S1.3 (№2185-4): a new operation of the same Store reuses the kept complete proofs instead of proving history again.
+  assert.deepEqual(external.result, cold.result);
+  assert.ok(external.report.misses < cold.report.misses, 'A new operation of the same Store reuses its kept proofs: ' + external.report.misses + ' of ' + cold.report.misses);
   const reopened = new Store(paths.get(fixed)); stores.push(reopened);
   const restarted = measured('fixed.readQuestionPacket.restart', () => readPacket(reopened));
   assert.deepEqual(restarted.result, cold.result); assert.ok(restarted.report.misses > 0, 'A new Store proves history again');
@@ -777,7 +808,8 @@ try {
     assert.ok(item.plain <= Math.max(item.regions, 1), row.label + ': an early key unfolds at most once per region over unchanged dependencies; ' + JSON.stringify(item));
   f.restart();
   const database = join(config.directory, 'ladder.sqlite'); copyFileSync(f.path, database);
-  console.log(JSON.stringify({ reports, unfoldings, database, journal: third.journal, project }));
+  console.log(JSON.stringify({ reports, unfoldings, database, journal: third.journal, project,
+    cross: crossOperation(['D1.materialize', 'D1.readGaps', 'B1.readOmInput', 'C2.frameBasis', 'C2.frameDerive', 'C5.layerBasis', 'M6.route-result', 'A3.series-history', 'G7.completion-work', 'E2.question-packet']) }));
 } finally {
   active = null;
   for (const store of stores) store.close();
@@ -841,6 +873,15 @@ test('S1.1 a real block ladder 1/2/3 with G4b deliver all reaches A3 and resumes
   assert.ok(ladder.reports.every(report => report.repeats === 0));
   for (const row of ladder.reports) t.diagnostic(JSON.stringify(row));
   for (const row of ladder.unfoldings) t.diagnostic(JSON.stringify(row));
+  const cross = (ladder as unknown as { cross: Record<string, { executions: number; identities: number; served: number; moved: number; repeated: number }> }).cross;
+  t.diagnostic('cross ' + JSON.stringify(cross));
+  // S1.3 (№2185-4, №2201): across all operations of the ladder a complete exact proof of D1/B1/C2 is derived once per
+  // Store — never again in a later operation while its footprint is current. On the base (a0957fa) the same ladder derives
+  // them again: D1.materialize 45 bodies for 35 identities, B1.readOmInput 90 for 70, C2.frame* 45 for 35.
+  for (const reader of ['D1.materialize', 'D1.readGaps', 'B1.readOmInput', 'C2.frameDerive', 'C2.frameBasis']) {
+    assert.ok(cross[reader] && cross[reader].executions > 0, 'The ladder derived ' + reader);
+    assert.equal(cross[reader].repeated, 0, reader + ': one derivation per exact key and Store across operations: ' + JSON.stringify(cross[reader]));
+  }
   const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(hooks).href)}, { data: { log: ${JSON.stringify(graph)} } });`;
   const isolated = await promisify(execFile)(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, alone,
     dist, ladder.database, ladder.project, JSON.stringify(ladder.journal)], { maxBuffer: 16 * 1024 * 1024 });
