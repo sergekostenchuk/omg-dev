@@ -125,6 +125,35 @@ function finding(code: string, target: string, field: string, message: string, r
   if (!result.ok) return result.refusal;
   throw new Error('Unreachable refusal');
 }
+
+/**
+ * H1.5 (№2166): the one place that says whether OM has a producer for the answer to a question. It reads only the fields
+ * of a gap of the proven D1; G4b's two emission points, the choice of work of H1 and the physical admission of E4 all ask
+ * it, so none of them keeps a list of its own. An owner question waits for the separately authenticated H2 producer; a
+ * predecessor question that is not a repository fact has no answer producer in the current contract. Nothing else does
+ * (M5 addressing, the input fields nodes/state/checkKind and the node expansion have their own producers).
+ */
+export type AnswerProducer =
+  | { readonly present: true }
+  | { readonly present: false; readonly code: 'owner_result_unavailable' | 'route_result_unsupported';
+    readonly field: 'owner-result' | 'answer'; readonly message: string };
+export type NoProducer = Extract<AnswerProducer, { present: false }>;
+const PRODUCER_PRESENT: AnswerProducer = Object.freeze({ present: true });
+const OWNER_ABSENT: NoProducer = Object.freeze({ present: false, code: 'owner_result_unavailable', field: 'owner-result',
+  message: 'An owner gap needs the separately authenticated H2 owner-result producer' });
+const ANSWER_UNSUPPORTED: NoProducer = Object.freeze({ present: false, code: 'route_result_unsupported', field: 'answer',
+  message: 'This question has no OM answer producer in the current contract' });
+export function answerProducerOf(gap: Pick<Gap, 'code' | 'field' | 'kind'>): AnswerProducer {
+  if (!object(gap) || !text(gap.code) || !text(gap.field) || !text(gap.kind)) invalid('gap');
+  if (gap.kind === 'owner-decision') return OWNER_ABSENT;
+  if (gap.code === 'predecessor_question' && gap.field === 'answer'
+    && (gap.kind === 'design-decision' || gap.kind === 'environment-confirmation' || gap.kind === 'post-implementation-proof'))
+    return ANSWER_UNSUPPORTED;
+  return PRODUCER_PRESENT;
+}
+/** The emission points of derive that name a question without an answer producer (`answerProducerOf` says absent). */
+export const NO_PRODUCER_EMISSIONS: readonly AnswersGateEmission[] = Object.freeze(['owner-absent', 'owner-offered',
+  'unsupported-absent', 'unsupported-offered'] as const);
 // The E5 terminal verdict is the checked distinction between N, T and cessation under one G4b code.
 const TERMINAL_EMISSIONS: Readonly<Record<AssessmentResultRecord['verdict'], AnswersGateEmission>> = Object.freeze({
   supported: 'assessment-supported', insufficient: 'assessment-insufficient', conflicting: 'assessment-conflicting',
@@ -358,20 +387,16 @@ function negativeFact(store: Store, request: AnswersGateRequest, row: AnswerRout
 }
 function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRouteResult, route: RoutedGap,
   gap: Gap, current: boolean, guards: TransactionGuard[], references: Ref[], writes: Write[], traced: Traced): AnswersGateTraceEntry | null {
-  const target = gap.target;
-  if (route.route === 'owner' || gap.kind === 'owner-decision') {
+  const target = gap.target, producer = answerProducerOf(gap);
+  if (route.route === 'owner' || !producer.present && producer.code === 'owner_result_unavailable') {
     const recognized = row.result ? proveOfferedRecord(store, request.project, row.result) : null;
-    return traced('owner-offered', finding('owner_result_unavailable', target,
-      'owner-result', 'An owner gap needs the separately authenticated H2 owner-result producer', row.result ?? row.gap),
-    offered(row.result), recognized === null ? {} : { recognized });
+    return traced('owner-offered', finding(OWNER_ABSENT.code, target, OWNER_ABSENT.field, OWNER_ABSENT.message, row.result ?? row.gap),
+      offered(row.result), recognized === null ? {} : { recognized });
   }
-  if (gap.code === 'predecessor_question' && gap.field === 'answer'
-    && (gap.kind === 'design-decision' || gap.kind === 'environment-confirmation'
-      || gap.kind === 'post-implementation-proof')) {
+  if (!producer.present) {
     const recognized = row.result ? proveOfferedRecord(store, request.project, row.result) : null;
-    return traced('unsupported-offered', finding('route_result_unsupported', target, 'answer',
-      'This question has no OM answer producer in the current contract', row.gap),
-    offered(row.result), recognized === null ? {} : { recognized });
+    return traced('unsupported-offered', finding(producer.code, target, producer.field, producer.message, row.gap),
+      offered(row.result), recognized === null ? {} : { recognized });
   }
   if (row.result === null) return traced('blocking-null', finding('answer_missing_for_blocking_gap', target, 'result',
     'A blocking gap needs an exact result', row.gap));
@@ -639,13 +664,9 @@ function derive(store: Store, request: AnswersGateRequest, current: boolean): De
     const row = rows[0];
     if (!row) {
       if (!gap.blocking) continue;
-      if (gap.kind === 'owner-decision') emit('owner-absent', finding('owner_result_unavailable', gap.target,
-        'owner-result', 'An owner gap needs the separately authenticated H2 owner-result producer', exact), exact, [], trail);
-      else if (gap.code === 'predecessor_question' && gap.field === 'answer'
-        && (gap.kind === 'design-decision' || gap.kind === 'environment-confirmation'
-          || gap.kind === 'post-implementation-proof'))
-        emit('unsupported-absent', finding('route_result_unsupported', gap.target, 'answer',
-          'This question has no OM answer producer in the current contract', exact), exact, [], trail);
+      const producer = answerProducerOf(gap);
+      if (!producer.present) emit(producer.code === 'owner_result_unavailable' ? 'owner-absent' : 'unsupported-absent',
+        finding(producer.code, gap.target, producer.field, producer.message, exact), exact, [], trail);
       else emit('blocking-absent', finding('answer_missing_for_blocking_gap', gap.target, 'result',
         'Every blocking D1 gap needs one result', exact), exact, [], trail);
       continue;
@@ -738,6 +759,49 @@ export function writeAnswersGate(store: Store, request: AnswersGateRequest): OmR
     const prepared = take(prepareAnswersGate(store, request));
     take(writeGuarded(store, { unit: 'G4b', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
     return prepared.record;
+  });
+}
+
+/**
+ * One question of a routed batch whose answer no producer of the current contract serves, with the exact gap it names.
+ * `blocking` is the D1 classification of that gap (an active question of the pass): a blocking one is a ground of the
+ * end of the pass (R13); a non-blocking one is merely not paid for.
+ */
+export interface UnservedQuestion { gap: Ref; target: string; field: string; blocking: boolean; producer: NoProducer }
+/** A batch of the route: the exact D1 records of its items (the bases of any decision on it) and its unserved questions. */
+export interface BatchProducers { batch: string; records: Ref[]; unserved: UnservedQuestion[] }
+export interface RouteProducers { routes: Ref; batches: BatchProducers[] }
+/**
+ * H1.5 (№2166): which questions of the batches of one M6 route have no answer producer. The route and the complete D1 it
+ * was derived on are read by their common readers, so neither the caller's copy of a kind nor the batch's own claim
+ * proves anything; every item is judged by `answerProducerOf` alone. The choice of work of H1 leaves an unserved batch out
+ * of a new paid attempt, and the physical admission of E4 refuses to send one: both ask this one reading. The batch is
+ * judged as it is — its composition is never cut down to the served part.
+ */
+export function readRouteProducers(store: Store, request: { project: string; routes: Ref }): OmResult<Sealed<RouteProducers>> {
+  return run(() => {
+    if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.routes)
+      || Object.keys(request).length !== 2) invalid('producers');
+    const routes = take(readRoutes(store, { project: request.project, record: request.routes }));
+    const gaps = take(readGaps(store, copy<GapReadRequest>(routes.record.value.request.gaps as GapReadRequest)));
+    if (gaps.sources.project !== request.project || !gaps.gate.passed)
+      fail('gap_source_missing', request.project, 'gaps', 'A producer check needs this project\'s complete exact D1 set that passed its gate');
+    const records = new Map(gaps.records.map(record => [record.id, record]));
+    const batches = routes.record.value.batches.map(batch => {
+      const exact: Ref[] = [], unserved: UnservedQuestion[] = [];
+      for (const item of batch.items) {
+        const saved = records.get(item.record.id);
+        if (!saved || !same(reference(saved), item.record) || saved.value.gap.id !== item.gap
+          || saved.value.gap.target !== item.target || saved.value.gap.field !== item.field)
+          fail('answer_route_foreign', item.target, 'route', 'A batch item is not a gap of the exact complete D1 set of its route', item.record);
+        exact.push(exactRef(reference(saved)));
+        const producer = answerProducerOf(saved.value.gap);
+        if (!producer.present) unserved.push({ gap: exactRef(reference(saved)), target: item.target, field: item.field,
+          blocking: saved.value.gap.blocking === true, producer });
+      }
+      return { batch: batch.id, records: sorted(exact), unserved: sorted(unserved) };
+    });
+    return { routes: exactRef(request.routes), batches: sorted(batches) };
   });
 }
 

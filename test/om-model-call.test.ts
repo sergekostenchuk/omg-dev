@@ -261,6 +261,7 @@ import { settleCandidate } from '../src/om/frame-accept.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, writeOmObligations } from '../src/om/obligations.js';
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
+import { prepareAnswersGateTrace } from '../src/om/answers-gate.js';
 import { runModelCall, readModelCall, readModelCallState, readManagedModelDiagnostic, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
 import { readCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
@@ -269,7 +270,7 @@ import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { checkCompletionLedger, pendingCallStore, readCompletionWorkAt } from '../src/om/model-call.js';
 
 /** The directory-independent prefix of e4Fixture — upstream stages, B1, M5 address, G2, D1 and routes — one seed per variant. */
-function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field', extraQuestion: boolean) {
+function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extraQuestion: boolean) {
   const engine = new ProductEngine(store);
   const project = 'garden', graphData = gardenGraph('cross');
   graphData.nodes.find(node => node.id === 'garden-produce-block')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
@@ -286,9 +287,12 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field', extraQuestion: 
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = valueOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  // 'design' also addresses the spare question as a design decision: its predecessor question has no answer producer (H1.5).
   const input = kind === 'field' ? base : valueOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
     decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+      decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write },
+    ...(kind === 'design' ? [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: 'discovery:spare', field: 'address', value: { consumer: 'garden-consume-block', kind: 'design-decision' } } })) as Write }] : [])] }));
   const horizon = valueOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
     choice: { choiceVersion: 'e4-fixture', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
@@ -306,16 +310,18 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field', extraQuestion: 
   return { graphData, graph, input, sources, gaps, gapRequest, source, routes };
 }
 
-function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
+function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
-  const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : 'addressed'}:${extraQuestion}`,
-    store => e4Prefix(store, kind, extraQuestion), 'omg-e4-dispatch-');
+  const extra = extraQuestion || kind === 'design';
+  const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : kind === 'design' ? 'design' : 'addressed'}:${extra}`,
+    store => e4Prefix(store, kind, extra), 'omg-e4-dispatch-');
   const { root, database } = seeded, { graphData, graph, input, sources, gaps, gapRequest, source, routes } = seeded.data;
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const project = 'garden';
   writeFileSync(join(root, 'e4-source.txt'), 'UTF-8 is the supported encoding.');
   const batch = routes.value.batches.find(batch => kind === 'node' ? batch.task === 'node-expansion' && batch.node === 'garden-produce-block'
+    : kind === 'design' ? batch.model === 'MC2' && batch.task === 'input-field' && batch.items.some(item => item.target === 'discovery:spare' && item.field === 'answer')
     : kind === 'field' ? batch.model === 'MC2' && batch.task === 'input-field' && batch.items.some(item => item.target === 'discovery:encoding')
     : batch.model === 'MC1' && batch.items.some(item => item.target === 'discovery:encoding'))!;
   assert.ok(batch);
@@ -3389,4 +3395,194 @@ test('S1.1 (№2012) the pending overlay of E4 is frozen only over proved reads:
   over.write({ id: 'w1', kind: 'fixture', expected: 0, value: { v: 'w1' } });
   over.writeMany([{ id: 'w2', kind: 'fixture', expected: 0, value: { v: 'w2' } }], [reference(row)]);
   assert.deepEqual(calls, [[1, 0], [1, 1]]); assert.ok(store.get('w1')); assert.ok(store.get('w2')); assert.equal(store.get('new'), null);
+});
+
+// ---- H1.5 (№2164, №2166): E4 sends nothing for a batch no answer producer serves ----
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+const H15_BASE_COMMIT = '479b307f8aa3d43745f5313c1f5c8a712bd7d55a';
+const h15CannotAnswer = { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'cannot_answer', code: 'cannot_answer', message: 'never needed' };
+const h15Heads = (store: Store) => store.list().map(reference);
+function h15Refusal<T>(result: OmResult<T>) { if (result.ok) assert.fail('Expected a typed refusal, not a paid or replayed call'); return result.refusal; }
+/** Records every kind written while `action` runs: a refusal before E1, the claim and the authorization writes nothing at all. */
+async function h15Written<T>(store: Store, action: () => Promise<T>): Promise<{ result: T; kinds: string[] }> {
+  const kinds: string[] = [], writeMany = store.writeMany.bind(store);
+  store.writeMany = ((inputs, guards) => { kinds.push(...inputs.map(input => input.kind)); return writeMany(inputs, guards); }) as Store['writeMany'];
+  try { return { result: await action(), kinds }; } finally { store.writeMany = writeMany; }
+}
+const h15Unserved = { code: 'route_result_unsupported', unit: 'E4', target: 'discovery:spare', field: 'answer', route: 'producer' };
+
+test('H1.5 №2164 E4 sends nothing for a design-decision answer batch: a ready packet is no right to pay, so runModelCall refuses before E1, the claim and the authorization', async t => {
+  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  assert.equal(f.packet.value.state, 'ready', 'E2 still calls the packet ready: the prohibition stands in E4');
+  assert.deepEqual([f.batch.model, f.batch.task, f.batch.items.map(item => item.field)], ['MC2', 'input-field', ['answer']]);
+  // The reviewer's probe (№2164): the very G4b that would judge the answer refuses it as unsupported, so paying buys nothing.
+  const judged = valueOf(prepareAnswersGateTrace(f.store, { project: f.project, gaps: f.gapRequest, routes: reference(f.routes), results: [] }))
+    .trace.filter(entry => entry.finding.at.target === 'discovery:spare');
+  assert.deepEqual(judged.map(entry => [entry.finding.code, entry.cause.emission]), [['route_result_unsupported', 'unsupported-absent']]);
+  f.steps([{ research: h15CannotAnswer, usage }]);
+  const before = h15Heads(f.store), gap = f.gaps.records.find(row => row.value.gap.target === 'discovery:spare')!;
+  const { result, kinds } = await h15Written(f.store, () => runModelCall(f.store, f.request));
+  const refusal = h15Refusal(result);
+  assert.deepEqual({ code: refusal.code, unit: refusal.at.unit, target: refusal.at.target, field: refusal.at.field, route: refusal.route }, h15Unserved);
+  assert.deepEqual(refusal.at.ref, reference(gap), 'Addressed to the exact D1 gap of the question');
+  assert.equal(f.sent().length, 0, 'The adapter was never called');
+  assert.deepEqual(kinds, [], 'Nothing was written: no E1 row, no running claim, no dispatch counter');
+  assert.deepEqual(h15Heads(f.store), before);
+  // The refusal repeats after a new store: the saved unsent packet is refused the same way.
+  f.restart();
+  const again = h15Refusal(await runModelCall(f.store, f.request));
+  assert.deepEqual([again.code, again.at.target, again.at.field], [refusal.code, refusal.at.target, refusal.at.field]);
+  assert.equal(f.sent().length, 0);
+  assert.deepEqual(h15Heads(f.store), before);
+});
+
+test('H1.5 №2164 E4 sends nothing for a design-decision answer batch through runModelCycle either, the reviewer role included', async t => {
+  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  f.steps([{ research: h15CannotAnswer, usage }, { research: h15CannotAnswer, usage }]);
+  const before = h15Heads(f.store);
+  for (const request of [f.request, { ...f.request, role: 'reviewer' as const }]) {
+    const { result, kinds } = await h15Written(f.store, () => runModelCycle(f.store, request));
+    const refusal = h15Refusal(result);
+    assert.deepEqual({ code: refusal.code, unit: refusal.at.unit, target: refusal.at.target, field: refusal.at.field, route: refusal.route }, h15Unserved, request.role);
+    assert.deepEqual(kinds, [], request.role);
+  }
+  f.restart();
+  assert.equal(h15Refusal(await runModelCycle(f.store, f.request)).code, 'route_result_unsupported');
+  assert.equal(f.sent().length, 0);
+  assert.deepEqual(h15Heads(f.store), before, 'No cycle record, no call, no ledger row');
+});
+
+test('H1.5 №2166 п.5 the direct transport is no way around E4: a registered E1 call of an ordinary question packet is refused by runModelTransport before any dispatch', async t => {
+  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  f.steps([{ research: h15CannotAnswer, usage }]);
+  const payload = f.packet.value.packet as { requestId: string; purpose: 'model-design' | 'model-research'; questions: { id: string }[] };
+  const attempt = f.series.value.attempts[0]!, assigned = new Set(payload.questions.map(question => question.id));
+  const dispatch = { adapter: reference(f.adapter), config: reference(f.configured) };
+  const admitted = valueOf(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
+    series: reference(f.series), attempt: attempt.ordinal, goal: attempt.goal, dispatch, packet: payload as unknown as Json, block: 'garden-consume-block',
+    gaps: f.batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))) }));
+  const before = h15Heads(f.store);
+  const refusal = h15Refusal(await runModelTransport(f.store, { project: f.project, call: reference(admitted.call), packet: payload as unknown as Json, role: 'implementer' }));
+  assert.deepEqual([refusal.code, refusal.at.field], ['model_call_request_invalid', 'purpose']);
+  assert.equal(f.sent().length, 0);
+  assert.deepEqual(h15Heads(f.store), before);
+});
+
+test('H1.5 №2166 п.5 a changed basis between the choice and the claim does not open the prohibition: the saved packet stays refused, and the packet of the new environment is refused for the same question', async t => {
+  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  f.steps([{ research: h15CannotAnswer, usage }]);
+  // The environment is measured into the packet: a new capacity is another basis of the same batch.
+  const changed = f.environment(120_000);
+  assert.notDeepEqual(reference(changed), reference(f.configured));
+  const stale = h15Refusal(await runModelCall(f.store, f.request));
+  assert.notEqual(stale.code, 'ok');
+  const request = { ...f.packetRequest, environment: reference(changed) };
+  const next = valueOf(writeQuestionPacket(f.store, request)).record;
+  assert.equal(next.value.state, 'ready');
+  const nextRefusal = h15Refusal(await runModelCall(f.store, { ...f.request, packet: reference(next), dispatch: { adapter: reference(f.adapter), config: reference(changed) } }));
+  assert.equal(nextRefusal.code, 'route_result_unsupported');
+  assert.equal(nextRefusal.at.target, 'discovery:spare');
+  assert.equal(f.sent().length, 0);
+});
+
+/**
+ * Runs a producer script with every engine module loaded from one exact commit, in its own process (the era check of
+ * test/om-answers-gate.test.ts): the loader serves each module from Git and refuses an engine module outside the commit,
+ * so a missed prefix cannot fall back to the current build and let the test pass vacuously.
+ */
+function h15AtCommit(f: { root: string; database: string }, commit: string, name: string, body: string, input: unknown): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
+  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  writeFileSync(argsFile, JSON.stringify(input));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.database, argsFile],
+    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 }));
+  const loaded = readFileSync(served, 'utf8').split('\n').filter(Boolean);
+  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/om/model-call.ts'),
+    `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
+  return output;
+}
+
+test('H1.5 №2166 п.3 ERA a call the base code already paid for is finished and accounted as before, applied or only received, also through a new store: the prohibition asks only for a NEW dispatch', async t => {
+  /** The base code sends the ready packet (it had no admission check); with `stop` its process dies right after the durable receipt. */
+  async function paidByBase(stop: boolean) {
+    const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+    f.steps([{ research: h15CannotAnswer, usage }]);
+    const base = h15AtCommit(f, H15_BASE_COMMIT, `h15-${stop ? 'received' : 'applied'}`, `const { runModelCall } = await import(src('om/model-call.js'));
+const writeMany = store.writeMany.bind(store);
+let stopped = false;
+if (args.stop) store.writeMany = (writes, guards) => {
+  const committed = writeMany(writes, guards);
+  if (!stopped && writes.some(write => write.kind === 'model-call' && write.value?.om?.application === 'received')) { stopped = true; throw new Error('simulated stop after the durable receipt'); }
+  return committed;
+};
+try { const result = await runModelCall(store, args.request); out({ ok: result.ok, stopped }); }
+catch (error) { out({ threw: String(error.message), stopped }); }`, { request: f.request, stop }) as { ok?: boolean; threw?: string; stopped: boolean };
+    assert.equal(f.sent().length, 1, 'The base code paid for the unserved batch once');
+    assert.equal(stop ? base.threw !== undefined && base.stopped : base.ok, true);
+    f.restart();
+    const [record] = f.store.list('model-call');
+    assert.ok(record);
+    assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(record) })).state, stop ? 'received' : 'applied');
+    const before = h15Heads(f.store);
+    const { result, kinds } = await h15Written(f.store, () => runModelCall(f.store, f.request));
+    const finished = valueOf(result);
+    assert.equal(finished.record.value.om.application, 'applied', 'The paid answer is applied and the call settled');
+    assert.equal(f.sent().length, 1, 'Nothing was sent again');
+    if (!stop) assert.deepEqual([kinds, h15Heads(f.store)], [[], before], 'A finished call replays without a new record');
+    f.restart();
+    const replay = valueOf(await runModelCall(f.store, f.request));
+    assert.equal(f.sent().length, 1);
+    assert.deepEqual(reference(replay.record), reference(finished.record), 'The replay after a new store is the same finished call');
+    const call = valueOf(readCall(f.store, f.project, finished.call));
+    return { application: finished.record.value.om.application, status: finished.record.value.status, usage: finished.record.value.usage,
+      outcome: finished.outcome?.kind ?? null, ledger: call.value.status, sent: f.sent().length };
+  }
+  const applied = await paidByBase(false), received = await paidByBase(true);
+  assert.deepEqual(received, applied, 'The new code finishes and accounts a received call exactly as the base code finishes and accounts its own');
+  assert.equal(applied.sent, 1);
 });

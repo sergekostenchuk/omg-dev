@@ -881,7 +881,25 @@ function modelAssignment(store: Store, request: ModelCallRequest) {
         field: item.field, consumer: mechanismOwner! })) }
     : { ...common, block: series.value.block, gaps: assignedItems.flatMap(item => item.consumers.map(consumer =>
       ({ id: item.target, goal: item.target, field: item.field, consumer }))) };
-  return { packet, payload, environment, binding, wire, series, admission };
+  return { packet, payload, environment, binding, wire, series, admission, batch };
+}
+/**
+ * H1.5 (№2166 п.3): the last defence of a NEW dispatch. A batch with a question that no answer producer serves is refused
+ * before E1, the claim and the authorization — G4b would not accept that answer, so paying for it buys nothing, however
+ * ready its packet is. It reads the packet's own exact routes and the complete D1 of them through the one G4b reading
+ * (`readRouteProducers`), so it is the same verdict the choice of work of H1 acted on. Only a dispatch without a saved call
+ * comes here: reading history, applying a received answer, recovery and a late receipt never ask it, so a paid call is
+ * always finished and accounted as before. Inputs are exact immutable revisions, so no guard of its own is needed.
+ */
+function requireAnswerProducers(store: Store, packet: Ref, project: string, routes: Ref, batch: string): void {
+  const read = take(readRouteProducers(store, { project, routes }));
+  const judged = read.batches.find(item => item.batch === batch);
+  if (!judged) fail('model_call_request_invalid', packet.id, 'batch', 'The packet names a batch its exact routes do not hold', routes);
+  const first = judged.unserved[0];
+  if (!first) return;
+  const refusal = refused(first.producer.code, first.producer.message, { unit: 'E4', target: first.target, field: first.producer.field, ref: first.gap },
+    first.producer.code === 'owner_result_unavailable' ? 'owner' : 'producer');
+  if (!refusal.ok) throw new CallFailure(refusal.refusal);
 }
 function modelWorkAdmission(store: Store, record: Revision<OmModelCall>, series: Ref): ModelWorkAdmission {
   if (!object(record.value) || !object(record.value.om) || !['om-model-call/v1', 'om-model-call/managed-v1'].includes(record.value.om.version))
@@ -1505,6 +1523,7 @@ async function modelCallUnder(store: Store, request: ModelCallRequest, signal: A
     const admission = take(prepareSeriesLineAdmission(admittedStore, request.project, assignment.admission.series));
     const prepared = take(prepareQuestionPacket(admittedStore, packet.value.request as QuestionPacketRequest));
     if (!same(reference(prepared.record), request.packet)) fail('model_call_request_invalid', request.packet.id, 'packet', 'Dispatch uses exactly the currently admitted E2 packet');
+    requireAnswerProducers(store, request.packet, request.project, packet.value.request.routes, assignment.batch.id);
     // H1.3: a new dispatch is new work of the pass; its E1, claim and transfer carry the admitted control.
     const controlled = gate.view();
     const guarded = storeView(store, { write(inputs, guards) {
@@ -2118,7 +2137,7 @@ import { completionAssignmentId, completionRootAssignments, completionWorkId, CO
 import { readAssessmentTerminalAt,
   readAssessmentRefusalAt, assessmentRefusalId, assessmentIntentId, assessmentCallNameForId } from './assessment.js';
 import { readJournal, readJournalAt } from './refusal-journal.js';
-import { answersProduct, answersCheckState, checkAnswersTransition, readAnswersParticipant, answersCheckCessationValue,
+import { answersProduct, answersCheckState, checkAnswersTransition, readAnswersParticipant, answersCheckCessationValue, readRouteProducers,
   type AnswersCheckState } from './answers-gate.js';
 import { readAnswersGateAssignmentAt, ANSWERS_GATE_ASSIGNMENT_CONTRACT } from './series.js';
 export interface CompletionCallOwner {

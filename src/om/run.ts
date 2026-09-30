@@ -16,12 +16,13 @@ import { openSeries, readAnySeriesAt, readCompletionBinding, completionWorkId, c
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim, readCompletionCloseAt, readStopContext } from "./repeat-gate.js";
 import { prepareStopAnalysis, readStopAnalysis, runStopAnalysis, type StopAnalysisRequest } from "./stop-analysis.js";
-import { prepareCompletionCause, readCompletionWorkAt, readManagedModelDiagnostic, readModelCycle, readPartAssembly, recoverOmModelCall, runModelCycle, writeCompletionCessation,
-  type CompletionSnapshot } from "./model-call.js";
+import { modelCallRecordId, prepareCompletionCause, readCompletionWorkAt, readManagedModelDiagnostic, readModelCycle, readPartAssembly, recoverOmModelCall, runModelCycle,
+  writeCompletionCessation, type CompletionSnapshot } from "./model-call.js";
 import { writeQuestionPacket } from "./question-packet.js";
 import { assessFact, readAssessmentIntentAt, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
-import { prepareAnswersGate, prepareAnswersGateTrace, readAnswersEvaluationAt, readAnswersGate, readAnswersGateTrace, writeAnswersCheckCessation, writeAnswersEvaluation, writeAnswersRegistration,
-  type AnswerRouteResult, type AnswersGateRequest } from "./answers-gate.js";
+import { NO_PRODUCER_EMISSIONS, prepareAnswersGate, prepareAnswersGateTrace, readAnswersEvaluationAt, readAnswersGate, readAnswersGateTrace, readRouteProducers,
+  writeAnswersCheckCessation, writeAnswersEvaluation, writeAnswersRegistration, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
+  type UnservedQuestion } from "./answers-gate.js";
 import { gateCandidate, prepareCandidate, writeCandidate, type CandidateRequest } from "./frame-candidate.js";
 import { prepareSettleCandidate, type SettleCandidateRequest } from "./frame-accept.js";
 import { readAcceptedFrameLayer, type FrameAttemptBinding } from "./layer-basis.js";
@@ -503,9 +504,15 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
   // 2. New work: the project mechanism M5:addressing first (№1737 п.2), then blocks strictly in M3 order.
   const m5 = bases.routes.value.batches.filter(isM5Batch).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const owners: [Owner, RouteBatch[]][] = m5.length ? [[{ owner: M5_OWNER }, [m5[0]!]]] : [];
+  // A batch whose questions no answer producer serves is not paid for (H1.5, №2166): it is no part of any new plan, its
+  // questions stay open at their exact address, and when nothing else is left the common G4b below names them. The one
+  // reading of the route that says so is taken once per choice and only when a block has a batch to weigh.
+  let unserved: ReadonlySet<string> | null = null;
+  const served = (batch: RouteBatch): boolean => !(unserved ??= new Set(take(readRouteProducers(store, { project, routes: bases.refs.routes }))
+    .batches.filter(row => row.unserved.length).map(row => row.batch))).has(batch.id);
   for (const block of bases.order) {
     const batches = bases.routes.value.batches.filter(batch => !isM5Batch(batch) && batch.items.every(item => item.consumers.includes(block))
-      && !(batch.task === "node-expansion" && batch.level === 2 && batch.node !== block))
+      && !(batch.task === "node-expansion" && batch.level === 2 && batch.node !== block)).filter(served)
       .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
     if (batches.length) owners.push([{ block }, batches]);
   }
@@ -852,6 +859,22 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   // environment change); only a packet never cycled gets the current dispatch.
   const cycleOf = (packet: Ref): Choice => step("cycle", history.saved("cycle", row => same(row.packet, packet))
     ?? { project, packet, dispatch: request.dispatch, role: "implementer" }, series.id, ordinal);
+  // H1.5 (№2166, №2221): the batches of the saved plan are judged by the one common reading of the attempt's exact routes
+  // and their complete D1 — never by the code of a saved wait. It is read once per continuation, only when a root is met.
+  let producers: Sealed<RouteProducers> | null = null;
+  const unservedOf = (batch: string): readonly UnservedQuestion[] =>
+    (producers ??= take(readRouteProducers(store, { project, routes: binding.value.plan.routes }))).batches.find(row => row.batch === batch)?.unserved ?? [];
+  // Physical work of a packet: the E4 call of its exact request (claimed, received, applied or refused) or a cycle of it
+  // among the attempt's products. It is E4's to finish, account and recover; the pass never cuts it short.
+  const physicalWork = (packet: Ref): boolean => {
+    const saved = store.get<{ packet?: { requestId?: unknown } }>(packet.id, packet.revision);
+    const requestId = saved?.value.packet?.requestId;
+    if (typeof requestId === "string" && requestId.length > 0 && store.get(modelCallRecordId(project, requestId))) return true;
+    return work.products.some(product => {
+      const row = store.get<{ request?: { packet?: Ref } }>(product.id, product.revision);
+      return row?.kind === "om-model-cycle" && isRef(row.value.request?.packet) && sameRef(row.value.request.packet, packet);
+    });
+  };
   const explained = new Set<string>();
   for (const assignment of open.filter(row => !parents.has(row.id))) {
     const value = assignment.value as CompletionAssignment;
@@ -862,6 +885,18 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if (cause.value.cause) return step("cease", { project, binding: reference(binding), assignment: reference(assignment) }, series.id, ordinal);
     if (value.kind === "root") {
       const packet = completionPacketOf(store, work, reference(assignment));
+      // H1.5 (№2221): a root whose batch holds a question no answer producer serves is not sent: E4 would refuse it and
+      // the pass would stand on that refusal for ever. Its blocking questions are grounds of the end of the pass (R13),
+      // standing on the exact routes and D1 records that prove them; the attempt's other assignments and the other
+      // series get their turn, and when nothing is left the pass ends. The saved plan and packet stay as they are: no
+      // G7 outcome is invented for the assignment. A packet whose physical work already began goes on by E4's own way.
+      const unserved = unservedOf(value.batch);
+      if (unserved.length && !(packet && physicalWork(packet))) {
+        stand(trail, [binding.value.plan.routes, ...unserved.map(question => question.gap)]);
+        trail.finals.push(...unserved.filter(question => question.blocking).map(question => reasonOf("unsupported-question",
+          question.producer.code, question.target, question.producer.field, question.producer.message, [question.gap])));
+        explained.add(assignment.id); continue;
+      }
       if (!packet) {
         // A works root (L3 node expansion) is asked with the D7 ledger of its exact D1 scope and D2 lines (F5).
         const batch = plan.value.batches.find(row => row.id === value.batch);
@@ -1127,7 +1162,6 @@ function passedGate(store: Store, project: string, evaluation: Ref): { passed: b
  * of a kind that has no answer producer (`owner-*`, `unsupported-*`). A gap of a question anyone else may still answer
  * (`blocking-absent`) is no ground. `own` is the attempt whose calls may be named; without it only the gap grounds count.
  */
-const NO_PRODUCER = ["owner-absent", "owner-offered", "unsupported-absent", "unsupported-offered"];
 function provenQuestions(store: Store, project: string, gate: Ref, own: { binding: unknown; products: readonly Ref[] } | null): RunReason[] {
   const reasons: RunReason[] = [];
   for (const entry of take(readAnswersGateTrace(store, { project, record: gate })).trace) reasons.push(...groundOf(store, entry, gate, own));
@@ -1143,7 +1177,7 @@ function groundOf(store: Store, entry: { finding: Refusal; cause: { emission: st
     return [reasonOf("frame-need-owner", checked.request.code, entry.finding.at.target, "answer", checked.request.message,
       [...(gate ? [gate] : []), call, diagnostic, ...gap])];
   }
-  if (!NO_PRODUCER.includes(cause.emission)) return [];
+  if (!(NO_PRODUCER_EMISSIONS as readonly string[]).includes(cause.emission)) return [];
   return [reasonOf("unsupported-question", entry.finding.code, entry.finding.at.target, entry.finding.at.field ?? "answer", entry.finding.message, gap)];
 }
 /**
@@ -1155,7 +1189,7 @@ function unansweredQuestions(store: Store, project: string, bases: Bases): RunRe
   const gaps = bases.routes.value.request.gaps as unknown as GapReadRequest;
   const prepared = prepareAnswersGateTrace(store, { project, gaps, routes: bases.refs.routes, results: [] });
   if (!prepared.ok) return [];
-  return prepared.value.trace.filter(entry => entry.cause.emission === "owner-absent" || entry.cause.emission === "unsupported-absent")
+  return prepared.value.trace.filter(entry => NO_PRODUCER_EMISSIONS.includes(entry.cause.emission))
     .flatMap(entry => groundOf(store, entry as never, null, null));
 }
 /** The obligations the attempt declared at a level: the items of its node-expansion batches (goal questions `fill`). */
