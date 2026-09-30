@@ -1104,7 +1104,7 @@
 - Отдаёт: M9 · Передать компилятору; Журнал отказов ворот
 - Читает записи: reader-result; Source; Evidence
 - Пишет записи: —
-- Разрешённые пути: `src/discovery/reader-reuse.ts`, `src/discovery/pilot-context.ts`, `test/reader-pilot.test.ts`
+- Разрешённые пути: `src/discovery/reader-reuse.ts`, `src/discovery/pilot-context.ts`, `src/discovery/research-continuation.ts`, `test/reader-pilot.test.ts`
 - Из движка как есть: общий исторический читатель reader-result — src/discovery/reader.ts (D8.4); урок 45 — ~/REPORTS/review/omg-lesson45-read-not-weaker-than-write_260926.md
 - После: D8.4a, D8.4c
 - Тесты сверх обязательных:
