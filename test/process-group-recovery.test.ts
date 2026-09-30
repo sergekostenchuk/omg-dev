@@ -441,7 +441,7 @@ test('№1631-1 C43/C44 e2e: a later attempt cannot inherit an earlier witness w
   assert.equal(second.value.state, 'interrupted'); assert.equal(second.value.child, null); assert.equal(pids.length, 2);
   const witnesses = processStopWitnesses(f.store, second.id);
   assert.equal(witnesses.length, 2);
-  assert.deepEqual(witnesses.map(w => (w.value as ProcessStopWitness).pid).sort((a, b) => a! - b!), [pids[0], pids[1]]);
+  assert.deepEqual(witnesses.map(w => (w.value as ProcessStopWitness).pid).sort((a, b) => a! - b!), [pids[0]!, pids[1]!].sort((a, b) => a - b));
   assert.equal(probeProcessIdentity(pids[1]!).state, 'present');
   // The third entry must not start: attempt two's spawned process still lives
   // but its start identity was never captured — the pid is held as
