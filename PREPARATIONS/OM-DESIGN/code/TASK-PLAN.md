@@ -1333,7 +1333,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `src/runtime/environment.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`
+- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `src/runtime/environment.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-addressing.test.ts`, `test/om-gap-lines.test.ts`, `test/om-question-packet.test.ts`
 - Из движка как есть: договор ~/REPORTS/review/omg-code-s13_contract-2185.md (№2179 + №2185); профили и сохранённые шаги сухого прогона ~/OMG/PREPARATIONS/OM-DRYRUN/profile/
 - После: H1.4, E2.2
 - Тесты сверх обязательных:
