@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 100. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → Q2 → Q2b → Q3 → Q2.1 → Q4 → Q5 → H2.0.
+Задач: 102. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → R1 → R2 → Q2 → Q2b → Q3 → Q2.1 → Q4 → Q5 → H2.0.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 31.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 33.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -1357,6 +1357,42 @@
   - замер до/после на тех же шагах копии omg-live: cycle попыток 1–3, A6, get/промахи, RSS; цель — снять повторный вывод истории попыток между операциями, без обещания нулевого роста
   - регрессии: каждый вид чтения Store (get/list/history/identities, pending-накладка) отмечается наблюдателем; чтение в обход наблюдателя — доказательство неполное; изменение истории попыток вторым Store → следующий вывод не отдаёт удержанное
 
+### R1 · Кольцо импортов R1: читатели обязательств OM через регистрацию в нижнем модуле
+
+**Цель.** Нижние слои (graph/obligation-handoff, graph/runtime-evidence, runtime/runtime-observation) перестают импортировать om/obligations: читатели readOmObligationHandoff и readOmObligationLedger доступны через слот в нижнем модуле уровня graph, om/obligations регистрирует их при загрузке; регистрант не вызывается при загрузке, пустой слот — типизированный отказ (урок TDZ answersSourceReader S1.1); поведение и отказы прежние; загрузочная компонента кольца уменьшается, порог храповика снижается.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: —
+- Пишет записи: —
+- Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
+- Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, раздел 3 (рёбра 13, 15, 22) и раздел 5 (риски TDZ); образец регистрации: om/refusal-journal.ts:256 answersSourceReader (S1.1 №1773)
+- После: S1.4
+- Тесты сверх обязательных:
+  - ДОГОВОР — у ревьюера до кода (размещение слота, имена, отказ пустого слота)
+  - храповик: LOAD_RING_LIMIT снижен до измеренного значения после правки; FULL — по замеру
+  - регрессии: пустой слот → типизированный отказ (не пропуск по форме); регистрант не вызывается при загрузке; холодный старт om-start на копии после правки (дым порядка загрузки); прежние тесты obligations/runtime-evidence/runtime-observation без правки ожиданий
+
+### R2 · Кольцо импортов R2: проверки стадий вне ProductEngine
+
+**Цель.** om/{input,frame-obligations,horizon,run}.ts перестают создавать ProductEngine ради inspect/compile: проверки стадий и компиляция выносятся в нижний модуль уровня pipeline, ProductEngine делегирует ему; рёбра om → product исчезают, рёбра product → om становятся односторонними; кластер водителя прохода выходит из кольца (по анализу 83→75); поведение, отказы и записи прежние.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: —
+- Пишет записи: —
+- Разрешённые пути: `src/product/stage-checks.ts`, `src/product/engine.ts`, `src/om/input.ts`, `src/om/frame-obligations.ts`, `src/om/horizon.ts`, `src/om/run.ts`, `test/import-ring.test.ts`
+- Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, разделы 3–4 (R2: input.ts:511 inspect, frame-obligations.ts:863,896, horizon.ts:406, run.ts:346 compile)
+- После: R1, S1.2, S1.4
+- Тесты сверх обязательных:
+  - ДОГОВОР — у ревьюера до кода (граница нового модуля, что делегирует ProductEngine, пути тестов водителя: om-run, om-run-driver, om-run-control)
+  - храповик снижен до измеренного значения
+  - регрессии: прежние тесты om-run/om-run-driver/om-run-control/product без правки ожиданий; холодный старт om-start на копии (дым порядка загрузки)
+
 ## Срез E · Обращения к модели: G8, учёт, пакет вопроса, форма ответа, отправка, оценщик
 
 Узкий адресный вопрос вместо «всего проекта». Задач: 10.
@@ -1943,7 +1979,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/om/refusal.ts`, `src/om/horizon.ts`, `src/om/model-call.ts`, `src/om/input.ts`, `test/om-refusal-codes.test.ts`
 - Из движка как есть: refused / REFUSAL_ROUTES — src/om/refusal.ts; наблюдение №21 — code/OBSERVATIONS.md
-- После: H1, Q1, S1.1, H1.3, D8.4.2, H1.5, S1.3, S1.4, S1.2
+- После: H1, Q1, S1.1, H1.3, D8.4.2, H1.5, S1.3, S1.4, S1.2, R1, R2
 - Тесты сверх обязательных:
   - РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ 29.09.2026 ~18:25 после третьего возврата (№1951, №1976, №2098; разбор ревьюера №2102): Q2 — ПОСЛЕ РУБЕЖА, не предпосылка H1.3/D8.4.2/рубежа (декларации и статический тест не меняют поведения продукта). ПОДХОД МЕНЯЕТСЯ: гарантия кодов отказа ТИПАМИ — локальные коды по модулям + явная передача проверенного отказа источника (tsc), без самодельного анализа происхождения значений; анализатор круга 3 (om/q2-review-r3) в продукт не вливается; договор пересобрать до выдачи.
   - ДОГОВОР №1822 (~/REPORTS/review/omg-code-q2_contract-1822.md — читать ЦЕЛИКОМ): ЧАСТЬ 1 из 3 — общий механизм и три исходных производителя. Статическая проверка TypeScript AST в test/om-refusal-codes.test.ts обходит ВСЕ src/om/*.ts; четыре канала (собственный Refusal / общий-заимствованный код по явно подключённой группе / передача результата зависимости с названным источником / исключение и код данных-исхода — свои классы); декларативные правила классов и общих групп — в refusal.ts БЕЗ импорта производителей (циклы загрузки); разрешение псевдонимов, констант, локальных помощников, позиции параметра кода, default и conditional; неразрешённое выражение — падение, не пропуск; запрещены исключения «весь файл»/«любой error.code»/«любой *_invalid»; ожидаемый каталог НЕ выводить из найденных эмиссий. Модули частей Q2b/Q2c — явным списком ещё не подключённых (не постоянное исключение). Runtime-фильтр к readJournalAt/readRun/G4b/E4 не подключать. Таблица №1822-5 (8 строк) и регрессии №1822-5. Опись ревьюера /tmp/omg-q2-inventory.json (+ скрипт .cjs) — исходная, не приёмочная.
@@ -1964,7 +2000,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/om/refusal.ts`, `src/om/assessment.ts`, `src/om/atomic-gate.ts`, `src/om/feasibility.ts`, `src/om/handoff.ts`, `src/om/series-transition.ts`, `src/om/series.ts`, `src/om/run.ts`, `test/om-refusal-codes.test.ts`
 - Из движка как есть: общая AST-проверка и декларации классов — Q2 (test/om-refusal-codes.test.ts, src/om/refusal.ts); договор №1822 — ~/REPORTS/review/omg-code-q2_contract-1822.md
-- После: Q2, H1.1, S1.1, H1.3, H1.5, S1.2
+- После: Q2, H1.1, S1.1, H1.3, H1.5, S1.2, R1, R2
 - Тесты сверх обязательных:
   - РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ 29.09.2026 (срезать церемонии, п.3): части 2 и 3 Q2 слиты в одну сдачу — только объявления кодов/классов и типы в девяти путях, предметные ветви не меняются; прежние тексты частей 2 и 3 ниже действуют вместе
   - ИЗ ЧАСТИ 3 (бывшая Q2c): series-transition.ts (fail — код четвёртым аргументом с default), series.ts series_transition_refused, run.ts candidate_gaps/answers_not_passed и новые коды H1.1/H1.2/H1.3; completion-группа уже создана в части 1; в конце список неподключённых модулей в тесте ПУСТ
@@ -1983,7 +2019,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/canonical.ts`, `src/om/series.ts`, `src/om/refusal-journal.ts`, `src/om/call-record.ts`, `src/om/obligations.ts`, `test/om-composite-keys.test.ts`
 - Из движка как есть: canonical — src/canonical.ts; наблюдение №21 — code/OBSERVATIONS.md
-- После: H1, Q2, Q2b, S1.1
+- После: H1, Q2, Q2b, S1.1, R1, R2
 - Тесты сверх обязательных:
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода ПОГРАНИЧНО; в договоре — нет; ключи эры — решить при выдаче; ориентиры Jev (куда смотреть при описи, не судья): src/om/series.ts:prepareBegin:811; src/om/call-record.ts:resolveMechanismSeries:824; src/om/series.ts:checkSeriesActivation:2637
   - найдено 25.09.2026 (eb90700): series.ts:1510 ключ achieved склеен пробелом; refusal-journal.ts:194 — через \0; call-record.ts:1029 сортирует по id\0revision без hash; столкновение требует разделителя внутри частей (маловероятно), но кодировка неоднозначна — порядок может зависеть от порядка доставки (детерминизм канонической формы)
@@ -2020,7 +2056,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/storage/store.ts`, `src/product/engine.ts`, `src/om/series.ts`, `test/storage.test.ts`, `test/om-series-current.test.ts`
 - Из движка как есть: проверка внешнего ревью — ~/REPORTS/review/omg-external-review-8.5-verification_260926.md; урок 36 — операционная область доказанных чтений; withHistoricalReads — src/om/input.ts:710-715
-- После: H1, H2, Q3, Q2.1, S1.4
+- После: H1, H2, Q3, Q2.1, S1.4, R1, R2
 - Тесты сверх обязательных:
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода НУЖНА; в договоре — нет; допуск legacy/unactivated/active/участие — таблица ДО выдачи; ориентиры Jev (куда смотреть при описи, не судья): src/product/engine.ts:ProductEngine.validateStage:214; src/product/engine.ts:ProductEngine.#assess:405; src/om/series.ts:prepareBegin:811
   - найдено 26.09.2026 (872e678): engine.ts:393-394 #omProject для legacy-проекта — store.list() без kind (головы ВСЕГО хранилища, store.ts:68-73) и history() по каждой (1+N запросов, N+R декодов SHA-256+JSON.parse); 9 путей из 48 команд (project, assess, compile, draft-om, draft-plan, accept-stage om-g2/compilation, continue-preparation ×2, repair-plan, repairs.prepare) и каждое чтение проекции (server.ts:44/:50; опрос UI раз в 1,2 с — ui/execution.tsx:15); кэша нет; для OM-проекта скан прекращается на первом B1 (engine.ts:387-391)
@@ -2194,7 +2230,7 @@
 - Пишет записи: owner-result
 - Разрешённые пути: `src/om/owner-result.ts`, `test/om-owner-result.test.ts`, `src/product/engine.ts`, `src/product/commands.ts`, `src/server.ts`, `test/server.test.ts`, `src/om/answers-gate.ts`, `test/om-answers-gate.test.ts`, `src/cli.ts`, `src/product/owner-authority.ts`, `test/owner-authority.test.ts`, `ui/app.tsx`
 - Из движка как есть: D1/D4 — gaps, routes; H2 — полномочие источника команды (вердикт №244)
-- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5
+- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5, R1, R2
 - Тесты сверх обязательных:
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода НУЖНА; в договоре — частичная; состояния приглашения/сессии/команды (№1353) — таблица ДО кода; ориентиры Jev (куда смотреть при описи, не судья): src/product/engine.ts:ProductEngine.validateStage:214; src/product/engine.ts:ProductEngine.#assess:405; src/product/engine.ts:ProductEngine.execute:459
   - ДОГОВОР МЕХАНИЗМА Б №1353 (файл ~/REPORTS/review/omg-code-h20_owner-authority-contract_260926.md) И РАЗРЕШЕНИЕ ВЛАДЕЛЬЦА 26.09.2026: отдельная локальная команда выпуска одноразового приглашения владельца (не ProductCommand, недоступна через execute/HTTP, serve по умолчанию не выпускает; секрет высокой энтропии через интерактивный терминал владельца; в Store — owner-session-grant/v1 с проверочным значением, без секрета; срок 10 мин, без продления) и UI входа/подтверждения (ui/app.tsx) — РАЗРЕШЕНЫ; локальный выпуск — доверенный bootstrap модели Б; обмен в UI: POST /api/owner/session требует общий connection token И секрет приглашения, однократность через детерминированный адрес сессии expected:0; bearer в HttpOnly SameSite=Strict cookie /api/owner (+Secure при HTTPS), точный Origin обязателен; owner-session/v1 — 30 мин, без продления, выход отзывает, перезапуск сервера уничтожает живые bearer; runtime-полномочие — непрозрачное, по закрытому реестру идентичностей (привязка Store/проект/действие/сессия), без brand/фабрики по role; execute и /api/command полномочия не получают никогда; общий writer owner-result проверяет полномочие перед подготовкой и перед записью, в транзакцию — точная ревизия сессии и предметные охраны; owner-command/v1 — идентичность команды, databaseId/project/action, точный Ref ревизии owner-session, B1/D1/M6, адрес и договор вопроса, значение и основание (без секретов); квитанция и owner-result одной транзакцией; точный повтор до нового допуска; история — по сохранённым ревизиям, logout/истечение не отменяют записанное; проверки выдачи/сессии — только в owner-authority.ts (не дублировать в server.ts/owner-result.ts); тест: обычные serve/command не выпускают приглашение и не создают owner-result; точный список тестовых файлов CLI/UI — при описи; поставка — вся цепочка до G4b
