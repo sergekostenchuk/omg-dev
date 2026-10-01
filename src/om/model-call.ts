@@ -1,10 +1,10 @@
 import type { AnswerGround } from './accepted-answer.js';
-import { readAcceptedFrameLayer, readLayerAcceptance, readLayerEnvelope, readUnacceptedLayer } from './layer-basis.js';
-import { readCompletionCloseAt, mechanismAttemptResults, prepareFinishClose } from './repeat-gate.js';
+import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance as readLayerAcceptanceOf, readLayerEnvelope as readLayerEnvelopeOf, readUnacceptedLayer as readUnacceptedLayerOf } from './layer-basis.js';
+import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { EngineError, requireCondition } from '../errors.js';
+import { EngineError } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
   prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
@@ -17,17 +17,16 @@ import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
 import { uniqueTransactionGuards, workspacePath, readEnvironmentAt, type Environment } from '../runtime/environment.js';
 import { tokenUsage, type TokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
-import { delivered, refused, sealed, isPlainObject, type Refusal, type OmResult, type Sealed } from './refusal.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { readAnswerCitations, prepareAnswerCitations, readAcceptedAnswer, readMc1Question } from './accepted-answer.js';
-import { checkAnswerForm, prepareAnswerForm } from './answer-form.js';
-import { readPacketResponse, readPartResult, readQuestionPacket, writeQuestionPacket, normalizePartAnswer,
-  type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
-import { readRoutes } from './routes.js';
-import { readFrameProposals, prepareFrameProposals, type LayerProposal } from './frame-proposals.js';
-import { WORKS_FRAME_CONTRACT, readFrameBasis, prepareFrame, type FrameRequest } from './frame-obligations.js';
+import { delivered, refused, sealed, isPlainObject, localErrors, localRefusals, transfer, transferring, type Refusal, type OmResult, type Sealed, type SourceCode, type SourceCodes } from './refusal.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { readAnswerCitations as readAnswerCitationsOf, prepareAnswerCitations as prepareAnswerCitationsOf, readAcceptedAnswer as readAcceptedAnswerOf, readMc1Question as readMc1QuestionOf } from './accepted-answer.js';
+import { checkAnswerForm as checkAnswerFormOf, prepareAnswerForm as prepareAnswerFormOf } from './answer-form.js';
+import { readPacketResponse as readPacketResponseOf, readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf, normalizePartAnswer as normalizePartAnswerOf, type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
+import { readRoutes as readRoutesOf } from './routes.js';
+import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as prepareFrameProposalsOf, type LayerProposal } from './frame-proposals.js';
+import { WORKS_FRAME_CONTRACT, readFrameBasis as readFrameBasisOf, prepareFrame as prepareFrameOf, type FrameRequest } from './frame-obligations.js';
 import { withHistoricalReads, historicalRead, historicalTrace } from './input.js';
-import { prepareAssessmentAdmission, readAssessmentIntentAt } from './assessment.js';
+import { prepareAssessmentAdmission as prepareAssessmentAdmissionOf, readAssessmentIntentAt as readAssessmentIntentAtOf } from './assessment.js';
 
 export const MODEL_CALL_CODES = Object.freeze([
   'model_call_request_invalid', 'model_adapter_response_invalid', 'model_adapter_interrupted',
@@ -35,6 +34,102 @@ export const MODEL_CALL_CODES = Object.freeze([
   'model_parts_invalid', 'model_parts_conflict',
   'model_call_record_invalid', 'model_call_identity_conflict', 'model_call_in_progress', 'model_call_application_pending',
 ] as const);
+/**
+ * Q2 (№2452-5, №2460-7): every refusal code model-call.ts creates itself, from the actual places of issue; the older
+ * MODEL_CALL_CODES above stays exported as it is. The two codes of a parsed transport answer are data of AdapterResult,
+ * never a local refusal; the exceptions have their own small set.
+ */
+export const MODEL_CALL_LOCAL_CODES = Object.freeze([
+  'model_call_request_invalid', 'model_call_record_invalid', 'model_call_identity_conflict', 'model_call_in_progress',
+  'model_call_application_pending', 'model_call_foreign', 'model_call_not_running',
+  'model_delivery_invalid', 'model_read_unavailable', 'model_parts_invalid', 'model_parts_conflict',
+  'packet_invalid', 'packet_attempt_invalid', 'dispatch_contract_invalid', 'ledger_invalid', 'input_stale',
+  'assessment_source_invalid',
+  'completion_invalid', 'completion_foreign', 'completion_closed', 'completion_conflict', 'completion_ceased',
+  'completion_claim_exists', 'completion_resolved', 'completion_cause_invalid', 'completion_cause_unproved',
+] as const);
+export type ModelCallLocalCode = typeof MODEL_CALL_LOCAL_CODES[number];
+export const MODEL_CALL_ERROR_CODES = Object.freeze(['model_call_request_invalid', 'research_dispatch_invalid'] as const);
+export type ModelCallErrorCode = typeof MODEL_CALL_ERROR_CODES[number];
+/**
+ * The codes of a transport outcome this module states itself (a parsed answer, a lost executor) — data of AdapterResult.error;
+ * a saved launch error is the historical arm. They are no refusal code of a result: a failed exchange becomes a refusal only
+ * through transportFailure, marked with its source (№2511-1).
+ */
+export const TRANSPORT_ERROR_CODES = Object.freeze(['model_adapter_interrupted', 'model_adapter_response_invalid', 'process_lost'] as const);
+export type TransportErrorCode = typeof TRANSPORT_ERROR_CODES[number];
+/**
+ * The units whose refusals model-call.ts hands on, each through a declared transfer at its import or its boundary; the
+ * 'transport' is the verified exchange of an adapter, passed on by transportFailure.
+ */
+export type ModelCallSource = 'refs' | 'input' | 'addressing' | 'accepted-answer' | 'answer-form' | 'answers-gate' | 'assessment'
+  | 'call-record' | 'frame-obligations' | 'frame-proposals' | 'layer-basis' | 'question-packet' | 'refusal-journal' | 'repeat-gate'
+  | 'routes' | 'series' | 'run-control' | 'transport';
+export type ModelCallCode = ModelCallLocalCode | SourceCodes<ModelCallSource>;
+export type ModelCallResult<T> = OmResult<T, ModelCallCode>;
+
+// Q2: the readers of the declared sources, bound once here — every refusal they return carries its source mark, and
+// take() below accepts no other foreign result. The refs readers keep their generics through explicit wrappers.
+const answersCheckCessationValue = transferring('answers-gate', answersCheckCessationValueOf);
+const answersCheckState = transferring('answers-gate', answersCheckStateOf);
+const checkAnswerForm = transferring('answer-form', checkAnswerFormOf);
+const checkAnswersTransition = transferring('answers-gate', checkAnswersTransitionOf);
+const deriveInputDecisions = transferring('addressing', deriveInputDecisionsOf);
+const mechanismAttemptResults = transferring('repeat-gate', mechanismAttemptResultsOf);
+const normalizePartAnswer = transferring('question-packet', normalizePartAnswerOf);
+const prepareAddressing = transferring('addressing', prepareAddressingOf);
+const prepareAnswerCitations = transferring('accepted-answer', prepareAnswerCitationsOf);
+const prepareAnswerForm = transferring('answer-form', prepareAnswerFormOf);
+const prepareAssessmentAdmission = transferring('assessment', prepareAssessmentAdmissionOf);
+const prepareCallDispatch = transferring('call-record', prepareCallDispatchOf);
+const prepareCompleteAttempt = transferring('series', prepareCompleteAttemptOf);
+const prepareCompletionAdmission = transferring('series', prepareCompletionAdmissionOf);
+const prepareFinishClose = transferring('repeat-gate', prepareFinishCloseOf);
+const prepareFrame = transferring('frame-obligations', prepareFrameOf);
+const prepareFrameProposals = transferring('frame-proposals', prepareFrameProposalsOf);
+const prepareJournalBatch = transferring('refusal-journal', prepareJournalBatchOf);
+const preparePartResult = transferring('question-packet', preparePartResultOf);
+const prepareQuestionPacket = transferring('question-packet', prepareQuestionPacketOf);
+const prepareRecordRefusal = transferring('refusal-journal', prepareRecordRefusalOf);
+const prepareSeriesLineAdmission = transferring('series', prepareSeriesLineAdmissionOf);
+const readAcceptedAnswer = transferring('accepted-answer', readAcceptedAnswerOf);
+const readAcceptedFrameLayer = transferring('layer-basis', readAcceptedFrameLayerOf);
+const readAnswerCitations = transferring('accepted-answer', readAnswerCitationsOf);
+const readAnswersGateAssignmentAt = transferring('series', readAnswersGateAssignmentAtOf);
+const readAnswersParticipant = transferring('answers-gate', readAnswersParticipantOf);
+const readAnySeriesAt = transferring('series', readAnySeriesAtOf);
+const readAssessmentIntentAt = transferring('assessment', readAssessmentIntentAtOf);
+const readAssessmentRefusalAt = transferring('assessment', readAssessmentRefusalAtOf);
+const readAssessmentTerminalAt = transferring('assessment', readAssessmentTerminalAtOf);
+const readCall = transferring('call-record', readCallOf);
+const readCallLedger = transferring('call-record', readCallLedgerOf);
+const readCallLedgerAt = transferring('call-record', readCallLedgerAtOf);
+const readCompletionBinding = transferring('series', readCompletionBindingOf);
+const readCompletionCloseAt = transferring('repeat-gate', readCompletionCloseAtOf);
+const readCompletionOriginalAdmission = transferring('series', readCompletionOriginalAdmissionOf);
+const readCompletionOwnerAt = transferring('series', readCompletionOwnerAtOf);
+const readCurrentSeriesPointer = transferring('series', readCurrentSeriesPointerOf);
+const readFrameBasis = transferring('frame-obligations', readFrameBasisOf);
+const readFrameProposals = transferring('frame-proposals', readFrameProposalsOf);
+const readJournal = transferring('refusal-journal', readJournalOf);
+const readJournalAt = transferring('refusal-journal', readJournalAtOf);
+const readLayerAcceptance = transferring('layer-basis', readLayerAcceptanceOf);
+const readLayerEnvelope = transferring('layer-basis', readLayerEnvelopeOf);
+const readMc1Question = transferring('accepted-answer', readMc1QuestionOf);
+const readOmInput = transferring('input', readOmInputOf);
+const readPacketResponse = transferring('question-packet', readPacketResponseOf);
+const readPartResult = transferring('question-packet', readPartResultOf);
+const readQuestionPacket = transferring('question-packet', readQuestionPacketOf);
+const readRouteProducers = transferring('answers-gate', readRouteProducersOf);
+const readRoutes = transferring('routes', readRoutesOf);
+const readSeriesAdmissionChange = transferring('series', readSeriesAdmissionChangeOf);
+const readSeriesWorkAdmission = transferring('series', readSeriesWorkAdmissionOf);
+const readUnacceptedLayer = transferring('layer-basis', readUnacceptedLayerOf);
+const recordCall = transferring('call-record', recordCallOf);
+const settleCall = transferring('call-record', settleCallOf);
+const writeQuestionPacket = transferring('question-packet', writeQuestionPacketOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 
 export interface AdapterRequest {
   protocol: 'omg-agent/v1'; requestId: string; mode: 'research';
@@ -46,30 +141,46 @@ export interface AdapterRequestInput {
 export interface AdapterResponseInput { requestId: string; process: ProcessResult }
 type Confirmed = ModelCall['confirmed'];
 interface AdapterResultBase { usage: TokenUsage | null; confirmed: Confirmed }
+/**
+ * The error of a failed exchange. The codes of a transport answer are a data type of their own (№2460-7); the saved launch
+ * error of a historical exchange is the other arm, marked as the exchange's at transportOf — never a plain string.
+ */
+export interface AdapterError { code: TransportErrorCode | SourceCode<'exchange'>; field: string; message: string }
 export type AdapterResult = AdapterResultBase & (
   | { kind: 'answered'; raw: string }
-  | { kind: 'interrupted' | 'off-form'; error: { code: string; field: string; message: string } }
+  | { kind: 'interrupted' | 'off-form'; error: AdapterError }
 );
 
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const unknownConfirmed = (): Confirmed => ({ model: null, effort: null, speed: null });
 const exactKeys = (value: object, keys: string[]) => Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+const refuse = localRefusals(MODEL_CALL_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: ModelCallErrorCode, message: string, details?: unknown) => never = localErrors(MODEL_CALL_ERROR_CODES);
 function invalid(field: string): never {
-  throw new EngineError('model_call_request_invalid', 'E4 requires an explicit complete request',
-    { unit: 'E4', target: 'model-call', field });
+  return raise('model_call_request_invalid', 'E4 requires an explicit complete request', { unit: 'E4', target: 'model-call', field });
 }
-class CallFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function take<T>(result: OmResult<T>): T { if (!result.ok) throw new CallFailure(result.refusal); return result.value; }
-function fail(code: string, target: string, field: string, message: string, ref?: Ref): never {
-  const result = refused(code, message, { unit: 'E4', target, field, ref }, 'producer');
+/** The throw channel of this module: a refusal of the local catalogue (fail) or of a declared source (take), nothing else. */
+class CallFailure extends Error { constructor(readonly refusal: Refusal<ModelCallCode>) { super(refusal.message); } }
+function take<T>(result: OmResult<T, ModelCallCode>): T { if (!result.ok) throw new CallFailure(result.refusal); return result.value; }
+function fail(code: ModelCallLocalCode, target: string, field: string, message: string, ref?: Ref): never {
+  const result = refuse(code, message, { unit: 'E4', target, field, ref }, 'producer');
   if (!result.ok) throw new CallFailure(result.refusal);
   throw new Error('Unreachable');
 }
-function result<T>(action: () => T): OmResult<Sealed<T>> {
+/** Where the throw channel ends: the one failure class this module throws, turned back into its typed result. */
+function caught(error: unknown): ModelCallResult<never> | null {
+  return error instanceof CallFailure ? { ok: false, refusal: error.refusal } : null;
+}
+/** A control refusal of run-control reaching this module: the whole refusal, marked with its source. */
+function controlLost(error: RunControlLost): ModelCallResult<never> {
+  return transfer('run-control', { ok: false as const, refusal: error.refusal });
+}
+function result<T>(action: () => T): ModelCallResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(action()); }
-    catch (error) { if (error instanceof CallFailure) return { ok: false, refusal: error.refusal }; throw error; }
+    catch (error) { const failed = caught(error); if (failed) return failed; throw error; }
   });
 }
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -78,7 +189,7 @@ const refs = (values: readonly Ref[]): Ref[] => [...new Map(values.map(ref => [c
   .sort(compareJson);
 
 /** Wire encoding only. Dispatch admission and the packet proof belong to E1 and E2. */
-export function adapterRequest(request: AdapterRequestInput): OmResult<Sealed<AdapterRequest>> {
+export function adapterRequest(request: AdapterRequestInput): ModelCallResult<Sealed<AdapterRequest>> {
   if (!object(request) || !text(request.requestId) || !text(request.model)
     || !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(request.effort)
     || !Object.hasOwn(request, 'packet')
@@ -92,7 +203,7 @@ export function adapterRequest(request: AdapterRequestInput): OmResult<Sealed<Ad
 }
 
 /** Decode transport evidence, not the answer's product form or its acceptance. */
-export function readAdapterResponse(request: AdapterResponseInput): OmResult<Sealed<AdapterResult>> {
+export function readAdapterResponse(request: AdapterResponseInput): ModelCallResult<Sealed<AdapterResult>> {
   if (!object(request) || !text(request.requestId) || !object(request.process)
     || !exactKeys(request, ['requestId', 'process'])
     || !exactKeys(request.process, ['exitCode', 'signal', 'stdout', 'stderr'])
@@ -208,7 +319,7 @@ function deliveryData(store: Store, project: string, environment: Environment, r
 }
 
 /** One historical proof for E2 continuations and E4 delivery/replay. Current adds freshness, never a different derivation. */
-export function readContinuationEvidence(store: Store, request: ContinuationEvidenceRequest, current = false): OmResult<Sealed<{ data: Json[]; novel: boolean; references: Ref[]; guards: TransactionGuard[] }>> {
+export function readContinuationEvidence(store: Store, request: ContinuationEvidenceRequest, current = false): ModelCallResult<Sealed<{ data: Json[]; novel: boolean; references: Ref[]; guards: TransactionGuard[] }>> {
   requireDeliveryRequest(store, request, true); if (typeof current !== 'boolean') invalid('current');
   request = sealed(request) as ContinuationEvidenceRequest;
   const derive = () => result(() => {
@@ -240,11 +351,11 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
   });
   return current ? derive() : historicalRead(store, { reader: 'E4.continuation', project: request.project, ref: request.response,
     parameters: request as unknown as Json }, derive,
-  () => refused('model_delivery_invalid', 'Delivery provenance contains a cycle', { unit: 'E4', target: request.response.id, field: 'continuation' }, 'producer'));
+  () => refuse('model_delivery_invalid', 'Delivery provenance contains a cycle', { unit: 'E4', target: request.response.id, field: 'continuation' }, 'producer'));
 }
 
 /** Executes only the addresses E3 validated; the sources and actual delivered values remain readable after restart. */
-export function deliverModelSources(store: Store, request: ReadDeliveryRequest): OmResult<Sealed<{ deliveries: Ref[]; references: Ref[] }>> {
+export function deliverModelSources(store: Store, request: ReadDeliveryRequest): ModelCallResult<Sealed<{ deliveries: Ref[]; references: Ref[] }>> {
   requireDeliveryRequest(store, request); request = sealed(request) as ReadDeliveryRequest;
   return result(() => {
     const setId = deliverySetId(request), oldSet = store.get<ContinuationEvidenceRequest>(setId);
@@ -403,7 +514,7 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
     ...packets.map(reference)]), guards: prepared ? externalGuards([...prepared.guards.filter(ref => ref.id !== proposal.id),
       ...(packetAdmission?.guards ?? [])], []) : [] };
 }
-export function readPartAssembly(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
+export function readPartAssembly(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<{
   record: Revision<PartAssemblyRecord>; proposal: Revision<LayerProposal>; references: Ref[];
 }>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
@@ -425,7 +536,7 @@ export function readPartAssembly(store: Store, request: { project: string; recor
     return { record: derived.record, proposal: derived.proposal, references: derived.references };
   }, () => fail('model_parts_invalid', request.record.id, 'history', 'An assembly cannot derive through itself', request.record)));
 }
-export function assembleModelParts(store: Store, request: PartAssemblyRequest): OmResult<Sealed<{
+export function assembleModelParts(store: Store, request: PartAssemblyRequest): ModelCallResult<Sealed<{
   record: Revision<PartAssemblyRecord>; proposal: Revision<LayerProposal>; references: Ref[];
 }>> {
   requireAssembly(store, request); request = sealed(request) as PartAssemblyRequest;
@@ -586,7 +697,7 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
     fail('model_delivery_invalid', project, 'diagnostic', 'A cycle retains the actual physical outcome diagnostic');
   return last as ModelCallOutcome;
 }
-export function readModelCycle(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCycleOutcome>> {
+export function readModelCycle(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<ModelCycleOutcome>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('cycle.read');
   return result(() => {
@@ -621,7 +732,7 @@ function prepareCycleCompletion(store: Store, binding: Ref, cycle: Ref, value: M
   return { writes: [] as Write[], guards: [reference(head), binding, ...sources] as TransactionGuard[] };
 }
 /** Continue only addressed source reads and assigned node parts; neither starts another A3 attempt. */
-export async function runModelCycle(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<OmResult<Sealed<ModelCycleOutcome>>> {
+export async function runModelCycle(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<ModelCallResult<Sealed<ModelCycleOutcome>>> {
   requireModelRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
   if (control !== undefined && !object(control)) invalid('control');
@@ -724,8 +835,8 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       return { ...read, repeated: false } as ModelCycleOutcome;
     });
   } catch (error) {
-    if (error instanceof CallFailure) return { ok: false, refusal: error.refusal };
-    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    { const failed = caught(error); if (failed) return failed; }
+    if (error instanceof RunControlLost) return controlLost(error);
     throw error;
   }
 }
@@ -734,14 +845,12 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
 import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
 import { isProcessStopRefusal, writeProcessStopWitness } from '../runtime/process-identity.js';
-import { recordCall, readCall, readCallLedgerAt, readCallLedger, callRecordId, callLedgerId, settleCall, prepareCallDispatch, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory, type CallLedger } from './call-record.js';
-import { prepareQuestionPacket, preparePartResult, partResponseId,
-  PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
-import { readAnySeriesAt, seriesRequestOf, prepareCompleteAttempt, prepareSeriesLineAdmission,
-  readSeriesWorkAdmission, readSeriesAdmissionChange, readCurrentSeriesPointer, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
-import { prepareJournalBatch, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
-import { prepareAddressing, deriveInputDecisions } from './addressing.js';
-import { readOmInput, type OmInputRecord } from './input.js';
+import { recordCall as recordCallOf, readCall as readCallOf, readCallLedgerAt as readCallLedgerAtOf, readCallLedger as readCallLedgerOf, callRecordId, callLedgerId, settleCall as settleCallOf, prepareCallDispatch as prepareCallDispatchOf, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory, type CallLedger } from './call-record.js';
+import { prepareQuestionPacket as prepareQuestionPacketOf, preparePartResult as preparePartResultOf, partResponseId, PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
+import { readAnySeriesAt as readAnySeriesAtOf, seriesRequestOf, prepareCompleteAttempt as prepareCompleteAttemptOf, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readSeriesWorkAdmission as readSeriesWorkAdmissionOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
+import { prepareJournalBatch as prepareJournalBatchOf, prepareRecordRefusal as prepareRecordRefusalOf, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
+import { prepareAddressing as prepareAddressingOf, deriveInputDecisions as deriveInputDecisionsOf } from './addressing.js';
+import { readOmInput as readOmInputOf, type OmInputRecord } from './input.js';
 import type { CheckedAnswerForm } from './answer-form.js';
 
 export interface ModelCallRequest { project: string; packet: Ref; dispatch: DispatchContract; role: 'implementer' | 'reviewer' }
@@ -897,9 +1006,18 @@ function requireAnswerProducers(store: Store, packet: Ref, project: string, rout
   if (!judged) fail('model_call_request_invalid', packet.id, 'batch', 'The packet names a batch its exact routes do not hold', routes);
   const first = judged.unserved[0];
   if (!first) return;
-  const refusal = refused(first.producer.code, first.producer.message, { unit: 'E4', target: first.target, field: first.producer.field, ref: first.gap },
-    first.producer.code === 'owner_result_unavailable' ? 'owner' : 'producer');
+  const refusal = unservedProducer(first);
   if (!refusal.ok) throw new CallFailure(refusal.refusal);
+}
+/**
+ * The verdict of G4b on an unserved question, as it came out of the exact D1 reading above: the code is answers-gate's own
+ * (NoProducer names both), carried with its message and field as data and addressed here at E4, the owner's absence routed
+ * to the owner as before. The one narrowing of this adapter only marks that code with its source after that reading.
+ */
+function unservedProducer(first: UnservedQuestion): ModelCallResult<never> {
+  const code = first.producer.code as SourceCode<'answers-gate', NoProducer['code']>;
+  return refused(code, first.producer.message, { unit: 'E4', target: first.target, field: first.producer.field, ref: first.gap },
+    first.producer.code === 'owner_result_unavailable' ? 'owner' : 'producer');
 }
 function modelWorkAdmission(store: Store, record: Revision<OmModelCall>, series: Ref): ModelWorkAdmission {
   if (!object(record.value) || !object(record.value.om) || !['om-model-call/v1', 'om-model-call/managed-v1'].includes(record.value.om.version))
@@ -964,7 +1082,7 @@ function checkModelTerminal(store: Store, record: Revision<OmModelCall>): void {
     || application === 'recovered' && source.value.om.application !== 'running')
     fail('model_call_record_invalid', record.id, 'terminal', 'The terminal witness retains the exact preceding physical outcome without completing A3');
 }
-export function readModelTerminalWitness(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
+export function readModelTerminalWitness(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<{
   series: Ref; attempt: number; goal: AttemptGoal; reason: 'interrupted'; call: Ref; change: SeriesAdmissionChange; references: Ref[];
 }>> {
   return result(() => {
@@ -1027,13 +1145,13 @@ function prepareModelFinish(store: Store, request: FinishModelAttemptRequest) {
     ...(old ? [reference(old)] : [])] as TransactionGuard[], writes) };
 }
 /** Shared prepared completion; neighbours can atomically persist their result and the single A3 outcome. */
-export function prepareModelAttemptFinish(store: Store, request: FinishModelAttemptRequest): OmResult<Sealed<{ diagnostic: Ref; writes: Write[]; guards: TransactionGuard[] }>> {
+export function prepareModelAttemptFinish(store: Store, request: FinishModelAttemptRequest): ModelCallResult<Sealed<{ diagnostic: Ref; writes: Write[]; guards: TransactionGuard[] }>> {
   requireFinish(store, request); request = sealed(request) as FinishModelAttemptRequest;
   // H1.0d (№1715, C15): the guards include the absences the outcome relied on; the caller carries them to its write.
   return result(() => prepareModelFinish(store, request));
 }
 /** Records one addressed failure/control outcome through the common journal and A3 transition. */
-export function finishModelAttempt(store: Store, request: FinishModelAttemptRequest): OmResult<Sealed<{ diagnostic: Ref }>> {
+export function finishModelAttempt(store: Store, request: FinishModelAttemptRequest): ModelCallResult<Sealed<{ diagnostic: Ref }>> {
   requireFinish(store, request); request = sealed(request) as FinishModelAttemptRequest;
   return result(() => {
     const prepared = prepareModelFinish(store, request);
@@ -1046,24 +1164,36 @@ function transportOf(exchange: Pick<ModelExchange, 'wire' | 'call' | 'process' |
   if (exchange.process !== null) return take(readAdapterResponse({ requestId: exchange.wire.requestId, process: exchange.process })) as AdapterResult;
   if (!exchange.launchError || !text(exchange.launchError.code) || !text(exchange.launchError.message))
     fail('model_call_record_invalid', exchange.call.id, 'process', 'Missing process evidence must have an explicit launch/interruption error');
-  return { kind: 'interrupted', usage: null, confirmed: unknownConfirmed(), error: { code: exchange.launchError.code,
+  // The saved launch error is history outside today's transport catalogue (№2460-4): its code is marked as the exchange's own
+  // after the check above — the one narrowing of this boundary; the record itself gains no field.
+  return { kind: 'interrupted', usage: null, confirmed: unknownConfirmed(), error: { code: exchange.launchError.code as SourceCode<'exchange'>,
     field: 'process', message: exchange.launchError.message } };
 }
-function failureOf(transport: AdapterResult, form: OmResult<Sealed<CheckedAnswerForm>> | null): Refusal | null {
+/**
+ * Boundary adapter of the verified transport (№2511-1): the error of a failed exchange as a refusal of E4. Its code is data
+ * of the exchange — one of TRANSPORT_ERROR_CODES, or the saved launch error of the historical arm, already marked as the
+ * exchange's — and it reaches the result channel only through this declared transfer, marked with its source; message,
+ * field, address and route stay as the failed exchange states them.
+ */
+function transportFailure(error: AdapterError): ModelCallResult<never> {
+  return transfer('transport', refused(error.code, error.message, { unit: 'E4', target: 'adapter', field: error.field }, 'producer'));
+}
+/** A failed exchange as a refusal of the result channel (through transportFailure), or the refusal of its answer form. */
+function failureOf(transport: AdapterResult, form: ModelCallResult<Sealed<CheckedAnswerForm>> | null): Refusal<ModelCallCode> | null {
   if (transport.kind !== 'answered') {
-    const failed = refused(transport.error.code, transport.error.message, { unit: 'E4', target: 'adapter', field: transport.error.field }, 'producer');
+    const failed = transportFailure(transport.error);
     return failed.ok ? null : failed.refusal;
   }
   return form && !form.ok ? form.refusal : null;
 }
-function finishReason(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal | null): FinishModelAttemptRequest['reason'] | null {
+function finishReason(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal<ModelCallCode> | null): FinishModelAttemptRequest['reason'] | null {
   if (transport.kind === 'interrupted') return 'interrupted';
   if (transport.kind === 'off-form' || failure) return 'off-form';
   if (form?.kind === 'awaiting-owner') return 'awaiting-owner';
   if (form?.kind === 'no-result') return 'refused';
   return null;
 }
-function finishDetail(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal | null) {
+function finishDetail(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal<ModelCallCode> | null) {
   if (failure) return { code: failure.code, message: failure.message };
   if (form?.kind === 'awaiting-owner') return { code: 'model_need_owner', message: `${form.reason}; ${form.decision}` };
   if (form?.kind === 'no-result') return { code: `model_${form.action}`, message: form.reason };
@@ -1178,7 +1308,7 @@ function requireModelCallRead(store: Store, request: { project: string; record: 
     || !exactKeys(request, ['project', 'record'])) invalid('record');
 }
 /** Exact E4 provenance and physical usage, including the original terminal completion contract. */
-export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallPhysical>> {
+export function readModelCallPhysical(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<ModelCallPhysical>> {
   requireModelCallRead(store, request);
   return result<ModelCallPhysical>(() => {
     const record = take(readRecord<OmModelCall>(store, request.record,
@@ -1268,7 +1398,7 @@ export function readModelCallPhysical(store: Store, request: { project: string; 
 }
 
 /** Historical playback additionally checks the saved product application through its original producer. */
-export function readModelCallState(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallState>> {
+export function readModelCallState(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<ModelCallState>> {
   requireModelCallRead(store, request);
   return result<ModelCallState>(() => historicalRead(store, { reader: 'E4.model-call-state', project: request.project, ref: request.record }, () => {
     const physical = take(readModelCallPhysical(store, request));
@@ -1291,7 +1421,7 @@ export function readModelCallState(store: Store, request: { project: string; rec
         response: null, outcome: null, part: null, diagnostic: value.om.diagnostic, repeated: true } };
     }
     const response = value.response?.record ?? null;
-    let outcome: CheckedAnswerForm | null = null, form: OmResult<Sealed<CheckedAnswerForm>> | null = null;
+    let outcome: CheckedAnswerForm | null = null, form: ModelCallResult<Sealed<CheckedAnswerForm>> | null = null;
     if (transport.kind === 'answered') {
       if (!response) fail('model_call_record_invalid', record.id, 'response', 'A completed adapter answer needs its saved raw source');
       const saved = take(readPacketResponse(store, { project: request.project, packet: value.om.request.packet, call: value.om.call, response }));
@@ -1335,7 +1465,7 @@ export function readModelCallState(store: Store, request: { project: string; rec
 }
 
 /** Product reads cannot mistake a durable receipt for a completed product result. */
-export function readModelCall(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<ModelCallOutcome>> {
+export function readModelCall(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<ModelCallOutcome>> {
   return result(() => {
     const state = take(readModelCallState(store, request));
     if (state.state === 'running') fail('model_call_in_progress', request.record.id, 'application', 'Dispatch has no saved receipt; resending is not safe');
@@ -1346,7 +1476,7 @@ export function readModelCall(store: Store, request: { project: string; record: 
 
 /** The only received -> terminal transition. Fresh receipts and restarts use the same current checks,
  * E3 derivation, E2/D3/A3 application and atomic refusal path; neither branch launches a process. */
-function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelCall>; exchange: Revision<ModelExchange>; transport: AdapterResult }): OmResult<Sealed<ModelCallOutcome>> {
+function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelCall>; exchange: Revision<ModelExchange>; transport: AdapterResult }): ModelCallResult<Sealed<ModelCallOutcome>> {
   const { record: receiptRecord, exchange, transport } = state;
   const request = receiptRecord.value.om.request, call = receiptRecord.value.om.call, id = receiptRecord.id;
   const exchangeRef = reference(exchange), wire = exchange.value.wire;
@@ -1393,7 +1523,7 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
     }
     let response: Ref | null = null, outcome: CheckedAnswerForm | null = null,
       part: ModelCallOutcome['part'] = null, input: Ref | null = null;
-    let checked: OmResult<Sealed<CheckedAnswerForm & { guards: TransactionGuard[] }>> | null = null;
+    let checked: ModelCallResult<Sealed<CheckedAnswerForm & { guards: TransactionGuard[] }>> | null = null;
     if (transport.kind === 'answered') {
       const responseWrite: Write = { id: partResponseId(request.project, call), kind: PART_RESPONSE_KIND, expected: 0,
         value: { project: request.project, packet: request.packet, call, requestId: wire.requestId, raw: transport.raw } satisfies PartResponseRecord };
@@ -1451,7 +1581,7 @@ function applyReceivedModelCall(store: Store, state: { record: Revision<OmModelC
     const applicationGuards = externalGuards(environment ? environment.remap([...guards, ...environment.guards]) : guards, writes);
     const committed = writeGuarded<OmModelCall>(store, { unit: 'E4', target: id, writes, guards: applicationGuards });
     const record = take(committed).find(record => record.id === id)!;
-    return delivered({ record, packet: request.packet, call, response, outcome, part, diagnostic, repeated: false }) as OmResult<Sealed<ModelCallOutcome>>;
+    return delivered({ record, packet: request.packet, call, response, outcome, part, diagnostic, repeated: false }) as ModelCallResult<Sealed<ModelCallOutcome>>;
   } catch (error) {
     if (!(error instanceof CallFailure)) throw error;
     if (owner) {
@@ -1492,7 +1622,7 @@ function settleAppliedCall(store: Store, outcome: ModelCallOutcome): ModelCallOu
 }
 
 /** One physical dispatch. Each new continuation is another packet and therefore another E1 call. */
-export async function runModelCall(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<OmResult<Sealed<ModelCallOutcome>>> {
+export async function runModelCall(store: Store, request: ModelCallRequest, signal?: AbortSignal, control?: RunControlHold): Promise<ModelCallResult<Sealed<ModelCallOutcome>>> {
   requireModelRequest(store, request); request = sealed(request) as ModelCallRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
   if (control !== undefined && !object(control)) invalid('control');
@@ -1502,7 +1632,7 @@ export async function runModelCall(store: Store, request: ModelCallRequest, sign
  * One dispatch under the gate of its chain (H1.3): a cycle hands its own gate on, so the admission its first new
  * dispatch takes is the one every continuation and next part of the same invocation writes under.
  */
-async function modelCallUnder(store: Store, request: ModelCallRequest, signal: AbortSignal | undefined, gate: RunControlGate): Promise<OmResult<Sealed<ModelCallOutcome>>> {
+async function modelCallUnder(store: Store, request: ModelCallRequest, signal: AbortSignal | undefined, gate: RunControlGate): Promise<ModelCallResult<Sealed<ModelCallOutcome>>> {
   try {
     const assignment = modelAssignment(store, request), { packet, payload, wire, binding } = assignment;
     const id = modelRecordId(request.project, wire.requestId), old = store.get<OmModelCall>(id);
@@ -1516,7 +1646,7 @@ async function modelCallUnder(store: Store, request: ModelCallRequest, signal: A
           ? take(applyReceivedModelCall(store, { record: state.outcome.record as Revision<OmModelCall>,
             ...checkedModelExchange(store, request, state.outcome.call, state.outcome.record.value.om.exchange!) }))
           : state.outcome as ModelCallOutcome;
-      return delivered(settleAppliedCall(store, outcome as ModelCallOutcome)) as OmResult<Sealed<ModelCallOutcome>>;
+      return delivered(settleAppliedCall(store, outcome as ModelCallOutcome)) as ModelCallResult<Sealed<ModelCallOutcome>>;
     }
     const environment = take(prepareManagedCallEnvironment(store, request.project, assignment.admission, request.role));
     const admittedStore = environment?.store ?? store;
@@ -1574,16 +1704,16 @@ async function modelCallUnder(store: Store, request: ModelCallRequest, signal: A
       writes: [exchangeWrite, { id, kind: 'model-call', expected: runningRecord.revision, value: receipt }], guards: [reference(runningRecord)] });
     if (!savedReceipt.ok && store.get<ModelCall>(id)?.value.recovery) {
       const recovered = preserveLateTransport(store, request.project, runningRecord, call, physical);
-      return delivered(take(readModelCall(store, { project: request.project, record: reference(recovered) }))) as OmResult<Sealed<ModelCallOutcome>>;
+      return delivered(take(readModelCall(store, { project: request.project, record: reference(recovered) }))) as ModelCallResult<Sealed<ModelCallOutcome>>;
     }
     const persisted = take(savedReceipt);
     const state = take(readModelCallState(store, { project: request.project, record: reference(persisted.find(row => row.id === id)!) }));
     if (state.state !== 'received') fail('model_call_record_invalid', id, 'application', 'Physical receipt must precede application');
     const applied = take(applyReceivedModelCall(store, state as Extract<ModelCallState, { state: 'received' }>));
-    return delivered(settleAppliedCall(store, applied as ModelCallOutcome)) as OmResult<Sealed<ModelCallOutcome>>;
+    return delivered(settleAppliedCall(store, applied as ModelCallOutcome)) as ModelCallResult<Sealed<ModelCallOutcome>>;
   } catch (error) {
-    if (error instanceof CallFailure) return { ok: false, refusal: error.refusal };
-    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    { const failed = caught(error); if (failed) return failed; }
+    if (error instanceof RunControlLost) return controlLost(error);
     throw error;
   }
 }
@@ -1670,9 +1800,9 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
   const admissionGuards = refs((environment ? environment.remap(collected) : collected).filter(isRef));
   const counterId = `project-dispatch:${hashJson(request.project)}`;
   const counter = store.get<{ projectId: string; serial: number }>(counterId);
-  requireCondition(!counter || (counter.kind === 'project-dispatch' && object(counter.value)
-    && counter.value.projectId === request.project && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0),
-  'research_dispatch_invalid', 'Invalid project dispatch counter');
+  if (counter && !(counter.kind === 'project-dispatch' && object(counter.value)
+    && counter.value.projectId === request.project && Number.isSafeInteger(counter.value.serial) && counter.value.serial >= 0))
+    raise('research_dispatch_invalid', 'Invalid project dispatch counter');
   const controlled = gate.view();
   let record = take(writeGuarded<ModelCall>(controlled, { unit: 'E4', target: running.id,
     writes: [...sourceWrites, { ...running, value: { ...running.value as ModelCall, ...physicalClaim() } },
@@ -1715,7 +1845,7 @@ async function startPhysicalTransport(store: Store, request: ModelTransportReque
 }
 const transportExchangeId = (request: ModelTransportRequest) => `om-model-transport:${request.project}:${hashJson(request)}`;
 /** Direct transport keeps E1's body and outcome opaque; it uses the same process boundary as ordinary E2/E3 calls. */
-export function readModelTransport(store: Store, request: { project: string; record: Ref }, history?: CallHistory): OmResult<Sealed<ModelTransportOutcome>> {
+export function readModelTransport(store: Store, request: { project: string; record: Ref }, history?: CallHistory): ModelCallResult<Sealed<ModelTransportOutcome>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('transport-record');
   if (history !== undefined && (!object(history) || !exactKeys(history, ['journal']) || !isRef(history.journal))) invalid('history');
@@ -1780,7 +1910,7 @@ export function readModelTransport(store: Store, request: { project: string; rec
   });
 }
 export async function runModelTransport(store: Store, request: ModelTransportRequest, signal?: AbortSignal,
-  extraGuards: readonly TransactionGuard[] = [], control?: RunControlHold): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
+  extraGuards: readonly TransactionGuard[] = [], control?: RunControlHold): Promise<ModelCallResult<Sealed<ModelTransportOutcome>>> {
   requireTransport(store, request); request = sealed(request) as ModelTransportRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
   if (control !== undefined && !object(control)) invalid('control');
@@ -1788,10 +1918,10 @@ export async function runModelTransport(store: Store, request: ModelTransportReq
 }
 /** A direct transport under the gate of its producer's chain (E5 or A6): their intent, E1 and dispatch share one admission. */
 export async function transportUnder(store: Store, request: ModelTransportRequest, signal: AbortSignal | undefined,
-  extraGuards: readonly TransactionGuard[], gate: RunControlGate): Promise<OmResult<Sealed<ModelTransportOutcome>>> {
+  extraGuards: readonly TransactionGuard[], gate: RunControlGate): Promise<ModelCallResult<Sealed<ModelTransportOutcome>>> {
   requireTransport(store, request); request = sealed(request) as ModelTransportRequest;
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
-  requireCondition(gate instanceof RunControlGate && gate.project === request.project, 'model_call_request_invalid', 'A transport runs under the control gate of its own project');
+  if (!(gate instanceof RunControlGate && gate.project === request.project)) raise('model_call_request_invalid', 'A transport runs under the control gate of its own project');
   extraGuards = uniqueTransactionGuards(extraGuards);
   try {
     const { call, wire, binding } = transportAssignment(store, request), id = modelRecordId(request.project, wire.requestId);
@@ -1802,7 +1932,7 @@ export async function transportUnder(store: Store, request: ModelTransportReques
       const saved = take(readModelTransport(store, { project: request.project, record: reference(prior) }));
       if (!same(saved.record.value.transport.request, request)) fail('model_call_identity_conflict', id, 'request', 'A physical identity cannot be rebound to another request');
       settlePhysicalCall(store, saved.record, request.call);
-      return delivered(saved) as OmResult<Sealed<ModelTransportOutcome>>;
+      return delivered(saved) as ModelCallResult<Sealed<ModelTransportOutcome>>;
     }
     const completion = take(prepareCompletionCall(store, request.project, { ...call.value, packet: request.packet } as AnyRecordCallRequest, 'claim'));
     if (completion.writes.length) fail('completion_invalid', call.id, 'work', 'The assessor must be registered before its claim');
@@ -1828,16 +1958,16 @@ export async function transportUnder(store: Store, request: ModelTransportReques
       writes: [exchangeWrite, { id, kind: 'model-call', expected: physical.record.revision, value: finished }], guards: [reference(physical.record)] });
     if (!savedReceipt.ok && store.get<ModelCall>(id)?.value.recovery) {
       const recovered = preserveLateTransport(store, request.project, physical.record as Revision<ModelCall>, request.call, physical);
-      return delivered(take(readModelTransport(store, { project: request.project, record: reference(recovered) }))) as OmResult<Sealed<ModelTransportOutcome>>;
+      return delivered(take(readModelTransport(store, { project: request.project, record: reference(recovered) }))) as ModelCallResult<Sealed<ModelTransportOutcome>>;
     }
     const written = take(savedReceipt);
     settlePhysicalCall(store, written.find(record => record.id === id)!, request.call);
-    return delivered({ record: written.find(record => record.id === id)!, call: request.call, exchange: ref, result: decoded, repeated: false }) as OmResult<Sealed<ModelTransportOutcome>>;
+    return delivered({ record: written.find(record => record.id === id)!, call: request.call, exchange: ref, result: decoded, repeated: false }) as ModelCallResult<Sealed<ModelTransportOutcome>>;
   } catch (error) {
     if (error instanceof CallFailure) {
       return { ok: false, refusal: error.refusal };
     }
-    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return controlLost(error);
     throw error;
   }
 }
@@ -1874,7 +2004,7 @@ export function captureApplicationFileObservation(source: Source): ApplicationFi
   }
 }
 /** Exact saved bytes only; this deliberately has no current filesystem access. */
-export function readApplicationFileObservation(source: Source, observation: unknown): OmResult<Sealed<{ changed: boolean }>> {
+export function readApplicationFileObservation(source: Source, observation: unknown): ModelCallResult<Sealed<{ changed: boolean }>> {
   return result(() => {
     if (!object(observation)) fail('model_call_record_invalid', source.origin.location, 'files', 'A file observation has a closed form');
     if (observation.kind === 'read') {
@@ -1896,7 +2026,7 @@ interface ModelApplicationRejection {
 }
 const APPLICATION_REJECTION_KIND = 'om-model-application-rejection';
 /** The refused transaction keeps the exact failed expected/observed comparison; later heads cannot rewrite it. */
-export function readModelApplicationRejection(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{record: Revision<ModelApplicationRejection>; failure: Refusal}>> {
+export function readModelApplicationRejection(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<{record: Revision<ModelApplicationRejection>; failure: Refusal}>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)
     || !exactKeys(request, ['project', 'record'])) invalid('application-rejection');
   return result(() => {
@@ -1994,10 +2124,10 @@ export function readModelApplicationRejection(store: Store, request: { project: 
   });
 }
 function saveRejectedModelApplication(store: Store, input: { request: ModelCallRequest; call: Ref; running: Revision<OmModelCall>;
-  exchange: Write; transport: AdapterResult; failure: Refusal; writes: Write[]; guards: Ref[] }): OmResult<Sealed<ModelCallOutcome>> {
+  exchange: Write; transport: AdapterResult; failure: Refusal; writes: Write[]; guards: Ref[] }): ModelCallResult<Sealed<ModelCallOutcome>> {
   return result(() => {
     const { request, call, running, exchange, transport } = input, exchangeRef = writeRef(exchange);
-    const normalized = refused('input_stale', `${input.failure.code}: ${input.failure.message}`,
+    const normalized = refuse('input_stale', `${input.failure.code}: ${input.failure.message}`,
       { ...input.failure.at, unit: 'E4' }, 'producer');
     let failure = ['input_stale', 'revision_conflict'].includes(input.failure.code) ? input.failure
       : !normalized.ok ? normalized.refusal : input.failure;
@@ -2133,15 +2263,11 @@ function preserveLateTransport(store: Store, project: string, dispatch: Revision
 
 // G7 completion graph: immutable logical assignments, exact producer products and a CAS registry.
 // Readers of local products use only their immutable assignment, never this registry or its close proof.
-import { completionAssignmentId, completionRootAssignments, completionWorkId, COMPLETION_ASSIGNMENT_KIND,
-  COMPLETION_WORK_KIND, readCompletionBinding, readCompletionOwnerAt, prepareCompletionAdmission, readCompletionOriginalAdmission,
-  type CompletionAssignment, type CompletionOwner, type CompletionWork } from './series.js';
-import { readAssessmentTerminalAt,
-  readAssessmentRefusalAt, assessmentRefusalId, assessmentIntentId, assessmentCallNameForId } from './assessment.js';
-import { readJournal, readJournalAt } from './refusal-journal.js';
-import { answersProduct, answersCheckState, checkAnswersTransition, readAnswersParticipant, answersCheckCessationValue, readRouteProducers,
-  type AnswersCheckState } from './answers-gate.js';
-import { readAnswersGateAssignmentAt, ANSWERS_GATE_ASSIGNMENT_CONTRACT } from './series.js';
+import { completionAssignmentId, completionRootAssignments, completionWorkId, COMPLETION_ASSIGNMENT_KIND, COMPLETION_WORK_KIND, readCompletionBinding as readCompletionBindingOf, readCompletionOwnerAt as readCompletionOwnerAtOf, prepareCompletionAdmission as prepareCompletionAdmissionOf, readCompletionOriginalAdmission as readCompletionOriginalAdmissionOf, type CompletionAssignment, type CompletionOwner, type CompletionWork } from './series.js';
+import { readAssessmentTerminalAt as readAssessmentTerminalAtOf, readAssessmentRefusalAt as readAssessmentRefusalAtOf, assessmentRefusalId, assessmentIntentId, assessmentCallNameForId } from './assessment.js';
+import { readJournal as readJournalOf, readJournalAt as readJournalAtOf } from './refusal-journal.js';
+import { answersProduct, answersCheckState as answersCheckStateOf, checkAnswersTransition as checkAnswersTransitionOf, readAnswersParticipant as readAnswersParticipantOf, answersCheckCessationValue as answersCheckCessationValueOf, readRouteProducers as readRouteProducersOf, type AnswersCheckState, type NoProducer, type UnservedQuestion } from './answers-gate.js';
+import { readAnswersGateAssignmentAt as readAnswersGateAssignmentAtOf, ANSWERS_GATE_ASSIGNMENT_CONTRACT } from './series.js';
 export interface CompletionCallOwner {
   contract: 'om-completion-call/v1'; binding: Ref; assignment: Ref; call: Ref; packetBasis: Ref;
 }
@@ -2208,7 +2334,7 @@ function factCompletionAssignments(store: Store, binding: Revision<CompletionOwn
     kind: 'fact', parent: reference(parent), source: modelRef, batch: parent.value.batch,
     position: null, question: fact.questionId }));
 }
-export function readCompletionAssignmentAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionAssignment>>> {
+export function readCompletionAssignmentAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionAssignment>>> {
   return result(() => historicalRead(store, { reader: 'G7.completion-assignment', project, ref }, () => {
     const record = take(readRecord<CompletionAssignment>(store, ref,
       { unit: 'G7', target: ref.id, kind: COMPLETION_ASSIGNMENT_KIND, idPrefix: `${COMPLETION_ASSIGNMENT_KIND}:${project}:` }));
@@ -2300,7 +2426,7 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
 /** The registered answers-gate check is one more logical assignment of the same work (H1.0c). */
 const completionAssignmentRefs = (graph: ReturnType<typeof completionGraph>): Ref[] =>
   refs([...graph.assignments, ...(graph.answers.check ? [graph.answers.check] : [])].map(reference));
-export function readCompletionWorkAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionSnapshot>> {
+export function readCompletionWorkAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<CompletionSnapshot>> {
   return result(() => historicalRead(store, { reader: 'G7.completion-work', project, ref }, () => {
     const work = take(readRecord<CompletionWork>(store, ref, { unit: 'G7', target: ref.id,
       kind: COMPLETION_WORK_KIND, idPrefix: `${COMPLETION_WORK_KIND}:${project}:` })) as Revision<CompletionWork>;
@@ -2342,7 +2468,7 @@ export function readCompletionWorkAt(store: Store, project: string, ref: Ref): O
   }, () => fail('completion_invalid', ref.id, 'history', 'A completion registry cannot derive through its own closure')));
 }
 /** H1.0c: exact open work plus exact additions, by the formula of its next revision; nothing is written or guessed. */
-export function readCompletionEffectiveAt(store: Store, project: string, closure: { work: Ref; additions: readonly Ref[]; journal: Ref | null }): OmResult<Sealed<CompletionSnapshot>> {
+export function readCompletionEffectiveAt(store: Store, project: string, closure: { work: Ref; additions: readonly Ref[]; journal: Ref | null }): ModelCallResult<Sealed<CompletionSnapshot>> {
   if (!(store instanceof Store) || !text(project)) invalid('store');
   if (!object(closure) || !exactKeys(closure, ['work', 'additions', 'journal']) || !isRef(closure.work) || !Array.isArray(closure.additions)
     || !closure.additions.every(isRef) || !(closure.journal === null || isRef(closure.journal))) invalid('closure');
@@ -2375,7 +2501,7 @@ function completionNext(store: Store, binding: Revision<CompletionOwner>, prior:
 }
 /** H1.0c: the single closed revision: the next revision over the close's additions and final journal, plus the proof. */
 export function completionClosedWork(store: Store, project: string, prior: Sealed<Revision<CompletionWork>>,
-  close: { additions: readonly Ref[]; journal: Ref | null }, closed: Ref): OmResult<Sealed<CompletionWork>> {
+  close: { additions: readonly Ref[]; journal: Ref | null }, closed: Ref): ModelCallResult<Sealed<CompletionWork>> {
   if (!(store instanceof Store) || !text(project)) invalid('store');
   if (!object(prior) || !isRef(reference(prior)) || !object(prior.value) || !isRef(prior.value.binding) || !Array.isArray(prior.value.products)
     || !object(close) || !Array.isArray(close.additions) || !close.additions.every(isRef)
@@ -2386,7 +2512,7 @@ export function completionClosedWork(store: Store, project: string, prior: Seale
     return { ...value, closed };
   });
 }
-export function prepareCompletionProducts(store: Store, bindingRef: Ref, products: readonly Ref[]): OmResult<Sealed<{ writes: Write[]; guards: Ref[]; work: Ref }>> {
+export function prepareCompletionProducts(store: Store, bindingRef: Ref, products: readonly Ref[]): ModelCallResult<Sealed<{ writes: Write[]; guards: Ref[]; work: Ref }>> {
   return result(() => {
     const project = bindingRef.id.split(':')[1]!;
     const id = completionWorkId(project, bindingRef.id), head = store.get<CompletionWork>(id);
@@ -2432,7 +2558,7 @@ function completionPacketRecord(store: Store, project: string, bindingRef: Ref, 
   return { id: `${COMPLETION_PACKET_KIND}:${project}:${hashJson({ binding: bindingRef, root: reference(root), packet })}`,
     kind: COMPLETION_PACKET_KIND, revision: 1, hash: hashJson(value), value };
 }
-export function readCompletionPacketAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionPacket>>> {
+export function readCompletionPacketAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionPacket>>> {
   return result(() => {
     const row = take(readRecord<CompletionPacket>(store, ref, { unit: 'G7', target: ref.id,
       kind: COMPLETION_PACKET_KIND, idPrefix: `${COMPLETION_PACKET_KIND}:${project}:` }));
@@ -2453,7 +2579,7 @@ function checkPacketMaterialization(store: Store, snapshot: Sealed<CompletionSna
     fail('completion_conflict', selected.id, 'plan', 'A blocked new first candidate cannot replace the selected plan');
 }
 /** E2 registers an immutable candidate, while E1 selects its executable plan and all parts. */
-export function prepareCompletionPacket(store: Store, packet: Ref): OmResult<Sealed<{ writes: Write[]; guards: Ref[] }>> {
+export function prepareCompletionPacket(store: Store, packet: Ref): ModelCallResult<Sealed<{ writes: Write[]; guards: Ref[] }>> {
   return result(() => {
     const project = packet.id.split(':')[1]!;
     const source = take(readQuestionPacket(store, { project, record: packet }));
@@ -2565,7 +2691,7 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
     technical, waiting: refs(waiting), guards: [reference(work), reference(binding)], answers };
 }
 /** E1 is a cross-check of the registered plan, never the plan itself. */
-export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionSnapshot>, ledger: Ref, journal: Ref | null = null): OmResult<Sealed<true>> {
+export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionSnapshot>, ledger: Ref, journal: Ref | null = null): ModelCallResult<Sealed<true>> {
   return result(() => {
     const owner = snapshot.binding.value, project = owner.project;
     // Context selection is not proof: readCallLedgerAt still rederives every row and
@@ -2626,7 +2752,7 @@ function deriveManagedModelDiagnostic(store: Store, binding: Revision<Completion
   return { reason: request.reason, request };
 }
 export function readManagedModelDiagnostic(store: Store, binding: Revision<CompletionOwner>, ref: Ref):
-  OmResult<Sealed<{ reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest }>> {
+  ModelCallResult<Sealed<{ reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest }>> {
   return result(() => deriveManagedModelDiagnostic(store, binding, ref));
 }
 /** The physical E1 stores a fingerprint, while registration carries the actual body. */
@@ -2646,7 +2772,7 @@ type EnvironmentAdmission = {
 /** One current resolver for materialization, registration and claim. Historical packet/intent
  * readers prove the full child; work proves that its exact original plan was selected. */
 export function prepareManagedEnvironment(store: Store, project: string, target: { packet: Ref } | { intent: Ref },
-  role: 'implementer' | 'reviewer' | null = null): OmResult<EnvironmentAdmission | null> {
+  role: 'implementer' | 'reviewer' | null = null): ModelCallResult<EnvironmentAdmission | null> {
   try {
     const intent = 'intent' in target ? take(readAssessmentIntentAt(store, project, target.intent)) : null;
     const packet = 'packet' in target ? take(readQuestionPacket(store, { project, record: target.packet })) : null;
@@ -2675,10 +2801,10 @@ export function prepareManagedEnvironment(store: Store, project: string, target:
     }
     const admission = take(prepareApplicationEnvironment(store, project, original, intent ? 'reviewer' : role));
     return { ok: true, value: { ...admission, guards: refs([...admission.guards, reference(head), reference(binding)]) } };
-  } catch (error) { if (error instanceof CallFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) { { const failed = caught(error); if (failed) return failed; } throw error; }
 }
 export function prepareManagedCallEnvironment(store: Store, project: string, request: AnyRecordCallRequest | AnyCallRecord,
-  role: 'implementer' | 'reviewer' | null = null): OmResult<EnvironmentAdmission | null> {
+  role: 'implementer' | 'reviewer' | null = null): ModelCallResult<EnvironmentAdmission | null> {
   try {
     if (request.purpose === 'stop-analysis' || request.purpose === 'origin-analysis'
       || !take(readCompletionBinding(store, project, request.series, request.attempt))) return { ok: true, value: null };
@@ -2696,10 +2822,10 @@ export function prepareManagedCallEnvironment(store: Store, project: string, req
     if (!same(request.dispatch.config, source.value.request.environment))
       fail('completion_foreign', request.call, 'dispatch', 'A selected E1 retains its original E2 Environment');
     return prepareManagedEnvironment(store, project, { packet }, role);
-  } catch (error) { if (error instanceof CallFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) { { const failed = caught(error); if (failed) return failed; } throw error; }
 }
 /** E1 producer and physical claim share this assignment resolver; the caller cannot select an era. */
-export function prepareCompletionCall(store: Store, project: string, request: AnyRecordCallRequest, mode: 'registration' | 'claim' = 'registration'): OmResult<Sealed<{
+export function prepareCompletionCall(store: Store, project: string, request: AnyRecordCallRequest, mode: 'registration' | 'claim' = 'registration'): ModelCallResult<Sealed<{
   owner: Omit<CompletionCallOwner, 'call'> | null; writes: Write[]; guards: TransactionGuard[];
 }>> {
   return result(() => {
@@ -2874,7 +3000,7 @@ export interface CompletionDispositionContext {
 /** A product proves its exact predecessor registry without recursing through the product being read. */
 export function readCompletionDispositionContext(store: Store, project: string, request: {
   binding: Ref; assignment: Ref; work: Ref;
-}): OmResult<Sealed<CompletionDispositionContext>> {
+}): ModelCallResult<Sealed<CompletionDispositionContext>> {
   return result(() => {
     const snapshot = take(readCompletionWorkAt(store, project, request.work));
     const assignment = take(readCompletionAssignmentAt(store, project, request.assignment));
@@ -2887,7 +3013,7 @@ export function readCompletionDispositionContext(store: Store, project: string, 
     return { binding: snapshot.binding, assignment, snapshot } as CompletionDispositionContext;
   });
 }
-export function prepareAssessmentDisposition(store: Store, project: string, intentRef: Ref): OmResult<Sealed<{
+export function prepareAssessmentDisposition(store: Store, project: string, intentRef: Ref): ModelCallResult<Sealed<{
   binding: Ref; assignment: Ref; work: Ref; guards: Ref[];
 } | null>> {
   return result(() => {
@@ -2905,7 +3031,7 @@ export function prepareAssessmentDisposition(store: Store, project: string, inte
   });
 }
 /** Common source closure for application: exact B1 facts and, when present, the selected MC1 fact. */
-export function readApplicationSources(store: Store, project: string, inputRef: Ref, grounds: readonly Sealed<AnswerGround>[]): OmResult<Sealed<{
+export function readApplicationSources(store: Store, project: string, inputRef: Ref, grounds: readonly Sealed<AnswerGround>[]): ModelCallResult<Sealed<{
   sources: Revision<Source>[]; references: Ref[];
 }>> {
   return result(() => {
@@ -2940,7 +3066,7 @@ function readAnyCompletionAssignmentAt(store: Store, project: string, ref: Ref):
   return { assignment: take(readCompletionAssignmentAt(store, project, ref)) as Revision<CompletionAssignment>, check: false };
 }
 /** One derivation proves a cause for both its producer and all historical disposition readers. */
-export function readCompletionCause(store: Store, project: string, assignmentRef: Ref, cause: CompletionCause): OmResult<Sealed<{ references: Ref[] }>> {
+export function readCompletionCause(store: Store, project: string, assignmentRef: Ref, cause: CompletionCause): ModelCallResult<Sealed<{ references: Ref[] }>> {
   return result(() => {
     const { assignment, check } = readAnyCompletionAssignmentAt(store, project, assignmentRef);
     const binding = take(readCompletionOwnerAt(store, project, assignment.value.binding)) as Revision<CompletionOwner>;
@@ -2995,7 +3121,7 @@ export function readCompletionCause(store: Store, project: string, assignmentRef
     fail('completion_cause_invalid', assignment.id, 'cause', 'Unknown causes do not end application');
   });
 }
-export function prepareCompletionCause(store: Store, project: string, assignmentRef: Ref): OmResult<Sealed<{
+export function prepareCompletionCause(store: Store, project: string, assignmentRef: Ref): ModelCallResult<Sealed<{
   cause: CompletionCause | null; guards: Ref[];
 }>> {
   return result(() => {
@@ -3242,7 +3368,7 @@ function cessationValue(store: Store, project: string, request: {
   }
   fail('completion_invalid', assignment.id, 'remainder', 'No unknown physical address may be fabricated for a remaining branch');
 }
-export function readCompletionCessationAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionCessation>>> {
+export function readCompletionCessationAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionCessation>>> {
   return result(() => historicalRead(store, { reader: 'G7.completion-cessation', project, ref }, () => {
     const record = take(readRecord<CompletionCessation>(store, ref, { unit: 'G7', target: ref.id,
       kind: COMPLETION_CESSATION_KIND, idPrefix: `${COMPLETION_CESSATION_KIND}:${project}:` }));
@@ -3258,7 +3384,7 @@ export function readCompletionCessationAt(store: Store, project: string, ref: Re
     return record as Revision<CompletionCessation>;
   }, () => fail('completion_invalid', ref.id, 'history', 'A cessation cannot prove itself')));
 }
-export function prepareCompletionCessation(store: Store, request: { project: string; binding: Ref; assignment: Ref }): OmResult<Sealed<{
+export function prepareCompletionCessation(store: Store, request: { project: string; binding: Ref; assignment: Ref }): ModelCallResult<Sealed<{
   record: Revision<CompletionCessation>; writes: Write[]; guards: TransactionGuard[];
 }>> {
   return result(() => {
@@ -3309,7 +3435,7 @@ export function prepareCompletionCessation(store: Store, request: { project: str
       || !writes.some(row => same(writeRef(row), guard)))) };
   });
 }
-export function writeCompletionCessation(store: Store, request: { project: string; binding: Ref; assignment: Ref }): OmResult<Sealed<Revision<CompletionCessation>>> {
+export function writeCompletionCessation(store: Store, request: { project: string; binding: Ref; assignment: Ref }): ModelCallResult<Sealed<Revision<CompletionCessation>>> {
   return result(() => {
     const prepared = take(prepareCompletionCessation(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'G7', target: prepared.record.id,
@@ -3321,7 +3447,7 @@ export function writeCompletionCessation(store: Store, request: { project: strin
 /** Current action admission is separate from historical product reading. */
 export function checkCompletionDisposition(store: Store, snapshot: Sealed<CompletionSnapshot>, request: {
   batch: string; assignment?: Ref; parent?: Ref; action: 'dispatch' | 'materialize' | 'apply' | 'cycle';
-}): OmResult<Sealed<true>> {
+}): ModelCallResult<Sealed<true>> {
   return result(() => {
     const parents = new Map(snapshot.assignments.map(row => [row.id, row.value.parent?.id ?? null]));
     const below = (child: string, ancestor: string): boolean => {
@@ -3353,7 +3479,7 @@ export function checkCompletionDisposition(store: Store, snapshot: Sealed<Comple
   });
 }
 /** A missing assessor intent is still addressed through the whole original MC1 fact set. */
-export function readAssessmentCessation(store: Store, project: string, modelCall: Ref, questionId: string): OmResult<Sealed<Revision<CompletionCessation> | null>> {
+export function readAssessmentCessation(store: Store, project: string, modelCall: Ref, questionId: string): ModelCallResult<Sealed<Revision<CompletionCessation> | null>> {
   return result(() => {
     const state = take(readModelCallState(store, { project, record: modelCall }));
     if (state.state !== 'applied' || state.outcome.outcome?.kind !== 'fact-candidates')
@@ -3532,7 +3658,7 @@ function deriveAssignmentEnvironment(before: Environment, after: Environment, se
 }
 
 /** A selected assignment keeps its original dispatch at claim and application; equivalent current settings provide fresh CAS admission. */
-export function prepareApplicationEnvironment(store: Store, project: string, original: Ref, role: 'implementer' | 'reviewer' | null): OmResult<EnvironmentAdmission> {
+export function prepareApplicationEnvironment(store: Store, project: string, original: Ref, role: 'implementer' | 'reviewer' | null): ModelCallResult<EnvironmentAdmission> {
   try {
     const head = store.get(`environment:${project}`);
     if (!head) fail('completion_cause_invalid', original.id, 'environment', 'The required environment cannot disappear');
@@ -3547,7 +3673,7 @@ export function prepareApplicationEnvironment(store: Store, project: string, ori
     } });
     // This current-only handle intentionally is not a sealed/serializable proof object.
     return { ok: true, value: { store: view, guards: [reference(head)], remap } };
-  } catch (error) { if (error instanceof CallFailure) return { ok: false, refusal: error.refusal }; throw error; }
+  } catch (error) { { const failed = caught(error); if (failed) return failed; } throw error; }
 }
 
 

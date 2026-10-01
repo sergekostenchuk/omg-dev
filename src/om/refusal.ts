@@ -19,20 +19,41 @@ export interface RefusalAddress {
   readonly ref?: Ref | undefined;
 }
 
-export interface Refusal {
-  readonly code: string;
+export interface Refusal<Code extends string = string> {
+  readonly code: Code;
   readonly message: string;
   readonly at: RefusalAddress;
   readonly route: RefusalRoute;
 }
 
-export type OmResult<T> =
+export type OmResult<T, Code extends string = string> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly refusal: Refusal };
+  | { readonly ok: false; readonly refusal: Refusal<Code> };
+
+// Q2 (№2452, №2460): a module creates refusals only from its own literal catalogue, and a refusal of another unit enters
+// it only through a declared transfer. Both are facts for tsc: an unknown literal, another module's code or a plain
+// string does not compile where a local code or a transferred code is expected. tsc proves no provenance of data and no
+// completeness of runtime branches; the link between a transfer and its real source is read in code and in review.
+/** The negative half of a result, as a declared source hands it over. */
+export type Failed<Code extends string = string> = { readonly ok: false; readonly refusal: Refusal<Code> };
+/**
+ * The mark of a transferred code: a fact of the type alone — the saved JSON gains no field, the refusal is the same
+ * object. Every source the code passed through is a key of the mark, so a refusal carried across two modules keeps both,
+ * and a code copied into a plain string loses the mark: `{ ...refusal, code: text }` is no transferred refusal.
+ */
+declare const TRANSFERRED: unique symbol;
+export type SourceCode<Source extends string, Code extends string = string> =
+  Code & { readonly [TRANSFERRED]: { readonly [Key in Source]: true } };
+/** The codes of several declared sources, one mark each (a distributive union, never one mark that needs every key). */
+export type SourceCodes<Sources extends string> = Sources extends string ? SourceCode<Sources> : never;
+/** A result of a declared source as the receiving module sees it: delivered values pass unchanged, refusals carry the mark. */
+export type Transferred<Source extends string, R> = R extends Failed<infer Code> ? Failed<SourceCode<Source, Code>> : R;
 
 // T11: what a unit hands out shares no mutable object with its source or with a policy table.
 export type Sealed<T> =
   T extends (...args: never[]) => unknown ? never
+  // A string stays itself, a marked code (SourceCode) included: a mark is no field of a value, and a string has none to seal.
+  : T extends string ? T
   : T extends readonly (infer Item)[] ? readonly Sealed<Item>[]
   : T extends object ? { readonly [Key in keyof T]: Sealed<T[Key]> }
   : T;
@@ -72,11 +93,52 @@ function seal(value: unknown, seen: Set<object>): unknown {
   return copy;
 }
 
-export function delivered<T>(value: T): OmResult<Sealed<T>> {
+/** A delivered value is the positive half alone: it fits any result type, whatever codes that type admits. */
+export function delivered<T>(value: T): { readonly ok: true; readonly value: Sealed<T> } {
   return Object.freeze({ ok: true as const, value: sealed(value) });
 }
 
-export function refused(code: string, message: string, at: RefusalAddress, route: RefusalRoute): OmResult<never> {
+/**
+ * A module's own constructor of refusals, bound to its literal catalogue: only a code of the catalogue compiles, and at
+ * runtime a code outside it is as malformed as an empty one. The catalogue is the module's full set of locally created
+ * codes — the subsets older tests pin (INPUT_REFUSAL_CODES, HORIZON_REFUSAL_CODES) stay separate exports.
+ */
+export function localRefusals<const Codes extends readonly string[]>(codes: Codes):
+  <Code extends Codes[number]>(code: Code, message: string, at: RefusalAddress, route: RefusalRoute) => OmResult<never, Code> {
+  requireCondition(Array.isArray(codes) && codes.length > 0 && codes.every(isText), "refusal_invalid", "A catalogue names its codes");
+  const known = new Set<string>(codes);
+  return (code, message, at, route) => {
+    requireCondition(known.has(code), "refusal_invalid", `The refusal code ${String(code)} is outside the module's catalogue`);
+    return refused(code, message, at, route);
+  };
+}
+/** The same bound for a module's own exceptions: a separate catalogue of EngineError codes, the global class unchanged. */
+export function localErrors<const Codes extends readonly string[]>(codes: Codes):
+  (code: Codes[number], message: string, details?: unknown) => never {
+  requireCondition(Array.isArray(codes) && codes.length > 0 && codes.every(isText), "refusal_invalid", "A catalogue names its codes");
+  const known = new Set<string>(codes);
+  return (code, message, details = null) => {
+    requireCondition(known.has(code), "refusal_invalid", `The error code ${String(code)} is outside the module's catalogue`);
+    throw new EngineError(code, message, details);
+  };
+}
+/**
+ * The one boundary where a declared source's refusal enters a module: the result itself (or its negative half), whole
+ * and unchanged, now marked with the source. Never a code and a message assembled by the caller, never an unknown value —
+ * the narrowing below is the only one a transfer makes, and it narrows nothing but the mark.
+ */
+export function transfer<Source extends string, R extends OmResult<unknown, string>>(source: Source, result: R): Transferred<Source, R> {
+  requireCondition(isText(source) && isPlainObject(result) && typeof result.ok === "boolean", "refusal_invalid", "A transfer names its source and carries a whole result");
+  return result as Transferred<Source, R>;
+}
+/** A reader of a declared source, bound once at the import boundary: every refusal it returns carries the source mark. */
+export function transferring<Source extends string, Args extends unknown[], R extends OmResult<unknown, string>>(source: Source,
+  reader: (...args: Args) => R): (...args: Args) => Transferred<Source, R> {
+  requireCondition(isText(source) && typeof reader === "function", "refusal_invalid", "A transferring reader names its source");
+  return (...args) => transfer(source, reader(...args));
+}
+
+export function refused<Code extends string>(code: Code, message: string, at: RefusalAddress, route: RefusalRoute): OmResult<never, Code> {
   requireCondition(isText(code) && isText(message), "refusal_invalid", "A refusal names a non-empty code and message");
   requireCondition(isPlainObject(at) && isText(at.unit) && isText(at.target)
     && (at.field === undefined || isText(at.field)) && (at.ref === undefined || isPlainObject(at.ref)),

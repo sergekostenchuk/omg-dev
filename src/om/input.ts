@@ -13,7 +13,7 @@ import { readLegacyOperation, StageChecks } from "../product/stage-checks.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { historicalProof, historicalTrace, pendingSnapshotView, withHistoricalReads } from "../history/proofs.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
+import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type Sealed, type SourceCodes } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { deriveInputDecisions } from "./addressing.js";
 import { answerSourceGuards, checkAnswerInputBody, prepareAnswerInvalidation, readAnswerForInput,
@@ -32,6 +32,24 @@ export const INPUT_REFUSAL_CODES = Object.freeze([
   "acceptance_kind_missing", "contract_boundary_prose", "stage_not_accepted",
 ] as const);
 export type InputRefusalCode = typeof INPUT_REFUSAL_CODES[number];
+/**
+ * Q2 (№2452-5, №2460): every code input.ts creates itself. The builder/gate subset above stays the exact set older
+ * tests pin; the local constructor below accepts this whole catalogue and nothing else.
+ */
+export const INPUT_LOCAL_CODES = Object.freeze([...INPUT_REFUSAL_CODES,
+  "om_admission_guard_invalid", "om_admission_guard_unsupported", "input_stale", "legacy_operation_active",
+  "record_forged", "answer_inapplicable", "addressing_conflict", "input_refresh_conflict"] as const);
+export type InputLocalCode = typeof INPUT_LOCAL_CODES[number];
+/** The exceptions input.ts throws itself (requests, admission channels, acceptance proofs, a moved dependency). */
+export const INPUT_ERROR_CODES = Object.freeze(["input_request_invalid", "om_admission_guard_invalid", "stage_not_accepted", "input_stale"] as const);
+export type InputErrorCode = typeof INPUT_ERROR_CODES[number];
+/** The units whose refusals input.ts hands on unchanged, each through a declared transfer. */
+export type InputSource = "refs" | "addressing" | "accepted-answer";
+export type InputCode = InputLocalCode | SourceCodes<InputSource>;
+export type InputResult<T> = OmResult<T, InputCode>;
+const refuse = localRefusals(INPUT_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: InputErrorCode, message: string, details?: unknown) => never = localErrors(INPUT_ERROR_CODES);
 export interface InputStage { ref: Ref; contractVersion: number | null; fields: Record<string, Json> }
 export type InputStages = Record<UpstreamStage, InputStage>;
 export interface InputOptions { inventory?: Ref | null; nodesRequiredSince?: number | null }
@@ -51,6 +69,11 @@ export interface OmInput {
 }
 export interface AppliedInputFact { question: OmInput['questions'][number]; value: Json; answer: Ref; mc1Question: Ref }
 export interface InputBuildResult { input: OmInput | null; hash: string | null; refusals: Refusal[]; gaps: InputGap[] }
+/**
+ * What the builder itself returns: the same shape with its refusals REPLACED (not intersected, №2511-2) by the builder's own
+ * catalogue — an intersection would keep the wide list's overloads, and a refusal of another unit could be pushed into it.
+ */
+export interface BuiltOmInput extends Omit<InputBuildResult, "refusals"> { readonly refusals: Refusal<InputRefusalCode>[] }
 export interface InputRequest { project: string; stages: Record<UpstreamStage, Ref>; inventory?: Ref | null; expected: number }
 export interface DecisionInputDerivation { previous: Ref; graph: Ref; decisions: Ref[] }
 export interface RefreshInputDerivation { kind: "refresh"; previous: Ref; stages: Record<UpstreamStage, Ref>; inventory: Ref | null }
@@ -70,28 +93,28 @@ const text = (value: unknown): value is string => typeof value === "string" && v
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
 const at = (target: string, field: string, ref?: Ref) => ({ unit: "G1", target, field, ...(ref ? { ref } : {}) });
-function invalid(field: string): never { throw new EngineError("input_request_invalid", "OM input needs a well-formed request", at("om-input", field)); }
+function invalid(field: string): never { return raise("input_request_invalid", "OM input needs a well-formed request", at("om-input", field)); }
 function copy<T>(value: T): T {
   try { return sealed(value) as T; } catch { return invalid("json"); }
 }
 
 /** Current OM gates may carry positive admission refs; absence needs a different producer contract. */
-export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): OmResult<Sealed<Ref[]>> {
+export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): InputResult<Sealed<Ref[]>> {
   if (!text(gate) || !["G1", "G2", "F4"].includes(unit))
-    throw new EngineError("om_admission_guard_invalid", "An admission channel needs its named gate and unit",
+    raise("om_admission_guard_invalid", "An admission channel needs its named gate and unit",
       { unit: "OM", target: "admissionGuards", field: !text(gate) ? "gate" : "unit" });
   let checked: TransactionGuard[];
   try { checked = uniqueTransactionGuards(value === undefined ? [] : value as TransactionGuard[]); }
   catch (error) {
     if (error instanceof EngineError && error.code === "invalid_guard")
-      return refused("om_admission_guard_invalid", `${gate}: ${error.message}`,
+      return refuse("om_admission_guard_invalid", `${gate}: ${error.message}`,
         { unit, target: gate, field: "admissionGuards" }, "producer");
     throw error;
   }
   const refs: Ref[] = [];
   for (const guard of checked) {
     if ('absent' in guard)
-      return refused("om_admission_guard_unsupported", `${gate} declares an absence not supported by this OM producer`,
+      return refuse("om_admission_guard_unsupported", `${gate} declares an absence not supported by this OM producer`,
         { unit, target: guard.id, field: `${gate}.admissionGuards` }, "producer");
     refs.push(guard);
   }
@@ -99,16 +122,16 @@ export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" |
 }
 
 /** Pure normalization; persistence independently resolves and checks the saved source records. */
-export function buildOmInput(stages: InputStages, options: InputOptions = {}): Sealed<InputBuildResult> {
+export function buildOmInput(stages: InputStages, options: InputOptions = {}): Sealed<BuiltOmInput> {
   if (!object(stages)) invalid("stages");
   if (!object(options) || (options.inventory !== undefined && options.inventory !== null && !isRef(options.inventory))
     || (options.nodesRequiredSince !== undefined && options.nodesRequiredSince !== null
       && (!Number.isSafeInteger(options.nodesRequiredSince) || options.nodesRequiredSince <= 0))) invalid("options");
   options = copy(options);
-  const refusals: Refusal[] = [], gaps: InputGap[] = [];
+  const refusals: Refusal<InputRefusalCode>[] = [], gaps: InputGap[] = [];
   const fail = (code: InputRefusalCode, stage: UpstreamStage, field: string, message: string) => {
     const ref = stages[stage]?.ref;
-    const result = refused(code, message, at(isRef(ref) ? ref.id : `stage:${stage}`, field, isRef(ref) ? ref : undefined), "producer");
+    const result = refuse(code, message, at(isRef(ref) ? ref.id : `stage:${stage}`, field, isRef(ref) ? ref : undefined), "producer");
     if (!result.ok) refusals.push(result.refusal);
   };
   for (const stage of INPUT_STAGES) {
@@ -117,7 +140,7 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     else if (value.contractVersion !== null && (!Number.isSafeInteger(value.contractVersion) || value.contractVersion <= 0))
       fail("stage_contract_version_unknown", stage, "contractVersion", "The exact draft contract version is unavailable");
   }
-  const finish = (input: OmInput | null): Sealed<InputBuildResult> => sealed({ input: refusals.length ? null : input,
+  const finish = (input: OmInput | null): Sealed<BuiltOmInput> => sealed({ input: refusals.length ? null : input,
     hash: refusals.length || !input ? null : hashJson(input), refusals: sorted(refusals), gaps: sorted(gaps) });
   if (refusals.length) return finish(null);
   // Check the new mandatory field before JSON normalization, including explicit undefined.
@@ -288,19 +311,19 @@ function requireInputRequest(store: Store, request: InputRequest): void {
 
 // An accepted historical snapshot is checked against its saved proof closure. A later source revision or file edit
 // is not a reason to rerun old acceptance against today's evidence or to substitute a current draft for its source.
-function loadSources(store: Store, request: InputRequest): OmResult<Sealed<InputStages>> {
+function loadSources(store: Store, request: InputRequest): InputResult<Sealed<InputStages>> {
   const stages = new Map<UpstreamStage, Revision<StageArtifact>>();
   for (const stage of INPUT_STAGES) {
     const result = readRecord<StageArtifact>(store, request.stages[stage], { unit: "G1", target: stageId(request.project, stage),
       id: stageId(request.project, stage), kind: "stage" });
-    if (!result.ok) return result;
+    if (!result.ok) return transfer("refs", result);
     stages.set(stage, result.value as Revision<StageArtifact>);
   }
   const sources: Partial<InputStages> = {};
   for (const [index, stage] of INPUT_STAGES.entries()) {
     const record = stages.get(stage)!;
     const bad = (field: string, message: string): never => {
-      throw new EngineError("stage_not_accepted", message, at(record.id, field, reference(record)));
+      raise("stage_not_accepted", message, at(record.id, field, reference(record)));
     };
     function check(condition: unknown, field: string, message: string): asserts condition {
       if (!condition) bad(field, message);
@@ -445,7 +468,7 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
       } else check(content.graph === null, "content.graph", "Only the operation map binds its own L1 projection");
       sources[stage] = { ref: reference(record), contractVersion: version, fields: content.fields as Record<string, Json> };
     } catch (error) {
-      return refused("stage_not_accepted", error instanceof Error ? error.message : "Saved acceptance proof is invalid",
+      return refuse("stage_not_accepted", error instanceof Error ? error.message : "Saved acceptance proof is invalid",
         error instanceof EngineError && error.code === "stage_not_accepted" ? error.details as ReturnType<typeof at>
           : at(record.id, "proofs", reference(record)), "producer");
     }
@@ -455,26 +478,26 @@ function loadSources(store: Store, request: InputRequest): OmResult<Sealed<Input
   if (Array.isArray(behaviors) && Array.isArray(features)) {
     const covered = new Set(features.flatMap((feature: unknown) => object(feature) && Array.isArray(feature.requirements) ? feature.requirements : []));
     if (covered.size !== behaviors.length || [...covered].some(value => !Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= behaviors.length))
-      return refused("stage_not_accepted", "Prepared features must cover every specified behavior", at(result.features.ref.id, "features.requirements", result.features.ref), "producer");
+      return refuse("stage_not_accepted", "Prepared features must cover every specified behavior", at(result.features.ref.id, "features.requirements", result.features.ref), "producer");
   }
   const outcomes = (result['operation-map'].fields['mapDesign'] as Row)?.artifacts;
   if (Array.isArray(outcomes)) for (const stage of INPUT_STAGES) {
     if ((result[stage].contractVersion ?? 1) === 1) continue;
     const findings = preparationFindings(stage, result[stage].fields, name => result[name as UpstreamStage]?.fields ?? null,
       outcomes.map((artifact: Row) => artifact.id));
-    if (findings.length) return refused("stage_not_accepted", findings[0]!.message,
+    if (findings.length) return refuse("stage_not_accepted", findings[0]!.message,
       at(result[stage].ref.id, findings[0]!.field ?? findings[0]!.target, result[stage].ref), "producer");
   }
   return delivered(result);
 }
 
-function deriveInputRecord(store: Store, request: InputRequest): OmResult<Sealed<OmInputRecord>> {
+function deriveInputRecord(store: Store, request: InputRequest): InputResult<Sealed<OmInputRecord>> {
   const sources = loadSources(store, request);
   if (!sources.ok) return sources;
   const inventory = request.inventory ?? null;
   if (inventory) {
     const read = readRecord(store, inventory, { unit: "G1", target: inventory.id, id: `repo-inventory:${request.project}`, kind: "repo-inventory" });
-    if (!read.ok) return read;
+    if (!read.ok) return transfer("refs", read);
   }
   const result = buildOmInput(sources.value as InputStages, { inventory });
   if (result.refusals.length) return { ok: false, refusal: result.refusals[0]! };
@@ -484,12 +507,12 @@ function deriveInputRecord(store: Store, request: InputRequest): OmResult<Sealed
 
 // Current acceptance reads more heads than Pipeline exposes as guards (notably the full graph).
 // Trace those reads without turning exact historical reads, such as an issued question, into heads.
-function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed<Ref[]>> {
+function currentAcceptance(store: Store, request: InputRequest): InputResult<Sealed<Ref[]>> {
   const heads = new Map<string, Ref>();
   const remember = (ref: Ref) => {
     const previous = heads.get(ref.id);
     if (previous && canonical(previous) !== canonical(ref))
-      throw new EngineError("input_stale", "An acceptance dependency changed during preparation", at(ref.id, "head", previous));
+      raise("input_stale", "An acceptance dependency changed during preparation", at(ref.id, "head", previous));
     heads.set(ref.id, ref);
   };
   const traced = new Proxy(store, {
@@ -507,29 +530,29 @@ function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed
     for (const ref of [...INPUT_STAGES.map(stage => request.stages[stage]), ...(request.inventory ? [request.inventory] : [])]) {
       const head = traced.get(ref.id);
       if (!head || canonical(reference(head)) !== canonical(ref))
-        return refused("input_stale", "The requested input source is no longer current", at(ref.id, "head", ref), "producer");
+        return refuse("input_stale", "The requested input source is no longer current", at(ref.id, "head", ref), "producer");
     }
     const projection = new StageChecks(traced).pipeline.inspect(request.project, "features");
     const admission = readOmAdmissionGuards(projection.admissionGuards, "pipeline.features", "G1");
     if (!admission.ok) return admission;
     if (projection.state !== "accepted") {
       const finding = projection.findings[0];
-      return refused("stage_not_accepted", finding?.message ?? "The current stages are not accepted",
+      return refuse("stage_not_accepted", finding?.message ?? "The current stages are not accepted",
         at(finding?.target ?? request.stages.features.id, finding?.field ?? finding?.code ?? "status", request.stages.features), "producer");
     }
     for (const ref of [...projection.guards, ...admission.value]) remember(ref);
     return delivered(sorted([...heads.values()]));
   } catch (error) {
     if (error instanceof EngineError && error.code === "input_stale")
-      return refused("input_stale", error.message, error.details as ReturnType<typeof at>, "producer");
+      return refuse("input_stale", error.message, error.details as ReturnType<typeof at>, "producer");
     throw error;
   }
 }
 
-export function prepareOmInput(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput<TransactionGuard>>> {
+export function prepareOmInput(store: Store, request: InputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   return withHistoricalReads(() => prepareOmInputInScope(store, request));
 }
-function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<PreparedOmInput<TransactionGuard>>> {
+function prepareOmInputInScope(store: Store, request: InputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   requireInputRequest(store, request);
   request = copy(request);
   const id = `om-input:${request.project}`, current = store.get<OmInputRecord>(id);
@@ -537,7 +560,7 @@ function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Se
   if (!current) {
     const operation = readLegacyOperation(store, request.project);
     if (operation?.value.state === "active")
-      return refused("legacy_operation_active", "The first OM input requires the legacy operation to finish",
+      return refuse("legacy_operation_active", "The first OM input requires the legacy operation to finish",
         at(operation.id, "state", reference(operation)), "producer");
     initialGuards.push(operation ? reference(operation) : { id: `legacy-operation:${request.project}`, absent: true });
   }
@@ -571,58 +594,58 @@ function prepareOmInputInScope(store: Store, request: InputRequest): OmResult<Se
     guards: [...guards, ...(existing ? [reference(existing)] : []), ...initialGuards] });
 }
 
-export function writeOmInput(store: Store, request: InputRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+export function writeOmInput(store: Store, request: InputRequest): InputResult<Sealed<Revision<OmInputRecord>>> {
   return withHistoricalReads(() => writeOmInputInScope(store, request));
 }
-function writeOmInputInScope(store: Store, request: InputRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+function writeOmInputInScope(store: Store, request: InputRequest): InputResult<Sealed<Revision<OmInputRecord>>> {
   const prepared = prepareOmInput(store, request);
   if (!prepared.ok) return prepared;
   if (prepared.value.existing) return delivered(prepared.value.existing);
   const result = writeGuarded<OmInputRecord>(store, { unit: "G1", target: `om-input:${request.project}`,
     writes: prepared.value.writes as Write[], guards: prepared.value.guards });
-  if (!result.ok) return result;
+  if (!result.ok) return transfer("refs", result);
   return delivered(result.value[0]!);
 }
 
-export function readOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<OmInputRecord>>> {
+export function readOmInput(store: Store, project: string, ref: Ref): InputResult<Sealed<Revision<OmInputRecord>>> {
   return withHistoricalReads(() => {
     requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
     if (!isRef(ref)) return readInputRecord(store, project, ref);
     return historicalProof(store, { reader: "B1.readOmInput", project, ref }, source => readInputRecord(source, project, ref),
-      () => refused("record_forged", "Input sources contain a cyclic derivation", at(ref.id, "derivation", ref), "producer"), value => value.ok);
+      () => refuse("record_forged", "Input sources contain a cyclic derivation", at(ref.id, "derivation", ref), "producer"), value => value.ok);
   });
 }
 
-function readInputRecord(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<OmInputRecord>>> {
+function readInputRecord(store: Store, project: string, ref: Ref): InputResult<Sealed<Revision<OmInputRecord>>> {
   requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
   const read = readRecord<OmInputRecord>(store, ref, { unit: "G1", target: `om-input:${project}`, id: `om-input:${project}`, kind: "om-input" });
-  if (!read.ok) return read;
+  if (!read.ok) return transfer("refs", read);
   const body = read.value.value;
   if (!object(body) || body.projectId !== project || !object(body.input) || !Array.isArray(body.input.sources)
     || body.input.sources.length !== INPUT_STAGES.length || !Array.isArray(body.gaps))
-    return refused("record_forged", "OM input has an incomplete saved source set", at(ref.id, "sources", ref), "producer");
+    return refuse("record_forged", "OM input has an incomplete saved source set", at(ref.id, "sources", ref), "producer");
   if (Object.hasOwn(body, "derivation")) {
     const lineage: unknown = body.derivation;
     if (!object(lineage) || !isRef(lineage.previous) || lineage.previous.id !== ref.id || lineage.previous.revision !== ref.revision - 1)
-      return refused("record_forged", "Derived input needs its immediately preceding exact input", at(ref.id, "derivation", ref), "producer");
-    let rebuilt: OmResult<Sealed<OmInputRecord>>;
+      return refuse("record_forged", "Derived input needs its immediately preceding exact input", at(ref.id, "derivation", ref), "producer");
+    let rebuilt: InputResult<Sealed<OmInputRecord>>;
     if (lineage.kind === "fact") {
       if (!isRef(lineage.answer) || !isRef(lineage.question))
-        return refused("record_forged", "An applied fact needs its exact accepted answer and MC1 question", at(ref.id, "derivation", ref), "producer");
+        return refuse("record_forged", "An applied fact needs its exact accepted answer and MC1 question", at(ref.id, "derivation", ref), "producer");
       rebuilt = deriveOmInput(store, { project, kind: "fact", previous: lineage.previous, answer: lineage.answer, question: lineage.question });
     } else if (lineage.kind === "reopen-facts") {
       const invalidations = normalizedInvalidations(lineage.invalidations);
-      if (!invalidations) return refused("record_forged", "Reopening facts needs a nonempty, unambiguous set of exact invalidations",
+      if (!invalidations) return refuse("record_forged", "Reopening facts needs a nonempty, unambiguous set of exact invalidations",
         at(ref.id, "derivation.invalidations", ref), "producer");
       const dependencies = Object.hasOwn(lineage, "dependencies") ? normalizedDependencies(lineage.dependencies) : undefined;
-      if (dependencies === null) return refused("record_forged", "Dependent recovery needs exact, unambiguous causes",
+      if (dependencies === null) return refuse("record_forged", "Dependent recovery needs exact, unambiguous causes",
         at(ref.id, "derivation.dependencies", ref), "producer");
       rebuilt = deriveOmInput(store, { project, kind: "reopen-facts", previous: lineage.previous, invalidations,
         ...(dependencies ? { dependencies } : {}) });
     } else if (Object.hasOwn(lineage, "kind")) {
       if (lineage.kind !== "refresh" || !object(lineage.stages) || INPUT_STAGES.some(stage => !isRef(lineage.stages[stage]))
         || (lineage.inventory !== null && !isRef(lineage.inventory)))
-        return refused("record_forged", "A refresh needs explicit exact stages and inventory", at(ref.id, "derivation", ref), "producer");
+        return refuse("record_forged", "A refresh needs explicit exact stages and inventory", at(ref.id, "derivation", ref), "producer");
       const previous = readOmInput(store, project, lineage.previous);
       if (!previous.ok) return previous;
       const root = deriveInputRecord(store, { project, stages: lineage.stages as InputRequest['stages'], inventory: lineage.inventory, expected: 0 });
@@ -630,45 +653,45 @@ function readInputRecord(store: Store, project: string, ref: Ref): OmResult<Seal
       rebuilt = refreshInputRecord(store, previous.value as Revision<OmInputRecord>, root.value as OmInputRecord);
     } else {
       if (!isRef(lineage.graph) || !Array.isArray(lineage.decisions) || !lineage.decisions.every(isRef))
-        return refused("record_forged", "Addressed input needs its exact graph and decisions", at(ref.id, "derivation", ref), "producer");
+        return refuse("record_forged", "Addressed input needs its exact graph and decisions", at(ref.id, "derivation", ref), "producer");
       rebuilt = deriveOmInput(store, { project, previous: lineage.previous, graph: lineage.graph, decisions: lineage.decisions });
     }
     if (!rebuilt.ok) return rebuilt;
     if (canonical(rebuilt.value) !== canonical(body))
-      return refused("record_forged", "Addressed input must derive from its exact previous input and checked decisions", at(ref.id, "derivation", ref), "producer");
+      return refuse("record_forged", "Addressed input must derive from its exact previous input and checked decisions", at(ref.id, "derivation", ref), "producer");
     return delivered(read.value);
   }
   const refs = new Map<UpstreamStage, Ref>();
   for (const source of body.input.sources) {
     const stage = object(source) ? source.stage as UpstreamStage : null;
     if (!stage || !INPUT_STAGES.includes(stage) || !isRef(source) || refs.has(stage))
-      return refused("record_forged", "OM input sources are foreign or duplicated", at(ref.id, "sources", ref), "producer");
+      return refuse("record_forged", "OM input sources are foreign or duplicated", at(ref.id, "sources", ref), "producer");
     refs.set(stage, { id: source.id, revision: source.revision, hash: source.hash });
   }
   const rebuilt = deriveInputRecord(store, { project, stages: Object.fromEntries(refs) as InputRequest['stages'],
     inventory: body.input.inventory, expected: 0 });
   if (!rebuilt.ok) return rebuilt;
   if (canonical(rebuilt.value) !== canonical(body))
-    return refused("record_forged", "OM input must be derived again from its exact saved sources", at(ref.id, "input", ref), "producer");
+    return refuse("record_forged", "OM input must be derived again from its exact saved sources", at(ref.id, "input", ref), "producer");
   // Genuine stage-only history stays valid, but a later root cannot erase an already checked decision
   // chain merely by omitting derivation. Walking exact predecessors also catches repeated stripped roots.
   if (ref.revision > 1) {
     const prior = store.get<OmInputRecord>(ref.id, ref.revision - 1);
     if (!prior || prior.kind !== "om-input")
-      return refused("record_forged", "An input revision needs its exact preceding input", at(ref.id, "previous", ref), "producer");
+      return refuse("record_forged", "An input revision needs its exact preceding input", at(ref.id, "previous", ref), "producer");
     const previous = readOmInput(store, project, reference(prior));
     if (!previous.ok) return previous;
     if (previous.value.value.derivation)
-      return refused("record_forged", "A stage-only root cannot erase accepted input decisions", at(ref.id, "derivation", ref), "producer");
+      return refuse("record_forged", "A stage-only root cannot erase accepted input decisions", at(ref.id, "derivation", ref), "producer");
   }
   return delivered(read.value);
 }
 
 // Both arguments have passed their source-derived historical readers. Inventory is the only independent
 // root source here: a stage change needs a separate resolution, never an implicit reset of D3 fields.
-function refreshInputRecord(store: Store, previous: Revision<OmInputRecord>, root: OmInputRecord): OmResult<Sealed<OmInputRecord>> {
+function refreshInputRecord(store: Store, previous: Revision<OmInputRecord>, root: OmInputRecord): InputResult<Sealed<OmInputRecord>> {
   if (canonical(previous.value.input.sources) !== canonical(root.input.sources))
-    return refused(INPUT_REFRESH_CONFLICT, "Changed stage sources require an explicit resolution of the accepted input decisions",
+    return refuse(INPUT_REFRESH_CONFLICT, "Changed stage sources require an explicit resolution of the accepted input decisions",
       at(previous.id, "sources", reference(previous)), "producer");
   const input = { ...previous.value.input, inventory: root.input.inventory };
   const gaps = sorted([...previous.value.gaps.filter(gap => gap.code !== "inventory_missing"),
@@ -683,23 +706,23 @@ function refreshInputRecord(store: Store, previous: Revision<OmInputRecord>, roo
 
 // A source update or another accepted decision may alter essential fact conditions. Historical
 // derivation checks the new body against the same D5 contract; current admission adds only heads.
-function checkFactContracts(store: Store, body: OmInputRecord): OmResult<Sealed<null>> {
+function checkFactContracts(store: Store, body: OmInputRecord): InputResult<Sealed<null>> {
   for (const fact of body.input.facts ?? []) {
     const checked = checkAnswerInputBody(store, { project: body.projectId, record: fact.answer,
       question: fact.mc1Question, input: body });
-    if (!checked.ok) return checked;
-    if (!checked.value.applicable) return refused("answer_inapplicable", "The applied fact no longer matches the exact input contract",
+    if (!checked.ok) return transfer("accepted-answer", checked);
+    if (!checked.value.applicable) return refuse("answer_inapplicable", "The applied fact no longer matches the exact input contract",
       at(fact.question.id, "answer", fact.answer), "producer");
   }
   return delivered(null);
 }
 
-function currentFactGuards(store: Store, body: OmInputRecord): OmResult<Sealed<Ref[]>> {
+function currentFactGuards(store: Store, body: OmInputRecord): InputResult<Sealed<Ref[]>> {
   const guards: Ref[] = [];
   for (const fact of body.input.facts ?? []) {
     const checked = answerSourceGuards(store, { project: body.projectId, record: fact.answer });
-    if (!checked.ok) return checked;
-    if (!checked.value.applicable) return refused("answer_inapplicable", "An applied fact's evidence is no longer current",
+    if (!checked.ok) return transfer("accepted-answer", checked);
+    if (!checked.value.applicable) return refuse("answer_inapplicable", "An applied fact's evidence is no longer current",
       at(fact.question.id, "answer", fact.answer), "producer");
     guards.push(...checked.value.guards);
   }
@@ -742,10 +765,10 @@ function normalizedDependencies(value: unknown): ReopenFactDependency[] | null {
 }
 
 /** Historical derivation shared by the addressing writer, restored reads and current admission. */
-export function deriveOmInput(store: Store, request: DerivedInputRequest): OmResult<Sealed<OmInputRecord>> {
+export function deriveOmInput(store: Store, request: DerivedInputRequest): InputResult<Sealed<OmInputRecord>> {
   return withHistoricalReads(() => deriveOmInputInScope(store, request));
 }
-function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmResult<Sealed<OmInputRecord>> {
+function deriveOmInputInScope(store: Store, request: DerivedInputRequest): InputResult<Sealed<OmInputRecord>> {
   if (!object(request)) invalid("request");
   requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
   if (!isRef(request.previous)) invalid("previous");
@@ -771,10 +794,10 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
     for (const invalidation of invalidations) {
       const matching = originalFacts.filter(fact => canonical(fact.answer) === canonical(invalidation.record));
       if (matching.length !== 1 || body.input.questions.some(question => question.id === matching[0]!.question.id))
-        return refused("answer_inapplicable", "Invalidation must name one applied fact whose original question is still filled",
+        return refuse("answer_inapplicable", "Invalidation must name one applied fact whose original question is still filled",
           at(request.previous.id, "facts", invalidation.record), "producer");
       const checked = readAnswerInvalidation(store, { project: request.project, invalidation });
-      if (!checked.ok) return checked;
+      if (!checked.ok) return transfer("accepted-answer", checked);
       removed.set(canonical(invalidation.record), matching[0]! as AppliedInputFact);
     }
     const provisional = (): OmInputRecord => {
@@ -793,10 +816,10 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
       for (const fact of result.input.facts ?? []) {
         const checked = checkAnswerInputBody(store, { project: request.project, record: fact.answer,
           question: fact.mc1Question, input: result });
-        if (!checked.ok) return checked;
+        if (!checked.ok) return transfer("accepted-answer", checked);
         if (checked.value.applicable) continue;
         if (checked.value.requirementChanges.length === 0)
-          return refused("answer_inapplicable", "Recovery cannot remove a fact without a changed essential condition",
+          return refuse("answer_inapplicable", "Recovery cannot remove a fact without a changed essential condition",
             at(fact.question.id, "answer", fact.answer), "producer");
         pending.push({ fact, reason: { record: fact.answer, question: fact.mc1Question, removed: causes,
           conditions: sorted(checked.value.requirementChanges) as AnswerRequirementChange[] } });
@@ -811,7 +834,7 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
     const normalized = sorted(dependencies);
     if (Object.hasOwn(request, "dependencies")
       && canonical(normalizedDependencies(request.dependencies)) !== canonical(normalized))
-      return refused("record_forged", "Dependent recovery causes must follow from the exact prior input and root invalidations",
+      return refuse("record_forged", "Dependent recovery causes must follow from the exact prior input and root invalidations",
         at(request.previous.id, "derivation.dependencies", request.previous), "producer");
     result.derivation = { kind: "reopen-facts", previous: request.previous, invalidations,
       ...(normalized.length ? { dependencies: normalized } : {}) };
@@ -821,19 +844,19 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
   if ("kind" in request) {
     const checked = readAnswerForInput(store, { project: request.project, record: request.answer,
       question: request.question, input: request.previous, current: false });
-    if (!checked.ok) return checked;
-    if (!checked.value.applicable) return refused("answer_inapplicable", "The accepted answer does not match this exact input contract",
+    if (!checked.ok) return transfer("accepted-answer", checked);
+    if (!checked.value.applicable) return refuse("answer_inapplicable", "The accepted answer does not match this exact input contract",
       at(request.previous.id, "answer", request.answer), "producer");
     const question = checked.value.sourceQuestion as OmInput['questions'][number];
     const fact: AppliedInputFact = { question, value: checked.value.checked.record.value.value as Json,
       answer: request.answer, mc1Question: request.question };
     const body = previous.value.value, existing = body.input.facts?.find(item => item.question.id === question.id);
     if (existing) return canonical(existing) === canonical(fact) ? delivered(body)
-      : refused("addressing_conflict", "An applied fact cannot overwrite the already filled question",
+      : refuse("addressing_conflict", "An applied fact cannot overwrite the already filled question",
         at(question.id, "answer", request.answer), "producer");
     const unresolved = body.input.questions.filter(item => item.id === question.id);
     if (unresolved.length !== 1 || canonical(unresolved[0]) !== canonical(question))
-      return refused("answer_inapplicable", "The original question must be an exact unresolved input field",
+      return refuse("answer_inapplicable", "The original question must be an exact unresolved input field",
         at(question.id, "answer", request.answer), "producer");
     const input: OmInput = { ...body.input as OmInput, questions: body.input.questions.filter(item => item.id !== question.id) as OmInput['questions'],
       facts: sorted([...(body.input.facts ?? []), fact]) as AppliedInputFact[] };
@@ -845,7 +868,7 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
   const decisions = sorted(request.decisions);
   const derived = deriveInputDecisions(store, { project: request.project, previous: previous.value as Revision<OmInputRecord>,
     graph: request.graph, decisions });
-  if (!derived.ok) return derived;
+  if (!derived.ok) return transfer("addressing", derived);
   const result: OmInputRecord = { projectId: request.project, input: derived.value.input as OmInput, hash: hashJson(derived.value.input),
     gaps: derived.value.gaps as InputGap[], derivation: { previous: request.previous, graph: request.graph, decisions: decisions as Ref[] } };
   const contracts = checkFactContracts(store, result);
@@ -853,15 +876,15 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): OmRes
 }
 
 /** Admit an exact saved version without reconstructing it as a stage-only root or requiring historical heads. */
-export function prepareExistingOmInput(store: Store, project: string, ref: Ref): OmResult<Sealed<PreparedOmInput>> {
+export function prepareExistingOmInput(store: Store, project: string, ref: Ref): InputResult<Sealed<PreparedOmInput>> {
   return withHistoricalReads(() => prepareExistingOmInputInScope(store, project, ref));
 }
-function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref): OmResult<Sealed<PreparedOmInput>> {
+function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref): InputResult<Sealed<PreparedOmInput>> {
   const read = readOmInput(store, project, ref);
   if (!read.ok) return read;
   const current = store.get<OmInputRecord>(ref.id);
   if (!current || canonical(reference(current)) !== canonical(ref))
-    return refused("input_stale", "The requested OM input version is no longer current", at(ref.id, "head", ref), "producer");
+    return refuse("input_stale", "The requested OM input version is no longer current", at(ref.id, "head", ref), "producer");
   const body = read.value.value;
   const acceptance = currentAcceptance(store, { project,
     stages: Object.fromEntries(body.input.sources.map(source => [source.stage,
@@ -874,10 +897,10 @@ function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref):
 }
 
 /** The only recovery bypass is the stale fact being removed; stage acceptance remains current. */
-export function prepareReopenOmInput(store: Store, request: { project: string; input: Ref }): OmResult<Sealed<PreparedOmInput>> {
+export function prepareReopenOmInput(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput>> {
   return withHistoricalReads(() => prepareReopenOmInputInScope(store, request));
 }
-function prepareReopenOmInputInScope(store: Store, request: { project: string; input: Ref }): OmResult<Sealed<PreparedOmInput>> {
+function prepareReopenOmInputInScope(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput>> {
   if (!object(request)) invalid("request");
   requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
   if (!isRef(request.input)) invalid("input");
@@ -885,7 +908,7 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
   const read = readOmInput(store, request.project, request.input);
   if (!read.ok) return read;
   const current = store.get<OmInputRecord>(request.input.id);
-  if (!current) return refused("input_stale", "Recovery requires an existing input head", at(request.input.id, "head", request.input), "producer");
+  if (!current) return refuse("input_stale", "Recovery requires an existing input head", at(request.input.id, "head", request.input), "producer");
   if (canonical(reference(current)) !== canonical(request.input)) {
     const admitted = prepareExistingOmInput(store, request.project, reference(current));
     if (!admitted.ok) return admitted;
@@ -899,7 +922,7 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
       if (!previous.ok) return previous;
       cursor = previous.value as Revision<OmInputRecord>;
     }
-    return refused("input_stale", "An old input can only repeat its exact saved recovery", at(request.input.id, "head", request.input), "producer");
+    return refuse("input_stale", "An old input can only repeat its exact saved recovery", at(request.input.id, "head", request.input), "producer");
   }
   const body = read.value.value as OmInputRecord;
   const acceptance = currentAcceptance(store, { project: request.project,
@@ -911,13 +934,13 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
   const guards: Ref[] = [...acceptance.value, request.input];
   for (const fact of body.input.facts ?? []) {
     const prepared = prepareAnswerInvalidation(store, { project: request.project, record: fact.answer });
-    if (!prepared.ok) return prepared;
+    if (!prepared.ok) return transfer("accepted-answer", prepared);
     guards.push(...prepared.value.guards);
     if (prepared.value.invalidation) invalidations.push(prepared.value.invalidation as AnswerInvalidation);
     for (const write of prepared.value.writes) {
       const old = writes.get(write.id);
       if (old && canonical(old) !== canonical(write))
-        return refused("input_stale", "A source changed between fact invalidations", at(write.id, "head"), "producer");
+        return refuse("input_stale", "A source changed between fact invalidations", at(write.id, "head"), "producer");
       writes.set(write.id, write as Write);
     }
   }
@@ -935,7 +958,7 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
   for (const guard of guards) {
     const previous = heads.get(guard.id);
     if (previous && canonical(previous) !== canonical(guard))
-      return refused("input_stale", "Recovery observed conflicting source heads", at(guard.id, "head", previous), "producer");
+      return refuse("input_stale", "Recovery observed conflicting source heads", at(guard.id, "head", previous), "producer");
     heads.set(guard.id, guard);
   }
   if (!invalidations.length) return delivered({ record: body, existing: read.value, writes: [], guards: sorted([...heads.values()]) });

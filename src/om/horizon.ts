@@ -5,7 +5,7 @@ import { controlPredecessors } from "../graph/dependencies.js";
 import type { Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
-import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from "./refusal.js";
+import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type RefusalRoute, type Sealed, type SourceCodes } from "./refusal.js";
 
 import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
@@ -23,6 +23,25 @@ export const HORIZON_REFUSAL_CODES = Object.freeze([
   "horizon_exclusion_unjustified", "horizon_exclusion_unknown", "horizon_available_unproven",
   "horizon_available_uncovered", "horizon_refinement_unproven",
 ] as const);
+export type HorizonRefusalCode = typeof HORIZON_REFUSAL_CODES[number];
+/**
+ * Q2 (№2452-5, №2460): every code horizon.ts creates itself — the gate subset above and the issuance set below stay the
+ * exact sets older tests pin; the local constructor accepts this whole catalogue and nothing else.
+ */
+export const HORIZON_LOCAL_CODES = Object.freeze([...HORIZON_REFUSAL_CODES,
+  "horizon_issuance_request_invalid", "horizon_issuance_binding_invalid", "horizon_issuance_record_invalid",
+  "horizon_choice_conflict", "input_stale", "record_forged"] as const);
+export type HorizonLocalCode = typeof HORIZON_LOCAL_CODES[number];
+/** The exceptions horizon.ts throws itself. */
+export const HORIZON_ERROR_CODES = Object.freeze(["horizon_request_invalid", "input_stale"] as const);
+export type HorizonErrorCode = typeof HORIZON_ERROR_CODES[number];
+/** The units whose refusals horizon.ts hands on unchanged, each through a declared transfer. */
+export type HorizonSource = "refs" | "input" | "series-transition";
+export type HorizonCode = HorizonLocalCode | SourceCodes<HorizonSource>;
+export type HorizonResult<T> = OmResult<T, HorizonCode>;
+const refuse = localRefusals(HORIZON_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: HorizonErrorCode, message: string, details?: unknown) => never = localErrors(HORIZON_ERROR_CODES);
 export interface HorizonChoice {
   choiceVersion: string;
   features: { outcome: string }[];
@@ -39,14 +58,14 @@ export interface Horizon {
   excluded: HorizonChoice['excluded']; hash: string;
 }
 export interface HorizonConflict { code: "horizon_requires_excluded"; block: string; path: string[] }
-export interface HorizonBuildResult { horizon: Horizon; conflicts: HorizonConflict[]; refusals: Refusal[] }
+export interface HorizonBuildResult { horizon: Horizon; conflicts: HorizonConflict[]; refusals: Refusal<HorizonRefusalCode>[] }
 
 const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
 function invalid(field: string): never {
-  throw new EngineError("horizon_request_invalid", "Horizon needs explicit well-formed inputs", { unit: "G2", target: "horizon", field });
+  return raise("horizon_request_invalid", "Horizon needs explicit well-formed inputs", { unit: "G2", target: "horizon", field });
 }
 function jsonCopy<T>(value: T): T {
   try { return sealed(value) as T; }
@@ -74,9 +93,9 @@ export function closeHorizon(upper: Graph, options: HorizonOptions): Sealed<Hori
   upper = jsonCopy(upper); options = jsonCopy(options);
   const blocks = new Map(upper.nodes.filter(node => node.kind === "block").map(node => [node.id, node]));
   const artifacts = new Map(upper.artifacts.map(artifact => [artifact.id, artifact]));
-  const refusals: Refusal[] = [], conflicts: HorizonConflict[] = [];
-  const fail = (code: string, target: string, field: string, message: string, route: RefusalRoute = "owner") => {
-    const result = refused(code, message, { unit: "G2", target, field }, route);
+  const refusals: Refusal<HorizonRefusalCode>[] = [], conflicts: HorizonConflict[] = [];
+  const fail = (code: HorizonRefusalCode, target: string, field: string, message: string, route: RefusalRoute = "owner") => {
+    const result = refuse(code, message, { unit: "G2", target, field }, route);
     if (!result.ok) refusals.push(result.refusal);
   };
   for (const exclusion of options.excluded) {
@@ -206,37 +225,37 @@ function receiptShape(value: unknown, project: string, artifact: string): value 
 }
 interface SavedPhase { projectId: string; phase: string; inputs: Ref[]; layer: Ref | null; draft: Ref | null; contractVersion?: number }
 // Resolve the producer's recorded proof closure historically; only current admission below reads heads.
-function exactClosure(store: Store, refs: Ref[]): OmResult<Sealed<Revision[]>> {
+function exactClosure(store: Store, refs: Ref[]): HorizonResult<Sealed<Revision[]>> {
   const pending = [...refs], seen = new Set<string>(), records: Revision[] = [];
   while (pending.length) {
     const ref = pending.shift()!;
-    if (!isRef(ref)) return refused("horizon_refinement_unproven", "Refinement has an invalid proof reference", address("refinement", "inputs"), "producer");
+    if (!isRef(ref)) return refuse("horizon_refinement_unproven", "Refinement has an invalid proof reference", address("refinement", "inputs"), "producer");
     const key = canonical(ref);
     if (seen.has(key)) continue;
     seen.add(key);
     const record = store.get(ref.id, ref.revision);
-    if (!record || record.hash !== ref.hash) return refused("horizon_refinement_unproven", "Refinement proof is absent or has a different hash", address(ref.id, "inputs", ref), "producer");
+    if (!record || record.hash !== ref.hash) return refuse("horizon_refinement_unproven", "Refinement proof is absent or has a different hash", address(ref.id, "inputs", ref), "producer");
     records.push(record);
     if ((record.kind === "phase" || record.kind === "graph-layer") && object(record.value)) {
       if (!Array.isArray(record.value['inputs']) || !record.value['inputs'].every(isRef))
-        return refused("horizon_refinement_unproven", "Refinement proof needs its explicit input set", address(ref.id, "inputs", ref), "producer");
+        return refuse("horizon_refinement_unproven", "Refinement proof needs its explicit input set", address(ref.id, "inputs", ref), "producer");
       pending.push(...record.value['inputs'] as unknown as Ref[]);
       if (record.kind === "phase") for (const field of ["draft", "layer"] as const) {
         const input = record.value[field];
         if (isRef(input)) pending.push(input);
-        else if (input !== null) return refused("horizon_refinement_unproven", "Refinement phase has an invalid source", address(ref.id, field, ref), "producer");
+        else if (input !== null) return refuse("horizon_refinement_unproven", "Refinement phase has an invalid source", address(ref.id, field, ref), "producer");
       }
     }
   }
   return delivered(records);
 }
-function readRefinement(store: Store, request: HorizonRequest, graph: Graph): OmResult<Sealed<string[]>> {
+function readRefinement(store: Store, request: HorizonRequest, graph: Graph): HorizonResult<Sealed<string[]>> {
   if (!request.refinement) return delivered([]);
   if (request.refinement.id === `graph-layer:${request.project}:2`) {
     const basis = readLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
-    if (!basis.ok) return refused("horizon_refinement_unproven", basis.refusal.message,
+    if (!basis.ok) return refuse("horizon_refinement_unproven", basis.refusal.message,
       address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
-    if (basis.value.producer !== "om") return refused("horizon_refinement_unproven", "Research refinement must retain its accepted milestone",
+    if (basis.value.producer !== "om") return refuse("horizon_refinement_unproven", "Research refinement must retain its accepted milestone",
       address(request.refinement.id, "producer", request.refinement), "producer");
     const relations = new RefinementRelations(graph);
     const frame = store.get<{ fills: { node: string; source: string }[] }>(basis.value.frame!.id, basis.value.frame!.revision)!;
@@ -246,9 +265,9 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
   }
   const read = readRecord<SavedPhase>(store, request.refinement, { unit: "G2", target: request.project,
     id: `phase:${request.project}:L2`, kind: "phase" });
-  if (!read.ok) return read;
+  if (!read.ok) return transfer("refs", read);
   const phase = read.value.value;
-  const reject = (field: string, source: Ref = request.refinement!) => refused("horizon_refinement_unproven", "Refinement must be an accepted L2 milestone with its exact proof closure",
+  const reject = (field: string, source: Ref = request.refinement!) => refuse("horizon_refinement_unproven", "Refinement must be an accepted L2 milestone with its exact proof closure",
     address(source.id, field, source), "producer");
   if (!object(phase) || phase.projectId !== request.project || phase.phase !== "L2" || phase.draft !== null
     || !isRef(phase.layer) || !Array.isArray(phase.inputs) || !phase.inputs.every(isRef)
@@ -257,14 +276,14 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
     || (phase.contractVersion !== undefined && phase.contractVersion !== 2)) return reject("inputs");
   const layerRead = readRecord<LayerBasis>(store, phase.layer, { unit: "G2", target: request.project,
     id: `graph-layer:${request.project}:2`, kind: "graph-layer" });
-  if (!layerRead.ok) return layerRead;
+  if (!layerRead.ok) return transfer("refs", layerRead);
   const layer = layerRead.value.value;
   if (!object(layer) || !object(layer.projection) || !Array.isArray(layer.inputs) || !layer.inputs.every(isRef)
     || !Array.isArray(layer.obligations) || (layer.layerProofs !== undefined && !Array.isArray(layer.layerProofs))) return reject("layer");
   if (graph.version === 2 && !layer.layerProofs?.some(proof => object(proof) && proof.level === 2)) return reject("layerProofs");
   if (graph.version === 1) {
     const checked = readLayerEnvelope(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer });
-    if (!checked.ok) return refused("horizon_refinement_unproven", checked.refusal.message,
+    if (!checked.ok) return refuse("horizon_refinement_unproven", checked.refusal.message,
       address(checked.refusal.at.target, checked.refusal.at.field ?? "inputs", phase.layer), "producer");
   }
   const closure = exactClosure(store, [request.refinement, ...layer.inputs]);
@@ -310,7 +329,7 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
     const upper = phase.inputs.filter(ref => ref.id === `graph-layer:${request.project}:1`);
     if (upper.length !== 1) return reject("inputs");
     const checked = readLayerBasis(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer, upper: upper[0]! });
-    if (!checked.ok) return refused("horizon_refinement_unproven", checked.refusal.message,
+    if (!checked.ok) return refuse("horizon_refinement_unproven", checked.refusal.message,
       address(checked.refusal.at.target, `layerProofs.${checked.refusal.at.field ?? "inputs"}`, phase.layer), "producer");
     const research = phase.inputs.filter(ref => ref.id === `phase:${request.project}:R1`);
     const ownProof = layer.layerProofs!.find(proof => proof.level === 2)!;
@@ -320,32 +339,32 @@ function readRefinement(store: Store, request: HorizonRequest, graph: Graph): Om
   return delivered(graph.nodes.filter(block => block.kind === "block" && graph.nodes.some(operation => operation.kind === "operation"
     && relations.refines(operation.id, block.id))).map(block => block.id).sort(order));
 }
-function deriveHorizon(store: Store, request: HorizonRequest): OmResult<Sealed<HorizonRecord>> {
+function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sealed<HorizonRecord>> {
   const inputRead = readOmInput(store, request.project, request.input);
-  if (!inputRead.ok) return inputRead;
+  if (!inputRead.ok) return transfer("input", inputRead);
   const graphRead = readRecord<Graph>(store, request.graph, { unit: "G2", target: request.project, id: `graph:${request.project}`, kind: "graph" });
-  if (!graphRead.ok) return graphRead;
+  if (!graphRead.ok) return transfer("refs", graphRead);
   const graph = graphRead.value.value as Graph;
   if (!object(graph) || !graphShapes[graph.version === 2 ? 1 : 0]!(graph))
-    return refused("horizon_unclosed", "The saved graph has an invalid shape", address(request.graph.id, "graph", request.graph), "producer");
+    return refuse("horizon_unclosed", "The saved graph has an invalid shape", address(request.graph.id, "graph", request.graph), "producer");
   const map = inputRead.value.value.input.sources.find(source => source.stage === "operation-map")!;
   const stage = readRecord<StageArtifact>(store, map, { unit: "G2", target: request.project, id: `stage:${request.project}:operation-map`, kind: "stage" });
-  if (!stage.ok) return stage;
+  if (!stage.ok) return transfer("refs", stage);
   const layerRef = object(stage.value.value.content) ? stage.value.value.content['graph'] : null;
   const layer = readRecord<LayerBasis>(store, layerRef, { unit: "G2", target: request.project, id: `graph-layer:${request.project}:1`, kind: "graph-layer" });
-  if (!layer.ok) return layer;
+  if (!layer.ok) return transfer("refs", layer);
   if (canonical(projectGraph(graph, 1)) !== canonical(layer.value.value.projection))
-    return refused("horizon_unclosed", "The graph must retain the exact accepted upper layer from OM input", address(request.graph.id, "upper", request.graph), "producer");
+    return refuse("horizon_unclosed", "The graph must retain the exact accepted upper layer from OM input", address(request.graph.id, "upper", request.graph), "producer");
   const refined = readRefinement(store, request, graph);
   if (!refined.ok) return refined;
   for (const [block, basis] of Object.entries(request.available)) {
     if (!object(basis) || !Object.keys(basis).length || !Object.values(basis).every(isRef))
-      return refused("horizon_available_unproven", "Availability needs exact receipts per artifact", address(block, "available"), "readiness");
+      return refuse("horizon_available_unproven", "Availability needs exact receipts per artifact", address(block, "available"), "readiness");
     for (const [artifact, ref] of Object.entries(basis)) {
       const receipt = readRecord<ArtifactReceipt>(store, ref, { unit: "G2", target: block, id: receiptId(request.project, artifact), kind: "artifact" });
-      if (!receipt.ok) return receipt;
+      if (!receipt.ok) return transfer("refs", receipt);
       if (!receiptShape(receipt.value.value, request.project, artifact))
-        return refused("horizon_available_unproven", "The receipt must name this project and artifact with complete producer evidence", address(block, artifact, ref), "readiness");
+        return refuse("horizon_available_unproven", "The receipt must name this project and artifact with complete producer evidence", address(block, artifact, ref), "readiness");
     }
   }
   const { level: _level, ...projection } = projectGraph(graph, 1);
@@ -353,20 +372,20 @@ function deriveHorizon(store: Store, request: HorizonRequest): OmResult<Sealed<H
   const options = { ...request.choice, refined: refined.value as string[], available: request.available };
   const result = closeHorizon(upper, options);
   const knownOutcomes = new Set(inputRead.value.value.input.features.map(feature => feature.outcome));
-  const extra: Refusal[] = [];
+  const extra: Refusal<HorizonRefusalCode>[] = [];
   for (const feature of request.choice.features) if (!knownOutcomes.has(feature.outcome)) {
-    const refusal = refused("horizon_feature_unknown", "The owner choice must name a feature of the accepted input", address(feature.outcome, "features"), "owner");
+    const refusal = refuse("horizon_feature_unknown", "The owner choice must name a feature of the accepted input", address(feature.outcome, "features"), "owner");
     if (!refusal.ok) extra.push(refusal.refusal);
   }
   return delivered({ project: request.project, request, result: { ...result, refusals: sorted([...result.refusals, ...extra]) } });
 }
 
-function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<Sealed<Ref[]>> {
+function currentHorizonSources(store: Store, request: HorizonRequest): HorizonResult<Sealed<Ref[]>> {
   const heads = new Map<string, Ref>();
   const remember = (ref: Ref) => {
     const previous = heads.get(ref.id);
     if (previous && canonical(previous) !== canonical(ref))
-      throw new EngineError("input_stale", "A horizon prerequisite changed during preparation", address(ref.id, "head", previous));
+      raise("input_stale", "A horizon prerequisite changed during preparation", address(ref.id, "head", previous));
     heads.set(ref.id, ref);
   };
   const traced = new Proxy(store, {
@@ -386,21 +405,21 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
     for (const ref of refs) {
       const head = traced.get(ref.id);
       if (!head || canonical(reference(head)) !== canonical(ref))
-        return refused("input_stale", "The horizon prerequisite is no longer current", address(ref.id, "head", ref), "producer");
+        return refuse("input_stale", "The horizon prerequisite is no longer current", address(ref.id, "head", ref), "producer");
     }
     const prepared = prepareExistingOmInput(traced, request.project, request.input);
-    if (!prepared.ok) return prepared;
+    if (!prepared.ok) return transfer("input", prepared);
     if (!prepared.value.existing || canonical(reference(prepared.value.existing)) !== canonical(request.input))
-      return refused("input_stale", "Horizon needs the currently admitted input", address(request.input.id, "input", request.input), "producer");
+      return refuse("input_stale", "Horizon needs the currently admitted input", address(request.input.id, "input", request.input), "producer");
     for (const guard of prepared.value.guards) remember(guard);
     if (request.refinement?.id === `graph-layer:${request.project}:2`) {
       const basis = readLayerAcceptance(traced, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
-      if (!basis.ok) return refused("horizon_refinement_unproven", basis.refusal.message,
+      if (!basis.ok) return refuse("horizon_refinement_unproven", basis.refusal.message,
         address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
       for (const ref of basis.value.currentReferences) {
         const head = traced.get(ref.id);
         if (!head || canonical(reference(head)) !== canonical(ref))
-          return refused("input_stale", "The accepted OM refinement is no longer current", address(ref.id, "head", ref), "producer");
+          return refuse("input_stale", "The accepted OM refinement is no longer current", address(ref.id, "head", ref), "producer");
       }
     } else if (request.refinement) {
       const engine = new StageChecks(traced);
@@ -408,10 +427,10 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
       for (const [name, gate] of [["refinement.L2", engine.refinement.gate(request.project, "L2")],
         ["layer.2", engine.graphs.layerGate(request.project, 2, phase.value.layer!)]] as const) {
         const admission = readOmAdmissionGuards(gate.admissionGuards, name, "G2");
-        if (!admission.ok) return admission;
+        if (!admission.ok) return transfer("input", admission);
         if (gate.findings.length) {
           const finding = gate.findings[0]!;
-          return refused("horizon_refinement_unproven", finding.message, address(finding.target, finding.code, request.refinement), "producer");
+          return refuse("horizon_refinement_unproven", finding.message, address(finding.target, finding.code, request.refinement), "producer");
         }
         for (const guard of [...gate.guards, ...admission.value]) remember(guard);
       }
@@ -419,7 +438,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
     return delivered(sorted([...heads.values()]));
   } catch (error) {
     if (error instanceof EngineError && error.code === "input_stale")
-      return refused("input_stale", error.message, address(request.project, "sources"), "producer");
+      return refuse("input_stale", error.message, address(request.project, "sources"), "producer");
     throw error;
   }
 }
@@ -428,20 +447,20 @@ function gateRecord(record: HorizonRecord, horizon: Ref): OmHorizonRecord {
   return { project: record.project, choiceVersion: record.request.choice.choiceVersion, horizon,
     horizonHash: record.result.horizon.hash, state: codes.length ? "refused" : "accepted", codes };
 }
-function replay(store: Store, request: HorizonRequest): OmResult<Sealed<HorizonRecords | null>> {
+function replay(store: Store, request: HorizonRequest): HorizonResult<Sealed<HorizonRecords | null>> {
   const suffix = `${request.project}:${request.choice.choiceVersion}`;
   const gate = store.get<OmHorizonRecord>(`om-horizon:${suffix}`);
   if (!gate) {
-    if (store.get(`horizon:${suffix}`)) return refused("record_forged", "A horizon candidate has no atomic G2 outcome", address(`horizon:${suffix}`, "gate"), "producer");
+    if (store.get(`horizon:${suffix}`)) return refuse("record_forged", "A horizon candidate has no atomic G2 outcome", address(`horizon:${suffix}`, "gate"), "producer");
     return delivered(null);
   }
   const saved = readHorizon(store, request.project, reference(gate));
   if (!saved.ok) return saved;
   if (canonical(saved.value.horizon.value.request) !== canonical(request))
-    return refused("horizon_choice_conflict", "This owner choice version already names a different request", address(gate.id, "choiceVersion", reference(gate)), "owner");
+    return refuse("horizon_choice_conflict", "This owner choice version already names a different request", address(gate.id, "choiceVersion", reference(gate)), "owner");
   return saved;
 }
-export function prepareHorizon(store: Store, request: HorizonRequest): OmResult<Sealed<PreparedHorizon>> {
+export function prepareHorizon(store: Store, request: HorizonRequest): HorizonResult<Sealed<PreparedHorizon>> {
   requireRequest(store, request);
   request = normalizedRequest(request);
   const existing = replay(store, request);
@@ -460,7 +479,7 @@ export function prepareHorizon(store: Store, request: HorizonRequest): OmResult<
   return delivered({ record, gate, writes, guards: sorted([...admission.value,
     ...(existing.value ? [reference(existing.value.horizon), reference(existing.value.gate)] : [])]), existing: existing.value });
 }
-export function writeHorizon(store: Store, request: HorizonRequest): OmResult<Sealed<HorizonRecords>> {
+export function writeHorizon(store: Store, request: HorizonRequest): HorizonResult<Sealed<HorizonRecords>> {
   requireRequest(store, request);
   request = normalizedRequest(request);
   // Delivery of an already applied owner command is historical; using it in a new transaction calls prepareHorizon.
@@ -471,21 +490,21 @@ export function writeHorizon(store: Store, request: HorizonRequest): OmResult<Se
   if (!prepared.ok) return prepared;
   if (prepared.value.existing) return delivered(prepared.value.existing);
   const written = writeGuarded(store, { unit: "G2", target: request.project, writes: prepared.value.writes as Write[], guards: prepared.value.guards });
-  if (!written.ok) return written;
+  if (!written.ok) return transfer("refs", written);
   return delivered({ horizon: written.value[0] as unknown as Revision<HorizonRecord>, gate: written.value[1] as unknown as Revision<OmHorizonRecord> });
 }
-export function readHorizon(store: Store, project: string, ref: Ref): OmResult<Sealed<HorizonRecords>> {
+export function readHorizon(store: Store, project: string, ref: Ref): HorizonResult<Sealed<HorizonRecords>> {
   requireStore(store, project);
   if (!isRef(ref)) invalid("reference");
   const gate = readRecord<OmHorizonRecord>(store, ref, { unit: "G2", target: project, idPrefix: `om-horizon:${project}:`, kind: "om-horizon" });
-  if (!gate.ok) return gate;
+  if (!gate.ok) return transfer("refs", gate);
   const value = gate.value.value;
-  const forged = () => refused("record_forged", "The G2 outcome must be rederived from its exact horizon sources", address(ref.id, "horizon", ref), "producer");
+  const forged = () => refuse("record_forged", "The G2 outcome must be rederived from its exact horizon sources", address(ref.id, "horizon", ref), "producer");
   if (!object(value) || value.project !== project || !text(value.choiceVersion) || !isRef(value.horizon)
     || ref.id !== `om-horizon:${project}:${value.choiceVersion}` || ref.revision !== 1) return forged();
   const horizon = readRecord<HorizonRecord>(store, value.horizon, { unit: "G2", target: project,
     id: `horizon:${project}:${value.choiceVersion}`, kind: "horizon" });
-  if (!horizon.ok) return horizon;
+  if (!horizon.ok) return transfer("refs", horizon);
   const record = horizon.value.value as HorizonRecord;
   if (horizon.value.revision !== 1 || !object(record) || record.project !== project || !object(record.request) || record.request.project !== project) return forged();
   try { requireRequest(store, record.request); }
@@ -525,10 +544,10 @@ const issuanceProject = (value: unknown): value is string => typeof value === "s
 const issuanceChoice = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value);
 const issuanceRefs = (values: readonly Ref[]): Ref[] => sorted([...new Map(values.map(ref => [canonical(ref), ref])).values()]);
 const issuanceId = (request: HorizonIssuanceRequest): string => `${HORIZON_ISSUANCE_KIND}:${request.project}:${hashJson({ horizon: request.horizon, transition: request.transition })}`;
-function issuanceFailure(code: typeof HORIZON_ISSUANCE_CODES[number], target: string, field: string, message: string, ref?: Ref): OmResult<never> {
-  return refused(code, message, address(target, field, ref), "producer");
+function issuanceFailure(code: typeof HORIZON_ISSUANCE_CODES[number], target: string, field: string, message: string, ref?: Ref): HorizonResult<never> {
+  return refuse(code, message, address(target, field, ref), "producer");
 }
-function checkIssuanceRequest(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<HorizonIssuanceRequest>> {
+function checkIssuanceRequest(store: Store, request: HorizonIssuanceRequest): HorizonResult<Sealed<HorizonIssuanceRequest>> {
   const bad = (field: string) => issuanceFailure("horizon_issuance_request_invalid", "horizon-issuance", field,
     "A G2 issuance needs its explicit project, choice version, exact horizon and saved prepared transition");
   if (!(store instanceof Store)) return bad("store");
@@ -541,7 +560,7 @@ function checkIssuanceRequest(store: Store, request: HorizonIssuanceRequest): Om
   return delivered(request);
 }
 /** P proves its own sources; G binds that exact P to the independently checked horizon outcome. */
-function deriveHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<DerivedHorizonIssuance>> {
+function deriveHorizonIssuance(store: Store, request: HorizonIssuanceRequest): HorizonResult<Sealed<DerivedHorizonIssuance>> {
   const horizon = readHorizon(store, request.project, request.horizon);
   if (!horizon.ok) return horizon;
   const gate = horizon.value.gate.value;
@@ -549,7 +568,7 @@ function deriveHorizonIssuance(store: Store, request: HorizonIssuanceRequest): O
     return issuanceFailure("horizon_issuance_binding_invalid", request.horizon.id, "horizon",
       "The issuance must name the proved horizon outcome of this exact project and choice version", request.horizon);
   const transition = readPreparedSeriesTransition(store, { project: request.project, record: request.transition });
-  if (!transition.ok) return transition;
+  if (!transition.ok) return transfer("series-transition", transition);
   const prepared = transition.value.record.value;
   if (prepared.state !== "prepared" || prepared.request.project !== request.project
     || prepared.request.choiceVersion !== request.choiceVersion || canonical(prepared.request.horizon) !== canonical(request.horizon))
@@ -560,10 +579,10 @@ function deriveHorizonIssuance(store: Store, request: HorizonIssuanceRequest): O
   return delivered({ record, transitionRequest: prepared.request as Parameters<typeof prepareSeriesTransition>[1],
     references: issuanceRefs([request.horizon, reference(horizon.value.horizon), request.transition, ...transition.value.references]) });
 }
-function readIssuanceRecord(store: Store, project: string, ref: Ref): OmResult<Sealed<CheckedHorizonIssuance>> {
+function readIssuanceRecord(store: Store, project: string, ref: Ref): HorizonResult<Sealed<CheckedHorizonIssuance>> {
   const saved = readRecord<HorizonIssuanceRecord>(store, ref, { unit: "G2", target: ref.id,
     idPrefix: `${HORIZON_ISSUANCE_KIND}:${project}:`, kind: HORIZON_ISSUANCE_KIND });
-  if (!saved.ok) return saved;
+  if (!saved.ok) return transfer("refs", saved);
   const value = saved.value.value;
   const bad = (field: string) => issuanceFailure("horizon_issuance_record_invalid", ref.id, field,
     "The issuance must be reproduced from its exact saved prepared transition and horizon", ref);
@@ -585,7 +604,7 @@ function readIssuanceRecord(store: Store, project: string, ref: Ref): OmResult<S
   return delivered({ record: saved.value, references: issuanceRefs([ref, ...derived.value.references]) });
 }
 /** Historical delivery never replaces the named P revision with its later applied/discarded head. */
-export function readHorizonIssuance(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<CheckedHorizonIssuance>> {
+export function readHorizonIssuance(store: Store, request: { project: string; record: Ref }): HorizonResult<Sealed<CheckedHorizonIssuance>> {
   const bad = (field: string) => issuanceFailure("horizon_issuance_request_invalid", "horizon-issuance", field,
     "A saved G2 issuance is read by its project and exact record reference");
   if (!(store instanceof Store)) return bad("store");
@@ -595,7 +614,7 @@ export function readHorizonIssuance(store: Store, request: { project: string; re
   if (!issuanceKeys(request, ["project", "record"])) return bad("request");
   return readIssuanceRecord(store, request.project, request.record);
 }
-export function prepareHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<PreparedHorizonIssuance>> {
+export function prepareHorizonIssuance(store: Store, request: HorizonIssuanceRequest): HorizonResult<Sealed<PreparedHorizonIssuance>> {
   const checked = checkIssuanceRequest(store, request);
   if (!checked.ok) return checked;
   request = checked.value as HorizonIssuanceRequest;
@@ -605,19 +624,19 @@ export function prepareHorizonIssuance(store: Store, request: HorizonIssuanceReq
   if (existing && canonical(existing) !== canonical(record))
     return issuanceFailure("horizon_issuance_record_invalid", record.id, "content", "An immutable issuance cannot be replaced by different content", reference(existing));
   const current = prepareSeriesTransition(store, derived.value.transitionRequest as Parameters<typeof prepareSeriesTransition>[1]);
-  if (!current.ok) return current;
+  if (!current.ok) return transfer("series-transition", current);
   if (current.value.writes.length || canonical(reference(current.value.record)) !== canonical(request.transition))
     return issuanceFailure("horizon_issuance_binding_invalid", request.transition.id, "transition",
       "An issuance uses an already saved exact preparation; it cannot create or replace that preparation", request.transition);
   for (const source of [request.horizon, request.transition]) {
     const head = store.get(source.id);
     if (!head || canonical(reference(head)) !== canonical(source))
-      return refused("input_stale", "The horizon or prepared transition is no longer current", address(source.id, "source", source), "producer");
+      return refuse("input_stale", "The horizon or prepared transition is no longer current", address(source.id, "source", source), "producer");
   }
   return delivered({ record, writes: existing ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }],
     guards: uniqueTransactionGuards([...current.value.guards, request.horizon, request.transition, ...(existing ? [reference(existing)] : [])]) });
 }
-export function writeHorizonIssuance(store: Store, request: HorizonIssuanceRequest): OmResult<Sealed<Revision<HorizonIssuanceRecord>>> {
+export function writeHorizonIssuance(store: Store, request: HorizonIssuanceRequest): HorizonResult<Sealed<Revision<HorizonIssuanceRecord>>> {
   const checked = checkIssuanceRequest(store, request);
   if (!checked.ok) return checked;
   request = checked.value as HorizonIssuanceRequest;
@@ -636,6 +655,6 @@ export function writeHorizonIssuance(store: Store, request: HorizonIssuanceReque
   if (!prepared.value.writes.length) return delivered(prepared.value.record);
   const written = writeGuarded<HorizonIssuanceRecord>(store, { unit: "G2", target: prepared.value.record.id,
     writes: prepared.value.writes, guards: prepared.value.guards });
-  if (!written.ok) return written;
+  if (!written.ok) return transfer("refs", written);
   return delivered(written.value[0]!);
 }
