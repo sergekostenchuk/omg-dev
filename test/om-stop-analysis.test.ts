@@ -26,7 +26,7 @@ import { readStopReport } from '../src/om/stop-report.js';
 import { recordCall, type AnyRecordCallRequest } from '../src/om/call-record.js';
 import { runModelTransport } from '../src/om/model-call.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -38,13 +38,6 @@ const ok = <T>(result: OmResult<T>): T => {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message} ${canonical(result.refusal.at)}`);
   return result.value;
 };
-function refusal(result: OmResult<unknown>, code?: string) {
-  assert.equal(result.ok, false);
-  if (result.ok) throw new Error('Expected an addressed refusal');
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target);
-  return result.refusal;
-}
 
 function fixture(t: TestContext, mode: 'block' | 'mechanism' = 'block', origin = false, capacity = 200_000) {
   const root = mkdtempSync(join(tmpdir(), 'omg-a6-')), database = join(root, 'state.sqlite');
@@ -214,8 +207,8 @@ for (const failure of ['off-form', 'transport'] as const) test(`A6 ${failure} pr
   if (failure === 'off-form') assert.equal(result.value.error.code, 'analysis_response_invalid');
   assert.equal(preserved(f), before); assert.equal(f.sent().length, 1);
   assert.deepEqual(f.store.get<{ usage: unknown }>(result.value.transport.id, result.value.transport.revision)!.value.usage, usage);
-  refusal(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'A failure is not a reviewed change', review: { ref: reference(result) } }));
-  refusal(escalateSeries(f.store, { ...f.address, stop: 3, review: { ref: reference(result) } }));
+  refusedWith(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'A failure is not a reviewed change', review: { ref: reference(result) } }), 'record_foreign');
+  refusedWith(escalateSeries(f.store, { ...f.address, stop: 3, review: { ref: reference(result) } }), 'record_foreign');
   f.restart(); const saved = canonical(f.store.list());
   assert.deepEqual(ok(await runStopAnalysis(f.store, f.request)), result);
   assert.equal(canonical(f.store.list()), saved); assert.equal(f.sent().length, 1);
@@ -223,7 +216,7 @@ for (const failure of ['off-form', 'transport'] as const) test(`A6 ${failure} pr
     const changed = new Environments(f.store).configure(f.project, { ...f.environment.value,
       reviewer: { ...f.environment.value.reviewer, model: 'another-local-reviewer' } }, f.environment.revision);
     const current = canonical(f.store.list());
-    refusal(await runStopAnalysis(f.store, { ...f.request, dispatch: { ...f.request.dispatch, config: reference(changed) } }), 'analysis_conflict');
+    refusedWith(await runStopAnalysis(f.store, { ...f.request, dispatch: { ...f.request.dispatch, config: reference(changed) } }), 'analysis_conflict');
     assert.equal(canonical(f.store.list()), current); assert.equal(f.sent().length, 1);
   }
 });
@@ -239,8 +232,8 @@ for (const part of ['evidence', 'change'] as const) test(`A6 a ${part} outside t
   const result = ok(await runStopAnalysis(f.store, f.request));
   assert.equal(result.kind, 'om-stop-analysis-failure'); assert.equal(result.value.error?.code, 'analysis_response_invalid');
   assert.equal(preserved(f), before); assert.equal(f.sent().length, 1);
-  refusal(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'An unrelated claim cannot resume this stop',
-    review: { ref: reference(result) } }));
+  refusedWith(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'An unrelated claim cannot resume this stop',
+    review: { ref: reference(result) } }), 'record_foreign');
 });
 
 test('A6 rejects identical reviewer and implementer identities before E1 or sending', async t => {
@@ -249,7 +242,7 @@ test('A6 rejects identical reviewer and implementer identities before E1 or send
     value: { ...value, reviewer: { ...value.reviewer, actor: value.implementer.actor } } });
   const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(imitation) } };
   const before = canonical(f.store.list());
-  refusal(await runStopAnalysis(f.store, request), 'assessor_not_independent');
+  refusedWith(await runStopAnalysis(f.store, request), 'assessor_not_independent');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
@@ -259,7 +252,7 @@ test('A6 checks the actual reviewer wire against V1 before recording or sending 
     reviewer: { ...value.reviewer, model: 'm'.repeat(200_000) } }, f.environment.revision);
   const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(large) } };
   const before = canonical(f.store.list());
-  refusal(await runStopAnalysis(f.store, request), 'context_too_large');
+  refusedWith(await runStopAnalysis(f.store, request), 'context_too_large');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
@@ -267,7 +260,7 @@ test('A6 an environment without its required request capacity fails before E1 or
   const f = fixture(t), { requestCapacityChars: _capacity, ...legacy } = f.environment.value;
   const missing = new Environments(f.store).configure(f.project, legacy, f.environment.revision);
   const before = canonical(f.store.list());
-  refusal(await runStopAnalysis(f.store, { ...f.request, dispatch: { ...f.request.dispatch, config: reference(missing) } }));
+  refusedWith(await runStopAnalysis(f.store, { ...f.request, dispatch: { ...f.request.dispatch, config: reference(missing) } }), 'capacity_missing');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
@@ -311,10 +304,10 @@ test('A6 unestablished origin records the known outcome without lifting a hold o
 test('A6 a claimed origin class unsupported by its exact grounds preserves the raw call and never lifts the hold', async t => {
   const f = fixture(t, 'block', true), before = preserved(f);
   scenario(f, answer(f, { origin: { class: 'derivation', basis: f.originSources } }));
-  refusal(await runStopAnalysis(f.store, f.request));
+  refusedWith(await runStopAnalysis(f.store, f.request), 'lift_unusable');
   assert.equal(preserved(f), before); assert.equal(f.store.list('om-origin-analysis').length, 0);
   assert.equal(f.store.list('model-call').length, 1); assert.equal(f.sent().length, 1);
-  f.restart(); refusal(await runStopAnalysis(f.store, f.request)); assert.equal(f.sent().length, 1);
+  f.restart(); refusedWith(await runStopAnalysis(f.store, f.request), 'lift_unusable'); assert.equal(f.sent().length, 1);
 });
 
 for (const boundary of ['admission', 'physical'] as const) test(`A6 changed report guard loses the ${boundary} transaction before provider dispatch`, async t => {
@@ -330,7 +323,7 @@ for (const boundary of ['admission', 'physical'] as const) test(`A6 changed repo
       other.write({ id: journal.id, kind: journal.kind, expected: journal.revision, value: journal.value });
     }
   });
-  try { refusal(await runStopAnalysis(f.store, f.request)); } finally { restore(); }
+  try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { restore(); }
   assert.equal(raced, true); assert.equal(f.sent().length, 0); assert.equal(f.store.list('model-call').length, 0);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(seriesNow(f).value.stop!.attempt, 3);
   assert.equal(f.store.list('call-record').length, boundary === 'admission' ? 0 : 1);
@@ -343,7 +336,7 @@ test('A6 malformed request and foreign exact series fail with addressed typed er
       error instanceof EngineError && typeof error.code === 'string' && Boolean(error.details));
   }
   const foreign: Ref = { ...f.request.series, hash: '0'.repeat(64) };
-  refusal(await runStopAnalysis(f.store, { ...f.request, series: foreign }));
+  refusedWith(await runStopAnalysis(f.store, { ...f.request, series: foreign }), 'record_forged');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
@@ -355,9 +348,9 @@ test('A6 the saved A5 source set requires its exact journal and every held origi
   const before = canonical(f.store.list()), restore = forbidSourceHeads(f, prepared.intent.report.guards);
   try {
     assert.deepEqual(ok(readStopReport(f.store, { project: f.project, sources })), prepared.intent.report);
-    refusal(readStopReport(f.store, { project: f.project, sources: { ...sources, journal: null } }));
-    refusal(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [] } }));
-    refusal(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [...sources.holds, ...sources.holds] } }));
+    refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, journal: null } }), 'refusals_unlinked');
+    refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [] } }), 'hold_invalid');
+    refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [...sources.holds, ...sources.holds] } }), 'hold_invalid');
     const { journal: _journal, ...missing } = sources;
     assert.throws(() => readStopReport(f.store, { project: f.project, sources: missing as typeof sources }), EngineError);
   } finally { restore(); }
@@ -375,12 +368,12 @@ test('A6 a source moving at answer application preserves raw usage and refuses a
       other.write({ id: journal.id, kind: journal.kind, expected: journal.revision, value: journal.value });
     }
   });
-  try { refusal(await runStopAnalysis(f.store, f.request)); } finally { restore(); }
+  try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { restore(); }
   assert.equal(raced, true); assert.deepEqual(reference(seriesNow(f)), before);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 1);
   assert.deepEqual(f.store.list<{ usage: unknown }>('model-call').map(record => record.value.usage), [usage]);
   f.restart(); const saved = canonical(f.store.list());
-  refusal(await runStopAnalysis(f.store, f.request));
+  refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale');
   assert.equal(f.sent().length, 1); assert.equal(canonical(f.store.list()), saved);
 });
 
@@ -417,7 +410,7 @@ test('A6 missing mandatory intent fields refuse before E1 and physical dispatch'
     const value = structuredClone(write.value) as Record<string, unknown>; delete value[field];
     f.store.write({ ...write, value });
     const before = canonical(f.store.list());
-    refusal(await runStopAnalysis(f.store, f.request), 'analysis_invalid');
+    refusedWith(await runStopAnalysis(f.store, f.request), 'analysis_invalid');
     assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
   }
 });
@@ -428,9 +421,9 @@ test('A6 missing saved result fields cannot be read as a producer-checked analys
     const restore = observeWrites(f, writes => {
       for (const write of writes) if (write.kind === 'om-stop-review') delete (write.value as Record<string, unknown>)[field];
     });
-    try { refusal(await runStopAnalysis(f.store, f.request), 'analysis_invalid'); } finally { restore(); }
+    try { refusedWith(await runStopAnalysis(f.store, f.request), 'analysis_invalid'); } finally { restore(); }
     const saved = f.store.list('om-stop-review')[0]!;
-    refusal(readStopAnalysis(f.store, { project: f.project, record: reference(saved) }), 'analysis_invalid');
+    refusedWith(readStopAnalysis(f.store, { project: f.project, record: reference(saved) }), 'analysis_invalid');
     assert.equal(preserved(f), before); assert.equal(f.sent().length, 1);
   }
 });
@@ -454,9 +447,9 @@ test('A6 history rejects a real E1 and physical response bound to a different ac
     stop: 3, goals: [...f.series.value.stop!.goals].sort(), attempt: 3, row: null, class: null, basis: [],
   } });
   const before = canonical(f.store.list());
-  const denied = refusal(readStopAnalysis(f.store, { project: f.project, record: reference(imitation) }), 'analysis_invalid');
+  const denied = refusedWith(readStopAnalysis(f.store, { project: f.project, record: reference(imitation) }), 'analysis_invalid');
   assert.equal(denied.at.field, 'transport');
-  refusal(await runStopAnalysis(f.store, f.request), 'analysis_invalid');
+  refusedWith(await runStopAnalysis(f.store, f.request), 'analysis_invalid');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 1);
 });
 
@@ -468,11 +461,11 @@ test('A6 an inherited saved stop cannot acquire a second reviewer call through a
     basis: { ground: 'inputs-changed', text: 'The next input slice retains the unaddressed stop.' } }));
   assert.deepEqual(successor.value.stop, f.series.value.stop);
   const before = canonical(f.store.list());
-  refusal(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
+  refusedWith(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
   assert.equal(canonical(f.store.list()), before); assert.equal(f.store.list('call-record').length, 1);
   f.restart();
   assert.deepEqual(ok(await runStopAnalysis(f.store, f.request)), original);
-  refusal(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
+  refusedWith(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
   assert.equal(f.sent().length, 1);
 });
 
@@ -488,7 +481,7 @@ test('A6 the exact checked intent cannot change between preparation and E1 admis
     }
     return found;
   }) as Store['get'];
-  try { refusal(await runStopAnalysis(f.store, f.request)); } finally { f.store.get = original; }
+  try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { f.store.get = original; }
   assert.equal(raced, true); assert.equal(f.store.get(intent.id)!.revision, intent.revision + 1);
   assert.equal(f.store.list('call-record').length, 0); assert.equal(f.store.list('model-call').length, 0);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 0);
@@ -540,7 +533,7 @@ test('A6 a durable running claim before spawn retains its reservation through re
   const physical = f.store.list<{ status: string; usage: unknown }>('model-call');
   assert.equal(physical.length, 1); assert.equal(physical[0]!.value.status, 'running'); assert.equal(physical[0]!.value.usage, null);
   f.restart(); const saved = canonical(f.store.list());
-  for (let repeat = 0; repeat < 2; repeat++) refusal(await runStopAnalysis(f.store, f.request), 'model_call_in_progress');
+  for (let repeat = 0; repeat < 2; repeat++) refusedWith(await runStopAnalysis(f.store, f.request), 'model_call_in_progress');
   assert.equal(canonical(f.store.list()), saved); assert.equal(f.store.list('call-record').length, 1);
   assert.equal(f.store.list('model-call').length, 1); assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 0);
 });
@@ -568,7 +561,7 @@ for (const boundary of ['E1', 'E4'] as const) for (const mode of ['absent', 'con
       const outcome = boundary === 'E1' ? recordCall(f.store, f.project, call, extra)
         : await runModelTransport(f.store, { project: f.project, call: reference(ok(admitted!).call),
           packet: JSON.parse(canonical(prepared.intent.packet)) as Json, role: 'reviewer' }, undefined, extra);
-      const denied = refusal(outcome, 'input_stale'); assert.equal(denied.at.target, id);
+      const denied = refusedWith(outcome, 'input_stale'); assert.equal(denied.at.target, id);
       assert.equal(denied.at.ref, undefined);
     } finally { restore(); }
     assert.equal(raced, true); assert.equal(f.sent().length, 0);

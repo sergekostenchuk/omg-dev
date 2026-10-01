@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { EngineError } from "../src/errors.js";
 import type { Graph, Node } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
+import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
 import type { TaskRun } from "../src/execution/model.js";
 import { git, inspectRepository, type ExecutionRoot, type RepositoryState } from "../src/runtime/environment.js";
@@ -20,6 +22,57 @@ import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 
 export type GardenVariant = "standard" | "cross";
 export const OM_FIXTURE_ERROR = "om_fixture_invalid";
+
+// A refusal is checked together with its code: a check that accepts any addressed refusal is green for whatever refused
+// first. The expected code is required and never defaulted — an empty string, an empty list and an empty item fail here
+// instead of silently passing — and the two channels stay apart: a negative OmResult is refusedWith, a thrown EngineError
+// is thrownWith. Neither says a record was saved or not; the caller's snapshot checks do. Every test of a value here is
+// strict (`=== false`, `typeof … === "string"`, `instanceof`, list membership): a truthiness test would let a damaged
+// envelope or a lookalike turn a check green.
+const shown = (value: unknown): string => value === null ? "null" : typeof value === "object" ? "an object" : String(value);
+
+const notRefusal = (wanted: string, result: unknown): string => {
+  const flag = (result as { readonly ok?: unknown }).ok;
+  return flag === true ? `${wanted}, received success` : `${wanted}, received a result whose ok is ${shown(flag)}`;
+};
+
+function expectedCodes(code: string | readonly string[]): readonly string[] {
+  const codes: unknown = typeof code === "string" ? [code] : code;
+  assert.ok(Array.isArray(codes) && codes.length > 0 && codes.every(item => typeof item === "string" && item.length > 0),
+    "A refusal check names its expected code: a non-empty string or a non-empty list of non-empty strings");
+  return codes as readonly string[];
+}
+
+/** The returned refusal of a negative result carries one of the named codes, an address and a reason. */
+export function refusedWith(result: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const codes = expectedCodes(code);
+  const wanted = `Expected a refusal ${codes.join(" | ")}`;
+  assert.ok(typeof result === "object" && result !== null, `${wanted}, received ${shown(result)}`);
+  // The discriminator of a refusal is the literal `ok: false`: a missing, null, zero or otherwise falsy flag is a damaged
+  // envelope, not a refusal, and `true` is an unexpected success.
+  if (result.ok !== false) assert.fail(notRefusal(wanted, result));
+  const refusal: unknown = result.refusal;
+  assert.ok(typeof refusal === "object" && refusal !== null, `${wanted}, received a result without a refusal`);
+  const { code: received, message, at } = refusal as { readonly code?: unknown; readonly message?: unknown; readonly at?: unknown };
+  assert.ok(typeof received === "string" && codes.includes(received), `Expected ${codes.join(" | ")}, received ${shown(received)}: ${shown(message)}`);
+  assert.ok(typeof at === "object" && at !== null && typeof (at as { target?: unknown }).target === "string"
+    && (at as { target: string }).target.length > 0, "A refusal is addressed");
+  assert.ok(typeof message === "string" && message.length > 0, "A refusal says why");
+  return result.refusal;
+}
+
+/** The call throws an EngineError with one of the named codes; a returned result, even a refusal, does not count. */
+export function thrownWith(action: () => unknown, code: string | readonly string[]): EngineError {
+  const codes = expectedCodes(code);
+  let outcome: { readonly thrown: true; readonly error: unknown } | { readonly thrown: false };
+  // The failure of this check stays outside the try: its own AssertionError is never taken for the expected exception.
+  try { action(); outcome = { thrown: false }; } catch (error) { outcome = { thrown: true, error }; }
+  if (!outcome.thrown) assert.fail(`Expected ${codes.join(" | ")} to be thrown, the call returned`);
+  const error = outcome.error;
+  assert.ok(error instanceof EngineError, `Expected an EngineError ${codes.join(" | ")}, received ${shown(error)}`);
+  assert.ok(typeof error.code === "string" && codes.includes(error.code), `Expected ${codes.join(" | ")}, received ${shown(error.code)}: ${shown(error.message)}`);
+  return error;
+}
 
 export interface FixtureLayer {
   projection: ReturnType<typeof projectGraph>;

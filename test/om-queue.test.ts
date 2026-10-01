@@ -31,7 +31,7 @@ import type { LayerProposal } from '../src/om/frame-proposals.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { readLayerAcceptance } from '../src/om/layer-basis.js';
-import { gardenGraph, createOmFixture } from './om-fixture.js';
+import { gardenGraph, createOmFixture, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 
 const project = 'garden', producer = 'garden-produce-block', consumer = 'garden-consume-block';
@@ -40,13 +40,6 @@ const clone = structuredClone;
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
-}
-function rejected(result: OmResult<unknown>, code?: string) {
-  assert.equal(result.ok, false);
-  if (result.ok) assert.fail('Expected an addressed refusal');
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target); assert.ok(result.refusal.message);
-  return result.refusal;
 }
 function malformed(action: () => unknown) {
   assert.throws(action, (error: unknown) => error instanceof EngineError && error.code === 'queue_request_invalid');
@@ -128,12 +121,12 @@ test('queue P uses the single explicit successful journey without guessing from 
   const selected = { ...original, machinePath: { ...original.machinePath, journeyId: other.id, actorId: other.actor, outcomeId: other.outcome } };
   assert.deepEqual(ok(computeBlockWeights(graph, blocksOf(graph), selected)).order.filter(row => row.P).map(row => row.block).sort(), [later, producer].sort());
   for (const change of [{ journeyId: 'unknown' }, { actorId: 'other' }, { outcomeId: 'other' }])
-    rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath, ...change } }), 'queue_policy_invalid');
+    refusedWith(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath, ...change } }), 'queue_policy_invalid');
   const failed = graph.journeys!.find(item => item.terminal === 'safe_failure')!;
-  rejected(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath,
+  refusedWith(computeBlockWeights(graph, blocksOf(graph), { ...original, machinePath: { ...original.machinePath,
     journeyId: failed.id, actorId: failed.actor, outcomeId: failed.outcome } }), 'queue_policy_invalid');
   graph.journeys!.push(clone(graph.journeys!.find(item => item.id === original.machinePath.journeyId)!));
-  rejected(computeBlockWeights(graph, blocksOf(graph), original), 'queue_policy_invalid');
+  refusedWith(computeBlockWeights(graph, blocksOf(graph), original), 'queue_policy_invalid');
 });
 
 test('queue S classifies all eight outcome durabilities, independently of boundary state', () => {
@@ -150,9 +143,9 @@ test('queue S classifies all eight outcome durabilities, independently of bounda
       ...graph.nodes.find(node => node.id === later)!.boundary, [field]: producer };
     assert.equal(ok(computeBlockWeights(graph, [producer], policy(graph))).order[0]!.S, 1, `another block assigns ${field}`);
     const missingDurability = clone(graph); delete missingDurability.artifacts.find(item => item.id === 'garden-data')!.durability;
-    rejected(computeBlockWeights(missingDurability, [producer], policy(graph)), 'queue_source_invalid');
+    refusedWith(computeBlockWeights(missingDurability, [producer], policy(graph)), 'queue_source_invalid');
     const missingOutcome = clone(graph); missingOutcome.artifacts = graph.artifacts.filter(item => item.id !== 'garden-data');
-    rejected(computeBlockWeights(missingOutcome, [producer], policy(graph)), 'queue_source_invalid');
+    refusedWith(computeBlockWeights(missingOutcome, [producer], policy(graph)), 'queue_source_invalid');
   }
 });
 
@@ -177,11 +170,11 @@ test('queue public inputs distinguish absent sources and sets from explicitly em
     const given = clone(p) as any; delete given.machinePath[field];
     malformed(() => computeBlockWeights(graph, rows, given));
   }
-  rejected(computeBlockWeights(graph, [], p), 'queue_source_invalid');
-  rejected(computeBlockWeights(graph, rows, { ...p, version: 'unknown' } as unknown as QueuePolicy), 'queue_policy_invalid');
-  rejected(computeBlockWeights(graph, rows, { ...p, coefficients: { D: 99, P: 0, S: 0 } } as QueuePolicy), 'queue_policy_invalid');
-  rejected(computeBlockWeights(graph, ['unknown'], p), 'queue_source_invalid');
-  rejected(computeBlockWeights(graph, [consumer, consumer], p), 'queue_source_invalid');
+  refusedWith(computeBlockWeights(graph, [], p), 'queue_source_invalid');
+  refusedWith(computeBlockWeights(graph, rows, { ...p, version: 'unknown' } as unknown as QueuePolicy), 'queue_policy_invalid');
+  refusedWith(computeBlockWeights(graph, rows, { ...p, coefficients: { D: 99, P: 0, S: 0 } } as QueuePolicy), 'queue_policy_invalid');
+  refusedWith(computeBlockWeights(graph, ['unknown'], p), 'queue_source_invalid');
+  refusedWith(computeBlockWeights(graph, [consumer, consumer], p), 'queue_source_invalid');
 });
 
 test('historical omg-live r2 has the accepted 24-block policy calculation without claiming a saved horizon', () => {
@@ -250,16 +243,16 @@ test('H1.1 №1844-7 №1852-4 the machine path is the minimum canonical key amo
     assert.equal(ok(selectMachinePath({ ...clone(graph), journeys }, blocks, ['garden-result'], layer)).journeyId, 'garden-a-journey');
   // No admitted journey of the intent: the machine's own refusal, addressed to the exact L1, never the owner's.
   const none = { ...clone(graph), journeys: graph.journeys!.filter(item => item.outcome !== 'garden-result' || item.terminal !== 'success') };
-  const empty = rejected(selectMachinePath(none, blocks, ['garden-result'], layer), 'queue_policy_invalid');
+  const empty = refusedWith(selectMachinePath(none, blocks, ['garden-result'], layer), 'queue_policy_invalid');
   assert.deepEqual([empty.route, empty.at.target, empty.at.field], ['producer', layer.id, 'machinePath']);
   // A refused common source is returned as it is, never skipped for the next convenient path.
   const broken = { ...clone(graph), edges: [{ id: 'garden-edge', relation: 'unknown', source: blocks[0]!, target: blocks[1]! }] } as unknown as Graph;
-  rejected(selectMachinePath(broken, blocks, ['garden-result'], layer), 'queue_source_invalid');
+  refusedWith(selectMachinePath(broken, blocks, ['garden-result'], layer), 'queue_source_invalid');
 });
 test('H1.1 №1852-4 a queue never orders a horizon by the path of another outcome', t => {
   const f = fixture(t);
   const foreign = { ...f.request, policy: { ...f.request.policy, machinePath: { ...f.request.policy.machinePath, outcomeId: 'garden-later' } } };
-  const refused = rejected(prepareBlockQueue(f.store, foreign), 'queue_policy_invalid');
+  const refused = refusedWith(prepareBlockQueue(f.store, foreign), 'queue_policy_invalid');
   assert.deepEqual([refused.route, refused.at.field], ['producer', 'machinePath']);
 });
 test('a genuine accepted L1 and horizon produce the first queue before L2 without requiring gaps', t => {
@@ -293,7 +286,7 @@ test('owner permutation is complete, explicit and reasoned; another horizon and 
   assert.equal(saved.value.request.override!.reason, reversed.override.reason);
   for (const override of [{ order: [consumer], reason: 'Missing producer' }, { order: [consumer,consumer], reason: 'Duplicate' },
     { order: [consumer,producer,later], reason: 'Foreign block' }, { order: [consumer,producer], reason: '' }])
-    rejected(prepareBlockQueue(f.store, { ...f.request, override }), 'queue_override_invalid');
+    refusedWith(prepareBlockQueue(f.store, { ...f.request, override }), 'queue_override_invalid');
   const nextHorizon = f.horizon('new-choice'), next = ok(writeBlockQueue(f.store, { ...f.request, horizon: reference(nextHorizon.gate) }));
   assert.notEqual(next.id, initial.id);
   assert.deepEqual(f.store.history(series.id), beforeSeries);
@@ -306,7 +299,7 @@ test('queue history uses original exact sources after heads change and restart w
     const graph = clone(f.graph.value); graph.nodes.find(node => node.id === producer)!.title += ' changed';
     new ProductEngine(other).graphs.save(project, graph, f.graph.revision, 'owner');
   } finally { other.close(); }
-  rejected(prepareBlockQueue(f.store, f.request), 'frame_upper_drift');
+  refusedWith(prepareBlockQueue(f.store, f.request), 'frame_upper_drift');
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try { assert.deepEqual(ok(readBlockQueue(exact, { project, record: reference(saved) })), saved); }
@@ -329,7 +322,7 @@ function everyGuardAtomic(f: ReturnType<typeof fixture>, guards: readonly Transa
         assert.deepEqual(reference(row), guard);
         other.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
       }
-      rejected(writeGuarded(target, { unit: 'M3', target: `guard-${index}`,
+      refusedWith(writeGuarded(target, { unit: 'M3', target: `guard-${index}`,
         writes, guards }), 'input_stale');
       assert.deepEqual(writes.map(write => target.get(write.id)), before, `No partial writes after ${guard.id} changed`);
     } finally { other.close(); target.close(); }
@@ -359,12 +352,13 @@ test('saved queue rederives its exact source, policy, features and permutation i
   ]) {
     const value = clone(saved.value) as Record<string, any>; mutate(value);
     const changed = rewrite(f.store, saved, value as typeof saved.value);
-    rejected(readBlockQueue(f.store, { project, record: reference(changed) }));
-    f.restart(); rejected(readBlockQueue(f.store, { project, record: reference(changed) }));
+    refusedWith(readBlockQueue(f.store, { project, record: reference(changed) }), 'queue_record_invalid');
+    f.restart(); refusedWith(readBlockQueue(f.store, { project, record: reference(changed) }), 'queue_record_invalid');
     rewrite(f.store, saved, saved.value);
   }
-  for (const change of [{ id: 'block-weight:other:foreign' }, { hash: '0'.repeat(64) }, { revision: 999 }])
-    rejected(readBlockQueue(f.store, { project, record: { ...reference(saved), ...change } }));
+  for (const [change, code] of [[{ id: 'block-weight:other:foreign' }, 'record_foreign'], [{ hash: '0'.repeat(64) }, 'record_forged'],
+    [{ revision: 999 }, 'record_missing']] as const)
+    refusedWith(readBlockQueue(f.store, { project, record: { ...reference(saved), ...change } }), code);
 });
 
 function routedFixture(f: ReturnType<typeof fixture>, horizon = reference(f.first.gate), graph = reference(f.graph)) {
@@ -395,13 +389,13 @@ test('question ordering reads real M5 and M6 consumer groups once without multip
   malformed(() => readQuestionQueue(f.store, { project, queue: reference(queue) } as Parameters<typeof readQuestionQueue>[1]));
   malformed(() => prepareQuestionQueue(f.store, { ...request, routes: null } as unknown as Parameters<typeof prepareQuestionQueue>[1]));
   const another = f.horizon('another-route-choice'), foreign = routedFixture(f, reference(another.gate));
-  rejected(readQuestionQueue(f.store, { ...request, routes: reference(foreign.routes) }), 'queue_source_invalid');
+  refusedWith(readQuestionQueue(f.store, { ...request, routes: reference(foreign.routes) }), 'queue_source_invalid');
   const original = clone(routes.value) as RoutesRecord;
   for (const mutate of [(value: typeof original) => { value.batches.pop(); },
     (value: typeof original) => { value.batches[0]!.items[0]!.consumers = []; }]) {
     const value = clone(original); mutate(value);
     const changed = rewrite(f.store, routes, value);
-    rejected(readQuestionQueue(f.store, { ...request, routes: reference(changed) }));
+    refusedWith(readQuestionQueue(f.store, { ...request, routes: reference(changed) }), 'route_record_invalid');
     rewrite(f.store, routes, original);
   }
   const graph = clone(f.graph.value); graph.nodes.find(node => node.id === producer)!.title += ' changed';
@@ -409,7 +403,7 @@ test('question ordering reads real M5 and M6 consumer groups once without multip
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try { assert.deepEqual(ok(readQuestionQueue(exact, request)), selected); } finally { exact.close(); }
-  rejected(prepareQuestionQueue(f.store, request), 'input_stale');
+  refusedWith(prepareQuestionQueue(f.store, request), 'input_stale');
 });
 
 test('an explicit empty model batch set from complete M5 and M6 selects no questions without treating missing routes as empty', async t => {
@@ -444,7 +438,7 @@ test('an explicit empty model batch set from complete M5 and M6 selects no quest
   const request = { project, queue: reference(queue), routes: reference(routes) };
   assert.deepEqual(ok(readQuestionQueue(f.store, request)).order, []);
   assert.deepEqual(ok(prepareQuestionQueue(f.store, request)).order, []);
-  rejected(readQuestionQueue(f.store, { ...request, routes: { ...request.routes, revision: 900 } }), 'record_missing');
+  refusedWith(readQuestionQueue(f.store, { ...request, routes: { ...request.routes, revision: 900 } }), 'record_missing');
 });
 
 test('the question-queue admission retains current route guards for an atomic consumer transaction', t => {
@@ -482,14 +476,14 @@ test('saved queue entry points reject incomplete public sources before reading o
     malformed(() => readBlockQueue(noRead, request as Parameters<typeof readBlockQueue>[1]));
   const wrongLayer = { ...f.request, policy: { ...f.request.policy,
     machinePath: { ...f.request.policy.machinePath, layer: { ...f.layer, hash: '0'.repeat(64) } } } };
-  rejected(prepareBlockQueue(f.store, wrongLayer), 'queue_policy_invalid');
+  refusedWith(prepareBlockQueue(f.store, wrongLayer), 'queue_policy_invalid');
   const changedGraph = clone(f.graph.value);
   changedGraph.nodes.find(node => node.id === producer)!.title += ' changed';
   new ProductEngine(f.store).graphs.save(project, changedGraph, f.graph.revision, 'owner');
   const otherSavedLayer = f.store.get(f.layer.id)!;
   assert.notEqual(otherSavedLayer.revision, f.layer.revision, 'The graph producer saved a different exact L1 revision');
   for (const layer of [{ ...f.layer, id: 'graph-layer:other:1' }, reference(otherSavedLayer)])
-    rejected(prepareBlockQueue(f.store, { ...f.request, policy: { ...f.request.policy,
+    refusedWith(prepareBlockQueue(f.store, { ...f.request, policy: { ...f.request.policy,
       machinePath: { ...f.request.policy.machinePath, layer } } }), 'queue_policy_invalid');
 });
 
@@ -676,8 +670,8 @@ test('late queue preparation refuses a changed accepted L1 while the original H 
   assert.notDeepEqual(newLayer, f.layer);
   assert.deepEqual(f.store.get(f.first.gate.id), f.first.gate);
   const request = { ...f.request, override: { order: [consumer, producer], reason: 'Reorder after the graph changed' } };
-  rejected(prepareBlockQueue(f.store, request));
-  rejected(prepareBlockQueue(f.store, { ...request, policy: { ...request.policy,
+  refusedWith(prepareBlockQueue(f.store, request), 'frame_upper_drift');
+  refusedWith(prepareBlockQueue(f.store, { ...request, policy: { ...request.policy,
     machinePath: { ...request.policy.machinePath, layer: newLayer } } }), 'queue_policy_invalid');
   f.restart();
   const exact = new ExactOnlyStore(f.path);
@@ -692,9 +686,9 @@ test('the extracted horizon admission retains the existing frame layer and upper
   const read = ok(readFrame(f.store, operations)), prepared = ok(prepareFrame(f.store, operations));
   assert.deepEqual(prepared.result, read.result);
   assert.deepEqual(prepared.expected, { graph: accepted.graph.revision, layer: accepted.layer.revision, frame: accepted.frame.revision });
-  rejected(prepareFrame(f.store, { ...operations, layer: null, frame: null }));
-  rejected(prepareFrame(f.store, { ...operations, frame: null }));
-  rejected(prepareFrame(f.store, { ...operations, layer: { ...operations.layer!, revision: 999 } }), 'record_missing');
+  refusedWith(prepareFrame(f.store, { ...operations, layer: null, frame: null }), 'input_stale');
+  refusedWith(prepareFrame(f.store, { ...operations, frame: null }), 'frame_basis_unproven');
+  refusedWith(prepareFrame(f.store, { ...operations, layer: { ...operations.layer!, revision: 999 } }), 'record_missing');
   const witness = ok(writeHorizon(f.store, { project, input: reference(f.input), graph: reference(accepted.graph),
     refinement: reference(accepted.layer), available: {},
     choice: { choiceVersion: 'queue-frame-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
@@ -702,9 +696,9 @@ test('the extracted horizon admission retains the existing frame layer and upper
     layer: null, frame: null, upper: { horizon: reference(witness.gate), frame: reference(accepted.frame) } };
   const worksRead = ok(readFrame(f.store, works)), worksPrepared = ok(prepareFrame(f.store, works));
   assert.deepEqual(worksPrepared.result, worksRead.result);
-  rejected(prepareFrame(f.store, { ...works, upper: { horizon: f.request.horizon, frame: reference(accepted.frame) } }));
-  rejected(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: null } }));
-  rejected(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: { ...reference(accepted.frame), hash: '0'.repeat(64) } } }));
+  refusedWith(prepareFrame(f.store, { ...works, upper: { horizon: f.request.horizon, frame: reference(accepted.frame) } }), 'frame_basis_unproven');
+  refusedWith(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: null } }), 'frame_basis_unproven');
+  refusedWith(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: { ...reference(accepted.frame), hash: '0'.repeat(64) } } }), 'frame_basis_unproven');
   const historicalWorks = ok(readFrame(f.store, { ...works, workZoneContract: 'accepted-l2-v1' }));
   f.restart();
   const exact = new ExactOnlyStore(f.path);
@@ -725,15 +719,16 @@ test('late admission cannot replace missing H, B1, policy or required exact upst
       const value: unknown = Reflect.get(target, key, target);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    rejected(prepareBlockQueue(missing, request));
-    rejected(readBlockQueue(missing, { project, record: reference(saved) }));
+    const code = hidden.id === f.layer.id ? 'stage_not_accepted' : 'record_missing';
+    refusedWith(prepareBlockQueue(missing, request), code);
+    refusedWith(readBlockQueue(missing, { project, record: reference(saved) }), code);
   }
   const choices = [
     { ...request.policy, version: 'unknown-version' },
     { ...request.policy, machinePath: { ...request.policy.machinePath, actorId: 'a-different-owner' } },
     { ...request.policy, coefficients: { D: 1, P: 1, S: 1 } },
   ];
-  for (const selection of choices) rejected(prepareBlockQueue(f.store, { ...request, policy: selection as QueuePolicy }), 'queue_policy_invalid');
+  for (const selection of choices) refusedWith(prepareBlockQueue(f.store, { ...request, policy: selection as QueuePolicy }), 'queue_policy_invalid');
   assert.equal(canonical(snapshots(f.store)), before);
 });
 
@@ -768,9 +763,9 @@ test('frame availability and explicit upper checks stay current while only M3 re
   try { other.write({ id: refinement.id, kind: refinement.kind, expected: refinement.revision, value: refinement.value }); }
   finally { other.close(); }
   ok(prepareFrame(f.store, operations));
-  const upperFailure = rejected(prepareFrame(f.store, works), 'frame_basis_unproven');
+  const upperFailure = refusedWith(prepareFrame(f.store, works), 'frame_basis_unproven');
   assert.equal(upperFailure.at.target, refinement.id, 'The current upper-layer gate keeps the original refinement address');
-  rejected(prepareBlockQueue(f.store, { ...request, override: { order: [consumer], reason: 'Reordered after refinement changed' } }), 'input_stale');
+  refusedWith(prepareBlockQueue(f.store, { ...request, override: { order: [consumer], reason: 'Reordered after refinement changed' } }), 'input_stale');
   f.reopen();
   ok(prepareFrame(f.store, operations));
   const exact = new ExactOnlyStore(f.database);
@@ -782,7 +777,7 @@ test('frame availability and explicit upper checks stay current while only M3 re
   const receiptWriter = new Store(f.database);
   try { receiptWriter.write({ id: receipt.id, kind: receipt.kind, expected: receipt.revision, value: receipt.value }); }
   finally { receiptWriter.close(); }
-  rejected(prepareFrame(f.store, operations), 'input_stale');
+  refusedWith(prepareFrame(f.store, operations), 'input_stale');
   assert.deepEqual(ok(readFrame(f.store, operations)), originalFrame);
 });
 
@@ -796,8 +791,8 @@ test('queue and common horizon admission reject graph-only upper drift while the
   assert.deepEqual(f.store.get(f.first.gate.id), f.first.gate);
   assert.deepEqual(f.store.get(f.input.id), f.input);
   for (let pass = 0; pass < 2; pass++) {
-    rejected(prepareHorizonBasis(f.store, { project, graph: reference(next), horizon: f.request.horizon }), 'frame_upper_drift');
-    rejected(prepareBlockQueue(f.store, { ...f.request, override: { order: [consumer, producer], reason: 'A new order does not accept a changed upper' } }), 'frame_upper_drift');
+    refusedWith(prepareHorizonBasis(f.store, { project, graph: reference(next), horizon: f.request.horizon }), 'frame_upper_drift');
+    refusedWith(prepareBlockQueue(f.store, { ...f.request, override: { order: [consumer, producer], reason: 'A new order does not accept a changed upper' } }), 'frame_upper_drift');
     const exact = new ExactOnlyStore(f.path);
     try { assert.deepEqual(ok(readBlockQueue(exact, { project, record: reference(saved) })), saved); }
     finally { exact.close(); }
@@ -836,7 +831,7 @@ test('concurrent creation of the same prepared queue preserves its CAS and leave
   let concurrent: typeof prepared.record;
   try { concurrent = ok(writeBlockQueue(other, f.request)); }
   finally { other.close(); }
-  const failure = rejected(writeGuarded(f.store, { unit: 'M3', target: prepared.record.id,
+  const failure = refusedWith(writeGuarded(f.store, { unit: 'M3', target: prepared.record.id,
     guards: prepared.guards, writes: [...prepared.writes,
       { id: 'queue-target-cas-neighbor', kind: 'test', expected: 0, value: {} }] }), 'revision_conflict');
   assert.equal(failure.at.target, prepared.record.id);

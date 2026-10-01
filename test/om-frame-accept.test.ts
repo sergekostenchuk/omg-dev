@@ -25,7 +25,7 @@ import { prepareCandidate, writeCandidate } from '../src/om/frame-candidate.js';
 import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, readRejectedCandidate, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal, type AcceptedFrameRequest, type Settlement } from '../src/om/frame-accept.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { gardenGraph, createOmFixture } from './om-fixture.js';
+import { gardenGraph, createOmFixture, refusedWith, thrownWith } from './om-fixture.js';
 import { prepareRebaseFrame, rebaseFrame } from '../src/om/frame-accept.js';
 import { buildRebasedLayer, readRebaseBasis, readLayerAcceptance, readAcceptedFrameLayer, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
@@ -170,8 +170,8 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
       { id: moved.layer.id, kind: 'graph-layer', expected: f.from.layer!.revision, value: layer }]);
     const forged = { frame: { ...current, frame: frameRef, layer: reference(written[1]!) }, proposals: [] };
     const changed = snapshot(forgedStore);
-    for (const read of [readFrameProposals, prepareFrameProposals]) refusal(read(forgedStore, forged), 'frame_basis_unproven');
-    for (const action of [prepareGaps, writeGaps]) refusal(action(forgedStore, { ...gapRequest, works: forged }), 'frame_basis_unproven');
+    for (const read of [readFrameProposals, prepareFrameProposals]) refusedWith(read(forgedStore, forged), 'frame_basis_unproven');
+    for (const action of [prepareGaps, writeGaps]) refusedWith(action(forgedStore, { ...gapRequest, works: forged }), 'frame_basis_unproven');
     assert.deepEqual(snapshot(forgedStore), changed);
   } finally { forgedStore.close(); }
   const markerPath = join(f.f.root, 'missing-rebase-marker.sqlite'); copyFileSync(branch.path, markerPath);
@@ -181,7 +181,7 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
       { id: moved.layer.id, kind: moved.layer.kind, expected: f.from.layer!.revision,
         value: { ...moved.layer.value, acceptance: { producer: 'om' } } }]);
     const before = snapshot(markerStore);
-    for (const action of [prepareRebaseFrame, rebaseFrame]) refusal(action(markerStore, f.request), 'frame_acceptance_invalid');
+    for (const action of [prepareRebaseFrame, rebaseFrame]) refusedWith(action(markerStore, f.request), 'frame_acceptance_invalid');
     assert.deepEqual(snapshot(markerStore), before);
   } finally { markerStore.close(); }
   const graphHead = f.store.get<Graph>('graph:garden')!;
@@ -232,7 +232,7 @@ test('C5 rebase refuses graph edits outside acceptance and guards its entire tra
       const head = isolated.get(guard.id)!;
       isolated.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
       const changed = snapshot(isolated);
-      refusal(writeGuarded(isolated, { unit: 'rebase-neighbor', target: 'rebase', guards: prepared.guards, writes: [...prepared.writes,
+      refusedWith(writeGuarded(isolated, { unit: 'rebase-neighbor', target: 'rebase', guards: prepared.guards, writes: [...prepared.writes,
         { id: 'neighbor:rebase', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');
       assert.deepEqual(snapshot(isolated), changed);
     } finally { isolated.close(); }
@@ -241,7 +241,7 @@ test('C5 rebase refuses graph edits outside acceptance and guards its entire tra
   edited.nodes.find(node => node.kind === 'work')!.title = 'changed outside acceptance';
   const altered = f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: edited });
   const before = snapshot(f.store), request = { ...f.request, to: { ...f.to, graph: reference(altered) } };
-  for (const action of [prepareRebaseFrame, rebaseFrame]) assert.equal(action(f.store, request).ok, false);
+  for (const action of [prepareRebaseFrame, rebaseFrame]) refusedWith(action(f.store, request), 'layer_basis_unproven');
   assert.deepEqual(snapshot(f.store), before);
 });
 
@@ -306,11 +306,6 @@ test('C5 retires a work fill when an accepted operation outcome changes under th
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
-}
-function refusal(result: OmResult<unknown>, code: string) {
-  if (result.ok) assert.fail(`Expected ${code}, received success`);
-  assert.equal(result.refusal.code, code); assert.ok(result.refusal.at.target);
-  return result.refusal;
 }
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function fixture(t: TestContext, keepOutsideIdentities = false) {
@@ -402,7 +397,7 @@ test('C5 guards every prepared input and frame absence in a common neighbor tran
       const row = isolated.get(guard.id)!;
       isolated.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
       const afterChange = snapshot(isolated);
-      refusal(writeGuarded(isolated, { unit: 'neighbor', target: 'accept', writes: [...prepared.writes,
+      refusedWith(writeGuarded(isolated, { unit: 'neighbor', target: 'accept', writes: [...prepared.writes,
         { id: 'neighbor:accept', kind: 'neighbor', expected: 0, value: {} }], guards: prepared.guards }), 'input_stale');
       assert.deepEqual(snapshot(isolated), afterChange);
       assert.equal(isolated.get('neighbor:accept'), null);
@@ -411,7 +406,7 @@ test('C5 guards every prepared input and frame absence in a common neighbor tran
   const other = fixture(t), absent = ok(prepareSettleCandidate(other.store, other.request));
   other.store.write({ id: 'om-frame:garden:2', kind: 'connection-frame', expected: 0, value: { occupied: true } });
   const before = snapshot(other.store);
-  refusal(writeGuarded(other.store, { unit: 'neighbor', target: 'accept', writes: absent.writes, guards: absent.guards }), 'revision_conflict');
+  refusedWith(writeGuarded(other.store, { unit: 'neighbor', target: 'accept', writes: absent.writes, guards: absent.guards }), 'revision_conflict');
   assert.deepEqual(snapshot(other.store), before);
 });
 
@@ -422,12 +417,12 @@ test('C5 rejects stale proposal heads and a second candidate of the same base wi
   assert.equal(second.state, 'candidate'); if (second.state !== 'candidate') return;
   ok(settleCandidate(f.store, f.request));
   const before = snapshot(f.store), ref = reference(second.record);
-  refusal(settleCandidate(f.store, { ...f.request, candidate: ref, outcome: { ...f.request.outcome, candidate: ref } }), 'input_stale');
+  refusedWith(settleCandidate(f.store, { ...f.request, candidate: ref, outcome: { ...f.request.outcome, candidate: ref } }), 'input_stale');
   assert.deepEqual(snapshot(f.store), before);
   const stale = fixture(t), row = stale.store.get(stale.proposalRef.id)!;
   stale.store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
   const staleBefore = snapshot(stale.store);
-  refusal(settleCandidate(stale.store, stale.request), 'input_stale');
+  refusedWith(settleCandidate(stale.store, stale.request), 'input_stale');
   assert.deepEqual(snapshot(stale.store), staleBefore);
 });
 
@@ -437,8 +432,8 @@ test('C5 does not trust foreign gate identities, future levels, claimed failure 
     { ...f.request.outcome, graphHash: '0'.repeat(64) },
     { ...f.request.outcome, candidate: { ...f.request.candidate, hash: '0'.repeat(64) } },
     { ...f.request.outcome, passed: false, codes: ['graph_invalid'] }])
-    refusal(settleCandidate(f.store, { ...f.request, outcome }), 'gate_outcome_mismatch');
-  refusal(settleCandidate(f.store, { ...f.request, level: 3, outcome: { ...f.request.outcome, gate: 'G5' } }), 'candidate_level_unsupported');
+    refusedWith(settleCandidate(f.store, { ...f.request, outcome }), 'gate_outcome_mismatch');
+  refusedWith(settleCandidate(f.store, { ...f.request, level: 3, outcome: { ...f.request.outcome, gate: 'G5' } }), 'candidate_level_unsupported');
   for (const field of ['candidate', 'outcome', 'project', 'level']) {
     const request = structuredClone(f.request) as unknown as Record<string, unknown>; delete request[field];
     assert.throws(() => prepareSettleCandidate(f.store, request as unknown as SettleCandidateRequest),
@@ -450,8 +445,8 @@ test('C5 does not trust foreign gate identities, future levels, claimed failure 
 test('C5 requires a well-formed G5 basis without widening G3 or trusting a level label', t => {
   const f = fixture(t), before = snapshot(f.store), basis = { id: 'om-atomic-gate:garden:unproven', revision: 1, hash: 'a'.repeat(64) };
   for (const action of [prepareSettleCandidate, settleCandidate]) {
-    refusal(action(f.store, { ...f.request, outcome: { ...f.request.outcome, basis } }), 'gate_outcome_mismatch');
-    refusal(action(f.store, { ...f.request, level: 3, outcome: { ...f.request.outcome, gate: 'G5', basis } }), 'gate_outcome_mismatch');
+    refusedWith(action(f.store, { ...f.request, outcome: { ...f.request.outcome, basis } }), 'gate_outcome_mismatch');
+    refusedWith(action(f.store, { ...f.request, level: 3, outcome: { ...f.request.outcome, gate: 'G5', basis } }), 'gate_outcome_mismatch');
     for (const bad of [null, {}, { ...basis, revision: 0 }, { ...basis, hash: 'wrong' }])
       assert.throws(() => action(f.store, { ...f.request, outcome: { ...f.request.outcome, basis: bad } } as SettleCandidateRequest),
         (error: unknown) => error instanceof EngineError && error.code === 'frame_accept_request_invalid');
@@ -485,7 +480,7 @@ test('the historical G5 rejection reader requires its complete failed outcome be
       { ...request, outcome: { ...request.outcome, passed: true, codes: [] } },
       { ...request, outcome: { gate: 'G5' as const, candidate: request.candidate, graphHash: request.outcome.graphHash,
         passed: false, codes: request.outcome.codes } }])
-      refusal(readRejectedCandidate(f.store, altered), 'gate_outcome_mismatch');
+      refusedWith(readRejectedCandidate(f.store, altered), 'gate_outcome_mismatch');
   } finally { f.store.get = get; }
   assert.deepEqual(snapshot(f.store), before);
 });
@@ -494,10 +489,10 @@ test('C5 preserves addressed source failures and execution exceptions on both ac
   const f = fixture(t), before = snapshot(f.store);
   for (const candidate of [{ ...f.request.candidate, revision: f.request.candidate.revision + 100 },
     { ...f.request.candidate, hash: '0'.repeat(64) }]) for (const action of [prepareSettleCandidate, settleCandidate])
-    refusal(action(f.store, { ...f.request, candidate, outcome: { ...f.request.outcome, candidate } }), 'candidate_missing');
+    refusedWith(action(f.store, { ...f.request, candidate, outcome: { ...f.request.outcome, candidate } }), 'candidate_missing');
   const foreign = { ...f.request.candidate, id: f.request.candidate.id.replace(':garden:', ':other:') };
   for (const action of [prepareSettleCandidate, settleCandidate])
-    refusal(action(f.store, { ...f.request, candidate: foreign, outcome: { ...f.request.outcome, candidate: foreign } }), 'record_foreign');
+    refusedWith(action(f.store, { ...f.request, candidate: foreign, outcome: { ...f.request.outcome, candidate: foreign } }), 'record_foreign');
   const original = f.store.get.bind(f.store);
   for (const fault of [new TypeError('graph unavailable'), new EngineError('record_corrupt', 'graph corrupt')]) {
     try {
@@ -509,7 +504,7 @@ test('C5 preserves addressed source failures and execution exceptions on both ac
   const changed = f.store.write({ id: f.candidate.id, kind: f.candidate.kind, expected: 1, value: f.candidate.value });
   const candidate = reference(changed), after = snapshot(f.store);
   for (const action of [prepareSettleCandidate, settleCandidate])
-    refusal(action(f.store, { ...f.request, candidate, outcome: { ...f.request.outcome, candidate } }), 'candidate_graph_mismatch');
+    refusedWith(action(f.store, { ...f.request, candidate, outcome: { ...f.request.outcome, candidate } }), 'candidate_graph_mismatch');
   assert.deepEqual(snapshot(f.store), after);
 });
 
@@ -517,7 +512,7 @@ test('C5 historical acceptance needs its own exact event and every public reader
   const f = fixture(t), accepted = ok(settleCandidate(f.store, f.request));
   const duplicate = f.store.write({ id: accepted.graph!.id, kind: 'graph', expected: accepted.graph!.revision, value: accepted.graph!.value });
   const request = { project: 'garden', level: 2 as const, graph: reference(duplicate), layer: reference(accepted.layer!), frame: reference(accepted.frame!) };
-  refusal(readAcceptedFrame(f.store, request), 'frame_acceptance_invalid');
+  refusedWith(readAcceptedFrame(f.store, request), 'frame_acceptance_invalid');
   const before = snapshot(f.store);
   for (const absent of [undefined, null, [], {}, { project: 'garden' }]) {
     const malformed = (error: unknown) => error instanceof EngineError && error.code === 'frame_accept_request_invalid';
@@ -531,7 +526,7 @@ test('C5 historical acceptance needs its own exact event and every public reader
   malformed.store.write({ id: 'om-frame:garden:2', kind: 'connection-frame', expected: 0,
     value: { acceptance: { candidate: malformed.request.candidate } } });
   const badSource = snapshot(malformed.store);
-  for (const action of [prepareSettleCandidate, settleCandidate]) refusal(action(malformed.store, malformed.request), 'frame_acceptance_invalid');
+  for (const action of [prepareSettleCandidate, settleCandidate]) refusedWith(action(malformed.store, malformed.request), 'frame_acceptance_invalid');
   assert.deepEqual(snapshot(malformed.store), badSource);
 });
 
@@ -568,7 +563,7 @@ test('C5 rejects the whole verified conflicting proposal combination with reprod
   assert.deepEqual(snapshot(f.store), after);
   const saved = { request, proposals: rejected.proposals.map(reference) };
   assert.deepEqual(ok(readRejectedProposals(f.store, saved)), rejected);
-  refusal(readRejectedProposals(f.store, { ...saved, proposals: saved.proposals.slice(1) }), 'proposal_rejection_invalid');
+  refusedWith(readRejectedProposals(f.store, { ...saved, proposals: saved.proposals.slice(1) }), 'proposal_rejection_invalid');
   const forkPath = join(f.root, 'forged-rejection.sqlite'); copyFileSync(savedSources.path, forkPath);
   const forgedStore = new Store(forkPath);
   try {
@@ -578,8 +573,8 @@ test('C5 rejects the whole verified conflicting proposal combination with reprod
       return forgedStore.write({ id: row.id, kind: row.kind, expected: 1, value });
     });
     assert.ok(forgedRows.every(row => row.revision === 2));
-    refusal(readRejectedProposals(forgedStore, { ...saved, proposals: forgedRows.map(reference) }), 'proposal_rejection_invalid');
-    refusal(prepareRejectProposals(forgedStore, request), 'proposal_rejection_invalid');
+    refusedWith(readRejectedProposals(forgedStore, { ...saved, proposals: forgedRows.map(reference) }), 'proposal_rejection_invalid');
+    refusedWith(prepareRejectProposals(forgedStore, request), 'proposal_rejection_invalid');
   } finally { forgedStore.close(); }
   const missingPath = join(f.root, 'missing-rejection-source.sqlite'); copyFileSync(savedSources.path, missingPath);
   const missingStore = new Store(missingPath);
@@ -589,7 +584,7 @@ test('C5 rejects the whole verified conflicting proposal combination with reprod
       delete value.verdict['request'];
       missingStore.write({ id: row.id, kind: row.kind, expected: 1, value });
     }
-    refusal(prepareRejectProposals(missingStore, request), 'proposal_rejection_invalid');
+    refusedWith(prepareRejectProposals(missingStore, request), 'proposal_rejection_invalid');
   } finally { missingStore.close(); }
   assert.deepEqual(ok(readRejectedProposals(f.store, saved)), rejected);
 });
@@ -597,23 +592,21 @@ test('C5 rejects the whole verified conflicting proposal combination with reprod
 test('C5 cannot reject successful assemblies, gaps, foreign sources, nonproposed revisions or unsupported levels', t => {
   const f = fixture(t), before = snapshot(f.store);
   for (const request of [{ frame: f.frame, proposals: [f.proposalRef] }, { frame: f.frame, proposals: [] }]) {
-    refusal(prepareRejectProposals(f.store, request), 'proposal_rejection_unproven');
-    refusal(rejectProposals(f.store, request), 'proposal_rejection_unproven');
+    refusedWith(prepareRejectProposals(f.store, request), 'proposal_rejection_unproven');
+    refusedWith(rejectProposals(f.store, request), 'proposal_rejection_unproven');
   }
-  for (const ref of [{ ...f.proposalRef, id: f.proposalRef.id.replace(':garden:', ':foreign:') },
-    { ...f.proposalRef, hash: '0'.repeat(64) }]) {
-    const result = rejectProposals(f.store, { frame: f.frame, proposals: [ref] });
-    assert.equal(result.ok, false);
-  }
-  refusal(rejectProposals(f.store, { frame: { ...f.frame, level: 3, upper: { horizon: f.frame.horizon, frame: null } },
+  for (const [ref, code] of [[{ ...f.proposalRef, id: f.proposalRef.id.replace(':garden:', ':foreign:') }, 'record_foreign'],
+    [{ ...f.proposalRef, hash: '0'.repeat(64) }, 'record_forged']] as const)
+    refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [ref] }), code);
+  refusedWith(rejectProposals(f.store, { frame: { ...f.frame, level: 3, upper: { horizon: f.frame.horizon, frame: null } },
     proposals: [f.proposalRef] }), 'candidate_level_unsupported');
-  refusal(rejectProposals(f.store, { frame: f.frame, proposals: [f.proposalRef, f.proposalRef] }), 'proposal_rejection_invalid');
+  refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [f.proposalRef, f.proposalRef] }), 'proposal_rejection_invalid');
   for (const value of [undefined, null, [], {}, { proposals: [] }, { frame: f.frame }])
     assert.throws(() => prepareRejectProposals(f.store, value as unknown as ProposalRequest),
       (error: unknown) => error instanceof EngineError && error.code === 'frame_accept_request_invalid');
   assert.deepEqual(snapshot(f.store), before);
   const accepted = ok(settleCandidate(f.store, f.request)), acceptedBefore = snapshot(f.store);
-  refusal(rejectProposals(f.store, { frame: f.frame, proposals: accepted.proposals.map(reference) }), 'proposal_not_proposed');
+  refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: accepted.proposals.map(reference) }), 'proposal_not_proposed');
   assert.deepEqual(snapshot(f.store), acceptedBefore);
 });
 
@@ -629,7 +622,7 @@ test('C5 rejection guards every current input and all participants without parti
       const row = store.get(guard.id)!;
       store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
       const before = snapshot(store);
-      refusal(writeGuarded(store, { unit: 'rejection-neighbor', target: 'reject', guards: prepared.guards,
+      refusedWith(writeGuarded(store, { unit: 'rejection-neighbor', target: 'reject', guards: prepared.guards,
         writes: [...prepared.writes, { id: 'neighbor:reject', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');
       assert.deepEqual(snapshot(store), before);
       assert.ok(request.proposals.every(ref => store.get<{ status: string }>(ref.id)!.value.status === 'proposed'));
@@ -915,7 +908,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   const rebaseAcceptance = { project, level: 3 as const, graph: to.graph, layer: reference(rebased.layer), frame: reference(rebased.frame) };
   const beforeRebaseRead = snapshot(store);
   const rebaseResult = readResultIdentity(store, { acceptance: rebaseAcceptance, obligation: obligation.id });
-  assert.equal(rebaseResult.ok, false, 'A rebase preserves history but accepts no new result');
+  refusedWith(rebaseResult, 'frame_acceptance_invalid'); // A rebase preserves history but accepts no new result
   assert.deepEqual(snapshot(store), beforeRebaseRead);
   const gaps = ok(writeGaps(store, { project, input: reference(input), graph: to.graph, horizon: to.horizon,
     operations: { frame: { ...operations, graph: to.graph, horizon: to.horizon, layer: reference(upper.layer!), frame: reference(upper.frame!) }, proposals: [] }, works }));
@@ -953,7 +946,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   assert.equal(canonical(ok(readResultIdentity(f.store, request))), identityBytes);
   assert.equal(canonical(f.store.get(nativeFrame.id, nativeFrame.revision)), frameBytes);
   assert.equal(canonical(f.store.get(rebased.frame.id, rebased.frame.revision)), rebaseBytes);
-  assert.equal(readResultIdentity(f.store, { acceptance: rebaseAcceptance, obligation: obligation.id }).ok, false);
+  refusedWith(readResultIdentity(f.store, { acceptance: rebaseAcceptance, obligation: obligation.id }), 'frame_acceptance_invalid');
   assert.deepEqual(snapshot(f.store), beforeHistory);
 });
 
@@ -968,14 +961,6 @@ function declaredAcceptance(f: ReturnType<typeof fixture>, block = 'garden-produ
   ok(openSeries(f.store, { ...address, slice: `accept:${block}`, predecessor: null, basis: null }));
   const series = ok(beginAttempt(f.store, { ...address, attempt: 1, goal }));
   return { address, goal, binding: { series: reference(series), ordinal: 1, obligations } };
-}
-
-function acceptanceDenied(action: () => OmResult<unknown>) {
-  let result: OmResult<unknown>;
-  try { result = action(); }
-  catch (error) { assert.ok(error instanceof EngineError, 'Malformed requests must fail with a typed engine error'); return; }
-  assert.equal(result.ok, false);
-  if (!result.ok) { assert.ok(result.refusal.code); assert.ok(result.refusal.at.target); }
 }
 
 test('C5.1 binds genuine N2 goals, retains the exact nonzero draft output and replays after restart without reassignment', t => {
@@ -995,7 +980,7 @@ test('C5.1 binds genuine N2 goals, retains the exact nonzero draft output and re
   const read = ok(readAcceptedFrameLayer(f.store, exact));
   assert.deepEqual(read.graph, accepted.graph); assert.deepEqual(read.layer, accepted.layer); assert.deepEqual(read.frame, accepted.frame);
   const duplicate = f.store.write({ id: accepted.layer.id, kind: accepted.layer.kind, expected: accepted.layer.revision, value: accepted.layer.value });
-  acceptanceDenied(() => readAcceptedFrame(f.store, { ...exact, graph: reference(accepted.graph!), layer: reference(duplicate) }));
+  refusedWith(readAcceptedFrame(f.store, { ...exact, graph: reference(accepted.graph!), layer: reference(duplicate) }), 'layer_basis_unproven');
   const ended = ok(completeAttempt(f.store, { ...declared.address, attempt: 1,
     outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } }));
   ok(openSeries(f.store, { ...declared.address, line: 2, slice: 'after-accepted-result', predecessor: reference(ended),
@@ -1009,7 +994,7 @@ test('C5.1 binds genuine N2 goals, retains the exact nonzero draft output and re
     assert.equal(replay.state, 'unchanged'); assert.deepEqual(replay.frame, accepted.frame);
     for (const binding of [null, { ...declared.binding, series: reference(second), ordinal: 2 },
       { ...declared.binding, obligations: declared.binding.obligations.slice(0, 1) }])
-      for (const action of [prepareSettleCandidate, settleCandidate]) acceptanceDenied(() => action(reopened, { ...request, binding }));
+      for (const action of [prepareSettleCandidate, settleCandidate]) refusedWith(action(reopened, { ...request, binding }), 'frame_acceptance_invalid');
     assert.deepEqual(snapshot(reopened), before);
   } finally { reopened.close(); }
 });
@@ -1026,9 +1011,13 @@ test('C5.1 rejects undeclared, foreign, identity and forged N2 bindings before a
   const identityFixture = fixture(t, true);
   const identity = identityFixture.candidate.value.fills.find(fill => fill.source === 'identity');
   assert.ok(identity);
-  const invalid = [
+  // A malformed obligation list is not a request: it is thrown. Every other undeclared, foreign or forged binding is
+  // answered with a returned refusal; neither channel stands in for the other.
+  const malformed = [
     { ...declared.binding, obligations: [] },
     { ...declared.binding, obligations: [declared.binding.obligations[0]!, declared.binding.obligations[0]!] },
+  ];
+  const invalid = [
     { ...declared.binding, obligations: ['missing-obligation'] },
     { ...declared.binding, series: foreign.binding.series },
     { ...declared.binding, ordinal: 2 },
@@ -1036,12 +1025,14 @@ test('C5.1 rejects undeclared, foreign, identity and forged N2 bindings before a
     { ...declared.binding, obligations: [frame.result.obligations.find(item => item.upper.node === foreign.address.block)!.id] },
   ];
   const before = snapshot(f.store);
+  for (const binding of malformed) for (const action of [prepareSettleCandidate, settleCandidate])
+    thrownWith(() => action(f.store, { ...f.request, binding }), 'frame_accept_request_invalid');
   for (const binding of invalid) for (const action of [prepareSettleCandidate, settleCandidate])
-    acceptanceDenied(() => action(f.store, { ...f.request, binding }));
+    refusedWith(action(f.store, { ...f.request, binding }), 'layer_basis_unproven');
   assert.deepEqual(snapshot(f.store), before);
   const shortBefore = snapshot(short.store);
-  for (const action of [prepareSettleCandidate, settleCandidate]) acceptanceDenied(() => action(short.store,
-    { ...short.request, binding: { series: reference(narrow), ordinal: 1, obligations: [undeclared] } }));
+  for (const action of [prepareSettleCandidate, settleCandidate]) refusedWith(action(short.store,
+    { ...short.request, binding: { series: reference(narrow), ordinal: 1, obligations: [undeclared] } }), 'layer_basis_unproven');
   assert.deepEqual(snapshot(short.store), shortBefore);
   const identityObligation = ok(readFrame(identityFixture.store, identityFixture.frame)).result.obligations.find(item => item.id === identity.obligation)!;
   for (const scenario of [
@@ -1056,8 +1047,8 @@ test('C5.1 rejects undeclared, foreign, identity and forged N2 bindings before a
     ok(openSeries(isolated.store, { ...address, slice: scenario.name, predecessor: null, basis: null }));
     const attempt = ok(beginAttempt(isolated.store, { ...address, attempt: 1, goal: scenario.goal }));
     const before = snapshot(isolated.store);
-    for (const action of [prepareSettleCandidate, settleCandidate]) acceptanceDenied(() => action(isolated.store,
-      { ...isolated.request, binding: { series: reference(attempt), ordinal: 1, obligations: scenario.obligations } }));
+    for (const action of [prepareSettleCandidate, settleCandidate]) refusedWith(action(isolated.store,
+      { ...isolated.request, binding: { series: reference(attempt), ordinal: 1, obligations: scenario.obligations } }), 'layer_basis_unproven');
     assert.deepEqual(snapshot(isolated.store), before);
   }
 });
@@ -1079,11 +1070,11 @@ test('C5.1 a real successor claims the predecessor revision and the series guard
   assert.equal(claimed.revision, ended.revision + 1); assert.equal(claimed.hash, ended.hash);
   assert.deepEqual(claimed.value, ended.value);
   const before = snapshot(f.store);
-  refusal(writeGuarded(f.store, { unit: 'C5.1', target: f.request.candidate.id,
+  refusedWith(writeGuarded(f.store, { unit: 'C5.1', target: f.request.candidate.id,
     writes: prepared.writes, guards: prepared.guards }), 'input_stale');
   // Isolate the successor's own same-body CAS from the earlier completion revision change.
   const successorGuards = prepared.guards.map(ref => ref.id === ended.id ? reference(ended) : ref);
-  refusal(writeGuarded(f.store, { unit: 'C5.1', target: f.request.candidate.id,
+  refusedWith(writeGuarded(f.store, { unit: 'C5.1', target: f.request.candidate.id,
     writes: prepared.writes, guards: successorGuards }), 'input_stale');
   assert.deepEqual(snapshot(f.store), before); assert.equal(f.store.get('om-frame:garden:2'), null);
 });
@@ -1132,9 +1123,9 @@ test('C5.1 explicit era fields and exact output back-references cannot be omitte
       store.writeMany(writes);
       store.close(); store = new Store(path);
       const before = snapshot(store), request = { project: 'garden', level: 2 as const, frame };
-      acceptanceDenied(() => readAcceptedFrameLayer(store, request));
-      acceptanceDenied(() => readLayerAcceptance(store, { ...request, graph: reference(store.get('graph:garden')!),
-        layer: reference(store.get(layerWrite.id)!) }));
+      refusedWith(readAcceptedFrameLayer(store, request), 'layer_basis_unproven');
+      refusedWith(readLayerAcceptance(store, { ...request, graph: reference(store.get('graph:garden')!),
+        layer: reference(store.get(layerWrite.id)!) }), 'layer_basis_unproven');
       assert.deepEqual(snapshot(store), before);
     } finally { store.close(); }
   }
@@ -1302,8 +1293,8 @@ test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptanc
     assert.deepEqual(reference(series), binding.series);
     assert.equal(series.value.attempts.find(item => item.ordinal === binding.ordinal)!.outcome, null);
     const before = snapshot(store);
-    for (const action of [prepareWorksAcceptance, writeWorksAcceptance]) acceptanceDenied(() => action(store,
-      { ...request, binding: { ...binding, obligations: [...binding.obligations, f.foreignObligations[0]!] } }));
+    for (const action of [prepareWorksAcceptance, writeWorksAcceptance]) refusedWith(action(store,
+      { ...request, binding: { ...binding, obligations: [...binding.obligations, f.foreignObligations[0]!] } }), 'layer_basis_unproven');
     assert.deepEqual(snapshot(store), before);
     const prepared = ok(prepareWorksAcceptance(store, request));
     assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(binding.series)));
@@ -1327,8 +1318,8 @@ test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptanc
     const savedHeads = snapshot(store);
     assert.deepEqual(ok(readAcceptedFrameLayer(store, exact)), saved);
     assert.equal(ok(writeWorksAcceptance(store, request)).state, 'unchanged');
-    for (const action of [prepareWorksAcceptance, writeWorksAcceptance]) acceptanceDenied(() => action(store,
-      { ...request, binding: { ...binding, obligations: binding.obligations.slice(0, 1) } }));
+    for (const action of [prepareWorksAcceptance, writeWorksAcceptance]) refusedWith(action(store,
+      { ...request, binding: { ...binding, obligations: binding.obligations.slice(0, 1) } }), 'input_stale');
     assert.deepEqual(snapshot(store), savedHeads);
     assert.equal(readFileSync(f.trace, 'utf8'), f.traceBytes);
   } finally { store.close(); }

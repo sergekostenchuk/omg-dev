@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { canonical, hashJson } from "../src/canonical.js";
 import { nodeSignature, receiptId } from "../src/compiler/model.js";
 import { resolveArtifact } from "../src/compiler/inputs.js";
@@ -12,8 +14,11 @@ import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { validateGraph } from "../src/graph/validate.js";
 import { reference, type StageArtifact } from "../src/pipeline/contracts.js";
+import { delivered, refused, type OmResult } from "../src/om/refusal.js";
 import { Store } from "../src/storage/store.js";
-import { createCrossOmFixture, createOmFixture, gardenGraph, OM_FIXTURE_ERROR } from "./om-fixture.js";
+import { createCrossOmFixture, createOmFixture, gardenGraph, OM_FIXTURE_ERROR, refusedWith, thrownWith } from "./om-fixture.js";
+
+const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
 
 function projection(graph: Graph, level: 1 | 2 | 3): Graph {
   const { level: _level, ...value } = projectGraph(graph, level);
@@ -210,4 +215,152 @@ test("a missing committed receipt rejects fixture creation at the exact record",
     assert.deepEqual(error.details, { target: missing });
     return true;
   });
+});
+
+
+// Q2.1: a check of a refusal names its code. The two helpers below are the only way the OM suites check one, so these
+// tests pin what they accept and what they refuse to accept.
+const probeAt = { unit: "T", target: "probe" };
+const refusal = (code = "probe_code"): OmResult<never> => refused(code, "A probe refusal", probeAt, "producer");
+const failsCheck = (action: () => unknown, message: RegExp, label = "the check"): void => {
+  assert.throws(action, (error: unknown) => {
+    assert.ok(error instanceof assert.AssertionError, `${label}: expected an AssertionError, received ${String(error)}`);
+    assert.match(error.message, message, label);
+    return true;
+  });
+};
+const badExpectations: unknown[] = ["", [], [""], ["probe_code", ""], undefined, null, 7];
+
+test("refusedWith accepts the named code or a code of the named list and returns the original refusal", () => {
+  const result = refusal();
+  if (result.ok) assert.fail("A probe refusal was built");
+  assert.equal(refusedWith(result, "probe_code"), result.refusal);
+  assert.equal(refusedWith(result, ["other_code", "probe_code"]), result.refusal);
+  assert.equal(refusedWith(result, ["probe_code"]), result.refusal);
+});
+
+test("refusedWith fails on another code, a code outside the list, an unexpected success and a refusal without address or reason", () => {
+  failsCheck(() => refusedWith(refusal(), "other_code"), /Expected other_code, received probe_code/);
+  failsCheck(() => refusedWith(refusal(), ["first_code", "second_code"]), /Expected first_code \| second_code, received probe_code/);
+  failsCheck(() => refusedWith(delivered(1), "probe_code"), /received success/);
+  const refusalOf = (target: string, message: string) => ({ ok: false as const,
+    refusal: { code: "probe_code", message, at: { unit: "T", target }, route: "producer" as const } });
+  failsCheck(() => refusedWith(refusalOf("", "A probe refusal"), "probe_code"), /A refusal is addressed/);
+  failsCheck(() => refusedWith(refusalOf("probe", ""), "probe_code"), /A refusal says why/);
+});
+
+test("refusedWith fails when the expected code is missing, empty or not a code, whatever the refusal says", () => {
+  for (const bad of badExpectations) failsCheck(() => refusedWith(refusal(), bad as string), /names its expected code/);
+  // A check without its second argument does not compile; at runtime it fails like any missing code.
+  failsCheck(() => {
+    // @ts-expect-error the code of a refusal check is required
+    refusedWith(refusal());
+  }, /names its expected code/);
+});
+
+test("thrownWith accepts the named code or a code of the named list and returns the thrown EngineError", () => {
+  const thrown = new EngineError("probe_code", "A probe exception", { target: "probe" });
+  assert.equal(thrownWith(() => { throw thrown; }, "probe_code"), thrown);
+  assert.equal(thrownWith(() => { throw thrown; }, ["other_code", "probe_code"]), thrown);
+});
+
+test("thrownWith keeps the channels apart: a returned refusal, a plain return, another code and a foreign exception fail", () => {
+  const throwing = (error: unknown) => () => { throw error; };
+  failsCheck(() => thrownWith(() => refusal(), "probe_code"), /to be thrown, the call returned/);
+  failsCheck(() => thrownWith(() => delivered(1), "probe_code"), /to be thrown, the call returned/);
+  failsCheck(() => thrownWith(throwing(new EngineError("probe_code", "A probe exception")), "other_code"), /Expected other_code, received probe_code/);
+  failsCheck(() => thrownWith(throwing(new EngineError("probe_code", "A probe exception")), ["first_code", "second_code"]),
+    /Expected first_code \| second_code, received probe_code/);
+  failsCheck(() => thrownWith(throwing(new TypeError("not an engine error")), "probe_code"), /Expected an EngineError probe_code/);
+  // The helper's own failure is never taken for the expected exception: an AssertionError raised inside the call fails the check.
+  failsCheck(() => thrownWith(() => assert.fail("raised inside the call"), "probe_code"), /Expected an EngineError probe_code/);
+  for (const bad of badExpectations) failsCheck(() => thrownWith(throwing(new EngineError("probe_code", "A probe exception")), bad as string), /names its expected code/);
+});
+
+const soundRefusal = { code: "probe_code", message: "A probe refusal", at: probeAt, route: "producer" as const };
+const asResult = (value: unknown): OmResult<unknown> => value as OmResult<unknown>;
+
+test("refusedWith takes only the literal ok: false for a refusal: a missing, null, zero or otherwise falsy discriminator fails", () => {
+  const legal = { ok: false as const, refusal: soundRefusal };
+  assert.equal(refusedWith(legal, "probe_code"), soundRefusal);
+  for (const [label, envelope] of [
+    ["missing ok", { refusal: soundRefusal }], ["ok: null", { ok: null, refusal: soundRefusal }], ["ok: 0", { ok: 0, refusal: soundRefusal }],
+    ["ok: undefined", { ok: undefined, refusal: soundRefusal }], ["ok: empty string", { ok: "", refusal: soundRefusal }],
+    ["ok: NaN", { ok: Number.NaN, refusal: soundRefusal }], ["ok: the string false", { ok: "false", refusal: soundRefusal }],
+    ["ok: 1", { ok: 1, refusal: soundRefusal }], ["ok: an object", { ok: {}, refusal: soundRefusal }],
+  ] as const) failsCheck(() => refusedWith(asResult(envelope), "probe_code"), /received a result whose ok is/, label);
+  // `true` is the unexpected success even when a refusal body rides along.
+  failsCheck(() => refusedWith(asResult({ ok: true, refusal: soundRefusal }), "probe_code"), /received success/, "ok: true");
+});
+
+test("refusedWith fails, never throws a bare TypeError, on a negative result with a damaged refusal and on a value that is no result", () => {
+  const body = (over: Record<string, unknown>) => ({ ok: false, refusal: { ...soundRefusal, ...over } });
+  for (const [label, envelope, pattern] of [
+    ["refusal missing", { ok: false }, /without a refusal/], ["refusal null", { ok: false, refusal: null }, /without a refusal/],
+    ["refusal a string", { ok: false, refusal: "probe_code" }, /without a refusal/],
+    ["code missing", body({ code: undefined }), /Expected probe_code, received undefined/], ["code a number", body({ code: 7 }), /Expected probe_code, received 7/],
+    ["address missing", body({ at: undefined }), /A refusal is addressed/], ["address null", body({ at: null }), /A refusal is addressed/],
+    ["target a number", body({ at: { unit: "T", target: 1 } }), /A refusal is addressed/], ["target an object", body({ at: { unit: "T", target: {} } }), /A refusal is addressed/],
+    ["target true", body({ at: { unit: "T", target: true } }), /A refusal is addressed/],
+    ["message a number", body({ message: 1 }), /A refusal says why/], ["message true", body({ message: true }), /A refusal says why/],
+    ["message an object", body({ message: {} }), /A refusal says why/],
+  ] as const) failsCheck(() => refusedWith(asResult(envelope), "probe_code"), pattern, label);
+  for (const [label, nothing] of [["null", null], ["undefined", undefined], ["a string", "refusal"], ["a number", 7]] as const)
+    failsCheck(() => refusedWith(asResult(nothing), "probe_code"), /Expected a refusal probe_code, received/, label);
+});
+
+test("thrownWith takes only a real EngineError with a string code: a lookalike, a foreign Error and a non-error value fail", () => {
+  const throwing = (error: unknown) => () => { throw error; };
+  for (const [label, thrown] of [
+    ["a plain object with the code", { code: "probe_code", message: "A probe exception" }],
+    ["an Error carrying the code", Object.assign(new Error("A probe exception"), { code: "probe_code" })],
+    ["a string", "probe_code"], ["a number", 7], ["null", null], ["undefined", undefined], ["a null-prototype object", Object.create(null)],
+  ] as const) failsCheck(() => thrownWith(throwing(thrown), "probe_code"), /Expected an EngineError probe_code/, label);
+  // An EngineError whose code is not a string cannot match the named codes, whatever it coerces to.
+  failsCheck(() => thrownWith(throwing(new EngineError(7 as unknown as string, "A probe exception")), "probe_code"), /Expected probe_code, received 7/, "a numeric code");
+});
+
+// The agreed refusal helpers may not let the code be omitted: no `?`, no default value, no `undefined` in its type and no
+// rest list, on any helper that takes an OmResult. Plain `code?` fields of test data are none of this check's business.
+const REFUSAL_HELPER_FILES = ["om-fixture.ts", "om-fixture.test.ts", "om-series-current.test.ts", "om-queue.test.ts",
+  "om-series-transition-prepared.test.ts", "om-stop-analysis.test.ts", "om-frame-accept.test.ts"];
+
+function optionalCodeHelpers(file: string, source: string): string[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2023, true);
+  const found: string[] = [];
+  const walk = (node: import("typescript").Node): void => {
+    if (ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isMethodDeclaration(node)) {
+      const takesResult = node.parameters.some(parameter => parameter.type !== undefined && /\bOmResult\b/.test(parameter.type.getText(sf)));
+      if (takesResult) for (const parameter of node.parameters) {
+        if (!/code/i.test(parameter.name.getText(sf))) continue;
+        const omittable = parameter.questionToken !== undefined || parameter.initializer !== undefined || parameter.dotDotDotToken !== undefined
+          || (parameter.type !== undefined && /\bundefined\b/.test(parameter.type.getText(sf)));
+        if (omittable) found.push(`${file}:${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1} ${parameter.getText(sf)}`);
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(sf);
+  return found;
+}
+
+test("the check against an omittable code sees every way to omit it and leaves other optional codes alone", () => {
+  for (const [label, source] of [
+    ["optional", "function rejected(result: OmResult<unknown>, code?: string) {}"],
+    ["default", "const denied = (result: OmResult<unknown>, code = '') => {};"],
+    ["undefined in the type", "function refusal(result: OmResult<unknown>, code: string | undefined) {}"],
+    ["rest list", "function failed(result: OmResult<unknown>, ...codes: string[]) {}"],
+    ["optional list", "function refusedAs(value: OmResult<T>, expectedCodes?: readonly string[]) {}"],
+  ] as const) assert.equal(optionalCodeHelpers("probe.ts", source).length, 1, label);
+  assert.deepEqual(optionalCodeHelpers("probe.ts", [
+    "function refusedWith(result: OmResult<unknown>, code: string | readonly string[]) {}",
+    "function other(value: unknown, code?: string) {}",
+    "interface Row { code?: string }",
+    "const row: { code?: string } = {};"].join("\n")), []);
+});
+
+test("no refusal helper of the Q2.1 suites lets the expected code be omitted", () => {
+  const offenders = REFUSAL_HELPER_FILES.flatMap(file =>
+    optionalCodeHelpers(file, readFileSync(new URL(`../../test/${file}`, import.meta.url), "utf8")));
+  assert.deepEqual(offenders, []);
 });

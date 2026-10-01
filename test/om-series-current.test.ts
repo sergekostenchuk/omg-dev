@@ -47,7 +47,7 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { createOmFixture, gardenGraph } from './om-fixture.js';
+import { createOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -58,13 +58,6 @@ const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reaso
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
-}
-function rejected(result: OmResult<unknown>, code?: string) {
-  assert.equal(result.ok, false);
-  if (result.ok) assert.fail('Expected an addressed refusal');
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target); assert.ok(result.refusal.message);
-  return result.refusal;
 }
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function commit(store: Store, prepared: { readonly writes: readonly Write[]; readonly guards: readonly TransactionGuard[] }) {
@@ -233,8 +226,8 @@ test('B3.0b real P G activation preserves legacy attempts stops and ladder acros
   const inactive = exclude(f), excluded = head(f);
   assert.equal(inactive.record.value.decisions[0]!.participation, 'excluded');
   assert.equal(ok(prepareSeriesParticipantAdmission(f.store, project, reference(excluded))).participation, 'excluded');
-  rejected(prepareSeriesLineAdmission(f.store, project, reference(excluded)));
-  rejected(beginAttempt(f.store, { project, block, line: 1, attempt: 4, goal: workGoal }));
+  refusedWith(prepareSeriesLineAdmission(f.store, project, reference(excluded)), 'series_invalid');
+  refusedWith(beginAttempt(f.store, { project, block, line: 1, attempt: 4, goal: workGoal }), 'series_invalid');
   const returned = activate(f, 'return-original');
   assert.equal(returned.record.value.decisions[0]!.outcome, 'continue');
   assert.deepEqual(head(f).value.attempts, stopped.value.attempts);
@@ -255,8 +248,8 @@ test('B3.0b first root and bootstrap serialize in both orders with no partial ne
     const root = ok(prepareOpenSeries(other, { project, block: independent, line: 1, slice: 'legacy:new-root', predecessor: null, basis: null }));
     assert.ok(root.guards.some(guard => guard.id === seriesMembershipId(project)));
     assert.ok(activation.guards.some(guard => guard.id === seriesMembershipId(project)));
-    if (first === 'root') { ok(commit(other, root)); rejected(commit(f.store, activation)); assert.equal(f.store.get(activation.record.id), null); }
-    else { ok(commit(f.store, activation)); rejected(commit(other, root)); assert.equal(f.store.get(root.writes[0]!.id), null); }
+    if (first === 'root') { ok(commit(other, root)); refusedWith(commit(f.store, activation), 'input_stale'); assert.equal(f.store.get(activation.record.id), null); }
+    else { ok(commit(f.store, activation)); refusedWith(commit(other, root), 'input_stale'); assert.equal(f.store.get(root.writes[0]!.id), null); }
     assert.equal(f.store.list('om-series-applied').length, first === 'root' ? 0 : 1);
   }
 });
@@ -269,8 +262,8 @@ test('B3.0b successor and bootstrap CAS the predecessor in both orders', t => {
     const successor = ok(prepareOpenSeries(other, { project, block, line: 2, slice: 'legacy:another-subject', predecessor: reference(source),
       basis: { ground: 'inputs-changed', text: 'The source changed before adoption' } }));
     assert.ok(successor.writes.some(write => write.id === source.id));
-    if (first === 'successor') { ok(commit(other, successor)); rejected(commit(f.store, activation)); assert.equal(f.store.get(activation.record.id), null); }
-    else { ok(commit(f.store, activation)); rejected(commit(other, successor)); assert.equal(f.store.get(successor.writes[0]!.id), null); }
+    if (first === 'successor') { ok(commit(other, successor)); refusedWith(commit(f.store, activation), 'input_stale'); assert.equal(f.store.get(activation.record.id), null); }
+    else { ok(commit(f.store, activation)); refusedWith(commit(other, successor), 'input_stale'); assert.equal(f.store.get(successor.writes[0]!.id), null); }
   }
 });
 
@@ -280,15 +273,15 @@ test('B3.0b managed root must be registered unactivated then included in a new f
   const added = f.series(independent);
   assert.equal(added.value.activation?.state, 'unactivated');
   assert.equal(ok(prepareSeriesParticipantAdmission(f.store, project, reference(added))).participation, 'unactivated');
-  rejected(prepareSeriesLineAdmission(f.store, project, reference(added)));
-  rejected(beginAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
-  rejected(applySeriesActivation(f.store, stale.request));
+  refusedWith(prepareSeriesLineAdmission(f.store, project, reference(added)), 'series_invalid');
+  refusedWith(beginAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: workGoal }), 'series_invalid');
+  refusedWith(applySeriesActivation(f.store, stale.request), 'series_invalid');
   const fresh = transition(f, 'include-new-root', { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] });
   const applied = ok(applySeriesActivation(f.store, fresh.request));
   assert.equal(applied.record.value.decisions.find(row => row.block === independent)!.outcome, 'establish-basis');
   ok(prepareSeriesLineAdmission(f.store, project, reference(head(f, independent))));
-  rejected(openSeries(f.store, { project, block: independent, line: 2, slice: 'unproved-string', predecessor: reference(head(f, independent)),
-    basis: { ground: 'inputs-changed', text: 'A caller cannot manufacture managed succession' } }));
+  refusedWith(openSeries(f.store, { project, block: independent, line: 2, slice: 'unproved-string', predecessor: reference(head(f, independent)),
+    basis: { ground: 'inputs-changed', text: 'A caller cannot manufacture managed succession' } }), 'series_conflict');
 });
 
 test('B3.0b participant membership changes invalidate an already prepared managed activation', t => {
@@ -297,7 +290,7 @@ test('B3.0b participant membership changes invalidate an already prepared manage
   const other = new Store(f.path);
   try { ok(openSeries(other, { project, block: independent, line: 1, slice: opaqueSlice, predecessor: null, basis: null })); }
   finally { other.close(); }
-  rejected(commit(f.store, next)); assert.equal(f.store.get(next.record.id), null);
+  refusedWith(commit(f.store, next), 'input_stale'); assert.equal(f.store.get(next.record.id), null);
   assert.equal(f.store.get(seriesCurrentId(project))!.revision, 1);
 });
 
@@ -310,22 +303,27 @@ test('B3.0b current admission preserves immutable pointer refs while attempt hea
   assert.deepEqual(f.store.get(seriesCurrentId(project)), applied.pointer);
   assert.deepEqual(ok(prepareSeriesLineAdmission(f.store, project, reference(running))).pointer, reference(applied.pointer));
   erase(f.store, seriesCurrentId(project));
-  rejected(prepareSeriesLineAdmission(f.store, project, reference(running)));
-  rejected(prepareSeriesParticipantAdmission(f.store, project, reference(running)));
-  rejected(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: workGoal }));
+  refusedWith(prepareSeriesLineAdmission(f.store, project, reference(running)), 'series_invalid');
+  refusedWith(prepareSeriesParticipantAdmission(f.store, project, reference(running)), 'series_invalid');
+  refusedWith(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: workGoal }), 'series_invalid');
   assert.deepEqual(ok(readSeriesAt(f.store, project, reference(active))), active);
 });
 
 test('B3.0b managed series cannot masquerade as legacy by dropping activation contract or basis', t => {
-  for (const field of ['contract', 'activation', 'applied', 'activeBasis', 'registered'] as const) {
+  // The era witness pins the first managed revision by hash, and `rewrite` changes that very revision in place. So the
+  // dropped activation basis fields and the registered root are refused by the PINNED CONTENT (record_forged on hash):
+  // that proves a pinned revision cannot be substituted, not that the check of the missing field is reached. Only the
+  // dropped contract or activation section meets the FORM check of the series (series_invalid on value).
+  for (const [field, code, at] of [['contract', 'series_invalid', 'value'], ['activation', 'series_invalid', 'value'],
+    ['applied', 'record_forged', 'hash'], ['activeBasis', 'record_forged', 'hash'], ['registered', 'record_forged', 'hash']] as const) {
     const f = fixture(t); f.series(); activate(f);
     const original = field === 'registered' ? f.series(independent) : head(f);
     const value = clone(original.value) as unknown as Record<string, Json>;
     if (field === 'contract' || field === 'activation') delete value[field];
     else delete (value['activation'] as Record<string, Json>)[field];
     const forged = rewrite(f.store, original, value as unknown as RepairSeries);
-    rejected(readSeriesAt(f.store, project, reference(forged)));
-    rejected(prepareSeriesLineAdmission(f.store, project, reference(forged)));
+    assert.equal(refusedWith(readSeriesAt(f.store, project, reference(forged)), code).at.field, at, field);
+    assert.equal(refusedWith(prepareSeriesLineAdmission(f.store, project, reference(forged)), code).at.field, at, field);
   }
 });
 
@@ -341,10 +339,10 @@ test('B3.0b E1 and E2 prepared before bootstrap refuse new dispatch while exact 
   const launch = ok(prepareCallDispatch(f.store, project, reference(call.call)));
   ok(commit(f.store, q));
   activate(f, 'adopt-running');
-  rejected(commit(f.store, { ...q, writes: [{ id: 'stale-e2-write', kind: 'test', expected: 0, value: {} }] }));
-  rejected(commit(f.store, { writes: [{ id: 'stale-e1-write', kind: 'test', expected: 0, value: {} }], guards: launch.guards }));
-  rejected(prepareCallDispatch(f.store, project, reference(call.call)));
-  rejected(recordCall(f.store, project, { ...callRequest, call: 'fresh-after-bootstrap' }));
+  refusedWith(commit(f.store, { ...q, writes: [{ id: 'stale-e2-write', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
+  refusedWith(commit(f.store, { writes: [{ id: 'stale-e1-write', kind: 'test', expected: 0, value: {} }], guards: launch.guards }), 'input_stale');
+  refusedWith(prepareCallDispatch(f.store, project, reference(call.call)), 'call_series_unresolved');
+  refusedWith(recordCall(f.store, project, { ...callRequest, call: 'fresh-after-bootstrap' }), 'call_series_unresolved');
   assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(q.record) })), q.record);
   assert.deepEqual(ok(readCall(f.store, project, reference(call.call))), call.call);
   assert.deepEqual(ok(recordCall(f.store, project, callRequest)).call, call.call);
@@ -355,8 +353,8 @@ test('B3.0b E2 new packet transaction guards the active pointer and cannot commi
   const f = product(fixture(t)), prepared = ok(prepareQuestionPacket(f.store, f.packetRequest));
   assert.ok(prepared.guards.some(guard => guard.id === seriesCurrentId(project)));
   exclude(f);
-  rejected(commit(f.store, prepared)); assert.equal(f.store.get(prepared.record.id), null);
-  rejected(prepareQuestionPacket(f.store, f.packetRequest));
+  refusedWith(commit(f.store, prepared), 'input_stale'); assert.equal(f.store.get(prepared.record.id), null);
+  refusedWith(prepareQuestionPacket(f.store, f.packetRequest), 'series_conflict');
 });
 
 async function received(f: ReturnType<typeof product>, request: ModelCallRequest) {
@@ -403,7 +401,7 @@ test('B3.0b E4 exclusion keeps physical response and single settlement after res
   const closed = ok(completeAttempt(f.store, close));
   assert.equal(closed.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(closed.value.withoutProgress, 1);
   assert.deepEqual(ok(completeAttempt(f.store, close)), closed);
-  rejected(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: f.goal }));
+  refusedWith(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: f.goal }), 'series_invalid');
   activate(f, 'return-after-close');
   const next = ok(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: f.goal }));
   assert.equal(next.value.attempts.length, 2); assert.deepEqual(next.value.attempts[0], closed.value.attempts[0]);
@@ -415,26 +413,28 @@ test('B3.0b missing or foreign E4 terminal proof cannot authorize explicit compl
   const f = product(fixture(t)), { request } = ready(f); await received(f, request); exclude(f);
   const terminal = ok(await runModelCall(f.store, request)).record;
   for (const variant of ['missing', 'foreign-series', 'foreign-pointer', 'wrong-ordinal'] as const) {
+    // A pointer of another project is refused as a foreign record; the other variants fail the terminal evidence itself.
+    const code = variant === 'foreign-pointer' ? 'record_foreign' : 'model_call_record_invalid';
     const value = clone(terminal.value) as OmModelCall;
     if (variant === 'missing') delete value.om.terminal;
     else if (variant === 'foreign-series') value.om.terminal!.series = { ...value.om.terminal!.series, id: 'repair-series:other:foreign:1' };
     else if (variant === 'foreign-pointer') value.om.terminal!.change.currentPointer = { ...value.om.terminal!.change.currentPointer, id: 'om-series-current:other' };
     else value.om.terminal!.attempt++;
     const forged = f.store.write({ id: terminal.id, kind: terminal.kind, expected: f.store.get(terminal.id)!.revision, value: value as unknown as Json });
-    rejected(readModelTerminalWitness(f.store, { project, record: reference(forged) }));
-    rejected(readModelCall(f.store, { project, record: reference(forged) }));
-    rejected(completeAttempt(f.store, { project, block, line: 1, attempt: 1, terminal: reference(forged),
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+    refusedWith(readModelTerminalWitness(f.store, { project, record: reference(forged) }), code);
+    refusedWith(readModelCall(f.store, { project, record: reference(forged) }), code);
+    refusedWith(completeAttempt(f.store, { project, block, line: 1, attempt: 1, terminal: reference(forged),
+      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }), code);
   }
   const rejection = f.store.get<Record<string, unknown>>(terminal.value.om.rejection!.id, terminal.value.om.rejection!.revision)!;
   const missingRejection = clone(rejection.value); delete missingRejection['terminal'];
   const noBasis = rewrite(f.store, rejection, missingRejection);
   const noTerminal = clone(terminal.value) as OmModelCall; delete noTerminal.om.terminal; noTerminal.om.rejection = reference(noBasis);
   const forgedRuntime = rewrite(f.store, terminal, noTerminal);
-  rejected(readModelCallPhysical(f.store, { project, record: reference(forgedRuntime) }));
-  rejected(readModelCall(f.store, { project, record: reference(forgedRuntime) }));
+  refusedWith(readModelCallPhysical(f.store, { project, record: reference(forgedRuntime) }), 'model_call_record_invalid');
+  refusedWith(readModelCall(f.store, { project, record: reference(forgedRuntime) }), 'model_call_record_invalid');
   rewrite(f.store, noBasis, rejection.value); rewrite(f.store, forgedRuntime, terminal.value as OmModelCall);
-  rejected(completeAttempt(f.store, { project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+  refusedWith(completeAttempt(f.store, { project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }), 'series_invalid');
   assert.equal(head(f).value.attempts[0]!.outcome, null); assert.equal(f.sent().length, 1);
   ok(readModelCall(f.store, { project, record: reference(terminal) }));
 });
@@ -492,7 +492,7 @@ function analysis(f: ReturnType<typeof product>) {
 }
 
 test('B3.0b A6 saved managed intent restores original exact admission and refuses missing or foreign proof', t => {
-  for (const missing of ['proof', 'pointer', 'foreign-proof'] as const) {
+  for (const [missing, code] of [['proof', 'analysis_invalid'], ['pointer', 'record_missing'], ['foreign-proof', 'record_foreign']] as const) {
     const f = product(fixture(t), true, false), a = analysis(f), prepared = ok(prepareStopAnalysis(f.store, a.request));
     assert.deepEqual(prepared.writes.map(write => write.kind), ['om-analysis-intent', 'om-analysis-admission']);
     assert.ok(prepared.guards.some(guard => guard.id === seriesCurrentId(project)));
@@ -501,7 +501,7 @@ test('B3.0b A6 saved managed intent restores original exact admission and refuse
     if (missing === 'proof') erase(f.store, proof.id);
     else if (missing === 'pointer') erase(f.store, seriesCurrentId(project));
     else rewrite(f.store, proof, { ...proof.value, pointer: { ...proof.value.pointer, id: 'om-series-current:foreign' } });
-    f.restart(); rejected(prepareStopAnalysis(f.store, a.request)); assert.equal(f.sent().length, 0);
+    f.restart(); refusedWith(prepareStopAnalysis(f.store, a.request), code); assert.equal(f.sent().length, 0);
   }
 });
 
@@ -511,11 +511,11 @@ test('B3.0b old A6 intent cannot reacquire admission after bootstrap or exclusio
     ok(commit(f.store, prepared));
     if (managed) exclude(f); else activate(f, 'adopt-stopped-intent');
     f.steps([{ research: a.answer, usage }]); f.restart();
-    rejected(await runStopAnalysis(f.store, a.request)); assert.equal(f.sent().length, 0);
+    refusedWith(await runStopAnalysis(f.store, a.request), 'call_series_unresolved'); assert.equal(f.sent().length, 0);
     assert.equal(f.store.list('om-stop-review').length, 0);
     const retry = ok(prepareStopAnalysis(f.store, a.request));
     assert.ok(retry.guards.some(guard => guard.id === a.request.series.id && 'revision' in guard && guard.revision === a.request.series.revision));
-    rejected(commit(f.store, { writes: [{ id: 'stale-analysis-application', kind: 'test', expected: 0, value: null }], guards: retry.guards }));
+    refusedWith(commit(f.store, { writes: [{ id: 'stale-analysis-application', kind: 'test', expected: 0, value: null }], guards: retry.guards }), 'input_stale');
   }
 });
 
@@ -608,8 +608,8 @@ writeFileSync(process.argv[3],JSON.stringify({series,p,g,rows,bytes:canonical(ro
       const activation = ok(prepareSeriesActivation(primary, { project, prepared: reference(old.p), issuance: reference(old.g) }));
       const opening = ok(prepareOpenSeries(other, { project, block: independent, line: 1, slice: 'legacy:concurrent-root', predecessor: null, basis: null }));
       for (const prepared of [activation, opening]) assert.equal(prepared.writes.find(write => write.id === seriesMembershipId(project))!.expected, 0);
-      if (first === 'root') { ok(commit(other, opening)); rejected(commit(primary, activation)); assert.equal(primary.get(activation.record.id), null); }
-      else { ok(commit(primary, activation)); rejected(commit(other, opening)); assert.equal(primary.get(opening.writes[0]!.id), null); }
+      if (first === 'root') { ok(commit(other, opening)); refusedWith(commit(primary, activation), 'input_stale'); assert.equal(primary.get(activation.record.id), null); }
+      else { ok(commit(primary, activation)); refusedWith(commit(other, opening), 'revision_conflict'); assert.equal(primary.get(opening.writes[0]!.id), null); }
       assert.deepEqual(ok(readSeriesAt(primary, project, reference(old.series))), old.series);
     } finally { primary.close(); other.close(); }
   }
@@ -638,7 +638,7 @@ writeFileSync(process.argv[3],JSON.stringify({series,p,g,rows,bytes:canonical(ro
       const membership = prepared.writes.find(write => write.id === seriesMembershipId(project))!;
       assert.deepEqual((membership.value as { roots: { block: string }[] }).roots.map(row => row.block).sort(), [block, independent, 'garden-produce-block'].sort());
       assert.equal(membership.expected, 0, 'The same transaction retains its original absent-membership CAS');
-      rejected(commit(primary, prepared)); assert.equal(primary.get(prepared.writes[0]!.id), null);
+      refusedWith(commit(primary, prepared), 'revision_conflict'); assert.equal(primary.get(prepared.writes[0]!.id), null);
     } finally { primary.close(); other.close(); }
   }
   let store = new Store(database);
@@ -696,8 +696,8 @@ test('B3.0b D5 new bound acceptance guards current C while exact repeat and reus
       ok(applySeriesActivation(other, change.request)); }
     finally { other.close(); }
     if (!accepted) {
-      rejected(commit(f.store, prepared)); assert.equal(f.store.get(prepared.record.id), null);
-      rejected(prepareAcceptedAnswer(f.store, answer.request));
+      refusedWith(commit(f.store, prepared), 'input_stale'); assert.equal(f.store.get(prepared.record.id), null);
+      refusedWith(prepareAcceptedAnswer(f.store, answer.request), 'input_stale');
       const independentFact = ok(writeAcceptedAnswer(f.store, { ...answer.request, attempt: null }));
       assert.equal(independentFact.value.request.attempt, null);
     } else {
@@ -747,12 +747,17 @@ test('B3.0b F5.2 saved and pending answer closures guard C but exact closure rep
       const verifiedPending = ok(confirmAnswerGapClosure(pendingView, supplied));
       assert.ok(verifiedPending.writes.some(write => write.id === close.accepted.id));
       assert.ok(verifiedPending.guards.some(guard => guard.id === seriesCurrentId(project)));
+      // The same call on the plain store is accepted while the block still participates; see the refusal below.
+      ok(confirmAnswerGapClosure(f.store, supplied));
     }
     const saved = pending ? null : ok(writeGapLines(f.store, request));
     exclude(f, 'after-answer-application');
     if (!saved) {
-      rejected(commit(f.store, prepared)); rejected(prepareGapLines(f.store, request));
-      rejected(confirmAnswerGapClosure(pendingView, supplied));
+      refusedWith(commit(f.store, prepared), 'input_stale'); refusedWith(prepareGapLines(f.store, request), 'series_invalid');
+      // The hiding view above would be refused for the record it hides, not for the exclusion: ask the plain store.
+      const unchanged = snapshot(f.store);
+      assert.equal(refusedWith(confirmAnswerGapClosure(f.store, supplied), 'series_invalid').at.field, 'participation');
+      assert.deepEqual(snapshot(f.store), unchanged);
     } else {
       const view = forbidCurrentPointer(f.store), before = snapshot(f.store);
       assert.deepEqual(ok(readGapLines(view, { project, record: reference(saved) })), saved);
@@ -837,7 +842,7 @@ test('B3.0b F5.2 new frame closure carries C while saved closure remains readabl
     const other = new Store(f.path);
     try { assert.equal(ok(applySeriesActivation(other, request)).record.value.decisions[0]!.outcome, 'continue'); }
     finally { other.close(); }
-    if (!saved) { rejected(commit(f.store, prepared)); rejected(prepareGapLines(f.store, frame.request)); }
+    if (!saved) { refusedWith(commit(f.store, prepared), 'input_stale'); refusedWith(prepareGapLines(f.store, frame.request), 'input_stale'); }
     else {
       const view = forbidCurrentPointer(f.store), before = snapshot(f.store);
       assert.deepEqual(ok(readGapLines(view, { project, record: reference(saved) })), saved);
@@ -857,7 +862,11 @@ function withoutManagedFields(value: RepairSeries): RepairSeries {
 }
 
 test('B3.0b era witness rejects paired field loss at first later and unactivated series revisions', t => {
-  for (const stage of ['first', 'later', 'unactivated'] as const) {
+  // Same split as above: the first managed revision and the unactivated registration are pinned by the era witness, so
+  // dropping their fields is refused as a substituted pinned content (record_forged on hash); only a later revision, which
+  // no witness pins, meets the check of the activation form (series_invalid on activation).
+  for (const [stage, code, at] of [['first', 'record_forged', 'hash'], ['later', 'series_invalid', 'activation'],
+    ['unactivated', 'record_forged', 'hash']] as const) {
     const f = fixture(t), legacy = f.series(); activate(f);
     const first = head(f), witness = era(f, reference(first));
     assert.equal(witness.revision, 1); assert.deepEqual(witness.value.firstManaged, reference(first));
@@ -869,8 +878,8 @@ test('B3.0b era witness rejects paired field loss at first later and unactivated
       assert.equal(registration.value.origin.kind, 'registration'); assert.deepEqual(registration.value.firstManaged, reference(row));
     }
     const forged = rewrite(f.store, row, withoutManagedFields(row.value));
-    f.restart(); rejected(readSeriesAt(f.store, project, reference(forged)));
-    rejected(prepareSeriesParticipantAdmission(f.store, project, reference(forged)));
+    f.restart(); assert.equal(refusedWith(readSeriesAt(f.store, project, reference(forged)), code).at.field, at, stage);
+    assert.equal(refusedWith(prepareSeriesParticipantAdmission(f.store, project, reference(forged)), code).at.field, at, stage);
     assert.deepEqual(ok(readSeriesAt(f.store, project, reference(legacy))), legacy);
   }
 });
@@ -886,7 +895,7 @@ test('B3.0b era proof rejects absent foreign or incomplete threshold and produce
         if (prop === 'get') return (id: string, revision?: number) => id === first.id && revision === first.revision ? null : target.get(id, revision);
         const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
       } });
-      rejected(readSeriesAt(view, project, reference(later))); continue;
+      refusedWith(readSeriesAt(view, project, reference(later)), 'record_missing'); continue;
     } else {
       const value = clone(witness.value) as unknown as Record<string, Json>;
       if (variant === 'foreign-first') value['firstManaged'] = { ...reference(first), id: 'repair-series:foreign:block:1' };
@@ -895,7 +904,7 @@ test('B3.0b era proof rejects absent foreign or incomplete threshold and produce
       if (variant === 'missing-field') delete value['firstManaged'];
       rewrite(f.store, witness, value as unknown as EraWitness);
     }
-    rejected(readSeriesAt(f.store, project, reference(later)));
+    refusedWith(readSeriesAt(f.store, project, reference(later)), 'series_invalid');
   }
 });
 
@@ -931,10 +940,10 @@ test('B3.0b legacy operation and era activation serialize in both second Store c
     const operation = ok(prepareBeginAttempt(other, { project, block, line: 1, attempt: 1, goal: workGoal }));
     assert.ok(operation.guards.some(guard => canonical(guard) === canonical(reference(source))));
     if (first === 'operation') {
-      ok(commit(other, operation)); rejected(commit(f.store, activation));
+      ok(commit(other, operation)); refusedWith(commit(f.store, activation), 'input_stale');
       assert.equal(f.store.get(seriesEraId(project, source.id)), null);
     } else {
-      ok(commit(f.store, activation)); rejected(commit(other, operation));
+      ok(commit(f.store, activation)); refusedWith(commit(other, operation), 'input_stale');
       assert.ok(f.store.get(seriesEraId(project, source.id), 1));
       assert.equal(head(f).value.attempts.length, 0);
     }
@@ -1003,7 +1012,7 @@ test('B3.0b new-work waits for explicit terminal close then preserves stop histo
       available: {}, choice: { choiceVersion, features: [{ outcome: 'garden-result' }], excluded: [] } }));
     return appliedPair(f, reference(horizon.gate), choiceVersion);
   };
-  rejected(prepareSeriesActivation(f.store, changed('changed-while-running')), 'attempt_running');
+  refusedWith(prepareSeriesActivation(f.store, changed('changed-while-running')), 'attempt_running');
   const closeRequest = { project, block, line: 1, attempt: 3, terminal: reference(terminal),
     outcome: { reason: 'interrupted' as const, achieved: [], cancelled: [], refusals: [] } };
   const closed = ok(completeAttempt(f.store, closeRequest));
@@ -1042,7 +1051,7 @@ test('B3.0b common historical work admission restores its original pointer guard
   assert.deepEqual(restored.guards, admitted.guards);
   assert.ok(restored.guards.some(guard => canonical(guard) === canonical(reference(source))));
   assert.ok(restored.guards.some(guard => canonical(guard) === canonical(reference(first.pointer))));
-  rejected(commit(f.store, { writes: [{ id: 'old-work-proof', kind: 'test', expected: 0, value: null }], guards: restored.guards }));
+  refusedWith(commit(f.store, { writes: [{ id: 'old-work-proof', kind: 'test', expected: 0, value: null }], guards: restored.guards }), 'input_stale');
   assert.equal(f.store.get('old-work-proof'), null);
 });
 
@@ -1112,20 +1121,21 @@ test('B3.0b exact running and received E4 records reject absent null and foreign
   const f = product(fixture(t)), { request } = ready(f), receipt = await received(f, request);
   const running = f.store.history<OmModelCall>(receipt.id).find(row => row.value.om.application === 'running')!;
   assert.ok(running);
-  for (const source of [running, receipt]) for (const variant of ['missing', 'null', 'foreign'] as const) {
+  for (const source of [running, receipt]) for (const [variant, code] of [['missing', 'series_invalid'],
+    ['null', 'model_call_record_invalid'], ['foreign', 'record_foreign']] as const) {
     const value = clone(source.value) as unknown as { om: Record<string, Json> };
     if (variant === 'missing') delete value.om['admission'];
     else if (variant === 'null') value.om['admission'] = null;
     else value.om['admission'] = { contract: 'om-model-admission/v1', series: { ...reference(f.running) },
       pointer: { ...reference(f.store.get(seriesCurrentId(project))!), id: 'om-series-current:foreign' } };
     const forged = rewrite(f.store, source, value as unknown as OmModelCall);
-    rejected(readModelCallPhysical(f.store, { project, record: reference(forged) }));
+    refusedWith(readModelCallPhysical(f.store, { project, record: reference(forged) }), code);
     rewrite(f.store, forged, source.value as OmModelCall);
   }
   assert.equal(f.sent().length, 1); ok(readModelCallPhysical(f.store, { project, record: reference(receipt) }));
   erase(f.store, seriesCurrentId(project));
   const before = snapshot(f.store);
-  rejected(await runModelCall(f.store, request));
+  refusedWith(await runModelCall(f.store, request), 'record_missing');
   assert.deepEqual(snapshot(f.store), before); assert.equal(f.sent().length, 1);
   assert.deepEqual(f.store.get(receipt.id), receipt, 'Lost proof preserves the physical receipt without manufacturing a terminal outcome');
 });
@@ -1135,7 +1145,7 @@ test('B3.0b old legacy E4 packet cannot gain a new physical launch after bootstr
   f.steps([{ research: fact(f), usage }]);
   activate(f, 'bootstrap-before-first-send'); f.restart();
   const before = snapshot(f.store);
-  rejected(await runModelCall(f.store, request)); assert.equal(f.sent().length, 0);
+  refusedWith(await runModelCall(f.store, request), 'series_conflict'); assert.equal(f.sent().length, 0);
   assert.equal(f.store.list('model-call').length, 0);
   assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(packet) })), packet);
   assert.deepEqual(snapshot(f.store), before);
@@ -1152,8 +1162,8 @@ test('B3.0b an unactivated registration cannot acquire later history or return a
     const value = clone(registered.value) as RepairSeries;
     const forged = f.store.write({ id: registered.id, kind: registered.kind, expected: f.store.get(registered.id)!.revision,
       value: later === 'changed-slice' ? { ...value, slice: 'forged-later-unactivated-slice' } : value });
-    rejected(readSeriesAt(f.store, project, reference(forged)));
-    rejected(prepareSeriesParticipantAdmission(f.store, project, reference(forged)));
+    refusedWith(readSeriesAt(f.store, project, reference(forged)), 'series_invalid');
+    refusedWith(prepareSeriesParticipantAdmission(f.store, project, reference(forged)), 'series_invalid');
     assert.deepEqual(ok(readSeriesAt(f.store, project, reference(registered))), registered);
   }
 });
@@ -1177,13 +1187,13 @@ test('B3.0b A6 saved physical response survives bootstrap or exclusion and stale
     const receipt = f.store.list<ModelCall>('model-call')[0]!;
     assert.deepEqual(receipt.value.usage, usage); assert.ok(receipt.value.response);
     if (managed) exclude(f); else activate(f, 'adopt-received-analysis');
-    f.restart(); rejected(await runStopAnalysis(f.store, a.request));
+    f.restart(); refusedWith(await runStopAnalysis(f.store, a.request), 'input_stale');
     assert.deepEqual(f.store.get(receipt.id), receipt); assert.equal(f.sent().length, 1);
     assert.equal(f.store.list('om-stop-review').length, 0);
     const call = f.store.list('call-record')[0]!;
     assert.equal(f.store.history(call.id).length, 2);
     const before = snapshot(f.store); f.restart();
-    rejected(await runStopAnalysis(f.store, a.request)); assert.deepEqual(snapshot(f.store), before); assert.equal(f.sent().length, 1);
+    refusedWith(await runStopAnalysis(f.store, a.request), 'input_stale'); assert.deepEqual(snapshot(f.store), before); assert.equal(f.sent().length, 1);
   }
 });
 
@@ -1211,8 +1221,10 @@ for (const foreign of ['another prepared transition', 'another horizon and choic
     } else if (foreign === 'another horizon and choice') issuance = transition(f, 'foreign-G-other-choice').request.issuance;
     else issuance = { ...pair.request.issuance, id: pair.request.issuance.id.replace(`:${project}:`, ':foreign-project:') };
     const request = { ...pair.request, issuance }, before = snapshot(f.store);
+    // A reference into another namespace is a foreign record; a real but unrelated P or G fails the exact binding instead.
+    const code = foreign === 'another project namespace' ? 'record_foreign' : 'series_invalid';
     for (const operation of [prepareSeriesActivation, applySeriesActivation]) {
-      rejected(operation(f.store, request));
+      refusedWith(operation(f.store, request), code);
       assert.deepEqual(snapshot(f.store), before);
     }
     for (const kind of ['om-series-applied', 'om-series-current', 'om-series-era', 'om-series-discarded'])
@@ -1231,9 +1243,9 @@ test('B3 applied and pointer history rederive the exact G binding after a self-c
     kind: applied.record.kind, expected: 0, value });
   const pointer = rewrite(f.store, applied.pointer, { ...clone(applied.pointer.value), applied: reference(forged) });
   const before = snapshot(f.store); f.restart();
-  rejected(readAppliedSeriesTransition(f.store, { project, record: reference(forged) }));
-  rejected(readCurrentSeriesPointer(f.store, { project, record: reference(pointer) }));
-  rejected(readCurrentSeriesPointer(f.store, { project }));
+  refusedWith(readAppliedSeriesTransition(f.store, { project, record: reference(forged) }), 'series_invalid');
+  refusedWith(readCurrentSeriesPointer(f.store, { project, record: reference(pointer) }), 'series_invalid');
+  refusedWith(readCurrentSeriesPointer(f.store, { project }), 'series_invalid');
   assert.deepEqual(snapshot(f.store), before);
 });
 
@@ -1241,7 +1253,7 @@ test('B3 discarded records only the proved negative pair after heads move and re
   const f = fixture(t); f.series(); stop(f); activate(f, 'before-negative');
   const pair = refusedPair(f), historicalP = f.store.history(pair.prepared.id);
   const afterNegative = snapshot(f.store);
-  const refused = rejected(applySeriesActivation(f.store, pair.request), 'series_transition_refused');
+  const refused = refusedWith(applySeriesActivation(f.store, pair.request), 'series_transition_refused');
   assert.deepEqual(refused.at.ref, pair.request.issuance);
   assert.deepEqual(snapshot(f.store), afterNegative);
   const first = ok(prepareSeriesDiscard(f.store, pair.request));
@@ -1288,33 +1300,35 @@ test('B3 discarded refuses accepted foreign and corrupt G and every absent saved
     horizon: pair.issuance.value.horizon, series: [] }));
   const wrongP = reference(ok(writeHorizonIssuance(f.store, { project, choiceVersion: pair.issuance.value.choiceVersion,
     horizon: pair.issuance.value.horizon, transition: reference(empty) })));
-  for (const request of [accepted.request, { ...pair.request, issuance: wrongP }, { ...pair.request, issuance: other.request.issuance },
-    { ...pair.request, issuance: { ...pair.request.issuance, hash: '0'.repeat(64) } },
-    { ...pair.request, issuance: { ...pair.request.issuance, id: pair.request.issuance.id.replace(`:${project}:`, ':foreign:') } }]) {
+  const discards: [Parameters<typeof prepareSeriesDiscard>[1], string][] = [[accepted.request, 'series_invalid'],
+    [{ ...pair.request, issuance: wrongP }, 'series_invalid'], [{ ...pair.request, issuance: other.request.issuance }, 'series_invalid'],
+    [{ ...pair.request, issuance: { ...pair.request.issuance, hash: '0'.repeat(64) } }, 'record_forged'],
+    [{ ...pair.request, issuance: { ...pair.request.issuance, id: pair.request.issuance.id.replace(`:${project}:`, ':foreign:') } }, 'record_foreign']];
+  for (const [request, code] of discards) {
     const before = snapshot(f.store);
-    rejected(prepareSeriesDiscard(f.store, request)); rejected(writeSeriesDiscard(f.store, request));
+    refusedWith(prepareSeriesDiscard(f.store, request), code); refusedWith(writeSeriesDiscard(f.store, request), code);
     assert.deepEqual(snapshot(f.store), before);
   }
   const forgedG = rewrite(f.store, accepted.issuance, { ...accepted.issuance.value, state: 'refused', codes: pair.issuance.value.codes });
   const masquerade = { ...accepted.request, issuance: reference(forgedG) }, beforeMasquerade = snapshot(f.store);
-  rejected(readHorizonIssuance(f.store, { project, record: reference(forgedG) }));
+  refusedWith(readHorizonIssuance(f.store, { project, record: reference(forgedG) }), 'horizon_issuance_record_invalid');
   for (const operation of [prepareSeriesActivation, applySeriesActivation, prepareSeriesDiscard, writeSeriesDiscard])
-    assert.notEqual(rejected(operation(f.store, masquerade)).code, 'series_transition_refused');
+    refusedWith(operation(f.store, masquerade), 'horizon_issuance_record_invalid');
   assert.deepEqual(snapshot(f.store), beforeMasquerade);
   rewrite(f.store, forgedG, accepted.issuance.value);
   const saved = ok(writeSeriesDiscard(f.store, pair.request)).record;
   for (const field of Object.keys(saved.value)) {
     const value = clone(saved.value) as unknown as Record<string, Json>; delete value[field];
     const forged = rewrite(f.store, saved, value as unknown as typeof saved.value), before = snapshot(f.store); f.restart();
-    rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }));
-    rejected(prepareSeriesDiscard(f.store, pair.request)); rejected(writeSeriesDiscard(f.store, pair.request));
+    refusedWith(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }), 'series_invalid');
+    refusedWith(prepareSeriesDiscard(f.store, pair.request), 'series_invalid'); refusedWith(writeSeriesDiscard(f.store, pair.request), 'series_invalid');
     assert.deepEqual(snapshot(f.store), before);
     rewrite(f.store, forged, saved.value);
   }
   for (const value of [{ ...saved.value, codes: [] }, { ...saved.value, state: 'accepted' },
     { ...saved.value, prepared: other.request.prepared }, { ...saved.value, issuance: other.request.issuance }]) {
     const forged = rewrite(f.store, saved, value as typeof saved.value); f.restart();
-    rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }));
+    refusedWith(readDiscardedSeriesTransition(f.store, { project, record: reference(forged) }), 'series_invalid');
     rewrite(f.store, forged, saved.value);
   }
   for (const source of [pair.prepared, pair.issuance]) {
@@ -1322,8 +1336,8 @@ test('B3 discarded refuses accepted foreign and corrupt G and every absent saved
       if (prop === 'get') return (id: string, revision?: number) => id === source.id ? null : target.get(id, revision);
       const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
     } });
-    rejected(readDiscardedSeriesTransition(view, { project, record: reference(saved) }));
-    rejected(writeSeriesDiscard(view, pair.request));
+    refusedWith(readDiscardedSeriesTransition(view, { project, record: reference(saved) }), 'record_missing');
+    refusedWith(writeSeriesDiscard(view, pair.request), 'record_missing');
   }
   assert.deepEqual(ok(readDiscardedSeriesTransition(f.store, { project, record: reference(saved) })), saved);
 });
@@ -1356,7 +1370,7 @@ test('B3 removing another block retains the stopped active series and the inacti
   assert.equal(f.store.get(`repair-series:${project}:2:${block}`), null);
   for (const field of ['stop', 'ladder', 'withoutProgress', 'attempts'] as const) assert.deepEqual(retained.value[field], stopped.value[field]);
   assert.deepEqual(ok(readStopHistory(f.store, { project, block, line: 1 })), history);
-  rejected(beginAttempt(f.store, { project, block, line: 1, attempt: 4, goal: workGoal }), 'series_stopped');
+  refusedWith(beginAttempt(f.store, { project, block, line: 1, attempt: 4, goal: workGoal }), 'series_stopped');
   const decision = applied.record.value.decisions.find(row => row.block === independent)!;
   assert.equal(decision.outcome, 'inactive'); assert.equal(decision.participation, 'excluded');
   assert.deepEqual(decision.activeBasis, independentBasis);
@@ -1383,12 +1397,12 @@ test('B3 one running participant refuses the whole new-work application and only
   ok(beginAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
   const accepted = acceptMappedFrame(f, { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null });
   const pair = changedPair(f, accepted, 'multi-running'), before = snapshot(f.store);
-  rejected(prepareSeriesActivation(f.store, pair), 'attempt_running');
-  rejected(applySeriesActivation(f.store, pair), 'attempt_running');
+  refusedWith(prepareSeriesActivation(f.store, pair), 'attempt_running');
+  refusedWith(applySeriesActivation(f.store, pair), 'attempt_running');
   assert.deepEqual(snapshot(f.store), before); assert.deepEqual(f.store.list('om-series-discarded'), []);
   ok(completeAttempt(f.store, { project, block: independent, line: 1, attempt: 1,
     outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
-  const afterClose = snapshot(f.store); rejected(applySeriesActivation(f.store, pair)); assert.deepEqual(snapshot(f.store), afterClose);
+  const afterClose = snapshot(f.store); refusedWith(applySeriesActivation(f.store, pair), 'series_invalid'); assert.deepEqual(snapshot(f.store), afterClose);
   const applied = ok(applySeriesActivation(f.store, changedPair(f, accepted, 'multi-closed')));
   assert.equal(applied.series.length, 2); assert.ok(applied.record.value.decisions.every(row => row.outcome === 'new-work'));
   assert.ok(applied.series.every(row => row.value.line === 2)); assert.deepEqual(f.store.list('om-series-discarded'), []);
@@ -1404,7 +1418,7 @@ test('B3 a second Store moving one participant defeats all prepared writes with 
   assert.equal(prepared.series.length, 2); assert.ok(prepared.series.every(row => row.value.line === 2));
   ok(beginAttempt(other, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
   const afterRival = snapshot(f.store);
-  rejected(commit(f.store, prepared)); assert.deepEqual(snapshot(f.store), afterRival);
+  refusedWith(commit(f.store, prepared), 'input_stale'); assert.deepEqual(snapshot(f.store), afterRival);
   assert.equal(f.store.get(prepared.record.id), null); assert.deepEqual(f.store.list('om-series-discarded'), []);
   for (const owner of [block, independent]) assert.equal(f.store.get(`repair-series:${project}:2:${owner}`), null);
   ok(completeAttempt(other, { project, block: independent, line: 1, attempt: 1,
@@ -1430,16 +1444,16 @@ test('B3 accepted new-work blocks old E1 E2 E4 admission while exact call and pa
   for (const restart of [false, true]) {
     if (restart) f.restart();
     const before = snapshot(f.store);
-    rejected(commit(f.store, { writes: [{ id: 'B3-stale-E1', kind: 'test', expected: 0, value: null }], guards: launch.guards }));
-    rejected(commit(f.store, { writes: [{ id: 'B3-stale-E2', kind: 'test', expected: 0, value: null }], guards: q.guards }));
-    rejected(prepareCallDispatch(f.store, project, reference(call.call)));
+    refusedWith(commit(f.store, { writes: [{ id: 'B3-stale-E1', kind: 'test', expected: 0, value: null }], guards: launch.guards }), 'input_stale');
+    refusedWith(commit(f.store, { writes: [{ id: 'B3-stale-E2', kind: 'test', expected: 0, value: null }], guards: q.guards }), 'input_stale');
+    refusedWith(prepareCallDispatch(f.store, project, reference(call.call)), 'call_series_unresolved');
     for (const series of [reference(f.running), reference(advanced)])
-      rejected(recordCall(f.store, project, { ...oldRequest, call: `fresh-old-${series.revision}`, series }), 'call_series_unresolved');
+      refusedWith(recordCall(f.store, project, { ...oldRequest, call: `fresh-old-${series.revision}`, series }), 'call_series_unresolved');
     const repeated = ok(recordCall(f.store, project, oldRequest));
     assert.equal(repeated.repeated, true); assert.deepEqual(repeated.call, call.call);
     assert.deepEqual(ok(readCall(f.store, project, reference(call.call))), call.call);
     assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(packet) })), packet);
-    rejected(await runModelCall(f.store, e4)); assert.equal(f.sent().length, 0);
+    refusedWith(await runModelCall(f.store, e4), 'series_conflict'); assert.equal(f.sent().length, 0);
     assert.equal(f.store.list('model-call').length, 0); assert.deepEqual(snapshot(f.store), before);
   }
   const running = ok(beginAttempt(f.store, { project, block, line: 2, attempt: 2, goal: f.goal }));
@@ -1621,12 +1635,12 @@ test('B3 discarded exact reading rejects wrong address revision hash kind and ex
   const wrongRevision = f.store.write({ id: saved.id, kind: saved.kind, expected: 1, value: saved.value });
   const extra = rewrite(f.store, saved, { ...saved.value, extra: null } as typeof saved.value);
   f.restart();
-  for (const record of [wrongAddress, wrongRevision, extra]) rejected(readDiscardedSeriesTransition(f.store, { project, record: reference(record) }));
+  for (const record of [wrongAddress, wrongRevision, extra]) refusedWith(readDiscardedSeriesTransition(f.store, { project, record: reference(record) }), 'series_invalid');
   rewrite(f.store, extra, saved.value);
-  rejected(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), hash: 'f'.repeat(64) } }), 'record_forged');
-  rejected(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), id: saved.id.replace(`:${project}:`, ':foreign:') } }), 'record_foreign');
+  refusedWith(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), hash: 'f'.repeat(64) } }), 'record_forged');
+  refusedWith(readDiscardedSeriesTransition(f.store, { project, record: { ...reference(saved), id: saved.id.replace(`:${project}:`, ':foreign:') } }), 'record_foreign');
   const alone = emptyProject(t); alone.store.write({ id: saved.id, kind: 'om-series-applied', expected: 0, value: saved.value }); alone.restart();
-  rejected(readDiscardedSeriesTransition(alone.store, { project, record: reference(saved) }), 'record_foreign');
+  refusedWith(readDiscardedSeriesTransition(alone.store, { project, record: reference(saved) }), 'record_foreign');
   assert.deepEqual(ok(readDiscardedSeriesTransition(f.store, { project, record: reference(saved) })), saved);
 });
 
@@ -1636,7 +1650,7 @@ test('B3 two Stores race the same discarded address without another write or ser
   assert.deepEqual(snapshot(f.store), before);
   const won = ok(writeSeriesDiscard(other, pair.request)), afterRival = snapshot(f.store);
   assert.deepEqual(afterRival.filter(row => row.head.id !== won.record.id), before);
-  rejected(commit(f.store, prepared), 'revision_conflict');
+  refusedWith(commit(f.store, prepared), 'revision_conflict');
   assert.deepEqual(snapshot(f.store), afterRival); assert.equal(f.store.history(won.record.id).length, 1);
   f.restart();
   assert.deepEqual(ok(writeSeriesDiscard(f.store, pair.request)), won);
@@ -1752,8 +1766,8 @@ test('29 H1.0b another block participation change is not a cause; the own exclus
   assert.ok(checked.cause); assert.equal(checked.cause.condition, 'active-participation');
   assert.deepEqual(checked.cause.change.currentPointer, reference(excluded.pointer));
   assert.deepEqual(ok(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: checked.cause })), checked);
-  assert.equal(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: { ...checked.cause,
-    change: { ...checked.cause.change, currentPointer: reference(continued.pointer) } } }).ok, false);
+  refusedWith(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: { ...checked.cause,
+    change: { ...checked.cause.change, currentPointer: reference(continued.pointer) } } }), 'assessment_cause_unproved');
   activate(f, 'h10b-reactivation'); f.restart();
   assert.deepEqual(ok(readAssessmentSeriesTerminationCause(f.store, { ...input, cause: checked.cause })), checked);
   assert.equal(ok(prepareAssessmentSeriesTerminationCause(f.store, input)).cause, null);
@@ -1774,8 +1788,8 @@ test('25 H1.0b an excluded managed root closes before any E1, with historical nu
   assert.equal(cessation.value.ledger, null); assert.equal(cessation.value.physicalId, null);
   const claim = { project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
   await t.test('45 complete managed work does not authorize raw A3 or a caller force flag', () => {
-    assert.equal(completeAttempt(f.store, { project, block, line: 1, attempt: 1,
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }).ok, false);
+    refusedWith(completeAttempt(f.store, { project, block, line: 1, attempt: 1,
+      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }), 'completion_required');
   });
   const closed = ok(closeAttempt(f.store, claim));
   assert.equal(head(f).value.attempts[0]!.outcome!.reason, 'interrupted');
@@ -1802,7 +1816,7 @@ test('23 H1.0b standalone physical terminal passes through G7 without weakening 
   const closed = ok(closeAttempt(f.store, claim));
   assert.deepEqual(head(f).value.attempts[0]!.terminal, reference(runtime));
   assert.equal(head(f).value.withoutProgress, 1);
-  assert.equal(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, reason: 'off-form' } }).ok, false);
+  refusedWith(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, reason: 'off-form' } }), 'outcome_conflict');
   f.restart(); const prior = snapshot(f.store);
   assert.deepEqual(ok(closeAttempt(f.store, claim)), closed);
   assert.deepEqual(snapshot(f.store), prior); assert.equal(f.sent().length, 1);
@@ -1860,10 +1874,10 @@ test('14 H1.0b inactive composition preserves S N and a stopped application in o
     assert.ok(work.negative.some(ref => ref.id === negative.id)); assert.equal(work.refusals.length, 1);
   });
   await t.test('24 a technical contribution cannot erase neighbouring S and N', () => {
-    assert.equal(closeAttempt(f.store, { ...claim, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+    refusedWith(closeAttempt(f.store, { ...claim, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }), 'completion_invalid');
   });
   await t.test('44 direct G7 cannot hide saved products behind empty claims', () => {
-    assert.equal(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, accepting: [], refusals: [] } }).ok, false);
+    refusedWith(closeAttempt(f.store, { ...claim, outcome: { ...claim.outcome, accepting: [], refusals: [] } }), 'completion_invalid');
   });
   const closed = ok(closeAttempt(f.store, claim)); const rows = [accepted, negative, stopped];
   assert.deepEqual(head(f).value.attempts[0]!.outcome!.achieved.map(x => x.basis), [accepted.value.accepted]);
@@ -1924,8 +1938,8 @@ async function inactivePhysicalRecovery(t: TestContext, paid: boolean) {
   assert.equal(cannot.ok, false); if (!cannot.ok) assert.equal(cannot.refusal.code, 'completion_claim_exists');
   assert.equal(ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, owner.binding.id))!))).complete, false);
   await t.test('26 inactive I cannot be closed by G7', () => {
-    assert.equal(closeAttempt(f.store, { project, block, line: 1, attempt: 1,
-      outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+    refusedWith(closeAttempt(f.store, { project, block, line: 1, attempt: 1,
+      outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }), 'completion_incomplete');
   });
   assert.equal(child.kill('SIGKILL'), true); await exited; f.restart();
   const recovered = f.engine.execute({ type: 'recover-model-call', project, call: reference(claimed) }) as Revision<OmModelCall>;
@@ -1979,7 +1993,7 @@ test('28 H1.0b completion-only rejects missing current admission and altered att
       };
       const v: unknown = Reflect.get(target, property, target); return typeof v === 'function' ? v.bind(target) : v;
     } });
-    assert.equal(prepareCompletionAdmission(view, project, reference(binding)).ok, false);
+    refusedWith(prepareCompletionAdmission(view, project, reference(binding)), field === 'kind' ? 'record_foreign' : 'series_invalid');
   });
   assert.equal(f.sent().length, 0);
 });
@@ -2000,7 +2014,7 @@ test('35 H1.0b root cessation retains all unchosen E2 candidates and defeats a p
   const root = before.assignments[0]!;
   const ceased = ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(root) }));
   assert.equal(ceased.value.remainder, 'expansion'); assert.equal(ceased.value.ledger, null);
-  assert.equal(commit(f.store, pending).ok, false);
+  refusedWith(commit(f.store, pending), 'input_stale');
   assert.equal(f.store.list('om-completion-packet').length, 2); assert.equal(f.store.list('call-record').length, 0);
   const after = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
   assert.equal(after.complete, true); assert.equal(after.assignments.length, 1);
@@ -2009,7 +2023,7 @@ test('35 H1.0b root cessation retains all unchosen E2 candidates and defeats a p
   f.restart(); const history = snapshot(f.store);
   assert.deepEqual(ok(writeQuestionPacket(f.store, f.packetRequest)).record, first.packet);
   assert.deepEqual(ok(writeQuestionPacket(f.store, alternate)).record, second);
-  assert.equal((await runModelCall(f.store, first.request)).ok, false);
+  refusedWith(await runModelCall(f.store, first.request), 'series_conflict');
   assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(ceased))), ceased);
   assert.deepEqual(snapshot(f.store), history); assert.equal(f.sent().length, 0);
 });

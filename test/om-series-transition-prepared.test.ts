@@ -3,7 +3,7 @@ import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { readLayerAcceptance } from "../src/om/layer-basis.js";
-import { createOmFixture } from "./om-fixture.js";
+import { createOmFixture, refusedWith } from "./om-fixture.js";
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -41,14 +41,6 @@ const opaqueSlice = "legacy:opaque-subject", clone = structuredClone;
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
-}
-function rejected(result: OmResult<unknown>, code?: string) {
-  assert.equal(result.ok, false);
-  if (result.ok) assert.fail("Expected an addressed refusal");
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target);
-  assert.ok(result.refusal.message);
-  return result.refusal;
 }
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function rewrite<T>(store: Store, record: Revision<T>, value: T): Revision<T> {
@@ -289,7 +281,7 @@ test("P public inputs are explicit, an empty named series set is legal, and a me
   }
   const empty = ok(writeSeriesTransition(f.store, { ...given, series: [] }));
   assert.deepEqual(empty.value.decisions, []);
-  rejected(comparePreparedSeriesSlices(f.store, { project, previous: reference(empty), next: reference(empty), block }), "series_transition_unproven");
+  refusedWith(comparePreparedSeriesSlices(f.store, { project, previous: reference(empty), next: reference(empty), block }), "series_transition_unproven");
   invalid(() => readPreparedSeriesTransition(f.store, { project } as { project: string; record: Ref }));
   invalid(() => comparePreparedSeriesSlices(f.store, { project, previous: reference(empty), next: reference(empty) } as Parameters<typeof comparePreparedSeriesSlices>[1]));
   const sources: GapRequest = { project, input: reference(f.input), graph: reference(f.graph), horizon: reference(horizon.gate),
@@ -298,10 +290,10 @@ test("P public inputs are explicit, an empty named series set is legal, and a me
   const gaps = ok(writeGaps(f.store, sources));
   const mechanism = ok(openSeries(f.store, { project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, line: 1,
     predecessor: null, basis: null, scope: { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) } }));
-  rejected(prepareSeriesTransition(f.store, { ...given, series: [reference(mechanism)] }), "series_transition_unproven");
+  refusedWith(prepareSeriesTransition(f.store, { ...given, series: [reference(mechanism)] }), "series_transition_unproven");
   const next = ok(openSeries(f.store, { project, block, line: 2, slice: "legacy:successor", predecessor: reference(series),
     basis: { ground: "inputs-changed", text: "The legacy owner changed the subject" } }));
-  rejected(prepareSeriesTransition(f.store, { ...given, series: [reference(series), reference(next)] }), "series_transition_unproven");
+  refusedWith(prepareSeriesTransition(f.store, { ...given, series: [reference(series), reference(next)] }), "series_transition_unproven");
 });
 
 test("P carries graph, stage, input and evidence guards to the same final transaction", t => {
@@ -326,7 +318,7 @@ test("P carries graph, stage, input and evidence guards to the same final transa
         engine.discovery.evidence.document(project, "brief", "A changed owner brief", "text/plain", old.revision);
       }
     } finally { other.close(); }
-    rejected(writeGuarded(f.store, { unit: "B3", target: prepared.record.id,
+    refusedWith(writeGuarded(f.store, { unit: "B3", target: prepared.record.id,
       writes: [...prepared.writes, { id: `neighbor:${kind}`, kind: "test", expected: 0, value: {} }], guards: prepared.guards }), "input_stale");
     assert.equal(f.store.get(prepared.record.id), null, kind); assert.equal(f.store.get(`neighbor:${kind}`), null, kind);
   }
@@ -339,7 +331,7 @@ test("prepared source CAS rejects a series changed by a second Store and writes 
   try { ok(beginAttempt(other, { project, block, line: 1, attempt: 1,
     goal: { key: "new-attempt", questions: ["Name the result"], result: "accepted proposal" } })); }
   finally { other.close(); }
-  rejected(writeGuarded(f.store, { unit: "B3.0a", target: prepared.record.id,
+  refusedWith(writeGuarded(f.store, { unit: "B3.0a", target: prepared.record.id,
     writes: [...prepared.writes, { id: "transition-neighbor", kind: "test", expected: 0, value: {} }], guards: prepared.guards }), "input_stale");
   assert.equal(f.store.get(prepared.record.id), null); assert.equal(f.store.get("transition-neighbor"), null);
 });
@@ -361,15 +353,16 @@ test("prepared history remains exact after source heads advance and the Store is
 test("prepared records require exact source references and rederive decisions instead of trusting saved hashes", t => {
   const f = fixture(t), horizon = f.horizon("choice-1"), series = f.series();
   const valid = request(reference(horizon.gate), [reference(series)]), before = snapshot(f.store);
-  for (const source of [
-    { ...valid, horizon: { ...valid.horizon, hash: "0".repeat(64) } },
-    { ...valid, horizon: { ...valid.horizon, revision: 900 } },
-    { ...valid, horizon: { ...valid.horizon, id: "om-horizon:other:choice-1" } },
-    { ...valid, series: [{ ...reference(series), hash: "0".repeat(64) }] },
-    { ...valid, series: [{ ...reference(series), revision: 900 }] },
-    { ...valid, series: [reference(series), reference(series)] },
-    { ...valid, choiceVersion: "another-choice" },
-  ]) rejected(prepareSeriesTransition(f.store, source));
+  const sources: [typeof valid, string][] = [
+    [{ ...valid, horizon: { ...valid.horizon, hash: "0".repeat(64) } }, "record_forged"],
+    [{ ...valid, horizon: { ...valid.horizon, revision: 900 } }, "record_missing"],
+    [{ ...valid, horizon: { ...valid.horizon, id: "om-horizon:other:choice-1" } }, "record_foreign"],
+    [{ ...valid, series: [{ ...reference(series), hash: "0".repeat(64) }] }, "record_forged"],
+    [{ ...valid, series: [{ ...reference(series), revision: 900 }] }, "record_missing"],
+    [{ ...valid, series: [reference(series), reference(series)] }, "series_transition_unproven"],
+    [{ ...valid, choiceVersion: "another-choice" }, "series_transition_unproven"],
+  ];
+  for (const [source, code] of sources) refusedWith(prepareSeriesTransition(f.store, source), code);
   assert.deepEqual(snapshot(f.store), before);
   const saved = ok(writeSeriesTransition(f.store, valid));
   const mutations: ((value: Record<string, any>) => void)[] = [
@@ -386,9 +379,9 @@ test("prepared records require exact source references and rederive decisions in
   for (const mutate of mutations) {
     const value = clone(saved.value) as Record<string, any>; mutate(value);
     const changed = rewrite(f.store, saved, value as PreparedSeriesTransitionRecord);
-    rejected(readPreparedSeriesTransition(f.store, { project, record: reference(changed) }));
+    refusedWith(readPreparedSeriesTransition(f.store, { project, record: reference(changed) }), "series_transition_unproven");
     f.restart();
-    rejected(readPreparedSeriesTransition(f.store, { project, record: reference(changed) }));
+    refusedWith(readPreparedSeriesTransition(f.store, { project, record: reference(changed) }), "series_transition_unproven");
     rewrite(f.store, saved, clone(saved.value) as PreparedSeriesTransitionRecord);
     assert.deepEqual(ok(readPreparedSeriesTransition(f.store, { project, record: reference(saved) })).record, saved);
   }
@@ -422,21 +415,21 @@ test("G2 refuses incomplete, foreign and mismatched issuance sources and recompu
   const given = { project, choiceVersion: "choice-1", horizon: reference(first.gate), transition: reference(transition) };
   for (const field of ["project", "choiceVersion", "horizon", "transition"] as const) {
     const missing = clone(given) as Record<string, unknown>; delete missing[field];
-    rejected(prepareHorizonIssuance(f.store, missing as typeof given), "horizon_issuance_request_invalid");
-    rejected(writeHorizonIssuance(f.store, missing as typeof given), "horizon_issuance_request_invalid");
+    refusedWith(prepareHorizonIssuance(f.store, missing as typeof given), "horizon_issuance_request_invalid");
+    refusedWith(writeHorizonIssuance(f.store, missing as typeof given), "horizon_issuance_request_invalid");
   }
   for (const change of [
     { ...given, choiceVersion: "choice-2", horizon: reference(second.gate) },
     { ...given, choiceVersion: "choice-2" },
-  ]) rejected(prepareHorizonIssuance(f.store, change), "horizon_issuance_binding_invalid");
+  ]) refusedWith(prepareHorizonIssuance(f.store, change), "horizon_issuance_binding_invalid");
   for (const field of ["horizon", "transition"] as const) {
-    rejected(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], revision: 900 } }), "record_missing");
-    rejected(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], hash: "0".repeat(64) } }), "record_forged");
-    rejected(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], id: `${field}:other` } }), "record_foreign");
+    refusedWith(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], revision: 900 } }), "record_missing");
+    refusedWith(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], hash: "0".repeat(64) } }), "record_forged");
+    refusedWith(prepareHorizonIssuance(f.store, { ...given, [field]: { ...given[field], id: `${field}:other` } }), "record_foreign");
   }
   const refusedHorizon = f.horizon("refused", { excluded: [{ block: producer, reason: "Excluded producer", returnCondition: "Select provider" }] });
   assert.equal(refusedHorizon.gate.value.state, "refused");
-  rejected(prepareHorizonIssuance(f.store, { ...given, choiceVersion: "refused", horizon: reference(refusedHorizon.gate) }), "horizon_issuance_binding_invalid");
+  refusedWith(prepareHorizonIssuance(f.store, { ...given, choiceVersion: "refused", horizon: reference(refusedHorizon.gate) }), "horizon_issuance_binding_invalid");
   const saved = ok(writeHorizonIssuance(f.store, given));
   for (const mutate of [
     (value: Record<string, any>) => { delete value.transition; },
@@ -447,9 +440,9 @@ test("G2 refuses incomplete, foreign and mismatched issuance sources and recompu
   ]) {
     const value = clone(saved.value) as Record<string, any>; mutate(value);
     const changed = rewrite(f.store, saved, value as typeof saved.value);
-    rejected(readHorizonIssuance(f.store, { project, record: reference(changed) }), "horizon_issuance_record_invalid");
+    refusedWith(readHorizonIssuance(f.store, { project, record: reference(changed) }), "horizon_issuance_record_invalid");
     f.restart();
-    rejected(readHorizonIssuance(f.store, { project, record: reference(changed) }), "horizon_issuance_record_invalid");
+    refusedWith(readHorizonIssuance(f.store, { project, record: reference(changed) }), "horizon_issuance_record_invalid");
     rewrite(f.store, saved, saved.value);
   }
 });
@@ -460,7 +453,7 @@ test("G2 source and target CAS are atomic and old issuance keeps its exact prepa
   const given = { project, choiceVersion: "choice-1", horizon: reference(horizon.gate), transition: reference(transition) };
   const prepared = ok(prepareHorizonIssuance(f.store, given)), other = new Store(f.path);
   const saved = (() => { try { return ok(writeHorizonIssuance(other, given)); } finally { other.close(); } })();
-  rejected(writeGuarded(f.store, { unit: "G2", target: saved.id, writes: [...prepared.writes,
+  refusedWith(writeGuarded(f.store, { unit: "G2", target: saved.id, writes: [...prepared.writes,
     { id: "issuance-neighbor", kind: "test", expected: 0, value: {} }], guards: prepared.guards }), "revision_conflict");
   assert.equal(f.store.get("issuance-neighbor"), null);
   const next = f.horizon("next"), p = ok(writeSeriesTransition(f.store, request(reference(next.gate), [reference(series)], "next")));
@@ -471,10 +464,10 @@ test("G2 source and target CAS are atomic and old issuance keeps its exact prepa
     competing.write({ id: p.id, kind: p.kind, expected: p.revision, value: { state: "discarded", source: reference(p) } });
     competing.write({ id: transition.id, kind: transition.kind, expected: transition.revision, value: { state: "applied", source: reference(transition) } });
   } finally { competing.close(); }
-  rejected(writeGuarded(f.store, { unit: "G2", target: pending.record.id, writes: [...pending.writes,
+  refusedWith(writeGuarded(f.store, { unit: "G2", target: pending.record.id, writes: [...pending.writes,
     { id: "issuance-neighbor", kind: "test", expected: 0, value: {} }], guards: pending.guards }), "input_stale");
   assert.equal(f.store.get(pending.record.id), null); assert.equal(f.store.get("issuance-neighbor"), null);
-  rejected(prepareHorizonIssuance(f.store, given), "input_stale");
+  refusedWith(prepareHorizonIssuance(f.store, given), "input_stale");
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try { assert.deepEqual(ok(readHorizonIssuance(exact, { project, record: reference(saved) })).record, saved); }
@@ -495,7 +488,7 @@ test("active exclusion and return preserve the last comparable active content wi
   assert.equal(decision(b, independent).outcome, "inactive");
   assert.equal(decision(c, independent).outcome, "establish-basis", "Preparation alone does not activate a managed series");
   assert.equal(ok(comparePreparedSeriesSlices(f.store, { project, previous: reference(a), next: reference(c), block: independent })), "continue");
-  rejected(comparePreparedSeriesSlices(f.store, { project, previous: reference(b), next: reference(c), block: independent }));
+  refusedWith(comparePreparedSeriesSlices(f.store, { project, previous: reference(b), next: reference(c), block: independent }), "series_transition_unproven");
   assert.deepEqual(f.store.get(series.id), series);
 });
 
@@ -731,7 +724,7 @@ test("a genuinely refused horizon has an exact prepared transition and negative 
   assert.equal(horizon.gate.value.state, "refused");
   assert.ok(horizon.gate.value.codes.includes("horizon_requires_excluded"));
   const given = request(reference(horizon.gate), [reference(series)], "refused-choice"), before = snapshot(f.store);
-  rejected(prepareSeriesTransition(f.store, { ...given, series: [{ ...reference(series), revision: 900 }] }), "record_missing");
+  refusedWith(prepareSeriesTransition(f.store, { ...given, series: [{ ...reference(series), revision: 900 }] }), "record_missing");
   const prepared = ok(prepareSeriesTransition(f.store, given));
   assert.deepEqual(snapshot(f.store), before);
   assert.deepEqual(prepared.record.value.decisions, [], "Refusal does not prove active, boundary or excluded participation");
@@ -756,9 +749,9 @@ test("a genuinely refused horizon has an exact prepared transition and negative 
     horizon: reference(accepted.gate), transition: reference(emptyAccepted) }));
   assert.equal(emptyIssued.value.state, "accepted", "The exact H outcome determines G; an empty decision set does not imply refusal");
   assert.deepEqual(emptyIssued.value.codes, []);
-  rejected(comparePreparedSeriesSlices(f.store, { project, previous: reference(otherTransition), next: reference(transition), block }), "series_transition_unproven");
-  rejected(prepareHorizonIssuance(f.store, { ...issuanceRequest, transition: reference(otherTransition) }), "horizon_issuance_binding_invalid");
-  rejected(prepareHorizonIssuance(f.store, { ...issuanceRequest, horizon: reference(accepted.gate), choiceVersion: "other-accepted" }), "horizon_issuance_binding_invalid");
+  refusedWith(comparePreparedSeriesSlices(f.store, { project, previous: reference(otherTransition), next: reference(transition), block }), "series_transition_unproven");
+  refusedWith(prepareHorizonIssuance(f.store, { ...issuanceRequest, transition: reference(otherTransition) }), "horizon_issuance_binding_invalid");
+  refusedWith(prepareHorizonIssuance(f.store, { ...issuanceRequest, horizon: reference(accepted.gate), choiceVersion: "other-accepted" }), "horizon_issuance_binding_invalid");
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try {
