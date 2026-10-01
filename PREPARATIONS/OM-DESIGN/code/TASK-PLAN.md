@@ -1367,7 +1367,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
+- Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/graph/obligation-policy.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
 - Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, раздел 3 (рёбра 13, 15, 22) и раздел 5 (риски TDZ); образец регистрации: om/refusal-journal.ts:256 answersSourceReader (S1.1 №1773)
 - После: D8.4.2, S1.3
 - Тесты сверх обязательных:
