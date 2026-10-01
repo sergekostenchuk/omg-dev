@@ -1405,7 +1405,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/product/stage-checks.ts`, `src/product/engine.ts`, `src/om/input.ts`, `src/om/frame-obligations.ts`, `src/om/horizon.ts`, `src/om/run.ts`, `test/import-ring.test.ts`
+- Разрешённые пути: `src/product/stage-checks.ts`, `src/product/engine.ts`, `src/om/input.ts`, `src/om/frame-obligations.ts`, `src/om/horizon.ts`, `src/om/run.ts`, `test/import-ring.test.ts`, `test/stage-checks.test.ts`, `test/om-obligation-readers.test.ts`
 - Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, разделы 3–4 (R2: input.ts:511 inspect, frame-obligations.ts:863,896, horizon.ts:406, run.ts:346 compile)
 - После: R1, S1.2, S1.4, S1.5
 - Тесты сверх обязательных:
