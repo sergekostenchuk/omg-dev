@@ -1441,7 +1441,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/history/proofs.ts`, `src/om/input.ts`, `src/compiler/compiler.ts`, `src/compiler/context.ts`, `src/graph/task-obligations.ts`, `test/import-ring.test.ts`, `test/om-input.test.ts`, `test/om-addressing.test.ts`, `test/om-result-identity.test.ts`, `test/om-operation-cost.test.ts`
+- Разрешённые пути: `src/history/proofs.ts`, `src/om/input.ts`, `src/compiler/compiler.ts`, `src/compiler/context.ts`, `src/graph/task-obligations.ts`, `test/import-ring.test.ts`, `test/om-input.test.ts`, `test/om-addressing.test.ts`, `test/om-result-identity.test.ts`, `test/om-operation-cost.test.ts`, `test/om-obligation-readers.test.ts`
 - Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md (R5); договоры S1.3 №2185 и S1.4 №2302 — семантика удержания не меняется
 - После: R2, S1.4
 - Тесты сверх обязательных:
