@@ -1,4 +1,6 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import { hashJson } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
@@ -8,7 +10,7 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { ProcessResult } from "../src/runtime/process.js";
 import {
-  REFUSAL_ROUTES, delivered, localErrors, localRefusals, refused, sealed, transfer, transferring,
+  REFUSAL_ROUTES, delivered, localErrors, localRefusals, refused, sealed, transfer, transferError, transferring,
   type OmResult, type Refusal, type RefusalAddress, type Sealed, type SourceCode,
 } from "../src/om/refusal.js";
 import { REFS_REFUSAL_CODES, writeGuarded } from "../src/om/refs.js";
@@ -25,6 +27,31 @@ import {
   type AdapterResult, type ModelCallCode, type ModelCallLocalCode, type ModelCallResult,
 } from "../src/om/model-call.js";
 import { createOmFixture, gardenGraph } from "./om-fixture.js";
+import {
+  ASSESSMENT_ERROR_CODES, ASSESSMENT_LOCAL_CODES, type AssessmentCode, type AssessmentLocalCode, type AssessmentResult,
+} from "../src/om/assessment.js";
+import {
+  ATOMIC_GATE_ERROR_CODES, ATOMIC_GATE_LOCAL_CODES, type AtomicGateCode, type AtomicGateLocalCode, type AtomicGateResult,
+} from "../src/om/atomic-gate.js";
+import {
+  FEASIBILITY_ERROR_CODES, FEASIBILITY_LOCAL_CODES, prepareFeasibility, writeFeasibility, type FeasibilityCode, type FeasibilityLocalCode,
+  type FeasibilityRequest, type FeasibilityResult, type PreparedFeasibility,
+} from "../src/om/feasibility.js";
+import {
+  HANDOFF_ERROR_CODES, HANDOFF_LOCAL_CODES, prepareHandoff, type HandoffCode, type HandoffLocalCode, type HandoffResult,
+} from "../src/om/handoff.js";
+import {
+  SERIES_TRANSITION_ERROR_CODES, SERIES_TRANSITION_LOCAL_CODES, type SeriesTransitionCode, type SeriesTransitionLocalCode,
+  type SeriesTransitionResult,
+} from "../src/om/series-transition.js";
+import {
+  SERIES_CODES, SERIES_ERROR_CODES, SERIES_LOCAL_CODES, type SeriesLocalCode, type SeriesResult, type SeriesResultCode,
+} from "../src/om/series.js";
+import { RUN_CODES, RUN_ERROR_CODES, RUN_LOCAL_CODES, type RunLocalCode, type RunResult, type RunResultCode } from "../src/om/run.js";
+import { Pipeline } from "../src/pipeline/pipeline.js";
+import { configureReaderPilot } from "../src/discovery/reader-pilot.js";
+import { Environments } from "../src/runtime/environment.js";
+import type { Store } from "../src/storage/store.js";
 
 // Q2 (№2452, №2460): the codes of a module's refusals as types. The negative probes below are real TypeScript: each
 // `@ts-expect-error` line fails to compile for the stated reason and nothing else on that line can fail, so an unused
@@ -274,7 +301,16 @@ const CLASS_GUARD: [
   Equals<Unmarked<HorizonCode>, HorizonLocalCode>,
   Equals<Unmarked<ModelCallCode>, ModelCallLocalCode>,
   Equals<ReturnType<typeof buildOmInput>["refusals"][number]["code"], InputRefusalCode>,
-] = [true, true, true, true];
+  // Q2b (№2518): the same guard over the seven modules, and the produced list of M8's result refusals is all marked.
+  Equals<Unmarked<AssessmentCode>, AssessmentLocalCode>,
+  Equals<Unmarked<AtomicGateCode>, AtomicGateLocalCode>,
+  Equals<Unmarked<FeasibilityCode>, FeasibilityLocalCode>,
+  Equals<Unmarked<HandoffCode>, HandoffLocalCode>,
+  Equals<Unmarked<SeriesTransitionCode>, SeriesTransitionLocalCode>,
+  Equals<Unmarked<SeriesResultCode>, SeriesLocalCode>,
+  Equals<Unmarked<RunResultCode>, RunLocalCode>,
+  Equals<Unmarked<PreparedFeasibility["refusals"][number]["code"]>, never>,
+] = [true, true, true, true, true, true, true, true, true, true, true, true];
 
 test("Q2 return 1: a transport code reaches a model-call result only as a transferred refusal marked with its source", () => {
   const lost = transfer("transport", refused("process_lost", "The physical executor was lost", AT, "producer"));
@@ -320,7 +356,7 @@ test("Q2 return 1: the builder's list of refusals takes only the builder's own c
   own.refusals.push(mine);
   assert.deepEqual(own.refusals.map(item => item.code), ["input_field_missing"]);
   assert.equal(sealed(own).refusals.length, 1);
-  assert.equal(CLASS_GUARD.length, 4);
+  assert.equal(CLASS_GUARD.length, 12, "Q2 three modules and the builder list, Q2b seven modules and the M8 result list");
 });
 
 // The pins below are read from the base before Q2 (4f8084c), not from the code under test: moving a code into a type must
@@ -468,4 +504,236 @@ test("Q2 pins model-call: every defect of an adapter answer keeps its exact prio
     assert.equal(result.value.usage !== null, retained, name);
     assert.deepEqual(result.value.confirmed, retained ? confirmed : { model: null, effort: null, speed: null }, name);
   }
+});
+
+// ---- Q2b (№2518, №2522): the same typing over assessment (E5), atomic-gate (G5), feasibility (M8), handoff (M9),
+// series-transition, series and run (H1).
+const asAssessment = <T>(result: AssessmentResult<T>): AssessmentResult<T> => result;
+const asAtomicGate = <T>(result: AtomicGateResult<T>): AtomicGateResult<T> => result;
+const asFeasibility = <T>(result: FeasibilityResult<T>): FeasibilityResult<T> => result;
+const asHandoff = <T>(result: HandoffResult<T>): HandoffResult<T> => result;
+const asSeriesTransition = <T>(result: SeriesTransitionResult<T>): SeriesTransitionResult<T> => result;
+const asSeries = <T>(result: SeriesResult<T>): SeriesResult<T> => result;
+const asRun = <T>(result: RunResult<T>): RunResult<T> => result;
+
+test("Q2b catalogues: each module's full local set from its places of issue, the pinned subsets kept, the exceptions apart", () => {
+  for (const catalogue of [ASSESSMENT_LOCAL_CODES, ASSESSMENT_ERROR_CODES, ATOMIC_GATE_LOCAL_CODES, ATOMIC_GATE_ERROR_CODES,
+    FEASIBILITY_LOCAL_CODES, FEASIBILITY_ERROR_CODES, HANDOFF_LOCAL_CODES, HANDOFF_ERROR_CODES, SERIES_TRANSITION_LOCAL_CODES,
+    SERIES_TRANSITION_ERROR_CODES, SERIES_CODES, SERIES_LOCAL_CODES, SERIES_ERROR_CODES, RUN_CODES, RUN_LOCAL_CODES, RUN_ERROR_CODES]) {
+    assert.ok(Object.isFrozen(catalogue));
+    assert.equal(new Set(catalogue).size, catalogue.length, "A catalogue names each code once");
+    assert.ok(catalogue.every(code => typeof code === "string" && code.length > 0));
+  }
+  assert.deepEqual(sorted(ASSESSMENT_LOCAL_CODES), sorted(["assessment_cause_invalid", "assessment_cause_unproved",
+    "assessment_identity_conflict", "assessment_independence_invalid", "assessment_intent_invalid", "assessment_refusal_invalid",
+    "assessment_result_invalid", "assessment_set_invalid", "assessment_source_invalid", "assessment_source_stale",
+    "assessment_not_supported", "completion_ceased"]));
+  assert.deepEqual([...ASSESSMENT_ERROR_CODES], ["assessment_request_invalid"]);
+  assert.deepEqual(sorted(ATOMIC_GATE_LOCAL_CODES), sorted(["atomic_gate_basis_unproven", "atomic_gate_bindings_unproven",
+    "atomic_gate_record_forged", "atomic_gate_transaction_conflict", "input_stale", "obligation_assignment_invalid", "packet_foreign",
+    "work_blocking_gap_open"]));
+  assert.deepEqual([...ATOMIC_GATE_ERROR_CODES], ["atomic_gate_request_invalid", "atomic_gate_internal"]);
+  assert.deepEqual(sorted(FEASIBILITY_LOCAL_CODES), sorted(["feasibility_record_invalid", "feasibility_contract_superseded",
+    "feasibility_stale", "feasibility_not_ready", "input_stale"]));
+  assert.deepEqual([...FEASIBILITY_ERROR_CODES], ["feasibility_request_invalid", "feasibility_internal"]);
+  // M9 states the saved-record codes of its own sources itself (№2460-1): they are its local codes, not a transfer of refs.
+  assert.deepEqual(sorted(HANDOFF_LOCAL_CODES), sorted(["handoff_record_invalid", "handoff_feasibility_unchanged", "feasibility_not_ready",
+    "input_stale", "record_missing", "record_forged", "record_foreign", "revision_conflict"]));
+  assert.deepEqual([...HANDOFF_ERROR_CODES], ["handoff_request_invalid", "handoff_internal"]);
+  assert.deepEqual([...SERIES_TRANSITION_LOCAL_CODES], ["series_transition_unproven", "series_slice_unproven"]);
+  assert.deepEqual([...SERIES_TRANSITION_ERROR_CODES], ["series_transition_request_invalid"]);
+  // series.ts: the store-repairs subset om-series.test pins inside the full set — G7, B3 and the handed-over record codes.
+  assert.equal(SERIES_CODES.length, 21);
+  assert.ok(SERIES_CODES.every(code => has(SERIES_LOCAL_CODES, code)));
+  assert.deepEqual(sorted(SERIES_LOCAL_CODES), sorted([...SERIES_CODES, "completion_required", "completion_conflict", "completion_invalid",
+    "completion_request_invalid", "input_stale", "series_transition_refused", "record_foreign", "revision_conflict"]));
+  assert.deepEqual([...SERIES_ERROR_CODES], ["series_request_invalid"]);
+  // run.ts: RUN_CODES stays exported and exact; each of its codes is a local refusal or the pass's exception, never both.
+  assert.deepEqual([...RUN_CODES], ["run_request_invalid", "run_record_invalid", "run_outcome_unknown", "run_intent_conflict", "horizon_empty"]);
+  for (const code of RUN_CODES) assert.notEqual(has(RUN_LOCAL_CODES, code), has(RUN_ERROR_CODES, code), code);
+  assert.deepEqual(sorted(RUN_LOCAL_CODES), sorted(["run_record_invalid", "run_outcome_unknown", "run_intent_conflict", "horizon_empty",
+    "record_missing", "candidate_gaps", "answers_not_passed"]));
+  assert.deepEqual([...RUN_ERROR_CODES], ["run_request_invalid"]);
+});
+
+test("Q2b local constructors: each module's catalogue bounds its refusals and exceptions at compile time and at runtime", () => {
+  assert.equal(failed(localRefusals(ASSESSMENT_LOCAL_CODES)("completion_ceased", "probe", AT, "producer")).code, "completion_ceased");
+  assert.equal(failed(localRefusals(ATOMIC_GATE_LOCAL_CODES)("packet_foreign", "probe", AT, "producer")).code, "packet_foreign");
+  assert.equal(failed(localRefusals(FEASIBILITY_LOCAL_CODES)("feasibility_stale", "probe", AT, "producer")).code, "feasibility_stale");
+  assert.equal(failed(localRefusals(HANDOFF_LOCAL_CODES)("record_forged", "probe", AT, "producer")).code, "record_forged");
+  assert.equal(failed(localRefusals(SERIES_TRANSITION_LOCAL_CODES)("series_slice_unproven", "probe", AT, "producer")).code, "series_slice_unproven");
+  assert.equal(failed(localRefusals(SERIES_LOCAL_CODES)("completion_invalid", "probe", AT, "producer")).code, "completion_invalid");
+  assert.equal(failed(localRefusals(RUN_LOCAL_CODES)("candidate_gaps", "probe", AT, "owner")).route, "owner");
+  assert.throws(() => localRefusals(ASSESSMENT_LOCAL_CODES)(
+    // @ts-expect-error a code of series is no code of E5
+    "series_conflict", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(ATOMIC_GATE_LOCAL_CODES)(
+    // @ts-expect-error an exception of the compiler's source resolution is no local refusal of G5 (it is transferred)
+    "external_input_missing", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(FEASIBILITY_LOCAL_CODES)(
+    // @ts-expect-error a finding of the repository inspection is no local refusal of M8 (it is transferred)
+    "repository_dirty", "probe", AT, "owner"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(HANDOFF_LOCAL_CODES)(
+    // @ts-expect-error the stage pipeline's exception is no local refusal of M9 (it is transferred)
+    "gate_rejected", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(SERIES_TRANSITION_LOCAL_CODES)(
+    // @ts-expect-error a refs code is no code the prepared transition creates
+    "record_missing", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(SERIES_LOCAL_CODES)(
+    // @ts-expect-error a code of the pass is no code of series
+    "candidate_gaps", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localRefusals(RUN_LOCAL_CODES)(
+    // @ts-expect-error the pass's exception code is no refusal of the pass (№2452-5)
+    "run_request_invalid", "probe", AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => localErrors(RUN_ERROR_CODES)("run_request_invalid", "A pass runs through a store"), { code: "run_request_invalid" });
+  assert.throws(() => localErrors(SERIES_ERROR_CODES)(
+    // @ts-expect-error another module's exception code is no exception of series
+    "run_request_invalid", "probe"), { code: "refusal_invalid" });
+});
+
+test("Q2b return-1 class (№2511-1): a code of another unit reaches a module's result only marked with a declared source", () => {
+  // Positive: the module's own literal, and a declared source's refusal through its transfer.
+  assert.equal(asAssessment(refused("assessment_not_supported", "probe", AT, "producer")).ok, false);
+  assert.equal(asAssessment(transfer("model-call", refused("model_call_in_progress", "probe", AT, "producer"))).ok, false);
+  assert.equal(asAtomicGate(transfer("obligations", refused("obligation_assignment_unresolved", "probe", AT, "producer"))).ok, false);
+  assert.equal(asFeasibility(transfer("frame-accept", refused("record_missing", "probe", AT, "producer"))).ok, false);
+  assert.equal(asHandoff(transfer("feasibility", refused("feasibility_stale", "probe", AT, "producer"))).ok, false);
+  assert.equal(asSeriesTransition(transfer("series", refused("series_missing", "probe", AT, "producer"))).ok, false);
+  assert.equal(asSeries(transfer("routes", refused("route_stale", "probe", AT, "producer"))).ok, false);
+  assert.equal(asRun(transfer("handoff", refused("handoff_record_invalid", "probe", AT, "producer"))).ok, false);
+  // Negative: a source's literal unmarked, in each module's result.
+  // @ts-expect-error a code of series is no E5 code unmarked
+  asAssessment(refused("series_conflict", "probe", AT, "producer"));
+  // @ts-expect-error the compiler's source exception is no G5 code unmarked
+  asAtomicGate(refused("external_input_missing", "probe", AT, "producer"));
+  // @ts-expect-error a finding of the repository inspection is no M8 code unmarked
+  asFeasibility(refused("repository_dirty", "probe", AT, "owner"));
+  // @ts-expect-error the stage pipeline's exception is no M9 code unmarked
+  asHandoff(refused("gate_rejected", "probe", AT, "producer"));
+  // @ts-expect-error a refs code is no code of the prepared transition unmarked
+  asSeriesTransition(refused("record_missing", "probe", AT, "producer"));
+  // @ts-expect-error a code of horizon is no code of series unmarked
+  asSeries(refused("horizon_unclosed", "probe", AT, "producer"));
+  // @ts-expect-error a model call in progress is no code of the pass unmarked
+  asRun(refused("model_call_in_progress", "probe", AT, "producer"));
+  // A plain string, and a plain literal copied over a transferred code, are no codes either.
+  const plain: string = "run_record_invalid";
+  // @ts-expect-error a plain string is no code of the pass, whatever it holds at runtime
+  asRun(refused(plain, "probe", AT, "producer"));
+  const compiled = transfer("stage-checks", refused("plan_input_invalid", "probe", AT, "producer"));
+  if (compiled.ok) assert.fail("A refusal was transferred");
+  assert.equal(asRun(compiled).ok, false);
+  // @ts-expect-error the substituted code is a plain literal, no transferred code of the compiler's stage check
+  asRun({ ...compiled, refusal: { ...compiled.refusal, code: "plan_input_invalid" } });
+  const pilot = transfer("reader-pilot", refused("pilot_boundary_reached", "probe", AT, "producer"));
+  if (pilot.ok) assert.fail("A refusal was transferred");
+  assert.equal(asHandoff(pilot).ok, false);
+  // @ts-expect-error the substituted code is a plain literal, no transferred code of the R3 boundary
+  asHandoff({ ...pilot, refusal: { ...pilot.refusal, code: "pilot_boundary_reached" } });
+  // A source a module does not declare is no source of it.
+  // @ts-expect-error the compiler's stage check is no declared source of M9
+  asHandoff(transfer("stage-checks", refused("plan_input_invalid", "probe", AT, "producer")));
+});
+
+test("Q2b return-2 class (№2511-2): M8's list of result refusals takes only the three producers' marked refusals", () => {
+  const inspection = transfer("inspection", refused("repository_dirty", "probe", AT, "owner"));
+  if (inspection.ok) assert.fail("A refusal was transferred");
+  const marked = inspection.refusal;
+  const foreign: Refusal<"repository_dirty"> = { code: "repository_dirty", message: "probe", at: AT, route: "owner" };
+  const wide: Refusal = { code: "repository_dirty", message: "probe", at: AT, route: "owner" };
+  const local: Refusal<FeasibilityLocalCode> = { code: "input_stale", message: "probe", at: AT, route: "producer" };
+  function resultList(value: PreparedFeasibility): void {
+    value.refusals.push(marked);
+    // @ts-expect-error an unmarked refusal cannot be pushed into M8's list of result refusals
+    value.refusals.push(foreign);
+    // @ts-expect-error a wide refusal cannot either
+    value.refusals.push(wide);
+    // @ts-expect-error nor a local refusal of M8: the list holds the producers' findings only
+    value.refusals.push(local);
+  }
+  void resultList;
+});
+
+test("Q2b transferError: a declared source's exception, its own code and message at the module's address and route, marked in the type alone", () => {
+  const error = new EngineError("plan_input_invalid", "Every input needs its exact M8 producer and artifact resolution", { field: "probe" });
+  const ref = { id: "stage:garden:compilation", revision: 2, hash: hashJson({ probe: true }) };
+  const result = transferError("stage-checks", error, { unit: "H1", target: "stage:garden:compilation", field: "compile", ref }, "producer");
+  const refusal = failed(asRun(result));
+  assert.deepEqual(refusal, { code: "plan_input_invalid", message: "Every input needs its exact M8 producer and artifact resolution",
+    at: { unit: "H1", target: "stage:garden:compilation", field: "compile", ref }, route: "producer" });
+  assert.deepEqual(Object.keys(refusal), ["code", "message", "at", "route"]);
+  assert.equal(Object.getOwnPropertySymbols(refusal).length, 0, "The mark is no field of the refusal");
+  assert.ok(deeplyFrozen(result));
+  assert.throws(() => transferError("stage-checks", { code: "plan_input_invalid", message: "forged", name: "EngineError", details: null } as never,
+    AT, "producer"), { code: "refusal_invalid" });
+  assert.throws(() => transferError("", error, AT, "producer"), { code: "refusal_invalid" });
+});
+
+// The pins below are read from the clean base 249abcb (before Q2b) with the same scenarios; revisions, hashes and the
+// temporary workspace path are not pinned. [case, code, message, unit, target, field, route]
+const HANDOFF_ADMISSION_PINS = [
+  ["finding-code", "probe_finding", "Stage validation refused acceptance", "M9", "probe-target", "probe-field", "producer"],
+  ["finding-no-field", "probe_finding", "Stage validation refused acceptance", "M9", "probe-target", "admission", "producer"],
+  ["no-details", "stage_not_ready", "Stage is not ready for acceptance", "M9", "stage:garden:om-g2", "admission", "producer"],
+  ["malformed-detail", "gate_rejected", "Stage validation refused acceptance", "M9", "stage:garden:om-g2", "admission", "producer"],
+  ["empty-details", "gate_rejected", "Stage validation refused acceptance", "M9", "stage:garden:om-g2", "admission", "producer"],
+] as const;
+const HANDOFF_ADMISSION_ERRORS: Record<typeof HANDOFF_ADMISSION_PINS[number][0], EngineError> = {
+  "finding-code": new EngineError("gate_rejected", "Stage validation refused acceptance", [
+    { code: "probe_finding", target: "probe-target", field: "probe-field", message: "A finding message" }, { code: "second", target: "t", message: "m" }]),
+  "finding-no-field": new EngineError("gate_rejected", "Stage validation refused acceptance", [{ code: "probe_finding", target: "probe-target", message: "m" }]),
+  "no-details": new EngineError("stage_not_ready", "Stage is not ready for acceptance"),
+  "malformed-detail": new EngineError("gate_rejected", "Stage validation refused acceptance", { code: 7, target: null, field: ["x"] }),
+  "empty-details": new EngineError("gate_rejected", "Stage validation refused acceptance", []),
+};
+const HANDOFF_GATE_PIN = ["feasibility_stale", "Stage validation refused acceptance", "M9", "om-feasibility:garden", "result", "producer"] as const;
+const HANDOFF_PILOT_PIN = ["pilot_boundary_reached", "This phase is beyond the explicitly permitted continuation boundary", "M9",
+  "reader-pilot:garden", "R3", "producer"] as const;
+const INSPECTION_PIN = ["repository_dirty", "Repository has uncommitted changes", "M8", "owner"] as const;
+
+interface WorksFixture { readonly store: Store; root: string; workspace: string; project: string; feasibility: FeasibilityRequest }
+/** The accepted works of om-feasibility.test, taken exactly as om-task-neighbors takes them. */
+async function acceptedWorks(t: TestContext): Promise<WorksFixture> {
+  const url = new URL("./om-feasibility.test.js", import.meta.url);
+  let source = readFileSync(url, "utf8");
+  const end = source.indexOf("const heads =");
+  assert.ok(end > 0, "The declared om-feasibility fixture seam");
+  source = source.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
+    (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
+  assert.ok(!/\btest\(/.test(source));
+  const module = await import(`data:text/javascript;base64,${Buffer.from(`${source}\nexport { acceptedWorksFixture };`).toString("base64")}`) as
+    { acceptedWorksFixture(t: TestContext): WorksFixture };
+  return module.acceptedWorksFixture(t);
+}
+
+test("Q2b pins M9 and M8: the stage pipeline's admission, the R3 boundary and the inspection keep their exact prior refusals (base 249abcb)", async t => {
+  const f = await acceptedWorks(t);
+  const m8 = writeFeasibility(f.store, f.feasibility);
+  if (!m8.ok) assert.fail(`M8: ${m8.refusal.code}`);
+  const request = { project: f.project, feasibility: reference(m8.value), expected: 0 };
+  // The pipeline's exception is the whole input of M9's named admission adapter: its first finding's code, target and
+  // field, or the exception's code, the stage and 'admission' when the finding has none (№2522-1).
+  const original = Pipeline.prototype.prepareAccepted;
+  try {
+    for (const [name, code, message, unit, target, field, route] of HANDOFF_ADMISSION_PINS) {
+      Pipeline.prototype.prepareAccepted = () => { throw HANDOFF_ADMISSION_ERRORS[name]; };
+      const refusal = failed(asHandoff(prepareHandoff(f.store, request)));
+      assert.deepEqual(shape(refusal), [code, message, unit, target, field, route], name);
+      assert.equal(refusal.at.ref, undefined, name);
+    }
+  } finally { Pipeline.prototype.prepareAccepted = original; }
+  // The finding differs from the exception's own code for real, too: G6 refuses the changed repository through the gate.
+  const dirty = join(f.workspace, "untracked-probe.txt");
+  writeFileSync(dirty, "A changed physical repository");
+  assert.deepEqual(shape(failed(prepareHandoff(f.store, request))), [...HANDOFF_GATE_PIN]);
+  const current = prepareFeasibility(f.store, { ...f.feasibility, expected: m8.value.revision });
+  if (!current.ok) assert.fail(`M8 preparation: ${current.refusal.code}`);
+  assert.deepEqual(current.value.refusals.map(refusal => [refusal.code, refusal.message, refusal.at.unit, refusal.route]), [[...INSPECTION_PIN]]);
+  assert.ok(current.value.refusals.every(refusal => refusal.at.field === undefined && refusal.at.target.endsWith("workspace")));
+  rmSync(dirty);
+  const command = { executable: process.execPath, args: ["--version"] };
+  configureReaderPilot(f.store, new Environments(f.store), f.project, { experimental: true, active: false, stopAfter: "L2",
+    reader: { actor: "g2-reader", model: "fixture", effort: "high", speed: "inherited", command }, agentCommand: command,
+    maxRequestChars: 300000, maxReadChars: 60000, maxReplyChars: 100000, maxCalls: 100, maxReportedTokens: 20000000 }, 0);
+  assert.deepEqual(shape(failed(prepareHandoff(f.store, request))), [...HANDOFF_PILOT_PIN]);
 });

@@ -7,13 +7,16 @@ import { RefinementRelations } from '../graph/relations.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
-import { readHorizon, prepareHorizon, type Horizon, type HorizonBasis, type HorizonRecords } from './horizon.js';
-import { readFrameBasis, readFrame, fillObligations, flowKey, type FilledFrame, type FrameRequest, type FrameScope } from './frame-obligations.js';
-import { readLayerAcceptance } from './layer-basis.js';
+import { readHorizon as readHorizonOf, prepareHorizon as prepareHorizonOf, type Horizon, type HorizonBasis, type HorizonRecords } from './horizon.js';
+import { readFrameBasis as readFrameBasisOf, readFrame as readFrameOf, fillObligations as fillObligationsOf, flowKey, type FilledFrame,
+  type FrameRequest, type FrameScope } from './frame-obligations.js';
+import { readLayerAcceptance as readLayerAcceptanceOf } from './layer-basis.js';
 import { historicalTrace, withHistoricalReads } from './input.js';
-import { readAnySeriesAt, prepareSeriesParticipantAdmission, type RepairSeries } from './series.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { delivered, refused, type OmResult, type Refusal, type Sealed } from './refusal.js';
+import { readAnySeriesAt as readAnySeriesAtOf, prepareSeriesParticipantAdmission as prepareSeriesParticipantAdmissionOf,
+  type RepairSeries } from './series.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { delivered, localErrors, localRefusals, transfer, transferring, type OmResult, type Refusal, type Sealed,
+  type SourceCodes } from './refusal.js';
 
 export const SERIES_TRANSITION_CONTRACT = 'om-series-transition/v1';
 export const SERIES_SLICE_CONTRACT = 'series-slice/v1';
@@ -32,7 +35,31 @@ export interface PreparedSeriesTransitionRecord {
 export interface PreparedSeriesTransition {
   record: Revision<PreparedSeriesTransitionRecord>; writes: Write[]; guards: TransactionGuard[];
 }
+/** Q2b (№2518): every refusal code the prepared transition creates itself; its exceptions apart. */
+export const SERIES_TRANSITION_LOCAL_CODES = Object.freeze(['series_transition_unproven', 'series_slice_unproven'] as const);
+export type SeriesTransitionLocalCode = typeof SERIES_TRANSITION_LOCAL_CODES[number];
+export const SERIES_TRANSITION_ERROR_CODES = Object.freeze(['series_transition_request_invalid'] as const);
+export type SeriesTransitionErrorCode = typeof SERIES_TRANSITION_ERROR_CODES[number];
+/** The units whose refusals the prepared transition hands on, each through its reader bound below. */
+export type SeriesTransitionSource = 'refs' | 'horizon' | 'frame-obligations' | 'layer-basis' | 'series';
+export type SeriesTransitionCode = SeriesTransitionLocalCode | SourceCodes<SeriesTransitionSource>;
+export type SeriesTransitionResult<T> = OmResult<T, SeriesTransitionCode>;
+
+const readHorizon = transferring('horizon', readHorizonOf);
+const prepareHorizon = transferring('horizon', prepareHorizonOf);
+const readFrameBasis = transferring('frame-obligations', readFrameBasisOf);
+const readFrame = transferring('frame-obligations', readFrameOf);
+const fillObligations = transferring('frame-obligations', fillObligationsOf);
+const readLayerAcceptance = transferring('layer-basis', readLayerAcceptanceOf);
+const readAnySeriesAt = transferring('series', readAnySeriesAtOf);
+const prepareSeriesParticipantAdmission = transferring('series', prepareSeriesParticipantAdmissionOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
+
 const UNIT = 'B3';
+const refuse = localRefusals(SERIES_TRANSITION_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: SeriesTransitionErrorCode, message: string, details?: unknown) => never = localErrors(SERIES_TRANSITION_ERROR_CODES);
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const exactRef = (value: unknown): value is Ref => object(value) && isRef(value)
@@ -40,15 +67,15 @@ const exactRef = (value: unknown): value is Ref => object(value) && isRef(value)
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(items: readonly T[]): T[] => [...items].sort((a, b) => order(canonical(a), canonical(b)));
 const uniqueRefs = (refs: readonly Ref[]): Ref[] => sorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]);
-class TransitionFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function take<T>(result: OmResult<T>): T {
+class TransitionFailure extends Error { constructor(readonly refusal: Refusal<SeriesTransitionCode>) { super(refusal.message); } }
+function take<T>(result: OmResult<T, SeriesTransitionCode>): T {
   if (!result.ok) throw new TransitionFailure(result.refusal);
   return result.value;
 }
-function fail(target: string, field: string, message: string, code = 'series_transition_unproven'): never {
-  return take(refused(code, message, { unit: UNIT, target, field }, 'producer'));
+function fail(target: string, field: string, message: string, code: SeriesTransitionLocalCode = 'series_transition_unproven'): never {
+  return take(refuse(code, message, { unit: UNIT, target, field }, 'producer'));
 }
-function result<T>(action: () => T): OmResult<Sealed<T>> {
+function result<T>(action: () => T): SeriesTransitionResult<Sealed<T>> {
   try { return delivered(withHistoricalReads(action)); }
   catch (error) { if (error instanceof TransitionFailure) return { ok: false, refusal: error.refusal }; throw error; }
 }
@@ -57,7 +84,7 @@ function requireRequest(store: Store, value: unknown): asserts value is SeriesTr
     || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value['project']) || !text(value['choiceVersion'])
     || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value['choiceVersion']) || !exactRef(value['horizon'])
     || !Array.isArray(value['series']) || !value['series'].every(exactRef))
-    throw new EngineError('series_transition_request_invalid', 'A prepared transition names its exact horizon and explicit series set',
+    raise('series_transition_request_invalid', 'A prepared transition names its exact horizon and explicit series set',
       { unit: UNIT, target: 'series-transition', field: 'request' });
 }
 function normalized(request: SeriesTransitionRequest): SeriesTransitionRequest {
@@ -296,11 +323,11 @@ function checked(store: Store, project: string, ref: Ref): Revision<PreparedSeri
   if (canonical(derived) !== canonical(value)) fail(ref.id, 'decisions', 'The transition and local slices must follow their exact sources');
   return read as Revision<PreparedSeriesTransitionRecord>;
 }
-export function readPreparedSeriesTransition(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<{
+export function readPreparedSeriesTransition(store: Store, request: { project: string; record: Ref }): SeriesTransitionResult<Sealed<{
   record: Revision<PreparedSeriesTransitionRecord>; references: Ref[];
 }>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !exactRef(request.record))
-    throw new EngineError('series_transition_request_invalid', 'Historical transition reading needs an exact reference',
+    raise('series_transition_request_invalid', 'Historical transition reading needs an exact reference',
       { unit: UNIT, target: 'series-transition', field: 'record' });
   return result(() => {
     const references: Ref[] = [];
@@ -311,7 +338,7 @@ export function readPreparedSeriesTransition(store: Store, request: { project: s
     return { record, references: uniqueRefs(references) };
   });
 }
-export function prepareSeriesTransition(store: Store, request: SeriesTransitionRequest): OmResult<Sealed<PreparedSeriesTransition>> {
+export function prepareSeriesTransition(store: Store, request: SeriesTransitionRequest): SeriesTransitionResult<Sealed<PreparedSeriesTransition>> {
   requireRequest(store, request); request = normalized(request);
   return result(() => {
     const id = transitionId(request), existing = store.get<PreparedSeriesTransitionRecord>(id, 1);
@@ -327,7 +354,7 @@ export function prepareSeriesTransition(store: Store, request: SeriesTransitionR
       guards: uniqueTransactionGuards(guards) };
   });
 }
-export function writeSeriesTransition(store: Store, request: SeriesTransitionRequest): OmResult<Sealed<Revision<PreparedSeriesTransitionRecord>>> {
+export function writeSeriesTransition(store: Store, request: SeriesTransitionRequest): SeriesTransitionResult<Sealed<Revision<PreparedSeriesTransitionRecord>>> {
   requireRequest(store, request); request = normalized(request);
   const existing = store.get<PreparedSeriesTransitionRecord>(transitionId(request), 1);
   if (existing) return result(() => checked(store, request.project, reference(existing)));
@@ -339,9 +366,9 @@ export function writeSeriesTransition(store: Store, request: SeriesTransitionReq
   return written.ok ? delivered(written.value[0]!) : written;
 }
 /** Content comparison only. Applying it requires B3.0b's proof of the last active basis and complete series membership. */
-export function comparePreparedSeriesSlices(store: Store, request: { project: string; previous: Ref; next: Ref; block: string }): OmResult<Sealed<'continue' | 'new-work'>> {
+export function comparePreparedSeriesSlices(store: Store, request: { project: string; previous: Ref; next: Ref; block: string }): SeriesTransitionResult<Sealed<'continue' | 'new-work'>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !exactRef(request.previous) || !exactRef(request.next) || !text(request.block))
-    throw new EngineError('series_transition_request_invalid', 'Slice comparison names two exact prepared sources and a block',
+    raise('series_transition_request_invalid', 'Slice comparison names two exact prepared sources and a block',
       { unit: UNIT, target: 'series-transition', field: 'comparison' });
   return result(() => {
     const previous = checked(store, request.project, request.previous).value.decisions.find(item => item.block === request.block);

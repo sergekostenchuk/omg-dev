@@ -16,24 +16,63 @@ import { validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { noteUntracedRead, Store, type Revision, type Write } from '../storage/store.js';
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
-import { readCapacity } from './capacity.js';
-import { readDeliveries } from './deliveries.js';
-import { prepareSettleCandidate, readAcceptedFrame, readRejectedCandidate, type AcceptedFrameRequest } from './frame-accept.js';
+import { readCapacity as readCapacityOf } from './capacity.js';
+import { readDeliveries as readDeliveriesOf } from './deliveries.js';
+import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
 import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
 import { isFrameAttemptBinding, type FrameAttemptBinding } from './layer-basis.js';
 import type { ProposalRequest } from './frame-proposals.js';
-import { prepareGapLines, readGapLines } from './gap-lines.js';
-import { prepareCurrentGaps, prepareGaps, readGaps, type GapCollection, type GapReadRequest, type GapRequest } from './gaps.js';
+import { prepareGapLines as prepareGapLinesOf, readGapLines as readGapLinesOf } from './gap-lines.js';
+import { prepareCurrentGaps as prepareCurrentGapsOf, prepareGaps as prepareGapsOf, readGaps as readGapsOf, type GapCollection, type GapReadRequest, type GapRequest } from './gaps.js';
 import { withHistoricalReads, historicalRead } from './input.js';
-import { readPartAssembly } from './model-call.js';
-import { prepareNeighbors, readNeighbors, type NeighborCollection } from './neighbors.js';
-import { prepareObligationTransfer, prepareOmObligations, readObligationTransfer, readOmObligations,
+import { readPartAssembly as readPartAssemblyOf } from './model-call.js';
+import { prepareNeighbors as prepareNeighborsOf, readNeighbors as readNeighborsOf, type NeighborCollection } from './neighbors.js';
+import { prepareObligationTransfer as prepareObligationTransferOf, prepareOmObligations as prepareOmObligationsOf, readObligationTransfer as readObligationTransferOf, readOmObligations as readOmObligationsOf,
   type ObligationRequest, type OmObligationHandoff, type OmObligations } from './obligations.js';
-import { readPartResult, type WorksPartBindings } from './question-packet.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
-import { prepareWorksFrame, readWorksFrame } from './works-frame.js';
+import { readPartResult as readPartResultOf, type WorksPartBindings } from './question-packet.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, transferError, transferring, type OmResult, type Refusal,
+  type Sealed, type SourceCodes } from './refusal.js';
+import type { Json } from '../canonical.js';
+import { prepareWorksFrame as prepareWorksFrameOf, readWorksFrame as readWorksFrameOf } from './works-frame.js';
+
+/** Q2b (№2518): every refusal code G5 creates itself, from the actual places of issue; its exceptions apart. */
+export const ATOMIC_GATE_LOCAL_CODES = Object.freeze(['atomic_gate_basis_unproven', 'atomic_gate_bindings_unproven',
+  'atomic_gate_record_forged', 'atomic_gate_transaction_conflict', 'input_stale', 'obligation_assignment_invalid', 'packet_foreign',
+  'work_blocking_gap_open'] as const);
+export type AtomicGateLocalCode = typeof ATOMIC_GATE_LOCAL_CODES[number];
+export const ATOMIC_GATE_ERROR_CODES = Object.freeze(['atomic_gate_request_invalid', 'atomic_gate_internal'] as const);
+export type AtomicGateErrorCode = typeof ATOMIC_GATE_ERROR_CODES[number];
+/** The units whose refusals G5 hands on: its readers, and the compiler's resolution of an external task source (its
+ * exceptions, through the exact earlier filter SOURCE_UNFIT). */
+export type AtomicGateSource = 'refs' | 'capacity' | 'deliveries' | 'frame-accept' | 'gap-lines' | 'gaps' | 'model-call' | 'neighbors'
+  | 'obligations' | 'question-packet' | 'works-frame' | 'compiler-inputs';
+export type AtomicGateCode = AtomicGateLocalCode | SourceCodes<AtomicGateSource>;
+export type AtomicGateResult<T> = OmResult<T, AtomicGateCode>;
+
+const readCapacity = transferring('capacity', readCapacityOf);
+const readDeliveries = transferring('deliveries', readDeliveriesOf);
+const prepareSettleCandidate = transferring('frame-accept', prepareSettleCandidateOf);
+const readAcceptedFrame = transferring('frame-accept', readAcceptedFrameOf);
+const readRejectedCandidate = transferring('frame-accept', readRejectedCandidateOf);
+const prepareGapLines = transferring('gap-lines', prepareGapLinesOf);
+const readGapLines = transferring('gap-lines', readGapLinesOf);
+const prepareCurrentGaps = transferring('gaps', prepareCurrentGapsOf);
+const prepareGaps = transferring('gaps', prepareGapsOf);
+const readGaps = transferring('gaps', readGapsOf);
+const readPartAssembly = transferring('model-call', readPartAssemblyOf);
+const prepareNeighbors = transferring('neighbors', prepareNeighborsOf);
+const readNeighbors = transferring('neighbors', readNeighborsOf);
+const prepareObligationTransfer = transferring('obligations', prepareObligationTransferOf);
+const prepareOmObligations = transferring('obligations', prepareOmObligationsOf);
+const readObligationTransfer = transferring('obligations', readObligationTransferOf);
+const readOmObligations = transferring('obligations', readOmObligationsOf);
+const readPartResult = transferring('question-packet', readPartResultOf);
+const prepareWorksFrame = transferring('works-frame', prepareWorksFrameOf);
+const readWorksFrame = transferring('works-frame', readWorksFrameOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 
 export const ATOMIC_GATE_CONTRACT = 'om-atomic-gate/v1' as const;
 export interface WorkProposalSource { kind: 'part' | 'assembly'; record: Ref }
@@ -55,19 +94,22 @@ function copy<T>(value: T): T {
   try { return sealed(value) as T; }
   catch (error) { if (error instanceof EngineError && error.code === 'unsealable_value') invalid('json'); throw error; }
 }
-class GateFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function fail(code: string, target: string, field: string, message: string): never {
-  const result = refused(code, message, { unit: 'G5', target, field }, 'producer');
+const refuse = localRefusals(ATOMIC_GATE_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: AtomicGateErrorCode, message: string, details?: unknown) => never = localErrors(ATOMIC_GATE_ERROR_CODES);
+class GateFailure extends Error { constructor(readonly refusal: Refusal<AtomicGateCode>) { super(refusal.message); } }
+function fail(code: AtomicGateLocalCode, target: string, field: string, message: string): never {
+  const result = refuse(code, message, { unit: 'G5', target, field }, 'producer');
   if (!result.ok) throw new GateFailure(result.refusal);
-  throw new EngineError('atomic_gate_internal', 'A refusal unexpectedly succeeded');
+  return raise('atomic_gate_internal', 'A refusal unexpectedly succeeded');
 }
-function take<T>(result: OmResult<T>): T { if (!result.ok) throw new GateFailure(result.refusal); return result.value; }
-function run<T>(action: () => T): OmResult<Sealed<T>> {
+function take<T>(result: OmResult<T, AtomicGateCode>): T { if (!result.ok) throw new GateFailure(result.refusal); return result.value; }
+function run<T>(action: () => T): AtomicGateResult<Sealed<T>> {
   return withHistoricalReads(() => { try { return delivered(action()); }
     catch (error) { if (error instanceof GateFailure) return { ok: false, refusal: error.refusal }; throw error; } });
 }
 function invalid(field: string): never {
-  throw new EngineError('atomic_gate_request_invalid', 'G5 needs explicit exact sources', { unit: 'G5', target: 'works', field });
+  return raise('atomic_gate_request_invalid', 'G5 needs explicit exact sources', { unit: 'G5', target: 'works', field });
 }
 function sourcesShape(sources: unknown): sources is WorkProposalSource[] {
   return Array.isArray(sources) && sources.every(source => object(source) && ['part', 'assembly'].includes(source.kind as string)
@@ -250,7 +292,7 @@ function proveBindingTransfer(store: Store, request: AtomicGateRequest, candidat
 }
 
 /** New G5 rules are layered on native graph checks; C4 remains the authority for assembly and binding. */
-export function checkAtomicWorks(graph: Graph, collection: GapCollection): OmResult<Sealed<Finding[]>> {
+export function checkAtomicWorks(graph: Graph, collection: GapCollection): AtomicGateResult<Sealed<Finding[]>> {
   return run(() => {
     const validation = validateGraph(graph), findings: Finding[] = [...validation.findings];
     if (!validation.graph) return findings;
@@ -375,7 +417,7 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
   return { record, writes, guards: unique(guards), references: unique([...references, request.candidate, request.neighbors,
     request.environment, ...request.sources, ...request.gaps.records]) };
 }
-export function readAtomicGate(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<AtomicGateRecord>>> {
+export function readAtomicGate(store: Store, request: { project: string; record: Ref }): AtomicGateResult<Sealed<Revision<AtomicGateRecord>>> {
   return run(() => {
     if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
     return historicalRead(store, { reader: 'G5.gate', project: request.project, ref: request.record }, () => {
@@ -389,7 +431,7 @@ export function readAtomicGate(store: Store, request: { project: string; record:
     }, () => fail('atomic_gate_record_forged', request.record.id, 'cycle', 'Gate sources contain a cyclic derivation'));
   });
 }
-export function prepareAtomicGate(store: Store, request: AtomicGateRequest): OmResult<Sealed<PreparedAtomicGate>> {
+export function prepareAtomicGate(store: Store, request: AtomicGateRequest): AtomicGateResult<Sealed<PreparedAtomicGate>> {
   return run(() => {
     const prepared = deriveGate(store, request, true), existing = store.get(prepared.record.id);
     if (existing) {
@@ -400,7 +442,7 @@ export function prepareAtomicGate(store: Store, request: AtomicGateRequest): OmR
     return prepared;
   });
 }
-export function writeAtomicGate(store: Store, request: AtomicGateRequest): OmResult<Sealed<Revision<AtomicGateRecord>>> {
+export function writeAtomicGate(store: Store, request: AtomicGateRequest): AtomicGateResult<Sealed<Revision<AtomicGateRecord>>> {
   return run(() => {
     requireRequest(store, request); request = normalizedGateRequest(request);
     const existing = store.get(gateId(request));
@@ -435,7 +477,7 @@ const acceptanceId = (request: WorksAcceptanceRequest) => `om-works-acceptance:$
 function acceptanceRow(value: WorksAcceptanceRecord): Revision<WorksAcceptanceRecord> {
   return { id: acceptanceId(value.request), kind: 'om-works-acceptance', revision: 1, hash: hashJson(value), value };
 }
-export function readWorksAcceptance(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<WorksAcceptanceRecord>>> {
+export function readWorksAcceptance(store: Store, request: { project: string; record: Ref }): AtomicGateResult<Sealed<Revision<WorksAcceptanceRecord>>> {
   return run(() => {
     if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('acceptance.read');
     const saved = take(readRecord<WorksAcceptanceRecord>(store, request.record, { unit: 'G5', target: request.record.id,
@@ -521,7 +563,7 @@ function worksCandidate(store: Store, project: string, results: readonly WorkPro
   return { tx, gapRead, candidateRef, neighbors };
 }
 /** Rebuild D1/D2/D7 over the final proposals and join every write with common C5 acceptance. */
-export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest): OmResult<Sealed<PreparedWorksAcceptance>> {
+export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest): AtomicGateResult<Sealed<PreparedWorksAcceptance>> {
   return run(() => {
     requireAcceptance(store, raw);
     const request = normalizeAcceptance(raw), id = acceptanceId(request), existing = store.get(id);
@@ -545,7 +587,7 @@ export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest
       writes: [...tx.writes.values()], guards: tx.protectedHeads() };
   });
 }
-export function writeWorksAcceptance(store: Store, request: WorksAcceptanceRequest): OmResult<Sealed<PreparedWorksAcceptance>> {
+export function writeWorksAcceptance(store: Store, request: WorksAcceptanceRequest): AtomicGateResult<Sealed<PreparedWorksAcceptance>> {
   return run(() => { const prepared = take(prepareWorksAcceptance(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'G5', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
     return prepared;
@@ -569,7 +611,8 @@ function neededSources(view: Store, store: Store, project: string, candidateRef:
       const resolved = resolveExternalSource(store, project, graph, artifact, reference(head), true);
       found.set(id, reference(head)); return resolved;
     } catch (error) {
-      if (error instanceof EngineError && SOURCE_UNFIT.has(error.code)) fail(error.code, artifact, 'sources', error.message);
+      if (error instanceof EngineError && SOURCE_UNFIT.has(error.code))
+        take(transferError('compiler-inputs', error, { unit: 'G5', target: artifact, field: 'sources' }, 'producer'));
       throw error;
     }
   }, () => undefined);
@@ -580,7 +623,7 @@ function neededSources(view: Store, store: Store, project: string, candidateRef:
  * runs, collecting instead of checking. Each needed source:<project>:<artifact> is read at its current head and checked
  * by the common resolver; a missing or unfit one is an addressed refusal naming the artifact. Nothing is written.
  */
-export function prepareCandidateSources(store: Store, raw: CandidateSourcesRequest): OmResult<Sealed<WorksSources>> {
+export function prepareCandidateSources(store: Store, raw: CandidateSourcesRequest): AtomicGateResult<Sealed<WorksSources>> {
   return run(() => {
     if (!(store instanceof Store) || !object(raw) || !same(Object.keys(raw).sort(), ['candidate', 'neighbors', 'project']) || !text(raw.project)
       || !isRef(raw.candidate) || !isRef(raw.neighbors)) invalid('sources');
@@ -591,7 +634,7 @@ export function prepareCandidateSources(store: Store, raw: CandidateSourcesReque
  * The same list for the works candidate these results make: the acceptance's own candidate transition, previewed
  * without durable writes, then the same collection. G5 still admits the list it is given currently.
  */
-export function prepareWorksSources(store: Store, raw: WorksSourcesRequest): OmResult<Sealed<WorksSources>> {
+export function prepareWorksSources(store: Store, raw: WorksSourcesRequest): AtomicGateResult<Sealed<WorksSources>> {
   return run(() => {
     if (!(store instanceof Store) || !object(raw) || !same(Object.keys(raw).sort(), ['project', 'results']) || !text(raw.project)
       || !Array.isArray(raw.results) || !raw.results.length || !raw.results.every(item => object(item)

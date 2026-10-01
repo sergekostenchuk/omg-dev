@@ -1,19 +1,21 @@
-import { readCompletionCloseAt } from './repeat-gate.js';
+import { readCompletionCloseAt as readCompletionCloseAtOf } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { EngineError, requireCondition } from "../errors.js";
+import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { readPreparedSeriesTransition, prepareSeriesTransition, comparePreparedSeriesSlices, type PreparedSeriesDecision } from "./series-transition.js";
-import { readHorizonIssuance, prepareHorizonIssuance } from "./horizon.js";
-import { readModelTerminalWitness, completionClosedWork } from "./model-call.js";
-import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type RefusalRoute, type Sealed } from "./refusal.js";
-import { readRecord, writeGuarded, type RefsRefusalCode } from "./refs.js";
-import { readJournal, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
-import { readGaps, prepareCurrentGaps, type GapReadRequest } from "./gaps.js";
-import { readOmInput, withHistoricalReads, historicalRead } from "./input.js";
-import { readFrameBasis } from "./frame-obligations.js";
-import { readRoutes, prepareRoutes, prepareManagedRouteBatch } from "./routes.js";
+import { readPreparedSeriesTransition as readPreparedSeriesTransitionOf, prepareSeriesTransition as prepareSeriesTransitionOf,
+  comparePreparedSeriesSlices as comparePreparedSeriesSlicesOf, type PreparedSeriesDecision } from "./series-transition.js";
+import { readHorizonIssuance as readHorizonIssuanceOf, prepareHorizonIssuance as prepareHorizonIssuanceOf } from "./horizon.js";
+import { readModelTerminalWitness as readModelTerminalWitnessOf, completionClosedWork as completionClosedWorkOf } from "./model-call.js";
+import { delivered, isPlainObject, isText, localErrors, localRefusals, sealed, transfer, transferring, type Failed, type OmResult,
+  type RefusalRoute, type Sealed, type SourceCodes } from "./refusal.js";
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from "./refs.js";
+import { readJournal as readJournalOf, REFUSAL_JOURNAL_KIND, type JournalRow } from "./refusal-journal.js";
+import { readGaps as readGapsOf, prepareCurrentGaps as prepareCurrentGapsOf, type GapReadRequest } from "./gaps.js";
+import { readOmInput as readOmInputOf, withHistoricalReads, historicalRead } from "./input.js";
+import { readFrameBasis as readFrameBasisOf } from "./frame-obligations.js";
+import { readRoutes as readRoutesOf, prepareRoutes as prepareRoutesOf, prepareManagedRouteBatch as prepareManagedRouteBatchOf } from "./routes.js";
 import { gapLineKey, gapLineExpectedResult } from "./gap-lines.js";
 import { inputDecisionNamespace } from "./addressing.js";
 
@@ -119,6 +121,46 @@ export const SERIES_CODES = Object.freeze([
   "owner_required", "review_unusable", "input_unfixed", "decision_unusable", "escalation_conflict",
 ] as const);
 export type SeriesCode = typeof SERIES_CODES[number];
+/**
+ * Q2b (№2518): every refusal code series.ts creates itself, from the actual places of issue — the store-repairs codes
+ * above (the subset om-series.test pins), the G7 completion codes, B3's refused transition and the saved-record codes it
+ * states about a handed-over record (№2460-1). SERIES_CODES stays exported and exact.
+ */
+export const SERIES_LOCAL_CODES = Object.freeze([...SERIES_CODES, "completion_required", "completion_conflict", "completion_invalid",
+  "completion_request_invalid", "input_stale", "series_transition_refused", "record_foreign", "revision_conflict"] as const);
+export type SeriesLocalCode = typeof SERIES_LOCAL_CODES[number];
+export const SERIES_ERROR_CODES = Object.freeze(["series_request_invalid"] as const);
+export type SeriesErrorCode = typeof SERIES_ERROR_CODES[number];
+/** The units whose refusals series.ts hands on, each through its reader bound below. */
+export type SeriesSource = "refs" | "repeat-gate" | "series-transition" | "horizon" | "model-call" | "refusal-journal" | "gaps"
+  | "input" | "frame-obligations" | "routes";
+export type SeriesResultCode = SeriesLocalCode | SourceCodes<SeriesSource>;
+export type SeriesResult<T> = OmResult<T, SeriesResultCode>;
+
+const readCompletionCloseAt = transferring("repeat-gate", readCompletionCloseAtOf);
+const readPreparedSeriesTransition = transferring("series-transition", readPreparedSeriesTransitionOf);
+const prepareSeriesTransition = transferring("series-transition", prepareSeriesTransitionOf);
+const comparePreparedSeriesSlices = transferring("series-transition", comparePreparedSeriesSlicesOf);
+const readHorizonIssuance = transferring("horizon", readHorizonIssuanceOf);
+const prepareHorizonIssuance = transferring("horizon", prepareHorizonIssuanceOf);
+const readModelTerminalWitness = transferring("model-call", readModelTerminalWitnessOf);
+const completionClosedWork = transferring("model-call", completionClosedWorkOf);
+const readJournal = transferring("refusal-journal", readJournalOf);
+const readGaps = transferring("gaps", readGapsOf);
+const prepareCurrentGaps = transferring("gaps", prepareCurrentGapsOf);
+const readOmInput = transferring("input", readOmInputOf);
+const readFrameBasis = transferring("frame-obligations", readFrameBasisOf);
+const readRoutes = transferring("routes", readRoutesOf);
+const prepareRoutes = transferring("routes", prepareRoutesOf);
+const prepareManagedRouteBatch = transferring("routes", prepareManagedRouteBatchOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer("refs", readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer("refs", writeGuardedOf<T>(store, request));
+const refuse = localRefusals(SERIES_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` (or `asserts`) makes a bare call end the control flow for tsc.
+const raise: (code: SeriesErrorCode, message: string, details?: unknown) => never = localErrors(SERIES_ERROR_CODES);
+const check: (condition: unknown, code: SeriesErrorCode, message: string) => asserts condition = (condition, code, message) => {
+  if (!condition) raise(code, message);
+};
 
 /** The goal named before the attempt: its lasting identity, the question or agreed package, and the checkable result. */
 export interface AttemptGoal {
@@ -442,7 +484,7 @@ export function seriesId(project: string, block: string, line: number): string {
   // The line is decimal digits and a project carries no ':', so the address of a series decomposes in one way only,
   // even though a block name carries ':' of its own ("block:cart").
   const id = `${REPAIR_SERIES_KIND}:${requireProject(project)}:${requireLine(line)}:${requireBlock(block)}`;
-  requireCondition(id.length <= MAX_ENTITY_ID, "series_request_invalid", "A series whose address overflows an entity id cannot be kept");
+  check(id.length <= MAX_ENTITY_ID, "series_request_invalid", "A series whose address overflows an entity id cannot be kept");
   return id;
 }
 
@@ -471,9 +513,9 @@ export function ownerDecisionNamespace(project: string): string {
  * an unchanged slice is the same series, and re-issuing one would be a way round a saved stop.
  * Opening the same series again changes nothing and writes no revision, however much has happened since (T5).
  */
-export function openSeries(store: Store, request: OpenSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function openSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function openSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function openSeries(store: Store, request: OpenSeriesRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function openSeries(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function openSeries(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareOpen(store, request)));
 }
 
@@ -483,9 +525,9 @@ export function openSeries(store: Store, request: AnyOpenSeriesRequest): OmResul
  * notification lost to a restart re-reaches the cycle it was about instead of opening the next one; the same ordinal
  * under another goal is a conflict. Only the next ordinal opens an attempt, and none opens while a stop stands.
  */
-export function beginAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function beginAttempt(store: Store, request: BeginAttemptRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareBegin(store, request)));
 }
 
@@ -495,9 +537,9 @@ export function beginAttempt(store: Store, request: AnyBeginAttemptRequest): OmR
  * closed is refused, so a late delivery does not undo a later one (T5). Whether the attempt moved the goal is decided
  * here, from the achievements it carries and the history of that goal — never from a word of the caller's.
  */
-export function completeAttempt(store: Store, request: CompleteAttemptRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function completeAttempt(store: Store, request: CompleteAttemptRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareComplete(store, request)));
 }
 
@@ -508,9 +550,9 @@ export function completeAttempt(store: Store, request: AnyCompleteAttemptRequest
  * saved since then standing. A continuation opens a new window of up to three attempts without progress; it is not
  * itself progress, so it spends the rung it stood on instead of returning the ladder to the start.
  */
-export function resumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function resumeSeries(store: Store, request: ResumeSeriesRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareResume(store, request)));
 }
 
@@ -522,9 +564,9 @@ export function resumeSeries(store: Store, request: AnyResumeSeriesRequest): OmR
  * It applies to its own stop and once: the same request again changes nothing, another review for a stop already
  * escalated is refused, and a stop that no longer stands cannot be escalated at all (T5).
  */
-export function escalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function escalateSeries(store: Store, request: EscalateSeriesRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareEscalate(store, request)));
 }
 
@@ -533,11 +575,11 @@ export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest):
  * An absent series is a typed refusal, not an empty one: a block that was never repaired and a series that was lost
  * are different facts, and no consumer may read them alike (T4).
  */
-export function readSeries(store: Store, request: SeriesRequest): OmResult<Sealed<Revision<RepairSeries>>>;
-export function readSeries(store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>>;
-export function readSeries(store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function readSeries(store: Store, request: SeriesRequest): SeriesResult<Sealed<Revision<RepairSeries>>>;
+export function readSeries(store: Store, request: AnySeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
+export function readSeries(store: Store, request: AnySeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "A series is read through a request object");
+  check(isPlainObject(request), "series_request_invalid", "A series is read through a request object");
   const address = requireAddress(request);
   return withHistoricalReads(() => {
     const current = currentSeries(store, address);
@@ -547,17 +589,17 @@ export function readSeries(store: Store, request: AnySeriesRequest): OmResult<Se
 }
 
 /** Exact history uses the same series check without requiring this revision to remain the head. */
-export function readAnySeriesAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+export function readAnySeriesAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   requireStore(store); requireProject(project);
-  requireCondition(isRef(ref), "series_request_invalid", "Historical series reading needs an exact reference");
+  check(isRef(ref), "series_request_invalid", "Historical series reading needs an exact reference");
   return withHistoricalReads(() => historicalRead(store, { reader: 'A3.series-history', project, ref, parameters: null },
     () => readSeriesHistory(store, project, ref),
     () => problem('series_invalid', 'Series history may not depend on itself', { target: ref.id, ref }, 'history')));
 }
-function readSeriesHistory(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+function readSeriesHistory(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   requireStore(store);
   requireProject(project);
-  if (!isRef(ref)) throw new EngineError("series_request_invalid", "Historical series reading needs an exact reference",
+  if (!isRef(ref)) raise("series_request_invalid", "Historical series reading needs an exact reference",
     { unit: UNIT, target: REPAIR_SERIES_KIND, field: "reference" });
   const prefix = `${REPAIR_SERIES_KIND}:${project}:`;
   const read = readRecord<AnyRepairSeries>(store, ref, { unit: UNIT, target: ref.id, kind: REPAIR_SERIES_KIND, idPrefix: prefix });
@@ -583,16 +625,16 @@ function readSeriesHistory(store: Store, project: string, ref: Ref): OmResult<Se
 }
 
 /** Work and participation share exact lineage proof, but only active participation admits new work. */
-export function prepareSeriesLineAdmission(store: Store, project: string, ref: Ref): OmResult<Sealed<SeriesLineAdmission>> {
-  requireStore(store); requireProject(project); requireCondition(isRef(ref), "series_request_invalid", "Admission needs an exact series");
+export function prepareSeriesLineAdmission(store: Store, project: string, ref: Ref): SeriesResult<Sealed<SeriesLineAdmission>> {
+  requireStore(store); requireProject(project); check(isRef(ref), "series_request_invalid", "Admission needs an exact series");
   return mechanismResult(() => currentBlockAdmission(store, project, ref, true));
 }
-export function prepareSeriesParticipantAdmission(store: Store, project: string, ref: Ref): OmResult<Sealed<SeriesLineAdmission>> {
-  requireStore(store); requireProject(project); requireCondition(isRef(ref), "series_request_invalid", "Participation needs an exact series");
+export function prepareSeriesParticipantAdmission(store: Store, project: string, ref: Ref): SeriesResult<Sealed<SeriesLineAdmission>> {
+  requireStore(store); requireProject(project); check(isRef(ref), "series_request_invalid", "Participation needs an exact series");
   return mechanismResult(() => currentBlockAdmission(store, project, ref, false));
 }
 
-function currentLineProblem(store: Store, address: Address, ref?: Ref): OmResult<never> | null {
+function currentLineProblem(store: Store, address: Address, ref?: Ref): SeriesResult<never> | null {
   return store.get(ownerSeriesId(address.project, address.owner, address.line + 1))
     ? problem("series_conflict", "New work belongs to the current successor of this lineage", { target: address.id, ref }, "line")
     : null;
@@ -611,15 +653,15 @@ function currentLineProblem(store: Store, address: Address, ref?: Ref): OmResult
  * stop keeps its goals and its window exactly. Nothing here is stored beside them and nothing is believed: a record
  * whose stored ladder, count or stop does not follow from the same walk is refused by readSeries before this returns.
  */
-export function readStopHistory(store: Store, request: AnySeriesRequest): OmResult<Sealed<StopHistory>> {
+export function readStopHistory(store: Store, request: AnySeriesRequest): SeriesResult<Sealed<StopHistory>> {
   const read = readSeries(store, request);
   if (!read.ok) return read;
   return stopHistoryOf(read.value.value);
 }
 
 /** The same history, derived from the exact saved series rather than its current head. */
-export function readStopHistoryAt(store: Store, project: string, ref: Ref): OmResult<Sealed<StopHistory>> {
-  const invalid = (field: string): never => { throw new EngineError("series_request_invalid", "Historical stop history needs its project and exact series",
+export function readStopHistoryAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<StopHistory>> {
+  const invalid = (field: string): never => { raise("series_request_invalid", "Historical stop history needs its project and exact series",
     { unit: UNIT, target: REPAIR_SERIES_KIND, field }); };
   if (!(store instanceof Store)) invalid("store");
   try { project = requireProject(project); }
@@ -629,33 +671,33 @@ export function readStopHistoryAt(store: Store, project: string, ref: Ref): OmRe
   return read.ok ? stopHistoryOf(read.value.value) : read;
 }
 
-function stopHistoryOf(value: Sealed<AnyRepairSeries>): OmResult<Sealed<StopHistory>> {
+function stopHistoryOf(value: Sealed<AnyRepairSeries>): SeriesResult<Sealed<StopHistory>> {
   const derived = walk(plainSeries(value as unknown as AnyRepairSeries));
   return delivered({ stops: derived.stops, standing: derived.stop === null ? null : derived.stop.attempt });
 }
 
 // Each change is prepared once and applied in one of two ways: written on its own here, or handed to a caller that
 // writes it together with other records in a single guarded transaction. One implementation, two entrances.
-export function prepareOpenSeries(store: Store, request: OpenSeriesRequest): OmResult<Sealed<SeriesTransition>>;
-export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
-export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareOpen(store, request))); }
-export function prepareBeginAttempt(store: Store, request: BeginAttemptRequest): OmResult<Sealed<SeriesTransition>>;
-export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>>;
-export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareBegin(store, request))); }
-export function prepareCompleteAttempt(store: Store, request: CompleteAttemptRequest): OmResult<Sealed<SeriesTransition>>;
-export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<AnySeriesTransition>>;
-export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareComplete(store, request))); }
-export function prepareResumeSeries(store: Store, request: ResumeSeriesRequest): OmResult<Sealed<SeriesTransition>>;
-export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
-export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareResume(store, request))); }
-export function prepareEscalateSeries(store: Store, request: EscalateSeriesRequest): OmResult<Sealed<SeriesTransition>>;
-export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<AnySeriesTransition>>;
-export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): OmResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareEscalate(store, request))); }
+export function prepareOpenSeries(store: Store, request: OpenSeriesRequest): SeriesResult<Sealed<SeriesTransition>>;
+export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>>;
+export function prepareOpenSeries(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareOpen(store, request))); }
+export function prepareBeginAttempt(store: Store, request: BeginAttemptRequest): SeriesResult<Sealed<SeriesTransition>>;
+export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>>;
+export function prepareBeginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareBegin(store, request))); }
+export function prepareCompleteAttempt(store: Store, request: CompleteAttemptRequest): SeriesResult<Sealed<SeriesTransition>>;
+export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>>;
+export function prepareCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareComplete(store, request))); }
+export function prepareResumeSeries(store: Store, request: ResumeSeriesRequest): SeriesResult<Sealed<SeriesTransition>>;
+export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>>;
+export function prepareResumeSeries(store: Store, request: AnyResumeSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareResume(store, request))); }
+export function prepareEscalateSeries(store: Store, request: EscalateSeriesRequest): SeriesResult<Sealed<SeriesTransition>>;
+export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>>;
+export function prepareEscalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<AnySeriesTransition>> { return withHistoricalReads(() => handed(prepareEscalate(store, request))); }
 
-const handed = (prepared: OmResult<Prepared>): OmResult<Sealed<AnySeriesTransition>> =>
+const handed = (prepared: SeriesResult<Prepared>): SeriesResult<Sealed<AnySeriesTransition>> =>
   prepared.ok ? delivered(prepared.value.transition) : prepared;
 
-function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Revision<AnyRepairSeries>>> {
+function applied(store: Store, prepared: SeriesResult<Prepared>): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   if (!prepared.ok) return prepared;
   const { transition, current } = prepared.value;
   // Nothing to write is a fact, not a failure: the series already holds what was asked for.
@@ -668,27 +710,27 @@ function applied(store: Store, prepared: OmResult<Prepared>): OmResult<Sealed<Re
   return delivered(result.value[0]!);
 }
 
-const unchanged = (current: Revision<AnyRepairSeries>, guards: readonly Ref[] = []): OmResult<Prepared> =>
+const unchanged = (current: Revision<AnyRepairSeries>, guards: readonly Ref[] = []): SeriesResult<Prepared> =>
   ({ ok: true, value: { transition: { writes: [], guards, value: current.value }, current } });
 
 function change(
   address: Address, value: AnyRepairSeries, expected: number, guards: readonly Ref[], current: Revision<AnyRepairSeries> | null,
   grounds: readonly PreparedWrite[] = [],
-): OmResult<Prepared> {
+): SeriesResult<Prepared> {
   const series: PreparedWrite = { id: address.id, kind: REPAIR_SERIES_KIND, expected, value };
   return { ok: true, value: { transition: { writes: [series, ...grounds], guards: [...guards], value }, current } };
 }
 
-function prepareOpen(store: Store, request: AnyOpenSeriesRequest): OmResult<Prepared> {
+function prepareOpen(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Prepared> {
   try { return prepareOpenInner(store, request); } catch (error) { if (error instanceof MechanismFailure) return error.result; throw error; }
 }
-function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult<Prepared> {
+function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): SeriesResult<Prepared> {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "A series is opened through a request object");
+  check(isPlainObject(request), "series_request_invalid", "A series is opened through a request object");
   const address = requireAddress(request);
   const mechanism = "owner" in request;
   if (mechanism) requireScope(request.scope);
-  else requireCondition(isText(request.slice), "series_request_invalid", "A series names the slice of the horizon it belongs to");
+  else check(isText(request.slice), "series_request_invalid", "A series names the slice of the horizon it belongs to");
   const projection = mechanism ? projectMechanismSlice(store, address.project, request.scope, false) : null;
   if (projection && !projection.ok) return projection;
   if (projection?.ok && projection.value.value.questions.length === 0)
@@ -699,11 +741,11 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult
 
   // The first line has no predecessor and no ground to stand on; any later line has both. Neither is a default.
   // Whether a predecessor that IS named is an exact reference is data, not shape: it comes back addressed.
-  requireCondition("predecessor" in request && (address.line === 1) === (request.predecessor === null),
+  check("predecessor" in request && (address.line === 1) === (request.predecessor === null),
     "series_request_invalid", "Only the first line of a series has no predecessor");
-  requireCondition((request.basis === null) === (request.predecessor === null),
+  check((request.basis === null) === (request.predecessor === null),
     "series_request_invalid", "A successor of a series carries the recorded ground it stands on");
-  requireCondition(request.basis === null || basisProblem(request.basis) === null,
+  check(request.basis === null || basisProblem(request.basis) === null,
     "series_request_invalid", "The ground of a successor names one of the recorded grounds and says what changed");
   const basis = request.basis === null ? null : basisOf(request.basis);
 
@@ -749,7 +791,7 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult
       }
       return unchanged(standing.value);
     }
-    return refused("series_conflict", "A series already stands at this address on another slice, predecessor or ground",
+    return refuse("series_conflict", "A series already stands at this address on another slice, predecessor or ground",
       { unit: UNIT, target: address.id, field: "slice", ref: reference(standing.value) }, "producer");
   }
 
@@ -773,13 +815,13 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult
   }
   if (earlier) {
     if (earlier.value.slice === slice) {
-      return refused("slice_unchanged", "An unchanged slice keeps the same series and the same count, and opens no successor",
+      return refuse("slice_unchanged", "An unchanged slice keeps the same series and the same count, and opens no successor",
         { unit: UNIT, target: address.id, field: "slice", ref: predecessor ?? undefined }, "producer");
     }
     // A cycle that is still running belongs to the series it was begun in: it is completed, or recorded as
     // interrupted, before the slice moves. Carrying it over would hand the successor an attempt it never began.
     if (running(earlier.value) !== null) {
-      return refused("attempt_running", "The predecessor still holds a running attempt, which is completed before the slice moves",
+      return refuse("attempt_running", "The predecessor still holds a running attempt, which is completed before the slice moves",
         { unit: UNIT, target: address.id, field: "attempts", ref: predecessor ?? undefined }, "producer");
     }
   }
@@ -810,22 +852,22 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): OmResult
     ...(membership?.record ? [reference(membership.record)] : [])], null, claim);
 }
 
-function prepareBegin(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): OmResult<Prepared> {
+function prepareBegin(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): SeriesResult<Prepared> {
   try { return prepareBeginInner(store, request, managed); }
   catch (error) { if (error instanceof CompletionFailure) return error.result; throw error; }
 }
 function requireBeginRequest(store: Store, request: AnyBeginAttemptRequest): Address {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "An attempt is begun through a request object");
+  check(isPlainObject(request), "series_request_invalid", "An attempt is begun through a request object");
   const address = requireAddress(request);
   if ("owner" in request) requireAdmission(request.admission);
-  requireCondition(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
+  check(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
     "series_request_invalid", "An attempt names the ordinal it opens, so that a late delivery finds its own attempt");
-  requireCondition(goalProblem(request.goal) === null,
+  check(goalProblem(request.goal) === null,
     "series_request_invalid", "An attempt names its goal beforehand: a lasting key, the question or package of questions, and the checkable result");
   return address;
 }
-function prepareBeginInner(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): OmResult<Prepared> {
+function prepareBeginInner(store: Store, request: AnyBeginAttemptRequest, managed?: CompletionPlan): SeriesResult<Prepared> {
   const address = requireBeginRequest(store, request);
   const goal = goalOf(request.goal);
 
@@ -840,12 +882,12 @@ function prepareBeginInner(store: Store, request: AnyBeginAttemptRequest, manage
   if (!completion.ok) return completion;
   const era = completionEra(store, address.project, address.id);
   if (!known && !managed && (request.completion || era && request.attempt >= era.value.firstManagedAttempt))
-    return refused("completion_required", "This attempt must open through G7 with its complete managed work", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+    return refuse("completion_required", "This attempt must open through G7 with its complete managed work", { unit: UNIT, target: address.id, field: "completion" }, "producer");
   if (known && completion.value !== null) {
     if (request.completion && canonical(normalizeCompletionPlan(request.completion)) !== canonical(completion.value.value.plan))
-      return refused("completion_conflict", "A repeated opening retains its original complete assignment", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+      return refuse("completion_conflict", "A repeated opening retains its original complete assignment", { unit: UNIT, target: address.id, field: "completion" }, "producer");
   } else if (known && managed)
-    return refused("completion_conflict", "An existing standalone attempt cannot acquire a completion owner", { unit: UNIT, target: address.id, field: "completion" }, "producer");
+    return refuse("completion_conflict", "An existing standalone attempt cannot acquire a completion owner", { unit: UNIT, target: address.id, field: "completion" }, "producer");
 
   if (known) {
     // T5: an ordinal this series already holds is that attempt, whether it is still running or long closed. A
@@ -887,13 +929,13 @@ function prepareBeginInner(store: Store, request: AnyBeginAttemptRequest, manage
   return change(address, value, head.revision, [...lineAdmission.value.guards, ...(admission?.guards ?? [])], head);
 }
 
-function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, managed?: Ref): OmResult<Prepared> {
+function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, managed?: Ref): SeriesResult<Prepared> {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "An outcome is recorded through a request object");
+  check(isPlainObject(request), "series_request_invalid", "An outcome is recorded through a request object");
   const address = requireAddress(request);
-  requireCondition(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
+  check(Number.isSafeInteger(request.attempt) && request.attempt >= 1,
     "series_request_invalid", "An outcome names the attempt it closes by its ordinal");
-  requireCondition(outcomeProblem(request.outcome, CLAIMED_REFUSAL_KEYS) === null,
+  check(outcomeProblem(request.outcome, CLAIMED_REFUSAL_KEYS) === null,
     "series_request_invalid", "An outcome names why the cycle ended, what it achieved and on what ground, what it cancelled, and every refusal with the journal row it stands for");
   const outcome = outcomeOf(request.outcome);
 
@@ -920,20 +962,20 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, manag
   const binding = readCompletionBinding(store, address.project, reference(head), request.attempt);
   if (!binding.ok) return binding;
   if (binding.value !== null) {
-    if (!managed) return refused('completion_required', 'Only G7 can close a managed attempt through its complete proof',
+    if (!managed) return refuse('completion_required', 'Only G7 can close a managed attempt through its complete proof',
       { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
     const proof = readCompletionCloseAt(store, address.project, managed);
     if (!proof.ok) return proof;
     if (!sameRef(proof.value.binding, reference(binding.value)) || !sameRef(proof.value.series, reference(head))
       || canonical(outcomeOf(proof.value.outcome)) !== canonical(outcome))
-      return refused('completion_invalid', 'The A3 outcome must equal the proved complete managed composition',
+      return refuse('completion_invalid', 'The A3 outcome must equal the proved complete managed composition',
         { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
-  } else if (managed) return refused('completion_invalid', 'A standalone attempt cannot acquire a managed close proof',
+  } else if (managed) return refuse('completion_invalid', 'A standalone attempt cannot acquire a managed close proof',
     { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
   let completionGuards: readonly Ref[];
   const terminal = 'terminal' in request ? request.terminal : undefined;
   if (terminal !== undefined) {
-    requireCondition(isRef(terminal), "series_request_invalid", "Terminal completion names an exact E4 witness");
+    check(isRef(terminal), "series_request_invalid", "Terminal completion names an exact E4 witness");
     const witness = readModelTerminalWitness(store, { project: address.project, record: terminal });
     if (!witness.ok) return witness;
     if (witness.value.series.id !== head.id || witness.value.attempt !== attempt.ordinal
@@ -985,13 +1027,13 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, manag
   return change(address, value, head.revision, completionGuards, head);
 }
 
-function prepareResume(store: Store, request: AnyResumeSeriesRequest): OmResult<Prepared> {
+function prepareResume(store: Store, request: AnyResumeSeriesRequest): SeriesResult<Prepared> {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "A stopped series is continued through a request object");
+  check(isPlainObject(request), "series_request_invalid", "A stopped series is continued through a request object");
   const address = requireAddress(request);
-  requireCondition(Number.isSafeInteger(request.stop) && request.stop >= 1,
+  check(Number.isSafeInteger(request.stop) && request.stop >= 1,
     "series_request_invalid", "A continuation names the attempt whose stop it answers");
-  requireCondition(groundProblem(request, isGroundRecord) === null,
+  check(groundProblem(request, isGroundRecord) === null,
     "series_request_invalid", "A continuation names one of the recorded grounds, says what changed, and carries the records that ground is made of — each stored and named by its exact reference, or written with it, never both and never neither");
 
   const current = currentSeries(store, address);
@@ -1039,13 +1081,13 @@ function prepareResume(store: Store, request: AnyResumeSeriesRequest): OmResult<
   return change(address, value, head.revision, lineAdmission.value.guards, head, grounded.write === null ? [] : [grounded.write]);
 }
 
-function prepareEscalate(store: Store, request: AnyEscalateSeriesRequest): OmResult<Prepared> {
+function prepareEscalate(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Prepared> {
   requireStore(store);
-  requireCondition(isPlainObject(request), "series_request_invalid", "A stop is escalated through a request object");
+  check(isPlainObject(request), "series_request_invalid", "A stop is escalated through a request object");
   const address = requireAddress(request);
-  requireCondition(Number.isSafeInteger(request.stop) && request.stop >= 1,
+  check(Number.isSafeInteger(request.stop) && request.stop >= 1,
     "series_request_invalid", "An escalation names the attempt whose stop it sends to the owner");
-  requireCondition(isGroundRecord(request.review),
+  check(isGroundRecord(request.review),
     "series_request_invalid", "An escalation names the review that ended without a decision — stored and named by its exact reference, or written with it, never both and never neither");
 
   const current = currentSeries(store, address);
@@ -1093,7 +1135,7 @@ interface Located {
 }
 
 /** The record the request's own ground stands on: the review, the confirmation of the fix, or the owner's decision. */
-function groundOf(store: Store, address: Address, request: ContinuationRequest): OmResult<never> | Located {
+function groundOf(store: Store, address: Address, request: ContinuationRequest): SeriesResult<never> | Located {
   if (request.ground === "review-record") {
     return locate(store, address, request.review, STOP_REVIEW_KIND, stopReviewNamespace(address.project), "review");
   }
@@ -1118,7 +1160,7 @@ function groundOf(store: Store, address: Address, request: ContinuationRequest):
  */
 function locate(
   store: Store, address: Address, source: GroundRecord, kind: string, namespace: string, field: string,
-): OmResult<never> | Located {
+): SeriesResult<never> | Located {
   if (source.ref !== undefined) {
     const read = readRecord<Json>(store, source.ref, { unit: UNIT, target: address.id, kind, idPrefix: namespace });
     if (!read.ok) return read;
@@ -1144,8 +1186,8 @@ function locate(
 
 // A record handed over to be written is refused with the codes A1 gives a stored record for the same defect, so that
 // one fact reads alike whichever way the record came.
-function asRecord(code: RefsRefusalCode, message: string, address: Address, field: string, ref?: Ref): OmResult<never> {
-  return refused(code, message, { unit: UNIT, target: address.id, field, ref }, "producer");
+function asRecord(code: "record_foreign" | "revision_conflict", message: string, address: Address, field: string, ref?: Ref): SeriesResult<never> {
+  return refuse(code, message, { unit: UNIT, target: address.id, field, ref }, "producer");
 }
 
 function basisFrom(request: ContinuationRequest, ref: Ref): ContinuationBasis {
@@ -1162,7 +1204,7 @@ function basisFrom(request: ContinuationRequest, ref: Ref): ContinuationBasis {
 /** Weighs the content of a ground's record against the history this series holds, whichever way the record came. */
 function groundStanding(
   store: Store, address: Address, basis: ContinuationBasis, value: unknown, held: AnyRepairSeries, stop: SeriesStop, context: Context,
-): OmResult<never> | null {
+): SeriesResult<never> | null {
   if (basis.ground === "review-record") return weighReview(value, address, stop, context, "decided");
   if (basis.ground === "inputs-fixed") return weighFix(store, address, basis, value, held, stop, context);
   return weighDecision(value, address, stop, context);
@@ -1218,7 +1260,7 @@ function reviewEnd(review: Record<string, unknown>): { readonly end: ReviewEnd }
  * to the owner and continues nothing. Each is refused on the other's path, so that no review is read as the outcome
  * it did not have. The independence of the reviewer and the worth of the cause are A6's to establish.
  */
-function weighReview(value: unknown, address: Address, stop: SeriesStop, context: Context, wanted: ReviewEnd): OmResult<never> | null {
+function weighReview(value: unknown, address: Address, stop: SeriesStop, context: Context, wanted: ReviewEnd): SeriesResult<never> | null {
   const found = aboutStop(value, address, stop);
   if ("field" in found) {
     return problem("review_unusable", `A review that ${notAbout(found.field)} is no ground for this stop`, context, `review${found.field}`);
@@ -1246,7 +1288,7 @@ function weighReview(value: unknown, address: Address, stop: SeriesStop, context
  * and T1 says what was decided is read from a record. WHO decided and how their action was authenticated is the command
  * API's to answer: this unit reads no field claiming it, and refuses towards the owner when the record does not hold.
  */
-function weighDecision(value: unknown, address: Address, stop: SeriesStop, context: Context): OmResult<never> | null {
+function weighDecision(value: unknown, address: Address, stop: SeriesStop, context: Context): SeriesResult<never> | null {
   const found = aboutStop(value, address, stop);
   if ("field" in found) {
     return problem("decision_unusable", `A decision that ${notAbout(found.field)} does not continue this stop`, context, `decision${found.field}`, "owner");
@@ -1270,7 +1312,7 @@ function weighDecision(value: unknown, address: Address, stop: SeriesStop, conte
  */
 function weighFix(
   store: Store, address: Address, basis: InputsContinuation, value: unknown, held: AnyRepairSeries, stop: SeriesStop, context: Context,
-): OmResult<never> | null {
+): SeriesResult<never> | null {
   const journal = readJournal(store, { project: address.project });
   if (!journal.ok) {
     return problem("refusal_unlinked", `This project holds no journal a refusal could stand in: ${journal.refusal.code}`, context, "refusal");
@@ -1321,7 +1363,7 @@ function weighFix(
  * so the refusal kept in the series is a refusal a gate really wrote, and G7's class and addressee are reachable from
  * it. The CLASSIFICATION is not required: G7 derives it later, and what matters here is that it can be found.
  */
-function linkedRefusals(store: Store, address: Address, claimed: readonly ClaimedRefusal[], context: Context): OmResult<never> | null {
+function linkedRefusals(store: Store, address: Address, claimed: readonly ClaimedRefusal[], context: Context): SeriesResult<never> | null {
   if (claimed.length === 0) return null;
   const journal = readJournal(store, { project: address.project });
   if (!journal.ok) {
@@ -1341,7 +1383,7 @@ function linkedRefusals(store: Store, address: Address, claimed: readonly Claime
   return null;
 }
 
-function currentSeries(store: Store, address: Address): OmResult<Revision<AnyRepairSeries>> | null {
+function currentSeries(store: Store, address: Address): SeriesResult<Revision<AnyRepairSeries>> | null {
   // The head revision of the exact id is what a reference to it is made of; the record is then read as any record is,
   // so a foreign kind standing at this address is refused instead of being extended.
   const head = store.get<AnyRepairSeries>(address.id);
@@ -1354,8 +1396,8 @@ function currentSeries(store: Store, address: Address): OmResult<Revision<AnyRep
   return broken ?? { ok: true, value: read.value as Revision<AnyRepairSeries> };
 }
 
-const missing = (address: Address): OmResult<never> =>
-  refused("series_missing", "No series of repairs stands for this block and line",
+const missing = (address: Address): SeriesResult<never> =>
+  refuse("series_missing", "No series of repairs stands for this block and line",
     { unit: UNIT, target: address.id }, "producer");
 
 const running = (value: AnyRepairSeries): Attempt | null => value.attempts.find(item => item.outcome === null) ?? null;
@@ -1781,7 +1823,7 @@ const said = (value: unknown): boolean =>
  * the first. The line of a predecessor is one less than its successor's, so the lineage ends at line 1 and cannot
  * close on itself.
  */
-function checkSeries(store: Store, value: unknown, address: Address, context: Context): OmResult<never> | null {
+function checkSeries(store: Store, value: unknown, address: Address, context: Context): SeriesResult<never> | null {
   const mechanism = address.owner.kind === "mechanism";
   const managed = isPlainObject(value) && (Object.hasOwn(value as object, "contract") || Object.hasOwn(value as object, "activation"));
   const keys = mechanism ? [...SERIES_KEYS.filter(key => key !== "block"), "owner", "scope", "admissions"]
@@ -1944,7 +1986,7 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
     if (!binding.ok) return binding;
     if (binding.value && attempt.outcome) {
       const id = completionCloseId(address.project, binding.value.id), close = store.get(id);
-      if (!close) return refused('completion_invalid', 'A managed outcome needs its exact G7 close proof',
+      if (!close) return refuse('completion_invalid', 'A managed outcome needs its exact G7 close proof',
         { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
       const proof = readCompletionCloseAt(store, address.project, reference(close));
       if (!proof.ok) return proof;
@@ -1957,7 +1999,7 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
         || !work || work.kind !== COMPLETION_WORK_KIND || !work.value.closed || !sameRef(work.value.closed, reference(close))
         || !work.value.previous || !sameRef(work.value.previous, proof.value.work) || !priorWork
         || canonical(work.value) !== canonical(closedWork!.value) || attempt.terminal)
-        return refused('completion_invalid', 'The managed outcome, closed registry and proof must agree',
+        return refuse('completion_invalid', 'The managed outcome, closed registry and proof must agree',
           { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
     }
   }
@@ -1986,7 +2028,7 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   return null;
 }
 
-function checkAttempt(value: unknown, ordinal: number, context: Context, path: string): OmResult<never> | null {
+function checkAttempt(value: unknown, ordinal: number, context: Context, path: string): SeriesResult<never> | null {
   if (!isPlainObject(value) || !exactKeys(value, [...ATTEMPT_KEYS, ...(Object.hasOwn(value as object, "terminal") ? ["terminal"] : [])])) {
     return problem("series_invalid", "An attempt carries its ordinal, its goal, its outcome and the verdict derived from them", context, path);
   }
@@ -2030,12 +2072,12 @@ function exactKeys(value: unknown, keys: readonly string[]): boolean {
 // A refusal of this unit goes back to whoever produced what it read — or, when what is missing is a decision only the
 // owner can take, to the owner. The series rules on the history it keeps and on nothing else, and switches nothing by
 // refusing (T8): a stop stays a stop, and no window opens because a ground was turned away.
-function problem(code: SeriesCode, message: string, context: Context, field: string, route: RefusalRoute = "producer"): OmResult<never> {
-  return refused(code, message, { unit: UNIT, target: context.target, field, ref: context.ref }, route);
+function problem(code: SeriesCode, message: string, context: Context, field: string, route: RefusalRoute = "producer"): SeriesResult<never> {
+  return refuse(code, message, { unit: UNIT, target: context.target, field, ref: context.ref }, route);
 }
 
 function requireStore(store: unknown): asserts store is Store {
-  requireCondition(store instanceof Store, "series_request_invalid", "A series is read and written through a store");
+  check(store instanceof Store, "series_request_invalid", "A series is read and written through a store");
 }
 
 /** The addressing slice contains semantic tasks and allowed accepted consumers; revisions remain evidence. */
@@ -2048,12 +2090,12 @@ export interface MechanismProjection { slice: string; value: MechanismSlice; gua
 export interface SeriesAdmissionProof extends MechanismProjection {
   goal: Omit<AttemptGoal, 'key'>; gaps: { id: string; target: string; field: string }[];
 }
-class MechanismFailure extends Error { constructor(readonly result: Extract<OmResult<never>, { ok: false }>) { super(result.refusal.message); } }
-function mechanismTake<T>(result: OmResult<T>): T { if (!result.ok) throw new MechanismFailure(result); return result.value; }
+class MechanismFailure extends Error { constructor(readonly result: Failed<SeriesResultCode>) { super(result.refusal.message); } }
+function mechanismTake<T>(result: SeriesResult<T>): T { if (!result.ok) throw new MechanismFailure(result); return result.value; }
 function mechanismCheck(condition: unknown, target: string, field: string, message: string): asserts condition {
   if (!condition) mechanismTake(problem('series_invalid', message, { target, ref: undefined }, field));
 }
-function mechanismResult<T>(action: () => T): OmResult<Sealed<T>> {
+function mechanismResult<T>(action: () => T): SeriesResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(action()); } catch (error) { if (error instanceof MechanismFailure) return error.result; throw error; }
   });
@@ -2064,7 +2106,7 @@ function normalizedScope(scope: Sealed<GapReadRequest>): GapReadRequest {
   return sealed({ sources: scope.sources, records: ordered(scope.records, canonical) }) as GapReadRequest;
 }
 function requireScope(scope: unknown): asserts scope is GapReadRequest {
-  requireCondition(mechanismObject(scope) && exactKeys(scope, ['sources', 'records']) && isPlainObject(scope.sources)
+  check(mechanismObject(scope) && exactKeys(scope, ['sources', 'records']) && isPlainObject(scope.sources)
     && isText(scope.sources.project) && isRef(scope.sources.input)
     && Array.isArray(scope.records) && scope.records.every(isRef), 'series_request_invalid', 'A mechanism scope requires the complete exact D1 source and record set');
 }
@@ -2072,7 +2114,7 @@ function normalizedAdmission(admission: MechanismAdmission): MechanismAdmission 
   return { gaps: normalizedScope(admission.gaps), routes: exactRef(admission.routes), batch: admission.batch };
 }
 function requireAdmission(admission: unknown): asserts admission is MechanismAdmission {
-  requireCondition(mechanismObject(admission) && exactKeys(admission, ['gaps', 'routes', 'batch']) && isRef(admission.routes)
+  check(mechanismObject(admission) && exactKeys(admission, ['gaps', 'routes', 'batch']) && isRef(admission.routes)
     && isText(admission.batch), 'series_request_invalid', 'Admission needs the full D1 and one exact selected M6 batch');
   requireScope(admission.gaps);
 }
@@ -2147,9 +2189,9 @@ function deriveMechanismProjection(store: Store, project: string, scope: Sealed<
     questions: ordered(questions, row => canonical([row.target, row.field])), consumers: ordered([...catalog.values()], canonical) };
   return { slice: hashJson(value), value, guards: refsUnique(guards), references: refsUnique(references) };
 }
-export function projectMechanismSlice(store: Store, project: string, scope: Sealed<GapReadRequest>, current = false): OmResult<Sealed<MechanismProjection>> {
+export function projectMechanismSlice(store: Store, project: string, scope: Sealed<GapReadRequest>, current = false): SeriesResult<Sealed<MechanismProjection>> {
   requireStore(store); requireProject(project); requireScope(scope);
-  requireCondition(typeof current === 'boolean', 'series_request_invalid', 'The reading mode must be explicit');
+  check(typeof current === 'boolean', 'series_request_invalid', 'The reading mode must be explicit');
   return mechanismResult(() => mechanismProjection(store, project, normalizedScope(scope), current));
 }
 function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission, current: boolean, managed?: { series: Ref; attempt: number }): SeriesAdmissionProof {
@@ -2199,9 +2241,9 @@ function deriveMechanismAdmission(store: Store, request: MechanismSeriesRequest,
     goal: { questions: ordered(gaps.map(gap => gapLineKey(request.project, gap.target, gap.field)), value => value),
       result: gapLineExpectedResult(request.project, gaps[0]!.target, gaps[0]!.field) } };
 }
-export function prepareSeriesAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): OmResult<Sealed<SeriesAdmissionProof>> {
+export function prepareSeriesAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): SeriesResult<Sealed<SeriesAdmissionProof>> {
   requireStore(store); const address = seriesAddress(request); requireAdmission(admission);
-  requireCondition(address.owner.kind === 'mechanism', 'series_request_invalid', 'This admission belongs to a mechanism');
+  check(address.owner.kind === 'mechanism', 'series_request_invalid', 'This admission belongs to a mechanism');
   return mechanismResult(() => {
     const read = mechanismTake(readAnySeries(store, request));
     const line = mechanismTake(prepareSeriesLineAdmission(store, request.project, reference(read)));
@@ -2213,7 +2255,7 @@ interface MechanismAdmissionRequest {
   project: string; series: Ref; attempt: number; admission: MechanismAdmission; current: boolean;
 }
 type MechanismAttemptProof = SeriesAdmissionProof & { series: Revision<MechanismRepairSeries>; owner: MechanismOwner; goal: AttemptGoal };
-export function readMechanismAdmission(store: Store, request: MechanismAdmissionRequest): OmResult<Sealed<MechanismAttemptProof>> {
+export function readMechanismAdmission(store: Store, request: MechanismAdmissionRequest): SeriesResult<Sealed<MechanismAttemptProof>> {
   return readMechanismAttemptAdmission(store, request, 'design');
 }
 /**
@@ -2222,13 +2264,13 @@ export function readMechanismAdmission(store: Store, request: MechanismAdmission
  * sources: these have their own current admission and guards, without replacing the original assignment.
  * E1 proves the exact stop/hold and permitted rung before dispatching.
  */
-export function readMechanismAnalysisAdmission(store: Store, request: MechanismAdmissionRequest): OmResult<Sealed<MechanismAttemptProof>> {
+export function readMechanismAnalysisAdmission(store: Store, request: MechanismAdmissionRequest): SeriesResult<Sealed<MechanismAttemptProof>> {
   return readMechanismAttemptAdmission(store, request, 'analysis');
 }
-function readMechanismAttemptAdmission(store: Store, request: MechanismAdmissionRequest, purpose: 'design' | 'analysis'): OmResult<Sealed<MechanismAttemptProof>> {
-  requireStore(store); requireCondition(isPlainObject(request), 'series_request_invalid', 'Admission reading requires an exact request');
+function readMechanismAttemptAdmission(store: Store, request: MechanismAdmissionRequest, purpose: 'design' | 'analysis'): SeriesResult<Sealed<MechanismAttemptProof>> {
+  requireStore(store); check(isPlainObject(request), 'series_request_invalid', 'Admission reading requires an exact request');
   requireProject(request.project); requireAdmission(request.admission);
-  requireCondition(isRef(request.series) && Number.isSafeInteger(request.attempt) && request.attempt > 0 && typeof request.current === 'boolean',
+  check(isRef(request.series) && Number.isSafeInteger(request.attempt) && request.attempt > 0 && typeof request.current === 'boolean',
     'series_request_invalid', 'The exact series, attempt and admission mode are required');
   return mechanismResult(() => {
     const series = mechanismTake(readAnySeriesAt(store, request.project, request.series)) as Revision<AnyRepairSeries>;
@@ -2259,25 +2301,25 @@ function readMechanismAttemptAdmission(store: Store, request: MechanismAdmission
 
 function requireAddress(request: AnySeriesRequest): Address { return seriesAddress(request); }
 export function seriesAddress(request: AnySeriesRequest): SeriesAddress {
-  requireCondition(isPlainObject(request), "series_request_invalid", "A series needs an explicit owner address");
+  check(isPlainObject(request), "series_request_invalid", "A series needs an explicit owner address");
   const project = requireProject(request.project), line = requireLine(request.line);
   if (Object.hasOwn(request, "owner")) {
     const owner = (request as MechanismSeriesRequest).owner;
-    requireCondition(isPlainObject(owner) && exactKeys(owner, ["kind", "mechanism"]) && owner.kind === "mechanism"
+    check(isPlainObject(owner) && exactKeys(owner, ["kind", "mechanism"]) && owner.kind === "mechanism"
       && owner.mechanism === "M5:addressing" && !Object.hasOwn(request, "block"), "series_request_invalid", "An explicit supported mechanism owner cannot masquerade as a block");
     const id = ownerSeriesId(project, owner, line);
-    requireCondition(id.length <= MAX_ENTITY_ID, "series_request_invalid", "The mechanism address exceeds the entity limit");
+    check(id.length <= MAX_ENTITY_ID, "series_request_invalid", "The mechanism address exceeds the entity limit");
     return { project, line, owner: { kind: "mechanism", mechanism: "M5:addressing" }, id };
   }
-  requireCondition(!Object.hasOwn(request, "scope") && !Object.hasOwn(request, "admission"), "series_request_invalid",
+  check(!Object.hasOwn(request, "scope") && !Object.hasOwn(request, "admission"), "series_request_invalid",
     "A modern mechanism envelope requires its explicit owner and cannot fall through to the legacy block contract");
   const block = requireBlock((request as SeriesRequest).block);
   return { project, line, owner: { kind: "block", block }, id: seriesId(project, block, line) };
 }
 export function seriesOwner(value: { readonly block: string } | { readonly owner: MechanismOwner }): SeriesOwner {
-  requireCondition(isPlainObject(value), "series_request_invalid", "An owner comes from an explicit series value");
+  check(isPlainObject(value), "series_request_invalid", "An owner comes from an explicit series value");
   if ("owner" in value) {
-    requireCondition(isPlainObject(value.owner) && exactKeys(value.owner, ["kind", "mechanism"])
+    check(isPlainObject(value.owner) && exactKeys(value.owner, ["kind", "mechanism"])
       && value.owner.kind === "mechanism" && value.owner.mechanism === "M5:addressing" && !Object.hasOwn(value, "block"),
       "series_request_invalid", "The mechanism owner is explicit and cannot also be a block");
     return { ...value.owner };
@@ -2291,8 +2333,8 @@ export function seriesRequestOf(value: Sealed<AnyRepairSeries>): AnySeriesReques
 const ownerSeriesId = (project: string, owner: SeriesOwner, line: number): string => owner.kind === "block"
   ? seriesId(project, owner.block, line) : `${REPAIR_SERIES_KIND}:${project}:mechanism:${line}:${owner.mechanism}`;
 const ownerFields = (owner: SeriesOwner) => owner.kind === "block" ? { block: owner.block } : { owner: { ...owner } };
-export const readAnySeries = (store: Store, request: AnySeriesRequest): OmResult<Sealed<Revision<AnyRepairSeries>>> => readSeries(store, request);
-export function readSeriesAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<RepairSeries>>> {
+export const readAnySeries = (store: Store, request: AnySeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> => readSeries(store, request);
+export function readSeriesAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<RepairSeries>>> {
   const read = readAnySeriesAt(store, project, ref);
   if (!read.ok) return read;
   if ("owner" in read.value.value) return problem("series_foreign", "This reader requires a block series", { target: ref.id, ref }, "owner");
@@ -2300,23 +2342,23 @@ export function readSeriesAt(store: Store, project: string, ref: Ref): OmResult<
 }
 
 function requireProject(project: unknown): string {
-  requireCondition(typeof project === "string" && project.length > 0, "series_request_invalid", "A series is kept for a project");
+  check(typeof project === "string" && project.length > 0, "series_request_invalid", "A series is kept for a project");
   // ':' separates namespaces inside an id: a project carrying one would address another project's records.
-  requireCondition(!project.includes(":"), "series_request_invalid", "A project name carries no ':' namespace separator");
+  check(!project.includes(":"), "series_request_invalid", "A project name carries no ':' namespace separator");
   // A refusal of a cycle is kept as a link into the project's journal, so a project whose journal cannot be addressed
   // cannot hold a series either.
-  requireCondition(project.length + REFUSAL_JOURNAL_KIND.length + 1 <= MAX_ENTITY_ID,
+  check(project.length + REFUSAL_JOURNAL_KIND.length + 1 <= MAX_ENTITY_ID,
     "series_request_invalid", "A project name that overflows an entity id cannot be repaired");
   return project;
 }
 
 function requireBlock(block: unknown): string {
-  requireCondition(typeof block === "string" && block.length > 0, "series_request_invalid", "A series is kept for a block");
+  check(typeof block === "string" && block.length > 0, "series_request_invalid", "A series is kept for a block");
   return block;
 }
 
 function requireLine(line: unknown): number {
-  requireCondition(Number.isSafeInteger(line) && Number(line) >= 1,
+  check(Number.isSafeInteger(line) && Number(line) >= 1,
     "series_request_invalid", "A series stands on a line of its own, counted from one");
   return line as number;
 }
@@ -2344,7 +2386,7 @@ export interface SeriesEra {
 }
 export function seriesEraId(project: string, seriesId: string): string {
   requireProject(project);
-  requireCondition(typeof seriesId === 'string' && seriesId.startsWith(`${REPAIR_SERIES_KIND}:${project}:`),
+  check(typeof seriesId === 'string' && seriesId.startsWith(`${REPAIR_SERIES_KIND}:${project}:`),
     'series_request_invalid', 'An era belongs to the complete series ID in its project');
   return `${SERIES_ERA_KIND}:${project}:${hashJson({ seriesId })}`;
 }
@@ -2382,7 +2424,7 @@ export interface SeriesAdmissionChange extends SeriesWorkAdmissionRequest {
 export function seriesMembershipId(project: string): string { return `${SERIES_MEMBERSHIP_KIND}:${requireProject(project)}`; }
 export function seriesCurrentId(project: string): string { return `${SERIES_CURRENT_KIND}:${requireProject(project)}`; }
 export function seriesRequiresAdmissionProof(series: AnyRepairSeries): boolean {
-  requireCondition(isPlainObject(series), 'series_request_invalid', 'An admission-era query requires a series record');
+  check(isPlainObject(series), 'series_request_invalid', 'An admission-era query requires a series record');
   return 'block' in series && series.contract === MANAGED_SERIES_CONTRACT;
 }
 function activationId(request: SeriesActivationRequest): string {
@@ -2390,13 +2432,13 @@ function activationId(request: SeriesActivationRequest): string {
 }
 function requireActivationRequest(store: Store, request: unknown): asserts request is SeriesActivationRequest {
   requireStore(store);
-  requireCondition(mechanismObject(request) && exactKeys(request, ['project', 'prepared', 'issuance'])
+  check(mechanismObject(request) && exactKeys(request, ['project', 'prepared', 'issuance'])
     && isRef(request.prepared) && isRef(request.issuance), 'series_request_invalid', 'Activation requires exact saved P and G2 sources');
   requireProject(request.project);
 }
 function requireWorkAdmissionRequest(store: Store, request: unknown, change = false): asserts request is SeriesWorkAdmissionRequest & { currentPointer?: Ref } {
   requireStore(store);
-  requireCondition(mechanismObject(request) && isRef(request.series) && (request.pointer === null || isRef(request.pointer))
+  check(mechanismObject(request) && isRef(request.series) && (request.pointer === null || isRef(request.pointer))
     && Object.hasOwn(request, 'pointer') && (!change || !Object.hasOwn(request, 'currentPointer') || isRef(request.currentPointer)),
   'series_request_invalid', 'Admission history names the exact source series and an explicit original pointer or null');
   requireProject(request.project);
@@ -2466,8 +2508,8 @@ function captureMembership(store: Store, project: string): CapturedMembership {
   return { record, value: record?.value ?? { contract: 'om-series-membership/v1', project, mode: 'legacy', roots: sortedRoots, activation: null },
     series: ordered([...current.values()], row => row.value.block) };
 }
-export function readSeriesMembership(store: Store, request: { project: string; record?: Ref }): OmResult<Sealed<Revision<SeriesMembership>>> {
-  requireStore(store); requireCondition(mechanismObject(request) && (!Object.hasOwn(request, 'record') || isRef(request.record)), 'series_request_invalid', 'Membership reading needs a project and optional exact reference'); requireProject(request.project);
+export function readSeriesMembership(store: Store, request: { project: string; record?: Ref }): SeriesResult<Sealed<Revision<SeriesMembership>>> {
+  requireStore(store); check(mechanismObject(request) && (!Object.hasOwn(request, 'record') || isRef(request.record)), 'series_request_invalid', 'Membership reading needs a project and optional exact reference'); requireProject(request.project);
   return mechanismResult(() => {
     if (request.record) return checkedMembership(store, request.project, request.record);
     const membership = captureMembership(store, request.project);
@@ -2485,7 +2527,7 @@ function checkedTransitionPair(store: Store, request: SeriesActivationRequest) {
   return { prepared, issuance };
 }
 function requireAcceptedIssuance(issuance: ReturnType<typeof checkedTransitionPair>['issuance']): void {
-  if (issuance.value.state === 'refused') mechanismTake(refused('series_transition_refused',
+  if (issuance.value.state === 'refused') mechanismTake(refuse('series_transition_refused',
     'The bound G2 refused this transition', { unit: 'B3', target: issuance.id, field: 'state', ref: reference(issuance) }, 'producer'));
 }
 function discardId(request: SeriesActivationRequest): string {
@@ -2514,14 +2556,14 @@ function checkedDiscarded(store: Store, project: string, ref: Ref): Revision<Dis
     'Discarded history is rederived from the bound negative G2, including its complete codes');
   return record;
 }
-export function readDiscardedSeriesTransition(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<DiscardedSeriesTransition>>> {
+export function readDiscardedSeriesTransition(store: Store, request: { project: string; record: Ref }): SeriesResult<Sealed<Revision<DiscardedSeriesTransition>>> {
   requireStore(store);
-  requireCondition(mechanismObject(request) && exactKeys(request, ['project', 'record']) && isRef(request.record),
+  check(mechanismObject(request) && exactKeys(request, ['project', 'record']) && isRef(request.record),
     'series_request_invalid', 'Discarded history names its project and exact saved record');
   requireProject(request.project);
   return mechanismResult(() => checkedDiscarded(store, request.project, request.record));
 }
-export function prepareSeriesDiscard(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesDiscard>> {
+export function prepareSeriesDiscard(store: Store, request: SeriesActivationRequest): SeriesResult<Sealed<PreparedSeriesDiscard>> {
   requireActivationRequest(store, request);
   return mechanismResult(() => {
     const id = discardId(request), existing = store.get<DiscardedSeriesTransition>(id, 1);
@@ -2531,7 +2573,7 @@ export function prepareSeriesDiscard(store: Store, request: SeriesActivationRequ
     return { record: revisionOfWrite<DiscardedSeriesTransition>(write), writes: [write], guards: [] };
   });
 }
-export function writeSeriesDiscard(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesDiscard>> {
+export function writeSeriesDiscard(store: Store, request: SeriesActivationRequest): SeriesResult<Sealed<PreparedSeriesDiscard>> {
   const prepared = prepareSeriesDiscard(store, request);
   if (!prepared.ok || !prepared.value.writes.length) return prepared;
   const written = writeGuarded(store, { unit: 'B3', target: prepared.value.record.id, writes: prepared.value.writes, guards: prepared.value.guards });
@@ -2643,19 +2685,19 @@ function checkedCurrent(store: Store, project: string, ref: Ref): Revision<Curre
     return record;
   }, () => { mechanismCheck(false, ref.id, 'pointer', 'Pointer history may not depend on itself'); throw new Error('Unreachable'); });
 }
-export function readAppliedSeriesTransition(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<AppliedSeriesTransition>>> {
-  requireStore(store); requireCondition(mechanismObject(request) && isRef(request.record), 'series_request_invalid', 'Applied history needs an exact reference'); requireProject(request.project);
+export function readAppliedSeriesTransition(store: Store, request: { project: string; record: Ref }): SeriesResult<Sealed<Revision<AppliedSeriesTransition>>> {
+  requireStore(store); check(mechanismObject(request) && isRef(request.record), 'series_request_invalid', 'Applied history needs an exact reference'); requireProject(request.project);
   return mechanismResult(() => checkedApplied(store, request.project, request.record));
 }
-export function readCurrentSeriesPointer(store: Store, request: { project: string; record?: Ref }): OmResult<Sealed<Revision<CurrentSeriesPointer>>> {
-  requireStore(store); requireCondition(mechanismObject(request) && (!Object.hasOwn(request, 'record') || isRef(request.record)), 'series_request_invalid', 'Pointer reading requires a project and optional exact reference'); requireProject(request.project);
+export function readCurrentSeriesPointer(store: Store, request: { project: string; record?: Ref }): SeriesResult<Sealed<Revision<CurrentSeriesPointer>>> {
+  requireStore(store); check(mechanismObject(request) && (!Object.hasOwn(request, 'record') || isRef(request.record)), 'series_request_invalid', 'Pointer reading requires a project and optional exact reference'); requireProject(request.project);
   return mechanismResult(() => {
     const ref = request.record ?? (() => { const head = store.get(seriesCurrentId(request.project));
       mechanismCheck(head, seriesCurrentId(request.project), 'pointer', 'The current series pointer is absent'); return reference(head); })();
     return checkedCurrent(store, request.project, ref);
   });
 }
-export function prepareSeriesActivation(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesActivation>> {
+export function prepareSeriesActivation(store: Store, request: SeriesActivationRequest): SeriesResult<Sealed<PreparedSeriesActivation>> {
   requireActivationRequest(store, request);
   return mechanismResult(() => {
     const existing = store.get<AppliedSeriesTransition>(activationId(request), 1);
@@ -2690,14 +2732,14 @@ export function prepareSeriesActivation(store: Store, request: SeriesActivationR
     return { record, pointer, series: pointer.value.series.map(row => revisionOfWrite<RepairSeries>(seriesWrites.find(write => write.id === row.activation.id)!)), writes, guards };
   });
 }
-export function applySeriesActivation(store: Store, request: SeriesActivationRequest): OmResult<Sealed<PreparedSeriesActivation>> {
+export function applySeriesActivation(store: Store, request: SeriesActivationRequest): SeriesResult<Sealed<PreparedSeriesActivation>> {
   const prepared = prepareSeriesActivation(store, request);
   if (!prepared.ok || !prepared.value.writes.length) return prepared;
   const written = writeGuarded(store, { unit: UNIT, target: request.project, writes: prepared.value.writes, guards: prepared.value.guards });
   return written.ok ? delivered({ ...prepared.value, writes: [] }) : written;
 }
 
-function checkSeriesActivation(store: Store, value: AnyRepairSeries, address: Address, context: Context): OmResult<'legacy' | 'managed'> {
+function checkSeriesActivation(store: Store, value: AnyRepairSeries, address: Address, context: Context): SeriesResult<'legacy' | 'managed'> {
   return mechanismResult<'legacy' | 'managed'>(() => {
     if (address.owner.kind === 'mechanism') return 'legacy';
     const activation = value.activation;
@@ -2765,7 +2807,7 @@ function checkSeriesActivation(store: Store, value: AnyRepairSeries, address: Ad
     return 'managed';
   });
 }
-function mutationAdmission(store: Store, source: Revision<AnyRepairSeries>): OmResult<Sealed<{ guards: readonly Ref[] }>> {
+function mutationAdmission(store: Store, source: Revision<AnyRepairSeries>): SeriesResult<Sealed<{ guards: readonly Ref[] }>> {
   // Legacy commands already read their own exact source. Activation rewrites it in the same CAS transaction,
   // preserving their established race codes and avoiding a stricter reread of unrelated legacy records.
   return source.value.contract === undefined && source.value.activation === undefined
@@ -2807,7 +2849,7 @@ function currentBlockAdmission(store: Store, project: string, ref: Ref, work: bo
   return { series, guards: refsUnique(guards), pointer: reference(pointer), activation: activation.applied,
     participation: activation.participation, references: refsUnique(references) };
 }
-export function readSeriesWorkAdmission(store: Store, request: SeriesWorkAdmissionRequest): OmResult<Sealed<SeriesLineAdmission>> {
+export function readSeriesWorkAdmission(store: Store, request: SeriesWorkAdmissionRequest): SeriesResult<Sealed<SeriesLineAdmission>> {
   requireWorkAdmissionRequest(store, request);
   return mechanismResult(() => {
     const series = mechanismTake(readAnySeriesAt(store, request.project, request.series)) as Revision<AnyRepairSeries>;
@@ -2826,7 +2868,7 @@ export function readSeriesWorkAdmission(store: Store, request: SeriesWorkAdmissi
       participation: 'active' as const, references: refsUnique([request.series, request.pointer, activation.applied, pointer.value.membership]) };
   });
 }
-export function readSeriesAdmissionChange(store: Store, request: SeriesWorkAdmissionRequest & { currentPointer?: Ref }): OmResult<Sealed<{
+export function readSeriesAdmissionChange(store: Store, request: SeriesWorkAdmissionRequest & { currentPointer?: Ref }): SeriesResult<Sealed<{
   proof: SeriesAdmissionChange; references: Ref[]; guards: Ref[];
 }>> {
   requireWorkAdmissionRequest(store, request, true);
@@ -2865,7 +2907,7 @@ export function readSeriesAdmissionChange(store: Store, request: SeriesWorkAdmis
       guards: request.currentPointer === undefined ? refsUnique([current, ...(head ? [reference(head)] : [])]) : [] };
   });
 }
-function checkTerminalCompletion(store: Store, project: string, id: string, attempt: Attempt): OmResult<true> {
+function checkTerminalCompletion(store: Store, project: string, id: string, attempt: Attempt): SeriesResult<true> {
   if (!isRef(attempt.terminal)) return problem('series_invalid', 'A terminal completion retains its exact E4 witness', { target: id, ref: undefined }, 'terminal');
   const witness = readModelTerminalWitness(store, { project, record: attempt.terminal });
   if (!witness.ok) return witness;
@@ -3003,18 +3045,18 @@ export const completionCloseId = (project: string, bindingId: string): string =>
 export const completionAssignmentId = (project: string, bindingId: string, key: string): string =>
   `${COMPLETION_ASSIGNMENT_KIND}:${project}:${hashJson({ binding: bindingId, key })}`;
 class CompletionFailure extends Error {
-  constructor(readonly result: Extract<OmResult<never>, { ok: false }>) { super(result.refusal.message); }
+  constructor(readonly result: Failed<SeriesResultCode>) { super(result.refusal.message); }
 }
-function completionFail(target: string, field: string, message: string, code = 'completion_invalid'): never {
-  const result = refused(code, message, { unit: 'G7', target, field }, 'producer');
+function completionFail(target: string, field: string, message: string, code: SeriesLocalCode = 'completion_invalid'): never {
+  const result = refuse(code, message, { unit: 'G7', target, field }, 'producer');
   if (!result.ok) throw new CompletionFailure(result);
   throw new Error('Unreachable');
 }
-function completionTake<T>(result: OmResult<T>): T {
+function completionTake<T>(result: SeriesResult<T>): T {
   if (!result.ok) throw new CompletionFailure(result);
   return result.value;
 }
-function completionResult<T>(read: () => T): OmResult<Sealed<T>> {
+function completionResult<T>(read: () => T): SeriesResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(read()); }
     catch (error) { if (error instanceof CompletionFailure) return error.result; throw error; }
@@ -3109,7 +3151,7 @@ function completionBindingBody(store: Store, project: string, value: CompletionO
   return { contract: 'om-completion-owner/v1', project, series: exactRef(value.series), previous: reference(before),
     attempt: value.attempt, owner: sources.owner, goal: sources.goal, plan, admission: 'owner' in request ? normalizedAdmission(request.admission) : null };
 }
-export function readCompletionOwnerAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<CompletionOwner>>> {
+export function readCompletionOwnerAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<CompletionOwner>>> {
   return completionResult(() => historicalRead(store, { reader: 'G7.completion-owner', project, ref }, () => {
     const record = completionExact<CompletionOwner>(store, project, ref, COMPLETION_OWNER_KIND);
     const value = completionBindingBody(store, project, record.value);
@@ -3119,7 +3161,7 @@ export function readCompletionOwnerAt(store: Store, project: string, ref: Ref): 
   }, () => completionFail(ref.id, 'history', 'A completion owner cannot derive from itself')));
 }
 /** Addressed selector. Missing a known managed ordinal is damage, never a legacy fallback. */
-export function readCompletionBinding(store: Store, project: string, series: Ref, ordinal: number): OmResult<Sealed<Revision<CompletionOwner> | null>> {
+export function readCompletionBinding(store: Store, project: string, series: Ref, ordinal: number): SeriesResult<Sealed<Revision<CompletionOwner> | null>> {
   return completionResult(() => {
     const source = completionTake(readRecord<AnyRepairSeries>(store, series,
       { unit: 'G7', target: series.id, kind: REPAIR_SERIES_KIND, id: series.id }));
@@ -3175,7 +3217,7 @@ export interface AnswersGateAssignment {
   key: typeof ANSWERS_GATE_ASSIGNMENT_KEY; kind: 'answers-gate'; owner: SeriesOwner; goal: AttemptGoal; plan: CompletionPlan;
 }
 export function answersGateAssignment(binding: Revision<CompletionOwner>): Revision<AnswersGateAssignment> {
-  requireCondition(isPlainObject(binding) && isText(binding.id) && isPlainObject(binding.value) && isText(binding.value.project)
+  check(isPlainObject(binding) && isText(binding.id) && isPlainObject(binding.value) && isText(binding.value.project)
     && isPlainObject(binding.value.owner) && isPlainObject(binding.value.goal) && isPlainObject(binding.value.plan)
     && isRef(reference(binding)), 'series_request_invalid', 'The answers-gate check derives from one exact completion binding');
   const value: AnswersGateAssignment = { contract: ANSWERS_GATE_ASSIGNMENT_CONTRACT, project: binding.value.project,
@@ -3185,9 +3227,9 @@ export function answersGateAssignment(binding: Revision<CompletionOwner>): Revis
     revision: 1, hash: hashJson(value), value };
 }
 /** The saved check equals its derivation from the exact binding; only a block owner has one (№1628 Q2). */
-export function readAnswersGateAssignmentAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AnswersGateAssignment>>> {
+export function readAnswersGateAssignmentAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<AnswersGateAssignment>>> {
   requireStore(store); requireProject(project);
-  requireCondition(isRef(ref), 'series_request_invalid', 'An answers-gate assignment is read by an exact reference');
+  check(isRef(ref), 'series_request_invalid', 'An answers-gate assignment is read by an exact reference');
   return completionResult(() => historicalRead(store, { reader: 'G7.answers-assignment', project, ref }, () => {
     const record = completionExact<AnswersGateAssignment>(store, project, ref, COMPLETION_ASSIGNMENT_KIND);
     const value = record.value;
@@ -3202,7 +3244,7 @@ export function readAnswersGateAssignmentAt(store: Store, project: string, ref: 
   }, () => completionFail(ref.id, 'history', 'An answers-gate assignment cannot derive from itself')));
 }
 /** G7's managed A3 preparer returns the indivisible opening bundle, never an unbacked S write. */
-export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemptRequest): OmResult<Sealed<AnySeriesTransition>> {
+export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>> {
   const address = requireBeginRequest(store, request);
   return completionResult(() => {
     const before = completionTake(readAnySeries(store, request)) as Revision<AnyRepairSeries>;
@@ -3233,13 +3275,13 @@ export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemp
   });
 }
 
-export function prepareManagedCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest, close: Ref): OmResult<Sealed<AnySeriesTransition>> {
+export function prepareManagedCompleteAttempt(store: Store, request: AnyCompleteAttemptRequest, close: Ref): SeriesResult<Sealed<AnySeriesTransition>> {
   return withHistoricalReads(() => handed(prepareComplete(store, request, close)));
 }
 
 
 /** The completion door belongs only to the original open attempt; it grants no new work admission. */
-export function prepareCompletionAdmission(store: Store, project: string, bindingRef: Ref): OmResult<Sealed<{ guards: Ref[] }>> {
+export function prepareCompletionAdmission(store: Store, project: string, bindingRef: Ref): SeriesResult<Sealed<{ guards: Ref[] }>> {
   return completionResult(() => {
     const binding = completionTake(readCompletionOwnerAt(store, project, bindingRef));
     const head = store.get(binding.value.series.id);
@@ -3264,7 +3306,7 @@ export function prepareCompletionAdmission(store: Store, project: string, bindin
 
 
 /** Reconstruct the exact opening work admission; no present-day pointer participates in this proof. */
-export function readCompletionOriginalAdmission(store: Store, project: string, bindingRef: Ref): OmResult<Sealed<{
+export function readCompletionOriginalAdmission(store: Store, project: string, bindingRef: Ref): SeriesResult<Sealed<{
   series: Ref; pointer: Ref | null; references: Ref[];
 }>> {
   return completionResult(() => {

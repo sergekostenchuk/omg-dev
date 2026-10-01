@@ -13,15 +13,17 @@ import { prepareWriterIndex, readWriterIndex } from '../ownership/writer-index.j
 import { isRef, reference, uniqueRefs, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Environments, inspectRepository, transactionGuardsCurrent, uniqueTransactionGuards, type Environment, type ExecutionRoot } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
-import { readAcceptedFrame } from './frame-accept.js';
-import { checkDeliveries, type DeliveryBases } from './deliveries.js';
-import { prepareFrame, readFrame, type FrameRequest } from './frame-obligations.js';
-import { readHorizon } from './horizon.js';
+import { readAcceptedFrame as readAcceptedFrameOf } from './frame-accept.js';
+import { checkDeliveries as checkDeliveriesOf, type DeliveryBases } from './deliveries.js';
+import { prepareFrame as prepareFrameOf, readFrame as readFrameOf, type FrameRequest } from './frame-obligations.js';
+import { readHorizon as readHorizonOf } from './horizon.js';
 import { historicalTrace, withHistoricalReads } from './input.js';
-import { readOmObligations } from './obligations.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { delivered, refused, type OmResult, type Refusal, type Sealed } from './refusal.js';
-import { readWorksFrame } from './works-frame.js';
+import { readOmObligations as readOmObligationsOf } from './obligations.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { delivered, localErrors, localRefusals, refused, transfer, transferError, transferring, type OmResult, type Refusal,
+  type Sealed, type SourceCode, type SourceCodes } from './refusal.js';
+import { readWorksFrame as readWorksFrameOf } from './works-frame.js';
+import type { Json } from '../canonical.js';
 
 export const FEASIBILITY_PRODUCER_CONTRACT = 'om-m8/v2' as const;
 export interface FeasibilityRequest {
@@ -45,25 +47,54 @@ export interface OmFeasibility extends Feasibility {
     inspection: FeasibilityInspection; deliveries: FeasibilityDeliveries;
   };
 }
+/** Q2b (№2518): every refusal code M8 creates itself, from the actual places of issue; its exceptions apart. */
+export const FEASIBILITY_LOCAL_CODES = Object.freeze(['feasibility_record_invalid', 'feasibility_contract_superseded',
+  'feasibility_stale', 'feasibility_not_ready', 'input_stale'] as const);
+export type FeasibilityLocalCode = typeof FEASIBILITY_LOCAL_CODES[number];
+export const FEASIBILITY_ERROR_CODES = Object.freeze(['feasibility_request_invalid', 'feasibility_internal'] as const);
+export type FeasibilityErrorCode = typeof FEASIBILITY_ERROR_CODES[number];
+/**
+ * The units whose refusals M8 hands on: its readers; the compiler's resolution of a task input (its exceptions, through
+ * the exact earlier filter); and the three producers whose findings become the refusals of a result — the repository
+ * inspection, the D7 readiness and the deliveries.
+ */
+export type FeasibilitySource = 'refs' | 'frame-accept' | 'works-frame' | 'obligations' | 'frame-obligations' | 'horizon'
+  | 'deliveries' | 'compiler-inputs' | 'inspection' | 'readiness';
+export type FeasibilityCode = FeasibilityLocalCode | SourceCodes<FeasibilitySource>;
+export type FeasibilityResult<T> = OmResult<T, FeasibilityCode>;
 export interface PreparedFeasibility {
-  record: Revision<OmFeasibility>; writes: Write[]; guards: TransactionGuard[]; references: Ref[]; refusals: Refusal[];
+  record: Revision<OmFeasibility>; writes: Write[]; guards: TransactionGuard[]; references: Ref[];
+  refusals: Refusal<SourceCode<'inspection'> | SourceCode<'readiness'> | SourceCode<'deliveries'>>[];
 }
+
+const readAcceptedFrame = transferring('frame-accept', readAcceptedFrameOf);
+const checkDeliveries = transferring('deliveries', checkDeliveriesOf);
+const prepareFrame = transferring('frame-obligations', prepareFrameOf);
+const readFrame = transferring('frame-obligations', readFrameOf);
+const readHorizon = transferring('horizon', readHorizonOf);
+const readOmObligations = transferring('obligations', readOmObligationsOf);
+const readWorksFrame = transferring('works-frame', readWorksFrameOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const id = (project: string) => `om-feasibility:${project}`;
-class Failure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function take<T>(result: OmResult<T>): T { if (!result.ok) throw new Failure(result.refusal); return result.value; }
-function fail(code: string, target: string, field: string, message: string): never {
-  take(refused(code, message, { unit: 'M8', target, field }, 'producer'));
-  throw new EngineError('feasibility_internal', 'A refusal unexpectedly succeeded');
+const refuse = localRefusals(FEASIBILITY_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: FeasibilityErrorCode, message: string, details?: unknown) => never = localErrors(FEASIBILITY_ERROR_CODES);
+class Failure extends Error { constructor(readonly refusal: Refusal<FeasibilityCode>) { super(refusal.message); } }
+function take<T>(result: OmResult<T, FeasibilityCode>): T { if (!result.ok) throw new Failure(result.refusal); return result.value; }
+function fail(code: FeasibilityLocalCode, target: string, field: string, message: string): never {
+  take(refuse(code, message, { unit: 'M8', target, field }, 'producer'));
+  return raise('feasibility_internal', 'A refusal unexpectedly succeeded');
 }
-function run<T>(action: () => T): OmResult<Sealed<T>> {
+function run<T>(action: () => T): FeasibilityResult<Sealed<T>> {
   return withHistoricalReads(() => { try { return delivered(action()); }
     catch (error) { if (error instanceof Failure) return { ok: false, refusal: error.refusal }; throw error; } });
 }
 function invalid(field: string): never {
-  throw new EngineError('feasibility_request_invalid', 'M8 requires an explicit project and exact accepted sources',
+  return raise('feasibility_request_invalid', 'M8 requires an explicit project and exact accepted sources',
     { unit: 'M8', target: 'feasibility', field });
 }
 function requireRequest(store: Store, request: unknown): asserts request is FeasibilityRequest {
@@ -93,14 +124,22 @@ function sources(store: Store, request: Pick<FeasibilityRequest, 'project' | 'gr
     guards: prepared?.guards ?? [] };
 }
 
-function addressed(finding: Finding): Refusal {
+/**
+ * A finding of one of the three producers of a result as its refusal: the finding's own code and message at the M8 address,
+ * the route chosen from the code as before, marked with that producer. Reached only through the three adapters below, each
+ * of which takes its producer's whole result (№2518-3, №2522-2).
+ */
+function addressed<Source extends 'inspection' | 'readiness' | 'deliveries'>(source: Source, finding: Finding): Refusal<SourceCode<Source>> {
   const route = finding.code === 'source_missing' ? 'gap'
     : /^(external_|artifact_|producer_|implementation_|ownership_|available_|environment_confirmation_|obligation_)/.test(finding.code)
       ? 'readiness' : 'owner';
-  const result = refused(finding.code, finding.message, { unit: 'M8', target: finding.target }, route);
+  const result = transfer(source, refused(finding.code, finding.message, { unit: 'M8', target: finding.target }, route));
   if (!result.ok) return result.refusal;
-  throw new EngineError('feasibility_internal', 'A refusal unexpectedly succeeded');
+  return raise('feasibility_internal', 'A refusal unexpectedly succeeded');
 }
+const inspectionRefusals = (result: ReturnType<typeof inspectRepository>) => result.findings.map(finding => addressed('inspection', finding));
+const readinessRefusals = (result: ReturnType<typeof readinessObligations>) => result.findings.map(finding => addressed('readiness', finding));
+const deliveryRefusals = (result: ReturnType<typeof deliveryInputs>) => result.findings.map(finding => addressed('deliveries', finding));
 
 type Sources = ReturnType<typeof sources>;
 const badRecord = (target: string, field: string): never =>
@@ -229,7 +268,7 @@ function deliveryInputs(store: Store, project: string, basis: Sources, inspectio
       if (!(error instanceof EngineError) || !['external_input_missing', 'artifact_contract_mismatch', 'producer_not_ready',
         'artifact_foreign', 'implementation_receipt_invalid', 'implementation_proof_missing', 'implementation_proof_foreign',
         'implementation_manifest_invalid', 'artifact_stale', 'plan_input_invalid'].includes(error.code)) throw error;
-      return take(refused(error.code, error.message, { unit: 'M8', target: artifact, field: 'delivery' }, 'readiness'));
+      return take(transferError('compiler-inputs', error, { unit: 'M8', target: artifact, field: 'delivery' }, 'readiness'));
     }
     resolved.set(key, { producer, artifact, source: input.source ?? null, receipt: input.receipt ?? null });
     if (input.source) inputGuards.push(input.source);
@@ -274,7 +313,7 @@ function resultValue(request: Pick<FeasibilityRequest, 'project' | 'graph' | 'la
 }
 
 /** Read-only preparation: current heads are guards; immutable proof dependencies remain exact saved inputs. */
-export function prepareFeasibility(store: Store, request: FeasibilityRequest): OmResult<Sealed<PreparedFeasibility>> {
+export function prepareFeasibility(store: Store, request: FeasibilityRequest): FeasibilityResult<Sealed<PreparedFeasibility>> {
   requireRequest(store, request);
   return run(() => {
     const references: Ref[] = [], traced = historicalTrace(store, ref => { references.push(ref); }, 'distinct');
@@ -294,6 +333,9 @@ export function prepareFeasibility(store: Store, request: FeasibilityRequest): O
     const readiness = readinessObligations(traced, request.project, [d7.producer, d7.ledger]);
     const deliveries = deliveryInputs(traced, request.project, basis, inspection);
     const value = resultValue(request, basis, inspection, readiness, deliveries);
+    // The refusals of the result, in the order of its findings (the inspection's, the readiness', the deliveries'), taken
+    // where the result is handed out, as before.
+    const refusals = () => [...inspectionRefusals(inspection.result), ...readinessRefusals(readiness), ...deliveryRefusals(deliveries)];
     proveInspection(traced, request.project, value);
     const guards = uniqueTransactionGuards([...basis.guards, request.graph, request.layer, request.frame, request.environment,
       reference(basis.candidate), d7.producer, d7.ledger, ...effective.guards, ...effective.admissionGuards, ...workspaceGuards,
@@ -305,14 +347,14 @@ export function prepareFeasibility(store: Store, request: FeasibilityRequest): O
     if (previous?.kind === write.kind && [request.expected, request.expected + 1].includes(previous.revision) && same(previous.value, value)) {
       const repeatGuards = uniqueTransactionGuards([...guards, reference(previous)]);
       if (!transactionGuardsCurrent(store, repeatGuards)) fail('input_stale', write.id, 'guards', 'An exact repeat requires its current admission');
-      return { record: previous, writes: [], guards: repeatGuards, references: uniqueRefs(references), refusals: value.findings.map(addressed) };
+      return { record: previous, writes: [], guards: repeatGuards, references: uniqueRefs(references), refusals: refusals() };
     }
     const record: Revision<OmFeasibility> = { id: write.id, kind: write.kind, revision: write.expected + 1, hash: hashJson(value), value };
-    return { record, writes: [write], guards, references: uniqueRefs(references), refusals: value.findings.map(addressed) };
+    return { record, writes: [write], guards, references: uniqueRefs(references), refusals: refusals() };
   });
 }
 
-export function writeFeasibility(store: Store, request: FeasibilityRequest): OmResult<Sealed<Revision<OmFeasibility>>> {
+export function writeFeasibility(store: Store, request: FeasibilityRequest): FeasibilityResult<Sealed<Revision<OmFeasibility>>> {
   requireRequest(store, request);
   return run(() => {
     // A late repeat returns the immutable result of that transition, not a new assessment of today's disk.
@@ -332,7 +374,7 @@ export function writeFeasibility(store: Store, request: FeasibilityRequest): OmR
 function requireReadRequest(store: Store, request: { project: string; record: Ref }): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('record');
 }
-export function readFeasibility(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<OmFeasibility>>> {
+export function readFeasibility(store: Store, request: { project: string; record: Ref }): FeasibilityResult<Sealed<Revision<OmFeasibility>>> {
   requireReadRequest(store, request);
   return run(() => {
     const record = take(readRecord<OmFeasibility>(store, request.record, { unit: 'M8', target: request.project, id: id(request.project), kind: 'feasibility' }));

@@ -138,6 +138,17 @@ export function transferring<Source extends string, Args extends unknown[], R ex
   return (...args) => transfer(source, reader(...args));
 }
 
+/**
+ * Q2b (№2518-3, №2522-1): a declared source's exception as the receiving module's refusal — the exception's own code and
+ * message, at the address and route the module always gave them, marked with the source. The module keeps its own filter
+ * of which exceptions it turns into refusals and rethrows the rest; the code is never chosen by the caller.
+ */
+export function transferError<Source extends string>(source: Source, error: EngineError, at: RefusalAddress, route: RefusalRoute):
+  OmResult<never, SourceCode<Source>> {
+  requireCondition(isText(source) && error instanceof EngineError, "refusal_invalid", "A transferred exception names its source and is an EngineError");
+  return transfer(source, refused(error.code, error.message, at, route));
+}
+
 export function refused<Code extends string>(code: Code, message: string, at: RefusalAddress, route: RefusalRoute): OmResult<never, Code> {
   requireCondition(isText(code) && isText(message), "refusal_invalid", "A refusal names a non-empty code and message");
   requireCondition(isPlainObject(at) && isText(at.unit) && isText(at.target)

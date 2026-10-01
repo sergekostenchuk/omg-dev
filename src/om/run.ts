@@ -1,41 +1,42 @@
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { EngineError, requireCondition } from "../errors.js";
+import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
-import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
-import { readRecord, writeGuarded } from "./refs.js";
-import { prepareRoutes, readRoutes, writeRoutes, type RouteBatch, type RoutesRecord, type RoutesRequest } from "./routes.js";
-import { readQuestionQueue } from "./queue.js";
-import { readHorizon } from "./horizon.js";
-import { prepareRunBases, readRunStandingGuards, writeRunBases, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
-import { readOmInput, type OmInputRecord } from "./input.js";
-import { readAcceptedAnswer } from "./accepted-answer.js";
-import { writeApplyAnswer } from "./addressing.js";
-import { openSeries, readAnySeriesAt, readCompletionBinding, completionWorkId, completionCloseId, prepareSeriesLineAdmission,
-  resumeSeries, seriesAddress, seriesRequestOf,
+import { delivered, isPlainObject, isText, localErrors, localRefusals, sealed, transfer, transferError, transferring, type OmResult,
+  type Refusal, type Sealed, type SourceCode, type SourceCodes } from "./refusal.js";
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from "./refs.js";
+import { prepareRoutes as prepareRoutesOf, readRoutes as readRoutesOf, writeRoutes as writeRoutesOf, type RouteBatch, type RoutesRecord, type RoutesRequest } from "./routes.js";
+import { readQuestionQueue as readQuestionQueueOf } from "./queue.js";
+import { readHorizon as readHorizonOf } from "./horizon.js";
+import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunStandingGuardsOf, writeRunBases as writeRunBasesOf, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
+import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
+import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
+import { writeApplyAnswer as writeApplyAnswerOf } from "./addressing.js";
+import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
+  resumeSeries as resumeSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
-import { closeAttempt, openAttempt, prepareManagedClaim, readCompletionCloseAt, readStopContext } from "./repeat-gate.js";
-import { prepareStopAnalysis, readStopAnalysis, runStopAnalysis, type StopAnalysisRequest } from "./stop-analysis.js";
-import { modelCallRecordId, prepareCompletionCause, readCompletionWorkAt, readManagedModelDiagnostic, readModelCycle, readPartAssembly, recoverOmModelCall, runModelCycle,
-  writeCompletionCessation, type CompletionSnapshot } from "./model-call.js";
-import { writeQuestionPacket } from "./question-packet.js";
-import { assessFact, readAssessmentIntentAt, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
-import { NO_PRODUCER_EMISSIONS, prepareAnswersGate, prepareAnswersGateTrace, readAnswersEvaluationAt, readAnswersGate, readAnswersGateTrace, readRouteProducers,
-  writeAnswersCheckCessation, writeAnswersEvaluation, writeAnswersRegistration, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
+import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
+import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
+import { modelCallRecordId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
+  writeCompletionCessation as writeCompletionCessationOf, type CompletionSnapshot } from "./model-call.js";
+import { writeQuestionPacket as writeQuestionPacketOf } from "./question-packet.js";
+import { assessFact as assessFactOf, readAssessmentIntentAt as readAssessmentIntentAtOf, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
+import { NO_PRODUCER_EMISSIONS, prepareAnswersGate as prepareAnswersGateOf, prepareAnswersGateTrace as prepareAnswersGateTraceOf, readAnswersEvaluationAt as readAnswersEvaluationAtOf, readAnswersGate as readAnswersGateOf, readAnswersGateTrace as readAnswersGateTraceOf, readRouteProducers as readRouteProducersOf,
+  writeAnswersCheckCessation as writeAnswersCheckCessationOf, writeAnswersEvaluation as writeAnswersEvaluationOf, writeAnswersRegistration as writeAnswersRegistrationOf, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
   type UnservedQuestion } from "./answers-gate.js";
-import { gateCandidate, prepareCandidate, writeCandidate, type CandidateRequest } from "./frame-candidate.js";
-import { prepareSettleCandidate, type SettleCandidateRequest } from "./frame-accept.js";
-import { readAcceptedFrameLayer, type FrameAttemptBinding } from "./layer-basis.js";
+import { gateCandidate as gateCandidateOf, prepareCandidate as prepareCandidateOf, writeCandidate as writeCandidateOf, type CandidateRequest } from "./frame-candidate.js";
+import { prepareSettleCandidate as prepareSettleCandidateOf, type SettleCandidateRequest } from "./frame-accept.js";
+import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
-import { prepareWorksAcceptance, prepareWorksSources, type WorksAcceptanceRequest } from "./atomic-gate.js";
-import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines, type GapLinesRecord } from "./gap-lines.js";
-import { prepareOmObligations, writeOmObligations } from "./obligations.js";
-import { prepareFeasibility, readFeasibility, writeFeasibility, type OmFeasibility } from "./feasibility.js";
-import { writeHandoff } from "./handoff.js";
+import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, type WorksAcceptanceRequest } from "./atomic-gate.js";
+import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
+import { prepareOmObligations as prepareOmObligationsOf, writeOmObligations as writeOmObligationsOf } from "./obligations.js";
+import { prepareFeasibility as prepareFeasibilityOf, readFeasibility as readFeasibilityOf, writeFeasibility as writeFeasibilityOf, type OmFeasibility } from "./feasibility.js";
+import { writeHandoff as writeHandoffOf } from "./handoff.js";
 import { stageId } from "../pipeline/contracts.js";
 import { StageChecks } from "../product/stage-checks.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { readGaps, type GapReadRequest } from "./gaps.js";
+import { readGaps as readGapsOf, type GapReadRequest } from "./gaps.js";
 import type { DispatchContract } from "./call-record.js";
 import { RunControlGate, RunControlLost, type RunControlHold } from "./run-control.js";
 
@@ -56,7 +57,94 @@ export const RUN_CONTRACT = "om-run/v1";
 export const RUN_CODES = Object.freeze(["run_request_invalid", "run_record_invalid", "run_outcome_unknown", "run_intent_conflict",
   "horizon_empty"] as const);
 export type RunCode = typeof RUN_CODES[number];
+/**
+ * Q2b (№2518): every refusal code the pass creates itself, from the actual places of issue; RUN_CODES above stays exported
+ * as it is (it also names the pass's exception code). The exceptions have their own set.
+ */
+export const RUN_LOCAL_CODES = Object.freeze(["run_record_invalid", "run_outcome_unknown", "run_intent_conflict", "horizon_empty",
+  "record_missing", "candidate_gaps", "answers_not_passed"] as const);
+export type RunLocalCode = typeof RUN_LOCAL_CODES[number];
+export const RUN_ERROR_CODES = Object.freeze(["run_request_invalid"] as const);
+export type RunErrorCode = typeof RUN_ERROR_CODES[number];
+/**
+ * The units whose refusals the pass hands on: the producers of its steps and the readers of its choice, each through its
+ * reader bound below; the compiler's stage check and the recovery of a model call (their exceptions, through
+ * transferError); and the pass's lost control.
+ */
+export type RunSource = "refs" | "routes" | "queue" | "horizon" | "run-bases" | "input" | "accepted-answer" | "addressing" | "series"
+  | "repeat-gate" | "stop-analysis" | "model-call" | "question-packet" | "assessment" | "answers-gate" | "frame-candidate"
+  | "frame-accept" | "layer-basis" | "atomic-gate" | "gap-lines" | "obligations" | "feasibility" | "handoff" | "gaps"
+  | "stage-checks" | "run-control";
+export type RunResultCode = RunLocalCode | SourceCodes<RunSource>;
+export type RunResult<T> = OmResult<T, RunResultCode>;
+
+const prepareRoutes = transferring("routes", prepareRoutesOf);
+const readRoutes = transferring("routes", readRoutesOf);
+const writeRoutes = transferring("routes", writeRoutesOf);
+const readQuestionQueue = transferring("queue", readQuestionQueueOf);
+const readHorizon = transferring("horizon", readHorizonOf);
+const prepareRunBases = transferring("run-bases", prepareRunBasesOf);
+const readRunStandingGuards = transferring("run-bases", readRunStandingGuardsOf);
+const writeRunBases = transferring("run-bases", writeRunBasesOf);
+const readOmInput = transferring("input", readOmInputOf);
+const readAcceptedAnswer = transferring("accepted-answer", readAcceptedAnswerOf);
+const writeApplyAnswer = transferring("addressing", writeApplyAnswerOf);
+const openSeries = transferring("series", openSeriesOf);
+const readAnySeriesAt = transferring("series", readAnySeriesAtOf);
+const readCompletionBinding = transferring("series", readCompletionBindingOf);
+const prepareSeriesLineAdmission = transferring("series", prepareSeriesLineAdmissionOf);
+const resumeSeries = transferring("series", resumeSeriesOf);
+const closeAttempt = transferring("repeat-gate", closeAttemptOf);
+const openAttempt = transferring("repeat-gate", openAttemptOf);
+const prepareManagedClaim = transferring("repeat-gate", prepareManagedClaimOf);
+const readCompletionCloseAt = transferring("repeat-gate", readCompletionCloseAtOf);
+const readStopContext = transferring("repeat-gate", readStopContextOf);
+const prepareStopAnalysis = transferring("stop-analysis", prepareStopAnalysisOf);
+const readStopAnalysis = transferring("stop-analysis", readStopAnalysisOf);
+const prepareCompletionCause = transferring("model-call", prepareCompletionCauseOf);
+const readCompletionWorkAt = transferring("model-call", readCompletionWorkAtOf);
+const readManagedModelDiagnostic = transferring("model-call", readManagedModelDiagnosticOf);
+const readModelCycle = transferring("model-call", readModelCycleOf);
+const readPartAssembly = transferring("model-call", readPartAssemblyOf);
+const writeCompletionCessation = transferring("model-call", writeCompletionCessationOf);
+const writeQuestionPacket = transferring("question-packet", writeQuestionPacketOf);
+const readAssessmentIntentAt = transferring("assessment", readAssessmentIntentAtOf);
+const prepareAnswersGate = transferring("answers-gate", prepareAnswersGateOf);
+const prepareAnswersGateTrace = transferring("answers-gate", prepareAnswersGateTraceOf);
+const readAnswersEvaluationAt = transferring("answers-gate", readAnswersEvaluationAtOf);
+const readAnswersGate = transferring("answers-gate", readAnswersGateOf);
+const readAnswersGateTrace = transferring("answers-gate", readAnswersGateTraceOf);
+const readRouteProducers = transferring("answers-gate", readRouteProducersOf);
+const writeAnswersCheckCessation = transferring("answers-gate", writeAnswersCheckCessationOf);
+const writeAnswersEvaluation = transferring("answers-gate", writeAnswersEvaluationOf);
+const writeAnswersRegistration = transferring("answers-gate", writeAnswersRegistrationOf);
+const gateCandidate = transferring("frame-candidate", gateCandidateOf);
+const prepareCandidate = transferring("frame-candidate", prepareCandidateOf);
+const writeCandidate = transferring("frame-candidate", writeCandidateOf);
+const prepareSettleCandidate = transferring("frame-accept", prepareSettleCandidateOf);
+const readAcceptedFrameLayer = transferring("layer-basis", readAcceptedFrameLayerOf);
+const prepareWorksAcceptance = transferring("atomic-gate", prepareWorksAcceptanceOf);
+const prepareWorksSources = transferring("atomic-gate", prepareWorksSourcesOf);
+const writeGapLines = transferring("gap-lines", writeGapLinesOf);
+const prepareOmObligations = transferring("obligations", prepareOmObligationsOf);
+const writeOmObligations = transferring("obligations", writeOmObligationsOf);
+const prepareFeasibility = transferring("feasibility", prepareFeasibilityOf);
+const readFeasibility = transferring("feasibility", readFeasibilityOf);
+const writeFeasibility = transferring("feasibility", writeFeasibilityOf);
+const writeHandoff = transferring("handoff", writeHandoffOf);
+const readGaps = transferring("gaps", readGapsOf);
+const runStopAnalysis = async (...args: Parameters<typeof runStopAnalysisOf>) => transfer("stop-analysis", await runStopAnalysisOf(...args));
+const runModelCycle = async (...args: Parameters<typeof runModelCycleOf>) => transfer("model-call", await runModelCycleOf(...args));
+const assessFact = async (...args: Parameters<typeof assessFactOf>) => transfer("assessment", await assessFactOf(...args));
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer("refs", readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer("refs", writeGuardedOf<T>(store, request));
 const UNIT = "H1";
+const refuse = localRefusals(RUN_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` (or `asserts`) makes a bare call end the control flow for tsc.
+const raise: (code: RunErrorCode, message: string, details?: unknown) => never = localErrors(RUN_ERROR_CODES);
+const check: (condition: unknown, code: RunErrorCode, message: string) => asserts condition = (condition, code, message) => {
+  if (!condition) raise(code, message);
+};
 export const runId = (project: string): string => `${RUN_KIND}:${project}`;
 
 export type { RunBases } from "./run-bases.js";
@@ -106,19 +194,19 @@ export interface RunRecord {
 }
 export interface RunAdvance { readonly record: Revision<RunRecord>; readonly performed: RunStep | null; readonly products: readonly Ref[] }
 
-class RunFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function fail(code: string, target: string, field: string, message: string, ref?: Ref, route: "producer" | "owner" = "producer"): never {
-  const result = refused(code, message, { unit: UNIT, target, field, ...(ref ? { ref } : {}) }, route);
+class RunFailure extends Error { constructor(readonly refusal: Refusal<RunResultCode>) { super(refusal.message); } }
+function fail(code: RunLocalCode, target: string, field: string, message: string, ref?: Ref, route: "producer" | "owner" = "producer"): never {
+  const result = refuse(code, message, { unit: UNIT, target, field, ...(ref ? { ref } : {}) }, route);
   if (!result.ok) throw new RunFailure(result.refusal);
   throw new Error("Unreachable");
 }
-function take<T>(result: OmResult<T>): T { if (!result.ok) throw new RunFailure(result.refusal); return result.value; }
-async function run<T>(action: () => T | Promise<T>): Promise<OmResult<Sealed<T>>> {
+function take<T>(result: OmResult<T, RunResultCode>): T { if (!result.ok) throw new RunFailure(result.refusal); return result.value; }
+async function run<T>(action: () => T | Promise<T>): Promise<RunResult<Sealed<T>>> {
   try { return delivered(await action()); }
   catch (error) {
     if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
     // A lost control is the typed control outcome of this entry (H1.3), never a wait of the pass.
-    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return transfer("run-control", { ok: false as const, refusal: error.refusal });
     throw error;
   }
 }
@@ -129,8 +217,8 @@ const sameRef = (left: Ref, right: Ref): boolean => left.id === right.id && left
 const refOf = (record: { id: string; revision: number; hash: string }): Ref => ({ id: record.id, revision: record.revision, hash: record.hash });
 
 function requireRequest(store: unknown, request: unknown): asserts request is RunRequest {
-  requireCondition(store instanceof Store, "run_request_invalid", "A pass runs through a store");
-  requireCondition(object(request) && isText(request.project)
+  check(store instanceof Store, "run_request_invalid", "A pass runs through a store");
+  check(object(request) && isText(request.project)
     && object(request.dispatch) && isRef(request.dispatch.adapter) && isRef(request.dispatch.config) && Object.keys(request.dispatch).length === 2
     && Object.keys(request).length === 2,
   "run_request_invalid", "A pass names its project and its dispatch contract; its bases are its own");
@@ -142,15 +230,15 @@ function normalizedOutcomes(value: unknown): string[] | null {
 }
 
 /** The saved pass, checked as a whole; a missing or malformed required field is an integrity refusal, never guessed. */
-export function readRun(store: Store, request: { project: string }): OmResult<Sealed<Revision<RunRecord>> | null> {
-  requireCondition(store instanceof Store && object(request) && isText(request.project) && Object.keys(request).length === 1,
+export function readRun(store: Store, request: { project: string }): RunResult<Sealed<Revision<RunRecord>> | null> {
+  check(store instanceof Store && object(request) && isText(request.project) && Object.keys(request).length === 1,
     "run_request_invalid", "A pass is read by its project");
   const head = store.get(runId(request.project));
   if (!head) return delivered(null);
   const read = readRecord<RunRecord>(store, reference(head), { unit: UNIT, target: head.id, kind: RUN_KIND, id: runId(request.project) });
   if (!read.ok) return read;
   const value = read.value.value as unknown;
-  if (!checkRecord(value, request.project)) return refused("run_record_invalid", "The pass record lost a required field or holds a foreign one",
+  if (!checkRecord(value, request.project)) return refuse("run_record_invalid", "The pass record lost a required field or holds a foreign one",
     { unit: UNIT, target: head.id, field: "record", ref: reference(head) }, "producer");
   return delivered(read.value as Revision<RunRecord>);
 }
@@ -214,12 +302,12 @@ function checkStep(step: unknown): step is RunStep {
  * also after complete. A first pass fixes the named outcomes, or every outcome of its exact B1, as a concrete set; an
  * outcome B1 does not accept is run_outcome_unknown, and nothing is written for such an intent.
  */
-export function startRun(store: Store, request: { project: string; outcomes?: readonly string[] }, control?: RunControlHold): OmResult<Sealed<Revision<RunRecord>>> {
-  requireCondition(store instanceof Store && object(request) && isText(request.project)
+export function startRun(store: Store, request: { project: string; outcomes?: readonly string[] }, control?: RunControlHold): RunResult<Sealed<Revision<RunRecord>>> {
+  check(store instanceof Store && object(request) && isText(request.project)
     && Object.keys(request).every(key => key === "project" || key === "outcomes")
     && (request.outcomes === undefined || normalizedOutcomes(request.outcomes) !== null),
   "run_request_invalid", "A pass is started by its project and, optionally, a nonempty set of intended outcomes");
-  requireCondition(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
+  check(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
   const project = request.project, named = request.outcomes === undefined ? null : normalizedOutcomes(request.outcomes)!;
   const existing = (): Revision<RunRecord> | null => {
     const saved = take(readRun(store, { project })) as Revision<RunRecord> | null;
@@ -250,7 +338,7 @@ export function startRun(store: Store, request: { project: string; outcomes?: re
     return raced ? delivered(raced) : written;
   } catch (error) {
     if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
-    if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal };
+    if (error instanceof RunControlLost) return transfer("run-control", { ok: false as const, refusal: error.refusal });
     throw error;
   }
 }
@@ -263,9 +351,9 @@ export function startRun(store: Store, request: { project: string; outcomes?: re
  * each new record of its work carries the admitted control in its final transaction, and a physical step gets the same
  * hold for its claim and transfer while its paid results pass by their exact links. A holder never takes a newer head.
  */
-export async function advanceRun(store: Store, request: RunRequest, control?: RunControlHold): Promise<OmResult<Sealed<RunAdvance>>> {
+export async function advanceRun(store: Store, request: RunRequest, control?: RunControlHold): Promise<RunResult<Sealed<RunAdvance>>> {
   requireRequest(store, request);
-  requireCondition(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
+  check(control === undefined || object(control), "run_request_invalid", "A control hold is an object");
   return run(async () => {
     const saved = take(readRun(store, { project: request.project }));
     if (!saved) fail("record_missing", runId(request.project), "run", "The pass must be started before it advances");
@@ -321,7 +409,7 @@ type Performed = { products: Ref[] } | { wait: RunWait };
  */
 async function perform(store: Store, raw: Store, hold: RunControlHold, request: RunRequest, step: RunStep): Promise<Performed> {
   const project = request.project, body = step.request as Record<string, unknown>;
-  const outcome = await (async (): Promise<OmResult<Ref[]>> => {
+  const outcome = await (async (): Promise<RunResult<Ref[]>> => {
     switch (step.action) {
       case "open-series": return mapped(openSeries(store, body as never), record => [refOf(record)]);
       case "open": return mapped(openAttempt(store, body as never), record => [refOf(record)]);
@@ -334,9 +422,9 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       case "obligations": return mapped(writeOmObligations(store, body as never), written => [refOf(written.producer), refOf(written.record)]);
       case "candidate": {
         const written = writeCandidate(store, body as never);
-        if (!written.ok) return written as OmResult<never>;
+        if (!written.ok) return written;
         return written.value.state === "candidate" ? { ok: true, value: [refOf(written.value.record)] }
-          : refused("candidate_gaps", "The assembled proposals leave open obligations; the candidate is not formed", { unit: UNIT, target: project, field: "candidate" }, "producer");
+          : refuse("candidate_gaps", "The assembled proposals leave open obligations; the candidate is not formed", { unit: UNIT, target: project, field: "candidate" }, "producer");
       }
       case "accept": return acceptFrame(store, project, body as unknown as AcceptRequest);
       case "works": return acceptWorks(store, body as unknown as WorksRequest);
@@ -346,10 +434,10 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
         try { new StageChecks(store).compile(project); }
         catch (error) {
           if (!(error instanceof EngineError)) throw error;
-          return refused(error.code, error.message, { unit: UNIT, target: stageId(project, "compilation"), field: "compile" }, "producer");
+          return transferError("stage-checks", error, { unit: UNIT, target: stageId(project, "compilation"), field: "compile" }, "producer");
         }
         const stage = store.get(stageId(project, "compilation"));
-        return stage ? { ok: true, value: [reference(stage)] } : refused("record_missing", "The compiler accepted no compilation stage",
+        return stage ? { ok: true, value: [reference(stage)] } : refuse("record_missing", "The compiler accepted no compilation stage",
           { unit: UNIT, target: stageId(project, "compilation"), field: "compile" }, "producer");
       }
       case "evaluate": return mapped(writeAnswersEvaluation(store, body as never), written => [refOf(written.evaluation)]);
@@ -379,7 +467,8 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
  * (a live or unobservable executor keeps holding the dispatch — its typed refusal is the wait), and the producer then
  * goes on with the same saved request, reading the recovered call instead of sending again.
  */
-async function recovering<T>(store: Store, project: string, produce: () => Promise<OmResult<T>>): Promise<OmResult<T>> {
+async function recovering<T, Code extends string>(store: Store, project: string, produce: () => Promise<OmResult<T, Code>>):
+  Promise<OmResult<T, Code | SourceCode<"model-call">>> {
   const first = await produce();
   if (first.ok || first.refusal.code !== "model_call_in_progress") return first;
   const head = store.get(first.refusal.at.target);
@@ -387,11 +476,11 @@ async function recovering<T>(store: Store, project: string, produce: () => Promi
   try { recoverOmModelCall(store, project, reference(head)); }
   catch (error) {
     if (!(error instanceof EngineError)) throw error;
-    return refused(error.code, error.message, { unit: UNIT, target: head.id, field: "recovery", ref: reference(head) }, "producer");
+    return transferError("model-call", error, { unit: UNIT, target: head.id, field: "recovery", ref: reference(head) }, "producer");
   }
   return produce();
 }
-function mapped<T, U>(result: OmResult<T>, map: (value: T) => U): OmResult<U> {
+function mapped<T, U, Code extends string>(result: OmResult<T, Code>, map: (value: T) => U): OmResult<U, Code> {
   return result.ok ? { ok: true, value: map(result.value) } : result;
 }
 function waitOf(refusal: Refusal, project: string): RunWait {
@@ -954,13 +1043,13 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     const proposals = uniqueRefs([...operations.proposals, ...group.flatMap(row => row.assemblies.filter(item => item.level === 2).map(item => item.proposal))]);
     const candidateRequest: CandidateRequest = { frame: operations.frame, proposals };
     const prepared = prepareCandidate(store, candidateRequest);
-    if (!prepared.ok) return { wait: waitOf(prepared.refusal as Refusal, project) };
+    if (!prepared.ok) return { wait: waitOf(prepared.refusal, project) };
     // Another block of this frame has not assembled its part yet: this attempt stays open and the pass goes on in M3.
     if (prepared.value.state === "gaps") return wait("frame_participants", series.id, "candidate",
       "The common operations frame still has open obligations of other blocks; this attempt waits for their work", group.map(row => reference(row.series)), "dependent");
     if (!prepared.value.existing) return step("candidate", candidateRequest, series.id, ordinal);
     const gate = gateCandidate(store, { project, candidate: reference(prepared.value.existing) });
-    if (!gate.ok) return { wait: waitOf(gate.refusal as Refusal, project) };
+    if (!gate.ok) return { wait: waitOf(gate.refusal, project) };
     candidate = { ref: reference(prepared.value.existing), graphHash: gate.value.graphHash };
   }
   if (block && work.answers && !work.answers.complete) {
@@ -1240,12 +1329,12 @@ interface WorksRequest { gate: AnswersGateRequest; works: WorksAcceptanceRequest
  * prepared by their producers and written in one guarded transaction. An acceptance already made for this candidate and
  * binding is found again, never made twice.
  */
-function acceptFrame(store: Store, project: string, request: AcceptRequest): OmResult<Ref[]> {
+function acceptFrame(store: Store, project: string, request: AcceptRequest): RunResult<Ref[]> {
   const found = acceptedFrame(store, project, request.settle.level, request.settle.candidate, request.settle.binding ?? null);
   if (found) return { ok: true, value: [found.frame] };
   const admitted = prepareAnswersGate(store, request.gate);
   if (!admitted.ok) return admitted;
-  if (!admitted.value.record.value.result.passed) return refused("answers_not_passed", "The current G4b does not pass; no M7 transition is admitted",
+  if (!admitted.value.record.value.result.passed) return refuse("answers_not_passed", "The current G4b does not pass; no M7 transition is admitted",
     { unit: UNIT, target: admitted.value.record.id, field: "result", ref: refOf(admitted.value.record) }, "producer");
   const settled = prepareSettleCandidate(store, request.settle);
   if (!settled.ok) return settled;
@@ -1253,17 +1342,17 @@ function acceptFrame(store: Store, project: string, request: AcceptRequest): OmR
     writes: [...admitted.value.writes, ...settled.value.writes], guards: uniqueTransactionGuards([...admitted.value.guards, ...settled.value.guards]) });
   if (!written.ok) return written;
   const frame = written.value.find(row => row.id === `om-frame:${project}:${request.settle.level}`);
-  return frame ? { ok: true, value: [refOf(frame)] } : refused("record_missing", "The acceptance wrote no frame", { unit: UNIT, target: project, field: "frame" }, "producer");
+  return frame ? { ok: true, value: [refOf(frame)] } : refuse("record_missing", "The acceptance wrote no frame", { unit: UNIT, target: project, field: "frame" }, "producer");
 }
 /** L3: the current G4b with the one works acceptance of C4/F7/G5/C5 (atomic-gate), in one guarded transaction. */
-function acceptWorks(store: Store, request: WorksRequest): OmResult<Ref[]> {
+function acceptWorks(store: Store, request: WorksRequest): RunResult<Ref[]> {
   const prepared = prepareWorksAcceptance(store, request.works);
   if (!prepared.ok) return prepared;
   const product = (): Ref[] => [prepared.value.acceptance ? refOf(prepared.value.acceptance.frame as Revision<unknown>) : refOf(prepared.value.record)];
   if (!prepared.value.writes.length) return { ok: true, value: product() };
   const admitted = prepareAnswersGate(store, request.gate);
   if (!admitted.ok) return admitted;
-  if (!admitted.value.record.value.result.passed) return refused("answers_not_passed", "The current G4b does not pass; no M7 transition is admitted",
+  if (!admitted.value.record.value.result.passed) return refuse("answers_not_passed", "The current G4b does not pass; no M7 transition is admitted",
     { unit: UNIT, target: admitted.value.record.id, field: "result", ref: refOf(admitted.value.record) }, "producer");
   const written = writeGuarded(store, { unit: UNIT, target: prepared.value.record.id,
     writes: [...admitted.value.writes, ...prepared.value.writes], guards: uniqueTransactionGuards([...admitted.value.guards, ...prepared.value.guards]) });

@@ -1,32 +1,91 @@
 import { canonical, hashJson, type Json } from '../canonical.js';
-import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { uniqueTransactionGuards, type Environment } from '../runtime/environment.js';
-import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { readJournal, recordRefusal, prepareRecordRefusal, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
+import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, transferring, type OmResult, type Refusal, type Sealed,
+  type SourceCodes } from './refusal.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { readJournal as readJournalOf, recordRefusal as recordRefusalOf, prepareRecordRefusal as prepareRecordRefusalOf, UNIT_REFUSAL_KIND, unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { historicalRead, withHistoricalReads } from './input.js';
 import type { Source } from '../evidence/evidence.js';
-import { checkAnswerForm } from './answer-form.js';
-import { readMc1Question, prepareMc1Question, prepareAnswerCitations, prepareE5AcceptedAnswer,
-  readAcceptedAnswer, readAnswerSearch, acceptedAnswerNamespace, answerIndexId,
+import { checkAnswerForm as checkAnswerFormOf } from './answer-form.js';
+import { readMc1Question as readMc1QuestionOf, prepareMc1Question as prepareMc1QuestionOf, prepareAnswerCitations as prepareAnswerCitationsOf, prepareE5AcceptedAnswer as prepareE5AcceptedAnswerOf,
+  readAcceptedAnswer as readAcceptedAnswerOf, readAnswerSearch as readAnswerSearchOf, acceptedAnswerNamespace, answerIndexId,
   ANSWER_INDEX_KIND,
   type AnswerGround, type AnswerQuestionContract, type Mc1QuestionRequest } from './accepted-answer.js';
-import { callLedgerId, readCallLedger, readFactAssessmentOrigin, readCall, recordCall,
+import { callLedgerId, readCallLedger as readCallLedgerOf, readFactAssessmentOrigin as readFactAssessmentOriginOf, readCall as readCallOf, recordCall as recordCallOf,
   type AddressedGap, type CallLedger, type DispatchContract, type FactAssessmentBasis,
   type RecordCallRequest } from './call-record.js';
-import { readApplicationSources, captureApplicationFileObservation, readApplicationFileObservation, type ApplicationFileObservation,
-  readModelCallState, readModelTransport, transportUnder, prepareCompletionProducts, pendingCallStore,
-  prepareApplicationEnvironment, prepareAssessmentDisposition, readAssessmentCessation, readCompletionWorkAt, readCompletionDispositionContext, prepareCompletionCause, readCompletionCause,
+import { readApplicationSources as readApplicationSourcesOf, captureApplicationFileObservation, readApplicationFileObservation as readApplicationFileObservationOf, type ApplicationFileObservation,
+  readModelCallState as readModelCallStateOf, readModelTransport as readModelTransportOf, transportUnder as transportUnderOf, prepareCompletionProducts as prepareCompletionProductsOf, pendingCallStore,
+  prepareApplicationEnvironment as prepareApplicationEnvironmentOf, prepareAssessmentDisposition as prepareAssessmentDispositionOf, readAssessmentCessation as readAssessmentCessationOf, readCompletionWorkAt as readCompletionWorkAtOf, readCompletionDispositionContext as readCompletionDispositionContextOf, prepareCompletionCause as prepareCompletionCauseOf, readCompletionCause as readCompletionCauseOf,
   type CompletionCause, type TransportModelCall } from './model-call.js';
-import { readPacketResponse } from './question-packet.js';
-import { prepareSeriesLineAdmission, readAnySeriesAt, readSeriesWorkAdmission, readSeriesAdmissionChange, readCurrentSeriesPointer,
+import { readPacketResponse as readPacketResponseOf } from './question-packet.js';
+import { prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readAnySeriesAt as readAnySeriesAtOf, readSeriesWorkAdmission as readSeriesWorkAdmissionOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf,
   type SeriesAdmissionChange, seriesCurrentId,
-  seriesId, readCompletionBinding, completionWorkId, prepareCompletionAdmission, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
-import { prepareCloseAttempt } from './repeat-gate.js';
+  seriesId, readCompletionBinding as readCompletionBindingOf, completionWorkId, prepareCompletionAdmission as prepareCompletionAdmissionOf, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
+import { prepareCloseAttempt as prepareCloseAttemptOf } from './repeat-gate.js';
 import { acceptanceRepresents } from './achievements.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
+
+/**
+ * Q2b (№2518): every refusal code E5 creates itself, from the actual places of issue; its exceptions apart.
+ */
+export const ASSESSMENT_LOCAL_CODES = Object.freeze(['assessment_cause_invalid', 'assessment_cause_unproved',
+  'assessment_identity_conflict', 'assessment_independence_invalid', 'assessment_intent_invalid', 'assessment_refusal_invalid',
+  'assessment_result_invalid', 'assessment_set_invalid', 'assessment_source_invalid', 'assessment_source_stale',
+  'assessment_not_supported', 'completion_ceased'] as const);
+export type AssessmentLocalCode = typeof ASSESSMENT_LOCAL_CODES[number];
+export const ASSESSMENT_ERROR_CODES = Object.freeze(['assessment_request_invalid'] as const);
+export type AssessmentErrorCode = typeof ASSESSMENT_ERROR_CODES[number];
+/** The units whose refusals E5 hands on, each through its reader bound below; 'run-control' is the pass's lost control. */
+export type AssessmentSource = 'refs' | 'refusal-journal' | 'answer-form' | 'accepted-answer' | 'call-record' | 'model-call'
+  | 'question-packet' | 'series' | 'repeat-gate' | 'run-control';
+export type AssessmentCode = AssessmentLocalCode | SourceCodes<AssessmentSource>;
+export type AssessmentResult<T> = OmResult<T, AssessmentCode>;
+
+const readJournal = transferring('refusal-journal', readJournalOf);
+const recordRefusal = transferring('refusal-journal', recordRefusalOf);
+const checkAnswerForm = transferring('answer-form', checkAnswerFormOf);
+const readMc1Question = transferring('accepted-answer', readMc1QuestionOf);
+const prepareMc1Question = transferring('accepted-answer', prepareMc1QuestionOf);
+const prepareAnswerCitations = transferring('accepted-answer', prepareAnswerCitationsOf);
+const prepareE5AcceptedAnswer = transferring('accepted-answer', prepareE5AcceptedAnswerOf);
+const readAcceptedAnswer = transferring('accepted-answer', readAcceptedAnswerOf);
+const readAnswerSearch = transferring('accepted-answer', readAnswerSearchOf);
+const readCallLedger = transferring('call-record', readCallLedgerOf);
+const readFactAssessmentOrigin = transferring('call-record', readFactAssessmentOriginOf);
+const readCall = transferring('call-record', readCallOf);
+const recordCall = transferring('call-record', recordCallOf);
+const readApplicationSources = transferring('model-call', readApplicationSourcesOf);
+const readApplicationFileObservation = transferring('model-call', readApplicationFileObservationOf);
+const readModelCallState = transferring('model-call', readModelCallStateOf);
+const readModelTransport = transferring('model-call', readModelTransportOf);
+const prepareCompletionProducts = transferring('model-call', prepareCompletionProductsOf);
+const prepareApplicationEnvironment = transferring('model-call', prepareApplicationEnvironmentOf);
+const prepareAssessmentDisposition = transferring('model-call', prepareAssessmentDispositionOf);
+const readAssessmentCessation = transferring('model-call', readAssessmentCessationOf);
+const readCompletionWorkAt = transferring('model-call', readCompletionWorkAtOf);
+const readCompletionDispositionContext = transferring('model-call', readCompletionDispositionContextOf);
+const prepareCompletionCause = transferring('model-call', prepareCompletionCauseOf);
+const readCompletionCause = transferring('model-call', readCompletionCauseOf);
+const readPacketResponse = transferring('question-packet', readPacketResponseOf);
+const prepareSeriesLineAdmission = transferring('series', prepareSeriesLineAdmissionOf);
+const readAnySeriesAt = transferring('series', readAnySeriesAtOf);
+const readSeriesWorkAdmission = transferring('series', readSeriesWorkAdmissionOf);
+const readSeriesAdmissionChange = transferring('series', readSeriesAdmissionChangeOf);
+const readCurrentSeriesPointer = transferring('series', readCurrentSeriesPointerOf);
+const readCompletionBinding = transferring('series', readCompletionBindingOf);
+const prepareCompletionAdmission = transferring('series', prepareCompletionAdmissionOf);
+const prepareCloseAttempt = transferring('repeat-gate', prepareCloseAttemptOf);
+// Bound lazily: the refusal journal's producer is a const of a module this one may load before it is initialised.
+const prepareRecordRefusal = (...args: Parameters<typeof prepareRecordRefusalOf>) => transfer('refusal-journal', prepareRecordRefusalOf(...args));
+const transportUnder = async (...args: Parameters<typeof transportUnderOf>) => transfer('model-call', await transportUnderOf(...args));
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
+const refuse = localRefusals(ASSESSMENT_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: AssessmentErrorCode, message: string, details?: unknown) => never = localErrors(ASSESSMENT_ERROR_CODES);
 
 export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
 export const ASSESSMENT_RESULT_KIND = 'om-assessment-result';
@@ -114,21 +173,21 @@ const order = (left: string, right: string): number => left < right ? -1 : left 
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
 const refs = (values: readonly Ref[]): Ref[] => [...new Map(values.map(value => [canonical(value), value])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
-class AssessmentFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function take<T>(value: OmResult<T>): T { if (!value.ok) throw new AssessmentFailure(value.refusal); return value.value; }
-function fail(code: string, target: string, field: string, message: string, ref?: Ref): never {
-  const outcome = refused(code, message, { unit: 'E5', target, field, ref }, 'producer');
+class AssessmentFailure extends Error { constructor(readonly refusal: Refusal<AssessmentCode>) { super(refusal.message); } }
+function take<T>(value: OmResult<T, AssessmentCode>): T { if (!value.ok) throw new AssessmentFailure(value.refusal); return value.value; }
+function fail(code: AssessmentLocalCode, target: string, field: string, message: string, ref?: Ref): never {
+  const outcome = refuse(code, message, { unit: 'E5', target, field, ref }, 'producer');
   if (!outcome.ok) throw new AssessmentFailure(outcome.refusal);
   throw new Error('Unreachable');
 }
-function checked<T>(action: () => T): OmResult<Sealed<T>> {
+function checked<T>(action: () => T): AssessmentResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(action()); }
     catch (error) { if (error instanceof AssessmentFailure) return { ok: false, refusal: error.refusal }; throw error; }
   });
 }
 function invalid(field: string): never {
-  throw new EngineError('assessment_request_invalid', 'E5 needs an explicit complete request',
+  return raise('assessment_request_invalid', 'E5 needs an explicit complete request',
     { unit: 'E5', target: ASSESSMENT_INTENT_KIND, field });
 }
 function requireProject(store: Store, project: unknown): asserts project is string {
@@ -257,7 +316,7 @@ function checkedIntent(record: Revision<AssessmentIntentRecord>): CheckedAssessm
     originalActor: record.value.originalActor, question: record.value.question,
     fact: record.value.fact, candidates: record.value.candidates };
 }
-export function prepareAssessmentIntent(store: Store, request: AssessmentIntentRequest): OmResult<Sealed<PreparedAssessmentIntent>> {
+export function prepareAssessmentIntent(store: Store, request: AssessmentIntentRequest): AssessmentResult<Sealed<PreparedAssessmentIntent>> {
   requireIntentRequest(store, request); request = sealed(request) as AssessmentIntentRequest;
   return checked(() => {
     const source = sourceBasis(store, request.project, request.modelCall, request.questionId);
@@ -278,7 +337,7 @@ export function prepareAssessmentIntent(store: Store, request: AssessmentIntentR
       guards: uniqueTransactionGuards(derived.guards) };
   });
 }
-export function writeAssessmentIntent(store: Store, request: AssessmentIntentRequest): OmResult<Sealed<Revision<AssessmentIntentRecord>>> {
+export function writeAssessmentIntent(store: Store, request: AssessmentIntentRequest): AssessmentResult<Sealed<Revision<AssessmentIntentRecord>>> {
   const prepared = prepareAssessmentIntent(store, request);
   if (!prepared.ok) return prepared;
   if (!prepared.value.writes.length) return delivered(prepared.value.record);
@@ -286,7 +345,7 @@ export function writeAssessmentIntent(store: Store, request: AssessmentIntentReq
     writes: prepared.value.writes, guards: prepared.value.guards });
   return written.ok ? delivered(written.value[0]!) : written;
 }
-export function readAssessmentIntentAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CheckedAssessmentIntent>> {
+export function readAssessmentIntentAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<CheckedAssessmentIntent>> {
   requireIntentRef(store, project, ref);
   return checked(() => historicalRead(store, { reader: 'E5.assessment-intent', project, ref }, () => {
     const record = take(readRecord<AssessmentIntentRecord>(store, ref, { unit: 'E5', target: ref.id,
@@ -348,13 +407,13 @@ function deriveAssessmentFileCause(store: Store, project: string, intent: Ref, c
 /** Historical proof uses the original source and saved observation, including after the file is restored. */
 export function readAssessmentFileTerminationCause(store: Store, request: {
   project: string; intent: Ref; cause: AssessmentFileTerminationCause;
-}): OmResult<Sealed<{ cause: AssessmentFileTerminationCause; references: Ref[] }>> {
+}): AssessmentResult<Sealed<{ cause: AssessmentFileTerminationCause; references: Ref[] }>> {
   requireIntentRef(store, request.project, request.intent);
   return checked(() => deriveAssessmentFileCause(store, request.project, request.intent, request.cause));
 }
 /** A missing cause means the required files were unchanged; unreadable original history is a refusal, not absence. */
 export function prepareAssessmentFileTerminationCause(store: Store, request: { project: string; intent: Ref }):
-  OmResult<Sealed<{ cause: AssessmentFileTerminationCause | null; references: Ref[] }>> {
+  AssessmentResult<Sealed<{ cause: AssessmentFileTerminationCause | null; references: Ref[] }>> {
   requireIntentRef(store, request.project, request.intent);
   return checked(() => {
     const original = assessmentFilePrerequisites(store, request.project, request.intent);
@@ -386,7 +445,7 @@ function assessmentSeriesCause(store: Store, project: string, intent: Sealed<Che
 /** An applied transition is a cause only when it actually removes this exact line's work admission. */
 export function readAssessmentSeriesTerminationCause(store: Store, request: {
   project: string; intent: Ref; cause: AssessmentSeriesTerminationCause;
-}): OmResult<Sealed<{ cause: AssessmentSeriesTerminationCause; references: Ref[] }>> {
+}): AssessmentResult<Sealed<{ cause: AssessmentSeriesTerminationCause; references: Ref[] }>> {
   requireIntentRef(store, request.project, request.intent);
   return checked(() => {
     const { cause } = request;
@@ -400,7 +459,7 @@ export function readAssessmentSeriesTerminationCause(store: Store, request: {
   });
 }
 export function prepareAssessmentSeriesTerminationCause(store: Store, request: { project: string; intent: Ref }):
-  OmResult<Sealed<{ cause: AssessmentSeriesTerminationCause | null; references: Ref[] }>> {
+  AssessmentResult<Sealed<{ cause: AssessmentSeriesTerminationCause | null; references: Ref[] }>> {
   requireIntentRef(store, request.project, request.intent);
   return checked(() => {
     const intent = take(readAssessmentIntentAt(store, request.project, request.intent));
@@ -426,7 +485,7 @@ function originalGuardHeads(store: Store, intent: Sealed<CheckedAssessmentIntent
   }
   return [...original];
 }
-export function prepareAssessmentAdmission(store: Store, project: string, ref: Ref): OmResult<Sealed<AssessmentAdmission>> {
+export function prepareAssessmentAdmission(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<AssessmentAdmission>> {
   requireIntentRef(store, project, ref);
   return checked(() => {
     const intent = take(readAssessmentIntentAt(store, project, ref));
@@ -461,7 +520,7 @@ function verdictOf(raw: string): { verdict: 'supported' | 'insufficient' | 'conf
     || !same(Object.keys(parsed).sort(), ['reasons', 'verdict'])) return null;
   return { verdict: parsed.verdict as 'supported' | 'insufficient' | 'conflicting', reasons: parsed.reasons as string[] };
 }
-export function readAssessmentResultAt(store: Store, project: string, intentRef: Ref, assessorRef: Ref): OmResult<Sealed<{
+export function readAssessmentResultAt(store: Store, project: string, intentRef: Ref, assessorRef: Ref): AssessmentResult<Sealed<{
   intent: CheckedAssessmentIntent; assessor: Revision<TransportModelCall>; call: Ref;
   verdict: AssessmentVerdict; reasons: string[]; references: Ref[];
 }>> {
@@ -488,13 +547,13 @@ export function readAssessmentResultAt(store: Store, project: string, intentRef:
   });
 }
 /** D5 uses this proof; only a supported physical verdict can become an accepted fact. */
-export function readAssessmentOutcomeAt(store: Store, project: string, intent: Ref, assessor: Ref): OmResult<Sealed<{
+export function readAssessmentOutcomeAt(store: Store, project: string, intent: Ref, assessor: Ref): AssessmentResult<Sealed<{
   intent: CheckedAssessmentIntent; assessor: Revision<TransportModelCall>; call: Ref;
   verdict: 'supported'; reasons: string[]; references: Ref[];
 }>> {
   const result = readAssessmentResultAt(store, project, intent, assessor);
   if (!result.ok) return result;
-  if (result.value.verdict !== 'supported') return refused('assessment_not_supported', 'Only a supported independent verdict can be accepted',
+  if (result.value.verdict !== 'supported') return refuse('assessment_not_supported', 'Only a supported independent verdict can be accepted',
     { unit: 'E5', target: assessor.id, field: 'verdict', ref: assessor }, 'gap');
   return delivered({ ...result.value, verdict: 'supported' as const });
 }
@@ -537,7 +596,7 @@ function terminationValue(store: Store, project: string, request: {
 }
 /** A terminal result never replaces the physical receipt or charges the model again. */
 export function applyAssessmentResult(store: Store, request: { project: string; intent: Ref; assessor: Ref }):
-  OmResult<Sealed<Revision<AssessmentResultRecord>>> {
+  AssessmentResult<Sealed<Revision<AssessmentResultRecord>>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || request.project.includes(':')
     || !isRef(request.intent) || !isRef(request.assessor)
     || !same(Object.keys(request).sort(), ['assessor', 'intent', 'project'])) invalid('result');
@@ -632,7 +691,7 @@ function prepareManagedAssessmentProducts(store: Store, project: string, result:
 }
 
 /** Reprove the paid terminal outcome without descending into its D5 answer or index. */
-export function readAssessmentTerminalBasisAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AssessmentResultRecord>>> {
+export function readAssessmentTerminalBasisAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<Revision<AssessmentResultRecord>>> {
   requireIntentRef(store, project, ref);
   return checked(() => historicalRead(store, { reader: 'E5.assessment-result-basis', project, ref }, () => {
     const record = take(readRecord<AssessmentResultRecord>(store, ref, { unit: 'E5', target: ref.id,
@@ -661,7 +720,7 @@ export function readAssessmentTerminalBasisAt(store: Store, project: string, ref
   }, () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
 }
 
-export function readAssessmentTerminalAt(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<AssessmentResultRecord>>> {
+export function readAssessmentTerminalAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<Revision<AssessmentResultRecord>>> {
   requireIntentRef(store, project, ref);
   return checked(() => historicalRead(store, { reader: 'E5.assessment-result', project, ref }, () => {
     const record = take(readAssessmentTerminalBasisAt(store, project, ref));
@@ -709,7 +768,7 @@ function assessmentRefusalBody(store: Store, project: string, resultRef: Ref): {
 }
 
 /** Reprove every field of a saved A2 source from the exact paid E5 result. */
-export function readAssessmentRefusalAt(store: Store, project: string, source: Ref): OmResult<Sealed<{
+export function readAssessmentRefusalAt(store: Store, project: string, source: Ref): AssessmentResult<Sealed<{
   record: Sealed<Revision<UnitRefusalRecord>>; result: Sealed<Revision<AssessmentResultRecord>>;
   intent: Sealed<CheckedAssessmentIntent>; target: string; consumer: string; guards: Ref[];
 }>> {
@@ -745,7 +804,7 @@ function writeAssessmentRefusal(store: Store, project: string, result: Ref): Rev
 }
 
 /** The candidate set comes from the original E4 answer, never from the caller's chosen subset. */
-export function readAssessmentSet(store: Store, project: string, intentRef: Ref): OmResult<Sealed<{
+export function readAssessmentSet(store: Store, project: string, intentRef: Ref): AssessmentResult<Sealed<{
   source: Ref; originalSeries: Ref; attempt: number; block: string; goal: AttemptGoal;
   complete: boolean; allSupported: boolean; accepted: Ref[]; results: Ref[]; guards: Ref[];
 }>> {
@@ -850,7 +909,7 @@ function assessmentRefusals(store: Store, project: string, negatives: readonly R
 }
 
 /** One checked E5 closing image, derived from the original response and exact saved A2 sources. */
-export function readAssessmentClosure(store: Store, project: string, intent: Ref): OmResult<Sealed<AssessmentClosure>> {
+export function readAssessmentClosure(store: Store, project: string, intent: Ref): AssessmentResult<Sealed<AssessmentClosure>> {
   requireIntentRef(store, project, intent);
   return checked<AssessmentClosure>(() => {
     const set = take(readAssessmentSet(store, project, intent));
@@ -870,7 +929,7 @@ export function readAssessmentClosure(store: Store, project: string, intent: Ref
 
 /** Match a complete E5 claim, including multiplicity and its original attempt, against the one derived image. */
 export function checkAssessmentClosure(store: Store, project: string, intent: Ref,
-  claim: AssessmentClosureClaim): OmResult<Sealed<ReadyAssessmentClosure>> {
+  claim: AssessmentClosureClaim): AssessmentResult<Sealed<ReadyAssessmentClosure>> {
   requireIntentRef(store, project, intent);
   return checked<ReadyAssessmentClosure>(() => {
     if (!object(claim) || !isRef(claim.series) || !Number.isSafeInteger(claim.attempt) || claim.attempt < 1
@@ -923,7 +982,7 @@ function requireAttemptClosureRequest(store: Store, request: unknown): asserts r
 
 /** Current discovery of every E5 set on this attempt, independent of the closing claims. */
 export function readCurrentAssessmentAttemptClosure(store: Store, request: AssessmentAttemptClosureRequest):
-  OmResult<Sealed<CurrentAssessmentAttemptClosure>> {
+  AssessmentResult<Sealed<CurrentAssessmentAttemptClosure>> {
   requireAttemptClosureRequest(store, request);
   return checked<CurrentAssessmentAttemptClosure>(() => {
     const { project } = request;
@@ -1014,7 +1073,7 @@ export function readCurrentAssessmentAttemptClosure(store: Store, request: Asses
 
 /** Check the E5 portion of a new G7 outcome; other providers own its non-E5 claims. */
 export function checkCurrentAssessmentAttemptClosure(store: Store, request: AssessmentAttemptClosureRequest,
-  claim: AssessmentClosureClaim): OmResult<Sealed<ReadyCurrentAssessmentAttemptClosure>> {
+  claim: AssessmentClosureClaim): AssessmentResult<Sealed<ReadyCurrentAssessmentAttemptClosure>> {
   requireAttemptClosureRequest(store, request);
   return checked<ReadyCurrentAssessmentAttemptClosure>(() => {
     if (!object(claim) || !isRef(claim.series) || !Number.isSafeInteger(claim.attempt)
@@ -1067,14 +1126,14 @@ export function checkCurrentAssessmentAttemptClosure(store: Store, request: Asse
 }
 
 /** The old positive-only entry delegates its write to the common attempt-level finalizer. */
-export function finishSupportedAssessmentAttempt(store: Store, project: string, intent: Ref): OmResult<Sealed<{
+export function finishSupportedAssessmentAttempt(store: Store, project: string, intent: Ref): AssessmentResult<Sealed<{
   complete: boolean; closed: boolean; results: Ref[];
 }>> {
   return finishAssessmentAttempt(store, project, intent);
 }
 
 /** Complete a saved terminal set without sending any assessor again. */
-export function finishAssessmentAttempt(store: Store, project: string, intent: Ref): OmResult<Sealed<{
+export function finishAssessmentAttempt(store: Store, project: string, intent: Ref): AssessmentResult<Sealed<{
   complete: boolean; closed: boolean; results: Ref[];
 }>> {
   requireIntentRef(store, project, intent);
@@ -1200,18 +1259,18 @@ export function finishAssessmentAttempt(store: Store, project: string, intent: R
  * accounts for what was already admitted and paid.
  */
 export async function assessFact(store: Store, request: AssessmentIntentRequest, signal?: AbortSignal, control?: RunControlHold):
-  Promise<OmResult<Sealed<Revision<AssessmentResultRecord>>>> {
+  Promise<AssessmentResult<Sealed<Revision<AssessmentResultRecord>>>> {
   requireIntentRequest(store, request);
   if (signal !== undefined && !(signal instanceof AbortSignal)) invalid('signal');
   if (control !== undefined && !isPlainObject(control)) invalid('control');
   try { return await assessUnderControl(store, request, signal, new RunControlGate(store, request.project, control)); }
-  catch (error) { if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal }; throw error; }
+  catch (error) { if (error instanceof RunControlLost) return transfer('run-control', { ok: false as const, refusal: error.refusal }); throw error; }
 }
 async function assessUnderControl(store: Store, request: AssessmentIntentRequest, signal: AbortSignal | undefined, gate: RunControlGate):
-  Promise<OmResult<Sealed<Revision<AssessmentResultRecord>>>> {
+  Promise<AssessmentResult<Sealed<Revision<AssessmentResultRecord>>>> {
   const ceased = readAssessmentCessation(store, request.project, request.modelCall, request.questionId);
   if (!ceased.ok) return ceased;
-  if (ceased.value) return refused('completion_ceased', 'The exact mandatory assessor remains ceased without another intent or physical call',
+  if (ceased.value) return refuse('completion_ceased', 'The exact mandatory assessor remains ceased without another intent or physical call',
     { unit: 'E5', target: ceased.value.value.assignment.id, field: 'disposition', ref: reference(ceased.value) }, 'producer');
   const intent = writeAssessmentIntent(gate.view(), request);
   if (!intent.ok) return intent;
@@ -1228,7 +1287,7 @@ async function assessUnderControl(store: Store, request: AssessmentIntentRequest
   const call = recordCall(gate.view(), request.project, callRequest);
   if (!call.ok) return call;
   const firstCall = store.get(call.value.call.id, 1);
-  if (!firstCall) return refused('assessment_result_invalid', 'The assessor needs its original E1 admission',
+  if (!firstCall) return refuse('assessment_result_invalid', 'The assessor needs its original E1 admission',
     { unit: 'E5', target: call.value.call.id, field: 'call' }, 'producer');
   const transport = await transportUnder(store, { project: request.project, call: reference(firstCall),
     packet: admission.packet as unknown as Json, role: 'reviewer' }, signal, [], gate);

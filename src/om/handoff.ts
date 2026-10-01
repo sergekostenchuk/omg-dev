@@ -5,26 +5,61 @@ import { isRef, reference, stageId, uniqueRefs, type Ref, type StageArtifact } f
 import { StageChecks } from '../product/stage-checks.js';
 import { transactionGuardsCurrent, uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
-import { readFeasibility } from './feasibility.js';
-import { readHorizon } from './horizon.js';
-import { readOmInput, withHistoricalReads } from './input.js';
-import { readRecord, writeGuarded } from './refs.js';
-import { delivered, refused, type OmResult, type Refusal, type Sealed } from './refusal.js';
+import { readFeasibility as readFeasibilityOf } from './feasibility.js';
+import { readHorizon as readHorizonOf } from './horizon.js';
+import { readOmInput as readOmInputOf, withHistoricalReads } from './input.js';
+import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
+import { delivered, localErrors, localRefusals, refused, transfer, transferError, transferring, type OmResult, type Refusal,
+  type Sealed, type SourceCodes } from './refusal.js';
+import type { Json } from '../canonical.js';
 
 export interface HandoffRequest { project: string; feasibility: Ref; expected: number }
 export interface HandoffReadRequest { project: string; record: Ref }
 export interface PreparedHandoff { record: Revision<StageArtifact>; writes: Write[]; guards: TransactionGuard[] }
 
+/** Q2b (№2518): every refusal code M9 creates itself, from the actual places of issue — the saved-record codes it states
+ * about its own sources included (№2460-1); its exceptions apart. */
+export const HANDOFF_LOCAL_CODES = Object.freeze(['handoff_record_invalid', 'handoff_feasibility_unchanged', 'feasibility_not_ready',
+  'input_stale', 'record_missing', 'record_forged', 'record_foreign', 'revision_conflict'] as const);
+export type HandoffLocalCode = typeof HANDOFF_LOCAL_CODES[number];
+export const HANDOFF_ERROR_CODES = Object.freeze(['handoff_request_invalid', 'handoff_internal'] as const);
+export type HandoffErrorCode = typeof HANDOFF_ERROR_CODES[number];
+/** The units whose refusals M9 hands on: its readers, and the exceptions of the R3 boundary and of the stage pipeline. */
+export type HandoffSource = 'refs' | 'feasibility' | 'horizon' | 'input' | 'reader-pilot' | 'pipeline';
+export type HandoffCode = HandoffLocalCode | SourceCodes<HandoffSource>;
+export type HandoffResult<T> = OmResult<T, HandoffCode>;
+
+const readFeasibility = transferring('feasibility', readFeasibilityOf);
+const readHorizon = transferring('horizon', readHorizonOf);
+const readOmInput = transferring('input', readOmInputOf);
+const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
+const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
+
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const target = (project: string) => stageId(project, 'om-g2');
-class Failure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function take<T>(result: OmResult<T>): T { if (!result.ok) throw new Failure(result.refusal); return result.value; }
-function fail(code: string, id: string, field: string, message: string): never {
-  take(refused(code, message, { unit: 'M9', target: id, field }, 'producer'));
-  throw new EngineError('handoff_internal', 'A refusal unexpectedly succeeded');
+const refuse = localRefusals(HANDOFF_LOCAL_CODES);
+// Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
+const raise: (code: HandoffErrorCode, message: string, details?: unknown) => never = localErrors(HANDOFF_ERROR_CODES);
+class Failure extends Error { constructor(readonly refusal: Refusal<HandoffCode>) { super(refusal.message); } }
+function take<T>(result: OmResult<T, HandoffCode>): T { if (!result.ok) throw new Failure(result.refusal); return result.value; }
+function fail(code: HandoffLocalCode, id: string, field: string, message: string): never {
+  take(refuse(code, message, { unit: 'M9', target: id, field }, 'producer'));
+  return raise('handoff_internal', 'A refusal unexpectedly succeeded');
 }
-function run<T>(action: () => T): OmResult<Sealed<T>> {
+/**
+ * The stage pipeline's refusal of the M9 admission (№2522-1): its first finding names the code, target and field, with the
+ * exception's own code, the stage and 'admission' when the finding has none — exactly the earlier choice, now the
+ * pipeline's transferred refusal. The whole exception comes in; no code is chosen outside this boundary.
+ */
+function admissionRefused(error: EngineError, id: string): HandoffResult<never> {
+  const detail = Array.isArray(error.details) ? error.details[0] as unknown : error.details;
+  const finding = object(detail) ? detail : {};
+  return transfer('pipeline', refused(typeof finding['code'] === 'string' ? finding['code'] : error.code, error.message,
+    { unit: 'M9', target: typeof finding['target'] === 'string' ? finding['target'] : id,
+      field: typeof finding['field'] === 'string' ? finding['field'] : 'admission' }, 'producer'));
+}
+function run<T>(action: () => T): HandoffResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(action()); }
     catch (error) { if (error instanceof Failure) return { ok: false, refusal: error.refusal }; throw error; }
@@ -35,7 +70,7 @@ function requireRequest(store: Store, request: unknown, read: boolean): void {
   if (!(store instanceof Store) || !object(request) || typeof request['project'] !== 'string' || !request['project'].trim()
     || !isRef(request[ref]) || (!read && (!Number.isSafeInteger(request['expected']) || (request['expected'] as number) < 0))
     || Object.keys(request).some(key => !['project', ref, ...(read ? [] : ['expected'])].includes(key))) {
-    throw new EngineError('handoff_request_invalid', 'M9 requires an explicit project, exact basis and transition revision',
+    raise('handoff_request_invalid', 'M9 requires an explicit project, exact basis and transition revision',
       { unit: 'M9', target: 'handoff', field: 'request' });
   }
 }
@@ -46,7 +81,7 @@ function exactSource(store: Store, ref: Ref): void {
 }
 
 /** The saved M8 and its B1 lineage establish history without inspecting today's repository or heads. */
-export function readHandoff(store: Store, request: HandoffReadRequest): OmResult<Sealed<Revision<StageArtifact>>> {
+export function readHandoff(store: Store, request: HandoffReadRequest): HandoffResult<Sealed<Revision<StageArtifact>>> {
   requireRequest(store, request, true);
   return run(() => {
     const record = take(readRecord<StageArtifact>(store, request.record,
@@ -75,7 +110,7 @@ export function readHandoff(store: Store, request: HandoffReadRequest): OmResult
 }
 
 /** A new admission always uses the current validator; a completed retry is handled only by writeHandoff. */
-export function prepareHandoff(store: Store, request: HandoffRequest): OmResult<Sealed<PreparedHandoff>> {
+export function prepareHandoff(store: Store, request: HandoffRequest): HandoffResult<Sealed<PreparedHandoff>> {
   requireRequest(store, request, false);
   return run(() => {
     const id = target(request.project);
@@ -97,19 +132,15 @@ export function prepareHandoff(store: Store, request: HandoffRequest): OmResult<
     try { assertPilotBoundary(store, request.project, 'R3'); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;
-      fail(error.code, error.code.startsWith('phase_') ? `phase-policy:${request.project}` : `reader-pilot:${request.project}`,
-        'R3', error.message);
+      take(transferError('reader-pilot', error, { unit: 'M9',
+        target: error.code.startsWith('phase_') ? `phase-policy:${request.project}` : `reader-pilot:${request.project}`, field: 'R3' }, 'producer'));
     }
     let prepared: ReturnType<StageChecks['pipeline']['prepareAccepted']>;
     try { prepared = new StageChecks(store).pipeline.prepareAccepted(request.project, 'om-g2',
       { feasibility: { ...request.feasibility } }, request.expected, boundary); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;
-      const detail = Array.isArray(error.details) ? error.details[0] as unknown : error.details;
-      const finding = object(detail) ? detail : {};
-      fail(typeof finding['code'] === 'string' ? finding['code'] : error.code,
-        typeof finding['target'] === 'string' ? finding['target'] : id,
-        typeof finding['field'] === 'string' ? finding['field'] : 'admission', error.message);
+      return take(admissionRefused(error, id));
     }
     const guards = uniqueTransactionGuards(prepared.guards);
     const stale = guards.find(guard => !transactionGuardsCurrent(store, [guard]));
@@ -120,7 +151,7 @@ export function prepareHandoff(store: Store, request: HandoffRequest): OmResult<
   });
 }
 
-export function writeHandoff(store: Store, request: HandoffRequest): OmResult<Sealed<Revision<StageArtifact>>> {
+export function writeHandoff(store: Store, request: HandoffRequest): HandoffResult<Sealed<Revision<StageArtifact>>> {
   requireRequest(store, request, false);
   return run(() => {
     const prior = store.get<StageArtifact>(target(request.project), request.expected + 1);
