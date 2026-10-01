@@ -1349,9 +1349,9 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`
+- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
 - Из движка как есть: договор S1.3 ~/REPORTS/review/omg-code-s13_contract-2185.md (№2185, №2194, №2201, №2217, №2233, №2248); сухие проверки ~/OMG/PREPARATIONS/OM-DRYRUN/ и /tmp/omg-preflight-kimi-run/ (Kimi №2291)
-- После: S1.3, D8.4.2
+- После: S1.3, D8.4.2, T-DIET, H1.5
 - Тесты сверх обязательных:
   - ДОГОВОР — у ревьюера ДО кода (новый вид средства в Store — наблюдатель чтений, №2198 шаг 2): полнота транзитивна; наблюдатель только для доказанной семьи настоящего Store; неполное не объявлять полным и не удерживать по пустому следу; git-признак и прочие внешние зависимости S1.3 сохраняются; пропущенный путь чтения Store → доказательство неполное (не устаревшее значение)
   - замер до/после на тех же шагах копии omg-live: cycle попыток 1–3, A6, get/промахи, RSS; цель — снять повторный вывод истории попыток между операциями, без обещания нулевого роста
