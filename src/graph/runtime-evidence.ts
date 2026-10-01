@@ -13,7 +13,7 @@ import { runtimeContext, runtimeCode, runtimeExecutableIdentity, runtimeSubjectP
   declaredCheckSources } from '../runtime/runtime-observation.js';
 import { runtimeSource, type RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
-import { readOmObligationLedger } from '../om/obligations.js';
+import { readOmObligationLedger } from './om-obligation-readers.js';
 import { historicalObservation } from '../discovery/response-recovery.js';
 
 export interface RuntimeEvidence {

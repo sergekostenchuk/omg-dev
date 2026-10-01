@@ -9,7 +9,7 @@ const ts = createRequire(import.meta.url)('typescript') as typeof import('typesc
 
 // №32: the import ring is a ratchet — it may only shrink. The limits are the
 // largest strongly connected component sizes measured on om/module = a574007.
-const LOAD_RING_LIMIT = 84;
+const LOAD_RING_LIMIT = 83;
 const FULL_RING_LIMIT = 133;
 
 type Graph = Map<string, string[]>;

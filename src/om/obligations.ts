@@ -14,8 +14,14 @@ import { historicalRead, withHistoricalReads } from './input.js';
 import { readFrameBasis } from './frame-obligations.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
+import { OM_LEDGER_ID_PREFIX, OM_OBLIGATION_CONTRACT, OM_PRODUCER_ID_PREFIX, registerOmObligationReaders,
+  type OmObligationHandoff } from '../graph/om-obligation-readers.js';
 
-export const OM_OBLIGATION_CONTRACT = 'om-obligations/v1';
+// The contract constants and handoff type belong to the lower reader slot so
+// that graph/runtime consumers never reach back into the OM unit; both names
+// stay re-exported here for the existing OM consumers.
+export { OM_OBLIGATION_CONTRACT } from '../graph/om-obligation-readers.js';
+export type { OmObligationHandoff } from '../graph/om-obligation-readers.js';
 export const OM_OWNER_ASSIGNMENT_CONTRACT = 'om-owner-gap-assignment/v1';
 export const OM_OWNER_ASSIGNMENT_KIND = 'om-owner-gap-assignment';
 export const OM_OBLIGATION_TRANSFER_CONTRACT = 'om-obligation-transfer/v1';
@@ -52,9 +58,6 @@ export interface OmObligationRecord {
 }
 export interface OmObligationProducer {
   contract: typeof OM_OBLIGATION_CONTRACT; project: string; request: ObligationRequest; ledger: Ref;
-}
-export interface OmObligationHandoff {
-  era: typeof OM_OBLIGATION_CONTRACT; producer: Ref; scope: Ref; obligations: CarriedObligation[];
 }
 export interface OmObligations {
   producer: Revision<OmObligationProducer>; record: Revision<OmObligationRecord>;
@@ -98,7 +101,7 @@ function requireRequest(request: ObligationRequest): void {
         && item.pending.expected === 0 && object(item.pending.value)))) invalid('assignments');
   if (Object.keys(request).some(key => !['project', 'gaps', 'lines', 'assignments'].includes(key))) invalid('request.fields');
 }
-function namespace(project: string, producer: boolean): string { return `${producer ? 'om-obligation-basis' : 'om-obligations'}:${project}:`; }
+function namespace(project: string, producer: boolean): string { return `${producer ? OM_PRODUCER_ID_PREFIX : OM_LEDGER_ID_PREFIX}${project}:`; }
 function row<T extends OmObligationRecord | OmObligationProducer>(value: T, producer: boolean): Revision<T> {
   const hash = hashJson(value);
   return { id: `${namespace(value.project, producer)}${hash}`, kind: producer ? 'om-obligation-basis' : 'om-obligations', revision: 1, hash, value };
@@ -507,8 +510,8 @@ export function readOmObligationHandoff(store: Store, project: string, inputs: R
   requireStore(store);
   if (!text(project) || !Array.isArray(inputs) || !inputs.every(isRef)) invalid('inputs');
   return result(() => {
-    const producers = inputs.filter(ref => ref.id.startsWith('om-obligation-basis:'));
-    const ledgers = inputs.filter(ref => ref.id.startsWith('om-obligations:'));
+    const producers = inputs.filter(ref => ref.id.startsWith(OM_PRODUCER_ID_PREFIX));
+    const ledgers = inputs.filter(ref => ref.id.startsWith(OM_LEDGER_ID_PREFIX));
     if (!producers.length && !ledgers.length) return null;
     if (inputs.some(ref => /^phase:.*:(R2|L3)$/.test(ref.id)))
       fail('obligation_era_conflict', project, 'inputs', 'One consumer cannot combine legacy research and OM obligation eras');
@@ -520,3 +523,10 @@ export function readOmObligationHandoff(store: Store, project: string, inputs: R
     return saved.handoff;
   });
 }
+
+// Loading this unit installs both complete readers in the lower slot; the slot
+// calls nothing at registration and lower consumers refuse an empty slot.
+registerOmObligationReaders({
+  handoff: readOmObligationHandoff,
+  ledger: readOmObligationLedger,
+});

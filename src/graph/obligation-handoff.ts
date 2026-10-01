@@ -5,7 +5,7 @@ import type { Store } from '../storage/store.js';
 import type { DiscoveryDraft } from '../discovery/discovery.js';
 import type { ResearchScope } from './research-scope.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
-import { readOmObligationHandoff, type OmObligationHandoff } from '../om/obligations.js';
+import { omObligationReadRequired, readOmObligationHandoff, type OmObligationHandoff } from './om-obligation-readers.js';
 
 export interface LegacyObligationHandoff { r2: Ref; scope: Ref; obligations: CarriedObligation[] }
 export type ObligationHandoff = LegacyObligationHandoff | OmObligationHandoff;
@@ -13,6 +13,10 @@ interface ResearchMilestone { projectId: string; phase: string; draft: Ref | nul
 
 /** The OM producer and its explicit ledger establish their own immutable era. */
 export function omObligationHandoff(store: Store, project: string, inputs: Ref[]): OmObligationHandoff | null {
+  // Inputs naming no OM era are answered here — exactly what the registered
+  // reader returns for them — so a bare consumer keeps its previous result
+  // without the OM unit ever loading; the slot only serves OM-era requests.
+  if (!omObligationReadRequired(store, project, inputs)) return null;
   const result = readOmObligationHandoff(store, project, inputs);
   if (!result.ok) throw new EngineError(result.refusal.code, result.refusal.message, result.refusal.at);
   return result.value as OmObligationHandoff | null;

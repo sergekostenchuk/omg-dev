@@ -8,6 +8,9 @@ import { isPlainObject } from '../om/refusal.js';
 import { writeGuarded } from '../om/refs.js';
 import { prepareFeasibility, readFeasibility, type OmFeasibility } from '../om/feasibility.js';
 import type { LayerBasis } from '../om/layer-basis.js';
+// The product assembly point: loading ProductEngine installs the OM obligation
+// reader pair into the lower graph slot before any consumer reads an OM era.
+import '../om/obligations.js';
 import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
 import { recoverResearchResponse } from '../discovery/response-recovery.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';

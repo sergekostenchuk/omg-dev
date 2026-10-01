@@ -1,29 +1,19 @@
 import { Ajv } from 'ajv';
 import { canonical } from '../canonical.js';
 import { requireCondition } from '../errors.js';
+import { KNOWLEDGE_KINDS, RESOLUTION_MOMENTS } from './om-obligation-readers.js';
+import type { CarriedObligation, ObligationAssignment } from './om-obligation-readers.js';
 import { reference, type Ref } from '../pipeline/contracts.js';
 import type { Store, Revision } from '../storage/store.js';
 import type { ResearchScope } from './research-scope.js';
 import type { Source } from '../evidence/evidence.js';
 
-export const KNOWLEDGE_KINDS = ['repository-fact', 'design-decision', 'owner-decision', 'environment-confirmation', 'post-implementation-proof'] as const;
-export const RESOLUTION_MOMENTS = ['R2', 'R3', 'task-start', 'task-result'] as const;
-export interface RuntimeCheck { script: Ref; dependencies: Ref[]; subjects: string[]; executables: string[]; args: string[]; timeoutMs: number; purpose: string;
-  /** Explicit owner contract: exit zero certifies this entire return condition. */
-  satisfies?: string }
-export interface ObligationAssignment {
-  obligation: string;
-  original: { record: Ref; pointer: string };
-  kind: typeof KNOWLEDGE_KINDS[number];
-  moment: typeof RESOLUTION_MOMENTS[number];
-  responsibleNode: string; responsibleConsumer: string;
-  neededForR2: boolean; reason: string;
-  returnCondition: string | null;
-  documentaryAllowance?: { sources: Ref[]; claimLimit: string };
-  runtimeCheck?: RuntimeCheck;
-}
+// The pure obligation contract types and constants live in the lower
+// om-obligation-readers module so its reader slot stays below the import ring;
+// this module keeps every previous name re-exported for its consumers.
+export { KNOWLEDGE_KINDS, RESOLUTION_MOMENTS } from './om-obligation-readers.js';
+export type { CarriedObligation, ObligationAssignment, ObligationWake, RuntimeCheck } from './om-obligation-readers.js';
 export interface ObligationPolicy { version: 1; sourceScope: Ref; assignments: ObligationAssignment[] }
-export interface CarriedObligation extends ObligationAssignment { scope: Ref; wake: ResearchScope['obligations'][number]['wake'] }
 const text = { type: 'string', minLength: 1 };
 const object = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties });
 const ref = object({ id: text, revision: { type: 'integer', minimum: 1 }, hash: { type: 'string', pattern: '^[a-f0-9]{64}$' } });

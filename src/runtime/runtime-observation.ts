@@ -17,7 +17,7 @@ import { probeProcessIdentity, stopOwnedGroup, processStopRefusal, writeProcessS
   evaluateProcessStopWitnesses, type ProcessStopHooks, type ProcessStopReport } from './process-identity.js';
 import type { ModelCall } from './model-usage.js';
 import { runtimeSource, type RuntimeObservation } from './runtime-observation-model.js';
-import { readOmObligationLedger } from '../om/obligations.js';
+import { readOmObligationLedger } from '../graph/om-obligation-readers.js';
 import { taskBindingId } from '../graph/task-obligations.js';
 
 export interface RuntimeObservationRequest { scope: Ref; obligation: string; key: string }
