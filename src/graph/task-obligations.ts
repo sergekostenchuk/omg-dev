@@ -4,7 +4,7 @@ import { isRef, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Ajv } from 'ajv';
 import { Store } from '../storage/store.js';
 import type { GapRecord } from '../om/gaps.js';
-import { historicalRead } from '../om/input.js';
+import { historicalRead } from '../history/proofs.js';
 import type { Graph } from './model.js';
 import type { ResearchScope } from './research-scope.js';
 import { graphSchema, graphV2Schema } from './schema.js';

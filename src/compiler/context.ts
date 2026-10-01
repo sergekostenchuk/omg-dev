@@ -15,7 +15,7 @@ import { readAcceptedFrame } from "../om/frame-accept.js";
 import { readFrame, type FrameRequest } from "../om/frame-obligations.js";
 import { readDeliveries, type DeliveryOwnershipBasis } from "../om/deliveries.js";
 import { readWorksFrame } from "../om/works-frame.js";
-import { historicalTrace, withHistoricalReads } from "../om/input.js";
+import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readRecord } from "../om/refs.js";
 import type { CompiledTask, MachinePlan } from "./model.js";
 

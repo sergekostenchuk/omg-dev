@@ -289,11 +289,20 @@ try {
   const { obligationHandoff } = await import(C.src + "graph/obligation-handoff.js");
   check("pre-consumer-handoff", obligationHandoff(probe, C.project, []) === null && probe.list().length === 0,
     "a bare consumer must keep the legacy-null result");
-  // The other two consumers reach the OM unit through the ordinary product tree: loading them registers the readers.
+  // R5 (№2451): the other two lower consumers no longer reach the OM unit through their own module tree — the slot stays
+  // empty and each reader is the addressed refusal that writes nothing, until the OM unit itself loads below.
   await import(C.src + "runtime/runtime-observation.js");
   await import(C.src + "graph/runtime-evidence.js");
-  const handed = slot.readOmObligationHandoff(probe, C.project, []);
-  check("registered-by-consumer-tree", handed.ok === true && handed.value === null, handed.ok ? "ok" : handed.refusal.code);
+  try { slot.readOmObligationHandoff(probe, C.project, []); check("handoff-unavailable-after-lower-consumers", false, "no throw"); }
+  catch (error) { check("handoff-unavailable-after-lower-consumers", error.code === "om_obligation_reader_unavailable"
+    && error.details && error.details.target === "readOmObligationHandoff" && probe.list().length === 0, error.code); }
+  try { slot.readOmObligationLedger(probe, { project: C.project, ledger: { id: "om-obligations:garden:absent", revision: 1, hash: "0".repeat(64) } });
+    check("ledger-unavailable-after-lower-consumers", false, "no throw"); }
+  catch (error) { check("ledger-unavailable-after-lower-consumers", error.code === "om_obligation_reader_unavailable"
+    && error.details && error.details.target === "readOmObligationLedger" && error.details.ledger
+    && error.details.ledger.id === "om-obligations:garden:absent" && probe.list().length === 0, error.code); }
+  check("legacy-handoff-after-lower-consumers", obligationHandoff(probe, C.project, []) === null && probe.list().length === 0,
+    "inputs naming no OM era keep their previous null");
   const built = await build(C);
   checks.push(...await runChecks(C, built));
 } catch (error) { checks.push({ name: "cold-process", pass: false, detail: String(error && (error.code || error.message) || error) }); }
@@ -387,14 +396,22 @@ try {
   const { omRuntimeAssignment } = await import(C.src + "runtime/runtime-observation.js");
   const { Store } = await import(C.src + "storage/store.js");
   const probe = new Store(C.probe);
-  // Its ordinary module tree reaches the OM unit, so the slot is installed; a ledger that does not exist is the
-  // addressed refusal of the reader, never an empty result.
+  // R5 (№2451): alone, its module tree no longer reaches the OM unit — the slot is empty, so a ledger read is the slot's
+  // addressed unavailable refusal with the ledger it was asked for, never an empty result and never a write.
   try { omRuntimeAssignment(probe, C.project, { id: "om-obligations:garden:absent", revision: 1, hash: "0".repeat(64) }, "x");
     check("cold-missing-ledger", false, "no throw"); }
-  catch (error) { check("cold-missing-ledger", error.code === "runtime_check_not_declared"
-    && error.details && error.details.code === "record_missing", error.code + ":" + JSON.stringify(error.details)); }
+  catch (error) { check("cold-missing-ledger", error.code === "om_obligation_reader_unavailable"
+    && error.details && error.details.target === "readOmObligationLedger" && error.details.ledger
+    && error.details.ledger.id === "om-obligations:garden:absent" && probe.list().length === 0,
+    error.code + ":" + JSON.stringify(error.details)); }
   const built = await build(C);
   const { project, saved } = built, store = built.store;
+  // Once the registrant has loaded in this process, the absent ledger is again the reader's own record_missing inside
+  // runtime_check_not_declared — the slot's unavailable refusal never stands in for it.
+  try { omRuntimeAssignment(probe, C.project, { id: "om-obligations:garden:absent", revision: 1, hash: "0".repeat(64) }, "x");
+    check("registered-missing-ledger", false, "no throw"); }
+  catch (error) { check("registered-missing-ledger", error.code === "runtime_check_not_declared"
+    && error.details && error.details.code === "record_missing", error.code + ":" + JSON.stringify(error.details)); }
   const { canonical } = await import(C.src + "canonical.js");
   const { reference } = await import(C.src + "pipeline/contracts.js");
   const { runtimeObligationId } = await import(C.src + "runtime/runtime-observation.js");

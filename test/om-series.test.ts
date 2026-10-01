@@ -3006,7 +3006,7 @@ export async function load(url, context, next) {
   const loaded = await next(url, context);
   if (!url.startsWith(root) || loaded.format !== 'module') return loaded;
   const file = decodeURIComponent(url.slice(root.length));
-  if (!bodies[file] && file !== 'src/om/input.js') return loaded;
+  if (!bodies[file] && file !== 'src/history/proofs.js') return loaded;
   let source = String(loaded.source);
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   const edits = [], found = new Set();
@@ -3025,7 +3025,11 @@ export async function load(url, context, next) {
   visit(tree);
   for (const name of Object.keys(bodies[file] ?? {})) if (!found.has(name)) throw new Error('Missing actual proof body: ' + name);
   for (const edit of edits.sort((a, b) => b.pos - a.pos)) source = source.slice(0, edit.pos) + edit.text + source.slice(edit.pos);
-  if (file === 'src/om/input.js') source += '\nglobalThis.__mechanismCostInternals = { sourceView, footprint: () => checkingFootprint > 0 };\n';
+  // R5 (№2451): the proof mechanism and its internals live in history/proofs; a missing one fails the test.
+  if (file === 'src/history/proofs.js') {
+    if (!/\nfunction sourceView\(/.test(source) || !/\nlet checkingFootprint = /.test(source)) throw new Error('The proof mechanism internals are absent');
+    source += '\nglobalThis.__mechanismCostInternals = { sourceView, footprint: () => checkingFootprint > 0 };\n';
+  }
   return { ...loaded, source };
 }
 `;

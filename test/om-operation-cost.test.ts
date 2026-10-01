@@ -51,7 +51,7 @@ export async function load(url, context, nextLoad) {
   if (!url.startsWith(root) || result.format !== 'module') return result;
   const file = decodeURIComponent(url.slice(root.length));
   if (baseline && !fixtures[file]) return result;
-  if (!bodies[file] && !fixtures[file] && file !== 'src/om/input.js') return result;
+  if (!bodies[file] && !fixtures[file] && file !== 'src/history/proofs.js') return result;
   let source = String(result.source);
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (fixtures[file]) {
@@ -81,7 +81,8 @@ export async function load(url, context, nextLoad) {
     visit(tree);
     for (const name of Object.keys(bodies[file] ?? {})) if (!found.has(name)) throw new Error('Uncached proof body missing: ' + file + ':' + name);
     for (const edit of edits.sort((left, right) => right.pos - left.pos)) source = source.slice(0, edit.pos) + edit.text + source.slice(edit.pos);
-    if (file === 'src/om/input.js') {
+    // R5 (№2451): the common mechanism lives in history/proofs; its anchors stay, each still required exactly once.
+    if (file === 'src/history/proofs.js') {
       const miss = 'const result = synchronous(() => action(traced ? historicalTrace(store) : store));';
       if (source.split(miss).length !== 2) throw new Error('The common historical proof action was not identified');
       source = source.replace(miss, 'const costAttempt = globalThis.__operationCost.miss(key, sourceView(store), traced, source);\n'

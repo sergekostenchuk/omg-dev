@@ -8,9 +8,9 @@ import { fileURLToPath } from 'node:url';
 const ts = createRequire(import.meta.url)('typescript') as typeof import('typescript');
 
 // №32: the import ring is a ratchet — it may only shrink. The limits are the
-// largest strongly connected component sizes measured after R2 (№2419, №2427)
-// on om/module = 4c2d5b3: the stage checks left ProductEngine (83 → 62, 133 → 101).
-const LOAD_RING_LIMIT = 62;
+// largest strongly connected component sizes measured after R5 (№2451) on
+// om/module = 380abe7: the historical-read mechanism left om/input (load 62 → 40, full 101).
+const LOAD_RING_LIMIT = 40;
 const FULL_RING_LIMIT = 101;
 
 type Graph = Map<string, string[]>;
@@ -184,4 +184,19 @@ test('R2 (№2419, №2427, №2430): the product engine is one-way over OM and 
     if (name.startsWith('om/') || name === 'product/stage-checks.ts')
       assert.ok(!targets.includes('product/engine.ts') && !targets.includes('product/preparation-run.ts'),
         `${name} must not import the engine or preparation-run, not even a type`);
+});
+
+test('R5 (№2451): the historical-read mechanism is below OM — history/proofs reaches no om, compiler or product file even through types, is its own component in both graphs, and the compiler and task obligations import it instead of om/input', () => {
+  const root = fileURLToPath(new URL('../../src/', import.meta.url));
+  const { load, full } = collectEdges(sources(root));
+  const reached = new Set(['history/proofs.ts']), queue = ['history/proofs.ts'];
+  for (let name = queue.shift(); name !== undefined; name = queue.shift())
+    for (const target of full.get(name) ?? []) if (!reached.has(target)) { reached.add(target); queue.push(target); }
+  assert.deepEqual([...reached].filter(name => /^(om|compiler|product)\//.test(name)), []);
+  assert.deepEqual(componentOf(load, 'history/proofs.ts'), ['history/proofs.ts']);
+  assert.deepEqual(componentOf(full, 'history/proofs.ts'), ['history/proofs.ts']);
+  for (const consumer of ['compiler/compiler.ts', 'compiler/context.ts', 'graph/task-obligations.ts']) {
+    assert.ok(!full.get(consumer)!.includes('om/input.ts'), `${consumer} no longer imports om/input`);
+    assert.ok(load.get(consumer)!.includes('history/proofs.ts'), `${consumer} imports the mechanism from below`);
+  }
 });

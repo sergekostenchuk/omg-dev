@@ -866,7 +866,7 @@ export async function load(url, context, next) {
  const result=await next(url,context);
  if(!url.startsWith(root)||result.format!=='module')return result;
  const file=url.slice(root.length);
- if(!['src/om/input.js','src/om/accepted-answer.js','src/storage/store.js'].includes(file))return result;
+ if(!['src/om/input.js','src/history/proofs.js','src/om/accepted-answer.js','src/storage/store.js'].includes(file))return result;
  let source=String(result.source);
  const tree=ts.createSourceFile(file,source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS), edits=[], found=new Set();
  function add(body,code){edits.push({pos:body.getStart(tree)+1,text:code});}
@@ -887,10 +887,14 @@ export async function load(url, context, next) {
   ts.forEachChild(node,visit);
  }
  visit(tree);
- const expected=file==='src/om/input.js'?['readInputRecord']:file==='src/storage/store.js'?['get']:['checkAcceptedRecord','loadMc1Question'];
+ const expected=file==='src/om/input.js'?['readInputRecord']:file==='src/history/proofs.js'?[]:file==='src/storage/store.js'?['get']:['checkAcceptedRecord','loadMc1Question'];
  for(const name of expected)if(!found.has(name))throw new Error('Full proof body absent: '+name);
  for(const edit of edits.sort((a,b)=>b.pos-a.pos))source=source.slice(0,edit.pos)+edit.text+source.slice(edit.pos);
- if(file==='src/om/input.js')source+='\\n'+monitor+'.view=sourceView;'+monitor+'.footprint=()=>checkingFootprint>0;';
+ // R5 (№2451): the proof mechanism and its internals live in history/proofs; a missing one fails the test.
+ if(file==='src/history/proofs.js'){
+  if(!/\\nfunction sourceView\\(/.test(source)||!/\\nlet checkingFootprint = /.test(source))throw new Error('The proof mechanism internals are absent');
+  source+='\\n'+monitor+'.view=sourceView;'+monitor+'.footprint=()=>checkingFootprint>0;';
+ }
  return {...result,source};
 }`);
   writeFileSync(preload, `import {register} from 'node:module';

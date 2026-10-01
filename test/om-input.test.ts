@@ -18,6 +18,7 @@ import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.j
 import { sealed } from "../src/om/refusal.js";
 import { pendingCallStore } from "../src/om/model-call.js";
 import { transactionForTests } from "../src/om/atomic-gate.js";
+import * as proofs from "../src/history/proofs.js";
 import { git, gitBytes, gitCalls } from "../src/runtime/environment.js";
 import {
   buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput, prepareReopenOmInput,
@@ -2159,4 +2160,76 @@ test("S1.4 (return №2, №2410 C1–C3) only a listed reader is kept on what t
     assert.deepEqual([counts[`tx.${name}`], counts[`tx.parent.${name}`]], [2, 2], `${name}: neither the child nor its parent was kept`);
   });
   assert.equal(first.get('s14t:candidate'), null, 'The preview never wrote to the Store');
+});
+
+test("R5 (№2451-1, -5) the old om/input entries and history/proofs are the same functions over one state: mixed and nested calls share one proof and replay it in full", t => {
+  assert.deepEqual([historicalRead, historicalProof, historicalTrace, withHistoricalReads],
+    [proofs.historicalRead, proofs.historicalProof, proofs.historicalTrace, proofs.withHistoricalReads]);
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'r5:a', kind: 'k', expected: 0, value: {} });
+  const key = { reader: 'R5.mixed', project: 'garden', ref: reference(a) };
+  let runs = 0;
+  const refs: string[] = [], view = historicalTrace(first, ref => { refs.push(ref.id); });
+  const prove = (entry: typeof historicalProof) => entry(view, key, source => { runs++; return canonical(source.get(a.id, 1) as Json); }, noCycle);
+  withHistoricalReads(() => { prove(proofs.historicalProof); proofs.withHistoricalReads(() => prove(historicalProof)); });
+  assert.equal(runs, 1, 'One proof across the old and the new entry, the nested scope sharing the outer one');
+  assert.deepEqual(refs, [a.id, a.id], 'The second use replays the whole trail to the trace');
+});
+
+test("R5 (№2451-4, -5) an exception releases the operation scope and an async action is the former input_request_invalid at G1/om-input — through either entry", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'r5:b', kind: 'k', expected: 0, value: {} });
+  let runs = 0;
+  const read = () => historicalRead(first, { reader: 'R5.released', project: 'garden', ref: reference(a) }, () => { runs++; return canonical(first.get(a.id, 1) as Json); }, noCycle);
+  assert.throws(() => proofs.withHistoricalReads(() => { read(); throw new Error('boom'); }), /boom/);
+  withHistoricalReads(read);
+  assert.equal(runs, 2, 'The failed operation left no scope behind: the next one derives on its own');
+  for (const scope of [withHistoricalReads, proofs.withHistoricalReads])
+    assert.throws(() => scope(() => Promise.resolve(1)), (error: unknown) => error instanceof EngineError && error.code === 'input_request_invalid'
+      && error.message === 'OM input needs a well-formed request' && canonical(error.details as Json) === canonical({ unit: 'G1', target: 'om-input', field: 'history.async' }));
+});
+
+test("R5 (№2451-3) the recovery's pending view owns its rows and is a trusted snapshot only over a source that is one: over a genuine Store a repeated proof checks no footprint, over an arbitrary Proxy it reads its source again", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'r5:c', kind: 'k', expected: 0, value: { v: 0 } });
+  const rows = [{ id: 'r5:pending', kind: 'k', revision: 1, hash: hashJson({ v: 1 }), value: { v: 1 } as Json }];
+  const trusted = proofs.pendingSnapshotView(first, rows);
+  rows[0]!.value = { v: 2 };
+  assert.deepEqual(trusted.get('r5:pending')!.value, { v: 1 }, 'The view owns its rows');
+  assert.ok(Object.isFrozen(trusted.get('r5:pending')));
+  assert.deepEqual(trusted.get(a.id), first.get(a.id), 'Every other read falls through to the source');
+  const proxy = new Proxy(first, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  const untrusted = proofs.pendingSnapshotView(proxy, rows);
+  const original = Store.prototype.get;
+  let gets = 0;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { gets++; return original.apply(this, args); } as typeof original;
+  t.after(() => { Store.prototype.get = original; });
+  const repeatReads = (view: Store) => withHistoricalReads(() => {
+    const prove = () => historicalProof(view, { reader: 'R5.pending', project: 'garden', ref: reference(a) }, source => canonical(source.get(a.id, 1) as Json), noCycle);
+    prove(); const before = gets; prove(); return gets - before;
+  });
+  assert.equal(repeatReads(trusted), 0, 'An exact read of a trusted snapshot is immutable: nothing to check again');
+  assert.ok(repeatReads(untrusted) > 0, 'Over an arbitrary Proxy the snapshot is not trusted: its footprint is read again');
+});
+
+test("R5 (return №1, №2471) the recovery's pending view owns a deep frozen copy of its rows: a nested object or array changed through the caller's argument or through a returned row never changes a trusted exact proof", t => {
+  const { first } = historicalStores(t);
+  const a = first.write({ id: 'r5d:a', kind: 'k', expected: 0, value: {} });
+  const value = { nested: { n: 1 }, list: [1, { m: 1 }] };
+  const rows = [{ id: 'r5d:pending', kind: 'k', revision: 1, hash: hashJson(value), value: value as unknown as Json }];
+  const view = proofs.pendingSnapshotView(first, rows);
+  let runs = 0;
+  const prove = () => historicalProof(view, { reader: 'R5.deep', project: 'garden', ref: reference(a) },
+    source => { runs++; return canonical(source.get('r5d:pending', 1)!.value as Json); }, noCycle);
+  withHistoricalReads(() => {
+    const cold = prove();
+    value.nested.n = 2; (value.list[1] as { m: number }).m = 2; value.list.push(3);
+    assert.deepEqual(view.get('r5d:pending', 1)!.value, { nested: { n: 1 }, list: [1, { m: 1 }] }, 'Changing the argument changes nothing the view holds');
+    const returned = view.get('r5d:pending', 1)!.value as { nested: { n: number }; list: unknown[] };
+    assert.throws(() => { returned.nested.n = 3; }, TypeError);
+    assert.throws(() => { returned.list.push(4); }, TypeError);
+    assert.equal(prove(), cold); assert.equal(runs, 1, 'The repeat of the exact proof is the same, and still true of the view');
+    assert.equal(canonical(view.get('r5d:pending', 1)!.value as Json), cold);
+  });
+  assert.ok(!Object.isFrozen(value) && !Object.isFrozen(value.nested) && !Object.isFrozen(value.list), "The caller's objects are not frozen in place");
 });

@@ -17,7 +17,7 @@ import { taskContext, loadTaskContextSources, boundedContext, selectDetail, type
 import { Owners, selectWriter } from "../ownership/owners.js";
 import { readWriterIndex } from "../ownership/writer-index.js";
 import { readFeasibility, type OmFeasibility } from "../om/feasibility.js";
-import { historicalTrace, withHistoricalReads } from "../om/input.js";
+import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readinessObligations } from '../graph/obligation-readiness.js';
 import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
 export type { MachinePlan } from "./model.js";
