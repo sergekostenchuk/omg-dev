@@ -2130,7 +2130,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/canonical.ts`, `src/om/series.ts`, `src/om/refusal-journal.ts`, `src/om/call-record.ts`, `src/om/obligations.ts`, `test/om-composite-keys.test.ts`, `test/om-call-record.test.ts`, `test/om-answers-gate.test.ts`, `test/om-model-call.test.ts`, `test/om-refusal-journal.test.ts`
+- Разрешённые пути: `src/canonical.ts`, `src/om/series.ts`, `src/om/refusal-journal.ts`, `src/om/call-record.ts`, `src/om/obligations.ts`, `test/om-composite-keys.test.ts`, `test/om-call-record.test.ts`, `test/om-answers-gate.test.ts`, `test/om-model-call.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-run.test.ts`
 - Из движка как есть: canonical — src/canonical.ts; наблюдение №21 — code/OBSERVATIONS.md
 - После: H1, Q2, Q2b, S1.1, R1, R2
 - Тесты сверх обязательных:
