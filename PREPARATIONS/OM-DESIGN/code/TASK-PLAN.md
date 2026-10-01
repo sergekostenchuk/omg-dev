@@ -1369,7 +1369,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
 - Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, раздел 3 (рёбра 13, 15, 22) и раздел 5 (риски TDZ); образец регистрации: om/refusal-journal.ts:256 answersSourceReader (S1.1 №1773)
-- После: S1.4
+- После: D8.4.2, S1.3
 - Тесты сверх обязательных:
   - ДОГОВОР — у ревьюера до кода (размещение слота, имена, отказ пустого слота)
   - храповик: LOAD_RING_LIMIT снижен до измеренного значения после правки; FULL — по замеру
