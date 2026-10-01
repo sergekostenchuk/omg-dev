@@ -562,6 +562,83 @@ test("writeGuarded rejects malformed absence and mixed guard forms before enteri
   assert.equal(store.get("om-answers:alpha"), null);
 });
 
+test("the input_stale address is the first stale guard in the normalized sequence, not the caller's array order", t => {
+  const { store, path } = fixture(t);
+  // An id-first pair with the opposite hash order: under a hash-first ordering the caller would list beta first,
+  // while the normalized sequence — the one writeMany checked — sorts by id and so always names alpha.
+  const low = store.write({ id: "om-input:alpha", kind: "om-input", expected: 0, value: { claim: "x" } });
+  let high = store.write({ id: "om-input:beta", kind: "om-input", expected: 0, value: { pick: 0 } });
+  for (let pick = 1; high.hash > low.hash; pick++)
+    high = store.write({ id: high.id, kind: "om-input", expected: high.revision, value: { pick } });
+  assert.ok(low.id < high.id && low.hash > high.hash);
+  const kept = store.write({ id: "om-input:0-kept", kind: "om-input", expected: 0, value: {} });
+
+  const second = new Store(path);
+  try {
+    second.write({ id: low.id, kind: "om-input", expected: low.revision, value: { claim: "moved" } });
+    second.write({ id: high.id, kind: "om-input", expected: high.revision, value: { pick: -1 } });
+  } finally { second.close(); }
+
+  const lowGuard = reference(low), highGuard = reference(high), keptGuard = reference(kept);
+  const writes = [
+    { id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} },
+    { id: "om-gaps:alpha", kind: "om-gaps", expected: 0, value: {} },
+  ];
+  const writesBefore = canonical(writes);
+  const variants: TransactionGuard[][] = [
+    [keptGuard, lowGuard, highGuard],
+    [highGuard, lowGuard, keptGuard],
+    [highGuard, lowGuard, highGuard, keptGuard, lowGuard],
+  ];
+  let first: Refusal | null = null;
+  for (const guards of variants) {
+    const before = canonical(guards);
+    const refusal = addressed(refusalOf(writeGuarded(store, {
+      unit: UNIT, target: "answers:alpha", writes, guards,
+    })), "input_stale");
+    // The current guard that sorts first is skipped; the address is the id-first stale guard and its expected Ref.
+    assert.equal(refusal.at.target, low.id);
+    assert.deepEqual(refusal.at.ref, lowGuard);
+    if (first) assert.deepEqual(refusal, first); else first = refusal;
+    assert.equal(canonical(guards), before);
+  }
+  assert.equal(canonical(writes), writesBefore);
+  assert.equal(store.get("om-answers:alpha"), null);
+  assert.equal(store.get("om-gaps:alpha"), null);
+});
+
+test("a stale positive guard names its expected reference while a stale absence names only its id", t => {
+  const { store, path } = fixture(t);
+  const moved = store.write({ id: "om-input:moved", kind: "om-input", expected: 0, value: {} });
+  const absentFirst = { id: "absent-probe:first", absent: true } as const;
+  const absentLast = { id: "reader-pilot:created", absent: true } as const;
+  const second = new Store(path);
+  try {
+    second.write({ id: moved.id, kind: "om-input", expected: moved.revision, value: { moved: true } });
+    second.write({ id: absentFirst.id, kind: "probe", expected: 0, value: {} });
+    second.write({ id: absentLast.id, kind: "probe", expected: 0, value: {} });
+  } finally { second.close(); }
+  const movedGuard = reference(moved);
+
+  // Both stale; the absent guard sorts first by id, so it is named and carries no reference.
+  const negative = addressed(refusalOf(writeGuarded(store, {
+    unit: UNIT, target: "answers:alpha", guards: [movedGuard, absentFirst],
+    writes: [{ id: "om-answers:alpha", kind: "om-answers", expected: 0, value: {} }],
+  })), "input_stale");
+  assert.deepEqual(negative.at, { unit: UNIT, target: absentFirst.id });
+  assert.equal(Object.hasOwn(negative.at, "ref"), false);
+
+  // With the positive guard first in the normalized order the address is its id and at.ref is the expected Ref.
+  const positive = addressed(refusalOf(writeGuarded(store, {
+    unit: UNIT, target: "answers:alpha", guards: [absentLast, movedGuard],
+    writes: [{ id: "om-answers:beta", kind: "om-answers", expected: 0, value: {} }],
+  })), "input_stale");
+  assert.equal(positive.at.target, moved.id);
+  assert.deepEqual(positive.at.ref, movedGuard);
+  assert.equal(store.get("om-answers:alpha"), null);
+  assert.equal(store.get("om-answers:beta"), null);
+});
+
 test("writeGuarded keeps the previous malformed Ref refusal fields while accepting the new guard channel", t => {
   const { store } = fixture(t);
   const id = "om-input:alpha", hash = hashJson({ claim: "x" });

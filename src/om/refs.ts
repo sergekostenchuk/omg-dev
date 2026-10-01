@@ -119,8 +119,7 @@ export function writeGuarded<T = Json>(store: Store, request: GuardedWrite): OmR
   } catch (error) {
     if (!(error instanceof EngineError)) throw error;
     if (error.code === "input_stale") {
-      // Revisions only grow and never change, so the guard that failed inside the transaction still fails here.
-      const stale = staleGuard(store, request.guards);
+      const stale = staleGuard(store, guards);
       return refused("input_stale", "A guarded input changed before this transaction could commit",
         { unit, target: stale?.id ?? subject, ref: stale && !("absent" in stale) ? stale : undefined }, "producer");
     }
@@ -165,6 +164,10 @@ function referenceField(value: unknown): string {
   return "reference";
 }
 
+// Revisions only grow and never change, so a guard that failed inside the transaction still fails here. The store
+// refuses without naming the input, so the address is the first stale guard found in the normalized sequence the
+// transaction itself checked — deterministic for a given observed state, and not a witness of the exact cause
+// inside the transaction: between the rollback and this rescan another store may have moved a further input.
 function staleGuard(store: Store, guards: readonly TransactionGuard[]): TransactionGuard | null {
   for (const guard of guards) {
     if (!transactionGuardsCurrent(store, [guard])) return guard;
