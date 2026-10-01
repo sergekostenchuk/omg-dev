@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 105. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → Q4 → Q5 → H2.0 → D8.5.1.
+Задач: 107. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → Q5 → H2.0 → D8.5.1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 36.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 38.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -1449,6 +1449,44 @@
   - храповик: загрузочная SCC существенно меньше 62, полная не больше 101; пороги по факту
   - регрессии S1.3/S1.4 (om-input, storage, store-view, om-operation-cost) без правки ожиданий; холодные продуктовые входы
 
+### R6 · Кольцо импортов R6: GapRecord структурным типом в graph/task-obligations
+
+**Цель.** graph/task-obligations.ts перестаёт импортировать тип GapRecord из om/gaps: узкий экспортируемый структурный тип { gap: { deferral?: object } }; совместимость GapRecord проверяется статическим утверждением в тесте; поведение и отказы неизменны; крупнейшая полная SCC без om/*.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: —
+- Пишет записи: —
+- Разрешённые пути: `src/graph/task-obligations.ts`, `test/task-obligations.test.ts`, `test/import-ring.test.ts`
+- Из движка как есть: разбор №2482; договор №2484 — читать ЦЕЛИКОМ
+- После: R5
+- Тесты сверх обязательных:
+  - ДОГОВОР №2484-1,2: структурный срез не заменяет доказательство записи (verifiedScope/OM-рукопожатие до чтения, условие пробуждения и отказы неизменны); импорт GapRecord только в тесте (не через Pick/ReturnType/import() в src); runtime-проверку формы не вводить
+  - храповик по факту (ожидаемо 40/53); закрепить отсутствие ребра task-obligations → om/gaps и отсутствие om/* в КРУПНЕЙШЕЙ полной SCC
+  - прежние task-obligations без правки ожиданий
+
+### R3 · Кольцо импортов R3+R4: OM-читатели компилятора через нижний слот
+
+**Цель.** Нижний комплект src/compiler/om-readers.ts и верхний регистрант src/om/compiler-readers.ts (явно из product/engine.ts): readFeasibility, gateFeasibility, neighborsOf, readNeighbors, readAtomicGate, readAcceptedFrame, readFrame, readDeliveries, readWorksFrame; потребители compiler/basis, compiler/compiler, compiler/context, graph/refinement, execution/task-obligations больше не импортируют om/*; реализации остаются в прежних OM-модулях.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: —
+- Пишет записи: —
+- Разрешённые пути: `src/compiler/om-readers.ts`, `src/om/compiler-readers.ts`, `test/om-compiler-readers.test.ts`, `src/compiler/basis.ts`, `src/compiler/compiler.ts`, `src/compiler/context.ts`, `src/graph/refinement.ts`, `src/execution/task-obligations.ts`, `src/product/engine.ts`, `test/import-ring.test.ts`
+- Из движка как есть: образец R1 — регистрация читателей обязательств (договор №2348); договор №2484 — читать ЦЕЛИКОМ
+- После: R6
+- Тесты сверх обязательных:
+  - ДОГОВОР №2484-3..8: типы слота структурные, без импортов om/*, ProductEngine, реализаций compiler (и транзитивно); tsc проверяет совместимость на регистрации всего комплекта без any/приведений
+  - регистрация однократная и атомарная: om_compiler_reader_invalid / повтор без эффекта / om_compiler_reader_conflict; своя копия ссылок; пустой слот → EngineError om_compiler_reader_unavailable (unit compiler, target, адрес) без чтений/записей и без null
+  - регрессии: пустой/неполный/повторный/конфликтующий комплект и мутация; холодный нижний вход до и после сборки; холодные engine, CLI, server-first с настоящим запросом + om-start; сравнение compile, refinement gate и контекста с базовой реализацией (Ref, guards, references, текст и hash контекста; legacy и OM; историческое чтение после сдвига голов); наблюдение чтений через тот же Store
+  - добавление явной сборки продукта в фикстуры, полагавшиеся на транзитивный импорт, — без согласования, строкой в сдаче
+  - храповик по факту (ожидаемо загрузочная 30, полная не выше принятой R6)
+
 ## Срез E · Обращения к модели: G8, учёт, пакет вопроса, форма ответа, отправка, оценщик
 
 Узкий адресный вопрос вместо «всего проекта». Задач: 10.
@@ -2112,7 +2150,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/storage/store.ts`, `src/product/engine.ts`, `src/om/series.ts`, `test/storage.test.ts`, `test/om-series-current.test.ts`
 - Из движка как есть: проверка внешнего ревью — ~/REPORTS/review/omg-external-review-8.5-verification_260926.md; урок 36 — операционная область доказанных чтений; withHistoricalReads — src/om/input.ts:710-715
-- После: H1, H2, Q3, Q2.1, S1.4, R1, R2
+- После: H1, H2, Q3, Q2.1, S1.4, R1, R2, R3
 - Тесты сверх обязательных:
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода НУЖНА; в договоре — нет; допуск legacy/unactivated/active/участие — таблица ДО выдачи; ориентиры Jev (куда смотреть при описи, не судья): src/product/engine.ts:ProductEngine.validateStage:214; src/product/engine.ts:ProductEngine.#assess:405; src/om/series.ts:prepareBegin:811
   - найдено 26.09.2026 (872e678): engine.ts:393-394 #omProject для legacy-проекта — store.list() без kind (головы ВСЕГО хранилища, store.ts:68-73) и history() по каждой (1+N запросов, N+R декодов SHA-256+JSON.parse); 9 путей из 48 команд (project, assess, compile, draft-om, draft-plan, accept-stage om-g2/compilation, continue-preparation ×2, repair-plan, repairs.prepare) и каждое чтение проекции (server.ts:44/:50; опрос UI раз в 1,2 с — ui/execution.tsx:15); кэша нет; для OM-проекта скан прекращается на первом B1 (engine.ts:387-391)
@@ -2286,7 +2324,7 @@
 - Пишет записи: owner-result
 - Разрешённые пути: `src/om/owner-result.ts`, `test/om-owner-result.test.ts`, `src/product/engine.ts`, `src/product/commands.ts`, `src/server.ts`, `test/server.test.ts`, `src/om/answers-gate.ts`, `test/om-answers-gate.test.ts`, `src/cli.ts`, `src/product/owner-authority.ts`, `test/owner-authority.test.ts`, `ui/app.tsx`
 - Из движка как есть: D1/D4 — gaps, routes; H2 — полномочие источника команды (вердикт №244)
-- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5, R1, R2
+- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5, R1, R2, R3
 - Тесты сверх обязательных:
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода НУЖНА; в договоре — частичная; состояния приглашения/сессии/команды (№1353) — таблица ДО кода; ориентиры Jev (куда смотреть при описи, не судья): src/product/engine.ts:ProductEngine.validateStage:214; src/product/engine.ts:ProductEngine.#assess:405; src/product/engine.ts:ProductEngine.execute:459
   - ДОГОВОР МЕХАНИЗМА Б №1353 (файл ~/REPORTS/review/omg-code-h20_owner-authority-contract_260926.md) И РАЗРЕШЕНИЕ ВЛАДЕЛЬЦА 26.09.2026: отдельная локальная команда выпуска одноразового приглашения владельца (не ProductCommand, недоступна через execute/HTTP, serve по умолчанию не выпускает; секрет высокой энтропии через интерактивный терминал владельца; в Store — owner-session-grant/v1 с проверочным значением, без секрета; срок 10 мин, без продления) и UI входа/подтверждения (ui/app.tsx) — РАЗРЕШЕНЫ; локальный выпуск — доверенный bootstrap модели Б; обмен в UI: POST /api/owner/session требует общий connection token И секрет приглашения, однократность через детерминированный адрес сессии expected:0; bearer в HttpOnly SameSite=Strict cookie /api/owner (+Secure при HTTPS), точный Origin обязателен; owner-session/v1 — 30 мин, без продления, выход отзывает, перезапуск сервера уничтожает живые bearer; runtime-полномочие — непрозрачное, по закрытому реестру идентичностей (привязка Store/проект/действие/сессия), без brand/фабрики по role; execute и /api/command полномочия не получают никогда; общий writer owner-result проверяет полномочие перед подготовкой и перед записью, в транзакцию — точная ревизия сессии и предметные охраны; owner-command/v1 — идентичность команды, databaseId/project/action, точный Ref ревизии owner-session, B1/D1/M6, адрес и договор вопроса, значение и основание (без секретов); квитанция и owner-result одной транзакцией; точный повтор до нового допуска; история — по сохранённым ревизиям, logout/истечение не отменяют записанное; проверки выдачи/сессии — только в owner-authority.ts (не дублировать в server.ts/owner-result.ts); тест: обычные serve/command не выпускают приглашение и не создают owner-result; точный список тестовых файлов CLI/UI — при описи; поставка — вся цепочка до G4b
