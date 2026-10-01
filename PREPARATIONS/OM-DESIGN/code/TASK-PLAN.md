@@ -1349,7 +1349,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/om/input.ts`, `src/storage/store.ts`, `src/storage/store-view.ts`, `src/om/atomic-gate.ts`, `test/om-input.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
 - Из движка как есть: договор S1.3 ~/REPORTS/review/omg-code-s13_contract-2185.md (№2185, №2194, №2201, №2217, №2233, №2248); сухие проверки ~/OMG/PREPARATIONS/OM-DRYRUN/ и /tmp/omg-preflight-kimi-run/ (Kimi №2291)
 - После: S1.3, D8.4.2, T-DIET, H1.5
 - Тесты сверх обязательных:
