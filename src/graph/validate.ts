@@ -13,6 +13,29 @@ import { requiredTests } from "./obligations.js";
 const ajv = new Ajv({ allErrors: true, strict: true, allowUnionTypes: true });
 const shape = ajv.compile<Graph>(graphSchema);
 const enrichedShape = ajv.compile<Graph>(graphV2Schema);
+/**
+ * S1.5 (№2363): whether a contract schema compiles on its own, remembered by the hash of the whole schema — a boolean
+ * per schema, never a validator, a schema or an Ajv shared between contracts: a shared instance lets one schema's $id
+ * serve another's $ref and refuses an equal $id. A miss compiles in a fresh isolated Ajv exactly as before and keeps
+ * nothing of it; a schema without a hash is compiled exactly as before. Bounded: the least recently used verdict goes.
+ */
+const SCHEMA_VERDICTS = 512;
+const schemaVerdicts = new Map<string, boolean>();
+function compiles(schema: unknown): boolean {
+  let key: string | null = null;
+  try { key = hashJson(schema); } catch { key = null; }
+  if (key !== null) {
+    const kept = schemaVerdicts.get(key);
+    if (kept !== undefined) { schemaVerdicts.delete(key); schemaVerdicts.set(key, kept); return kept; }
+  }
+  let verdict = true;
+  try { new Ajv({ strict: true }).compile(schema as object); } catch { verdict = false; }
+  if (key !== null) {
+    schemaVerdicts.set(key, verdict);
+    for (const oldest of schemaVerdicts.keys()) { if (schemaVerdicts.size <= SCHEMA_VERDICTS) break; schemaVerdicts.delete(oldest); }
+  }
+  return verdict;
+}
 export interface Validation { graph: Graph | null; hash: string | null; findings: Finding[] }
 
 export function validateGraph(input: unknown): Validation {
@@ -46,10 +69,8 @@ export function validateGraph(input: unknown): Validation {
     return false;
   };
   const relations = new RefinementRelations(graph);
-  for (const contract of graph.contracts) {
-    try { new Ajv({ strict: true }).compile(contract.schema as object); }
-    catch { fail("contract_invalid", contract.id, "Contract must be a valid self-contained JSON Schema"); }
-  }
+  for (const contract of graph.contracts)
+    if (!compiles(contract.schema)) fail("contract_invalid", contract.id, "Contract must be a valid self-contained JSON Schema");
   for (const artifact of graph.artifacts) if (!contracts.has(artifact.contract)) fail("contract_missing", artifact.id, artifact.contract);
   for (const node of graph.nodes) {
     if (!artifacts.has(node.outcome)) fail("outcome_missing", node.id, node.outcome);

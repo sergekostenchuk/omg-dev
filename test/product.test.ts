@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -79,4 +79,37 @@ test("unrelated research cannot approve a stage and research retains the input v
   const concept = engine.prepare("demo", "concept");
   engine.discovery.evidence.document("demo", "brief", "new brief", "text/plain", 1);
   assert.ok(engine.discovery.gate("demo", reference(concept)).findings.some(f => f.code === "research_context_stale"));
+});
+
+// S1.5 (№2363): the projection is no function of the Store alone — the files behind its sources and the executor's
+// memory speak at every call, so nothing of it may be remembered by the Store's change stamp.
+test("S1.5 №2363 the projection follows the files behind its sources at an unchanged Store stamp — a changed, a removed and a restored file — and reads executionRunning from the executor each time", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-s15-")); const store = new Store(join(root, "state.sqlite"));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  engine.execute({ type: "create-project", project: "p", title: "Probe" });
+  const file = join(root, "brief.txt"); writeFileSync(file, "old brief");
+  const source = engine.discovery.evidence.file("p", "brief", root, "brief.txt", "text/plain", 0);
+  const draft = engine.prepare("p", "discovery"), question = draft.value.questions[0]!;
+  engine.discovery.fact(question, 1, reference(source), { kind: "text-range", start: 0, end: 9 });
+  const assessment = () => engine.projection("p").questions.find(row => row.id === question)!.assessment;
+  const stamp = store.changeStamp();
+  assert.equal(assessment().state, "answered");
+  writeFileSync(file, "new brief");
+  const changed = assessment();
+  assert.equal(store.changeStamp(), stamp, "No record changed: a projection remembered by the stamp would have kept the stale answer");
+  assert.equal(changed.state, "stale"); assert.ok(changed.findings.some(finding => finding.code === "evidence_stale"));
+  rmSync(file);
+  const removed = assessment();
+  assert.equal(removed.state, "stale"); assert.ok(removed.findings.length, "A removed file is no current evidence either");
+  writeFileSync(file, "old brief");
+  assert.equal(assessment().state, "answered", "The restored file makes the same answer current again");
+  assert.equal(store.changeStamp(), stamp);
+  // executionRunning comes from the executor's memory, never from a record.
+  assert.equal(engine.projection("p").executionRunning, false);
+  const executor = engine.executor, original = executor.isRunning;
+  executor.isRunning = () => true;
+  try { assert.equal(engine.projection("p").executionRunning, true); } finally { executor.isRunning = original; }
+  assert.equal(engine.projection("p").executionRunning, false);
+  assert.equal(store.changeStamp(), stamp);
 });

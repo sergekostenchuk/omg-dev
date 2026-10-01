@@ -857,3 +857,47 @@ test('G1.4 persisted repair release requires complete own result, defect and par
     store.close(); store = new Store(database); assert.deepEqual(readLegacyOperation(store, 'p'), repeated); firstInput(store);
   } finally { store.close(); rmSync(database, { force: true }); }
 });
+
+// ---- S1.5 (№2363): the search for saved OM provenance follows the Store it is given ----
+
+const legacyRoute = (engine: ProductEngine) => engine.legacyRoute('p');
+const provenanceRefusal = (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
+  && canonical(error.details) === canonical({ unit: 'product', target: 'om-input:p', field: 'revision' });
+const bareLegacy = { om: false, guards: [{ id: 'om-input:p', absent: true }] };
+
+test('S1.5 №2363 a provenance record written by a second Store refuses the next pass of the first Store and of a cold reopening alike', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-s15-second-')), database = join(directory, 'state.sqlite');
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  engine.execute({ type: 'create-project', project: 'p', title: 'p' });
+  assert.deepEqual(legacyRoute(engine), bareLegacy);
+  const other = new Store(database);
+  try { other.write({ id: 'om-horizon:p:h1', kind: 'om-horizon', expected: 0, value: {} }); } finally { other.close(); }
+  assert.throws(() => legacyRoute(engine), provenanceRefusal, 'The first Store sees the record the second one wrote');
+  store.close(); store = new Store(database); engine = new ProductEngine(store);
+  assert.throws(() => legacyRoute(engine), provenanceRefusal, 'A cold reopening agrees');
+});
+
+test('S1.5 №2363 a view that is no proven Store keeps the full walk through its own reads: a subclass serving a provenance record its file lacks refuses, while the genuine Store and a Proxy of it stay legacy', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-s15-view-')), database = join(directory, 'state.sqlite');
+  const store = new Store(database);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  new ProductEngine(store).execute({ type: 'create-project', project: 'p', title: 'p' });
+  const ghost: Revision = { id: 'om-horizon:p:ghost', kind: 'om-horizon', revision: 1, hash: '0'.repeat(64), value: {} };
+  class Overlay extends Store {
+    override get<T = Json>(id: string, revision?: number): Revision<T> | null { return id === ghost.id ? ghost as Revision<T> : super.get<T>(id, revision); }
+    override list<T = Json>(kind?: string): Revision<T>[] {
+      const rows = super.list<T>(kind); return kind === undefined || kind === ghost.kind ? [...rows, ghost as Revision<T>] : rows;
+    }
+    override history<T = Json>(id: string): Revision<T>[] { return id === ghost.id ? [ghost as Revision<T>] : super.history<T>(id); }
+  }
+  const overlay = new Overlay(database);
+  try {
+    assert.throws(() => legacyRoute(new ProductEngine(overlay)), provenanceRefusal,
+      'The identities of the file beneath do not describe the view: the reads of the view itself decide');
+  } finally { overlay.close(); }
+  assert.deepEqual(legacyRoute(new ProductEngine(store)), bareLegacy, 'The genuine Store holds no provenance');
+  // A transparent Proxy, bound to its target the way the engine's own trace views are: no proven Store, the same records.
+  const proxied = new Proxy(store, { get(target, key) { const value: unknown = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value; } });
+  assert.deepEqual(legacyRoute(new ProductEngine(proxied)), bareLegacy, 'A Proxy walks the same records through its own reads and agrees');
+});

@@ -18,6 +18,7 @@ import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-ob
 import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
@@ -177,6 +178,19 @@ function b1OriginSource(project: string, value: unknown): boolean {
   if (context['kind'] === 'frame') return namedB1References(project, context['request'], FRAME_ORIGIN_REFS);
   if (context['kind'] === 'proposal') return namedB1References(project, context['request'], PROPOSAL_ORIGIN_REFS);
   return false;
+}
+/**
+ * S1.5 (№2363): every address whose record savedB1Origin can accept in any revision — the fixed B1 addresses and the
+ * namespaces of the producer table: those the project owns through the address itself, and the two whose ownership
+ * is claimed only by a body, taken whatever project their current head names. Decided by the address alone, never by
+ * a kind or by the text of a body, so the search below reads bodies and histories of these records only.
+ */
+function b1Candidate(project: string, id: string): boolean {
+  if (b1Address(project, id)) return true;
+  const namespace = id.split(':')[0]!;
+  if (!Object.hasOwn(B1_SHARED_ORIGINS, namespace)) return false;
+  return namespace === 'runtime-observation' || namespace === 'writer-index'
+    || id.startsWith(`${namespace}:${project}:`) || id === `${namespace}:${project}`;
 }
 function savedB1Origin(project: string, record: Revision<unknown>): boolean {
   if (b1Address(project, record.id)) return true;
@@ -412,7 +426,15 @@ export class ProductEngine {
       if (!checked.ok) throw new EngineError(checked.refusal.code, checked.refusal.message, checked.refusal.at);
       return true;
     }
-    const savedOrigin = this.store.list().some(record => savedB1Origin(project, record)
+    // S1.5 (№2363): without a first B1 the saved provenance is sought only where the predicate can find it. On a proven
+    // genuine Store the candidates are chosen by identity, without decoding the bodies of foreign namespaces; any other
+    // view — pending, trace, Proxy, subclass — keeps the full walk through its own reads, which its identities do not
+    // describe. The predicate, its history walk and the refusal stay the same; a corrupt candidate still surfaces.
+    const genuine = provenStore(this.store);
+    const records = genuine
+      ? genuine.identities('list').filter(row => b1Candidate(project, row.id)).flatMap(row => { const head = this.store.get(row.id); return head ? [head] : []; })
+      : this.store.list();
+    const savedOrigin = records.some(record => savedB1Origin(project, record)
       || this.store.history(record.id).some(revision => savedB1Origin(project, revision)));
     if (savedOrigin)
       throw new EngineError('record_missing', 'OM provenance requires the exact first B1 input',

@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson } from '../src/canonical.js';
@@ -625,4 +626,111 @@ try{
     assert.equal(exactHistory(), canonical(expectedHistory));
     assert.equal(store.get('om-input:p'), null);
   } finally { store.close(); }
+});
+
+// ---- S1.5 (№2363): the search for saved OM provenance of a project without its first B1 ----
+
+/** Two bare projects in one Store: the era question is asked of 'p', 'q' is the foreign neighbour. */
+function provenanceFixture(t: TestContext) {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-s15-provenance-')), database = join(directory, 'state.sqlite');
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  for (const project of ['p', 'q']) engine.execute({ type: 'create-project', project, title: project });
+  return { database, get store() { return store; }, get engine() { return engine; },
+    reopen() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
+}
+/** The refusal of #omProject at the exact first B1 address — through the legacy route and through the projection. */
+function refusesProvenance(engine: ProductEngine, project = 'p') {
+  const provenance = (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
+    && canonical(error.details) === canonical({ unit: 'product', target: `om-input:${project}`, field: 'revision' });
+  assert.throws(() => engine.legacyRoute(project), provenance);
+  assert.throws(() => engine.projection(project), provenance);
+}
+const stillLegacy = (engine: ProductEngine, project = 'p') =>
+  assert.deepEqual(engine.legacyRoute(project), { om: false, guards: [{ id: `om-input:${project}`, absent: true }] });
+
+/** One record per class of the provenance table (and of its negatives), written without a first B1 of 'p'. */
+const PROVENANCE_ROWS: { name: string; row: { id: string; kind: string; value: unknown }; refused: boolean; refusedQ?: boolean }[] = [
+  { name: 'a fixed B1 address', row: { id: 'om-feasibility:p', kind: 'om-feasibility', value: {} }, refused: true },
+  { name: 'a B1 producer address', row: { id: 'om-horizon:p:h1', kind: 'om-horizon', value: { any: 'body' } }, refused: true },
+  { name: 'an OM frame address', row: { id: 'om-frame:p:2', kind: 'om-frame', value: {} }, refused: true },
+  { name: 'a part proposal address', row: { id: 'om-proposal:p:part:x', kind: 'om-proposal', value: {} }, refused: true },
+  { name: 'the mechanism series address', row: { id: 'repair-series:p:mechanism:1', kind: 'repair-series', value: {} }, refused: true },
+  { name: 'a declared reference path (graph-layer acceptance.frame)', row: { id: 'graph-layer:p:1', kind: 'graph-layer',
+    value: { acceptance: { frame: { id: 'om-frame:p:2', revision: 1, hash: 'f' } } } }, refused: true },
+  { name: 'a declared source path (om-unit-refusal origin.sources ref)', row: { id: 'om-unit-refusal:p:u1', kind: 'om-unit-refusal',
+    value: { refusals: [{ origin: { sources: [{ ref: { id: 'om-input:p', revision: 1, hash: 'i' } }] } }] } }, refused: true },
+  { name: 'a declared owner path (the M5 mechanism)', row: { id: 'om-owner-decision:p:d1', kind: 'om-owner-decision',
+    value: { owner: { kind: 'mechanism', mechanism: 'M5:addressing' } } }, refused: true },
+  { name: 'an OM model call with a B1 draft', row: { id: 'model-call:p:om:c1', kind: 'model-call', value: { draftId: 'om-input:p' } }, refused: true },
+  { name: 'a research model call with the same body', row: { id: 'model-call:p:research:c2', kind: 'model-call', value: { draftId: 'om-input:p' } }, refused: false },
+  { name: 'the om-g2 stage bound to the OM feasibility', row: { id: 'stage:p:om-g2', kind: 'stage',
+    value: { content: { feasibility: { id: 'om-feasibility:p', revision: 1, hash: 'f' } } } }, refused: true },
+  { name: 'an upstream stage drafted from a B1 producer', row: { id: 'stage:p:discovery', kind: 'stage',
+    value: { content: { draft: { id: 'om-horizon:p:x', revision: 1, hash: 'h' } } } }, refused: true },
+  { name: 'the OM writer index, owned through its body', row: { id: 'writer-index:any-address', kind: 'writer-index',
+    value: { project: 'p', contract: 'writer-index/om-m8-v1' } }, refused: true },
+  { name: "another project's OM writer index", row: { id: 'writer-index:other', kind: 'writer-index',
+    value: { project: 'q', contract: 'writer-index/om-m8-v1' } }, refused: false, refusedQ: true },
+  { name: 'a managed repair series by its contract', row: { id: 'repair-series:p:1:garden-block', kind: 'repair-series', value: { contract: 'om-repair-series/v2' } }, refused: true },
+  { name: 'a legacy repair series', row: { id: 'repair-series:p:1:other-block', kind: 'repair-series', value: { attempts: [] } }, refused: false },
+  { name: 'a transition-managed membership', row: { id: 'om-series-membership:p', kind: 'om-series-membership', value: { mode: 'transition-managed' } }, refused: true },
+  { name: 'a legacy membership', row: { id: 'om-series-membership:p', kind: 'om-series-membership', value: { mode: 'legacy' } }, refused: false },
+  { name: 'a runtime observation owned through its body', row: { id: 'runtime-observation:host:1', kind: 'runtime-observation',
+    value: { projectId: 'p', scope: { id: 'om-input:p', revision: 1, hash: 'i' } } }, refused: true },
+  { name: "another project's runtime observation with the same scope", row: { id: 'runtime-observation:host:2', kind: 'runtime-observation',
+    value: { projectId: 'q', scope: { id: 'om-input:p', revision: 1, hash: 'i' } } }, refused: false },
+  { name: "another project's producer address", row: { id: 'om-horizon:q:h1', kind: 'om-horizon', value: {} }, refused: false, refusedQ: true },
+  { name: 'an incomplete body: a runtime observation without its project', row: { id: 'runtime-observation:host:3', kind: 'runtime-observation',
+    value: { scope: { id: 'om-input:p', revision: 1, hash: 'i' } } }, refused: false },
+  { name: 'an incomplete body: a series that is no object', row: { id: 'repair-series:p:1:text-block', kind: 'repair-series', value: 'text' }, refused: false },
+  { name: 'a namespace outside the table, whatever its body says', row: { id: 'research-context:p:x', kind: 'research-context',
+    value: { inputs: [{ id: 'om-input:p', revision: 1, hash: 'i' }], draft: { id: 'om-horizon:p:x' } } }, refused: false },
+  { name: 'a foreign namespace carrying a table kind', row: { id: 'custom:p:1', kind: 'repair-series', value: { contract: 'om-repair-series/v2' } }, refused: false },
+];
+
+test('S1.5 №2363 without a first B1 the saved provenance is found in every class of the producer table and nowhere else: fixed and producer addresses, declared reference, source and owner paths, the model-call, stage, writer-index, repair-series and membership rules, bodies that claim the project — never foreign projects, incomplete bodies or namespaces outside the table; a cold reopening agrees', t => {
+  for (const { name, row, refused, refusedQ } of PROVENANCE_ROWS) {
+    const f = provenanceFixture(t);
+    stillLegacy(f.engine); stillLegacy(f.engine, 'q');
+    f.store.write({ ...row, expected: 0 } as Write);
+    for (const pass of [0, 1]) {
+      if (pass) f.reopen();
+      if (refused) refusesProvenance(f.engine); else stillLegacy(f.engine);
+      if (refusedQ) refusesProvenance(f.engine, 'q'); else stillLegacy(f.engine, 'q');
+      assert.ok(true, name);
+    }
+  }
+});
+
+test('S1.5 №2363 provenance left only in an old revision is still found through the history: a membership that became legacy, and a writer index whose head now names another project', t => {
+  const f = provenanceFixture(t);
+  f.store.write({ id: 'om-series-membership:p', kind: 'om-series-membership', expected: 0, value: { mode: 'transition-managed' } });
+  f.store.write({ id: 'om-series-membership:p', kind: 'om-series-membership', expected: 1, value: { mode: 'legacy' } });
+  refusesProvenance(f.engine);
+  f.reopen(); refusesProvenance(f.engine);
+  const g = provenanceFixture(t);
+  g.store.write({ id: 'writer-index:w', kind: 'writer-index', expected: 0, value: { project: 'p', contract: 'writer-index/om-m8-v1' } });
+  g.store.write({ id: 'writer-index:w', kind: 'writer-index', expected: 1, value: { project: 'q', contract: 'other' } });
+  refusesProvenance(g.engine); stillLegacy(g.engine, 'q');
+  g.reopen(); refusesProvenance(g.engine); stillLegacy(g.engine, 'q');
+});
+
+test('S1.5 №2363 a corrupt record surfaces when it is a candidate of the search and is no longer read when its namespace lies outside the table', t => {
+  const f = provenanceFixture(t);
+  // A row the Store never wrote: its checksum does not match its body, so decoding it is an integrity refusal.
+  const corrupt = (id: string, kind: string) => {
+    const raw = new DatabaseSync(f.database);
+    try {
+      raw.prepare('INSERT INTO revisions(entity_id, revision, kind, body, sha256) VALUES (?, 1, ?, ?, ?)').run(id, kind, '{}', 'f'.repeat(64));
+      raw.prepare('INSERT INTO heads(entity_id, revision) VALUES (?, 1)').run(id);
+    } finally { raw.close(); }
+  };
+  corrupt('research-context:p:broken', 'research-context');
+  stillLegacy(f.engine);
+  f.reopen(); stillLegacy(f.engine);
+  corrupt('om-horizon:p:broken', 'om-horizon');
+  const integrity = (error: unknown) => error instanceof EngineError && error.code === 'record_corrupt';
+  assert.throws(() => f.engine.legacyRoute('p'), integrity);
+  f.reopen(); assert.throws(() => f.engine.legacyRoute('p'), integrity);
 });
