@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 103. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → R1 → S1.5 → R2 → Q2 → Q2b → Q3 → Q2.1 → Q4 → Q5 → H2.0.
+Задач: 103. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → S1.5 → R1 → R2 → Q2 → Q2b → Q3 → Q2.1 → Q4 → Q5 → H2.0.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -1387,9 +1387,9 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/graph/obligation-policy.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
+- Разрешённые пути: `src/graph/om-obligation-readers.ts`, `src/graph/obligation-policy.ts`, `src/product/engine.ts`, `src/om/obligations.ts`, `src/graph/obligation-handoff.ts`, `src/graph/runtime-evidence.ts`, `src/runtime/runtime-observation.ts`, `test/import-ring.test.ts`, `test/om-obligation-readers.test.ts`
 - Из движка как есть: план ~/OMG/PREPARATIONS/OM-RING/PLAN.md, раздел 3 (рёбра 13, 15, 22) и раздел 5 (риски TDZ); образец регистрации: om/refusal-journal.ts:256 answersSourceReader (S1.1 №1773)
-- После: D8.4.2, S1.3
+- После: D8.4.2, S1.3, S1.5
 - Тесты сверх обязательных:
   - ДОГОВОР — у ревьюера до кода (размещение слота, имена, отказ пустого слота)
   - храповик: LOAD_RING_LIMIT снижен до измеренного значения после правки; FULL — по замеру
