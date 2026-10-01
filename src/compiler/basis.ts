@@ -1,14 +1,13 @@
-import { Store, type Revision } from "../storage/store.js";
+import { Store } from "../storage/store.js";
 import type { MachinePlan } from "./model.js";
 import type { Feasibility } from "../graph/refinement.js";
 import type { StageArtifact } from "../pipeline/contracts.js";
 import { isRef } from "../pipeline/contracts.js";
 import { hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { readFeasibility, type OmFeasibility } from "../om/feasibility.js";
-import type { Sealed } from "../om/refusal.js";
+import { readFeasibility, type OmFeasibilityView, type OmRecord } from "./om-readers.js";
 
-export function requireBasis(store: Store, plan: MachinePlan): Sealed<Revision<OmFeasibility>> | void {
+export function requireBasis(store: Store, plan: MachinePlan): OmRecord<OmFeasibilityView> | void {
   requireCondition(plan && [1, 2].includes(plan.version) && [plan.graph, plan.environment, plan.stage, plan.feasibility].every(isRef)
     && Array.isArray(plan.guards) && plan.guards.every(isRef) && Array.isArray(plan.tasks), "plan_invalid", "Plan requires its versioned compilation basis");
   const stage = store.get<StageArtifact>(plan.stage.id, plan.stage.revision);
@@ -16,7 +15,7 @@ export function requireBasis(store: Store, plan: MachinePlan): Sealed<Revision<O
   requireCondition(stage?.kind === "stage" && stage.hash === plan.stage.hash && stage.value.projectId === plan.projectId
     && stage.value.stage === "om-g2" && stage.value.status === "accepted"
     && hashJson(stage.value.content) === hashJson({ feasibility: plan.feasibility }), "plan_basis_foreign", "Plan must bind the accepted OM-G2 stage");
-  let om: Sealed<Revision<OmFeasibility>> | undefined;
+  let om: OmRecord<OmFeasibilityView> | undefined;
   if (plan.feasibility.id.startsWith('om-feasibility:')) {
     requireCondition(plan.version === 2, 'plan_invalid', 'M8 compilation uses the version 2 task and ownership contract');
     const checked = readFeasibility(store, { project: plan.projectId, record: plan.feasibility });

@@ -8,10 +8,11 @@ import { fileURLToPath } from 'node:url';
 const ts = createRequire(import.meta.url)('typescript') as typeof import('typescript');
 
 // №32: the import ring is a ratchet — it may only shrink. The limits are the
-// largest strongly connected component sizes measured after R6 (№2484) on
-// om/module = 4f8084c: task-obligations reads the OM gap record through a
-// structural slice, so om/* left the largest full component (load 40, full 101 → 53).
-const LOAD_RING_LIMIT = 40;
+// largest strongly connected component sizes measured after R3+R4 (№2484) on
+// om/module = ee2bf80: the compiler, its context, refinement and task obligations
+// read OM through the lower compiler slot, so the load ring lost them (load 40 → 30;
+// full stays 53, which om/* had already left with R6).
+const LOAD_RING_LIMIT = 30;
 const FULL_RING_LIMIT = 53;
 
 type Graph = Map<string, string[]>;
@@ -210,4 +211,31 @@ test('R6 (№2484): graph/task-obligations keeps no edge to om/gaps or any om mo
   assert.deepEqual(targets.filter(name => name.startsWith('om/')), []);
   const ring = largestComponent(full);
   assert.deepEqual(ring.filter(name => name.startsWith('om/')).sort(), []);
+});
+
+test('R3+R4 (№2484, №2489): the compiler, its context, refinement and task obligations reach the OM readers only through the lower compiler slot, which reaches no om, product or compiler implementation even through types', () => {
+  const root = fileURLToPath(new URL('../../src/', import.meta.url));
+  const { load, full } = collectEdges(sources(root));
+  const readers = ['om/feasibility.ts', 'om/neighbors.ts', 'om/atomic-gate.ts', 'om/frame-accept.ts', 'om/frame-obligations.ts',
+    'om/deliveries.ts', 'om/works-frame.ts'];
+  // Not declared closed by this task: context still seals through om/refusal and reads plain records through om/refs.
+  const residual: Record<string, string[]> = { 'compiler/context.ts': ['om/refs.ts', 'om/refusal.ts'] };
+  for (const consumer of ['compiler/basis.ts', 'compiler/compiler.ts', 'compiler/context.ts', 'graph/refinement.ts', 'execution/task-obligations.ts']) {
+    const targets = full.get(consumer)!;
+    assert.deepEqual(targets.filter(name => readers.includes(name)), [], `${consumer} must not import an OM reader module, not even a type`);
+    for (const name of targets.filter(name => name.startsWith('om/')))
+      assert.ok((residual[consumer] ?? []).includes(name), `${consumer} gained an OM edge to ${name}`);
+    // task obligations take the proved basis from compiler/basis; the other four call the slot themselves.
+    if (consumer !== 'execution/task-obligations.ts')
+      assert.ok(load.get(consumer)!.includes('compiler/om-readers.ts'), `${consumer} reads OM through the lower slot`);
+  }
+  const reached = new Set(['compiler/om-readers.ts']), queue = ['compiler/om-readers.ts'];
+  for (let name = queue.shift(); name !== undefined; name = queue.shift())
+    for (const target of full.get(name) ?? []) if (!reached.has(target)) { reached.add(target); queue.push(target); }
+  assert.deepEqual([...reached].filter(name => /^(om|product|compiler)\//.test(name) && name !== 'compiler/om-readers.ts'), []);
+  assert.deepEqual(componentOf(load, 'compiler/om-readers.ts'), ['compiler/om-readers.ts']);
+  assert.deepEqual(componentOf(full, 'compiler/om-readers.ts'), ['compiler/om-readers.ts']);
+  // The registrant sits above the slot and is installed by the product assembly point.
+  assert.ok(load.get('om/compiler-readers.ts')!.includes('compiler/om-readers.ts'));
+  assert.ok(load.get('product/engine.ts')!.includes('om/compiler-readers.ts'));
 });

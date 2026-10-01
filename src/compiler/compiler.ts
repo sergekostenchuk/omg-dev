@@ -16,7 +16,7 @@ import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, loadTaskContextSources, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 import { Owners, selectWriter } from "../ownership/owners.js";
 import { readWriterIndex } from "../ownership/writer-index.js";
-import { readFeasibility, type OmFeasibility } from "../om/feasibility.js";
+import { readFeasibility, type ObligationHandoffForm } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readinessObligations } from '../graph/obligation-readiness.js';
 import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
@@ -36,7 +36,7 @@ export class Compiler {
     const record = this.store.get<Graph>(`graph:${project}`)!; const graph = requireGraph(record.value);
     const environment = this.environments.get(project);
     const owners = new Owners(this.store, project, feasibility.value.repository!);
-    const handoff = om ? (feasibility.value as OmFeasibility).obligations.handoff
+    const handoff = om ? feasibility.value.obligations!.handoff
       : taskObligationHandoff(this.store, project, feasibility.value.inputs);
     const researchObligations = handoff ? requireTaskObligations(this.store, project, graph, handoff) : undefined;
     const derived = deriveTasks(project, record.hash, graph, (producer, artifact) =>
@@ -99,7 +99,8 @@ export class Compiler {
       if (om) {
         const deliveries = om.value.producer.deliveries, ownership = deliveries.ownership;
         requireCondition(ownership, 'plan_basis_incomplete', 'An M8 plan requires its exact ownership slice');
-        const handoff = structuredClone(om.value.obligations.handoff) as OmFeasibility['obligations']['handoff'];
+        // An own mutable copy of the slot's checked form; requireTaskObligations checks it against ObligationHandoff.
+        const handoff = structuredClone(om.value.obligations.handoff) as ObligationHandoffForm;
         const researchObligations = requireTaskObligations(this.store, plan.value.projectId, graph.value, handoff);
         const writers = new Map<string, ReturnType<typeof selectWriter>>();
         const owner = (path: string) => {

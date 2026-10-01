@@ -7,14 +7,10 @@ import { RefinementRelations } from "../graph/relations.js";
 import type { Command, Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { controlPredecessors } from "../graph/dependencies.js";
-import { sealed, type OmResult, type Sealed } from "../om/refusal.js";
-import { neighborsOf, readNeighbors, type NeighborCollection, type NeighborPacket, type NeighborSources } from "../om/neighbors.js";
-import { readFeasibility } from "../om/feasibility.js";
-import { readAtomicGate } from "../om/atomic-gate.js";
-import { readAcceptedFrame } from "../om/frame-accept.js";
-import { readFrame, type FrameRequest } from "../om/frame-obligations.js";
-import { readDeliveries, type DeliveryOwnershipBasis } from "../om/deliveries.js";
-import { readWorksFrame } from "../om/works-frame.js";
+import { sealed, type Sealed } from "../om/refusal.js";
+import { neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors, readWorksFrame,
+  type DeliveryOwnershipBasis, type FrameRequest, type NeighborCollection, type NeighborPacket, type NeighborSources,
+  type OmReaderResult } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readRecord } from "../om/refs.js";
 import type { CompiledTask, MachinePlan } from "./model.js";
@@ -94,7 +90,7 @@ function copy<T>(value: T): T {
   try { return sealed(value) as T; }
   catch (error) { if (error instanceof EngineError && error.code === "unsealable_value") invalid("json"); throw error; }
 }
-function take<T>(result: OmResult<T>): T {
+function take<T>(result: OmReaderResult<T>): T {
   if (!result.ok) throw new EngineError(result.refusal.code, result.refusal.message, result.refusal.at);
   return result.value;
 }

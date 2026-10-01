@@ -9,6 +9,9 @@ import type { LayerBasis } from '../om/layer-basis.js';
 // The product assembly point: loading ProductEngine installs the OM obligation
 // reader pair into the lower graph slot before any consumer reads an OM era.
 import '../om/obligations.js';
+// …and the OM readers of the compiler, its context, refinement and task
+// obligations into the lower compiler slot (R3+R4).
+import '../om/compiler-readers.js';
 import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
 import { recoverResearchResponse } from '../discovery/response-recovery.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';

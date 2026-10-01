@@ -21,7 +21,7 @@ import { withObligationEvidence } from './obligation-evidence.js';
 import { readinessObligations, type ReadinessObligations } from './obligation-readiness.js';
 import { obligationHandoff } from './obligation-handoff.js';
 import { requireTaskObligations, TASK_OBLIGATION_CONTRACT } from './task-obligations.js';
-import { gateFeasibility as gateOmFeasibility } from '../om/feasibility.js';
+import { gateFeasibility as gateOmFeasibility } from '../compiler/om-readers.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
