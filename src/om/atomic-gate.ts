@@ -14,7 +14,7 @@ import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import { safeRelativePath } from '../graph/topology.js';
 import { validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { noteUntracedRead, Store, type Revision, type Write } from '../storage/store.js';
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity } from './capacity.js';
 import { readDeliveries } from './deliveries.js';
@@ -96,16 +96,20 @@ class Transaction {
   constructor(readonly store: Store) {
     const row = (write: Write): Revision<unknown> => ({ id: write.id, kind: write.kind, revision: write.expected + 1,
       hash: hashJson(write.value), value: write.value });
+    // S1.4 (№2410): a preview answers from its own pending writes, so a proof reading it — even while it still delegates
+    // down — has a dependency no Store reports; such a proof stays incomplete.
     const get = (id: string, revision?: number) => {
+      noteUntracedRead();
       const pending = this.writes.get(id);
       return pending && (revision === undefined || revision === pending.expected + 1) ? row(pending) : store.get(id, revision);
     };
     const list = (kind?: string) => {
+      noteUntracedRead();
       const records = new Map(store.list<unknown>(kind).map(record => [record.id, record]));
       for (const write of this.writes.values()) { records.delete(write.id); if (!kind || write.kind === kind) records.set(write.id, row(write)); }
       return [...records.values()].sort((a, b) => order(a.id, b.id));
     };
-    const history = (id: string) => { const pending = this.writes.get(id); return [...store.history(id), ...(pending ? [row(pending)] : [])]; };
+    const history = (id: string) => { noteUntracedRead(); const pending = this.writes.get(id); return [...store.history(id), ...(pending ? [row(pending)] : [])]; };
     if (provenReads(store)) {
       // S1.1 (№1942-2, №2008-1): over reads proved to be a genuine Store's (the instance, or a write-only view of the
       // storage helper's own making) the preview is a frozen source view of its own, no Proxy — the common cache keeps

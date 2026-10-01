@@ -7,7 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Store, storeReads, type AbsentGuard, type ReadGuard, type TransactionGuard } from "../src/storage/store.js";
+import { observeStore, Store, storeReads, type AbsentGuard, type ReadGuard, type StoreObserver, type TransactionGuard } from "../src/storage/store.js";
+import { captureView, storeView } from "../src/storage/store-view.js";
 import { isRef } from "../src/pipeline/contracts.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
 import { EngineError } from "../src/errors.js";
@@ -321,7 +322,7 @@ test("S1.3 the change stamp moves with every commit this Store or another connec
   assert.throws(() => { const closed = new Store(path); closed.close(); closed.changeStamp(); }, code("store_busy"));
 });
 
-test("S1.3 every Store counts its get, list and history reads in one process-wide count; identities and stamps are not such reads", t => {
+test("S1.3/S1.4 every Store counts its get, list, history and identities reads in one process-wide count (№2302-1); a stamp is no such read", t => {
   const { store, path } = fixture(t);
   const other = new Store(path);
   try {
@@ -330,7 +331,46 @@ test("S1.3 every Store counts its get, list and history reads in one process-wid
     store.get("count:a"); store.get("count:a", 1); store.list("proof"); store.history("count:a"); other.get("count:a");
     assert.equal(storeReads() - start, 5);
     const settled = storeReads();
-    store.identities("get", "count:a"); store.identities("list"); store.identities("history", "count:a"); store.changeStamp();
-    assert.equal(storeReads(), settled);
+    store.identities("get", "count:a"); store.identities("list"); store.identities("history", "count:a");
+    assert.equal(storeReads() - settled, 3, "identities are reads of the Store too, no bypass of the count");
+    const counted = storeReads(); store.changeStamp();
+    assert.equal(storeReads(), counted);
   } finally { other.close(); }
+});
+
+test("S1.4 the Store reports each completed read once with its request and result, never a read that threw, and every write attempt before its first check — refused, rolled back or refused by a view policy (№2302-1, -2)", t => {
+  const { store } = fixture(t);
+  const a = store.write({ id: "observe:a", kind: "proof", expected: 0, value: { v: 1 } });
+  const events: unknown[] = [], writes: Store[] = [];
+  let begun = 0, untraced = 0;
+  const token = {};
+  const watcher: StoreObserver = {
+    begin() { begun++; return token; },
+    end(given, source, method, mode, id, revision, rows) { assert.equal(given, token); events.push([source === store, method, mode, id ?? null, revision ?? null, rows.map(row => row.id)]); },
+    write(source) { writes.push(source); },
+    untraced() { untraced++; },
+  };
+  const previous = observeStore(watcher);
+  try {
+    store.get(a.id); store.get(a.id, 1); store.get("observe:none"); store.list("proof"); store.list("none"); store.history(a.id);
+    store.identities("get", a.id, 1); store.identities("list"); store.identities("history", "observe:none");
+    assert.deepEqual(events, [
+      [true, "get", "get", a.id, null, [a.id]], [true, "get", "get", a.id, 1, [a.id]], [true, "get", "get", "observe:none", null, []],
+      [true, "list", "list", "proof", null, [a.id]], [true, "list", "list", "none", null, []], [true, "history", "history", a.id, null, [a.id]],
+      [true, "identities", "get", a.id, 1, [a.id]], [true, "identities", "list", null, null, [a.id]], [true, "identities", "history", "observe:none", null, []],
+    ]);
+    const settled = events.length, started = begun;
+    assert.throws(() => store.get(Symbol("unbindable") as unknown as string));
+    assert.deepEqual([events.length, begun], [settled, started + 1], "A read that threw was begun and never reported as complete");
+    assert.throws(() => store.write({ id: a.id, kind: "proof", expected: 7, value: {} }), (error: unknown) => (error as EngineError).code === "revision_conflict");
+    assert.throws(() => store.writeMany([{ id: "observe:b", kind: "proof", expected: 0, value: {} }], [{ id: "observe:none", absent: true }, { id: a.id, revision: 9, hash: a.hash }]),
+      (error: unknown) => (error as EngineError).code === "input_stale");
+    const refusing = storeView(store, { write: () => { throw new EngineError("policy_refused", "never"); } });
+    assert.throws(() => refusing.write({ id: a.id, kind: "proof", expected: 1, value: {} }), (error: unknown) => (error as EngineError).code === "policy_refused");
+    assert.deepEqual(writes, [store, store, store], "Each attempt — a conflict, a stale guard, a policy refusal — is reported before any check");
+    assert.equal(store.get(a.id)!.revision, 1, "Nothing was published");
+    const capture = captureView(store, { rows: new Map() }).view, writeOnly = storeView(store, { write: () => { throw new EngineError("policy_refused", "never"); } });
+    writeOnly.get(a.id); writeOnly.list("proof"); assert.equal(untraced, 0, "A write-only view of the Store reads as the Store itself");
+    capture.get(a.id); capture.list("proof"); capture.history(a.id); assert.equal(untraced, 3, "Every read through an opaque view is reported as untraced (№2395)");
+  } finally { observeStore(previous); }
 });

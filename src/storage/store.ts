@@ -37,9 +37,29 @@ function transactionGuards(value: unknown): TransactionGuard[] {
 }
 
 let physicalReads = 0;
-/** Reads made through get/list/history of every Store in this process (S1.3, №2201): a historical proof counts those it
- * did not trace itself, so a read from a closure-captured Store keeps that proof inside one operation. */
+/** Reads made through get/list/history/identities of every Store in this process (S1.3, №2201; S1.4, №2302-1): a
+ * historical proof compares them with the reads it observed, so any read it did not see keeps that proof incomplete. */
 export function storeReads(): number { return physicalReads; }
+export type StoreReadMethod = 'get' | 'list' | 'history' | 'identities';
+/**
+ * S1.4 (№2302): what a historical proof observes at this implementation — a read only once it has completed, with its
+ * request and result, and every write attempt before its first check. A read that throws is never reported.
+ */
+export interface StoreObserver {
+  begin(store: Store): object | undefined;
+  end(token: object, store: Store, method: StoreReadMethod, mode: 'get' | 'list' | 'history', id: string | undefined,
+    revision: number | undefined, rows: readonly (Revision<unknown> | RevisionIdentity)[]): void;
+  write(store: Store): void;
+  /** A read answered through a view whose own answers no Store reports (S1.4, №2395). */
+  untraced(): void;
+}
+let observer: StoreObserver | null = null;
+/** Installs the observer and returns the previous one, so a test can put it back. */
+export function observeStore(next: StoreObserver | null): StoreObserver | null { const previous = observer; observer = next; return previous; }
+/** A write attempt that a view's policy may refuse before it reaches any Store is still an attempt (№2302-2). */
+export function noteWriteAttempt(store: Store): void { observer?.write(store); }
+/** A read projection, capture or other opaque view may answer without reaching any Store: the reading proof is incomplete. */
+export function noteUntracedRead(): void { observer?.untraced(); }
 
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
@@ -73,6 +93,8 @@ export class Store {
   }
   /** The identities get/list/history select, read without decoding bodies: saved revisions never change. */
   identities(method: 'get' | 'list' | 'history', id?: string, revision?: number): RevisionIdentity[] {
+    physicalReads++;
+    const token = observer?.begin(this);
     const columns = "r.entity_id, r.revision, r.kind, r.sha256";
     const rows = method === 'get' ? [revision === undefined
       ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id=?`).get(id!)
@@ -81,12 +103,17 @@ export class Store {
         ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) ORDER BY entity_id`).all()
         : this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE kind=? ORDER BY entity_id`).all(id)
       : this.#db.prepare(`SELECT ${columns} FROM revisions r WHERE entity_id=? ORDER BY revision`).all(id!);
-    return rows.map(row => ({ id: String(row!['entity_id']), kind: String(row!['kind']), revision: Number(row!['revision']), hash: String(row!['sha256']) }));
+    const found = rows.map(row => ({ id: String(row!['entity_id']), kind: String(row!['kind']), revision: Number(row!['revision']), hash: String(row!['sha256']) }));
+    if (token) observer!.end(token, this, 'identities', method, id, revision, found);
+    return found;
   }
   get databaseId(): string { return String(this.#db.prepare("SELECT database_id FROM identity WHERE id=1").get()!['database_id']); }
   get<T = Json>(id: string, revision?: number): Revision<T> | null {
     physicalReads++;
-    return this.#get<T>(id, revision);
+    const token = observer?.begin(this);
+    const found = this.#get<T>(id, revision);
+    if (token) observer!.end(token, this, 'get', 'get', id, revision, found ? [found] : []);
+    return found;
   }
   #get<T = Json>(id: string, revision?: number): Revision<T> | null {
     const row = revision === undefined
@@ -96,17 +123,25 @@ export class Store {
   }
   list<T = Json>(kind?: string): Revision<T>[] {
     physicalReads++;
+    const token = observer?.begin(this);
     const sql = "SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision)";
     const rows = kind === undefined ? this.#db.prepare(`${sql} ORDER BY entity_id`).all()
       : this.#db.prepare(`${sql} WHERE kind=? ORDER BY entity_id`).all(kind);
-    return rows.map(row => decode<T>(row));
+    const found = rows.map(row => decode<T>(row));
+    if (token) observer!.end(token, this, 'list', 'list', kind, undefined, found);
+    return found;
   }
   history<T = Json>(id: string): Revision<T>[] {
     physicalReads++;
-    return this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
+    const token = observer?.begin(this);
+    const found = this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
+    if (token) observer!.end(token, this, 'history', 'history', id, undefined, found);
+    return found;
   }
   write<T = Json>(input: Write): Revision<T> { return this.writeMany<T>([input])[0]!; }
   writeMany<T = Json>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    // Even a refused or rolled-back attempt: its guard reads are no pure proof (№2302-2).
+    observer?.write(this);
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
     const checkedGuards = transactionGuards(guards);
     const ids = new Set<string>();

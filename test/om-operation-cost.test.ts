@@ -987,10 +987,12 @@ function pass(f, request, prefix) {
   }
   return { advance, until, drive, closes, performed, transitions, retarget(next) { request = next; } };
 }
-/** The saved history of an attempt read again: cold in a new operation, hot inside one, and in a new Store. */
+/** The saved history of an attempt read again: cold in a new Store, hot inside one operation, kept by the next one, and
+ * cold again after a restart. The Store that wrote it keeps its complete proofs (S1.3, S1.4 №2302), so cold is a new Store. */
 function rereadPacket(f, prefix, ref) {
   const read = store => ok(readQuestionPacket(store, { project, record: ref }));
   const saved = f.store.get(ref.id, ref.revision);
+  f.restart();
   const cold = measured(prefix + '.packet.cold', () => read(f.store));
   assert.equal(cold.result.hash, saved.hash); assert.ok(cold.report.misses > 0);
   // The read proves in the one region of the real Store; the history it unfolds may hold works content, whose necessary
@@ -1004,6 +1006,9 @@ function rereadPacket(f, prefix, ref) {
     assert.deepEqual(reference(journal.result), saved.value.journal);
     assert.equal(journal.report.executions['A2.readJournalAt'], journal.report.keys['A2.readJournalAt'], 'every exact journal key proves once');
   }
+  const kept = measured(prefix + '.packet.kept', () => read(f.store));
+  assert.deepEqual(kept.result, cold.result);
+  assert.ok(kept.report.misses < cold.report.misses, 'The next operation of the unchanged Store is served by its kept proofs: ' + kept.report.misses);
   f.restart();
   const restarted = measured(prefix + '.packet.restart', () => read(f.store));
   assert.deepEqual(restarted.result, cold.result); assert.ok(restarted.report.misses > 0);

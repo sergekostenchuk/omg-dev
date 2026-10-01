@@ -1,7 +1,7 @@
 import { types } from 'node:util';
 import { EngineError, requireCondition } from '../errors.js';
 import { canonical, hashJson } from '../canonical.js';
-import { Store, type Revision, type TransactionGuard, type Write } from './store.js';
+import { noteUntracedRead, noteWriteAttempt, Store, type Revision, type TransactionGuard, type Write } from './store.js';
 
 /** One storage view over a Store or a nearer view (№1728): the single
  * interception of BOTH write methods. One public call is exactly one policy
@@ -94,19 +94,23 @@ export function storeView(target: Store, policy: StoreViewPolicy): Store {
     get(target, prop, _receiver) {
       if (typeof prop !== 'string') return Reflect.get(target, prop, target);
       if (prop === 'write')
-        return <T,>(input: Write): Revision<T> => policy.write([input], [])[0] as Revision<T>;
+        return <T,>(input: Write): Revision<T> => { noteWriteAttempt(target); return policy.write([input], [])[0] as Revision<T>; };
       if (prop === 'writeMany')
         return <T,>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] =>
-          policy.write(inputs, guards) as Revision<T>[];
+          (noteWriteAttempt(target), policy.write(inputs, guards)) as Revision<T>[];
       if (prop === 'get' && policy.get)
         return (id: string, revision?: number) => {
+          noteUntracedRead();
           const projected = policy.get!(id, revision);
           // Only undefined delegates to the nearest target; an explicit null is
           // the projection's own answer "no record in this view" (№1760-2).
           return projected === undefined ? target.get(id, revision) : projected;
         };
-      if (READ_METHODS.has(prop))
-        return (Reflect.get(target, prop, target) as (...args: never[]) => unknown).bind(target);
+      if (READ_METHODS.has(prop)) {
+        // An opaque view's reads are no proved family's (S1.4, №2395): whoever reads through it stays incomplete.
+        const read = (Reflect.get(target, prop, target) as (...args: never[]) => unknown).bind(target);
+        return (...args: never[]) => { noteUntracedRead(); return read(...args); };
+      }
       if (READ_PROPERTIES.has(prop)) return Reflect.get(target, prop, target);
       const descriptor = descriptorOf(target, prop);
       if (descriptor && typeof descriptor.get === 'function')
@@ -147,9 +151,9 @@ function writeOnlyView(target: Store, policy: StoreViewPolicy, unsupported: (pro
     },
   });
   const members = Object.create(gate) as Record<string, unknown>;
-  Object.defineProperty(members, 'write', { value: <T,>(input: Write): Revision<T> => policy.write([input], [])[0] as Revision<T> });
+  Object.defineProperty(members, 'write', { value: <T,>(input: Write): Revision<T> => { noteWriteAttempt(target); return policy.write([input], [])[0] as Revision<T>; } });
   Object.defineProperty(members, 'writeMany', { value: <T,>(inputs: Write[], guards: TransactionGuard[] = []): Revision<T>[] =>
-    policy.write(inputs, guards) as Revision<T>[] });
+    (noteWriteAttempt(target), policy.write(inputs, guards)) as Revision<T>[] });
   const reads = new Map<string, unknown>();
   for (const name of READ_METHODS) {
     const method = Reflect.get(target, name, target) as (...args: never[]) => unknown;

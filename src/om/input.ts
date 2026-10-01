@@ -12,7 +12,7 @@ import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { ProductEngine } from "../product/engine.js";
 import { readLegacyOperation } from "../product/preparation-run.js";
-import { Store, storeReads, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { observeStore, Store, storeReads, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { gitCalls, uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
@@ -591,7 +591,14 @@ type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observ
 /** `accounted`: physical Store reads this journal traced (its own and its nested proofs'); `complete`: every read of the
  * proof and of every proof nested in it was traced and none of them ran git — the only journal whose footprint is its
  * whole dependency area. */
-interface ReadJournal { entries: (ReadEvent | ReadJournal)[]; sources: Set<Store>; footprint: ReadEvent[]; accounted: number; complete: boolean }
+interface ReadJournal {
+  entries: (ReadEvent | ReadJournal)[]; sources: Set<Store>; footprint: ReadEvent[]; accounted: number; complete: boolean;
+  /** A write was attempted or an opaque view answered while this proof ran (S1.4, №2302-2, №2395); change stamps its observed Stores had before their reads;
+   * the Stores those reads came from — apart from `sources`, which decide replay through a view and never see them. */
+  tainted: boolean; stamps: Map<Store, string | null>; stores: Set<Store>;
+  /** A listed reader over the proven family of a genuine Store: its closure reads are observed (S1.4, №2410). */
+  observing: boolean;
+}
 interface HistoricalProof { value: unknown; events: ReadJournal; footprint: ReadEvent[]; complete: boolean }
 interface HistoricalView { active: Set<string>; proven: Map<string, HistoricalProof> }
 interface HistoricalTrace { source: Store; observe: ((ref: Ref, head: boolean, method: ReadEvent['method']) => void) | undefined; mode: 'ordered' | 'distinct'; seen: Set<string>; journals: WeakSet<ReadJournal> }
@@ -670,6 +677,48 @@ function recordRead(event: ReadEvent | ReadJournal): void {
 function readSignature(source: Store, records: readonly Revision<unknown>[]): string {
   return digest(canonical(isProxy(source) && !historicalSnapshots.has(source) ? records : records.map(row => ({ ...reference(row), kind: row.kind }))));
 }
+/**
+ * S1.4 (№2410, C1/C2): the readers whose untraced action is observed at the Store and may be kept on that observation.
+ * Each was audited: its action reads only the Store it was given as root (directly or through the common readers it
+ * calls with that Store) and values derived from its key — no overlay, preview, projection or other Store captured from
+ * outside, no file, environment, clock or randomness; git is counted (№2217). An overlay a reader builds inside its
+ * action from those values is rebuilt by every derivation. Every other historicalRead keeps the S1.3 semantics: a
+ * closure read is not accounted and the proof is not kept beyond its operation.
+ */
+const OBSERVED_READERS: ReadonlySet<string> = new Set([
+  'G7.completion-assignment', 'G7.completion-work', 'G7.completion-cessation', 'G7.completion-owner', 'G7.completion-close',
+  'G7.answers-assignment', 'A3.series-history', 'A3.3.full-gaps', 'A3.3.mechanism-slice', 'A3.3.mechanism-admission',
+  'E2.question-packet', 'E4.model-call-state', 'M6.route-result',
+]);
+/**
+ * S1.4 (№2302): the Store's own implementation reports every completed read and every write attempt, so a proof whose
+ * action reads a closure-captured Store journals those reads too. A read inside a traced read is that read's own; a read
+ * checking a footprint is only accounted, never a new dependency. Such an event carries no observation: a cold action
+ * reading around a trace shows it nothing, and neither does its replay (№2302-4).
+ */
+observeStore({
+  begin(store) {
+    const capture = historicalViews && !readStack.length ? proofCaptures.at(-1) : undefined;
+    // Checking a footprint is accounted for any proof; a closure read only for an observed reader (C1/C2).
+    if (!capture || !(checkingFootprint || capture.observing)) return undefined;
+    // Taken before the first read: a commit after it can only make the stamp older, never mask a change.
+    if (capture && !checkingFootprint && !capture.stamps.has(store)) capture.stamps.set(store, provenStore(store) === store ? store.changeStamp() : null);
+    return capture;
+  },
+  end(token, store, _method, mode, id, revision, rows) {
+    const capture = token as ReadJournal;
+    capture.accounted++;
+    if (checkingFootprint) return;
+    // Identities carry the same {id, revision, hash, kind} a genuine source's signature is made of.
+    const records = rows as Revision<unknown>[];
+    capture.entries.push({ source: store, method: mode, id, revision, references: records.map(reference), observations: [],
+      stamp: capture.stamps.get(store) ?? null, signature: readSignature(store, records),
+      mutable: mode !== 'get' || revision === undefined || !records.length });
+  },
+  write() { for (const capture of proofCaptures) capture.tainted = true; },
+  // An opaque view answered (№2395): every enclosing proof is incomplete; checking a footprint is no such read.
+  untraced() { if (!checkingFootprint) for (const capture of proofCaptures) capture.tainted = true; },
+});
 function observedRead<T>(store: Store, method: ReadEvent['method'], id: string | undefined, revision: number | undefined, action: () => T): T {
   // Taken before the read: a commit between the stamp and the read can only make the stamp older, never mask a change.
   const recorded = !readStack.length && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
@@ -727,8 +776,10 @@ function completeJournal(journal: ReadJournal): void {
       if (children.has(entry)) continue;
       children.add(entry);
       for (const source of entry.sources) journal.sources.add(source);
+      for (const store of entry.stores) journal.stores.add(store);
       for (const event of entry.footprint) remember(event);
     } else {
+      if (!entry.observations.length) journal.stores.add(entry.source);
       for (const observation of entry.observations) journal.sources.add(observation.source);
       if (entry.mutable) remember(entry);
     }
@@ -748,9 +799,12 @@ function currentFootprint(footprint: readonly ReadEvent[]): boolean {
       const genuine = event.stamp === null ? null : provenStore(event.source);
       if (genuine) {
         let now = stamps.get(genuine);
-        if (now === undefined) { now = genuine.changeStamp(); stamps.set(genuine, now); }
-        if (event.stamp === now) continue;
-        if (digest(canonical(genuine.identities(event.method, event.id, event.revision))) !== event.signature) return false;
+        // A Store closed since (S1.4: an observed closure read of another Store) is no current source: derive again.
+        try {
+          if (now === undefined) { now = genuine.changeStamp(); stamps.set(genuine, now); }
+          if (event.stamp === now) continue;
+          if (digest(canonical(genuine.identities(event.method, event.id, event.revision))) !== event.signature) return false;
+        } catch { return false; }
         event.stamp = now;
         continue;
       }
@@ -797,7 +851,8 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     if (!view) { view = { active: new Set(), proven: new Map() }; views.set(source, view); }
     if (view.active.has(exact)) return synchronous(onCycle);
     const area = retainedArea(source), kept = view.proven.has(exact) ? undefined : area?.get(exact);
-    if (kept) {
+    // A traced caller replays a proof to its observers; one derived through a closure read shows them nothing (S1.4).
+    if (kept && (!(traced || historicalTraces.has(store)) || kept.complete)) {
       // Another operation proved it: it serves this one only while its whole footprint is current.
       area!.delete(exact);
       if (currentFootprint(kept.footprint)) {
@@ -809,6 +864,9 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       }
     }
     const complete = traced || historicalTraces.has(store), previous = view.proven.get(exact);
+    // An untraced action is observed at the Store (S1.4, №2302, №2410): only a listed reader over the proven family of a
+    // genuine Store; every other one keeps the S1.3 semantics.
+    const observing = OBSERVED_READERS.has(key.reader) && provenStore(source) === source, observable = complete || observing;
     if (previous && (!complete || previous.complete)) {
       if (currentFootprint(previous.footprint)) { replayProof(store, previous.events); return previous.value as T; }
       // A proof of a genuine Store is checked on its own at every use, so only the moved one goes (S1.3). A mutable opaque
@@ -817,7 +875,8 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       else view.proven.clear();
     }
     view.active.add(exact);
-    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false }; proofCaptures.push(events);
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), observing };
+    proofCaptures.push(events);
     const reads = storeReads(), gits = gitCalls(); proofStarts++;
     let completed = false;
     try {
@@ -826,15 +885,17 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       completeJournal(events); completed = true;
       // Complete only if every physical read of this action was traced, it ran no git (№2217) and every nested journal —
       // derived here or taken from a cache — is complete too (№2201): a dependency outside the Store travels to every parent.
-      events.complete = complete && storeReads() - reads === events.accounted && gitCalls() === gits
+      events.complete = observable && !events.tainted && storeReads() - reads === events.accounted && gitCalls() === gits
         && events.entries.every(entry => !('entries' in entry) || entry.complete);
       const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);
       if (replayable && !(object(result) && result.ok === false) && cacheable(result)) {
         const proof = { value: result, events, footprint: events.footprint, complete };
         view.proven.set(exact, proof);
-        // Kept beyond this operation only with its full dependency area: a complete journal of this Store alone.
+        // Kept beyond this operation only with its full dependency area: a complete journal of this Store alone — never on
+        // an empty trail, which proves no dependency at all, only that none reached the Store (№2302, card).
         const frozen = { all: true };
-        if (area && events.complete && [...events.sources].every(observed => observed === source) && plainValue(result, frozen)) {
+        if (area && events.complete && events.entries.length > 0 && [...events.sources].every(observed => observed === source)
+          && [...events.stores].every(observed => observed === source) && plainValue(result, frozen)) {
           area.set(exact, { ...proof, value: frozen.all ? result : structuredClone(result), frozen: frozen.all });
           for (const oldest of area.keys()) { if (area.size <= RETAINED_LIMIT) break; area.delete(oldest); }
         }

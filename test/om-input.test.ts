@@ -16,6 +16,8 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.js";
 import { sealed } from "../src/om/refusal.js";
+import { pendingCallStore } from "../src/om/model-call.js";
+import { transactionForTests } from "../src/om/atomic-gate.js";
 import { git, gitBytes, gitCalls } from "../src/runtime/environment.js";
 import {
   buildOmInput, gateInput, prepareOmInput, writeOmInput, readOmInput, deriveOmInput, prepareExistingOmInput, prepareReopenOmInput,
@@ -1953,4 +1955,208 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   const lost = refusal(prepareOmInput(f.store, req), "stage_not_accepted");
   assert.equal(lost.code, "stage_not_accepted");
   assert.ok(lost.message.includes("acceptance"), JSON.stringify(lost));
+});
+
+// A reader of the audited list (S1.4, №2410 C1): its cases are told apart by parameters. Any other reader keeps S1.3 (C2).
+const LISTED = 'M6.route-result';
+
+test("S1.4 every read of a closure-captured Store is observed at the Store — head and exact get, absence, list with and without kind, an empty list, history, identities in three modes: the proof outlives its operation, and a dependency a second Store creates or changes is derived again, never answered stale", t => {
+  const { first, second } = sameFileStores(t);
+  const a = first.write({ id: 's14:a', kind: 'k', expected: 0, value: { v: 0 } });
+  let n = 0;
+  const bump = (id: string, kind = 'k') => { const head = second.get(id); second.write({ id, kind, expected: head?.revision ?? 0, value: { v: ++n } }); };
+  const cases: [string, (store: Store) => unknown, () => void][] = [
+    ['get head', store => store.get(a.id), () => bump(a.id)],
+    ['get absent head', store => store.get('s14:absent'), () => bump('s14:absent')],
+    ['get absent revision', store => store.get('s14:later', 1), () => bump('s14:later')],
+    ['list of a kind', store => store.list('k2'), () => bump('s14:k2', 'k2')],
+    ['list of all', store => store.list(), () => bump('s14:any', 'k4')],
+    ['history', store => store.history('s14:h'), () => bump('s14:h')],
+    ['identities get', store => store.identities('get', 's14:ig'), () => bump('s14:ig')],
+    ['identities list', store => store.identities('list', 'k3'), () => bump('s14:il', 'k3')],
+    ['identities history', store => store.identities('history', 's14:ih'), () => bump('s14:ih')],
+  ];
+  for (const [name, read, change] of cases) {
+    let runs = 0;
+    const prove = () => withHistoricalReads(() => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: name } },
+      () => { runs++; return canonical(read(first) as Json); }, noCycle));
+    const cold = prove();
+    assert.equal(prove(), cold); assert.equal(runs, 1, `${name}: the unchanged observed trail serves the next operation without the body`);
+    change();
+    assert.notEqual(prove(), cold, `${name}: the dependency a second Store changed is derived again`); assert.equal(runs, 2);
+    prove(); assert.equal(runs, 2, `${name}: the new derivation is kept in its turn`);
+  }
+  // Positive control: a head moved by a second Store does not cancel the proof of an exact revision; a new Store derives.
+  let exact = 0;
+  const proveExact = (store: Store) => withHistoricalReads(() => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'exact' } },
+    () => { exact++; return canonical(store.get(a.id, 1) as Json); }, noCycle));
+  const saved = proveExact(first); bump(a.id);
+  assert.equal(proveExact(first), saved); assert.equal(exact, 1, 'A later head leaves the proved exact revision lawful');
+  assert.equal(proveExact(second), saved); assert.equal(exact, 2, 'Another Store instance starts cold');
+});
+
+test("S1.4 nested readers pass their trail and incompleteness up, also from a cache: cold and kept children, git, a foreign Store, a child over a non-proven view and a read that threw keep the parent out; the observer is released after an exception; a trace with the observer counts each read once and replays what the cold run showed", t => {
+  const { first, second } = historicalStores(t);
+  const a = first.write({ id: 's14n:a', kind: 'k', expected: 0, value: { v: 1 } }), b = first.write({ id: 's14n:b', kind: 'k', expected: 0, value: { v: 2 } });
+  second.write({ id: a.id, kind: 'k', expected: 0, value: { foreign: true } });
+  const repository = gitRepository(t), counts: Record<string, number> = {};
+  const read = (reader: string, action: () => unknown, store: Store = first) => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: reader } },
+    () => { counts[reader] = (counts[reader] ?? 0) + 1; return canonical(action() as Json); }, noCycle);
+  const child = () => read('child', () => first.get(a.id));
+  const parents = [
+    () => read('parent.cold', () => [child(), first.get(b.id)]),
+    () => read('parent.cached', () => [child(), first.get(b.id, 1)]),
+    () => read('parent.git', () => [first.get(a.id), gitBytes(repository, ['rev-parse', 'HEAD']).length]),
+    () => read('parent.foreign', () => [first.get(a.id), second.get(a.id)]),
+    () => read('parent.opaque', () => [first.get(a.id), read('child.opaque', () => first.get(a.id), captureView(first).view)]),
+    () => read('parent.threw', () => { assert.throws(() => first.get(Symbol('unbindable') as unknown as string)); /* started, never completed */ return first.get(a.id); }),
+  ];
+  withHistoricalReads(() => { for (const parent of parents) parent(); });
+  withHistoricalReads(() => { for (const parent of parents) parent(); read('parent.late', () => [child(), first.get(b.id)]); });
+  withHistoricalReads(() => read('parent.late', () => [child(), first.get(b.id)]));
+  assert.deepEqual({ ...counts }, { child: 1, 'parent.cold': 1, 'parent.cached': 1, 'parent.git': 2, 'parent.foreign': 2, 'child.opaque': 2,
+    'parent.opaque': 2, 'parent.threw': 2, 'parent.late': 1 }, 'Complete parents, over cold, cached and kept children, are kept; every other one is derived again');
+  assert.throws(() => withHistoricalReads(() => read('boom', () => { first.get(a.id); throw new Error('boom'); })), /boom/);
+  withHistoricalReads(() => read('after.boom', () => first.get(b.id))); withHistoricalReads(() => read('after.boom', () => first.get(b.id)));
+  assert.equal(counts['after.boom'], 1, 'The observer is released after an exception: the next proof is observed and kept');
+  const seen: string[][] = [];
+  const traced = () => {
+    const refs: string[] = [], view = historicalTrace(first, ref => { refs.push(ref.id); });
+    const value = withHistoricalReads(() => read('traced', () => [view.get(a.id), first.get(b.id)], view));
+    seen.push(refs); return value;
+  };
+  assert.equal(traced(), traced());
+  assert.equal(counts.traced, 1, 'A trace and the Store observer count each read once: the proof is complete and kept');
+  assert.deepEqual(seen, [[a.id], [a.id]], 'The replay shows the trace what the cold run showed it; the closure read stays invisible to both');
+  // A proof derived through the plain Store is kept for plain callers only: a traced caller of a later operation derives it
+  // once through its trace, and that traced proof then replays to the next traced operation what a cold run would show.
+  const viaRoot = (store: Store) => read('replay', () => store.get(a.id), store);
+  withHistoricalReads(() => viaRoot(first));
+  const shown: string[][] = [];
+  for (let i = 0; i < 2; i++) {
+    const refs: string[] = [], view = historicalTrace(first, ref => { refs.push(ref.id); });
+    withHistoricalReads(() => viaRoot(view)); shown.push(refs);
+  }
+  assert.deepEqual(shown, [[a.id], [a.id]], 'Each traced operation is shown exactly what its cold run would show');
+  assert.equal(counts.replay, 2, 'Derived once plain, once traced; the traced proof serves the next traced operation');
+  // Ordered and distinct traces: the kept replay equals the cold trail, with its multiplicity in order and once as a set.
+  const twiceRead = (store: Store) => read('modes', () => [store.get(a.id), store.get(b.id), store.get(a.id)], store);
+  const trails = (mode: 'ordered' | 'distinct') => {
+    const refs: string[] = [], view = historicalTrace(first, ref => { refs.push(ref.id); }, mode);
+    withHistoricalReads(() => twiceRead(view)); return refs;
+  };
+  assert.deepEqual([trails('ordered'), trails('ordered'), trails('distinct'), trails('distinct')],
+    [[a.id, b.id, a.id], [a.id, b.id, a.id], [a.id, b.id], [a.id, b.id]], 'Cold and kept trails are equal in both modes');
+  assert.equal(counts.modes, 1, 'The second, third and fourth traced operations replay the kept traced proof');
+  // A closed source in a proof's trail sends the next use to derive again, and that derivation's own error stands.
+  const closing = new Store(join(second.path + '.other')); t.after(() => { try { closing.close(); } catch { /* closed */ } });
+  closing.write({ id: a.id, kind: 'k', expected: 0, value: { other: true } });
+  withHistoricalReads(() => {
+    const viaClosing = () => read('closing', () => [first.get(a.id), closing.get(a.id)]);
+    viaClosing(); closing.close();
+    assert.throws(viaClosing, (error: unknown) => (error as EngineError).code === 'store_busy', 'The derivation again meets the closed Store itself');
+  });
+  assert.equal(counts.closing, 2);
+});
+
+test("S1.4 a pending overlay, a write rolled back or refused by a view policy and an opaque view keep no proof beyond the operation; write-only views share one and keep their own policies; a stop after warm-up still refuses the guarded write", t => {
+  const { first, second } = sameFileStores(t);
+  const a = first.write({ id: 's14c:a', kind: 'k', expected: 0, value: { v: 1 } });
+  let runs = 0;
+  const twice = (reader: string, store: Store, action: () => unknown) => {
+    const before = runs;
+    for (let i = 0; i < 2; i++) withHistoricalReads(() => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: reader } },
+      () => { runs++; return canonical(action() as Json); }, noCycle));
+    return runs - before;
+  };
+  const pending = pendingCallStore(first, [{ id: 's14c:pending', kind: 'k', expected: 0, value: { v: 1 } }]);
+  assert.equal(twice('pending', pending, () => pending.get('s14c:pending')), 2, 'A pending overlay is no proved family of the Store');
+  assert.equal(twice('rolled-back', first, () => {
+    try { first.write({ id: a.id, kind: 'k', expected: 9, value: {} }); } catch { /* rolled back */ }
+    return first.get(a.id);
+  }), 2, 'A rolled-back write attempt keeps the proof out');
+  const refusing = storeView(first, { write: () => { throw new EngineError('policy_refused', 'This view never writes'); } });
+  assert.equal(twice('refused', first, () => {
+    try { refusing.write({ id: a.id, kind: 'k', expected: 1, value: {} }); } catch { /* refused by the policy */ }
+    return first.get(a.id);
+  }), 2, 'A write the policy refused before any Store is still an attempt');
+  const opaque = new Proxy(first, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  assert.equal(twice('opaque', opaque, () => opaque.get(a.id)), 2, 'An opaque view is no proved family');
+  const once = runs;
+  withHistoricalReads(() => { for (let i = 0; i < 3; i++) historicalRead(opaque, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'opaque.once' } },
+    () => { runs++; return canonical(opaque.get(a.id) as Json); }, noCycle); });
+  assert.equal(runs - once, 1, 'Inside one operation it is still derived once: reads the Store observes behind it do not make it unreplayable');
+  assert.equal(first.get(a.id)!.revision, 1, 'Nothing was published');
+  const refused: Write[][] = [];
+  const left = storeView(first, { write: (writes, guards) => first.writeMany(writes, guards) });
+  const right = storeView(first, { write: writes => { refused.push(writes); throw new EngineError('policy_refused', 'This view never writes'); } });
+  let views = 0;
+  const viaView = (view: Store) => withHistoricalReads(() => historicalRead(view, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'views' } },
+    () => { views++; return canonical(view.get(a.id) as Json); }, noCycle));
+  viaView(left); viaView(right); viaView(left);
+  assert.equal(views, 1, 'Write-only views of one Store share its kept untraced proof');
+  assert.throws(() => right.write({ id: a.id, kind: 'k', expected: 1, value: {} }), (error: unknown) => (error as EngineError).code === 'policy_refused');
+  assert.equal(refused.length, 1, 'The kept proof carries no policy: the refusing view refuses on its own');
+  left.write({ id: a.id, kind: 'k', expected: 1, value: { v: 2 } });
+  viaView(right); assert.equal(views, 2, 'A write through a neighbour view moves the shared proof');
+  const gate = new RunControlGate(first, 'garden'), control = gate.view();
+  let gated = 0;
+  const viaGate = () => withHistoricalReads(() => historicalRead(control, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'gate' } },
+    () => { gated++; return canonical(control.get(a.id) as Json); }, noCycle));
+  viaGate(); viaGate(); assert.equal(gated, 1);
+  const stopped = stopRun(second, { project: 'garden' });
+  assert.ok(stopped.ok && stopped.value.stopped);
+  viaGate(); assert.equal(gated, 1, 'Reading a kept proof through the gate view is no admission');
+  assert.throws(() => control.write({ id: 's14c:new', kind: 'k', expected: 0, value: {} }),
+    (error: unknown) => error instanceof RunControlLost && error.refusal.code === 'run_stopped');
+  assert.equal(first.get('s14c:new'), null, 'The stop is checked after the cache hit: the guarded write published nothing');
+});
+
+test("S1.4 (return №1, №2395) a read projection in a closure — a capture's pending row — keeps the proof incomplete: the next operation sees what the projection holds now, flat and nested, also when its child proof is reused inside the parent's operation", t => {
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 's14r:anchor', kind: 'k', expected: 0, value: {} });
+  const pending = captureView(first, { rows: new Map() });
+  const counts = { child: 0, parent: 0 };
+  const key = { reader: LISTED, project: 'garden', ref: reference(anchor), parameters: { case: 'capture' } };
+  const child = () => historicalRead(first, key, () => {
+    counts.child++; return canonical([first.get(anchor.id, 1), pending.view.get('s14r:candidate')?.value ?? null] as Json);
+  }, noCycle);
+  const parent = () => historicalRead(first, { ...key, parameters: { case: 'capture.parent' } }, () => { counts.parent++; return [child(), child()].join('|'); }, noCycle);
+  const flat = withHistoricalReads(child), nested = withHistoricalReads(parent);
+  assert.deepEqual(counts, { child: 2, parent: 1 }, 'Inside one operation the child is derived once and reused by its parent');
+  pending.view.write({ id: 's14r:candidate', kind: 'k', expected: 0, value: { pending: true } });
+  const flatAfter = withHistoricalReads(child), nestedAfter = withHistoricalReads(parent);
+  assert.notEqual(flatAfter, flat); assert.match(flatAfter, /"pending":true/, 'The next operation sees the row the projection holds now');
+  assert.notEqual(nestedAfter, nested); assert.match(nestedAfter, /"pending":true/, 'The parent of such a child is no kept proof either');
+  assert.deepEqual(counts, { child: 4, parent: 2 }, 'Neither the flat nor the nested proof was kept across operations');
+  assert.equal(first.get('s14r:candidate'), null, 'The pending row lives in the projection only');
+});
+
+test("S1.4 (return №2, №2410 C1–C3) only a listed reader is kept on what the Store observed; a Transaction preview read from a closure — get, list or history, even while it delegates down — keeps the proof incomplete, flat and as a child warmed before its parent", t => {
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 's14t:anchor', kind: 'k', expected: 0, value: {} });
+  const key = (reader: string, kase: string) => ({ reader, project: 'garden', ref: reference(anchor), parameters: { case: kase } });
+  const counts: Record<string, number> = {};
+  const prove = (reader: string, kase: string, action: () => unknown) => historicalRead(first, key(reader, kase),
+    () => { counts[kase] = (counts[kase] ?? 0) + 1; return canonical(action() as Json); }, noCycle);
+  // C1/C2: the same body over the plain Store — kept for a listed reader, derived in every operation for any other one.
+  for (let i = 0; i < 2; i++) withHistoricalReads(() => { prove(LISTED, 'listed', () => first.get(anchor.id, 1)); prove('S1.4.unlisted', 'unlisted', () => first.get(anchor.id, 1)); });
+  assert.deepEqual([counts.listed, counts.unlisted], [1, 2], 'The observer gives completeness to a listed reader only (C1); any other keeps S1.3 (C2)');
+  // C3: the preview answers from its pending writes; every read of it is untraced, also while it still delegates down.
+  const tx = transactionForTests(first);
+  const reads: [string, () => unknown][] = [
+    ['get', () => tx.view.get('s14t:candidate')?.value ?? null],
+    ['list', () => tx.view.list('k').map(row => row.id)],
+    ['history', () => tx.view.history('s14t:candidate').map(row => row.revision)],
+  ];
+  const child = (name: string, read: () => unknown) => prove(LISTED, `tx.${name}`, () => [first.get(anchor.id, 1), read()]);
+  const parent = (name: string, read: () => unknown) => prove(LISTED, `tx.parent.${name}`, () => [child(name, read), first.get(anchor.id, 1)]);
+  const before = reads.map(([name, read]) => withHistoricalReads(() => [child(name, read), parent(name, read)]));
+  tx.add({ writes: [{ id: 's14t:candidate', kind: 'k', expected: 0, value: { pending: true } }], guards: [] });
+  const after = reads.map(([name, read]) => withHistoricalReads(() => [child(name, read), parent(name, read)]));
+  reads.forEach(([name], index) => {
+    assert.notDeepEqual(after[index], before[index], `${name}: the next operation sees what the preview holds now, flat and nested`);
+    assert.deepEqual([counts[`tx.${name}`], counts[`tx.parent.${name}`]], [2, 2], `${name}: neither the child nor its parent was kept`);
+  });
+  assert.equal(first.get('s14t:candidate'), null, 'The preview never wrote to the Store');
 });
