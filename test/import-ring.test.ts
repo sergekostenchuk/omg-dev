@@ -8,9 +8,10 @@ import { fileURLToPath } from 'node:url';
 const ts = createRequire(import.meta.url)('typescript') as typeof import('typescript');
 
 // №32: the import ring is a ratchet — it may only shrink. The limits are the
-// largest strongly connected component sizes measured on om/module = a574007.
-const LOAD_RING_LIMIT = 83;
-const FULL_RING_LIMIT = 133;
+// largest strongly connected component sizes measured after R2 (№2419, №2427)
+// on om/module = 4c2d5b3: the stage checks left ProductEngine (83 → 62, 133 → 101).
+const LOAD_RING_LIMIT = 62;
+const FULL_RING_LIMIT = 101;
 
 type Graph = Map<string, string[]>;
 
@@ -91,6 +92,19 @@ function largestComponent(graph: Graph): string[] {
   return largest;
 }
 
+// The strongly connected component of one file: what it reaches that also reaches it back.
+function componentOf(graph: Graph, node: string): string[] {
+  const reach = (start: string, next: (name: string) => string[]): Set<string> => {
+    const seen = new Set([start]), queue = [start];
+    for (let name = queue.shift(); name !== undefined; name = queue.shift())
+      for (const target of next(name)) if (!seen.has(target)) { seen.add(target); queue.push(target); }
+    return seen;
+  };
+  const forward = reach(node, name => graph.get(name) ?? []);
+  const backward = reach(node, name => [...graph].filter(([, targets]) => targets.includes(name)).map(([source]) => source));
+  return [...forward].filter(name => backward.has(name)).sort();
+}
+
 function sources(root: string): Map<string, string> {
   const files = new Map<string, string>();
   for (const entry of readdirSync(root, { recursive: true })) {
@@ -157,4 +171,17 @@ test('edge extraction is complete: import-equals closes a ring, fully type-only 
     ]));
     assert.deepEqual(largestComponent(graphs.load), ['a.ts', 'b.ts'], `mixed ${label} keeps its load edge`);
   }
+});
+
+test('R2 (№2419, №2427, №2430): the product engine is one-way over OM and the lower modules — alone in the load graph, and in the full graph sharing its component only with its own product helpers', () => {
+  const root = fileURLToPath(new URL('../../src/', import.meta.url));
+  const { load, full } = collectEdges(sources(root));
+  assert.deepEqual(componentOf(load, 'product/engine.ts'), ['product/engine.ts']);
+  // Its helpers take the engine as a typed parameter (import type): a product-layer cycle with no OM or lower module.
+  assert.deepEqual(componentOf(full, 'product/engine.ts'), ['product/engine.ts', 'product/preparation-run.ts',
+    'product/refinement-research.ts', 'product/repair-feedback.ts', 'product/repairs.ts', 'product/stage-research.ts']);
+  for (const [name, targets] of full)
+    if (name.startsWith('om/') || name === 'product/stage-checks.ts')
+      assert.ok(!targets.includes('product/engine.ts') && !targets.includes('product/preparation-run.ts'),
+        `${name} must not import the engine or preparation-run, not even a type`);
 });

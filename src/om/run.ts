@@ -33,7 +33,7 @@ import { prepareOmObligations, writeOmObligations } from "./obligations.js";
 import { prepareFeasibility, readFeasibility, writeFeasibility, type OmFeasibility } from "./feasibility.js";
 import { writeHandoff } from "./handoff.js";
 import { stageId } from "../pipeline/contracts.js";
-import { ProductEngine } from "../product/engine.js";
+import { StageChecks } from "../product/stage-checks.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readGaps, type GapReadRequest } from "./gaps.js";
 import type { DispatchContract } from "./call-record.js";
@@ -343,7 +343,7 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       case "feasibility": return mapped(writeFeasibility(store, body as never), record => [refOf(record)]);
       case "handoff": return mapped(writeHandoff(store, body as never), record => [refOf(record)]);
       case "compile": {
-        try { new ProductEngine(store).compile(project); }
+        try { new StageChecks(store).compile(project); }
         catch (error) {
           if (!(error instanceof EngineError)) throw error;
           return refused(error.code, error.message, { unit: UNIT, target: stageId(project, "compilation"), field: "compile" }, "producer");

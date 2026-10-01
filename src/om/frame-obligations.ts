@@ -9,7 +9,7 @@ import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type GateResult, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from "./refusal.js";
 import { Store, type Revision } from "../storage/store.js";
-import { ProductEngine } from "../product/engine.js";
+import { StageChecks } from "../product/stage-checks.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
 import { historicalProof, historicalTrace, withHistoricalReads, prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord } from "./refs.js";
@@ -860,7 +860,7 @@ export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceReq
     const { traced, guards, current, acceptGate } = frameCurrentSources(store);
     for (const ref of [request.graph, request.layer, ...basis.currentReferences]) current(ref);
     if (basis.producer === "research") {
-      const engine = new ProductEngine(traced);
+      const engine = new StageChecks(traced);
       acceptGate(engine.graphs.layerGate(request.project, request.level, request.layer), `layer.${request.level}`);
       const phase = request.level === 2 ? "R1" : "R2";
       acceptGate(engine.refinement.gate(request.project, phase), `refinement.${phase}`);
@@ -893,7 +893,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
     const layerHead = traced.get<FrameLayer>(`graph-layer:${request.project}:${request.level}`);
     if (!request.layer && (layerHead?.value.acceptance !== undefined || layerHead?.value.layerProofs?.some(proof => proof.level === request.level)))
       frameReject("frame_basis_unproven", layerHead.id, "layer", "An accepted lower layer cannot be omitted");
-    const engine = new ProductEngine(traced);
+    const engine = new StageChecks(traced);
     if (request.layer) {
       const admission = frameTake(prepareLayerAcceptance(store,
         { project: request.project, level: request.level, graph: request.graph, layer: request.layer }));

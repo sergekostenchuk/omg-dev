@@ -10,8 +10,7 @@ import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
-import { ProductEngine } from "../product/engine.js";
-import { readLegacyOperation } from "../product/preparation-run.js";
+import { readLegacyOperation, StageChecks } from "../product/stage-checks.js";
 import { observeStore, Store, storeReads, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { gitCalls, uniqueTransactionGuards } from "../runtime/environment.js";
@@ -508,7 +507,7 @@ function currentAcceptance(store: Store, request: InputRequest): OmResult<Sealed
       if (!head || canonical(reference(head)) !== canonical(ref))
         return refused("input_stale", "The requested input source is no longer current", at(ref.id, "head", ref), "producer");
     }
-    const projection = new ProductEngine(traced).pipeline.inspect(request.project, "features");
+    const projection = new StageChecks(traced).pipeline.inspect(request.project, "features");
     const admission = readOmAdmissionGuards(projection.admissionGuards, "pipeline.features", "G1");
     if (!admission.ok) return admission;
     if (projection.state !== "accepted") {

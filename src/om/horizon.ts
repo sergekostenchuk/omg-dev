@@ -10,7 +10,7 @@ import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal,
 import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
-import { ProductEngine } from "../product/engine.js";
+import { StageChecks } from "../product/stage-checks.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
@@ -403,7 +403,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): OmResult<
           return refused("input_stale", "The accepted OM refinement is no longer current", address(ref.id, "head", ref), "producer");
       }
     } else if (request.refinement) {
-      const engine = new ProductEngine(traced);
+      const engine = new StageChecks(traced);
       const phase = traced.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
       for (const [name, gate] of [["refinement.L2", engine.refinement.gate(request.project, "L2")],
         ["layer.2", engine.graphs.layerGate(request.project, 2, phase.value.layer!)]] as const) {

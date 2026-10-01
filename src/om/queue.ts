@@ -1,7 +1,7 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
-import { ProductEngine } from '../product/engine.js';
+import { StageChecks } from '../product/stage-checks.js';
 import { isRef, reference, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
@@ -278,7 +278,7 @@ function refinementGuards(store: Store, horizon: HorizonRecords, graph: Ref): Re
       { unit: 'M3', target: refinement.id, kind: 'phase', id: `phase:${request.project}:L2` }));
     // Legacy layers need the full projection check too, even when they predate layerProofs.
     take(readLayerEnvelope(traced, { project: request.project, level: 2, graph, layer: phase.value.layer }));
-    const engine = new ProductEngine(traced);
+    const engine = new StageChecks(traced);
     for (const [name, gate] of [['refinement.L2', engine.refinement.gate(request.project, 'L2')],
       ['layer.2', engine.graphs.layerGate(request.project, 2, phase.value.layer)]] as const) {
       const admission = take(readOmAdmissionGuards(gate.admissionGuards, name, 'G2'));

@@ -1,10 +1,8 @@
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
-import { readOmInput } from '../om/input.js';
 import { configureDispatch } from '../om/dispatch.js';
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass } from '../om/run-driver.js';
 import { spendReport } from '../om/spend-report.js';
-import { isPlainObject } from '../om/refusal.js';
 import { writeGuarded } from '../om/refs.js';
 import { prepareFeasibility, readFeasibility, type OmFeasibility } from '../om/feasibility.js';
 import type { LayerBasis } from '../om/layer-basis.js';
@@ -21,12 +19,12 @@ import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-ob
 import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
-import { provenStore } from "../storage/store-view.js";
+import { StageChecks, type Project, type StageContent } from "./stage-checks.js";
 import { Pipeline } from "../pipeline/pipeline.js";
-import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
+import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -35,17 +33,14 @@ import type { Graph } from "../graph/model.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards, workspacePath, type Environment } from "../runtime/environment.js";
 import { Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
-import { projectGraph } from "../graph/project.js";
 import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 import { Executor } from "../execution/runner.js";
-import { resultGate } from "../execution/result.js";
 import type { TaskRun } from "../execution/model.js";
 import type { ExecutionRoot } from "../runtime/environment.js";
 import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
-import { preparationFindings } from "../discovery/preparation-validation.js";
 import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
 import { RefinementResearch } from "./refinement-research.js";
@@ -53,173 +48,8 @@ import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { configureSavedSynthesis } from "../discovery/saved-synthesis.js";
 
-export interface Project { id: string; title: string }
-export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
+export type { Project, StageContent } from "./stage-checks.js";
 
-// These producer address spaces require B1 even when their saved envelope is incomplete.
-// Shared pre-B1 records are handled below by their provenance fields, never by arbitrary text.
-const recordObject = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
-const B1_PRODUCERS = Object.freeze([
-  'horizon', 'om-horizon', 'series-transition', 'om-horizon-issuance', 'om-series-applied', 'om-series-discarded', 'om-series-era', 'om-analysis-admission',
-  'block-weight', 'om-input-decision', 'om-gap', 'om-gap-lines', 'om-candidate',
-  'om-answer-task', 'om-mc1-question', 'om-answer', 'om-answer-index', 'om-routes', 'om-answers-gate',
-  'om-owner-gap-assignment', 'om-obligation-transfer', 'om-obligation-basis', 'om-obligations',
-  'om-question-packet', 'om-part-response', 'om-part-result', 'om-part-assembly',
-  'om-assessment-intent', 'om-assessment-result',
-  'om-completion-owner', 'om-completion-era', 'om-completion-assignment', 'om-completion-work', 'om-completion-close', 'om-completion-cessation', 'om-completion-packet',
-  'om-read-delivery', 'om-read-deliveries', 'om-model-cycle', 'om-model-exchange',
-  'om-model-application-rejection', 'om-neighbors', 'om-atomic-gate', 'om-works-acceptance', 'om-work-rejection',
-]);
-function b1Address(project: string, id: unknown): boolean {
-  // H1: the one pass of a project starts from its exact first B1, so its record is B1-born even when incomplete.
-  return typeof id === 'string' && (id === `om-input:${project}` || id === `om-feasibility:${project}` || id === `om-series-current:${project}`
-    || id === `om-run:${project}`
-    || B1_PRODUCERS.some(namespace => id.startsWith(`${namespace}:${project}:`))
-    || [2, 3].some(level => id === `om-frame:${project}:${level}`)
-    || ['part', 'assembly'].some(source => id.startsWith(`om-proposal:${project}:${source}:`))
-    || id.startsWith(`repair-series:${project}:mechanism:`));
-}
-// Paths end at declared Ref slots; * expands arrays only. Never descend into a leaf's contents.
-function provenanceValues(value: unknown, path: string): unknown[] {
-  let values: unknown[] = [value];
-  for (const field of path.split('.')) values = values.flatMap(item => field === '*'
-    ? Array.isArray(item) ? item : [] : recordObject(item) && Object.hasOwn(item, field) ? [item[field]] : []);
-  return values;
-}
-function b1Reference(project: string, value: unknown): boolean {
-  // Incomplete references still name lost dependencies, but arbitrary nested ids do not.
-  return recordObject(value) && b1Address(project, value['id']);
-}
-const under = (prefix: string, paths: readonly string[]) => paths.map(path => `${prefix}.${path}`);
-const FRAME_ORIGIN_REFS = Object.freeze(['graph', 'horizon', 'layer', 'frame', 'upper.horizon', 'upper.frame']);
-const PROPOSAL_ORIGIN_REFS = Object.freeze([...under('frame', FRAME_ORIGIN_REFS), 'proposals.*']);
-const GAP_ORIGIN_REFS = Object.freeze(['records.*', 'sources.input', 'sources.horizon', 'sources.graph',
-  ...under('sources.operations', PROPOSAL_ORIGIN_REFS), 'sources.works.layer',
-  ...under('sources.works', PROPOSAL_ORIGIN_REFS)]);
-const CALL_ORIGIN_REFS = Object.freeze(['series', 'basis.series', 'basis.hold', 'basis.assessment', 'admission.routes',
-  ...under('admission.gaps', GAP_ORIGIN_REFS)]);
-interface ProvenanceFields {
-  readonly refs: readonly string[];
-  readonly sources: readonly string[];
-  readonly owners: readonly string[];
-}
-function provenance(refs: readonly string[], sources: readonly string[] = [], owners: readonly string[] = []): ProvenanceFields {
-  return Object.freeze({ refs: Object.freeze([...refs]), sources: Object.freeze([...sources]), owners: Object.freeze([...owners]) });
-}
-// Closed producer schema map. Unknown namespaces are not evidence of B1; fixed B1 addresses above are.
-const B1_SHARED_ORIGINS: Readonly<Record<string, ProvenanceFields>> = Object.freeze({
-  'om-assessment-intent': provenance(['source.modelCall', 'source.call', 'source.packet', 'source.response',
-    'source.question', 'candidates.*.question', 'fact.question', 'originalSeries', 'series',
-    'dispatch.adapter', 'dispatch.config', 'originalGuards.*']),
-  'om-assessment-result': provenance(['intent', 'assessor', 'accepted', 'index', 'binding', 'assignment', 'work', 'call', 'receipt',
-    'cause.source', 'cause.prerequisite.source', 'cause.prerequisite.context', 'cause.prerequisite.physical', 'cause.prerequisite.packet', 'cause.replacement', 'cause.proof', 'cause.appeared', 'cause.graph', 'cause.change.currentPointer']),
-  'om-completion-owner': provenance(['series', 'previous', 'plan.routes']),
-  'om-completion-era': provenance(['opening', 'binding']),
-  'om-completion-assignment': provenance(['binding', 'parent', 'source']),
-  'om-completion-packet': provenance(['binding', 'root', 'packet']),
-  'om-completion-work': provenance(['binding', 'previous', 'assignments.*', 'products.*', 'journal', 'closed']),
-  'om-completion-cessation': provenance(['binding', 'assignment', 'work', 'packet', 'call', 'ledger', 'physical', 'exchange', 'rejection',
-    'cause.source', 'cause.prerequisite.source', 'cause.prerequisite.context', 'cause.prerequisite.physical', 'cause.prerequisite.packet', 'cause.replacement', 'cause.proof', 'cause.appeared', 'cause.graph', 'cause.change.currentPointer']),
-  'om-completion-close': provenance(['binding', 'work', 'series', 'ledger', 'journal', 'claim.accepting.*', 'claim.cancelling.*', 'waiting.*']),
-  'om-series-era': provenance(['firstManaged', 'origin.applied', 'origin.membership', 'origin.pointer']),
-  'om-series-membership': provenance(['activation', 'roots.*.root']),
-  'om-analysis-intent': provenance(['request.series', 'request.hold', 'sources.series', 'sources.journal', 'sources.holds.*',
-    'report.guards.*', ...under('call', CALL_ORIGIN_REFS)], [], ['call.owner']),
-  'om-proposal': provenance(['base.graph', 'base.frame', 'replaces.*.base.graph', 'verdict.candidate', 'verdict.gate',
-    'verdict.refusal.at.ref', ...under('verdict.request', PROPOSAL_ORIGIN_REFS)]),
-  'repair-series': provenance(['predecessor', 'inherited.*.outcome.achieved.*.basis', 'attempts.*.outcome.achieved.*.basis',
-    'activation.registered', 'activation.applied', 'activation.prepared', 'activation.activeBasis', 'attempts.*.terminal',
-    'continuations.*.review', 'continuations.*.input', 'continuations.*.confirmation', 'continuations.*.decision',
-    'escalations.*.review', ...under('scope', GAP_ORIGIN_REFS), 'admissions.*.basis.routes',
-    ...under('admissions.*.basis.gaps', GAP_ORIGIN_REFS)], [], ['owner']),
-  'call-record': provenance([...CALL_ORIGIN_REFS, 'dispatch.adapter', 'dispatch.config'], [], ['owner']),
-  'om-call-ledger': provenance(['calls.*.call', ...under('calls.*', CALL_ORIGIN_REFS)], [], ['calls.*.owner']),
-  'om-origin-hold': provenance(['series', 'lift.record'], ['lift.basis.*'], ['owner']),
-  'om-origin-analysis': provenance([], ['basis.*'], ['owner']),
-  'om-origin-decision': provenance([], [], ['owner']),
-  'om-stop-review': provenance([], [], ['owner']),
-  'om-owner-decision': provenance([], [], ['owner']),
-  'om-input-fix': provenance(['input']),
-  'om-unit-refusal': provenance([], ['refusals.*.origin.sources.*']),
-  'om-refusal-journal': provenance(['rows.*.source'], ['rows.*.origin.sources.*', 'classifications.*.basis.*']),
-  'model-call': provenance(['request.record', 'response.record', 'recovery', 'profile', 'packet.archive', 'budget.segment',
-    'runtime.declaration', 'om.request.dispatch.adapter', 'om.request.dispatch.config', 'om.input', 'om.call', 'om.exchange', 'om.part.proposal', 'om.part.result', 'om.diagnostic',
-    'om.completionOwner.binding', 'om.completionOwner.assignment', 'om.completionOwner.call', 'om.completionOwner.packetBasis',
-    'transport.completionOwner.binding', 'transport.completionOwner.assignment', 'transport.completionOwner.call', 'transport.completionOwner.packetBasis',
-    'om.rejection', 'om.completion', 'om.failure.at.ref', 'om.request.packet', 'transport.exchange', 'transport.request.call',
-    'om.admission.series', 'om.admission.pointer', 'om.terminal.source', 'om.terminal.call', 'om.terminal.series',
-    'om.terminal.admission.series', 'om.terminal.admission.pointer', 'om.terminal.change.series', 'om.terminal.change.pointer',
-    'om.terminal.change.applied', 'om.terminal.change.currentPointer']),
-  'om-model-transport': provenance(['request.call', 'call']),
-  'graph-layer': provenance(['acceptance.frame', 'inputs.*', 'obligations.*.inputs.*', 'layerProofs.*.inputs.*',
-    'projection.researchObligations.*.scope']),
-  'graph': provenance(['researchObligations.*.scope']),
-  'discovery': provenance(['inputs.*', 'derivations.*.source']),
-  'stage': provenance(['inputs.*', 'proofs.*']),
-  'plan': provenance(['graph', 'environment', 'stage', 'feasibility', 'guards.*', 'tasks.*.inputs.*.receipt',
-    'tasks.*.inputs.*.source', 'tasks.*.ownership.*.receipt', 'graphSnapshot.researchObligations.*.scope',
-    'tasks.*.researchObligations.*.requirement.scope',
-    'tasks.*.researchObligations.*.requirement.original.record',
-    'tasks.*.researchObligations.*.requirement.documentaryAllowance.sources.*',
-    'tasks.*.researchObligations.*.requirement.runtimeCheck.script',
-    'tasks.*.researchObligations.*.requirement.runtimeCheck.dependencies.*']),
-  'runtime-observation': provenance(['scope', 'environment', 'context.*', 'check.script', 'check.dependencies.*']),
-  'writer-index': provenance([]),
-});
-const STAGE_CONTENT_ORIGINS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  'om-g2': Object.freeze(['content.feasibility']), compilation: Object.freeze(['content.plan']),
-  execution: Object.freeze(['content.result']),
-});
-function namedB1References(project: string, value: unknown, paths: readonly string[]): boolean {
-  return paths.some(path => provenanceValues(value, path).some(ref => b1Reference(project, ref)));
-}
-function b1OriginSource(project: string, value: unknown): boolean {
-  if (!recordObject(value)) return false;
-  if (b1Reference(project, value['ref'])) return true;
-  const context = value['context'];
-  if (!recordObject(context)) return false;
-  if (context['kind'] === 'frame') return namedB1References(project, context['request'], FRAME_ORIGIN_REFS);
-  if (context['kind'] === 'proposal') return namedB1References(project, context['request'], PROPOSAL_ORIGIN_REFS);
-  return false;
-}
-/**
- * S1.5 (№2363): every address whose record savedB1Origin can accept in any revision — the fixed B1 addresses and the
- * namespaces of the producer table: those the project owns through the address itself, and the two whose ownership
- * is claimed only by a body, taken whatever project their current head names. Decided by the address alone, never by
- * a kind or by the text of a body, so the search below reads bodies and histories of these records only.
- */
-function b1Candidate(project: string, id: string): boolean {
-  if (b1Address(project, id)) return true;
-  const namespace = id.split(':')[0]!;
-  if (!Object.hasOwn(B1_SHARED_ORIGINS, namespace)) return false;
-  return namespace === 'runtime-observation' || namespace === 'writer-index'
-    || id.startsWith(`${namespace}:${project}:`) || id === `${namespace}:${project}`;
-}
-function savedB1Origin(project: string, record: Revision<unknown>): boolean {
-  if (b1Address(project, record.id)) return true;
-  const value = record.value;
-  if (!recordObject(value)) return false;
-  const namespace = record.id.split(':')[0]!;
-  const belongs = namespace === 'runtime-observation' ? value['projectId'] === project
-    : namespace === 'writer-index' ? value['project'] === project
-    : record.id.startsWith(`${namespace}:${project}:`) || record.id === `${namespace}:${project}`;
-  if (!belongs || !Object.hasOwn(B1_SHARED_ORIGINS, namespace)) return false;
-  if (namespace === 'model-call' && !record.id.startsWith(`model-call:${project}:om:`)) return false;
-  const fields = B1_SHARED_ORIGINS[namespace]!;
-  return namedB1References(project, value, fields.refs)
-    || fields.sources.some(path => provenanceValues(value, path).some(source => b1OriginSource(project, source)))
-    || fields.owners.some(path => provenanceValues(value, path).some(owner => recordObject(owner)
-      && owner['kind'] === 'mechanism' && owner['mechanism'] === 'M5:addressing'))
-    || namespace === 'model-call' && b1Address(project, value['draftId'])
-    || namespace === 'stage' && (Object.entries(STAGE_CONTENT_ORIGINS).some(([stage, paths]) =>
-      record.id === stageId(project, stage as Stage) && namedB1References(project, value, paths))
-      || UPSTREAM_STAGES.some(stage => record.id === stageId(project, stage))
-        && namedB1References(project, value, ['content.draft', 'content.graph']))
-    || namespace === 'writer-index' && value['contract'] === 'writer-index/om-m8-v1'
-    || namespace === 'repair-series' && (value['contract'] === 'om-repair-series/v2'
-      || recordObject(value['activation']) && value['activation']['contract'] === 'om-series-activation/v1')
-    || namespace === 'om-series-membership' && value['mode'] === 'transition-managed';
-}
 export class ProductEngine {
   readonly discovery: Discovery;
   readonly graphs: GraphRepository;
@@ -232,97 +62,20 @@ export class ProductEngine {
   readonly repairs: PlanRepairs;
   readonly stageResearch: StageResearch;
   readonly refinementResearch: RefinementResearch;
+  /** The lower kit of stage checks, era and compile (R2, №2419): the fields above are its very instances. */
+  readonly checks: StageChecks;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
-    this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
-    const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
-    this.pipeline = new Pipeline(store, validators);
-    this.environments = new Environments(store);
-    this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
-    this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
+    this.checks = new StageChecks(store);
+    this.discovery = this.checks.discovery; this.graphs = this.checks.graphs; this.pipeline = this.checks.pipeline;
+    this.environments = this.checks.environments; this.refinement = this.checks.refinement; this.compiler = this.checks.compiler;
     this.executor = new Executor(store, this.compiler, this.environments);
     this.researcher = new Researcher(store, this.discovery, this.environments);
     this.repairs = new PlanRepairs(this);
     this.stageResearch = new StageResearch(this);
     this.refinementResearch = new RefinementResearch(this, actor);
   }
-  protected validateStage(stage: Stage, context: GateContext): GateResult {
-    const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
-    if (stage === "om-g2") {
-      const content = context.content as { feasibility?: unknown } | null;
-      if (!content || Object.keys(content).join(",") !== "feasibility" || !isRef(content.feasibility)) return rejected("feasibility_missing", "This stage requires a bound R3 result");
-      return this.refinement.feasibilityGate(context.projectId, content.feasibility, context.accepted === true);
-    }
-    if (stage === "compilation") {
-      const content = context.content as { plan?: unknown } | null;
-      if (!content || Object.keys(content).join(",") !== "plan" || !isRef(content.plan)) return rejected("plan_missing", "Compilation stage requires a generated plan");
-      return this.compiler.gate(context.projectId, content.plan, context.accepted === true);
-    }
-    if (stage === "execution") {
-      const content = context.content as { result?: unknown } | null;
-      if (!content || !isRef(content.result) || Object.keys(content).join(",") !== "result") return rejected("execution_result_missing", "Execution requires a complete committed result");
-      return resultGate(this.store, context.projectId, content.result);
-    }
-    if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
-    const content = context.content as unknown as StageContent;
-    if (!content || typeof content !== "object" || !isRef(content.draft) || !content.fields
-      || !Object.hasOwn(content, "graph") || Object.keys(content).sort().join(",") !== "draft,fields,graph") return rejected("stage_content_invalid", "Stage content must bind a discovery result and its fields");
-    const draft = this.store.get<DiscoveryDraft>(content.draft.id);
-    if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
-      || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
-    const result = this.discovery.gate(context.projectId, content.draft);
-    const version = draft.value.contractVersion ?? 1;
-    const legacy = version === 1;
-    if ((version !== RESEARCH_CONTRACT_VERSION && !context.accepted) || ![1, 2, 3, RESEARCH_CONTRACT_VERSION].includes(version))
-      result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const expected = (legacy ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS : version === 3 ? VERSION3_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
-    const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
-    if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
-    if (!legacy && result.findings.length === 0) {
-      const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
-      result.findings.push(...preparationFindings(stage, content.fields, name => {
-        const source = this.store.get<StageArtifact>(stageId(context.projectId, name));
-        return (source?.value.content as unknown as StageContent | undefined)?.fields ?? null;
-      }, outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
-    }
-    const prior = context.inputs[0];
-    if (prior && !draft.value.inputs.some(input => input.id === prior.id && input.hash === prior.hash && input.revision === prior.revision)) result.findings.push({ code: "research_context_stale", target: stage, message: "Research must bind the accepted prerequisite used by this stage" });
-    if (stage === "operation-map") {
-      if (!isRef(content.graph)) result.findings.push({ code: "graph_missing", target: stage, message: "An operation map is required" });
-      else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
-      if ([3, 4].includes(version) && result.findings.length === 0) {
-        const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
-        const initial = this.store.get<StageArtifact>(stageId(context.projectId, "discovery"))!.value.content as unknown as StageContent;
-        const concept = this.store.get<StageArtifact>(stageId(context.projectId, "concept"))!.value.content as unknown as StageContent;
-        try {
-          const proposed = buildL1(graph.value.id, graph.value.title, content.fields['mapDesign'], initial.fields, concept.fields);
-          if (canonical(projectGraph(graph.value, 1)) !== canonical(projectGraph(proposed, 1))) result.findings.push({ code: "map_design_drift", target: graph.id, message: "Stored L1 must match the researched design and accepted concept" });
-        } catch (error) { result.findings.push({ code: "map_design_invalid", target: stage, message: error instanceof Error ? error.message : "Invalid researched map" }); }
-      }
-    } else if (content.graph !== null) result.findings.push({ code: "graph_binding_unexpected", target: stage, message: "This stage inherits its map through the accepted prerequisite" });
-    if (stage === "features") {
-      const specification = prior?.value.content as unknown as StageContent;
-      const behavior = specification?.fields['behavior'];
-      const graph = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
-      const features = content.fields['features'];
-      const covered = new Set<number>();
-      if (!Array.isArray(features) || !Array.isArray(behavior) || !graph) result.findings.push({ code: "feature_binding_missing", target: stage, message: "Features require a specification and operation map" });
-      else for (const raw of features) {
-        const feature = raw as { title: string; outcome: string; requirements: number[] };
-        if (!graph.value.projection.artifacts.some(artifact => artifact.id === feature.outcome)) result.findings.push({ code: "feature_outcome_missing", target: feature.title, field: "features", message: "Feature outcome must exist in the operation map" });
-        for (const index of feature.requirements) {
-          if (!Number.isSafeInteger(index) || index < 0 || index >= behavior.length) result.findings.push({ code: "feature_requirement_missing", target: feature.title, field: "features", message: "Feature refers to a nonexistent requirement" });
-          else covered.add(index);
-        }
-      }
-      if (Array.isArray(behavior) && covered.size !== behavior.length) result.findings.push({ code: "requirement_uncovered", target: stage, field: "features", message: "Every specified behavior needs a feature" });
-      const layer = this.graphs.layerGate(context.projectId, 1); result.findings.push(...layer.findings); result.guards.push(...layer.guards);
-    }
-    return result;
-  }
-  #project(id: string): Revision<Project> {
-    const project = this.store.get<Project>(`project:${id}`);
-    requireCondition(project && project.kind === "project", "project_missing", "Project does not exist"); return project;
-  }
+  protected validateStage(stage: Stage, context: GateContext): GateResult { return this.checks.validateStage(stage, context); }
+  #project(id: string): Revision<Project> { return this.checks.project(id); }
   prepare(project: string, stage: UpstreamStage): Revision<DiscoveryDraft> {
     this.#project(project);
     const prior = predecessor(stage); const inputs: Ref[] = [];
@@ -373,77 +126,13 @@ export class ProductEngine {
     };
   }
   /** Capture the absent dependency before resolving the project era. It belongs only to new production. */
-  legacyRoute(project: string): { om: boolean; guards: TransactionGuard[] } {
-    const guards: TransactionGuard[] = [{ id: `om-input:${project}`, absent: true }];
-    return { om: this.#omProject(project), guards };
-  }
-  #legacyProductionGuards(project: string): TransactionGuard[] {
-    const route = this.legacyRoute(project);
-    if (route.om)
-      throw new EngineError('legacy_route_closed', 'New legacy production is closed after the first OM input',
-        { unit: 'product', target: `om-input:${project}` });
-    return route.guards;
-  }
-  #production<T>(project: string, guards: TransactionGuard[], produce: () => T): T {
-    try { return produce(); }
-    catch (error) {
-      const id = `om-input:${project}`;
-      if (error instanceof EngineError && error.code === 'input_stale'
-        && guards.some(guard => guard.id === id && 'absent' in guard)
-        && !transactionGuardsCurrent(this.store, [{ id, absent: true }]))
-        throw new EngineError(error.code, error.message, { unit: 'product', target: id });
-      throw error;
-    }
-  }
-  #planProductionGuards(project: string, planRef: Ref): TransactionGuard[] {
-    const plan = this.store.get<MachinePlan>(planRef.id, planRef.revision);
-    // The publisher still proves this exact plan. Only the declared producer address selects the route.
-    return plan?.value?.feasibility?.id === `om-feasibility:${project}` ? []
-      : this.#legacyProductionGuards(project);
-  }
-  compile(project: string, extraGuards: TransactionGuard[] = []) {
-    assertPilotBoundary(this.store, project, 'R3');
-    this.#project(project);
-    const route = this.legacyRoute(project);
-    const basis = this.store.get<StageArtifact>(stageId(project, 'om-g2'));
-    const feasibility = (basis?.value?.content as unknown as { feasibility?: Ref } | undefined)?.feasibility;
-    const guards = uniqueTransactionGuards([...extraGuards,
-      ...(feasibility?.id === `om-feasibility:${project}` && basis ? [reference(basis)] : route.guards)]);
-    // Core compile/accept keep their existing no-write repeats. The negative dependency is checked
-    // only if this command actually creates a plan, publishes a stage, or accepts a draft.
-    return this.#production(project, guards, () => {
-      const plan = this.compiler.compile(project, guards);
-      const current = this.store.get<StageArtifact>(stageId(project, 'compilation'));
-      if (current?.value.status === 'accepted' && (current.value.content as unknown as { plan?: Ref }).plan?.hash === plan.hash) return plan;
-      const stage = this.compiler.publish(project, reference(plan), current?.revision ?? 0, guards);
-      this.pipeline.accept(project, 'compilation', stage.revision, guards);
-      return plan;
-    });
-  }
+  legacyRoute(project: string): { om: boolean; guards: TransactionGuard[] } { return this.checks.legacyRoute(project); }
+  #legacyProductionGuards(project: string): TransactionGuard[] { return this.checks.legacyProductionGuards(project); }
+  #production<T>(project: string, guards: TransactionGuard[], produce: () => T): T { return this.checks.production(project, guards, produce); }
+  #planProductionGuards(project: string, planRef: Ref): TransactionGuard[] { return this.checks.planProductionGuards(project, planRef); }
+  compile(project: string, extraGuards: TransactionGuard[] = []) { return this.checks.compile(project, extraGuards); }
   /** The first B1 is an immutable era boundary, independent of current stage or layer readiness. */
-  #omProject(project: string): boolean {
-    const id = `om-input:${project}`;
-    const first = this.store.get(id, 1);
-    if (first) {
-      const checked = readOmInput(this.store, project, reference(first));
-      if (!checked.ok) throw new EngineError(checked.refusal.code, checked.refusal.message, checked.refusal.at);
-      return true;
-    }
-    // S1.5 (№2363): without a first B1 the saved provenance is sought only where the predicate can find it. On a proven
-    // genuine Store the candidates are chosen by identity, without decoding the bodies of foreign namespaces; any other
-    // view — pending, trace, Proxy, subclass — keeps the full walk through its own reads, which its identities do not
-    // describe. The predicate, its history walk and the refusal stay the same; a corrupt candidate still surfaces.
-    const genuine = provenStore(this.store);
-    const records = genuine
-      ? genuine.identities('list').filter(row => b1Candidate(project, row.id)).flatMap(row => { const head = this.store.get(row.id); return head ? [head] : []; })
-      : this.store.list();
-    const savedOrigin = records.some(record => savedB1Origin(project, record)
-      || this.store.history(record.id).some(revision => savedB1Origin(project, revision)));
-    if (savedOrigin)
-      throw new EngineError('record_missing', 'OM provenance requires the exact first B1 input',
-        { unit: 'product', target: id, field: 'revision' });
-    return false;
-  }
+  #omProject(project: string): boolean { return this.checks.omProject(project); }
   #assess(project: string, expected: number) {
     // Capture the negative dependency before selecting the legacy route, and keep it until its transaction.
     const legacyGuards: TransactionGuard[] = [{ id: `om-input:${project}`, absent: true }];

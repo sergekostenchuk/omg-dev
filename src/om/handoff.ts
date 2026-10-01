@@ -2,7 +2,7 @@ import { canonical, hashJson } from '../canonical.js';
 import { assertPilotBoundary } from '../discovery/reader-pilot.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, stageId, uniqueRefs, type Ref, type StageArtifact } from '../pipeline/contracts.js';
-import { ProductEngine } from '../product/engine.js';
+import { StageChecks } from '../product/stage-checks.js';
 import { transactionGuardsCurrent, uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { readFeasibility } from './feasibility.js';
@@ -100,8 +100,8 @@ export function prepareHandoff(store: Store, request: HandoffRequest): OmResult<
       fail(error.code, error.code.startsWith('phase_') ? `phase-policy:${request.project}` : `reader-pilot:${request.project}`,
         'R3', error.message);
     }
-    let prepared: ReturnType<ProductEngine['pipeline']['prepareAccepted']>;
-    try { prepared = new ProductEngine(store).pipeline.prepareAccepted(request.project, 'om-g2',
+    let prepared: ReturnType<StageChecks['pipeline']['prepareAccepted']>;
+    try { prepared = new StageChecks(store).pipeline.prepareAccepted(request.project, 'om-g2',
       { feasibility: { ...request.feasibility } }, request.expected, boundary); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;

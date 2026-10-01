@@ -566,3 +566,43 @@ test("R1 product entries: ProductEngine, CLI command and server read the saved O
   execFileSync(process.execPath, [coldScript(root, "entries-base", `${BUILD}\n${BUILD_BASE}`)], { encoding: "utf8" });
   coldChecks(runCold(coldScript(root, "entries", PRODUCT_ENTRIES)));
 });
+
+/** R2 (№2419-6): the server entry first. In a fresh process server.js is the first product module loaded — before the
+ * engine, the storage helper or any OM module — and a real request performs the OM read through the installed pair;
+ * the removed transitive OM → engine imports must not leave the slot empty or a module in its TDZ. */
+const SERVER_FIRST = String.raw`
+const C = CONFIG;
+const checks = [];
+const check = (name, pass, detail) => checks.push({ name, pass: !!pass, detail });
+try {
+  const { createProductServer } = await import(C.src + "server.js");
+  const { readFileSync } = await import("node:fs");
+  const { Store } = await import(C.src + "storage/store.js");
+  const { ProductEngine } = await import(C.src + "product/engine.js");
+  const { runtimeObligationId } = await import(C.src + "runtime/runtime-observation.js");
+  const saved = JSON.parse(readFileSync(C.saved, "utf8"));
+  const store = new Store(C.database);
+  const server = createProductServer(new ProductEngine(store));
+  await new Promise(done => server.listen(0, "127.0.0.1", done));
+  try {
+    const request = { type: "observe-runtime", project: C.project,
+      scope: { id: saved.record.id, revision: saved.record.revision, hash: saved.record.hash },
+      obligation: runtimeObligationId(saved.handoff.obligations[0]), key: "r2-server-first" };
+    const response = await fetch("http://127.0.0.1:" + server.address().port + "/api/command", { method: "POST",
+      headers: { "content-type": "application/json", "x-omg-token": server.accessToken }, body: JSON.stringify(request) });
+    const text = await response.text(), body = JSON.parse(text);
+    check("server-first-observe-runtime", response.status === 200 && body.observation && body.observation.value.status === "observed",
+      response.status + ":" + text.slice(0, 300));
+    check("server-first-clean", !text.includes("om_obligation_reader_unavailable") && !text.includes("Cannot access")
+      && !text.includes("ReferenceError") && !text.includes("is not defined"), text.slice(0, 200));
+  } finally { await new Promise(done => server.close(done)); store.close(); }
+} catch (error) { checks.push({ name: "server-first", pass: false, detail: String(error && (error.code || error.message) || error) }); }
+console.log(JSON.stringify({ checks }));
+`;
+
+test("R2 cold server-first: with no OM module importing the engine, the server entry loaded first reads the saved OM base through the installed pair", t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-r2-server-first-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  execFileSync(process.execPath, [coldScript(root, "server-first-base", `${BUILD}\n${BUILD_BASE}`)], { encoding: "utf8" });
+  coldChecks(runCold(coldScript(root, "server-first", SERVER_FIRST)));
+});
