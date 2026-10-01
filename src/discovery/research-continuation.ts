@@ -8,7 +8,9 @@ import { canonical, hashJson } from "../canonical.js";
 import { reference, isRef } from "../pipeline/contracts.js";
 import { requireCondition } from "../errors.js";
 import { archivedContext, contextValue } from "./working-context.js";
-import { readerResultCurrent } from "./reader.js";
+import { readerResultCurrent, readReaderResultAt } from "./reader.js";
+import { isReaderResultRef } from "./pilot-context.js";
+import { EngineError } from "../errors.js";
 import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
 import { projectCheckpointValue, researchAction, matchAcceptedPaidAnswer,
@@ -62,19 +64,30 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
     if (turn.value.question && canonical(turn.value.question) !== canonical(reference(question))) return null;
     const action = (turn.value.action as { action?: string })?.action;
     const materialRef = observation?.value?.ref ?? observation?.ref;
-    const material = isRef(materialRef) ? store.get<any>(materialRef.id, materialRef.revision) : null;
-    if (material?.kind === "reader-result" && (material.hash !== materialRef.hash
-      || !readerResultCurrent(store, question.value.projectId, material.value))) return null;
+    // D8.4.1 (№2314): a reader material named by its saved address is proven as a whole by the
+    // common reader first — lost, damaged or substituted is its addressed refusal (S3), thrown as
+    // is; only a proven result that is not current today is excluded without a refusal (S2).
+    if (isRef(materialRef) && isReaderResultRef(materialRef)) {
+      const material = readReaderResultAt(store, question.value.projectId, materialRef);
+      if (!readerResultCurrent(store, question.value.projectId, material.value)) return null;
+    }
     const evidence = new Evidence(store);
     if (action === "read_bundle" && !observation.observations.every((o: any) => evidence.verify(o))) return null;
     if (action === "read_source" && !evidence.verify(observation)) return null;
     if (action === "read" && (!reader || canonical(reference(reader)) !== canonical(observation.ref) || !sourceIsCurrent(reader.value))) return null;
     if (action === "read_context") {
+      if (isRef(observation.record) && isReaderResultRef(observation.record)) {
+        // The result behind the saved page: proven first (S3 thrown as is), then the page's own
+        // current admission — a stale page is no focus (S2), and nothing else is hidden.
+        readReaderResultAt(store, question.value.projectId, observation.record);
+        try{requireCurrentPriorContext(store,store.get<DiscoveryDraft>(question.value.draftId)!,observation);}
+        catch(error){
+          if(error instanceof EngineError&&error.code==='reader_result_invalid')throw error;
+          return null;
+        }
+      }
       const record = store.get(observation.record.id);
       if (!record || canonical(reference(record)) !== canonical(observation.record)) return null;
-      if(record.kind==='reader-result'){
-        try{requireCurrentPriorContext(store,store.get<DiscoveryDraft>(question.value.draftId)!,observation);}catch{return null;}
-      }
       if (record.kind === "research-context") {
         try { archivedContext(store, store.get<DiscoveryDraft>(question.value.draftId)!, observation.record); } catch { return null; }
       }
@@ -87,10 +100,12 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
 function readerSelection(store: Store, focus: any, question: Revision<Question>) {
   const view = focus?.value?.ref ? focus.value : focus;
   const ref = view?.ref;
-  const record = isRef(ref) ? store.get<any>(ref.id, ref.revision) : null;
-  if (record?.kind !== "reader-result" || record.hash !== ref.hash || record.value.question.id !== question.id
-    || record.value.projectId !== question.value.projectId || !view.observations
-    || canonical(view.observations) !== canonical(record.value.observations)) return null;
+  if (!isRef(ref) || !isReaderResultRef(ref)) return null;
+  // D8.4.1 (№2314): the selection's result is proven as a whole by the common reader (S3 thrown
+  // as is) before the view is compared with it and before today's whole-result admission (S2).
+  const record = readReaderResultAt(store, question.value.projectId, ref);
+  if (record.value.question.id !== question.id || record.value.projectId !== question.value.projectId
+    || !view.observations || canonical(view.observations) !== canonical(record.value.observations)) return null;
   if (!readerResultCurrent(store, question.value.projectId, record.value)) return null;
   return { key: canonical(reference(record)), kind: "reader", value: { ref: reference(record), purpose: record.value.purpose,
     observations: record.value.observations, coverage: record.value.coverage, unresolved: record.value.unresolved } };

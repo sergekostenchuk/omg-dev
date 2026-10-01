@@ -2,18 +2,22 @@ import { mapStatus } from "../graph/map-status.js";
 import { researchScope, scopeObligations } from "../graph/research-scope.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import { readerResultCurrent, type ReaderResult } from "./reader.js";
-import { priorReaderIndex } from './reader-reuse.js';
+import { readerResultCurrent, readReaderResultAt, type ReaderResult } from "./reader.js";
+import { priorReaderIndex, bindReaderResultProof } from './reader-reuse.js';
 import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
-import { reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { reference, stageId, isRef, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import { researchGraphContext } from "./research-context.js";
 import type { Graph } from "../graph/model.js";
 import { layerDeltaView } from "./layer-delta.js";
 import { researchConsumerIds } from "../graph/research-evidence.js";
 import { contextTable, targetFieldGroups, CONTEXT_ENCODING } from "./context-tables.js";
 import { archivedContext, contextValue, contextPage, type ContextPage } from "./working-context.js";
+
+// D8.4.1: the reuse leaf receives the shared historical reader from this module (already inside
+// the import ring) instead of importing reader.ts back — the ring ratchet (№32) stays at its limit.
+bindReaderResultProof(readReaderResultAt);
 
 const escape = (value: string) => value.replaceAll("~", "~0").replaceAll("/", "~1");
 const descriptor = (pointer: string, value: unknown) => ({ pointer, chars: canonical(value).length, hash: hashJson(value) });
@@ -32,10 +36,24 @@ export function contextCatalogue(store: Store, draft: Revision<DiscoveryDraft>) 
 }
 
 export function readPilotContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref, pointer: string, maxChars: number, page?: ContextPage) {
-  if(store.get(ref.id,ref.revision)?.kind==='reader-result'){
-    const saved=store.get<ReaderResult>(ref.id,ref.revision)!;
+  // D8.4.1 (№2314): a reader-result is recognised by its saved address, not by the kind of whatever
+  // record exists today — a lost or damaged result is the common reader's addressed refusal (S3),
+  // never another branch. The page's own observation keeps today's admission (S2) afterwards.
+  if(isReaderResultRef(ref)){
+    // №2332-2: a claimed project is never trusted before the proof. A record claiming another
+    // project is first proven as THAT project's exact result by the common reader — only a proven
+    // foreign result keeps the previous access refusal (context_reference_foreign); an unprovable
+    // claim, a rewritten body or a lost record is the reader's addressed refusal (S3).
+    const claimed=store.get<ReaderResult>(ref.id,ref.revision);
+    const claimedProject=claimed?.kind==='reader-result'&&claimed.value!==null&&typeof claimed.value==='object'
+      ?claimed.value.projectId:undefined;
+    if(typeof claimedProject==='string'&&claimedProject!==draft.value.projectId){
+      readReaderResultAt(store,claimedProject,ref);
+      requireCondition(false,'context_reference_foreign','Prior reading access is limited to exact observations of this project');
+    }
+    const saved=readReaderResultAt(store,draft.value.projectId,ref);
     const match=typeof pointer==='string'&&/^\/observations\/(0|[1-9]\d*)(?:\/.*)?$/.exec(pointer);
-    requireCondition(saved.hash===ref.hash&&saved.value.projectId===draft.value.projectId&&match,
+    requireCondition(saved.value.projectId===draft.value.projectId&&match,
       'context_reference_foreign','Prior reading access is limited to exact observations of this project');
     const observation=saved.value.observations[Number(match[1])];
     requireCondition(observation?.projectId===draft.value.projectId&&new Evidence(store).verify(observation),
@@ -112,8 +130,16 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     return source?.kind === "source" && source.value.projectId === project && canonical(reference(source)) === canonical(ref)
       && sourceIsCurrent(source.value);
   };
-  const allReadings = store.list<ReaderResult>("reader-result").filter(record => record.value.projectId === project
-    && record.value.question.id === question.id);
+  // D8.4.1 (№2314 S1–S4): within the scope of this project and question every candidate is proven
+  // as a whole by the common historical reader before today's admission of the whole result
+  // (readerResultCurrent), the exclusion of child parts and the delivery to the model.
+  // №2332-1: the scope reads only the claimed project and, where provable, the question; a candidate
+  // of this project whose question is not a readable reference is not provably another question and
+  // reaches the common reader, which refuses it with its address.
+  const allReadings = store.list<ReaderResult>("reader-result").filter(record => record.value !== null
+    && typeof record.value === "object" && !Array.isArray(record.value) && record.value.projectId === project
+    && (!isRef(record.value.question) || record.value.question.id === question.id))
+    .map(record => readReaderResultAt(store, project, reference(record)));
   const currentReadings=allReadings.filter(record=>readerResultCurrent(store,project,record.value));
   const childParts=new Set(currentReadings.flatMap(record=>(record.value.parts??[]).map(ref=>canonical(ref))));
   const readings=currentReadings.filter(record=>!childParts.has(canonical(reference(record))));
@@ -126,12 +152,17 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     if (action.action === "read_source") return evidence.verify(observation as Observation);
     if (action.action === "read") return sourceCurrent(observation.ref);
     if (action.action === "read_context") {
-      if(store.get(observation.record.id)?.kind==='reader-result'){
+      if(isRef(observation.record)&&isReaderResultRef(observation.record)){
+        // S2 (today's admission of the page) is false; S3 (the result or its basis lost, damaged or
+        // substituted) is the common reader's refusal, thrown as is — never false.
         try{
           readPilotContext(store,draft,observation.record,observation.pointer,Number.MAX_SAFE_INTEGER,
             observation.page?{offset:observation.page.offset,limit:observation.page.end-observation.page.offset}:undefined);
           return true;
-        }catch{return false;}
+        }catch(error){
+          if(error instanceof EngineError&&error.code==='reader_result_invalid')throw error;
+          return false;
+        }
       }
       if (store.get(observation.record.id)?.kind === "research-context") {
         try { archivedContext(store, draft, observation.record); return true; } catch { return false; }
@@ -181,4 +212,9 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     staleReadings: directReadings.filter(record => !currentRead(record)).map(record => ({ ref: reference(record), action: record.value.action })),
     openGaps: map.openGaps, failures: map.failures,
   };
+}
+
+/** A saved reader-result address of either era (reader-result:<hash>, reader-result:v2:<hash>). */
+export function isReaderResultRef(ref: Ref): boolean {
+  return typeof ref.id === "string" && ref.id.startsWith("reader-result:");
 }

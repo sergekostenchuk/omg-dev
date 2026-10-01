@@ -9,6 +9,7 @@ import {reference} from '../src/pipeline/contracts.js';
 import {hashJson} from '../src/canonical.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import {priorReaderIndex} from '../src/discovery/reader-reuse.js';
+import {numberedSource,type ReaderResult} from '../src/discovery/reader.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {workingContext} from '../src/discovery/working-context.js';
@@ -25,7 +26,17 @@ function fixture(t:test.TestContext){
  const pilot=configureReaderPilot(store,engine.environments,'p',{experimental:true,active:true,stopAfter:'L2',reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},agentCommand:command,maxRequestChars:300000,maxContinuationChars:100000,maxReadChars:60000,maxReplyChars:100000,maxCalls:100,maxReportedTokens:10000000,planning:{fields:['topic'],maxRequestChars:70000,maxRounds:3}},0);
  const draft=engine.discovery.create('p','discovery','R0','compilation',[{field:'topic',kind:'design',prompt:'Resolve the current contract',risk:'Losing a required source',schema:{type:'object'}}]);
  const q=store.get<Question>(draft.value.questions[0]!)!;
- return {root,store,engine,env,pilot,draft,q};
+ // D8.4.1 (№2317): the prior readings of ANOTHER question are lawful records of the previous era — the exact
+ // question, pilot, Source, purpose, sources, coverage and original bytes, at the content address of the full body.
+ const priorDraft=engine.discovery.create('p','discovery','R0','compilation',[{field:'earlier',kind:'design',prompt:'An earlier contract',risk:'An earlier source',schema:{type:'object'}}]);
+ const priorQuestion=store.get<Question>(priorDraft.value.questions[0]!)!;
+ const priorReading=(source:ReturnType<typeof engine.discovery.evidence.document>,observations:ReaderResult['observations'],purpose:string)=>{
+  const {lines:_lines,...coverage}=numberedSource(source);
+  const value:ReaderResult={projectId:'p',question:reference(priorQuestion),pilot:reference(pilot),purpose,sources:[reference(source)],
+   coverage:[coverage],observations,unresolved:[]};
+  return store.write<ReaderResult>({id:`reader-result:${hashJson(value)}`,kind:'reader-result',expected:0,value});
+ };
+ return {root,store,engine,env,pilot,draft,q,priorQuestion,priorReading};
 }
 
 test('44 source records and 321 observations fit the global 300000 request envelope without embedding the 262-entry index',async t=>{
@@ -37,7 +48,7 @@ test('44 source records and 321 observations fit the global 300000 request envel
   const unique=i<42?6:5,total=i<13?8:7;
   const observations=Array.from({length:total},(_,n)=>f.engine.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:(n%unique)*400,end:(n%unique)*400+200}));
   count+=observations.length;
-  f.store.write({id:`reader-result:${hashJson(i)}`,kind:'reader-result',expected:0,value:{projectId:'p',question:{id:'old-question',revision:1,hash:'a'.repeat(64)},observations}});
+  f.priorReading(source,observations,`Read module ${i}`);
  }
  assert.equal(count,321);
  const index=priorReaderIndex(f.store,'p',f.q.id);assert.equal(index.length,262);
