@@ -2180,8 +2180,13 @@ ${body}
 
 const H15_BASE_COMMIT = "479b307f8aa3d43745f5313c1f5c8a712bd7d55a";
 /** A managed attempt of `block` planned on exactly this batch — the plan an earlier pass saved (the reviewer's helper, №2221). */
-function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15") {
-  ok(openSeries(f.store, { project, block, line: 1, slice, predecessor: null, basis: null }));
+function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15", seriesCommit?: string) {
+  const opening = { project, block, line: 1, slice, predecessor: null, basis: null };
+  // Q3 (№2573-1, №2580): a line an earlier commit continues is opened by that commit's own producer; every other scenario
+  // opens it with the current code, in the new era.
+  if (seriesCommit) atCommit(f, seriesCommit, "era-series", `const { openSeries } = await import(src('om/series.js'));
+out(reference(take(openSeries(store, args))));`, opening);
+  else ok(openSeries(f.store, opening));
   const goal = { key: `${slice}:${block}`, questions: [...new Set(batches.flatMap(batch => batch.items.map(item => gapLineKey(project, item.target, item.field))))].sort(),
     result: gapLineExpectedResult(project, batches[0]!.items[0]!.target, batches[0]!.items[0]!.field) };
   return ok(openAttempt(f.store, { project, block, line: 1, attempt: 1, goal, completion: { routes: bases.routes, batches: batches.map(batch => batch.id).sort() } }));
@@ -2353,7 +2358,7 @@ test("H1.5 ERA №2221 physical work of an unserved batch paid by the base code 
   const f = runFixture(t, ["spare"]);
   addressQuestions(f, [["spare", "design-decision"]]);
   const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
-  openPlanned(f, bases, "garden-consume-block", [batch]);
+  openPlanned(f, bases, "garden-consume-block", [batch], "before-h15", H15_BASE_COMMIT);
   const request = f.request();
   f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
   // The base code has no producer check: it sends the unserved packet and receives the paid answer.

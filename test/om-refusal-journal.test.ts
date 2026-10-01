@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ import { writeGuarded } from "../src/om/refs.js";
 import {
   classifyRefusal, journalId, prepareClassifyRefusal, prepareRecordRefusal, readJournal, recordRefusal, unitRefusalNamespace,
   normalizeOriginSource, originSourceKey, prepareJournalBatch, readJournalAt,
-  REFUSAL_JOURNAL_CODES, REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND,
+  REFUSAL_JOURNAL_CODES, REFUSAL_JOURNAL_KIND, SOURCE_ORDER, UNIT_REFUSAL_KIND,
   type ClassifyRefusalRequest, type ClassifyRefusalsRequest, type JournalRequest, type JournalRow,
   type RecordRefusalRequest, type RefusalClassification, type RefusalJournal, type OriginSource,
   type JournalBatch, type JournalBatchRequest, type JournalWrite, type JournalTransition,
@@ -1569,7 +1569,7 @@ try {
   return { batch: printed.slice(0, split), text, ...(JSON.parse(text) as { outputs: unknown[]; history: unknown[] }) };
 }
 
-test("C34 C68 H1.0c the accepted single-row preparations keep writes, guards, values and refusals byte for byte against the base 4e4351f", t => {
+test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as the base continues it, and a new journal is created in the explicit new form", t => {
   const { root, store } = fixture(t);
   const frame: FrameRequest = { project: PROJECT, level: 2, graph: BASE, horizon: refTo("om-horizon-gate:alpha:one"),
     layer: null, frame: null, upper: null };
@@ -1615,7 +1615,8 @@ test("C34 C68 H1.0c the accepted single-row preparations keep writes, guards, va
     { op: "prepareRecord", request: record(refs['moved']) },
     { op: "record", request: record(refs['moved']) },
     { op: "prepareClassify", request: { project: PROJECT, classifications: [decide(g3!, { class: "proposal" }), decide(g5a!), decide(g5b!, { basis: [] })] } },
-    { op: "apply", of: 15 },
+    // The index of the output it applies within the continued run, which starts after the three creation steps.
+    { op: "apply", of: 12 },
     { op: "prepareClassify", request: { project: PROJECT, classifications: [decide(g5b!, { basis: [] }), decide(g3!, { class: "proposal" })] } },
     { op: "classify", request: { project: PROJECT, ...decide(g4!, { class: "unknown", addressee: "owner" }) } },
     { op: "classify", request: { project: PROJECT, ...decide(g4!, { class: "unknown", addressee: "owner" }) } },
@@ -1633,13 +1634,20 @@ test("C34 C68 H1.0c the accepted single-row preparations keep writes, guards, va
     { op: "prepareClassify", request: { project: PROJECT, classifications: [{ ...decide(g3!), basis: [{ role: "proposal" }] }] } },
     { op: "prepareRecord", request: record(refs['g3'], "alpha:beta") },
   ];
-  const current = join(root, "current.sqlite"), base = join(root, "base.sqlite");
-  for (const path of [current, base]) {
+  const era = join(root, "era.sqlite"), current = join(root, "current.sqlite"), base = join(root, "base.sqlite");
+  const fresh = join(root, "fresh.sqlite"), freshBase = join(root, "fresh-base.sqlite");
+  for (const path of [era, fresh, freshBase]) {
     const target = new Store(path);
     try { assert.deepEqual(seed(target), refs); } finally { target.close(); }
   }
-  const mine = journalRun(root, current, steps, false);
-  const theirs = journalRun(root, base, steps, true);
+  // Q3 (№2573-2): the journal is created by the base 4e4351f — a journal of its era — and both codes then continue it on
+  // identical copies: what the base did to it, the current code does byte for byte, by the rule of that era.
+  const created = journalRun(root, era, [steps[2]!], true).outputs as { result: { ok: boolean } }[];
+  assert.equal(created[0]!.result.ok, true);
+  for (const path of [current, base]) copyFileSync(era, path);
+  const continued = steps.slice(3);
+  const mine = journalRun(root, current, continued, false);
+  const theirs = journalRun(root, base, continued, true);
   // Each run is what it says: this tree has the batch, the base does not.
   assert.equal(mine.batch, "function");
   assert.equal(theirs.batch, "undefined");
@@ -1651,11 +1659,10 @@ test("C34 C68 H1.0c the accepted single-row preparations keep writes, guards, va
   type Output = { result?: { ok: boolean; value?: { writes?: unknown[]; guards?: Ref[] }; refusal?: { code: string } };
     throws?: { code: string; message: string } };
   const outputs = mine.outputs as Output[];
-  assert.equal(outputs.length, steps.length);
-  assert.deepEqual(outputs[0]!.result!.value!.guards, [refs['g3']]);
-  assert.deepEqual([outputs[3]!.result!.value!.writes, outputs[3]!.result!.value!.guards], [[], []]);
+  assert.equal(outputs.length, continued.length);
+  assert.deepEqual([outputs[0]!.result!.value!.writes, outputs[0]!.result!.value!.guards], [[], []]);
   // C68: frame-accept.ts:214 finds the previous head among these guards, after the source.
-  const previous = outputs[5]!.result!.value!.guards!;
+  const previous = outputs[2]!.result!.value!.guards!;
   assert.deepEqual(previous.map(ref => ref.id), [refs['g5']!.id, journalId(PROJECT)]);
   assert.equal(previous.find(ref => ref.id === journalId(PROJECT))!.revision, 1);
   const codes = new Set(outputs.map(item => item.throws?.code ?? (item.result!.ok ? "ok" : item.result!.refusal!.code)));
@@ -1668,12 +1675,27 @@ test("C34 C68 H1.0c the accepted single-row preparations keep writes, guards, va
   // every source it holds with every decision it holds is a repeat of it.
   const written = new Store(base); t.after(() => written.close());
   const head = deliveredOf(readJournal(written, { project: PROJECT }));
-  assert.deepEqual(JSON.parse(JSON.stringify(head)), (outputs[30]!.result as { value: unknown }).value);
+  assert.deepEqual(JSON.parse(JSON.stringify(head)), (outputs[27]!.result as { value: unknown }).value);
   assert.deepEqual(deliveredOf(readJournalAt(written, PROJECT, reference(head))), head);
   const repeat = deliveredOf(prepareJournalBatch(written, batchOf({ sources: [refs['g3']!, refs['g5']!, refs['g4']!, refs['context']!],
     classifications: [...head.value.classifications] })));
   assert.deepEqual([repeat.writes, repeat.guards, repeat.result], [[], [reference(head)], reference(head)]);
   assert.deepEqual(repeat.value, head.value);
+  assert.equal(Object.hasOwn(head.value, "sourceOrder"), false, "A journal of the base era stays unmarked when the current code continues it");
+
+  // A journal the current code CREATES is of the explicit new form, marked on its preparation and its revision; the base
+  // creates the same journal unmarked. The two creations differ by the era they name, not by the rows of a one-source refusal.
+  type Created = { result: { ok: boolean; value: { guards?: Ref[]; value: Record<string, unknown> } } };
+  const creation = [steps[0]!, steps[2]!];
+  const newForm = journalRun(root, fresh, creation, false).outputs as Created[];
+  const baseForm = journalRun(root, freshBase, creation, true).outputs as Created[];
+  assert.deepEqual(newForm[0]!.result.value.guards, [refs['g3']]);
+  assert.equal(newForm[0]!.result.value.value["sourceOrder"], SOURCE_ORDER);
+  assert.equal(newForm[1]!.result.value.value["sourceOrder"], SOURCE_ORDER);
+  assert.equal(Object.hasOwn(baseForm[1]!.result.value.value, "sourceOrder"), false);
+  assert.deepEqual(newForm[1]!.result.value.value["rows"], baseForm[1]!.result.value.value["rows"]);
+  const reread = new Store(fresh); t.after(() => reread.close());
+  assert.equal(deliveredOf(readJournal(reread, { project: PROJECT })).value.sourceOrder, SOURCE_ORDER);
 });
 
 // ---- H1.0c S1: the marks of G4b, the typed reader registry and the ban on classifying a G4b row (C19, C21, C36, №1628).

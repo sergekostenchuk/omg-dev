@@ -285,8 +285,11 @@ async function originalFactForLegacyAssessor(f: ReturnType<typeof fixture>) {
   const goal: AttemptGoal = { key: `answers:legacy-assessor:${f.target}`,
     questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-  ok(openSeries(f.store, { project: f.project, block: f.block, line: 1,
-    slice: 'answers:legacy-assessor', predecessor: null, basis: null }));
+  // Q3 (№2573-1): the line the E5.0 assessor works on is opened by that era's own producer, so the legacy code reads a
+  // series of its own form; the current code then continues this line in its era, as any old line is continued.
+  atCommit(f, LEGACY_ASSESSOR_COMMIT, 'legacy-series', `const { openSeries } = await import(src('om/series.js'));
+out({ series: reference(take(openSeries(store, args))) });`, { project: f.project, block: f.block, line: 1,
+    slice: 'answers:legacy-assessor', predecessor: null, basis: null });
   const series = ok(beginAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal }));
   const scenario = join(f.root, 'assessment-scenario.json');
   const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario,

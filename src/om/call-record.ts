@@ -1,5 +1,5 @@
 import { prepareCompletionCall, prepareManagedCallEnvironment } from './model-call.js';
-import { canonical, hashJson, type Json } from "../canonical.js";
+import { canonical, compareKeys, compositeKey, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { tokenUsage, type TokenUsage } from "../runtime/model-usage.js";
@@ -1224,7 +1224,9 @@ function sameRef(left: Ref, right: Ref): boolean {
 function uniqueRefs(values: readonly Ref[]): Ref[] {
   const refs = new Map<string, Ref>();
   for (const ref of values) refs.set(`${ref.id}\0${ref.revision}\0${ref.hash}`, exactRef(ref));
-  return [...refs.values()].sort((left, right) => compareText(`${left.id}\0${left.revision}`, `${right.id}\0${right.revision}`));
+  // The whole Ref orders the guards: two references that differ only by hash are never left in the order they arrived in.
+  const key = (ref: Ref) => compositeKey([ref.id, ref.revision, ref.hash]);
+  return [...refs.values()].sort((left, right) => compareKeys(key(left), key(right)));
 }
 
 function compareText(left: string, right: string): number {

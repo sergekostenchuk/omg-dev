@@ -1,4 +1,4 @@
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, compositeKey, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
@@ -79,7 +79,15 @@ export interface RefusalClassification {
   readonly basis: readonly OriginSource[];
 }
 
+/**
+ * Q3 (№2549, №2556): the order a revision of the journal keeps the origin sources of its rows and the grounds of its
+ * classifications in. A journal created since Q3 carries it on every revision; a journal without it is of the fec6932 era,
+ * whose NUL-joined originSourceKey stays its order for reading and for an exact repeat. One revision, one order.
+ */
+export const SOURCE_ORDER = "composite-key/v1" as const;
+export type SourceOrder = typeof SOURCE_ORDER;
 export interface RefusalJournal {
+  readonly sourceOrder?: SourceOrder;
   readonly projectId: string;
   readonly rows: readonly JournalRow[];
   readonly classifications: readonly RefusalClassification[];
@@ -221,11 +229,22 @@ export function normalizeOriginSource(value: unknown): Sealed<OriginSource> {
     throw error;
   }
 }
-/** Context participates in identity; contextless sources retain their established ordering. */
+/**
+ * Context participates in identity; contextless sources retain their established ordering. The key of the fec6932 era:
+ * repeat-gate orders and compares its own saved grounds by it, so its meaning does not change (№2556-4).
+ */
 export function originSourceKey(value: OriginSource): string {
   const source = normalizeOriginSource(value);
   return `${source.role}\0${source.ref.id}\0${source.ref.revision}\0${source.ref.hash}${source.context === undefined ? "" : `\0${canonical(source.context)}`}`;
 }
+
+/** The key of the new order: the canonical tuple of fixed arity, an absent context null in its place. */
+export function originSourceOrderKey(value: OriginSource): string {
+  const source = normalizeOriginSource(value);
+  return compositeKey([source.role, source.ref.id, source.ref.revision, source.ref.hash, source.context ?? null]);
+}
+const sourceKeyOf = (order: SourceOrder | undefined): (source: OriginSource) => string =>
+  order === SOURCE_ORDER ? originSourceOrderKey : originSourceKey;
 
 export function journalId(project: string): string {
   return `${REFUSAL_JOURNAL_KIND}:${requireProject(project)}`;
@@ -398,12 +417,15 @@ function prepareRecord(store: Store, request: RecordRefusalRequest): OmResult<Pr
   const head = current && current.ok ? (current.value as Revision<RefusalJournal>) : null;
   const rows: readonly JournalRow[] = head ? head.value.rows : [];
 
+  // The order of the revision appended to; a journal this write creates is of the new order (№2556-3).
+  const order = head ? head.value.sourceOrder : SOURCE_ORDER;
   const additions: JournalRow[] = [];
-  appendRows(read.value.value, source, new Set(rows.map(row => row.id)), additions);
+  appendRows(read.value.value, source, new Set(rows.map(row => row.id)), additions, order);
   if (head && additions.length === 0) return unchanged(head);
 
   // A journal that has classified nothing yet says so explicitly: an absent set is never read as an empty one (T4).
   const value: RefusalJournal = {
+    ...(order === undefined ? {} : { sourceOrder: order }),
     projectId: project,
     rows: [...rows, ...additions],
     classifications: head ? head.value.classifications : [],
@@ -439,13 +461,15 @@ function prepareClassify(store: Store, request: ClassifyRefusalsRequest): OmResu
   if (!current.ok) return current;
   const head = current.value as Revision<RefusalJournal>;
   const context: Context = { target, ref: reference(head) };
+  const order = head.value.sourceOrder;
   const decided = decide(new Set(head.value.rows.map(row => row.id)), head.value.classifications, request.classifications, context,
-    answersRows(project, head.value.rows));
+    answersRows(project, head.value.rows), order);
   if (!decided.ok) return decided;
   const additions = decided.value;
   if (additions.length === 0) return unchanged(head);
 
   const value: RefusalJournal = {
+    ...(order === undefined ? {} : { sourceOrder: order }),
     projectId: project,
     rows: head.value.rows,
     classifications: [...head.value.classifications, ...additions],
@@ -506,6 +530,8 @@ export function prepareJournalBatch(store: Store, request: JournalBatchRequest):
   if (current && !current.ok) return current;
   const head = current ? (current.value as Revision<RefusalJournal>) : null;
   const rows: readonly JournalRow[] = head ? head.value.rows : [];
+  // The order of the revision appended to; a journal this batch creates is of the new order (№2556-3).
+  const order = head ? head.value.sourceOrder : SOURCE_ORDER;
 
   const known = new Set(rows.map(row => row.id));
   const additions: JournalRow[] = [];
@@ -519,7 +545,7 @@ export function prepareJournalBatch(store: Store, request: JournalBatchRequest):
     const read = readSource(creates ? withPending(store, creates.record) : store, ref, project, target);
     if (!read.ok) return read;
     const source = reference(read.value);
-    appendRows(read.value.value, source, known, additions);
+    appendRows(read.value.value, source, known, additions, order);
     if (creates) creations.push(creates.write);
     else stored.push(source);
   }
@@ -529,7 +555,7 @@ export function prepareJournalBatch(store: Store, request: JournalBatchRequest):
   }
   const context: Context = { target, ref: head ? reference(head) : undefined };
   const decided = decide(known, head ? head.value.classifications : [], asked.classifications, context,
-    answersRows(project, [...rows, ...additions]));
+    answersRows(project, [...rows, ...additions]), order);
   if (!decided.ok) return decided;
   if (head && additions.length === 0 && decided.value.length === 0) {
     const standing = reference(head);
@@ -537,6 +563,7 @@ export function prepareJournalBatch(store: Store, request: JournalBatchRequest):
   }
 
   const value: RefusalJournal = {
+    ...(order === undefined ? {} : { sourceOrder: order }),
     projectId: project,
     rows: [...rows, ...additions],
     classifications: [...(head ? head.value.classifications : []), ...decided.value],
@@ -583,9 +610,9 @@ function readSource(store: Store, ref: unknown, project: string, target: string)
 }
 
 /** Appends the rows of one checked record that `known` does not hold yet. */
-function appendRows(record: UnitRefusalRecord, source: Ref, known: Set<string>, additions: JournalRow[]): void {
+function appendRows(record: UnitRefusalRecord, source: Ref, known: Set<string>, additions: JournalRow[], order: SourceOrder | undefined): void {
   for (const entry of record.refusals) {
-    const row = rowOf(record.gate, entry, source);
+    const row = rowOf(record.gate, entry, source, order);
     // T5: the same refusal again is a repeat, not a second event, on either path — a re-delivered record or a
     // record that names one refusal twice. Two DIFFERENT records keep their own rows, so a repetition across
     // attempts still reaches G7 (T6).
@@ -601,7 +628,7 @@ const answersRows = (project: string, rows: readonly JournalRow[]): ReadonlySet<
 
 /** The decisions of a request that do not stand yet, weighed against the rows and the decisions that do. */
 function decide(rows: ReadonlySet<string>, standing: readonly RefusalClassification[],
-  requested: readonly RefusalClassification[], context: Context, answers: ReadonlySet<string>): OmResult<RefusalClassification[]> {
+  requested: readonly RefusalClassification[], context: Context, answers: ReadonlySet<string>, order: SourceOrder | undefined): OmResult<RefusalClassification[]> {
   // The decisions already standing and those taken earlier in THIS set are weighed alike: a set that says one thing
   // twice says it once, and a set that says two different things about one refusal decides it twice, which is what
   // the journal holds each refusal once against.
@@ -612,7 +639,7 @@ function decide(rows: ReadonlySet<string>, standing: readonly RefusalClassificat
     // №1628 Q1, C36: G4b has no refusal of its own for G7 to classify; a decision about a G4b row is refused by address,
     // never kept as a class or an addressee to be read back.
     if (answers.has(item.row)) return problem("classification_invalid", "A G4b row is an observation of the gate and is never classified", context, "row");
-    const classification = classificationOf(item);
+    const classification = classificationOf(item, order);
     const already = decided.get(item.row);
     if (already) {
       if (hashJson(already) === hashJson(classification)) continue;
@@ -729,7 +756,7 @@ function currentJournal(store: Store, project: string, target: string): OmResult
   return readJournalAt(store, project, reference(head));
 }
 
-function rowOf(gate: string, entry: UnitRefusal, source: Ref): JournalRow {
+function rowOf(gate: string, entry: UnitRefusal, source: Ref, order: SourceOrder | undefined): JournalRow {
   // Fields are copied one by one: a row holds what the journal is defined to hold and nothing else, whatever the
   // record around them carried.
   const body = {
@@ -741,20 +768,20 @@ function rowOf(gate: string, entry: UnitRefusal, source: Ref): JournalRow {
       // delivered twice hashes alike.
       sources: entry.origin.sources
         .map(normalizeOriginSource)
-        .sort((left, right) => compare(originSourceKey(left as OriginSource), originSourceKey(right as OriginSource))),
+        .sort((left, right) => compare(sourceKeyOf(order)(left as OriginSource), sourceKeyOf(order)(right as OriginSource))),
     },
     source: { id: source.id, revision: source.revision, hash: source.hash },
   };
   return { id: hashJson(body), ...body };
 }
 
-function classificationOf(source: RefusalClassification): RefusalClassification {
+function classificationOf(source: RefusalClassification, order: SourceOrder | undefined): RefusalClassification {
   return {
     row: source.row, class: source.class, addressee: source.addressee,
     // Canonical for the same reason a row is: two readings of the same decision must compare equal (T5, T6).
     basis: source.basis
       .map(normalizeOriginSource)
-      .sort((left, right) => compare(originSourceKey(left as OriginSource), originSourceKey(right as OriginSource))),
+      .sort((left, right) => compare(sourceKeyOf(order)(left as OriginSource), sourceKeyOf(order)(right as OriginSource))),
   };
 }
 
@@ -816,8 +843,14 @@ function checkOrigin(value: unknown, context: Context, path: string, codes: Code
 }
 
 function checkJournal(store: Store, value: unknown, project: string, context: Context): OmResult<never> | null {
-  if (!isPlainObject(value) || !exactKeys(value, JOURNAL_KEYS)) return problem("journal_invalid", "A journal carries its project and its rows", context, "value");
+  const marked = isPlainObject(value) && Object.hasOwn(value as object, "sourceOrder");
+  if (!isPlainObject(value) || !exactKeys(value, [...JOURNAL_KEYS, ...(marked ? ["sourceOrder"] : [])]))
+    return problem("journal_invalid", "A journal carries its project and its rows", context, "value");
   const journal = value as Record<string, unknown>;
+  // An absent order is the fec6932 era; a present one names the order this unit writes, and nothing else (№2556-3).
+  if (marked && journal['sourceOrder'] !== SOURCE_ORDER)
+    return problem("journal_invalid", "A journal names the order of its sources only as this unit writes it", context, "sourceOrder");
+  const order = journal['sourceOrder'] as SourceOrder | undefined;
   const projectId = journal['projectId'];
   if (!isText(projectId)) return problem("journal_invalid", "A journal names the project it belongs to", context, "projectId");
   // A journal of another project standing at this address is not this project's journal, however well it reads.
@@ -841,7 +874,7 @@ function checkJournal(store: Store, value: unknown, project: string, context: Co
     if (bad) return bad;
     // T3: the row is derived AGAIN from the refusal record it names, not read back from its own fields. A row that
     // merely agrees with itself — content rewritten and its id recomputed to match — is not a refusal the gate gave.
-    const produced = rowsOfSource(store, project, from, context, path, derived);
+    const produced = rowsOfSource(store, project, from, context, path, derived, order);
     if ("ok" in produced) return produced;
     const rowId = id as string;
     const original = produced.get(rowId);
@@ -852,7 +885,7 @@ function checkJournal(store: Store, value: unknown, project: string, context: Co
     seen.add(rowId);
     if (answersRowMarks(project, original).any) answers.add(rowId);
   }
-  return checkClassifications(journal['classifications'], seen, context, answers);
+  return checkClassifications(journal['classifications'], seen, context, answers, order);
 }
 
 /**
@@ -863,7 +896,7 @@ function checkJournal(store: Store, value: unknown, project: string, context: Co
  */
 function rowsOfSource(
   store: Store, project: string, source: Ref, context: Context, path: string,
-  derived: Map<string, ReadonlyMap<string, JournalRow>>,
+  derived: Map<string, ReadonlyMap<string, JournalRow>>, order: SourceOrder | undefined,
 ): ReadonlyMap<string, JournalRow> | OmResult<never> {
   const key = `${source.id}:${source.revision}:${source.hash}`;
   const known = derived.get(key);
@@ -884,14 +917,15 @@ function rowsOfSource(
   }
   const rows = new Map<string, JournalRow>();
   for (const entry of read.value.value.refusals) {
-    const row = rowOf(read.value.value.gate, entry, source);
+    const row = rowOf(read.value.value.gate, entry, source, order);
     rows.set(row.id, row);
   }
   derived.set(key, rows);
   return rows;
 }
 
-function checkClassifications(value: unknown, rows: ReadonlySet<string>, context: Context, answers: ReadonlySet<string>): OmResult<never> | null {
+function checkClassifications(value: unknown, rows: ReadonlySet<string>, context: Context, answers: ReadonlySet<string>,
+  order: SourceOrder | undefined): OmResult<never> | null {
   // A journal of the earlier shape, which carried no set of classifications at all, is not an unclassified journal:
   // "nothing classified yet" is said with an empty set, and an absent one says nothing (T4).
   if (!Array.isArray(value)) return problem("journal_invalid", "A journal carries its set of classifications, explicitly empty until G7 has classified a refusal", context, "classifications");
@@ -913,7 +947,7 @@ function checkClassifications(value: unknown, rows: ReadonlySet<string>, context
       const issue = sourceIssue(basis[ground]);
       if (issue !== null) return problem("journal_invalid", "A ground needs its role, exact reference and complete context", context, issue ? `${where}.${issue}` : where);
     }
-    if (hashJson(classificationOf(item as unknown as RefusalClassification)) !== hashJson(item)) {
+    if (hashJson(classificationOf(item as unknown as RefusalClassification, order)) !== hashJson(item)) {
       return problem("journal_invalid", "A classification is not held as this unit writes one", context, path);
     }
     const row = fields['row'] as string;

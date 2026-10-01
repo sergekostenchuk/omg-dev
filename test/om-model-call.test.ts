@@ -310,7 +310,8 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
   return { graphData, graph, input, sources, gaps, gapRequest, source, routes };
 }
 
-function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false) {
+function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
+  seriesCommit?: string) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
   const extra = extraQuestion || kind === 'design';
   const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : kind === 'design' ? 'design' : 'addressed'}:${extra}`,
@@ -341,8 +342,12 @@ function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 
   const address = kind === 'field' ? { project, owner: { kind: 'mechanism' as const, mechanism: 'M5:addressing' as const }, line: 1 }
     : { project, block: kind === 'node' ? batch.node! : 'garden-consume-block', line: 1 };
   const admission = { gaps: gapRequest, routes: reference(routes), batch: batch.id };
-  valueOf(openSeries(store, kind === 'field' ? { ...address, scope: gapRequest, predecessor: null, basis: null } as never
-    : { ...address, slice: 'e4-fixture', predecessor: null, basis: null } as never));
+  const firstLine = kind === 'field' ? { ...address, scope: gapRequest, predecessor: null, basis: null }
+    : { ...address, slice: 'e4-fixture', predecessor: null, basis: null };
+  // Q3 (№2573-1): a historical producer continues a line of its own form, opened by its own commit when a test names one.
+  if (seriesCommit) h15AtCommit({ root, database }, seriesCommit, 'era-series', `const { openSeries } = await import(src('om/series.js'));
+out(reference(take(openSeries(store, args))));`, firstLine);
+  else valueOf(openSeries(store, firstLine as never));
   for (let attempt = 1; attempt <= priorNoProgress; attempt++) {
     valueOf(beginAttempt(store, kind === 'field' ? { ...address, attempt, goal, admission } as never : { ...address, attempt, goal } as never));
     valueOf(completeAttempt(store, { ...address, attempt, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
@@ -2684,14 +2689,14 @@ test('33 H1.0b CAS loss leaves a received response retryable without irreversibl
 test('16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement', async t => {
   const { pathToFileURL } = await import('node:url');
   const { execFile } = await import('node:child_process');
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, false); f.steps([{ research: e4Fact(f), usage }]);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, false, false, H10A_COMMIT); f.steps([{ research: e4Fact(f), usage }]);
   const repo = fileURLToPath(new URL('../../', import.meta.url));
   const loader = join(f.root, 'h10a-loader.mjs'), producer = join(f.root, 'h10a-producer.mjs'), spec = join(f.root, 'h10a.json');
   writeFileSync(loader, String.raw`import{execFileSync}from'node:child_process';import{fileURLToPath}from'node:url';
 let root,ts;export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
 export async function load(url,context,next){const prefix=new URL('dist/src/',root).href;
 if(url.startsWith(prefix)&&/\.js$/.test(url)){const relative='src/'+url.slice(prefix.length).replace(/\.js$/,'.ts');
-const source=execFileSync('git',['show','7aa19cc95adc5c94152c17425d17b6e88d64617f:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
+const source=execFileSync('git',['show','${H10A_COMMIT}:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
 return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}return next(url,context);}`);
   writeFileSync(spec, JSON.stringify({ database: f.database, request: f.request, packet: f.packetRequest, repo: pathToFileURL(repo + '/').href }));
   writeFileSync(producer, String.raw`import{readFileSync}from'node:fs';
@@ -3403,6 +3408,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 const H15_BASE_COMMIT = '479b307f8aa3d43745f5313c1f5c8a712bd7d55a';
+const H10A_COMMIT = '7aa19cc95adc5c94152c17425d17b6e88d64617f';
 const h15CannotAnswer = { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'cannot_answer', code: 'cannot_answer', message: 'never needed' };
 const h15Heads = (store: Store) => store.list().map(reference);
 function h15Refusal<T>(result: OmResult<T>) { if (result.ok) assert.fail('Expected a typed refusal, not a paid or replayed call'); return result.refusal; }
@@ -3550,7 +3556,7 @@ ${body}
 test('H1.5 №2166 п.3 ERA a call the base code already paid for is finished and accounted as before, applied or only received, also through a new store: the prohibition asks only for a NEW dispatch', async t => {
   /** The base code sends the ready packet (it had no admission check); with `stop` its process dies right after the durable receipt. */
   async function paidByBase(stop: boolean) {
-    const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+    const f = e4Fixture(t, 'design', 100_000, 0, 5000, true, true, false, H15_BASE_COMMIT);
     f.steps([{ research: h15CannotAnswer, usage }]);
     const base = h15AtCommit(f, H15_BASE_COMMIT, `h15-${stop ? 'received' : 'applied'}`, `const { runModelCall } = await import(src('om/model-call.js'));
 const writeMany = store.writeMany.bind(store);

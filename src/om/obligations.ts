@@ -82,6 +82,16 @@ function fail(code: string, target: string, field: string, message: string, rout
   throw new EngineError('obligation_internal', 'A refusal unexpectedly succeeded');
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new ObligationFailure(result.refusal); return result.value; }
+/**
+ * Q3 (№2549-1, №2557): the deepest level the accepted frames reach in the exact graph. Only nodes of that graph count, and
+ * an empty intersection is refused before any maximum is taken — the maximum of nothing is -Infinity, never a level.
+ */
+export function acceptedLevelOf(graph: Graph, acceptedNodes: ReadonlySet<string>, graphRef: Ref): OmResult<1 | 2 | 3> {
+  const levels = graph.nodes.filter(node => acceptedNodes.has(node.id)).map(node => LEVEL[node.kind]);
+  if (!levels.length) return refused('obligation_context_mismatch', 'The accepted frames must name nodes of the exact graph',
+    { unit: 'D7', target: graphRef.id, field: 'frames' }, 'producer');
+  return { ok: true, value: Math.max(...levels) as 1 | 2 | 3 };
+}
 function result<T>(action: () => T): OmResult<Sealed<T>> {
   return withHistoricalReads(() => {
     try { return delivered(action()); }
@@ -141,7 +151,7 @@ function context(store: Store, request: ObligationRequest): Context {
       if (LEVEL[node.kind] <= item.frame.level) acceptedNodes.add(node.id);
     inputs.push(...frame.references);
   }
-  const acceptedLevel = Math.max(...graph.nodes.filter(node => acceptedNodes.has(node.id)).map(node => LEVEL[node.kind])) as 1 | 2 | 3;
+  const acceptedLevel = take(acceptedLevelOf(graph, acceptedNodes, sources.graph));
   const { level: _level, ...projection } = projectGraph(graph, acceptedLevel);
   // Both endpoints AND every relation along the responsibility path need acceptance.
   // Unaccepted lower edges cannot supply a bridge between accepted upper nodes.

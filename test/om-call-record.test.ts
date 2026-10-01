@@ -1410,7 +1410,50 @@ test("block origin analysis follows its inherited current hold and rejects a lif
 
 const e4FixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 
-function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store) {
+const E50_COMMIT = "3eb5dac3c790ca988082840693969b06b5d81966";
+/**
+ * Q3 (№2573-1): opens a series with the openSeries of one exact earlier commit, in its own process, so the line a
+ * historical producer of that commit continues is of its own form. Every engine module comes from that commit.
+ */
+function openSeriesAt(root: string, path: string, commit: string, request: Json): Ref {
+  const repository = fileURLToPath(new URL("../../", import.meta.url));
+  const loader = join(root, "series-loader.mjs"), producer = join(root, "series-producer.mjs");
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/src/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, request] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const { openSeries } = await import(src('om/series.js'));
+const store = new Store(database);
+try {
+  const opened = openSeries(store, JSON.parse(request));
+  if (!opened.ok) throw Error(JSON.stringify(opened.refusal));
+  process.stdout.write(JSON.stringify(reference(opened.value)));
+} finally { store.close(); }`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
+  return JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, path,
+    JSON.stringify(request)], { cwd: repository, encoding: "utf8", timeout: 60_000, maxBuffer: 10_000_000 })) as Ref;
+}
+
+function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, seriesCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), "omg-e50-fact-")), path = join(root, "state.sqlite"), project = "garden";
   let store = new StoreType(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1454,7 +1497,10 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
   const block = "garden-consume-block", source = store.get<{ content: string }>(`source:${project}:brief`)!;
   const attemptGoal: AttemptGoal = { key: "e50:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
-  deliveredOf(openSeries(store, { project, block, line: 1, slice: "e50-fact", predecessor: null, basis: null }));
+  const opening = { project, block, line: 1, slice: "e50-fact", predecessor: null, basis: null };
+  // A historical producer continues a line of its own form: opened by its commit when the test asks for one (№2573-1).
+  if (seriesCommit) openSeriesAt(root, path, seriesCommit, opening);
+  else deliveredOf(openSeries(store, opening));
   const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [e4FixturePath, "--scenario", scenario, "--trace", trace] };
@@ -1519,7 +1565,7 @@ test("new direct fact E1 refuses both unmanaged and reserved names without an E5
 });
 
 test("genuine E5.0 E1 and E4 records remain historical after restart while an old open E1 cannot launch E4", async t => {
-  const f = factAssessmentFixture(t), origin = await f.original(), current = origin.assessment();
+  const f = factAssessmentFixture(t, Store, E50_COMMIT), origin = await f.original(), current = origin.assessment();
   const basis = structuredClone(origin.basis);
   delete (basis as { assessment?: Ref }).assessment;
   const oldPacket = { questionId: f.questionId, value: "UTF-8", evidence: origin.model.response };
