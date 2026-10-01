@@ -92,6 +92,8 @@ function agreesWithIndependentCompilation(graph: ReturnType<typeof exampleGraph>
 const unique = (tag: string, index: number) => ({ type: "string", description: `s15-${tag}-${index}` });
 
 test("S1.5 №2363 a contract schema is compiled once per distinct schema: equal bytes in another object and under another contract id reuse the verdict, a changed schema and the reverse order compile only what is new, and the findings equal an independent compilation", () => {
+  // The fixture's own contract is remembered first, so a filtered standalone run counts the same as a full one.
+  invalidContracts(withContracts([]));
   const a = { id: "s15-a", schema: unique("once", 1) }, b = { id: "s15-b", schema: structuredClone(unique("once", 1)) };
   const first = compilations(() => invalidContracts(withContracts([a, b])));
   assert.deepEqual(first.result, []); assert.equal(first.compiled, 1, "Equal bytes in two objects under two ids compile once");
@@ -108,6 +110,8 @@ test("S1.5 №2363 every contract is judged alone: equal $id in two schemas is n
   const inner = { id: "s15-inner", schema: { $id: "urn:s15:inner", definitions: { s: { type: "string" } }, $ref: "#/definitions/s" } };
   const external = { id: "s15-external", schema: { $ref: "urn:s15:shared" } };
   assert.deepEqual([compilesAlone(sameId1.schema), compilesAlone(sameId2.schema), compilesAlone(inner.schema), compilesAlone(external.schema)], [true, true, true, false]);
+  // The fixture's own contract is remembered first, so the count below is exact for these four schemas alone.
+  invalidContracts(withContracts([]));
   const forward = compilations(() => invalidContracts(withContracts([sameId1, sameId2, inner, external])));
   assert.deepEqual(forward.result, ["s15-external"], "Only the external reference is refused; the shared $id and the inner $ref pass");
   assert.equal(forward.compiled, 4, "Four distinct schemas, four isolated compilations");
