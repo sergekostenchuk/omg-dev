@@ -1848,7 +1848,9 @@ function historicalApplicationBasis(store: Store, request: ModelCallRequest, cal
   const seen: Ref[] = [];
   // S1.1 (№1887-5): the common transparent collector, not an opaque Proxy of its own — the readers' proofs stay shared
   // with the operation and a hot proof replays the same references to this collector. Only gets count, as before.
-  const observed = historicalTrace(store, (ref, _head, method) => { if (method === 'get') seen.push(ref); });
+  // S1.2 (№2329): the basis is a sorted set of exact references, so the collector declares the distinct semantics it
+  // needs: a replayed kept proof then visits each shared subproof once instead of once per nested use.
+  const observed = historicalTrace(store, (ref, _head, method) => { if (method === 'get') seen.push(ref); }, 'distinct');
   modelAssignment(observed, request);
   take(readCall(observed, request.project, call));
   if (transport.kind === 'answered') checkAnswerForm(observed, { project: request.project, packet: request.packet, raw: transport.raw });

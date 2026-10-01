@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
@@ -31,10 +31,10 @@ import { settleCandidate } from "../src/om/frame-accept.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import type { Node } from "../src/graph/model.js";
 import { preparedField } from "./preparation-fixture.js";
-import { readOmInput, writeOmInput } from "../src/om/input.js";
+import { readOmInput, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { readHorizon, writeHorizon, writeHorizonIssuance } from "../src/om/horizon.js";
-import { writeSeriesTransition } from "../src/om/series-transition.js";
-import { applySeriesActivation, beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, readCompletionBinding, readSeriesMembership, resumeSeries, seriesRequestOf } from "../src/om/series.js";
+import { readPreparedSeriesTransition, writeSeriesTransition } from "../src/om/series-transition.js";
+import { applySeriesActivation, beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, readAnySeriesAt, readAppliedSeriesTransition, readCompletionBinding, readCurrentSeriesPointer, readSeriesMembership, resumeSeries, seriesRequestOf } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes.js";
@@ -1899,7 +1899,7 @@ test("25 R20 №1937-1 №1860-5 H1.1 managed N2: while the first participant wa
   assert.equal(f.sent().length, 2, "The missing participant is actually paid");
 });
 
-test("25 R8 R20 №1937-2 №1860-8 H1.1 managed N2 after C5: completion bases serve both D2 and G7 through second stores, with no B3 before the group is closed", async t => {
+test("25 R8 R20 №1937-2 №1860-8 H1.1 managed N2 after C5: completion bases serve both D2 and G7 through second stores, with no B3 before the group is closed; S1.2 №1961-4 then the common B3 of the new slices and the first L3 step on the joint base, nothing paid again", async t => {
   const f = runFixture(t, [], false);
   for (const block of ["garden-produce-block", "garden-consume-block"])
     ok(openSeries(f.store, { project, block, line: 1, slice: "h11-initial", predecessor: null, basis: null }));
@@ -1924,8 +1924,78 @@ test("25 R8 R20 №1937-2 №1860-8 H1.1 managed N2 after C5: completion bases s
   assert.deepEqual(reference(f.store.get(`om-series-current:${project}`)!), pointer);
   for (const block of ["garden-produce-block", "garden-consume-block"])
     assert.equal(blockSeries(f, block).value.attempts.at(-1)!.outcome!.reason, "result", block);
-  // B3 of the new slices and the L3 admission after it are the next step of new work; their cost in the managed fixture
-  // is the S1 class (named in the report), so this regression stops at the closed group.
+  // ---- S1.2 (№1961-4): on the joint base the same pass goes on past the closed group ----
+  // The common B3 of the new slices — P over both current lines, its G2 issuance and the activation, each by its own
+  // producer, inside the pass's own bases step — then the lawful first L3 step of new work on the line that activation
+  // made, through a second store after the activation. The accepted N2 stays the exact basis of the new issue, both
+  // participants are named by their exact revisions, the closed attempts stay closed and nothing is paid again.
+  const paid = f.sent().length, acceptances = f.store.history(`om-frame:${project}:2`).length;
+  const roots = ok(readSeriesMembership(f.store, { project })).value.roots;
+  const blocks = ["garden-consume-block", "garden-produce-block"];
+  const previous = blocks.map(block => reference(f.store.get(`repair-series:${project}:1:${block}`)!));
+  const l3 = await driveUntil(f, request, state => state.phase === "step" && state.step.action === "cycle", 30, ["bases"]);
+  assert.deepEqual(l3.trail, ["bases", "open", "register", "obligations", "packet"],
+    "One B3 of the new slices inside the pass's own bases, then the first L3 work opens on the line it activated: no second bases, no open-series");
+  const built = ok(prepareRunBases(f.store, { project }));
+  if (built.state !== "ready") assert.fail("The bases over the accepted N2 are current");
+  assert.deepEqual(ok(readHorizon(f.store, project, built.built.bases.horizon)).horizon.value.request.refinement,
+    reference(f.store.get(`graph-layer:${project}:2`)!), "The new issue stands on the accepted N2 layer");
+  // The activation the pointer names is of this very issue, over the complete registered membership, by exact revisions.
+  assert.notDeepEqual(reference(f.store.get(`om-series-current:${project}`)!), pointer, "The pointer moved to the new activation");
+  const current = ok(readCurrentSeriesPointer(f.store, { project })).value;
+  const activation = ok(readAppliedSeriesTransition(f.store, { project, record: current.applied })).value;
+  const plan = ok(readPreparedSeriesTransition(f.store, { project, record: activation.prepared })).record.value;
+  assert.deepEqual(plan.request.horizon, built.built.bases.horizon, "P names the horizon of the pass's own new issue");
+  // The producer normalizes its series by the canonical form of the whole Ref (hash included), so the lawful order of
+  // the two lines depends on the fixture's hashes: the set is compared through the same sorting of copies (№2347).
+  const byCanonical = (a: Ref, b: Ref) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0;
+  assert.equal(plan.request.series.length, previous.length, "P names exactly the two current lines");
+  assert.deepEqual([...plan.request.series].sort(byCanonical), [...previous].sort(byCanonical), "P covers both current lines at their exact revisions");
+  assert.deepEqual(activation.decisions.map(row => [row.block, row.participation, row.outcome]),
+    blocks.map(block => [block, "active", "new-work"]), "Both participants are active on their new slices");
+  assert.deepEqual(activation.roots, roots, "The registered membership is the same");
+  assert.equal(f.store.list("series-transition").length, transitions + 1, "One P");
+  assert.equal(f.store.list("om-series-applied").length, applied + 1, "One activation");
+  for (const [index, block] of blocks.entries()) {
+    // The new line of each block stands on its exact previous line; the pointer names the new line's activation revision.
+    const next = f.store.get<RepairSeries>(`repair-series:${project}:2:${block}`)!;
+    assert.deepEqual(next.value.predecessor, previous[index], block);
+    assert.deepEqual(current.series.find(row => row.block === block), { block, activation: reference(f.store.get(next.id, 1)!), participation: "active" }, block);
+    assert.deepEqual(f.store.get<RepairSeries>(previous[index]!.id)!.value.attempts.map(attempt => attempt.outcome?.reason), ["result"], `${block}: the closed attempt of line 1 stays closed`);
+  }
+  // The first L3 step: the produce block's new line (first in M3), on a level-3 batch of these bases — chosen, not yet paid.
+  const step = l3.state.phase === "step" ? l3.state.step : assert.fail("A saved step");
+  assert.equal(step.series, `repair-series:${project}:2:garden-produce-block`);
+  assert.deepEqual(f.store.get<RepairSeries>(step.series!)!.value.attempts.map(attempt => attempt.outcome), [null], "One open attempt on the new line");
+  const saved = (step.request as unknown as { packet: Ref }).packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  assert.deepEqual(packet.value.request.routes, built.built.bases.routes, "The L3 packet stands on the routes of the new bases");
+  const batch = f.store.get<RoutesRecord>(built.built.bases.routes.id, built.built.bases.routes.revision)!.value.batches.find(row => row.id === packet.value.request.batch)!;
+  assert.deepEqual([batch.task, batch.level, batch.node], ["node-expansion", 3, "garden-h1-operation-garden-produce-block"]);
+  assert.equal(f.sent().length, paid, "Nothing was paid again: the L3 call is chosen, not yet made");
+  assert.equal(f.store.history(`om-frame:${project}:2`).length, acceptances, "One common acceptance");
+  // A new store finds the same saved step on the same bases: the build repeated with the open attempt named writes
+  // nothing — no second P, issuance or activation — and nothing is sent again.
+  f.restart();
+  assert.deepEqual(ok(readRun(f.store, { project }))!.value.state, l3.state);
+  const heads = f.store.list().map(reference);
+  assert.deepEqual(ok(writeRunBases(f.store, { project }, { open: [step.series!] })).bases, built.built.bases);
+  assert.deepEqual(f.store.list().map(reference), heads, "The repeated build found its bases and wrote nothing");
+  assert.equal(f.sent().length, paid);
+  // The exact references P stands on read the same however its nested proofs are served (№2329): cold on this store,
+  // hot inside one operation (replayed from the operation's own proofs), warmed by the nested readers before the
+  // collector attaches (replayed from kept proofs), and again on a new store.
+  const readPlan = () => ok(readPreparedSeriesTransition(f.store, { project, record: activation.prepared }));
+  const cold = readPlan();
+  assert.deepEqual(cold.record.value, plan);
+  const hot = withHistoricalReads(() => { readPlan(); return readPlan(); });
+  const warmed = withHistoricalReads(() => {
+    ok(readHorizon(f.store, project, plan.request.horizon));
+    for (const ref of plan.request.series) ok(readAnySeriesAt(f.store, project, ref));
+    return readPlan();
+  });
+  assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
+  f.restart();
+  assert.deepEqual(readPlan(), cold);
 });
 
 test("R19 №1937-3 H1.1 a second store opening work between the saved bases step's admission and its write: the step is refused, D1 does not move", async t => {

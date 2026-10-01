@@ -304,7 +304,9 @@ export function readPreparedSeriesTransition(store: Store, request: { project: s
       { unit: UNIT, target: 'series-transition', field: 'record' });
   return result(() => {
     const references: Ref[] = [];
-    const traced = historicalTrace(store, ref => references.push(ref));
+    // S1.2 (№2329): the set of exact dependencies, never the multiplicity of visits — an ordered observer receives a kept
+    // proof's replay with every nested journal repeated per use, which grows exponentially over managed series history.
+    const traced = historicalTrace(store, ref => references.push(ref), 'distinct');
     const record = checked(traced, request.project, request.record);
     return { record, references: uniqueRefs(references) };
   });
