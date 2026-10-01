@@ -3,7 +3,6 @@ import { EngineError, requireCondition } from '../errors.js';
 import { isRef, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Ajv } from 'ajv';
 import { Store } from '../storage/store.js';
-import type { GapRecord } from '../om/gaps.js';
 import { historicalRead } from '../history/proofs.js';
 import type { Graph } from './model.js';
 import type { ResearchScope } from './research-scope.js';
@@ -45,6 +44,11 @@ export interface TaskObligationCheck {
   byNode: Map<string, BoundTaskObligation[]>;
 }
 
+// №2484 R6: the OM gap record is read here by its original deferral flag only.
+// A structural slice keeps the record's own type out of this module's imports;
+// the record proof itself is unchanged — the OM handshake ran before the read.
+export interface GapDeferralSlice { gap: { deferral?: object } }
+
 function verifiedScope(store: Store, project: string, handoff: ObligationHandoff): ResearchScope | null {
   let scope: ResearchScope | null = null;
   if (!('r2' in handoff)) {
@@ -79,7 +83,7 @@ function bindingContext(store: Store, graph: Graph, handoff: ObligationHandoff, 
     if (!scope) {
       // The common OM reader has proved this exact /gap. Its original deferral
       // survives the handoff; a new work refinement can make its consumer due.
-      const original = store.get<GapRecord>(obligation.original.record.id, obligation.original.record.revision)!.value.gap;
+      const original = store.get<GapDeferralSlice>(obligation.original.record.id, obligation.original.record.revision)!.value.gap;
       const realizes = (node: Graph['nodes'][number]) => node.kind === 'work'
         && relations.refines(node.id, obligation.responsibleNode) && relations.refines(node.id, obligation.responsibleConsumer);
       // Graphs have no uiRequired signal. Retain that explicit wake term without

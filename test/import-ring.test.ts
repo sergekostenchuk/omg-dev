@@ -8,10 +8,11 @@ import { fileURLToPath } from 'node:url';
 const ts = createRequire(import.meta.url)('typescript') as typeof import('typescript');
 
 // №32: the import ring is a ratchet — it may only shrink. The limits are the
-// largest strongly connected component sizes measured after R5 (№2451) on
-// om/module = 380abe7: the historical-read mechanism left om/input (load 62 → 40, full 101).
+// largest strongly connected component sizes measured after R6 (№2484) on
+// om/module = 4f8084c: task-obligations reads the OM gap record through a
+// structural slice, so om/* left the largest full component (load 40, full 101 → 53).
 const LOAD_RING_LIMIT = 40;
-const FULL_RING_LIMIT = 101;
+const FULL_RING_LIMIT = 53;
 
 type Graph = Map<string, string[]>;
 
@@ -199,4 +200,14 @@ test('R5 (№2451): the historical-read mechanism is below OM — history/proofs
     assert.ok(!full.get(consumer)!.includes('om/input.ts'), `${consumer} no longer imports om/input`);
     assert.ok(load.get(consumer)!.includes('history/proofs.ts'), `${consumer} imports the mechanism from below`);
   }
+});
+
+test('R6 (№2484): graph/task-obligations keeps no edge to om/gaps or any om module, and the largest full component has no om member', () => {
+  const root = fileURLToPath(new URL('../../src/', import.meta.url));
+  const { full } = collectEdges(sources(root));
+  const targets = full.get('graph/task-obligations.ts')!;
+  assert.ok(!targets.includes('om/gaps.ts'), 'task-obligations must not import om/gaps, not even a type');
+  assert.deepEqual(targets.filter(name => name.startsWith('om/')), []);
+  const ring = largestComponent(full);
+  assert.deepEqual(ring.filter(name => name.startsWith('om/')).sort(), []);
 });

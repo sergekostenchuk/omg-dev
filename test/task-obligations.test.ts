@@ -9,7 +9,9 @@ import { preparedFeatures } from './product-fixture.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { configureResearchScope } from '../src/graph/research-scope.js';
 import { carriedObligations, type ObligationPolicy } from '../src/graph/obligation-policy.js';
-import { bindTaskObligations, requireTaskObligations, taskBindingId, taskObligationHandoff, TASK_OBLIGATION_CONTRACT } from '../src/graph/task-obligations.js';
+import { bindTaskObligations, requireTaskObligations, taskBindingId, taskObligationHandoff, TASK_OBLIGATION_CONTRACT,
+  type GapDeferralSlice } from '../src/graph/task-obligations.js';
+import type { GapRecord } from '../src/om/gaps.js';
 import { obligationHandoff } from '../src/graph/obligation-handoff.js';
 import { layerDesignSpec, layerDesignOf } from '../src/graph/layer-design.js';
 import { projectGraph } from '../src/graph/project.js';
@@ -20,6 +22,11 @@ import type { Graph } from '../src/graph/model.js';
 import type { Question } from '../src/discovery/discovery.js';
 import { planningForQuestion } from '../src/discovery/research-routing.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
+
+// R6 (№2484): the structural slice stays honest — a real OM GapRecord is
+// assignable to it, so the deferral read sees the actual stored field.
+const gapRecordFitsSlice: GapRecord extends GapDeferralSlice ? true : never = true;
+void gapRecordFitsSlice;
 
 function fixture(t: test.TestContext, responsible = 'p-produce-block') {
   const root = mkdtempSync(join(tmpdir(), 'omg-task-obligations-')), store = new Store(join(root, 'db.sqlite')), engine = new ProductEngine(store);
