@@ -390,7 +390,10 @@ test('a recovery diagnostic without new bytes preserves the complete physical ev
  const f=fixture(t,'positive',10,4000);
  let failure:EngineError|null=null;
  try{await observeRuntime(f.store,'p',{scope:reference(f.scope),obligation:'boundary',key:'paid'},undefined,
-  {signal:()=>'EPERM',identify:probeProcessIdentity});}catch(e){failure=e as EngineError;}
+  {signal:()=>'EPERM',identify:probeProcessIdentity,
+   // D8.5.1 (№2447): the refused sweep is re-probed; pin the probe to EPERM so the group's
+   // absence stays unproven and the denial stands (an implicit real probe would prove it absent).
+   probeGroup:()=>'EPERM'});}catch(e){failure=e as EngineError;}
  assert.equal(failure?.code,'process_stop_denied');
  const record=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
  t.after(()=>{if(record.value.snapshot)rmSync(record.value.snapshot,{recursive:true,force:true});});

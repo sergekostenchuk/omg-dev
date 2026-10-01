@@ -242,11 +242,17 @@ test('row 18: a refused stop surfaces its own typed error and keeps the original
 
 test('row 19: leader exit plus a refused group sweep rejects with the real result on the private carrier (№1631-5 C24)', async t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  let signals = 0, probes = 0;
   const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('partial-out')"] }, root, '', 4000, undefined, true,
-    undefined, { signal: () => 'EPERM' }));
+    undefined, { signal: () => { signals++; return 'EPERM'; },
+      // D8.5.1 (№2433): the refused sweep is re-probed; absence here stays UNPROVEN (the group never reads absent),
+      // so the denial stands as before.
+      probeGroup: () => { probes++; return 'EPERM'; } }));
   assert.equal(error.code, 'process_stop_denied');
-  const details = error.details as { outcome: string; stage: string; result?: unknown };
+  const details = error.details as { outcome: string; stage: string; result?: unknown; errno?: string; groupProbe?: string | null };
   assert.equal(details.outcome, 'denied'); assert.equal(details.stage, 'group-sweep');
+  assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, 'EPERM');
+  assert.equal(signals, 1); assert.ok(probes >= 1 && probes <= 6, `probes ${probes} within the budget`);
   // Public diagnostics never carry the physical bytes; server.ts serializes
   // details into HTTP responses. The private carrier keeps them with the
   // completeness flag for the subject's own recovery path.
@@ -254,6 +260,71 @@ test('row 19: leader exit plus a refused group sweep rejects with the real resul
   assert.doesNotMatch(JSON.stringify(details), /partial-out/);
   const physical = processStopPhysical(error);
   assert.equal(physical!.complete, true); assert.equal(physical!.exitCode, 0); assert.equal(physical!.stdout, 'partial-out');
+});
+
+// D8.5.1 (№2433): a transient EPERM/EACCES of the sweep with the group proven absent by the same-PGID
+// signal-0 probe is absent — the command's actual result is returned, the refusal never masks it.
+test('row 19c: a refused sweep with the group proven absent resolves with the real result (EPERM)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  let signals = 0, probes = 0;
+  const result = await runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('partial-out'); process.exitCode = 1"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => { signals++; return 'EPERM'; }, probeGroup: () => { probes++; return 'ESRCH'; } });
+  assert.equal(result.exitCode, 1); assert.equal(result.stdout, 'partial-out');
+  assert.equal(signals, 1); assert.equal(probes, 1);
+});
+
+test('row 19d: a refused sweep with the group proven absent resolves with the real result (EACCES)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const result = await runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('done')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EACCES', probeGroup: () => 'ESRCH' });
+  assert.equal(result.exitCode, 0); assert.equal(result.stdout, 'done');
+});
+
+test('row 19e: a late proven absence still resolves — the probe retries within its budget', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  let signals = 0, probes = 0;
+  const result = await runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('late')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => { signals++; return 'EPERM'; }, probeGroup: () => { probes++; return probes === 1 ? 'EPERM' : 'ESRCH'; } });
+  assert.equal(result.exitCode, 0); assert.equal(result.stdout, 'late');
+  assert.equal(signals, 1); assert.ok(probes >= 2, `second probe happened (${probes})`);
+});
+
+test('row 19f: a probe answering present keeps the denial and the original errno', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  let probes = 0;
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => { probes++; return null; } }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; errno: string; groupProbe?: string | null };
+  assert.equal(details.outcome, 'denied'); assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, null);
+  assert.ok(probes >= 1 && probes <= 6, `probes ${probes} within the budget`);
+});
+
+test('row 19g: a probe observation error is no absence — the original denial keeps its diagnostics', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => 'EIO' }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; errno: string; groupProbe?: string | null };
+  assert.equal(details.outcome, 'denied'); assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, 'EIO');
+});
+
+test('row 19h: a throwing probe is an observation error, never an absence', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => { throw Object.assign(new Error('probe blew'), { code: 'EBADF' }); } }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; errno: string; groupProbe?: string | null };
+  assert.equal(details.outcome, 'denied'); assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, 'EBADF');
+});
+
+test('row 19i: a sweep error other than EPERM/EACCES keeps the previous classification and is never probed', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  let probes = 0;
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EIO', probeGroup: () => { probes++; return 'ESRCH'; } }));
+  assert.equal(error.code, 'process_stop_failed');
+  assert.equal(probes, 0);
 });
 
 test('row 19b: leader exit plus a clean sweep resolves normally', async t => {
@@ -274,6 +345,47 @@ test('row 20: timeout and exit racing produce one outcome and at most one signal
   await assert.rejects(run, (e: EngineError) => e.code === 'process_timeout' || e.code === 'process_cancelled');
   assert.equal(signals, 1);
 });
+
+// №2475 (D8.5.1 return 1): an abort/timeout landing between close and the sweep probe's end must not
+// lose the already-complete physical — the refusal carries it (complete:true, the real exitCode)
+// with the original reason as cause. The ESRCH control keeps the bare original reason.
+for (const reason of ['abort', 'timeout'] as const) for (const finalProbe of ['EPERM', 'ESRCH'] as const) {
+  test(`row 19j: ${reason} after close while the sweep probe is pending, then ${finalProbe}`, async t => {
+    const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+    const controller = new AbortController();
+    let closed = false, signals = 0, probes = 0;
+    let triggerTimeout: (() => void) | null = null;
+    const cp = createRequire(import.meta.url)('node:child_process') as typeof import('node:child_process');
+    const originalSpawn = cp.spawn, originalTimeout = globalThis.setTimeout;
+    t.after(() => { (cp as { spawn: unknown }).spawn = originalSpawn; globalThis.setTimeout = originalTimeout; syncBuiltinESMExports(); });
+    globalThis.setTimeout = (((callback: (...args: never[]) => void, delay?: number, ...args: never[]) => {
+      if (delay === 4000) triggerTimeout = () => callback(...args);
+      return originalTimeout(callback, delay, ...args);
+    }) as unknown) as typeof setTimeout;
+    (cp as { spawn: unknown }).spawn = (...args: never[]) => {
+      const child = (originalSpawn as (...a: never[]) => ReturnType<typeof originalSpawn>)(...args);
+      // Fire only after every close listener, including runProcess's own, has returned.
+      child.once('close', () => { closed = true; queueMicrotask(() => reason === 'abort' ? controller.abort() : triggerTimeout?.()); });
+      return child;
+    };
+    syncBuiltinESMExports();
+    const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('whole-output'); process.stderr.write('whole-error'); process.exitCode=7"] },
+      root, '', 4000, controller.signal, true, undefined,
+      { signal: () => { signals++; return 'EPERM'; }, probeGroup: () => { probes++; return closed ? finalProbe : 'EPERM'; } }));
+    assert.equal(closed, true);
+    assert.equal(signals, 1);
+    assert.ok(probes > 1 && probes <= 6, `probes ${probes} within the budget`);
+    const cause = reason === 'abort' ? 'process_cancelled' : 'process_timeout';
+    if (finalProbe === 'ESRCH') {
+      assert.equal(error.code, cause);
+      return;
+    }
+    assert.equal(error.code, 'process_stop_denied');
+    const details = error.details as { errno: string; groupProbe?: string | null; cause: { code: string } };
+    assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, 'EPERM'); assert.equal(details.cause.code, cause);
+    assert.deepEqual(processStopPhysical(error), { exitCode: 7, signal: null, stdout: 'whole-output', stderr: 'whole-error', complete: true });
+  });
+}
 
 test('row 23: a finished record replays its own state without touching any process', t => {
   const store = storeFixture(t);

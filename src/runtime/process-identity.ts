@@ -42,6 +42,10 @@ export interface ProcessStopReport {
   expectedStarted: string | null;
   observedStarted: string | null;
   errno: string | null;
+  /** Present only when the refused sweep was re-probed (D8.5.1): the deciding probe's errno
+   * ('ESRCH' proved the absence), null when the group still answered, or the probe's own error.
+   * The sweep's original EPERM/EACCES stays in `errno` — the probe result never replaces it. */
+  groupProbe?: string | null;
   /** Present only when the sender was child.kill and it returned false. */
   signalReturned?: boolean;
 }
@@ -51,6 +55,10 @@ export interface ProcessStopReport {
 export interface ProcessStopHooks {
   identify?: (pid: number) => ProcessIdentityProbe;
   signal?: (pid: number) => string | null | void;
+  /** The signal-0 probe of the same process group after a refused sweep (D8.5.1): no value means the
+   * group still exists (absence not proven), 'ESRCH' proves its absence, any other errno is an
+   * observation error and never an absence. */
+  probeGroup?: (pid: number) => string | null | void;
 }
 
 /** Classifies one signal attempt by its errno and an independent post-check.
@@ -318,6 +326,14 @@ export function evaluateProcessStopWitnesses(
  * the syscall was accepted — acceptance is not proof the group is gone. */
 export function killGroup(pid: number): string | null {
   try { process.kill(-pid, "SIGKILL"); return null; }
+  catch (error) { return (error as NodeJS.ErrnoException)?.code ?? "unknown"; }
+}
+
+/** One signal-0 probe of the same process group: signal 0 sends nothing, so an accepted probe
+ * only says the group still exists (absence NOT proven); 'ESRCH' proves the addressed group is
+ * absent; any other errno is an observation error and never an absence (D8.5.1, row 14 of №1500). */
+export function probeGroupAbsence(pid: number): string | null {
+  try { process.kill(-pid, 0); return null; }
   catch (error) { return (error as NodeJS.ErrnoException)?.code ?? "unknown"; }
 }
 
