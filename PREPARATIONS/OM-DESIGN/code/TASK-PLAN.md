@@ -1367,7 +1367,7 @@
 - Отдаёт: —
 - Читает записи: —
 - Пишет записи: —
-- Разрешённые пути: `src/runtime/process.ts`, `src/runtime/process-identity.ts`, `test/process.test.ts`, `test/model-usage.test.ts`, `test/process-group-recovery.test.ts`
+- Разрешённые пути: `src/runtime/process.ts`, `src/runtime/process-identity.ts`, `test/process.test.ts`, `test/model-usage.test.ts`, `test/process-group-recovery.test.ts`, `test/runtime-observation.test.ts`
 - Из движка как есть: анализ Kimi №2431, артефакты /tmp/omg-flaky-kimi-run/; договор D8.5 №1500
 - После: D8.5
 - Тесты сверх обязательных:
