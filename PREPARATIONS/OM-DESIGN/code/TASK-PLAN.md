@@ -2209,10 +2209,11 @@
 - Отдаёт: —
 - Читает записи: TransactionGuard; Ref
 - Пишет записи: —
-- Разрешённые пути: `src/canonical.ts`, `src/storage/store.ts`, `src/runtime/environment.ts`, `src/pipeline/contracts.ts`, `src/om/refs.ts`, `test/storage.test.ts`
+- Разрешённые пути: `src/canonical.ts`, `src/storage/store.ts`, `src/runtime/environment.ts`, `src/pipeline/contracts.ts`, `src/om/refs.ts`, `src/storage/store-view.ts`, `test/storage.test.ts`
 - Из движка как есть: проверка внешнего ревью — ~/REPORTS/review/omg-external-review-8.5-verification_260926.md
 - После: Q4, S1.4, R44
 - Тесты сверх обязательных:
+  - ДОГОВОР №2649 (~/REPORTS/review/omg-code-q5_contract-2649.md; опись Devin №2647): одна Q5, 7 путей (+store-view.ts — validateGuardForm, 4-я копия из S1.4, иначе захват и commit расходятся); единственный строгий checkTransactionGuards в store.ts → invalid_guard; environment.ts — обёртка + дедуп/сорт; isRef и referenceField — через HASH_RE; 15 строгих inline и 7 схем, response-recovery source_stale, {40,64} — не трогать, без новых задач; смена кода readOmAdmissionGuards на om_admission_guard_invalid — допустимое следствие, регрессия в storage.test; тест «заглавный хэш на захвате store-view — отказ формы» в storage.test
   - найдено 26.09.2026 (872e678): три копии проверки охран — pipeline/contracts.ts:38 isRef строгий /^[a-f0-9]{64}$/, store.ts:31 с флагом i, environment.ts:35 — побайтовая копия store.ts с i; сравнение хэшей регистрозависимо (store.ts:99, environment.ts:52); противоположные тесты — storage.test.ts:184 (заглавный хэш → input_stale, форма признана годной) и om-refs.test.ts:573 (A×64 → reference_invalid); правило формы SHA-256 в ~11 местах (2 нестрогих, 9 строгих); дыры нет (digest даёт нижний регистр, внешние схемы строгие, commands.ts:69), но порча формы классифицируется как гонка
   - механизм: HASH_RE = /^[a-f0-9]{64}$/ (без i) и HASH_PATTERN в src/canonical.ts; единственный checkTransactionGuards в src/storage/store.ts; environment.ts вызывает его и оставляет только дедуп и сортировку; isRef и referenceField (refs.ts:164) — на HASH_RE
   - СОСЕДИ: storage.test.ts:184 — заглавный хэш переносится в список испорченных форм с ожиданием invalid_guard (явная замена инварианта с докладом было → стало); правило эры не нарушается — сохранённых заглавных хэшей быть не может
