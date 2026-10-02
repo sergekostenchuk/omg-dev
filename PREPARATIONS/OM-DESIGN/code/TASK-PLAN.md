@@ -1531,12 +1531,16 @@
 - Единицы карты: —
 - Получает от: —
 - Отдаёт: —
-- Читает записи: —
-- Пишет записи: —
-- Разрешённые пути: `src/adapters/devin-stdio.ts`, `src/om/dispatch.ts`, `src/product/commands.ts`, `src/om/model-call.ts`, `src/om/assessment.ts`, `src/runtime/call-runtime.ts`, `src/adapters/adapter-lineage.ts`, `src/adapters/codex-estimate.ts`, `test/devin-stdio.test.ts`
+- Читает записи: dispatch-adapter (adapter:<project>:active и прежний adapter:<project>:codex-stdio); model-call.runtime (version 1 и 2)
+- Пишет записи: dispatch-adapter adapter:<project>:active (CAS); model-call.runtime version:2 для Devin
+- Разрешённые пути: `src/adapters/devin-stdio.ts`, `src/adapters/stdio-providers.ts`, `src/om/dispatch.ts`, `src/product/commands.ts`, `src/om/model-call.ts`, `src/om/assessment.ts`, `src/runtime/call-runtime.ts`, `src/adapters/adapter-lineage.ts`, `src/adapters/codex-estimate.ts`, `scripts/runtime-checks/omg-runtime-check.mjs`, `test/devin-stdio.test.ts`, `test/om-dispatch.test.ts`, `test/call-runtime.test.ts`, `test/adapter-lineage.test.ts`, `test/runtime-checks.test.ts`
 - Из движка как есть: src/adapters/codex-stdio.ts — образец протокола omg-agent/v1; RUNBOOK ~/OMG/PREPARATIONS/OM-LIVE/RUNBOOK.md — шаги (а)–(в) среды и dispatch
 - После: Q2b
 - Тесты сверх обязательных:
+  - ДОГОВОР №2674 (~/REPORTS/review/omg-code-ad1_contract-2674.md — читать ЦЕЛИКОМ; опись №2672): 15 путей; текущий выбор — adapter:<project>:active (CAS, повтор без записи, без отката к Codex при повреждении), прежний путь codex-stdio без изменений пока active нет; runtime-evidence version:2 с provider{protocol,executable,args,result} для Devin, version:1/snapshot.codex — только Codex, дискриминированные типы; codex-estimate.ts:21 (runtime.version) обновить согласованно; omg-runtime-check.mjs — обе формы, для Devin изоляция → явный отказ sandbox_provider_unsupported (Codex-canary не засчитывается)
+  - усилие ↔ модель: medium↔swe-2-medium, high↔swe-2-high, max↔swe-2-max; несовпадение — adapter_model_invalid; low/xhigh/ultra — adapter_effort_unsupported; fast и --compact-research — adapter_option_invalid до запуска; chat/research/review — --permission-mode auto, implement — accept-edits, --sandbox явно; запрос — через --prompt-file (временный файл, закрытые права, уборка), не аргументом -p; runProcess без shell
+  - ответ: весь непустой stdout — ровно один JSON-объект (research/reader/review/implement), без fenced-извлечения; пусто → provider_empty, иначе provider_result_invalid; usage:null (не ноль, сэмплы Codex не заимствовать); researchCall с segment без оценки — отказ budget_estimate_missing до отправки
+  - регрессии №2674-10: четыре режима + reader, точный argv и большой prompt через файл; Codex → Devin → Codex в одном Store, гонка второго Store; version:1 и version:2; сквозной OM-вызов с заглушкой devin, E5 независимым actor, исторический повтор после reopen без второй отправки; отмена и отказ остановки на границе runProcess (stopHooks, не SIGSTOP)
   - ДО КОДА — опись Devin: все места привязки к Codex с file:строка, таблица исходов адаптера (режим × исход: ok / невалидный JSON / ошибка CLI / таймаут / пустой ответ / отказ остановки) — договор ревьюера Codex
   - тесты — с заглушкой бинаря devin (без живых вызовов); живые пробы SWE-2 — отдельно, на копии, бесплатно
   - прежний путь codex-stdio — без изменений поведения (регрессии существующих наборов)
