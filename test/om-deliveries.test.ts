@@ -26,7 +26,7 @@ import { writeOmObligations } from '../src/om/obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { writeWorksFrame } from '../src/om/works-frame.js';
-import { createCrossOmFixture } from './om-fixture.js';
+import { createCrossOmFixture, refusedWith } from './om-fixture.js';
 
 const clone = structuredClone;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
@@ -35,10 +35,9 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
-function denied(result: OmResult<unknown>, code?: string) {
-  if (result.ok) assert.fail(`Expected ${code ?? 'a typed refusal'}`);
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target && (result.refusal.at.field || result.refusal.at.ref));
+function denied(result: OmResult<unknown>, code: string | readonly string[]): void {
+  const refusal = refusedWith(result, code);
+  assert.ok(refusal.at.field || refusal.at.ref);
 }
 function finding(result: Sealed<DeliveryCheck>, code: string, target?: string) {
   const found = result.findings.find(row => row.code === code && (target === undefined || row.target === target));
@@ -364,10 +363,14 @@ test('F3 proves saved ready-producer deliveries and preserves the separate M8 ex
         { ...options, owner: (() => proof) as unknown as typeof c.owner }), 'delivery_request_invalid');
     denied(checkDeliveries(null as unknown as Store, 'garden', c.graph, c.bases, options), 'delivery_request_invalid');
     denied(checkDeliveries(f.store, '', c.graph, c.bases, options), 'delivery_request_invalid');
-    for (const request of [null, {}, { ...c.request, candidate: reference(c.receipt) },
-      { ...c.request, candidate: { ...c.request.candidate, hash: hashJson('forged-candidate') } }]) {
-      denied(prepareDeliveries(f.store, request as typeof c.request));
-      denied(readDeliveries(f.store, request as DeliveryReadRequest));
+    for (const [request, prepareCode, readCode] of [
+      [null, 'delivery_request_invalid', 'delivery_request_invalid'],
+      [{}, 'delivery_request_invalid', 'delivery_request_invalid'],
+      [{ ...c.request, candidate: reference(c.receipt) }, 'record_foreign', 'delivery_basis_unproven'],
+      [{ ...c.request, candidate: { ...c.request.candidate, hash: hashJson('forged-candidate') } }, 'record_forged', 'delivery_basis_unproven'],
+    ] as const) {
+      denied(prepareDeliveries(f.store, request as typeof c.request), prepareCode);
+      denied(readDeliveries(f.store, request as DeliveryReadRequest), readCode);
     }
     denied(readDeliveries(f.store, c.request as DeliveryReadRequest), 'delivery_basis_unproven');
   });
@@ -487,10 +490,15 @@ test('F3 proves saved ready-producer deliveries and preserves the separate M8 ex
   await t.test('historical ownership requires exact complete path indexes and execution root, never a supplied null', () => {
     const request = clone(ok(prepareDeliveries(f.store, c.request)).request) as DeliveryReadRequest;
     const paths = Object.keys(request.ownership.indexes), path = paths[0]!;
-    for (const value of [undefined, null, {}, { ...request.ownership, contract: 'unknown' },
-      { ...request.ownership, root: undefined }, { ...request.ownership, root: null },
-      { ...request.ownership, indexes: {} }, { ...request.ownership, indexes: { [path]: null } }])
-      denied(readDeliveries(f.store, { ...request, ownership: value } as DeliveryReadRequest));
+    for (const [value, valueCode] of [
+      [undefined, 'delivery_basis_unproven'], [null, 'delivery_basis_unproven'], [{}, 'delivery_basis_unproven'],
+      [{ ...request.ownership, contract: 'unknown' }, 'delivery_basis_unproven'],
+      [{ ...request.ownership, root: undefined }, 'delivery_basis_unproven'],
+      [{ ...request.ownership, root: null }, 'writer_index_invalid'],
+      [{ ...request.ownership, indexes: {} }, 'delivery_basis_unproven'],
+      [{ ...request.ownership, indexes: { [path]: null } }, 'delivery_basis_unproven'],
+    ] as const)
+      denied(readDeliveries(f.store, { ...request, ownership: value } as DeliveryReadRequest), valueCode);
     const changed = clone(request);
     changed.ownership.indexes[path] = { ...changed.ownership.indexes[path]!, hash: hashJson('forged-index') };
     denied(readDeliveries(f.store, changed), 'writer_index_invalid');

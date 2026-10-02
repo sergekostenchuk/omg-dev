@@ -5,9 +5,9 @@ import { EngineError } from "../src/errors.js";
 import type { Graph } from "../src/graph/model.js";
 import { RefinementRelations } from "../src/graph/relations.js";
 import type { Horizon } from "../src/om/horizon.js";
-import { sealed, type OmResult, type Sealed } from "../src/om/refusal.js";
+import { sealed, type OmResult, type Refusal, type Sealed } from "../src/om/refusal.js";
 import { workZone, readWorkZone, prepareWorkZone, type WorkZoneRequest } from "../src/om/work-zone.js";
-import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, refusedWith } from "./om-fixture.js";
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -188,11 +188,10 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
-function denied(result: OmResult<unknown>, code?: string) {
-  if (result.ok) assert.fail(`Expected ${code ?? 'refusal'}`);
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target && (result.refusal.at.field || result.refusal.at.ref));
-  return result.refusal;
+function denied(result: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const refusal = refusedWith(result, code);
+  assert.ok(refusal.at.field || refusal.at.ref);
+  return refusal;
 }
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function nativeZone(t: TestContext) {
@@ -265,9 +264,13 @@ test('F1 rejects foreign exact sources, forged hashes, omitted accepted frames a
   for (const action of [readWorkZone, prepareWorkZone]) {
     for (const field of ['graph', 'layer', 'horizon', 'frame'] as const) {
       const source = f.request[field]!;
-      denied(action(f.store, { ...f.request, [field]: { ...source, id: source.id.replace('garden', 'foreign') } }));
-      denied(action(f.store, { ...f.request, [field]: { ...source, hash: '0'.repeat(64) } }));
-      denied(action(f.store, { ...f.request, [field]: { ...source, revision: 9999 } }));
+      const frameBasis = field === 'frame';
+      denied(action(f.store, { ...f.request, [field]: { ...source, id: source.id.replace('garden', 'foreign') } }),
+        frameBasis ? 'frame_basis_unproven' : 'record_foreign');
+      denied(action(f.store, { ...f.request, [field]: { ...source, hash: '0'.repeat(64) } }),
+        frameBasis ? 'frame_basis_unproven' : 'record_forged');
+      denied(action(f.store, { ...f.request, [field]: { ...source, revision: 9999 } }),
+        frameBasis ? 'frame_basis_unproven' : 'record_missing');
     }
     denied(action(f.store, { ...f.request, frame: null }), 'frame_basis_unproven');
   }
@@ -503,7 +506,7 @@ test('F1 historical D1 and D2 from the accepted old producer retain the lower br
       assert.ok('frame' in gaps.sources.works);
       assert.equal(gaps.sources.works.frame.workZoneContract, 'accepted-l2-v1');
       assert.ok(gaps.collection.gaps.length < history.collection.gaps.length);
-      denied(prepareCurrentGaps(store, history.read));
+      denied(prepareCurrentGaps(store, history.read), 'input_stale');
       assert.deepEqual(snapshot(store), before, 'Historical read and current preparation cannot rewrite the former era');
     } finally { store.close(); }
   }
@@ -516,21 +519,21 @@ test('F1 current D1 admission distinguishes identical collections from different
   const prepared = ok(prepareGaps(store, history.read.sources));
   assert.deepEqual(prepared.collection, old.collection, 'The distinction is the producer contract, not a conveniently different result');
   assert.ok(prepared.writes.length > 0);
-  denied(prepareCurrentGaps(store, history.read));
+  denied(prepareCurrentGaps(store, history.read), 'input_stale');
   assert.deepEqual(snapshot(store), before);
   const written = ok(writeGaps(store, history.read.sources));
   assert.ok('frame' in written.sources.works);
   assert.equal(written.sources.works.frame.workZoneContract, 'accepted-l2-v1');
   const current: GapReadRequest = { sources: structuredClone(written.sources) as GapRequest, records: written.records.map(reference) };
   ok(prepareCurrentGaps(store, current));
-  denied(readGaps(store, { sources: current.sources, records: history.read.records }));
-  denied(readGaps(store, { sources: history.read.sources, records: current.records }));
+  denied(readGaps(store, { sources: current.sources, records: history.read.records }), 'gap_record_forged');
+  denied(readGaps(store, { sources: history.read.sources, records: current.records }), 'gap_record_forged');
   const after = snapshot(store);
   const restarted = new Store(history.database);
   try {
     assert.deepEqual(ok(readGaps(restarted, history.read)).collection, old.collection);
     ok(readGapLines(restarted, { project: 'garden', record: history.lines }));
-    denied(prepareCurrentGaps(restarted, history.read));
+    denied(prepareCurrentGaps(restarted, history.read), 'input_stale');
     ok(prepareCurrentGaps(restarted, current));
     assert.deepEqual(ok(writeGaps(restarted, current.sources)), written);
     assert.deepEqual(snapshot(restarted), after);

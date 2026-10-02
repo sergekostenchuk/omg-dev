@@ -29,7 +29,7 @@ import { openSeries, beginAttempt, completeAttempt, readSeries, readSeriesAt, ty
 import { confirmResults } from "../src/om/achievements.js";
 import { closeAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, refusedWith } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 
 const clone = structuredClone;
@@ -52,9 +52,10 @@ function addressed(refusal: Refusal): void {
   assert.ok(refusal.at.field || refusal.at.ref);
   assert.ok(["producer", "gap", "owner", "readiness"].includes(refusal.route));
 }
-function unchangedRefusal(value: ReturnType<typeof mergeLines>, before: readonly GapLine[], code?: string): void {
+function unchangedRefusal(value: ReturnType<typeof mergeLines>, before: readonly GapLine[], code: string): void {
+  assert.ok(code.length > 0);
   assert.ok(value.refusals.length > 0);
-  if (code) assert.ok(value.refusals.some(item => item.code === code), `${code} absent: ${value.refusals.map(item => item.code).join(", ")}`);
+  assert.ok(value.refusals.some(item => item.code === code), `${code} absent: ${value.refusals.map(item => item.code).join(", ")}`);
   value.refusals.forEach(addressed);
   assert.deepEqual(value.lines, before);
 }
@@ -262,10 +263,9 @@ function ok<T>(value: OmResult<T>): T {
   if (!value.ok) assert.fail(`${value.refusal.code}: ${value.refusal.message}`);
   return value.value;
 }
-function denied(value: OmResult<unknown>, code?: string): Refusal {
-  if (value.ok) assert.fail(`Expected ${code ?? "an addressed refusal"}, received success`);
-  if (code) assert.equal(value.refusal.code, code);
-  addressed(value.refusal); return value.refusal;
+function denied(value: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const refusal = refusedWith(value, code);
+  addressed(refusal); return refusal;
 }
 const historySnapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function firstPassFixture(t: TestContext) {
@@ -440,7 +440,7 @@ test("D2 saved filled closures remain readable and replayable after heads drift 
     assert.deepEqual(ok(readGapLines(reopened, { project: "garden", record: reference(saved) })), saved);
     assert.deepEqual(ok(readGapLines(reopened, { project: "garden", record: reference(first) })), first);
     assert.deepEqual(ok(writeGapLines(reopened, request)), saved);
-    denied(prepareGapLines(reopened, { ...request, previous: reference(saved), pass: 3, closures: [] }));
+    denied(prepareGapLines(reopened, { ...request, previous: reference(saved), pass: 3, closures: [] }), "input_stale");
     assert.deepEqual(historySnapshot(reopened), before);
   } finally { reopened.close(); }
 });
@@ -449,25 +449,25 @@ test("D2 refuses invalid closure authority and exact-source masks without changi
   const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
   const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps, closures: [next.closure] };
   const inventory = first.value.lines.find(item => item.target === "repo-inventory")!;
-  const variants: GapClosureRequest[] = [
-    { ...next.closure, reason: "cancelled" },
-    { ...next.closure, acceptance: null },
-    { ...next.closure, basis: next.candidate },
-    { ...next.closure, acceptance: { ...next.acceptance, project: "other" } },
-    { ...next.closure, acceptance: { ...next.acceptance, frame: { ...next.acceptance.frame, hash: "0".repeat(64) } }, basis: { ...next.acceptance.frame, hash: "0".repeat(64) } },
-    { ...next.closure, acceptance: { ...next.acceptance, graph: { ...next.acceptance.graph, hash: "0".repeat(64) } } },
-    { ...next.closure, id: inventory.id },
+  const variants: Array<readonly [GapClosureRequest, string]> = [
+    [{ ...next.closure, reason: "cancelled" }, "closure_unsupported"],
+    [{ ...next.closure, acceptance: null }, "closure_unconfirmed"],
+    [{ ...next.closure, basis: next.candidate }, "closure_unconfirmed"],
+    [{ ...next.closure, acceptance: { ...next.acceptance, project: "other" } }, "closure_unconfirmed"],
+    [{ ...next.closure, acceptance: { ...next.acceptance, frame: { ...next.acceptance.frame, hash: "0".repeat(64) } }, basis: { ...next.acceptance.frame, hash: "0".repeat(64) } }, "closure_unconfirmed"],
+    [{ ...next.closure, acceptance: { ...next.acceptance, graph: { ...next.acceptance.graph, hash: "0".repeat(64) } } }, "closure_unconfirmed"],
+    [{ ...next.closure, id: inventory.id }, "closure_invalid"],
   ];
   const before = historySnapshot(f.store);
-  for (const closure of variants) {
-    for (const operation of [prepareGapLines, writeGapLines]) denied(operation(f.store, { ...request, closures: [closure] }));
+  for (const [closure, code] of variants) {
+    for (const operation of [prepareGapLines, writeGapLines]) denied(operation(f.store, { ...request, closures: [closure] }), code);
     assert.deepEqual(historySnapshot(f.store), before);
   }
   for (const operation of [prepareGapLines, writeGapLines]) {
     denied(operation(f.store, { ...request, closures: [{ ...next.closure, reason: "cancelled" }] }), "closure_unsupported");
     denied(operation(f.store, { ...request, previous: { ...reference(first), hash: "0".repeat(64) } }), "input_stale");
-    denied(operation(f.store, { ...request, gaps: { ...next.gaps, records: [] } }));
-    denied(operation(f.store, { ...request, gaps: { ...next.gaps, records: [...next.gaps.records, next.gaps.records[0]!] } }));
+    denied(operation(f.store, { ...request, gaps: { ...next.gaps, records: [] } }), "gap_missing");
+    denied(operation(f.store, { ...request, gaps: { ...next.gaps, records: [...next.gaps.records, next.gaps.records[0]!] } }), "gap_duplicate");
   }
   assert.deepEqual(historySnapshot(f.store), before);
 });
@@ -491,8 +491,8 @@ test("D2 historical reader rejects rehashed missing lines, status claims and bro
       const value = clone(validNext) as GapLinesRecord; forge(value);
       const forged = store.write({ id: closed.id, kind: GAP_LINE_KIND, expected: closed.revision, value });
       const before = historySnapshot(store);
-      denied(readGapLines(store, { project: "garden", record: reference(forged) }));
-      denied(prepareGapLines(store, { ...request, previous: reference(forged), pass: 3, closures: [] }));
+      denied(readGapLines(store, { project: "garden", record: reference(forged) }), "gap_line_forged");
+      denied(prepareGapLines(store, { ...request, previous: reference(forged), pass: 3, closures: [] }), "gap_line_forged");
       assert.deepEqual(ok(readGapLines(store, { project: "garden", record: reference(closed) })), closed);
       assert.deepEqual(historySnapshot(store), before);
     } finally { store.close(); }
@@ -506,13 +506,13 @@ test("D2 historical reader rejects rehashed missing lines, status claims and bro
     value.lines.find(line => line.id === next.line.id)!.basis!.hash = "0".repeat(64);
     const forged = badClosureStore.write({ id: closed.id, kind: GAP_LINE_KIND, expected: 1, value });
     const before = historySnapshot(badClosureStore);
-    denied(readGapLines(badClosureStore, { project: "garden", record: reference(forged) }));
-    denied(prepareGapLines(badClosureStore, { ...request, previous: reference(forged), pass: 3, closures: [] }));
+    denied(readGapLines(badClosureStore, { project: "garden", record: reference(forged) }), "closure_unconfirmed");
+    denied(prepareGapLines(badClosureStore, { ...request, previous: reference(forged), pass: 3, closures: [] }), "closure_unconfirmed");
     assert.deepEqual(ok(readGapLines(badClosureStore, { project: "garden", record: reference(first) })), first);
     assert.deepEqual(historySnapshot(badClosureStore), before);
   } finally { badClosureStore.close(); }
-  denied(readGapLines(f.store, { project: "other", record: reference(closed) }));
-  denied(readGapLines(f.store, { project: "garden", record: { ...reference(closed), hash: "0".repeat(64) } }));
+  denied(readGapLines(f.store, { project: "other", record: reference(closed) }), "record_foreign");
+  denied(readGapLines(f.store, { project: "garden", record: { ...reference(closed), hash: "0".repeat(64) } }), "record_forged");
 });
 
 test("D2 prepared closure guards sources, accepted filling, and prior history in a neighbor transaction", async t => {
@@ -672,11 +672,11 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
   const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
   const block = ok(prepareFrame(f.store, next.gaps.sources.operations.frame)).result.obligations.find(item => item.id === next.line.target)!.upper.node;
   const goal = goalFor(next.line), saved = await f.store.snapshot(join(f.root, "before-attempt"));
-  const cases: Array<{ project?: string; block?: string; goal?: AttemptGoal; ordinal?: number; corruptHash?: boolean }> = [
-    { project: "other" }, { block: "garden-other-block" },
-    { goal: { ...goal, questions: ["another-question"] } },
-    { goal: { ...goal, result: "another-result" } },
-    { ordinal: 2 }, { corruptHash: true },
+  const cases: Array<{ project?: string; block?: string; goal?: AttemptGoal; ordinal?: number; corruptHash?: boolean; code: string }> = [
+    { project: "other", code: "record_foreign" }, { block: "garden-other-block", code: "closure_unconfirmed" },
+    { goal: { ...goal, questions: ["another-question"] }, code: "closure_unconfirmed" },
+    { goal: { ...goal, result: "another-result" }, code: "closure_unconfirmed" },
+    { ordinal: 2, code: "closure_unconfirmed" }, { corruptHash: true, code: "record_forged" },
   ];
   for (const [index, variant] of cases.entries()) {
     const path = join(f.root, `bad-attempt-${index}.sqlite`); copyFileSync(saved.path, path);
@@ -688,7 +688,7 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
       const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
         closures: [{ ...next.closure, attempt: { series, attempt: variant.ordinal ?? 1 } }] };
       const before = historySnapshot(store);
-      for (const operation of [prepareGapLines, writeGapLines]) denied(operation(store, request));
+      for (const operation of [prepareGapLines, writeGapLines]) denied(operation(store, request), variant.code);
       assert.deepEqual(historySnapshot(store), before);
     } finally { store.close(); }
   }

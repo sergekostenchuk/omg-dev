@@ -41,7 +41,7 @@ import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt,
   type AssessmentIntentRequest, type AssessmentResultRecord } from '../src/om/assessment.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { type OmResult } from '../src/om/refusal.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, refusedWith } from './om-fixture.js';
 import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -55,13 +55,10 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
-function denied(result: OmResult<unknown>, code?: string): void {
-  assert.equal(result.ok, false);
-  if (result.ok) return;
-  if (code) assert.equal(result.refusal.code, code);
-  assert.equal(result.refusal.at.unit, 'E5');
-  assert.ok(result.refusal.at.target);
-  if (result.refusal.at.unit === 'E5' && result.refusal.code !== 'input_stale') assert.ok(result.refusal.at.field);
+function denied(result: OmResult<unknown>, code: string | readonly string[]): void {
+  const refusal = refusedWith(result, code);
+  assert.equal(refusal.at.unit, 'E5');
+  if (refusal.code !== 'input_stale') assert.ok(refusal.at.field);
 }
 /** The directory-independent prefix of fixture — upstream stages, B1, M5 addresses, G2, D1 and routes — one seed per fact count. */
 function e5Prefix(store: Store, twoFacts: boolean) {
@@ -311,11 +308,7 @@ test('E5 D2 closure keeps the original attempt of the accepted answer', async t 
       ? { ...chain.confirmation.attempt, attempt: chain.confirmation.attempt.attempt + 1 }
       : { ...chain.confirmation.attempt, series: { ...chain.confirmation.attempt.series, id: 'repair-series:foreign' } };
     const result = confirmAnswerGapClosure(f.store, { ...chain.confirmation, attempt });
-    assert.equal(result.ok, false, changed);
-    if (!result.ok) {
-      assert.equal(result.refusal.code, 'answer_attempt_invalid', changed);
-      assert.equal(result.refusal.at.unit, 'D5', changed);
-    }
+    assert.equal(refusedWith(result, 'answer_attempt_invalid').at.unit, 'D5', changed);
   }
 });
 
@@ -336,8 +329,7 @@ test('E5 D2 closure refuses a second Store changing the admitted line before the
   }) as Store['writeMany'];
   try {
     const result = writeGapLines(f.store, chain.next);
-    assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.refusal.code, 'input_stale');
+    refusedWith(result, 'input_stale');
   } finally { f.store.writeMany = originalWrite; }
   assert.equal(raced, true);
   assert.deepEqual(f.store.list(GAP_LINE_KIND).map(reference), before);
@@ -386,7 +378,7 @@ test('an E5 D5 answer without its terminal result is not readable as accepted', 
       () => readAnswerSearch(f.store, { project: f.project, record: index }),
       () => applicableAnswer(f.store, { project: f.project, record: accepted, question: admission.question.record })]) {
       const result = read();
-      assert.equal(result.ok, false, 'A D5 answer without its E5 terminal cannot be consumed');
+      refusedWith(result, 'answer_record_invalid');
     }
   }
   const physicalVerdict = ok(readAssessmentResultAt(f.store, f.project, reference(intent), reference(physical.record)));
@@ -399,7 +391,7 @@ test('an E5 D5 answer without its terminal result is not readable as accepted', 
   for (const restart of [false, true]) {
     if (restart) f.restart();
     const found = readAnswerSearch(f.store, { project: f.project, record: index });
-    assert.equal(found.ok, false, 'An index cannot validate an E5 result naming a missing revision');
+    refusedWith(found, 'answer_record_invalid');
     if (!found.ok) assert.equal(found.refusal.code, 'answer_record_invalid');
   }
 });
@@ -411,7 +403,7 @@ test('a direct G7 close cannot omit an unassessed fact from the original MC1 res
   assert.ok(first.value.accepted);
   const closed = closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
     outcome: { reason: 'result', accepting: [first.value.accepted!], cancelling: [], refusals: [] } });
-  assert.equal(closed.ok, false);
+  refusedWith(closed, 'achievement_unconfirmed');
   if (!closed.ok) assert.equal(closed.refusal.code, 'achievement_unconfirmed');
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
   assert.equal(f.store.list(ASSESSMENT_RESULT_KIND).length, 1);
@@ -452,8 +444,7 @@ test('a direct G7 close atomically guards the complete assessed source set', asy
   try {
     const closed = closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
       outcome: { reason: 'result', accepting, cancelling: [], refusals: [] } });
-    assert.equal(closed.ok, false);
-    if (!closed.ok) assert.equal(closed.refusal.code, 'input_stale');
+    refusedWith(closed, 'input_stale');
   } finally { f.store.writeMany = originalWrite; }
   assert.equal(raced, true);
   assert.deepEqual(f.store.get<RepairSeries>(f.series.id), before);
@@ -521,7 +512,7 @@ test('real technical E5 terminals permit their own G7 close and exact restart re
       outcome: { reason: variant, accepting: [], cancelling: [], refusals: [] } };
     const wrongReason = closeAttempt(f.store, { ...closing, outcome: { ...closing.outcome,
       reason: variant === 'off-form' ? 'interrupted' as const : 'off-form' as const } });
-    assert.equal(wrongReason.ok, false);
+    refusedWith(wrongReason, 'origin_unreadable');
     if (!wrongReason.ok) assert.equal(wrongReason.refusal.code, 'origin_unreadable');
     const closed = ok(closeAttempt(f.store, closing));
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, variant);
@@ -557,7 +548,7 @@ test('a technical terminal retains its own verdict when a semantic E5 fact close
     else assert.equal(f.store.get(assessmentRefusalId(f.project, reference(first))) !== null, true);
     const wrong = closeAttempt(f.store, { project: f.project, block: 'garden-consume-block',
       line: 1, attempt: 1, outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: [] } });
-    assert.equal(wrong.ok, false, 'the aggregate cannot erase the semantic terminal');
+    refusedWith(wrong, 'outcome_conflict');
     const before = f.store.list().map(reference), calls = f.sent().length;
     f.restart();
     assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(first))), first);
@@ -654,9 +645,9 @@ test('E4 independently refuses changed role and packet before a paid assessor di
   const requestCall = { project: f.project, call: reference(call.call), packet: admission.packet as Json };
   const before = f.store.list('model-call').map(reference), sent = f.sent().length;
   const wrongRole = await runModelTransport(f.store, { ...requestCall, role: 'implementer' });
-  assert.equal(wrongRole.ok, false);
+  refusedWith(wrongRole, 'model_call_request_invalid');
   const wrongPacket = await runModelTransport(f.store, { ...requestCall, packet: { forged: true }, role: 'reviewer' });
-  assert.equal(wrongPacket.ok, false);
+  refusedWith(wrongPacket, 'packet_invalid');
   assert.deepEqual(f.store.list('model-call').map(reference), before);
   assert.equal(f.sent().length, sent);
 });
@@ -686,7 +677,7 @@ test('E4 atomically refuses a changed intent source before reservation and sends
   try {
     const refused = await runModelTransport(f.store, { project: f.project, call: reference(call.call),
       packet: admission.packet as Json, role: 'reviewer' });
-    assert.equal(refused.ok, false);
+    refusedWith(refused, 'input_stale');
   } finally { f.store.writeMany = originalWrite; }
   assert.equal(raced, true);
   assert.deepEqual(f.store.list('model-call').map(reference), before);
@@ -719,13 +710,13 @@ test('E5 retains a paid response when a source moves before supported applicatio
     const adapter = second.get(request.dispatch.adapter.id)!;
     second.write({ id: adapter.id, kind: adapter.kind, expected: adapter.revision, value: adapter.value });
   } finally { second.close(); }
-  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }));
+  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }), 'assessment_source_stale');
   assert.ok(f.store.get(physical.record.id));
   assert.equal(f.store.list('accepted-answer').length, 0);
   assert.equal(f.store.get(`om-assessment-result:${f.project}:${hashJson(intent.id)}`), null);
   f.restart();
   assert.ok(f.store.get(physical.record.id));
-  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }));
+  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }), 'assessment_source_stale');
 });
 
 test('E5 completion cannot close an obsolete line when a successor appears before its transaction', async t => {
@@ -793,7 +784,7 @@ test('19 H1.0a E5 registers every original fact and atomically retains S plus N 
   assert.equal(work.assignments.filter(row => row.value.kind === 'fact').length, 2);
   const premature = managedCloseAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1,
     attempt: 1, outcome: { reason: 'result', accepting: [first.value.accepted], cancelling: [], refusals: [] } });
-  assert.equal(premature.ok, false);
+  refusedWith(premature, 'completion_incomplete');
   const secondRequest = { ...request, questionId: f.questionIds[1]! };
   const second = ok(await assessFact(f.store, secondRequest));
   assert.equal(second.value.verdict, 'insufficient');
@@ -831,8 +822,8 @@ test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 co
     const snapshot = () => ok(readCompletionWorkAt(f.store, f.project,
       reference(f.store.get(completionWorkId(f.project, binding.id))!)));
     assert.equal(snapshot().complete, false);
-    assert.equal(closeAttempt(f.store, { project:f.project, block:'garden-consume-block', line:1, attempt:1,
-      outcome:{ reason:'off-form', accepting:[], cancelling:[], refusals:[] } }).ok, false);
+    refusedWith(closeAttempt(f.store, { project:f.project, block:'garden-consume-block', line:1, attempt:1,
+      outcome:{ reason:'off-form', accepting:[], cancelling:[], refusals:[] } }), 'completion_incomplete');
     const second = ok(await assessFact(f.store, requests[1]!));
     const work = snapshot(); assert.equal(work.complete, true);
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
@@ -844,10 +835,10 @@ test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 co
       : choices.includes('interrupted' as never) ? 'interrupted' : 'off-form';
     const claim = { project:f.project, block:'garden-consume-block', line:1, attempt:1,
       outcome:{ reason, accepting:work.accepting, cancelling:[], refusals:work.refusals } } as const;
-    if (work.accepting.length) assert.equal(closeAttempt(f.store, { ...claim,
-      outcome:{...claim.outcome, accepting:[]} }).ok, false, 'A technical terminal cannot conceal S');
-    if (work.refusals.length) assert.equal(closeAttempt(f.store, { ...claim,
-      outcome:{...claim.outcome, refusals:[]} }).ok, false, 'A neighbouring T cannot conceal N');
+    if (work.accepting.length) refusedWith(closeAttempt(f.store, { ...claim,
+      outcome:{...claim.outcome, accepting:[]} }), 'completion_invalid');
+    if (work.refusals.length) refusedWith(closeAttempt(f.store, { ...claim,
+      outcome:{...claim.outcome, refusals:[]} }), 'completion_invalid');
     let completed:ReturnType<typeof ok<ReturnType<typeof closeAttempt> extends OmResult<infer T>?T:never>>;
     await child.test('29 complete composition is closed once only by explicit G7',()=>{
       completed=ok(closeAttempt(f.store,claim));
@@ -897,7 +888,7 @@ test('C10 H1.0a G7 carries product-head guards from before the full managed deri
   try {
     const result=closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
       outcome:{reason:'result',accepting:work.accepting,cancelling:[],refusals:work.refusals}});
-    assert.equal(result.ok,false); if(!result.ok) assert.equal(result.refusal.code,'input_stale');
+    refusedWith(result,'input_stale');
   } finally {f.store.writeMany=original;}
   assert.equal(raced,true);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
@@ -916,8 +907,8 @@ test('24 H1.0a a complete MC1 root cannot hide an unpaid MC2 root in the initial
   await t.test('25 H1.0a local finish reports complete but the whole attempt is open',()=>{
     const finish=ok(finishAssessmentAttempt(f.store,f.project,reference(firstIntent)));
     assert.equal(finish.complete,true); assert.equal(finish.closed,false);
-    assert.equal(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
-      outcome:{reason:'result',accepting:[first.value.accepted!],cancelling:[],refusals:[]}}).ok,false);
+    refusedWith(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
+      outcome:{reason:'result',accepting:[first.value.accepted!],cancelling:[],refusals:[]}}),'completion_incomplete');
   });
   const other=f.otherRoot();
   writeFileSync(f.scenario,JSON.stringify({steps:[f.originalStep,{research:{verdict:'supported',reasons:[]},usage},
@@ -946,8 +937,8 @@ test('18 H1.0a answered assessor transport is still I until its exact E5 applica
   const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
   const getWork=()=>ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
   assert.equal(getWork().complete,false);
-  assert.equal(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
-    outcome:{reason:'result',accepting:[],cancelling:[],refusals:[]}}).ok,false);
+  refusedWith(closeAttempt(f.store,{project:f.project,block:'garden-consume-block',line:1,attempt:1,
+    outcome:{reason:'result',accepting:[],cancelling:[],refusals:[]}}),'completion_incomplete');
   const result=ok(await assessFact(f.store,request));assert.equal(result.value.verdict,'supported');
   assert.equal(getWork().complete,true);assert.equal(f.sent().length,2);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
@@ -1061,10 +1052,10 @@ test('24 H1.0a two genuine MC1 roots share a block through realizes and retain b
       assert.deepEqual(ok(finishAssessmentAttempt(f.store,f.project,terminal.value.intent)),{complete:true,closed:false,results:[reference(terminal)]});
       if(position===0){
         const denied=prepareQuestionPacket(f.store,f.packetRequests[i]!);
-        assert.equal(denied.ok,false);if(!denied.ok)assert.equal(denied.refusal.code,'route_stale','An applicable target D5 forbids another send');
+        refusedWith(denied,'route_stale');
         const before=f.store.list().map(reference);
-        assert.equal(closeAttempt(f.store,{project:f.project,block:f.block,line:1,attempt:1,
-          outcome:{reason:'result',accepting:work.accepting,cancelling:[],refusals:work.refusals}}).ok,false);
+        refusedWith(closeAttempt(f.store,{project:f.project,block:f.block,line:1,attempt:1,
+          outcome:{reason:'result',accepting:work.accepting,cancelling:[],refusals:work.refusals}}),'completion_incomplete');
         assert.deepEqual(f.store.list().map(reference),before);
       }
     }
@@ -1106,7 +1097,7 @@ test('C38 H1.0a neighbouring S during receipt preserves target admission while t
   try {
     const missingLine=prepareManagedRouteBatch(f.store,{project:f.project,series:reference(f.series),attempt:1,
       routes:f.opening.completion.routes,batch:f.batches[1]!.id});
-    assert.equal(missingLine.ok,false);
+    refusedWith(missingLine,'series_conflict');
     if(!missingLine.ok)assert.equal(missingLine.refusal.code,'series_conflict');
   } finally { f.store.get=get; }
   const ownIndex=answerIndexId(f.project,f.batches[0]!.items[0]!.target,f.batches[0]!.items[0]!.field);
@@ -1126,7 +1117,7 @@ test('C38 H1.0a neighbouring S during receipt preserves target admission while t
   assert.equal(raced,true);assert.equal(received.outcome?.kind,'fact-candidates');
   assert.equal(received.record.value.om.application,'applied');assert.equal(f.sent().length,3);
   const stale=writeGuarded(f.store,{unit:'test',target:'target-search',writes:[{id:'test:target-search',kind:'test',expected:0,value:{}}],guards:own.guards});
-  assert.equal(stale.ok,false);if(!stale.ok)assert.equal(stale.refusal.code,'input_stale');
+  refusedWith(stale,'input_stale');
   assert.equal(f.store.get('test:target-search'),null);
   const answer=ok(await assessFact(f.store,{project:f.project,modelCall:reference(received.record),
     questionId:f.batches[1]!.items[0]!.gap,dispatch:f.dispatch}));assert.equal(answer.value.verdict,'supported');
@@ -1135,8 +1126,8 @@ test('C38 H1.0a neighbouring S during receipt preserves target admission while t
   const graph=f.store.get<Graph>(`graph:${f.project}`)!;
   new ProductEngine(f.store).graphs.save(f.project,graph.value,graph.revision,'change a shared source');
   const common=writeGuarded(f.store,{unit:'test',target:'common-source',writes:[{id:'test:common-source',kind:'test',expected:0,value:{}}],guards:target.guards});
-  assert.equal(common.ok,false);if(!common.ok)assert.equal(common.refusal.code,'input_stale');
-  assert.equal(prepareQuestionPacket(f.store,f.packetRequests[1]!).ok,false);
+  refusedWith(common,'input_stale');
+  refusedWith(prepareQuestionPacket(f.store,f.packetRequests[1]!),'input_stale');
 });
 
 
@@ -1183,18 +1174,20 @@ test('3 H1.0b unchanged bytes and an unrelated real Source cannot prove file ter
 test('17 H1.0b missing original history and unknown observations are not file-change proofs', async t => {
   const f = fixture(t, false, false, true, false, true), request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request)), input = { project: f.project, intent: reference(intent) };
-  for (const observation of [{ kind: 'unavailable', code: 'EIO' }, { kind: 'read', bytes: 'invalid base64!' },
-    { kind: 'read', bytes: '', error: 'ENOENT' }, { kind: 'unavailable' }]) {
+  for (const [observation, observationCode] of [
+    [{ kind: 'unavailable', code: 'EIO' }, 'model_call_record_invalid'], [{ kind: 'read', bytes: 'invalid base64!' }, 'model_call_record_invalid'],
+    [{ kind: 'read', bytes: '', error: 'ENOENT' }, 'assessment_cause_invalid'], [{ kind: 'unavailable' }, 'assessment_cause_invalid'],
+  ] as const) {
     const checked = readAssessmentFileTerminationCause(f.store, { ...input, cause: { kind: 'file-observation',
       source: reference(f.source), observation } as never });
-    assert.equal(checked.ok, false);
+    refusedWith(checked, observationCode);
   }
-  for (const missing of [intent.id, f.source.id]) {
+  for (const [missing, missingCode] of [[intent.id, 'record_missing'], [f.source.id, 'call_basis_unresolved']] as const) {
     const view = new Proxy(f.store, { get(target, prop) {
       if (prop === 'get') return (id: string, revision?: number) => id === missing ? null : target.get(id, revision);
       const value: unknown = Reflect.get(target, prop, target); return typeof value === 'function' ? value.bind(target) : value;
     } });
-    assert.equal(prepareAssessmentFileTerminationCause(view, input).ok, false);
+    refusedWith(prepareAssessmentFileTerminationCause(view, input), missingCode);
   }
 });
 
@@ -1317,12 +1310,12 @@ test('18 H1.0b missing fact intents remain mandatory and a ceased child cannot h
   await t.test('21 a ceased fact cannot hide its mandatory sibling', () => {
     assert.equal(current().complete, false); assert.equal(f.store.list(ASSESSMENT_INTENT_KIND).length, 0);
   });
-  assert.equal(closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
-    outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }).ok, false);
+  refusedWith(closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
+    outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }), 'completion_incomplete');
   writeFileSync(f.sourcePath, bytes); f.restart();
   const ceasedRequest = { ...request, questionId: facts[0]!.value.question! };
-  const denied = await assessFact(f.store, ceasedRequest); assert.equal(denied.ok, false);
-  if (!denied.ok) { assert.equal(denied.refusal.code, 'completion_ceased'); assert.deepEqual(denied.refusal.at.ref, reference(cessation)); }
+  const denied = await assessFact(f.store, ceasedRequest);
+  assert.deepEqual(refusedWith(denied, 'completion_ceased').at.ref, reference(cessation));
   assert.equal(f.store.list(ASSESSMENT_INTENT_KIND).length, 0);
   f.assessor(); const accepted = ok(await assessFact(f.store, { ...request, questionId: facts[1]!.value.question! }));
   assert.equal(accepted.value.verdict, 'supported'); assert.equal(current().complete, true);
@@ -1331,7 +1324,7 @@ test('18 H1.0b missing fact intents remain mandatory and a ceased child cannot h
   const closed = ok(closeAttempt(f.store, close)), history = f.store.list().map(reference); f.restart();
   await t.test('40 exact mixed close repeats without heads or new expense', () => { assert.deepEqual(ok(closeAttempt(f.store, close)), closed); });
   assert.deepEqual(ok(readCompletionCessationAt(f.store, f.project, reference(cessation))), cessation);
-  assert.equal((await assessFact(f.store, ceasedRequest)).ok, false);
+  refusedWith(await assessFact(f.store, ceasedRequest), 'completion_ceased');
   assert.deepEqual(f.store.list().map(reference), history); assert.equal(f.sent().length, 2);
 });
 
@@ -1396,9 +1389,9 @@ test('17 H1.0b invalid replacement environment cannot masquerade as a cause even
     const fake = f.store.write({ id: replacement.id, kind: replacement.kind,
       expected: f.store.get(replacement.id)!.revision, value });
     assert.throws(() => readEnvironmentAt(f.store, f.project, reference(fake)), EngineError);
-    assert.equal(readCompletionCause(f.store, f.project, disposition.assignment,
-      { ...cause, replacement: reference(fake) } as typeof cause).ok, false);
-    assert.equal(applyAssessmentResult(f.store, paid.apply).ok, false);
+    refusedWith(readCompletionCause(f.store, f.project, disposition.assignment,
+      { ...cause, replacement: reference(fake) } as typeof cause), 'completion_cause_invalid');
+    refusedWith(applyAssessmentResult(f.store, paid.apply), 'completion_cause_invalid');
     assert.equal(f.store.get(assessmentResultId(f.project, reference(paid.intent))), null);
   });
   assert.equal(f.sent().length, 2);
@@ -1430,7 +1423,7 @@ test('36 H1.0b semantic apply and application termination race for one terminal 
         return originalWrite(writes, guards);
       }) as Store['writeMany'];
       const stale = applyAssessmentResult(f.store, paid.apply); f.store.writeMany = originalWrite;
-      assert.equal(raced, true); assert.equal(stale.ok, false);
+      assert.equal(raced, true); refusedWith(stale, 'input_stale');
       if (!stale.ok) assert.equal(stale.refusal.code, 'input_stale');
       assert.ok(winner && (winner as ReturnType<typeof applyAssessmentResult>).ok);
       const result = ok(applyAssessmentResult(f.store, paid.apply));
@@ -1469,7 +1462,7 @@ test('34 H1.0b claim and not-dispatched exclude each other under both transactio
           const written = original(writes, guards), other = new Store(f.path);
           try {
             const stale = writeGuarded(other, { unit: 'G7', target: cease.record.id, writes: cease.writes, guards: cease.guards });
-            assert.equal(stale.ok, false); if (!stale.ok) assert.equal(stale.refusal.code, 'input_stale');
+            refusedWith(stale, 'input_stale');
           } finally { other.close(); }
           return written;
         }
@@ -1489,8 +1482,7 @@ test('34 H1.0b claim and not-dispatched exclude each other under both transactio
       if (!called.ok) assert.equal(called.refusal.code, 'input_stale');
       assert.equal(f.store.get(cease.record.value.physicalId!), null);
       assert.deepEqual(ok(readCompletionCessationAt(f.store, f.project, reference(cease.record))), cease.record);
-      const denied = await runModelTransport(f.store, transport); assert.equal(denied.ok, false);
-      if (!denied.ok) assert.equal(denied.refusal.code, 'completion_ceased');
+      const denied = await runModelTransport(f.store, transport); refusedWith(denied, 'completion_ceased');
     }
     f.restart(); const history = f.store.list().map(reference);
     const repeat = await assessFact(f.store, request); assert.equal(repeat.ok, first === 'claim');
@@ -1505,13 +1497,15 @@ test('17 H1.0b termination rederives every mandatory source and G4b reads the te
   const terminal = ok(applyAssessmentResult(f.store, paid.apply));
   assert.equal(terminal.value.verdict, 'application-terminated');
   const saved = f.store.list().map(reference);
-  for (const source of [paid.intent.value.source.modelCall, paid.intent.value.source.response, paid.intent.value.source.packet,
-    paid.intent.value.source.question, paid.physical.call, paid.physical.record.value.transport.exchange!]) {
+  for (const [source, sourceCode] of [[paid.intent.value.source.modelCall, 'call_basis_unresolved'],
+    [paid.intent.value.source.response, 'call_basis_unresolved'], [paid.intent.value.source.packet, 'call_basis_unresolved'],
+    [paid.intent.value.source.question, 'call_basis_unresolved'], [paid.physical.call, 'call_unresolved'],
+    [paid.physical.record.value.transport.exchange!, 'record_missing']] as const) {
     const view = new Proxy(f.store, { get(target, property) {
       if (property === 'get') return (id: string, revision?: number) => id === source.id ? null : target.get(id, revision);
       const v: unknown = Reflect.get(target, property, target); return typeof v === 'function' ? v.bind(target) : v;
     } });
-    assert.equal(readAssessmentTerminalAt(view, f.project, reference(terminal)).ok, false, source.id);
+    refusedWith(readAssessmentTerminalAt(view, f.project, reference(terminal)), sourceCode);
   }
   assert.deepEqual(f.store.list().map(reference), saved); writeFileSync(f.sourcePath, bytes);
   const gaps = structuredClone(f.routes.value.request.gaps) as GapReadRequest;
@@ -1546,11 +1540,11 @@ test('37 H1.0b a prepared D5 leaf loses to termination and an orphan leaf is an 
     writeFileSync(f.sourcePath, 'changed');
     const before = f.store.list().map(reference), applied = applyAssessmentResult(f.store, paid.apply);
     if (orphan) {
-      assert.equal(applied.ok, false); assert.deepEqual(f.store.list().map(reference), before);
-      assert.equal(readAcceptedAnswer(f.store, { project: f.project, record: reference(leaf.record) }).ok, false);
+      refusedWith(applied, 'assessment_result_invalid'); assert.deepEqual(f.store.list().map(reference), before);
+      refusedWith(readAcceptedAnswer(f.store, { project: f.project, record: reference(leaf.record) }), 'answer_record_invalid');
     } else {
       assert.equal(ok(applied).value.verdict, 'application-terminated');
-      assert.equal(writeGuarded(f.store, { unit: 'E5', target: leaf.record.id, writes: leaf.writes, guards: leaf.guards }).ok, false);
+      refusedWith(writeGuarded(f.store, { unit: 'E5', target: leaf.record.id, writes: leaf.writes, guards: leaf.guards }), 'input_stale');
       assert.equal(f.store.get(leaf.record.id), null);
     }
     f.restart(); const history = f.store.list().map(reference), replay = applyAssessmentResult(f.store, paid.apply);
@@ -1574,7 +1568,7 @@ test('33 H1.0b replacement Environment racing termination is guarded and reuses 
     return write(writes, guards);
   }) as Store['writeMany'];
   const first = applyAssessmentResult(f.store, paid.apply); f.store.writeMany = write;
-  assert.equal(moved, true); assert.equal(first.ok, false); if (!first.ok) assert.equal(first.refusal.code, 'input_stale');
+  assert.equal(moved, true); refusedWith(first, 'input_stale');
   assert.equal(f.store.list(ASSESSMENT_RESULT_KIND).length, 0);
   f.restart(); const result = ok(applyAssessmentResult(f.store, paid.apply));
   assert.equal(result.value.verdict, 'application-terminated'); assert.equal(f.sent().length, 2);
@@ -1597,7 +1591,7 @@ test('39 H1.0b late unpaid E1 retains the prior not-dispatched proof and never g
   writeFileSync(f.sourcePath, bytes);
   const late = ok(recordCall(f.store, f.project, callRequest)); assert.equal(late.call.value.status, 'open');
   const denied = await runModelTransport(f.store, { project: f.project, call: reference(late.call), packet: admission.packet as Json, role: 'reviewer' });
-  assert.equal(denied.ok, false); if (!denied.ok) assert.equal(denied.refusal.code, 'completion_ceased');
+  refusedWith(denied, 'completion_ceased');
   assert.equal(f.store.get(ceased.value.physicalId!), null);
   const close = { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
     outcome: { reason: 'interrupted' as const, accepting: [], cancelling: [], refusals: [] } };
@@ -1616,7 +1610,7 @@ test('6 H1.0b settled E1 without physical evidence is not a never-dispatched ass
   ok(settleCall(f.store, reference(call.call), usage, 'failed')); writeFileSync(f.sourcePath, 'changed');
   for (const restart of [false, true]) {
     if (restart) f.restart(); const history = f.store.list().map(reference);
-    assert.equal(writeCompletionCessation(f.store, { project: f.project, binding: disposition.binding, assignment: disposition.assignment }).ok, false);
+    refusedWith(writeCompletionCessation(f.store, { project: f.project, binding: disposition.binding, assignment: disposition.assignment }), 'completion_invalid');
     assert.deepEqual(f.store.list().map(reference), history);
   }
   assert.equal(f.sent().length, 1);
@@ -1636,7 +1630,7 @@ test('22 H1.0b a physical terminal resolves its own MC1 root but retains the oth
   const claim = { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
     outcome: { reason: 'off-form' as const, accepting: [], cancelling: [], refusals: [] } };
   assert.equal(current().complete, false); assert.equal(current().technical.length, 1);
-  assert.equal(closeAttempt(f.store, claim).ok, false);
+  refusedWith(closeAttempt(f.store, claim), 'completion_incomplete');
   const other = f.otherRoot();
   const secondCycle = ok(await runModelCycle(f.store, other.request));
   await t.test('43 ordinary cycles register both terminals but never independently close managed work', () => {
@@ -1673,8 +1667,7 @@ test('35 H1.0b independent roots retry their shared work CAS without replacing e
     return write(writes, guards);
   }) as Store['writeMany'];
   const firstTry = recordCall(f.store, f.project, requests[0]!); f.store.writeMany = write;
-  assert.equal(raced, true); assert.equal(firstTry.ok, false);
-  if (!firstTry.ok) assert.equal(firstTry.refusal.code, 'input_stale');
+  assert.equal(raced, true); refusedWith(firstTry, 'input_stale');
   assert.equal(f.store.list('call-record').length, 1);
   ok(recordCall(f.store, f.project, requests[0]!));
   assert.equal(f.store.list('call-record').length, 2); assert.equal(f.store.list('model-call').length, 0);
@@ -1715,7 +1708,7 @@ test('3 H1.0b equivalent configure before assessor claim preserves exact intent,
         return write(writes, guards);
       }) as Store['writeMany'];
       const first = await runModelTransport(f.store, transportRequest); f.store.writeMany = write;
-      assert.equal(raced, true); assert.equal(first.ok, false); if (!first.ok) assert.equal(first.refusal.code, 'input_stale');
+      assert.equal(raced, true); refusedWith(first, 'input_stale');
       assert.equal(f.sent().length, 1); assert.deepEqual(f.store.get(admitted.call.id), admitted.call);
       f.restart();
     }
@@ -1794,13 +1787,13 @@ test('3 H1.0b staged assessor role agrees at cessation, transport and historical
           if (proof.kind !== 'required-record-replaced' || proof.prerequisite.kind !== 'environment') assert.fail('Environment cause');
           assert.equal(proof.prerequisite.role, 'reviewer');
           ok(readCompletionCause(f.store, f.project, disposition.assignment, proof));
-          assert.equal(readCompletionCause(f.store, f.project, disposition.assignment, {
+          refusedWith(readCompletionCause(f.store, f.project, disposition.assignment, {
             ...proof, prerequisite: { ...proof.prerequisite, role: null },
-          }).ok, false, 'An assessor never gets the ordinary choice of roles');
+          }), 'completion_cause_invalid');
         } else {
-          assert.equal(readCompletionCause(f.store, f.project, disposition.assignment, { kind: 'required-record-replaced',
+          refusedWith(readCompletionCause(f.store, f.project, disposition.assignment, { kind: 'required-record-replaced',
             prerequisite: { kind: 'environment', source: f.dispatch.config, context: reference(intent), physical: null, role: 'reviewer' },
-            replacement: reference(replacement), proof: null }).ok, false);
+            replacement: reference(replacement), proof: null }), 'completion_cause_invalid');
         }
         const before = f.store.list();
         const ceased = writeCompletionCessation(f.store, { project: f.project, binding: disposition.binding, assignment: disposition.assignment });
@@ -1808,13 +1801,13 @@ test('3 H1.0b staged assessor role agrees at cessation, transport and historical
         if (ceased.ok) {
           assert.equal(ceased.value.value.disposition, 'not-dispatched');
           f.restart(); ok(readCompletionCessationAt(f.store, f.project, reference(ceased.value)));
-          assert.equal((await assessFact(f.store, request)).ok, false); assert.equal(f.sent().length, 1);
-          if (call) assert.equal((await runModelTransport(f.store, transportRequest())).ok, false);
+          refusedWith(await assessFact(f.store, request), 'completion_ceased'); assert.equal(f.sent().length, 1);
+          if (call) refusedWith(await runModelTransport(f.store, transportRequest()), 'completion_ceased');
         } else {
           assert.deepEqual(f.store.list(), before);
           assert.equal(ceased.refusal.code, blocks ? 'completion_claim_exists' : 'completion_cause_unproved');
           if (stage === 'claim') {
-            assert.equal((await runModelTransport(f.store, transportRequest())).ok, false); assert.equal(f.sent().length, 1);
+            refusedWith(await runModelTransport(f.store, transportRequest()), 'model_call_in_progress'); assert.equal(f.sent().length, 1);
           } else {
             if (!call) call = ok(recordCall(f.store, f.project, e1)).call;
             const transport = ok(await runModelTransport(f.store, transportRequest()));

@@ -321,16 +321,19 @@ test("thrownWith takes only a real EngineError with a string code: a lookalike, 
 });
 
 // The agreed refusal helpers may not let the code be omitted: no `?`, no default value, no `undefined` in its type and no
-// rest list, on any helper that takes an OmResult. Plain `code?` fields of test data are none of this check's business.
+// rest list, on any helper that takes an OmResult, a `ReturnType<...>` result or an action function (`=>`). Plain `code?`
+// fields of test data are none of this check's business; the scan covers the known helper files below, not every helper ever.
 const REFUSAL_HELPER_FILES = ["om-fixture.ts", "om-fixture.test.ts", "om-series-current.test.ts", "om-queue.test.ts",
-  "om-series-transition-prepared.test.ts", "om-stop-analysis.test.ts", "om-frame-accept.test.ts"];
+  "om-series-transition-prepared.test.ts", "om-stop-analysis.test.ts", "om-frame-accept.test.ts",
+  "om-accepted-answer.test.ts", "om-addressing.test.ts", "om-assessment.test.ts", "om-deliveries.test.ts",
+  "om-gap-lines.test.ts", "om-obligations.test.ts", "om-work-zone.test.ts", "om-works-frame.test.ts"];
 
 function optionalCodeHelpers(file: string, source: string): string[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.ES2023, true);
   const found: string[] = [];
   const walk = (node: import("typescript").Node): void => {
     if (ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isMethodDeclaration(node)) {
-      const takesResult = node.parameters.some(parameter => parameter.type !== undefined && /\bOmResult\b/.test(parameter.type.getText(sf)));
+      const takesResult = node.parameters.some(parameter => parameter.type !== undefined && /\bOmResult\b|\bReturnType\s*<|=>/.test(parameter.type.getText(sf)));
       if (takesResult) for (const parameter of node.parameters) {
         if (!/code/i.test(parameter.name.getText(sf))) continue;
         const omittable = parameter.questionToken !== undefined || parameter.initializer !== undefined || parameter.dotDotDotToken !== undefined
@@ -351,15 +354,19 @@ test("the check against an omittable code sees every way to omit it and leaves o
     ["undefined in the type", "function refusal(result: OmResult<unknown>, code: string | undefined) {}"],
     ["rest list", "function failed(result: OmResult<unknown>, ...codes: string[]) {}"],
     ["optional list", "function refusedAs(value: OmResult<T>, expectedCodes?: readonly string[]) {}"],
+    ["ReturnType result", "function unchangedRefusal(value: ReturnType<typeof merge>, before: unknown[], code?: string) {}"],
+    ["action function", "function rejected(action: () => OmResult<unknown>, code?: string) {}"],
   ] as const) assert.equal(optionalCodeHelpers("probe.ts", source).length, 1, label);
   assert.deepEqual(optionalCodeHelpers("probe.ts", [
     "function refusedWith(result: OmResult<unknown>, code: string | readonly string[]) {}",
+    "function carried(result: ReturnType<typeof build>, code: string) {}",
+    "function named(fn: () => void, label?: string) {}",
     "function other(value: unknown, code?: string) {}",
     "interface Row { code?: string }",
     "const row: { code?: string } = {};"].join("\n")), []);
 });
 
-test("no refusal helper of the Q2.1 suites lets the expected code be omitted", () => {
+test("no refusal helper of the Q2.1 and Q2.2 suites lets the expected code be omitted", () => {
   const offenders = REFUSAL_HELPER_FILES.flatMap(file =>
     optionalCodeHelpers(file, readFileSync(new URL(`../../test/${file}`, import.meta.url), "utf8")));
   assert.deepEqual(offenders, []);

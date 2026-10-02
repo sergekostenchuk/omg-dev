@@ -4,7 +4,6 @@ import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
-import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
@@ -28,9 +27,9 @@ import { writeOmInput } from '../src/om/input.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND,
   writeOmObligations, type OwnerGapAssignment } from '../src/om/obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import type { OmResult } from '../src/om/refusal.js';
+import type { OmResult, Refusal } from '../src/om/refusal.js';
 import { prepareWorksFrame, readWorksFrame, writeWorksFrame } from '../src/om/works-frame.js';
-import { createCrossOmFixture, gardenGraph } from './om-fixture.js';
+import { createCrossOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -41,15 +40,10 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
-function denied(result: OmResult<unknown>, code?: string) {
-  if (result.ok) assert.fail(`Expected ${code ?? 'a typed refusal'}`);
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target && (result.refusal.at.field || result.refusal.at.ref));
-  return result.refusal;
-}
-function rejected(action: () => OmResult<unknown>) {
-  try { denied(action()); }
-  catch (error) { if (!(error instanceof EngineError)) throw error; assert.ok(error.code); }
+function denied(result: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const refusal = refusedWith(result, code);
+  assert.ok(refusal.at.field || refusal.at.ref);
+  return refusal;
 }
 function put(store: Store, id: string, proposal: LayerProposal) {
   return reference(store.write({ id: `om-proposal:garden:${id}`, kind: 'layer-proposal', expected: 0, value: proposal }));
@@ -225,7 +219,7 @@ test('F2 stores the first real L3 candidate with distinct local/cross flows, exa
   const request = { project: 'garden', candidate: reference(written.record) }, saved = heads(f.store);
   assert.deepEqual(ok(readWorksFrame(f.store, request)), ok(readCandidate(f.store, request)));
   assert.deepEqual(ok(writeWorksFrame(f.store, f.request)), written); assert.deepEqual(heads(f.store), saved);
-  denied(gateCandidate(f.store, request));
+  denied(gateCandidate(f.store, request), 'candidate_level_unsupported');
   for (const gate of ['G3', 'G5'] as const) denied(settleCandidate(f.store, { ...request, level: 3,
     outcome: { gate, candidate: request.candidate, graphHash: written.record.value.graphHash, passed: true, codes: [] } }), 'candidate_level_unsupported');
   assert.deepEqual(heads(f.store), saved);
@@ -236,18 +230,18 @@ test('F2 stores the first real L3 candidate with distinct local/cross flows, exa
 
 test('F2 requires explicit D7 era, ledger, exact proposal context and bindings even for an empty handoff', t => {
   const f = firstWorks(t), before = heads(f.store), original = f.request;
-  for (const bad of [
-    { ...original, works: undefined }, { ...original, works: null },
-    { ...original, works: { ...original.works!, contract: 'unknown' } },
-    { ...original, works: { ...original.works!, ledger: undefined } },
-    { ...original, works: { ...original.works!, bindings: undefined } },
-    { ...original, works: { ...original.works!, ledger: original.works!.producer } },
-    { ...original, works: { ...original.works!, producer: { ...original.works!.producer, hash: '0'.repeat(64) } } },
-  ]) for (const action of [prepareWorksFrame, writeWorksFrame]) rejected(() => action(f.store, bad as CandidateRequest));
+  for (const [bad, badCode] of [
+    [{ ...original, works: undefined }, 'works_contract_invalid'], [{ ...original, works: null }, 'works_contract_invalid'],
+    [{ ...original, works: { ...original.works!, contract: 'unknown' } }, 'works_contract_invalid'],
+    [{ ...original, works: { ...original.works!, ledger: undefined } }, 'works_contract_invalid'],
+    [{ ...original, works: { ...original.works!, bindings: undefined } }, 'works_contract_invalid'],
+    [{ ...original, works: { ...original.works!, ledger: original.works!.producer } }, 'works_obligations_invalid'],
+    [{ ...original, works: { ...original.works!, producer: { ...original.works!.producer, hash: '0'.repeat(64) } } }, 'record_forged'],
+  ] as const) for (const action of [prepareWorksFrame, writeWorksFrame]) denied(action(f.store, bad as CandidateRequest), badCode);
   assert.deepEqual(heads(f.store), before);
   const peer = put(f.store, 'extra-work-context', { ...clone(f.proposal), nodes: [], fills: [], tests: [], artifacts: [], contracts: [], edges: [], journeys: [] });
   const changed = heads(f.store);
-  denied(prepareWorksFrame(f.store, { ...original, proposals: [...original.proposals, peer] }));
+  denied(prepareWorksFrame(f.store, { ...original, proposals: [...original.proposals, peer] }), 'works_obligations_invalid');
   assert.deepEqual(heads(f.store), changed);
   const source = ok(prepareFrameProposals(f.store, { frame: original.frame, proposals: original.proposals }));
   for (const field of ['codeRef', 'foreignCode', 'reserved', 'contract', 'wake', 'ambiguousWake', 'anchor',
@@ -281,7 +275,8 @@ test('F2 requires explicit D7 era, ledger, exact proposal context and bindings e
     const result = assembleCandidate(clone(source.frame) as unknown as FrameRead, [observation], original.works);
     denied(result, field === 'wake' || field === 'ambiguousWake' ? 'sleeping_wake_test_missing'
       : field === 'anchor' ? 'sleeping_anchor_underivable' : field === 'localMissingCode' ? 'works_code_missing'
-      : field === 'localForeignCode' ? 'works_code_foreign' : field === 'upperDrift' ? 'works_upper_drift' : undefined);
+      : field === 'localForeignCode' ? 'works_code_foreign' : field === 'upperDrift' ? 'works_upper_drift'
+      : field === 'reserved' ? 'proposal_node_reserved' : field === 'contract' ? 'proposal_invalid' : 'slot_fill_foreign');
   }
 });
 
@@ -319,7 +314,7 @@ test('F2 retains distinct D7 assignments of one gap and validates consumers agai
   for (const bindings of [works.bindings.slice(1), [first, first],
     [{ ...first, consumers: [{ node: 'garden-consume-work', tests: [] }] }, works.bindings[1]!],
     [{ ...first, consumers: [{ node: 'garden-later-work', tests: ['garden-produce-work-test'] }] }, works.bindings[1]!]]) {
-    denied(prepareWorksFrame(f.store, { ...f.request, works: { ...works, bindings } }));
+    denied(prepareWorksFrame(f.store, { ...f.request, works: { ...works, bindings } }), 'works_obligations_invalid');
   }
   assert.deepEqual(heads(f.store), before);
 });
@@ -339,7 +334,7 @@ test('F2 hands D7 and C2 guards to the candidate transaction without publishing 
       const before = heads(branch);
       denied(writeGuarded(branch, { unit: 'F2', target: 'works-candidate', writes: prepared.writes, guards: prepared.guards }), 'input_stale');
       assert.deepEqual(heads(branch), before);
-      denied(prepareWorksFrame(branch, f.request));
+      denied(prepareWorksFrame(branch, f.request), index < 5 ? 'input_stale' : index < 7 ? 'obligation_record_invalid' : 'stage_not_accepted');
       assert.deepEqual(heads(branch), before);
     } finally { branch.close(); }
   }

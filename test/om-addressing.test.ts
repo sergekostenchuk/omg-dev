@@ -35,7 +35,7 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { readLayerAcceptance } from '../src/om/layer-basis.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
-import { createOmFixture, gardenGraph } from './om-fixture.js';
+import { createOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -45,10 +45,6 @@ const fakeRef: Ref = { id: 'decision:test', revision: 1, hash: '1'.repeat(64) };
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
-}
-function refused(result: OmResult<unknown>, code?: string): void {
-  assert.equal(result.ok, false);
-  if (!result.ok) { if (code) assert.equal(result.refusal.code, code); assert.ok(result.refusal.at.target); }
 }
 function fixture(t: TestContext, unknowns: Json[] = [{ id: 'output-format',
   question: 'Which output format does the repository support?', consumer: block,
@@ -161,8 +157,8 @@ test('D3.1 native fact precondition retains the active D1 gap until application 
     gaps: { sources: f.gaps.sources, records: f.gaps.records }, closures: [] };
   const lines = ok(writeGapLines(f.store, linesRequest));
   const before = f.store.list().map(reference);
-  refused(prepareGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }));
-  refused(writeGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }));
+  refusedWith(prepareGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }), 'closure_invalid');
+  refusedWith(writeGapLines(f.store, { ...linesRequest, pass: 2, previous: reference(lines), closures: [accepted.closure] }), 'closure_invalid');
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(ok(readGaps(f.store, linesRequest.gaps)).collection.gaps.some(gap => gap.target === question && gap.field === 'answer'), true);
   f.restart();
@@ -194,7 +190,7 @@ test('D3 native first pass addresses a question through B1, horizon, frame and D
   const source = f.store.get('source:garden:brief')!;
   f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(addressed))), addressed);
-  refused(prepareAddressing(f.store, request), 'stage_not_accepted');
+  refusedWith(prepareAddressing(f.store, request), 'stage_not_accepted');
 });
 
 test('F5.3 fills only absent producer fields, preserves original text, and never answers the question', t => {
@@ -269,7 +265,7 @@ test('D3 reports every semantic refusal and refuses unknown IDs, enums, duplicat
   const wrongBase = f.request(); const pending = wrongBase.decisions[0]! as { pending: Write };
   const body = clone(pending.pending.value) as Record<string, any>; body.input = { ...reference(f.input), revision: 10 };
   pending.pending = inputDecisionWrite(body as any) as Write;
-  const failed = prepareAddressing(f.store, wrongBase); refused(failed, 'addressing_source_invalid');
+  const failed = prepareAddressing(f.store, wrongBase); refusedWith(failed, 'addressing_source_invalid');
   if (!failed.ok) seen.add(failed.refusal.code);
   assert.deepEqual([...seen].sort(), [...ADDRESSING_CODES].sort());
 });
@@ -298,16 +294,16 @@ test('D3 rejects missing arguments and malformed complete sets before reading or
 
 test('D3 accepts no status, foreign graph, unaccepted lower consumer, or substituted proposal in place of checked sources', t => {
   const f = fixture(t), before = f.store.list().map(reference);
-  const cases: AddressingRequest[] = [];
+  const cases: Array<[AddressingRequest, string]> = [];
   const statusOnly = f.request();
   (statusOnly.decisions[0] as { pending: Write }).pending.value = { status: 'accepted', project: f.project };
-  cases.push(statusOnly);
-  const foreign = f.request(); foreign.graph = { ...foreign.graph, id: 'graph:garden-other' }; cases.push(foreign);
-  const lower = f.request(reference(f.input), 'address', question, { consumer: 'garden-produce-operation', kind: 'repository-fact' }); cases.push(lower);
+  cases.push([statusOnly, 'addressing_source_invalid']);
+  const foreign = f.request(); foreign.graph = { ...foreign.graph, id: 'graph:garden-other' }; cases.push([foreign, 'layer_basis_unproven']);
+  const lower = f.request(reference(f.input), 'address', question, { consumer: 'garden-produce-operation', kind: 'repository-fact' }); cases.push([lower, 'addressing_invalid']);
   const wrongHash = f.request(); const write = (wrongHash.decisions[0] as { pending: Write }).pending;
-  write.id = write.id.replace(/.$/, write.id.endsWith('0') ? '1' : '0'); cases.push(wrongHash);
-  for (const request of cases) {
-    refused(prepareAddressing(f.store, request)); refused(writeAddressing(f.store, request));
+  write.id = write.id.replace(/.$/, write.id.endsWith('0') ? '1' : '0'); cases.push([wrongHash, 'addressing_source_invalid']);
+  for (const [request, code] of cases) {
+    refusedWith(prepareAddressing(f.store, request), code); refusedWith(writeAddressing(f.store, request), code);
     assert.deepEqual(f.store.list().map(reference), before);
   }
 });
@@ -318,10 +314,10 @@ test('D3 guard closure aborts every pending record and a neighbour when a prereq
   assert.ok(prepared.guards.some(ref => ref.id === proof.id));
   f.store.write({ id: proof.id, kind: proof.kind, expected: proof.revision, value: proof.value });
   const before = f.store.list().map(reference);
-  refused(writeGuarded(f.store, { unit: 'D3-neighbour', target: 'neighbour', guards: prepared.guards,
+  refusedWith(writeGuarded(f.store, { unit: 'D3-neighbour', target: 'neighbour', guards: prepared.guards,
     writes: [...prepared.writes, { id: 'neighbour', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
   assert.deepEqual(f.store.list().map(reference), before);
-  refused(prepareAddressing(f.store, request), 'stage_not_accepted');
+  refusedWith(prepareAddressing(f.store, request), 'stage_not_accepted');
 });
 
 test('D3 saved proposal guards reject a newer proposal revision before writing the input', t => {
@@ -329,7 +325,7 @@ test('D3 saved proposal guards reject a newer proposal revision before writing t
   const proposal = f.store.write(pending); request.decisions = [{ record: reference(proposal) }];
   const prepared = ok(prepareAddressing(f.store, request));
   f.store.write({ id: proposal.id, kind: proposal.kind, expected: proposal.revision, value: proposal.value });
-  refused(writeGuarded(f.store, { unit: 'F5.3', target: f.input.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  refusedWith(writeGuarded(f.store, { unit: 'F5.3', target: f.input.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
   assert.equal(f.store.get(f.input.id)!.revision, 1);
 });
 
@@ -343,7 +339,7 @@ test('D3 exact replay has complete current guards and late delivery preserves a 
   const proof = f.store.get('source:garden:brief')!;
   assert.ok(replay.guards.some(ref => ref.id === proof.id));
   f.store.write({ id: proof.id, kind: proof.kind, expected: proof.revision, value: proof.value });
-  refused(writeGuarded(f.store, { unit: 'replay-neighbour', target: 'neighbour', guards: replay.guards,
+  refusedWith(writeGuarded(f.store, { unit: 'replay-neighbour', target: 'neighbour', guards: replay.guards,
     writes: [{ id: 'neighbour', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
   f.restart(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(later))), later);
 });
@@ -449,7 +445,7 @@ test('D3 canonical nodes proposals retain one identity across permutations, late
   const offered = (duplicate.decisions[0] as { pending: Write }).pending.value as any;
   assert.equal(normalizeInputDecisionProposal(offered).decision.value instanceof Array, true);
   assert.equal((normalizeInputDecisionProposal(offered).decision.value as readonly Json[]).length, 3);
-  refused(writeAddressing(f.store, duplicate), 'addressing_invalid');
+  refusedWith(writeAddressing(f.store, duplicate), 'addressing_invalid');
   assert.deepEqual(f.store.list().map(reference), latest);
   const layers = [{ id: 'graph-layer:garden:2', revision: 1, hash: '2'.repeat(64) },
     { id: 'graph-layer:garden:3', revision: 1, hash: '3'.repeat(64) }];
@@ -481,13 +477,13 @@ for (const level of [2, 3] as const) test(`D3 research lower admission L${level}
   f.store.write({ id: assessment.id, kind: assessment.kind, expected: assessment.revision, value: assessment.value });
   assert.ok(f.engine.refinement.gate(f.project, phase).findings.some(finding => finding.code === 'phase_stale'));
   const before = f.store.list().map(reference);
-  refused(prepareAddressing(f.store, next)); refused(writeAddressing(f.store, next));
-  refused(writeGuarded(f.store, { unit: 'D3', target: input.id, guards: prepared.guards,
+  refusedWith(prepareAddressing(f.store, next), 'frame_basis_unproven'); refusedWith(writeAddressing(f.store, next), 'frame_basis_unproven');
+  refusedWith(writeGuarded(f.store, { unit: 'D3', target: input.id, guards: prepared.guards,
     writes: [...prepared.writes, { id: 'neighbor:research', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
   assert.deepEqual(f.store.list().map(reference), before);
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
   f.reopen(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
-  refused(prepareAddressing(f.store, next));
+  refusedWith(prepareAddressing(f.store, next), 'frame_basis_unproven');
 });
 
 function acceptOperations(f: ReturnType<typeof fixture>) {
@@ -526,14 +522,14 @@ test('D3 OM lower admission guards its own layer and current producer closure wh
   for (const ref of [graph, layer, ...basis.currentReferences]) assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)), ref.id);
   f.store.write({ id: layer.id, kind: operations.layer.kind, expected: layer.revision, value: operations.layer.value });
   const before = f.store.list().map(reference);
-  refused(prepareAddressing(f.store, next), 'input_stale'); refused(writeAddressing(f.store, next), 'input_stale');
-  refused(writeGuarded(f.store, { unit: 'D3', target: f.input.id, guards: prepared.guards,
+  refusedWith(prepareAddressing(f.store, next), 'input_stale'); refusedWith(writeAddressing(f.store, next), 'input_stale');
+  refusedWith(writeGuarded(f.store, { unit: 'D3', target: f.input.id, guards: prepared.guards,
     writes: [...prepared.writes, { id: 'neighbor:om', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
   assert.deepEqual(f.store.list().map(reference), before);
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
   f.restart(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
   assert.deepEqual(ok(writeAddressing(f.store, firstRequest)), accepted);
-  refused(prepareAddressing(f.store, next), 'input_stale');
+  refusedWith(prepareAddressing(f.store, next), 'input_stale');
 });
 
 test('D3.1 native fact application rederives B1, complete D1 and closed D2 with the same achievement after restart', async t => {
@@ -577,8 +573,8 @@ test('D3.1 native fact application rederives B1, complete D1 and closed D2 with 
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(applied))), applied);
   assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(closed) })), closed);
   assert.equal(ok(confirmResults(f.store, { ...confirm, accepting: [reference(closed)] })).achieved[0]!.key, answerKey);
-  refused(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
-  refused(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: applied.revision }), 'answer_inapplicable');
+  refusedWith(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
+  refusedWith(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: applied.revision }), 'answer_inapplicable');
 });
 
 test('D3.1 independent inventory refresh preserves the fact contract, addressing and late delivery identity', async t => {
@@ -633,18 +629,18 @@ test('D3.1 different contract and changed evidence refuse application without wr
   const f = factFixture(t), accepted = await f.accept(), changed = f.issue(f.gaps, { type: 'string', enum: ['JSON'] });
   const request: ApplyAnswerRequest = { project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) };
   let before = f.store.list().map(reference);
-  refused(prepareApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
-  refused(writeApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
+  refusedWith(prepareApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
+  refusedWith(writeApplyAnswer(f.store, { ...request, question: reference(changed.question) }), 'answer_inapplicable');
   assert.deepEqual(f.store.list().map(reference), before);
   for (const advance of [false, true]) {
     f.changeEvidence('XML', advance); before = f.store.list().map(reference);
-    refused(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
-    refused(writeApplyAnswer(f.store, request), 'answer_inapplicable');
+    refusedWith(prepareApplyAnswer(f.store, request), 'answer_inapplicable');
+    refusedWith(writeApplyAnswer(f.store, request), 'answer_inapplicable');
     assert.deepEqual(f.store.list().map(reference), before);
   }
   f.restart();
   ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(accepted.saved) }));
-  refused(writeApplyAnswer(f.store, request), 'answer_inapplicable');
+  refusedWith(writeApplyAnswer(f.store, request), 'answer_inapplicable');
 });
 
 test('D3.1 application guards include evidence, the exact fact, contract, base and stage proof; no partial neighbor write', async t => {
@@ -658,7 +654,7 @@ test('D3.1 application guards include evidence, the exact fact, contract, base a
     const old = f.store.get(id)!;
     f.store.write({ id, kind: old.kind, expected: old.revision, value: old.value });
     const before = f.store.list().map(reference);
-    refused(writeGuarded(f.store, { unit: 'D3.1-test', target: f.input.id, guards: prepared.guards,
+    refusedWith(writeGuarded(f.store, { unit: 'D3.1-test', target: f.input.id, guards: prepared.guards,
       writes: [...prepared.writes, { id: 'neighbor:application', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');
     assert.deepEqual(f.store.list().map(reference), before);
     assert.equal(f.store.get('neighbor:application'), null);
@@ -675,8 +671,8 @@ test('D3.1 forged applied values and altered answer references cannot survive hi
     else body.input.facts![0]!.answer.hash = 'f'.repeat(64);
     body.hash = hashJson(body.input);
     const forged = f.store.write({ id: f.input.id, kind: 'om-input', expected: f.input.revision, value: body });
-    refused(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
-    f.restart(); refused(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
+    refusedWith(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
+    f.restart(); refusedWith(readOmInput(f.store, f.project, reference(forged)), 'record_forged');
   });
 });
 
@@ -693,18 +689,18 @@ test('D3.1 rejects missing arguments, foreign or forged bases and status imitati
     assert.throws(() => fn(unreadable, value as ApplyAnswerRequest), (error: unknown) => error instanceof EngineError
       && error.code === 'addressing_request_invalid' && !!error.details);
   for (const fn of [prepareApplyAnswer, writeApplyAnswer])
-    refused(fn(f.store, { ...request, project: 'missing-project' }), 'addressing_source_invalid');
-  for (const change of [{ answer: { ...request.answer, id: 'om-answer:other:foreign' } },
-    { answer: { ...request.answer, hash: 'f'.repeat(64) } }, { question: { ...request.question, hash: 'e'.repeat(64) } },
-    { input: { ...request.input, id: 'om-input:other' } }]) {
+    refusedWith(fn(f.store, { ...request, project: 'missing-project' }), 'addressing_source_invalid');
+  for (const [change, code] of [[{ answer: { ...request.answer, id: 'om-answer:other:foreign' } }, 'record_foreign'],
+    [{ answer: { ...request.answer, hash: 'f'.repeat(64) } }, 'record_forged'], [{ question: { ...request.question, hash: 'e'.repeat(64) } }, 'record_forged'],
+    [{ input: { ...request.input, id: 'om-input:other' } }, 'addressing_conflict']] as const) {
     const before = f.store.list().map(reference);
-    refused(prepareApplyAnswer(f.store, { ...request, ...change })); refused(writeApplyAnswer(f.store, { ...request, ...change }));
+    refusedWith(prepareApplyAnswer(f.store, { ...request, ...change }), code); refusedWith(writeApplyAnswer(f.store, { ...request, ...change }), code);
     assert.deepEqual(f.store.list().map(reference), before);
   }
   const fake = f.store.write({ id: 'om-answer:garden:status-only', kind: 'accepted-answer', expected: 0,
     value: { project: f.project, target: question, value: 'JSON', status: 'accepted' } });
   const before = f.store.list().map(reference);
-  refused(writeApplyAnswer(f.store, { ...request, answer: reference(fake) }));
+  refusedWith(writeApplyAnswer(f.store, { ...request, answer: reference(fake) }), 'answer_record_invalid');
   assert.deepEqual(f.store.list().map(reference), before);
 });
 
@@ -744,7 +740,7 @@ for (const advance of [true, false]) test(`D3.1 stale applied fact recovery comp
   const sourceRevision = f.store.get(f.source.id)!.revision;
   f.changeEvidence('XML', advance); f.restart();
   const request = { project: f.project, input: reference(firstInput) }, before = f.store.list().map(reference);
-  refused(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: firstInput.revision }), 'answer_inapplicable');
+  refusedWith(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: firstInput.revision }), 'answer_inapplicable');
   const prepared = ok(prepareReopenAnswers(f.store, request));
   assert.deepEqual(f.store.list().map(reference), before, 'Preparation must not write a Source or input');
   assert.equal(prepared.writes.some(write => write.id === f.source.id), !advance);
@@ -754,7 +750,7 @@ for (const advance of [true, false]) test(`D3.1 stale applied fact recovery comp
   assert.equal(recovered.value.input.facts?.some(fact => fact.question.id === question), false);
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(recovered))), recovered);
   assert.deepEqual(ok(prepareOmInput(f.store, { project: f.project, stages: f.stages, expected: recovered.revision })).record, recovered.value);
-  refused(prepareApplyAnswer(f.store, { project: f.project, input: reference(recovered),
+  refusedWith(prepareApplyAnswer(f.store, { project: f.project, input: reference(recovered),
     answer: reference(first.saved), question: reference(first.question) }), 'answer_inapplicable');
   const resumed = f.gapsFor(reference(recovered));
   assert.ok(resumed.gap);
@@ -804,12 +800,12 @@ test('D3.1 recovery protects source, input and stage dependencies in the shared 
     const old = f.store.get(id)!;
     f.store.write({ id, kind: old.kind, expected: old.revision, value: old.value });
     const before = f.store.list().map(reference);
-    refused(writeGuarded(f.store, { unit: 'D3.1', target: applied.id, guards: prepared.guards,
+    refusedWith(writeGuarded(f.store, { unit: 'D3.1', target: applied.id, guards: prepared.guards,
       writes: [...prepared.writes, { id: 'neighbor:recovery', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
     assert.deepEqual(f.store.list().map(reference), before);
     assert.equal(f.store.get('neighbor:recovery'), null);
     assert.equal(f.store.get(applied.id)!.revision, applied.revision + (dependency === 'input' ? 1 : 0));
-    if (dependency === 'stage-proof') refused(writeReopenAnswers(f.store, request));
+    if (dependency === 'stage-proof') refusedWith(writeReopenAnswers(f.store, request), 'stage_not_accepted');
   });
 });
 
@@ -823,13 +819,13 @@ test('D3.1 recovery refuses malformed requests before reading and foreign input 
     for (const request of [null, {}, { project: f.project }, { project: '', input: reference(f.input) }])
       assert.throws(() => fn(inaccessible, request as any), (error: unknown) => error instanceof EngineError && error.code === 'addressing_request_invalid');
     const before = f.store.list().map(reference);
-    refused(fn(f.store, { project: f.project, input: { ...reference(f.input), id: 'om-input:other' } }));
+    refusedWith(fn(f.store, { project: f.project, input: { ...reference(f.input), id: 'om-input:other' } }), 'record_foreign');
     assert.deepEqual(f.store.list().map(reference), before);
   }
 });
 
 test('D3.1 historical recovery cannot be forged by a stale marker or by retaining the withdrawn value', async t => {
-  for (const fault of ['unchanged-source', 'foreign-source', 'retained-value'] as const) await t.test(fault, async child => {
+  for (const [fault, faultCode] of [['unchanged-source', 'answer_inapplicable'], ['foreign-source', 'answer_inapplicable'], ['retained-value', 'record_forged']] as const) await t.test(fault, async child => {
     const f = factFixture(child), accepted = await f.accept(), applied = ok(writeApplyAnswer(f.store, {
       project: f.project, input: reference(f.input), answer: reference(accepted.saved), question: reference(accepted.question) }));
     f.changeEvidence('XML');
@@ -842,8 +838,8 @@ test('D3.1 historical recovery cannot be forged by a stale marker or by retainin
     else body.input.facts = clone(applied.value.input.facts!) as NonNullable<OmInputRecord['input']['facts']>;
     body.hash = hashJson(body.input);
     const forged = f.store.write({ id: applied.id, kind: applied.kind, expected: applied.revision, value: body });
-    refused(readOmInput(f.store, f.project, reference(forged)));
-    f.restart(); refused(readOmInput(f.store, f.project, reference(forged)));
+    refusedWith(readOmInput(f.store, f.project, reference(forged)), faultCode);
+    f.restart(); refusedWith(readOmInput(f.store, f.project, reference(forged)), faultCode);
   });
 });
 
@@ -1073,9 +1069,9 @@ test('D3.1 recovery closes A to B to D contracts, preserves C, proves reasons an
       }
       forgedBody.hash = hashJson(forgedBody.input);
       const forged = branch.write({ id: original.id, kind: original.kind, expected: original.revision, value: forgedBody });
-      refused(readOmInput(branch, f.project, reference(forged)), 'record_forged');
+      refusedWith(readOmInput(branch, f.project, reference(forged)), 'record_forged');
       branch.close(); branch = new Store(path);
-      refused(readOmInput(branch, f.project, reference(forged)), 'record_forged');
+      refusedWith(readOmInput(branch, f.project, reference(forged)), 'record_forged');
     } finally { branch.close(); }
   }
   for (const row of [x.B.source, x.C.source, x.D.source]) {
@@ -1084,7 +1080,7 @@ test('D3.1 recovery closes A to B to D contracts, preserves C, proves reasons an
     try {
       branch.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
       const beforeRace = branch.list().map(reference);
-      refused(writeGuarded(branch, { unit: 'D3.1', target: original.id, guards: prepared.guards,
+      refusedWith(writeGuarded(branch, { unit: 'D3.1', target: original.id, guards: prepared.guards,
         writes: [...prepared.writes, { id: 'neighbor:dependency-recovery', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
       assert.deepEqual(branch.list().map(reference), beforeRace);
     } finally { branch.close(); }

@@ -29,7 +29,7 @@ import { OM_OBLIGATION_CONTRACT, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNME
   type ObligationTransferRequest, type ObligationTransferRecord, type OmObligations } from "../src/om/obligations.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, refusedWith, thrownWith } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
@@ -42,20 +42,12 @@ function ok<T>(value: OmResult<T>): T {
   if (!value.ok) assert.fail(`Unexpected ${value.refusal.code}: ${value.refusal.message}`);
   return value.value;
 }
-function denied(value: OmResult<unknown>, code?: string): Refusal {
-  if (value.ok) assert.fail(`Expected ${code ?? "an addressed refusal"}, received success`);
-  if (code) assert.equal(value.refusal.code, code);
-  assert.ok(value.refusal.at.target.length > 0);
-  assert.ok(value.refusal.at.field || value.refusal.at.ref);
-  assert.ok(["producer", "gap", "owner", "readiness"].includes(value.refusal.route));
-  return value.refusal;
-}
-function engineRefusal(action: () => unknown, code?: string): void {
-  assert.throws(action, error => {
-    assert.ok(error instanceof EngineError);
-    if (code) assert.equal(error.code, code);
-    return true;
-  });
+function denied(value: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const refusal = refusedWith(value, code);
+  assert.ok(refusal.at.target.length > 0);
+  assert.ok(refusal.at.field || refusal.at.ref);
+  assert.ok(["producer", "gap", "owner", "readiness"].includes(refusal.route));
+  return refusal;
 }
 function malformed(error: unknown): boolean {
   assert.ok(error instanceof EngineError);
@@ -185,8 +177,8 @@ test("D7 omitted producer or ledger inputs cannot become legacy no-obligation su
   for (const [removed, code] of [[saved.producer.id, "obligation_basis_missing"], [saved.record.id, "obligation_ledger_missing"]] as const) {
     const inputs = saved.inputs.filter(ref => ref.id !== removed) as Ref[];
     denied(readOmObligationHandoff(f.store, f.project, inputs), code);
-    engineRefusal(() => obligationHandoff(f.store, f.project, inputs), code);
-    engineRefusal(() => taskObligationHandoff(f.store, f.project, inputs), code);
+    thrownWith(() => obligationHandoff(f.store, f.project, inputs), code);
+    thrownWith(() => taskObligationHandoff(f.store, f.project, inputs), code);
     assert.ok(readinessObligations(f.store, f.project, inputs).findings.some(item => item.code === code));
   }
   assert.equal(ok(readOmObligationHandoff(f.store, f.project, [])), null);
@@ -197,16 +189,16 @@ test("D7 omitted producer or ledger inputs cannot become legacy no-obligation su
 
 test("D7 duplicate producer and ledger inputs cannot select an ambiguous obligation basis", t => {
   const f = fixture(t), saved = ok(writeOmObligations(f.store, f.request)), before = revisions(f.store);
-  for (const duplicate of [reference(saved.producer), reference(saved.record)]) {
+  for (const [duplicate, code] of [[reference(saved.producer), "obligation_basis_missing"], [reference(saved.record), "obligation_ledger_missing"]] as const) {
     const inputs = [...saved.inputs, duplicate] as Ref[];
-    denied(readOmObligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => obligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => taskObligationHandoff(f.store, f.project, inputs));
+    denied(readOmObligationHandoff(f.store, f.project, inputs), code);
+    thrownWith(() => obligationHandoff(f.store, f.project, inputs), code);
+    thrownWith(() => taskObligationHandoff(f.store, f.project, inputs), code);
     assert.ok(readinessObligations(f.store, f.project, inputs).findings.length > 0);
   }
   const duplicateGaps = { ...f.request, gaps: { ...f.request.gaps, records: [...f.request.gaps.records, f.request.gaps.records[0]!] } };
-  denied(prepareOmObligations(f.store, duplicateGaps));
-  denied(writeOmObligations(f.store, duplicateGaps));
+  denied(prepareOmObligations(f.store, duplicateGaps), "gap_duplicate");
+  denied(writeOmObligations(f.store, duplicateGaps), "gap_duplicate");
   assert.deepEqual(revisions(f.store), before);
 });
 
@@ -235,24 +227,25 @@ test("D7 unavailable records, foreign references and forged hashes are addressed
       f.store.get = ((id: string, revision?: number) => id === victim.id ? null : original(id, revision)) as Store["get"];
       denied(readOmObligations(f.store, { project: f.project, producer: reference(saved.producer) }), "record_missing");
       denied(readOmObligationHandoff(f.store, f.project, clone(saved.inputs) as Ref[]), "record_missing");
-      engineRefusal(() => obligationHandoff(f.store, f.project, clone(saved.inputs) as Ref[]), "record_missing");
-      engineRefusal(() => taskObligationHandoff(f.store, f.project, clone(saved.inputs) as Ref[]), "record_missing");
+      thrownWith(() => obligationHandoff(f.store, f.project, clone(saved.inputs) as Ref[]), "record_missing");
+      thrownWith(() => taskObligationHandoff(f.store, f.project, clone(saved.inputs) as Ref[]), "record_missing");
       assert.ok(readinessObligations(f.store, f.project, clone(saved.inputs) as Ref[]).findings.some(item => item.code === "record_missing"));
     } finally { f.store.get = original; }
     const inputs = saved.inputs.map(ref => ref.id === victim.id ? { ...ref, hash: "0".repeat(64) } : ref) as Ref[];
-    denied(readOmObligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => obligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => taskObligationHandoff(f.store, f.project, inputs));
+    const forgedCode = victim === saved.producer ? "record_forged" : "obligation_ledger_missing";
+    denied(readOmObligationHandoff(f.store, f.project, inputs), forgedCode);
+    thrownWith(() => obligationHandoff(f.store, f.project, inputs), forgedCode);
+    thrownWith(() => taskObligationHandoff(f.store, f.project, inputs), forgedCode);
     assert.ok(readinessObligations(f.store, f.project, inputs).findings.length > 0);
   }
   denied(readOmObligations(f.store, { project: f.project, producer: { ...reference(saved.producer), hash: "0".repeat(64) } }), "record_forged");
   denied(readOmObligations(f.store, { project: "gardens", producer: reference(saved.producer) }), "record_foreign");
-  denied(readOmObligationHandoff(f.store, "gardens", clone(saved.inputs) as Ref[]));
+  denied(readOmObligationHandoff(f.store, "gardens", clone(saved.inputs) as Ref[]), "record_foreign");
   assert.deepEqual(revisions(f.store), before);
   const foreign = f.store.write({ id: `${saved.producer.id}:foreign-kind`, kind: "counterfeit", expected: 0, value: saved.producer.value });
   denied(readOmObligations(f.store, { project: f.project, producer: reference(foreign) }), "record_foreign");
   const inputs = saved.inputs.map(ref => ref.id === saved.producer.id ? reference(foreign) : ref) as Ref[];
-  denied(readOmObligationHandoff(f.store, f.project, inputs));
+  denied(readOmObligationHandoff(f.store, f.project, inputs), "record_foreign");
 });
 
 test("D7 rejects mixed OM and legacy R2 or L3 eras before interpreting either as an empty handoff", t => {
@@ -260,8 +253,8 @@ test("D7 rejects mixed OM and legacy R2 or L3 eras before interpreting either as
   for (const phases of [["R2"], ["L3"], ["R2", "L3"]]) {
     const inputs = [...saved.inputs, ...phases.map(phase => ({ id: `phase:${f.project}:${phase}`, revision: 1, hash: hashJson(phase) }))] as Ref[];
     denied(readOmObligationHandoff(f.store, f.project, inputs), "obligation_era_conflict");
-    engineRefusal(() => obligationHandoff(f.store, f.project, inputs), "obligation_era_conflict");
-    engineRefusal(() => taskObligationHandoff(f.store, f.project, inputs), "obligation_era_conflict");
+    thrownWith(() => obligationHandoff(f.store, f.project, inputs), "obligation_era_conflict");
+    thrownWith(() => taskObligationHandoff(f.store, f.project, inputs), "obligation_era_conflict");
     assert.ok(readinessObligations(f.store, f.project, inputs).findings.some(item => item.code === "obligation_era_conflict"));
   }
   assert.deepEqual(revisions(f.store), before);
@@ -316,23 +309,23 @@ test("D7 rehashed ledger and producer counterfeits cannot claim a valid native c
       expected: f.store.get(saved.producer.id)!.revision, value: producerValue });
     const inputs = saved.inputs.map(ref => ref.id === saved.producer.id ? reference(producer) : ref.id === saved.record.id ? reference(forged) : ref) as Ref[];
     const before = revisions(f.store);
-    denied(readOmObligations(f.store, { project: f.project, producer: reference(producer) }));
-    denied(readOmObligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => obligationHandoff(f.store, f.project, inputs));
-    engineRefusal(() => taskObligationHandoff(f.store, f.project, inputs));
+    denied(readOmObligations(f.store, { project: f.project, producer: reference(producer) }), "obligation_record_invalid");
+    denied(readOmObligationHandoff(f.store, f.project, inputs), "obligation_record_invalid");
+    thrownWith(() => obligationHandoff(f.store, f.project, inputs), "obligation_record_invalid");
+    thrownWith(() => taskObligationHandoff(f.store, f.project, inputs), "obligation_record_invalid");
     assert.deepEqual(ok(readOmObligations(f.store, { project: f.project, producer: reference(saved.producer) })).handoff, saved.handoff);
     assert.deepEqual(revisions(f.store), before);
   }
-  for (const mutate of [
-    (record: OmObligationProducer) => { record.request.project = "gardens"; },
-    (record: OmObligationProducer) => { record.request.lines = reference(f.input); },
-    (record: OmObligationProducer) => { delete (record as Partial<OmObligationProducer>).ledger; },
-  ]) {
+  for (const [mutate, mutateCode] of [
+    [(record: OmObligationProducer) => { record.request.project = "gardens"; }, "obligation_context_mismatch"],
+    [(record: OmObligationProducer) => { record.request.lines = reference(f.input); }, "record_foreign"],
+    [(record: OmObligationProducer) => { delete (record as Partial<OmObligationProducer>).ledger; }, "obligation_record_invalid"],
+  ] as const) {
     const value = clone(saved.producer.value) as OmObligationProducer; mutate(value);
     const forged = f.store.write<OmObligationProducer>({ id: saved.producer.id, kind: saved.producer.kind,
       expected: f.store.get(saved.producer.id)!.revision, value });
     assert.equal(forged.hash, hashJson(value));
-    denied(readOmObligations(f.store, { project: f.project, producer: reference(forged) }));
+    denied(readOmObligations(f.store, { project: f.project, producer: reference(forged) }), mutateCode);
   }
 });
 
@@ -409,12 +402,6 @@ function ownerWrite(value: OwnerGapAssignment): Write {
 function pendingOwners(f: ReturnType<typeof fixture>): ObligationRequest {
   return { ...f.request, assignments: f.input.value.input.questions.map((_, index) => ({ pending: ownerWrite(ownerAssignment(f, index)) })) };
 }
-function rejectAction(action: () => OmResult<unknown>): void {
-  let value: OmResult<unknown>;
-  try { value = action(); }
-  catch (error) { assert.ok(error instanceof EngineError); assert.ok(error.code); return; }
-  denied(value);
-}
 
 test("D7 native D3 late questions retain kind, deadline and original address; H2 adds explicit assignment without closing or advancing anything", t => {
   const f = fixture(t, ["environment-confirmation", "post-implementation-proof"]);
@@ -422,10 +409,10 @@ test("D7 native D3 late questions retain kind, deadline and original address; H2
   assert.equal(late.length, 2);
   assert.deepEqual(late.map(row => row.value.gap.moment).sort(), ["task-result", "task-start"]);
   assert.equal(f.store.get("phase:garden:R2"), null); assert.equal(f.store.get("phase:garden:L3"), null);
-  const before = revisions(f.store), noAssignment = denied(prepareOmObligations(f.store, f.request));
+  const before = revisions(f.store), noAssignment = denied(prepareOmObligations(f.store, f.request), "obligation_assignment_unresolved");
   assert.equal(noAssignment.route, "owner");
   assert.ok(late.some(row => row.value.gap.target === noAssignment.at.target));
-  denied(writeOmObligations(f.store, f.request));
+  denied(writeOmObligations(f.store, f.request), "obligation_assignment_unresolved");
   assert.deepEqual(revisions(f.store), before);
   const request = pendingOwners(f), prepared = ok(prepareOmObligations(f.store, request));
   assert.equal(prepared.writes.length, 4, "Two H2 contracts and the complete producer/ledger are one transaction");
@@ -486,8 +473,8 @@ test("D7 H2 source must be complete, canonical, foreign-free and authoritative b
     const value = clone(valid); mutate(value);
     const request: ObligationRequest = { ...f.request, assignments: [{ pending: ownerWrite(value) }] };
     const before = revisions(f.store);
-    rejectAction(() => prepareOmObligations(f.store, request));
-    rejectAction(() => writeOmObligations(f.store, request));
+    denied(prepareOmObligations(f.store, request), "obligation_assignment_invalid");
+    denied(writeOmObligations(f.store, request), "obligation_assignment_invalid");
     assert.deepEqual(revisions(f.store), before, name);
   }
   for (const [id, kind] of [[`om-proposal:${f.project}:not-owner`, "layer-proposal"],
@@ -496,8 +483,8 @@ test("D7 H2 source must be complete, canonical, foreign-free and authoritative b
     const record = f.store.write({ id: id!, kind: kind!, expected: 0, value: valid });
     const request: ObligationRequest = { ...f.request, assignments: [{ record: reference(record) }] };
     const before = revisions(f.store);
-    denied(readOwnerGapAssignment(f.store, { project: f.project, record: reference(record) }));
-    denied(prepareOmObligations(f.store, request)); denied(writeOmObligations(f.store, request));
+    denied(readOwnerGapAssignment(f.store, { project: f.project, record: reference(record) }), "record_foreign");
+    denied(prepareOmObligations(f.store, request), "record_foreign"); denied(writeOmObligations(f.store, request), "record_foreign");
     assert.deepEqual(revisions(f.store), before);
   }
 });
@@ -510,15 +497,15 @@ test("D7 exact runtime declarations keep source guards and explicit satisfies wi
   assignment.runtimeCheck = { script: reference(script), dependencies: [], subjects: ["garden-produce-block"], executables: [process.execPath], args: [],
     timeoutMs: 1000, purpose: "Observe the explicitly declared repository prerequisite", satisfies: assignment.returnCondition };
   const normalized = clone(normalizeOwnerGapAssignment(value)) as OwnerGapAssignment;
-  for (const mutate of [
-    (candidate: OwnerGapAssignment) => { delete candidate.assignments[0]!.runtimeCheck!.satisfies; },
-    (candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.satisfies = "An unrelated property"; },
-    (candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.script = { ...reference(script), hash: "0".repeat(64) }; },
-    (candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.dependencies = [{ id: "source:garden:absent", revision: 1, hash: "1".repeat(64) }]; },
-  ]) {
+  for (const [mutate, mutateCode] of [
+    [(candidate: OwnerGapAssignment) => { delete candidate.assignments[0]!.runtimeCheck!.satisfies; }, "obligation_assignment_invalid"],
+    [(candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.satisfies = "An unrelated property"; }, "obligation_assignment_invalid"],
+    [(candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.script = { ...reference(script), hash: "0".repeat(64) }; }, "record_forged"],
+    [(candidate: OwnerGapAssignment) => { candidate.assignments[0]!.runtimeCheck!.dependencies = [{ id: "source:garden:absent", revision: 1, hash: "1".repeat(64) }]; }, "record_missing"],
+  ] as const) {
     const candidate = clone(normalized); mutate(candidate);
     const before = revisions(f.store), request = { ...f.request, assignments: [{ pending: ownerWrite(candidate) }] };
-    rejectAction(() => prepareOmObligations(f.store, request)); rejectAction(() => writeOmObligations(f.store, request));
+    denied(prepareOmObligations(f.store, request), mutateCode); denied(writeOmObligations(f.store, request), mutateCode);
     assert.deepEqual(revisions(f.store), before);
   }
   const request: ObligationRequest = { ...f.request, assignments: [{ pending: ownerWrite(normalized) }] };
@@ -538,14 +525,14 @@ test("D7 pending H2 assignments commit with the producer once; competing ownersh
   const snapshot = await f.store.snapshot(join(f.root, "pending-owner"));
   const owner = fresh.writes.find(write => write.kind === OM_OWNER_ASSIGNMENT_KIND)!;
   assert.ok(owner, "A pending owner contract belongs to the same atomic write set");
-  for (const [name, dependency] of [["owner", null], ["gap", request.gaps.records.find(ref => ref.id.includes(hashJson(["discovery:late-0", "answer"])))!],
-    ["input", reference(f.input)], ["lines", reference(f.lines)]] as const) {
+  for (const [name, dependency, raceCode] of [["owner", null, "revision_conflict"], ["gap", request.gaps.records.find(ref => ref.id.includes(hashJson(["discovery:late-0", "answer"])))!, "input_stale"],
+    ["input", reference(f.input), "input_stale"], ["lines", reference(f.lines), "input_stale"]] as const) {
     const path = join(f.root, `pending-race-${name}.sqlite`); copyFileSync(snapshot.path, path); const branch = new Store(path);
     try {
       if (dependency) { const old = branch.get(dependency.id)!; branch.write({ id: old.id, kind: old.kind, expected: old.revision, value: old.value }); }
       else branch.write(owner);
       const before = revisions(branch);
-      denied(writeGuarded(branch, { unit: "D7", target: "pending-owner-race", writes: fresh.writes, guards: fresh.guards }));
+      denied(writeGuarded(branch, { unit: "D7", target: "pending-owner-race", writes: fresh.writes, guards: fresh.guards }), raceCode);
       assert.equal(branch.get(fresh.producer.id), null); assert.equal(branch.get(fresh.record.id), null);
       assert.deepEqual(revisions(branch), before);
     } finally { branch.close(); }
@@ -575,7 +562,7 @@ test("D7 one native gap with two accepted consumers requires two complete owner 
     [...value.assignments, { ...value.assignments[0]!, responsibleNode: "garden-consume-block", responsibleConsumer: "garden-consume-block" }]]) {
     const request = { ...f.request, assignments: [{ pending: ownerWrite({ ...value, assignments }) }] };
     const before = revisions(f.store);
-    rejectAction(() => prepareOmObligations(f.store, request)); rejectAction(() => writeOmObligations(f.store, request));
+    denied(prepareOmObligations(f.store, request), "obligation_assignment_invalid"); denied(writeOmObligations(f.store, request), "obligation_assignment_invalid");
     assert.deepEqual(revisions(f.store), before);
   }
   const request = { ...f.request, assignments: [{ pending: ownerWrite(value) }] }, saved = ok(writeOmObligations(f.store, request));

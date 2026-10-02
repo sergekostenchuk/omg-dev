@@ -34,8 +34,8 @@ import { writeGuarded } from '../src/om/refs.js';
 import { openSeries, readSeries } from '../src/om/series.js';
 import { openAttempt, closeAttempt } from '../src/om/repeat-gate.js';
 import { confirmResults } from '../src/om/achievements.js';
-import type { OmResult } from '../src/om/refusal.js';
-import { gardenGraph } from './om-fixture.js';
+import type { OmResult, Refusal } from '../src/om/refusal.js';
+import { gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -122,13 +122,11 @@ function ok<T>(result: OmResult<T>): T {
   return result.value;
 }
 
-function rejected(result: OmResult<unknown>, code?: string): string {
-  assert.equal(result.ok, false);
-  if (result.ok) assert.fail('Expected an addressed refusal');
-  if (code) assert.equal(result.refusal.code, code);
-  assert.ok(result.refusal.at.target);
-  if ((ANSWER_REFUSAL_CODES as readonly string[]).includes(result.refusal.code) && result.refusal.at.unit === 'D5') assert.ok(result.refusal.at.field);
-  return result.refusal.code;
+function rejected(result: OmResult<unknown>, code: string | readonly string[]): Refusal {
+  const refusal = refusedWith(result, code);
+  assert.ok(refusal.at.target);
+  if ((ANSWER_REFUSAL_CODES as readonly string[]).includes(refusal.code) && refusal.at.unit === 'D5') assert.ok(refusal.at.field);
+  return refusal;
 }
 
 function factFixture(t: TestContext) {
@@ -238,7 +236,7 @@ test('D5 producer task rejects absent producer choices, malformed schemas, incom
   assert.equal(ok(prepareAnswerTask(f.store, { ...request, resultForm: false })).contract.resultForm, false);
   for (const schema of [null, 3, 'string', { type: 'not-a-json-type' }, { unknownStrictKeyword: true }, { $ref: 'urn:unavailable' }] as Json[])
     rejected(prepareAnswerTask(f.store, { ...request, resultForm: schema }), 'answer_question_invalid');
-  rejected(prepareAnswerTask(f.store, { ...request, gaps: { ...request.gaps, records: [] } }));
+  rejected(prepareAnswerTask(f.store, { ...request, gaps: { ...request.gaps, records: [] } }), 'gap_missing');
   rejected(prepareAnswerTask(f.store, { ...request, requirements: [{ pointer: '/missing' }] }), 'answer_question_invalid');
   const counterfeit = f.store.write({ id: 'om-answer-task:garden:pretend', kind: 'answer-task', expected: 0,
     value: { project: f.project, fingerprint: 'x', status: 'accepted' } });
@@ -356,14 +354,15 @@ test('D5 index bootstraps legacy exact answers but refuses partial, empty and fo
       ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: bootstrap.writes, guards: bootstrap.guards }));
       assert.deepEqual(ok(prepareAnswerSearch(f.store, request)).writes, []);
       const wrong = f.store.write({ id: 'om-answer:garden:unreadable', kind: 'other-kind', expected: 0, value: {} });
-      assert.ok(wrong); rejected(prepareAnswerSearch(f.store, request));
+      assert.ok(wrong); rejected(prepareAnswerSearch(f.store, request), 'record_foreign');
     } else {
       const answers = missing === 'all' ? [] : missing === 'partial' ? [reference(batch.records[0]!)]
         : [{ ...reference(batch.records[0]!), id: 'om-answer:other:foreign' }];
       f.store.write({ id, kind: ANSWER_INDEX_KIND, expected: 0, value: { project: f.project, target: f.target, field: 'answer', answers, previous: null } });
-      const before = f.store.list().map(reference); rejected(prepareAnswerSearch(f.store, request));
+      const catalogCode = missing === 'foreign' ? 'record_foreign' : 'answer_record_invalid';
+      const before = f.store.list().map(reference); rejected(prepareAnswerSearch(f.store, request), catalogCode);
       assert.deepEqual(f.store.list().map(reference), before);
-      rejected(prepareAcceptedAnswer(f.store, a.request));
+      rejected(prepareAcceptedAnswer(f.store, a.request), catalogCode);
     }
   }
 });
@@ -426,14 +425,14 @@ test('D5 accepts a native D3-addressed MC1 fact, rederives history and issues a 
     gaps: { sources: f.gaps.sources, records: f.gaps.records }, closures: [] };
   const line = ok(writeGapLines(f.store, lineRequest));
   const next = { ...lineRequest, pass: 2, previous: reference(line), closures: [prepared.closure] };
-  rejected(prepareGapLines(f.store, next));
+  rejected(prepareGapLines(f.store, next), 'closure_invalid');
   assert.equal(f.store.get(prepared.record.id), null);
   const saved = ok(writeAcceptedAnswer(f.store, a.request)), checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(saved) }));
   assert.equal(checked.record.value.value, 'JSON'); assert.equal(checked.record.value.grounds[0]!.proofLimit, 'repository-observation');
   assert.equal(saved.hash, hashJson(saved.value)); assert.equal(Object.isFrozen(saved.value.grounds), true);
   assert.deepEqual(ok(writeAcceptedAnswer(f.store, a.request)), saved);
   assert.equal(ok(prepareAcceptedAnswer(f.store, a.request)).writes.length, 0);
-  rejected(prepareGapLines(f.store, { ...next, closures: [{ ...prepared.closure, answer: { record: reference(saved) } }] }));
+  rejected(prepareGapLines(f.store, { ...next, closures: [{ ...prepared.closure, answer: { record: reference(saved) } }] }), 'closure_invalid');
   assert.equal(ok(applicableAnswer(f.store, { project: f.project, record: reference(saved), question: reference(a.question) })).applicable, true);
   const final = f.store.list().map(reference); f.restart();
   assert.deepEqual(ok(readAcceptedAnswer(f.store, { project: f.project, record: reference(saved) })), checked);
@@ -650,10 +649,10 @@ test('D5 exact target input and fact evidence guards reject races without admitt
   assert.equal(ok(answerSourceGuards(f.store, request)).applicable, false);
   const forged = clone(f.input.value) as OmInputRecord; forged.input.questions[0]!.consumer = 'garden-consume-block'; forged.hash = hashJson(forged.input);
   const row = f.store.write({ id: f.input.id, kind: f.input.kind, expected: f.input.revision, value: forged });
-  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }));
+  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }), 'record_forged');
   f.restart();
   assert.equal(ok(readAnswerForInput(f.store, { ...request, current: false })).applicable, true);
-  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }));
+  rejected(readAnswerForInput(f.store, { ...request, input: reference(row), current: false }), 'record_forged');
 });
 
 test('D5 invalidation is derived from changed exact source heads and remains historical after another change and restart', async t => {
@@ -725,17 +724,17 @@ test('D5 invalidation refuses unrelated, non-successor, duplicate and forged evi
   assert.ok(prepared.invalidation, 'A newer source revision requires reconfirmation even with equal content');
   const pair = { before: reference(f.source), after: reference(source) };
   const other = f.engine.discovery.evidence.document(f.project, 'unrelated', '{"answer":"XML"}', 'application/json', 0);
-  const variants: AnswerInvalidation[] = [
-    { record: reference(accepted), sources: [] },
-    { record: reference(accepted), sources: [pair, pair] },
-    { record: reference(accepted), sources: [{ before: pair.before, after: pair.before }] },
-    { record: reference(accepted), sources: [{ before: pair.after, after: pair.before }] },
-    { record: reference(accepted), sources: [{ before: reference(other), after: pair.after }] },
-    { record: reference(accepted), sources: [{ before: pair.before, after: reference(other) }] },
-    { record: reference(accepted), sources: [{ ...pair, after: { ...pair.after, hash: '0'.repeat(64) } }] },
+  const variants: Array<[AnswerInvalidation, string]> = [
+    [{ record: reference(accepted), sources: [] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [pair, pair] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [{ before: pair.before, after: pair.before }] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [{ before: pair.after, after: pair.before }] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [{ before: reference(other), after: pair.after }] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [{ before: pair.before, after: reference(other) }] }, 'answer_inapplicable'],
+    [{ record: reference(accepted), sources: [{ ...pair, after: { ...pair.after, hash: '0'.repeat(64) } }] }, 'record_forged'],
   ];
   const before = f.store.list().map(reference);
-  for (const invalidation of variants) rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation }));
+  for (const [invalidation, code] of variants) rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation }), code);
   assert.deepEqual(f.store.list().map(reference), before);
   const foreign = f.store.write({ id: source.id, kind: 'source', expected: source.revision, value: { ...source.value, projectId: 'other' } });
   rejected(readAnswerInvalidation(f.store, { project: f.project, invalidation: { record: reference(accepted), sources: [{ before: pair.before, after: reference(foreign) }] } }), 'answer_unconfirmed');
@@ -842,7 +841,7 @@ test('D5 rejects another coherent answer chain, unsupported assessments, counter
 
 test('D5 refuses missing or substituted MC1 sources and preserves every module refusal as addressed data', async t => {
   const f = factFixture(t), a = await f.answer(), seen = new Set<string>();
-  const collect = (value: OmResult<unknown>, code: string) => seen.add(rejected(value, code));
+  const collect = (value: OmResult<unknown>, code: string) => seen.add(rejected(value, code).code);
   const question = clone(a.request), absent = { id: 'om-mc1-question:garden:absent', revision: 1, hash: '0'.repeat(64) };
   rejected(prepareAcceptedAnswer(f.store, { ...question, question: absent }), 'record_missing');
   rejected(readMc1Question(f.store, { project: 'other', record: a.request.question }), 'record_foreign');
@@ -869,21 +868,21 @@ test('D5 saved MC1 questions recheck their complete D1 set, consumer, requiremen
   const permuted = clone(q.request); permuted.gaps.records.reverse();
   const repeated = ok(prepareMc1Question(f.store, permuted));
   assert.deepEqual(repeated.writes, []); assert.deepEqual(repeated.record, q.question);
-  const cases: Mc1QuestionRequest[] = [
-    { ...q.request, gaps: { ...q.request.gaps, records: [q.request.gap] } },
-    { ...q.request, contract: { ...q.request.contract, consumer: { blocks: ['garden-consume-block'] } } },
-    { ...q.request, contract: { ...q.request.contract, requirements: ['invented requirement'] } },
-    { ...q.request, requirements: [{ pointer: '/absent' }] },
-    { ...q.request, requirements: [{ pointer: '/contracts/0/state/~2bad' }] },
-    { ...q.request, requirements: [{ pointer: '/absent/~2bad' }] },
-    { ...q.request, engineQuestion: f.issue().request.engineQuestion },
+  const cases: Array<[Mc1QuestionRequest, string]> = [
+    [{ ...q.request, gaps: { ...q.request.gaps, records: [q.request.gap] } }, 'gap_missing'],
+    [{ ...q.request, contract: { ...q.request.contract, consumer: { blocks: ['garden-consume-block'] } } }, 'answer_question_invalid'],
+    [{ ...q.request, contract: { ...q.request.contract, requirements: ['invented requirement'] } }, 'answer_question_invalid'],
+    [{ ...q.request, requirements: [{ pointer: '/absent' }] }, 'answer_question_invalid'],
+    [{ ...q.request, requirements: [{ pointer: '/contracts/0/state/~2bad' }] }, 'answer_question_invalid'],
+    [{ ...q.request, requirements: [{ pointer: '/absent/~2bad' }] }, 'answer_question_invalid'],
+    [{ ...q.request, engineQuestion: f.issue().request.engineQuestion }, 'answer_question_invalid'],
   ];
-  for (const request of cases) {
+  for (const [request, code] of cases) {
     const before = f.store.list().map(reference);
-    rejected(prepareMc1Question(f.store, request)); assert.deepEqual(f.store.list().map(reference), before);
+    rejected(prepareMc1Question(f.store, request), code); assert.deepEqual(f.store.list().map(reference), before);
     const value = { project: f.project, request, fingerprint: answerContractFingerprint(request.contract) };
     const row = f.store.write({ id: `om-mc1-question:${f.project}:${hashJson(value)}`, kind: 'mc1-question', expected: 0, value });
-    rejected(readMc1Question(f.store, { project: f.project, record: reference(row) }));
+    rejected(readMc1Question(f.store, { project: f.project, record: reference(row) }), code);
   }
   assert.deepEqual(ok(readMc1Question(f.store, { project: f.project, record: reference(q.question) })).record, q.question);
   f.restart(); ok(readMc1Question(f.store, { project: f.project, record: reference(q.question) }));
