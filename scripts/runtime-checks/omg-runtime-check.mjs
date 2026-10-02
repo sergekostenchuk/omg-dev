@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, realpathSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, platform, release, arch } from 'node:os';
-import { join, resolve, delimiter } from 'node:path';
+import { join, resolve, delimiter, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { DatabaseSync } from 'node:sqlite';
@@ -54,11 +54,44 @@ export function runCommand(command, cwd, input = '', timeout = 5000) {
 }
 
 function runtimeInput(input) {
+  // executables is the declared provider set for classification: a required array of
+  // non-empty names ([] is lawful); its absence or a malformed element is refused up front.
   requireThat(input?.protocol === 'omg-runtime-observation/v1' && validRef(input.scope) && validRef(input.obligation?.record)
     && typeof input.obligation.pointer === 'string' && input.runtime?.environment?.projectId
     && input.scope.id === `research-scope:${input.runtime.environment.projectId}:R2`
+    && Array.isArray(input.executables) && input.executables.every(name => typeof name === 'string' && name.length > 0)
     && realpathSync(input.runtime.root) === realpathSync(process.cwd()), 'runtime_input_invalid');
   return input.runtime;
+}
+
+// The closed adapter table, duplicated intentionally: this module is self-contained owner evidence.
+// versionPattern is frozen data, never the live RegExp: a frozen RegExp still mutates through
+// compile(), so every check builds an independent matcher from source/flags at the point of use.
+export const KNOWN_ADAPTERS = Object.freeze({
+  'codex-stdio.js': Object.freeze({ protocol: 'codex-stdio', executable: 'codex', versionPattern: Object.freeze({ source: '^codex-cli [^\\r\\n]+\\s*$', flags: '' }) }),
+  'devin-stdio.js': Object.freeze({ protocol: 'devin-stdio', executable: 'devin', versionPattern: Object.freeze({ source: '^devin [^\\r\\n]+\\s*$', flags: '' }) }),
+});
+/** The provider a role command actually launches. A known module names its provider. An unknown
+ * module keeps the Codex era only while the exact declaration names no foreign provider
+ * executable; a declared foreign provider is unprovable — null, never Codex by substitution. */
+function classifyProvider(command, executables) {
+  const entry = Array.isArray(command?.args) ? command.args[0] : undefined;
+  const known = typeof entry === 'string' && !entry.startsWith('-') ? KNOWN_ADAPTERS[basename(entry)] : undefined;
+  if (known) return known;
+  return executables.some(name => Object.values(KNOWN_ADAPTERS).some(provider => provider.protocol !== 'codex-stdio' && provider.executable === basename(name)))
+    ? null : KNOWN_ADAPTERS['codex-stdio.js'];
+}
+/** Every provider the declared runtime actually names: pilot.agentCommand substitutes the main roles'
+ * commands, and the reader pilot's own command is counted separately. */
+function runtimeProviders(runtime, executables) {
+  const commands = runtime.pilot?.agentCommand
+    ? [runtime.pilot.agentCommand]
+    : [runtime.environment?.implementer, runtime.environment?.reviewer].filter(Boolean).map(role => role.command);
+  if (runtime.pilot?.reader?.command) commands.push(runtime.pilot.reader.command);
+  const providers = [...new Map(commands.map(command => {
+    const provider = classifyProvider(command, executables); return [provider?.protocol ?? '', provider];
+  })).values()];
+  return providers.length ? providers : [KNOWN_ADAPTERS['codex-stdio.js']];
 }
 
 const canaryProgram = `const fs=require('node:fs'),net=require('node:net'),cp=require('node:child_process');
@@ -83,6 +116,9 @@ export function sandboxCommand(mode, root, payload) {
 
 export async function isolation(input, run = runCommand) {
   const runtime = runtimeInput(input), owned = [], server = createServer(socket => socket.end());
+  // Devin has no local sandbox command to certify here; a Codex canary never counts as Devin
+  // isolation, and an unprovable provider gets no Codex certification either.
+  requireThat(runtimeProviders(runtime, input.executables).every(provider => provider?.protocol === 'codex-stdio'), 'sandbox_provider_unsupported');
   try {
     const workspace = mkdtempSync(join(runtime.root, '.omg-canary-')); owned.push(workspace);
     const home = mkdtempSync(join(homedir(), '.omg-canary-')); owned.push(home);
@@ -133,7 +169,11 @@ export async function isolation(input, run = runCommand) {
 export async function platformReadiness(input, run = runCommand) {
   const runtime = runtimeInput(input), versions = {};
   requireThat(platform() !== 'win32', 'posix_runtime_required');
-  for (const name of ['node','npm','git','codex']) {
+  const providers = runtimeProviders(runtime, input.executables);
+  // A provider whose module the declaration cannot attribute is probed as nothing: the run
+  // refuses instead of reporting full success over a silently skipped provider.
+  requireThat(providers.every(provider => provider !== null), 'runtime_provider_unknown');
+  for (const name of [...new Set(['node','npm','git',...providers.map(provider => provider.executable)])]) {
     const command = { executable: name === 'node' ? process.execPath : executable(name, runtime.root), args: ['--version'] };
     const result = await run(command, runtime.root); requireThat(result.exitCode === 0 && result.signal === null && result.stdout.trim(), `${name}_version_unavailable`);
     versions[name] = { command, result };
@@ -169,17 +209,30 @@ function expectedSubjects(scope) {
   return [...[...new Set(checks.flatMap(check=>check.subjects))].sort().map(requested=>({requested,kind:'file'})),
     ...[...new Set(checks.flatMap(check=>check.executables))].sort().map(requested=>({requested,kind:'executable'}))];
 }
-function currentFiles(snapshot, runtime, scope) {
+function currentFiles(snapshot, runtime, scope, version) {
   requireThat(snapshot && same(snapshot.binding,runtime) && snapshot.root === runtime.root, 'call_runtime_foreign');
   requireThat(Array.isArray(snapshot.subjects) && same(snapshot.subjects.map(({requested,kind})=>({requested,kind})),expectedSubjects(scope)),
     'call_subject_set_incomplete');
   const files = [snapshot.interpreter,...snapshot.subjects];
   requireThat(snapshot.adapter && snapshot.subjects.some(file=>same(file,snapshot.adapter)), 'call_adapter_missing');
-  const codex=snapshot.subjects.find(file=>file.kind==='executable'&&file.requested==='codex');
-  requireThat(codex && snapshot.codex?.executable===codex.path && same(snapshot.codex.args,['--version'])
-    && snapshot.codex.result?.exitCode===0 && snapshot.codex.result.signal===null
-    && typeof snapshot.codex.result.stdout==='string' && snapshot.codex.result.stdout.length<=4096
-    && /^codex-cli [^\r\n]+\s*$/.test(snapshot.codex.result.stdout),'call_version_missing');
+  if (version===2) {
+    // The provider field must name the adapter's own classified protocol; a Codex-era record never proves Devin.
+    const provider=KNOWN_ADAPTERS[basename(snapshot.adapter.path)];
+    requireThat(provider && provider.protocol!=='codex-stdio' && snapshot.provider?.protocol===provider.protocol
+      && same(snapshot.provider.args,['--version'])
+      && snapshot.provider.result?.exitCode===0 && snapshot.provider.result.signal===null
+      && typeof snapshot.provider.result.stdout==='string' && snapshot.provider.result.stdout.length<=4096
+      && new RegExp(provider.versionPattern.source, provider.versionPattern.flags).test(snapshot.provider.result.stdout),'call_version_missing');
+    const probe=snapshot.subjects.find(file=>file.kind==='executable'&&file.requested===provider.executable);
+    requireThat(probe && snapshot.provider.executable===probe.path,'call_version_missing');
+  } else {
+    const codex=snapshot.subjects.find(file=>file.kind==='executable'&&file.requested==='codex');
+    const codexPattern=KNOWN_ADAPTERS['codex-stdio.js'].versionPattern;
+    requireThat(codex && snapshot.codex?.executable===codex.path && same(snapshot.codex.args,['--version'])
+      && snapshot.codex.result?.exitCode===0 && snapshot.codex.result.signal===null
+      && typeof snapshot.codex.result.stdout==='string' && snapshot.codex.result.stdout.length<=4096
+      && new RegExp(codexPattern.source, codexPattern.flags).test(snapshot.codex.result.stdout),'call_version_missing');
+  }
   for (const file of files) {
     const actual = file.kind === 'executable' ? executable(file.requested,runtime.root) : realpathSync(resolve(runtime.root,file.requested));
     requireThat(actual === file.path && same(identity(actual),file.identity) && hashFile(actual) === file.hash
@@ -191,6 +244,10 @@ export function providerCompatibility(input, database) {
   const runtime = runtimeInput(input), db = openEvidenceDatabase(database,runtime.environment.projectId);
   try {
     const scope = db.get(input.scope,true); requireThat(scope.kind === 'research-scope' && scope.value.policy, 'scope_policy_missing');
+    // The classification set carried in the input must equal the one computed from the
+    // exact stored declaration — a caller cannot relabel which providers were declared.
+    const declared = [...new Set(scope.value.policy.assignments.flatMap(item => item.runtimeCheck ? item.runtimeCheck.executables : []))].sort();
+    requireThat(same([...new Set(input.executables)].sort(), declared), 'runtime_input_invalid');
     const required = [runtime.environment.implementer, runtime.environment.reviewer].map(role=>({...role,command:runtime.pilot?.agentCommand??role.command}));
     if(runtime.pilot?.reader)required.push(runtime.pilot.reader);
     const settings = [...new Map(required.map(role=>[canonical([role.model,role.effort,role.speed??'inherited']),{model:role.model,effort:role.effort,speed:role.speed??'inherited'}])).values()];
@@ -199,7 +256,7 @@ export function providerCompatibility(input, database) {
       let matching = null;
       for (const row of db.calls()) try {
         const call = row.value, evidence = call.runtime, snapshot = evidence.snapshot;
-        requireThat(evidence.version === 1 && same(evidence.declaration,input.scope) && evidence.error === null
+        requireThat((evidence.version === 1 || evidence.version === 2) && same(evidence.declaration,input.scope) && evidence.error === null
           && same(setting,{model:call.requested.model,effort:call.requested.effort,speed:call.requested.speed??'inherited'})
           && snapshot.roleHash === hash(canonical(call.requested)) && evidence.requestHash === call.request.hash, 'call_binding_foreign');
         requireThat(required.some(role=>role.model===call.requested.model && role.effort===call.requested.effort
@@ -207,7 +264,7 @@ export function providerCompatibility(input, database) {
           && same(snapshot.invocation.args,call.requested.command.args)
           && snapshot.invocation.executable===executable(call.requested.command.executable,runtime.root)
           && snapshot.adapter.path===realpathSync(resolve(runtime.root,call.requested.command.args[0])), 'call_command_foreign');
-        currentFiles(snapshot,runtime,scope.value);
+        currentFiles(snapshot,runtime,scope.value,evidence.version);
         const requestRow = db.get(call.request.record), responseRow = db.get(call.response.record);
         requireThat(requestRow.kind === 'model-request' && responseRow.kind === 'model-response'
           && requestRow.value.draftId === call.draftId && responseRow.value.draftId === call.draftId
@@ -226,7 +283,8 @@ export function providerCompatibility(input, database) {
           && request.model === setting.model && request.effort === setting.effort && (request.speed??'inherited') === setting.speed,
         'call_protocol_foreign');
         matching = { call:refOf(row),request:refOf(requestRow),response:refOf(responseRow),requested:setting,confirmed:call.confirmed,
-          startedAt:call.startedAt,finishedAt:call.finishedAt,command:call.requested.command,adapter:snapshot.adapter,codex:snapshot.codex,mode:request.mode };
+          startedAt:call.startedAt,finishedAt:call.finishedAt,command:call.requested.command,adapter:snapshot.adapter,
+          provider:{protocol:evidence.version===2?snapshot.provider?.protocol:'codex-stdio',...(snapshot.provider??snapshot.codex)},mode:request.mode };
         break;
       } catch { /* A foreign or incomplete call cannot fill this setting. */ }
       requireThat(matching, 'compatible_call_unavailable'); found.push(matching);

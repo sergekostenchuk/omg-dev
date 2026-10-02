@@ -21,12 +21,26 @@ import {processStart,probeProcessIdentity,processStopWitnesses,type ProcessStopW
 import {observeRuntime,recoverRuntimeObservation,type RuntimeObservationResult} from '../src/runtime/runtime-observation.js';
 import type {EngineError} from '../src/errors.js';
 import type {RuntimeObservation} from '../src/runtime/runtime-observation-model.js';
-import type {RuntimeCheck} from '../src/graph/obligation-policy.js';
+import type {RuntimeCheck,CarriedObligation} from '../src/graph/obligation-policy.js';
 import type {Source} from '../src/evidence/evidence.js';
 import type {Question} from '../src/discovery/discovery.js';
 import type {Graph} from '../src/graph/model.js';
 import type {TechnicalReport} from '../src/graph/research-contracts.js';
 import type {ResearchAction,ResearchAssessment} from '../src/discovery/research-model.js';
+import {projectGraph} from '../src/graph/project.js';
+import {UPSTREAM_STAGES} from '../src/discovery/requirements.js';
+import {writeOmInput} from '../src/om/input.js';
+import {inputDecisionWrite,writeAddressing} from '../src/om/addressing.js';
+import {writeHorizon} from '../src/om/horizon.js';
+import {writeGaps,type GapRequest} from '../src/om/gaps.js';
+import {writeGapLines} from '../src/om/gap-lines.js';
+import {writeOmObligations,normalizeOwnerGapAssignment,OM_OWNER_ASSIGNMENT_CONTRACT,OM_OWNER_ASSIGNMENT_KIND,type OwnerGapAssignment} from '../src/om/obligations.js';
+import {taskBindingId} from '../src/graph/task-obligations.js';
+import type {OmResult} from '../src/om/refusal.js';
+import type {Write} from '../src/storage/store.js';
+import {gardenGraph} from './om-fixture.js';
+import {preparedFeatures} from './product-fixture.js';
+import {preparedField} from './preparation-fixture.js';
 
 async function until(predicate:()=>boolean){const end=Date.now()+4000;while(!predicate()){if(Date.now()>end)throw Error('Fixture did not reach expected state');await new Promise(r=>setTimeout(r,10));}}
 function fixture(t:test.TestContext,mode='positive',delay=60,timeoutMs=4000){
@@ -43,7 +57,7 @@ function fixture(t:test.TestContext,mode='positive',delay=60,timeoutMs=4000){
   obligations:[{gap,state:'active',reason:'Original fixture requirement',wake:null}]},0);
  const marker=join(root,'invocations.log'),subject=join(root,'runtime-subject.bin'),helper=join(root,'helper.mjs');
  writeFileSync(subject,'release-one');writeFileSync(helper,"export const tag='pinned-original';\n");
- writeFileSync(join(root,'check.mjs'),`import{readFileSync,appendFileSync,existsSync}from'node:fs';import{tag}from'./helper.mjs';const input=JSON.parse(readFileSync(0,'utf8'));appendFileSync(process.argv[2],'executed\\n');const finish=()=>{console.log(JSON.stringify({fixture:true,tag,root:input.runtime.root,mode:process.argv[3]}));if(process.argv[3]==='negative')process.exitCode=7;};if(process.argv[3]==='wait'){const timer=setInterval(()=>{if(existsSync(process.argv[2]+'.release')){clearInterval(timer);finish();}},10);}else setTimeout(finish,Number(process.argv[4]));`);
+ writeFileSync(join(root,'check.mjs'),`import{readFileSync,appendFileSync,existsSync}from'node:fs';import{tag}from'./helper.mjs';const input=JSON.parse(readFileSync(0,'utf8'));appendFileSync(process.argv[2],'executed\\n');const finish=()=>{console.log(JSON.stringify({fixture:true,tag,root:input.runtime.root,mode:process.argv[3],executables:input.executables}));if(process.argv[3]==='negative')process.exitCode=7;};if(process.argv[3]==='wait'){const timer=setInterval(()=>{if(existsSync(process.argv[2]+'.release')){clearInterval(timer);finish();}},10);}else setTimeout(finish,Number(process.argv[4]));`);
  const code=engine.discovery.evidence.file('p','check',root,'check.mjs','text/plain',0),dependency=engine.discovery.evidence.file('p','helper',root,'helper.mjs','text/plain',0);
  const check:RuntimeCheck={script:reference(code),dependencies:[reference(dependency)],subjects:['runtime-subject.bin'],executables:[],args:[marker,mode,String(delay)],timeoutMs,purpose:'Capture the executed fixture, never claim a production sandbox test'};
  const scope=configureResearchScope(store,{...original.value,policy:{version:1,sourceScope:reference(original),assignments:[{obligation:gap.id,original:{record:reference(original),pointer:'/obligations/0/gap'},
@@ -235,6 +249,73 @@ test('missing or foreign declarations and extra executable parameters are refuse
  assert.equal(f.store.list('runtime-observation').length,0);
 });
 
+test('the check module input carries the sorted union of executables declared by the exact scope',async t=>{
+ const f=fixture(t),previous=process.env['PATH'];
+ t.after(()=>{if(previous===undefined)delete process.env['PATH'];else process.env['PATH']=previous;});
+ const bin=join(f.root,'bin');mkdirSync(bin);
+ for(const name of ['tool-a','tool-b']){const path=join(bin,name);writeFileSync(path,'#!/bin/sh\nexit 0\n');chmodSync(path,0o755);}
+ process.env['PATH']=[bin,previous??''].join(delimiter);
+ // The declaration lists them unsorted; the module input carries the sorted unique union.
+ const policy={...f.scope.value.policy!,assignments:f.scope.value.policy!.assignments.map(a=>({...a,runtimeCheck:{...f.check,executables:['tool-b','tool-a']}}))};
+ const scope=configureResearchScope(f.store,{...f.scope.value,policy},f.scope.revision);
+ const result=await f.engine.execute({type:'observe-runtime',project:'p',scope:reference(scope),obligation:'boundary',key:'union'}) as RuntimeObservationResult;
+ assert.equal(result.observation.value.status,'observed');assert.equal(result.observation.value.result!.exitCode,0);
+ assert.deepEqual(JSON.parse(result.observation.value.result!.stdout).executables,['tool-a','tool-b']);
+});
+
+test('an OM declaration hands the union of every assignment executable to the check module input',async t=>{
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'omg-om-union-'))),store=new Store(join(root,'db.sqlite')),project='garden';
+ t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
+ const engine=new ProductEngine(store);
+ const previous=process.env['PATH'];t.after(()=>{if(previous===undefined)delete process.env['PATH'];else process.env['PATH']=previous;});
+ const bin=join(root,'bin');mkdirSync(bin);
+ for(const name of ['tool-a','tool-b']){const path=join(bin,name);writeFileSync(path,'#!/bin/sh\nexit 0\n');chmodSync(path,0o755);}
+ process.env['PATH']=[bin,previous??''].join(delimiter);
+ // The real B1 -> D1 -> D2 -> owner-assignment producer chain, with two retained gaps
+ // declaring different executables: the union reaches the module, not only the picked check.
+ const desired=gardenGraph(),{level:_l,...projection}=projectGraph(desired,1);
+ preparedFeatures(engine,project,projection as Graph,field=>{
+  const value=preparedField(project,field);
+  if(field==='preparation')(value as Record<string,Json>).unknowns=[0,1].map(i=>({id:`late-${i}`,question:`Observe condition ${i}`,
+   consumer:'garden-produce-block',moment:'task-start',blocksCurrentStage:false,resolution:'Address during OM'}));
+  return value;});
+ const command={executable:process.execPath,args:['--version']};
+ engine.environments.configure(project,{workspace:root,implementer:{actor:'worker',model:'fixture',effort:'high',command},
+  reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:3000},0);
+ const ok=<T,>(result:OmResult<T>):T=>{if(!result.ok)assert.fail(`${result.refusal.code}: ${result.refusal.message}`);return result.value;};
+ let input=ok(writeOmInput(store,{project,expected:0,
+  stages:Object.fromEntries(UPSTREAM_STAGES.map(stage=>[stage,reference(store.get(`stage:${project}:${stage}`)!)])) as Record<typeof UPSTREAM_STAGES[number],ReturnType<typeof reference>>}));
+ const graph=store.get<Graph>(`graph:${project}`)!,upper=store.get(`graph-layer:${project}:2`)!;
+ input=ok(writeAddressing(store,{project,input:reference(input),graph:reference(graph),
+  decisions:input.value.input.questions.map(question=>({pending:inputDecisionWrite({project,input:reference(input),graph:reference(graph),
+   layers:[],decision:{target:question.id,field:'address',value:{consumer:'garden-produce-block',kind:'environment-confirmation'}}}) as Write}))}));
+ const horizon=ok(writeHorizon(store,{project,input:reference(input),graph:reference(graph),refinement:null,available:{},
+  choice:{choiceVersion:'union-first-pass',features:[{outcome:'garden-result'}],excluded:[]}}));
+ const sources:GapRequest={project,input:reference(input),graph:reference(graph),horizon:reference(horizon.gate),
+  operations:{proposals:[],frame:{project,level:2,graph:reference(graph),horizon:reference(horizon.gate),layer:null,frame:null,upper:null}},
+  works:{state:'upper-not-accepted',layer:reference(upper)}};
+ const gaps=ok(writeGaps(store,sources)),gapRead={sources:structuredClone(gaps.sources) as GapRequest,records:gaps.records.map(reference)};
+ const lines=ok(writeGapLines(store,{project,previous:null,pass:1,gaps:gapRead,closures:[]}));
+ const script=engine.discovery.evidence.document(project,'om-union-check',
+  `import{readFileSync}from'node:fs';const input=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({executables:input.executables}));`,'text/plain',0);
+ const tools=['tool-a','tool-b'];
+ const ledger=ok(writeOmObligations(store,{project,gaps:gapRead,lines:reference(lines),assignments:gaps.records
+  .filter(row=>row.value.gap.kind==='environment-confirmation').map((row,i)=>{
+   const value=structuredClone(normalizeOwnerGapAssignment({contract:OM_OWNER_ASSIGNMENT_CONTRACT,project,
+    context:{gaps:gapRead,lines:reference(lines)},gap:reference(row),assignments:row.value.gap.consumers.map(responsibleConsumer=>({
+     responsibleNode:responsibleConsumer,responsibleConsumer,reason:'An explicit late runtime prerequisite',
+     returnCondition:`Ready for ${responsibleConsumer}`,wake:null}))})) as OwnerGapAssignment;
+   for(const assignment of value.assignments)assignment.runtimeCheck={script:reference(script),dependencies:[],subjects:[],
+    executables:[tools[i%2]!],args:[],timeoutMs:3000,purpose:'Observe the declared union input',satisfies:assignment.returnCondition};
+   const normalized=normalizeOwnerGapAssignment(value);
+   return{pending:{id:`om-owner-gap-assignment:${project}:${hashJson(normalized)}`,kind:OM_OWNER_ASSIGNMENT_KIND,expected:0,value:normalized}};})}));
+ const obligation=structuredClone(ledger.handoff.obligations[0]!) as CarriedObligation;
+ const result=await engine.execute({type:'observe-runtime',project,scope:reference(ledger.record),
+  obligation:taskBindingId(obligation),key:'om-union'}) as RuntimeObservationResult;
+ assert.equal(result.observation.value.status,'observed');assert.equal(result.observation.value.result!.exitCode,0);
+ assert.deepEqual(JSON.parse(result.observation.value.result!.stdout).executables,['tool-a','tool-b']);
+});
+
 test('recovery checks PID identity, preserves other processes and releases an interrupted observation',async t=>{
  const f=fixture(t),result=await f.observe();
  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await once(child,'spawn');
@@ -412,4 +493,19 @@ test('a recovery diagnostic without new bytes preserves the complete physical ev
  const reopened=new Store(join(f.root,'db.sqlite'));t.after(()=>reopened.close());
  assert.deepEqual(reopened.get<ProcessStopWitness>(witness.id)!.value.physical,witness.value.physical,
   'a reopen of the store returns the same complete physical result');
+});
+
+test('a completed observation survives a store reopen and replays exactly without another launch',async t=>{
+ const f=fixture(t),first=await f.observe();
+ assert.equal(first.observation.value.status,'observed');assert.equal(readFileSync(f.marker,'utf8'),'executed\n');
+ // The record was written before the executables field existed in the module input: its exact
+ // repeat returns through recordedResult and never reaches the new launch boundary.
+ f.store.close();
+ const reopened=new Store(join(f.root,'db.sqlite')),engine=new ProductEngine(reopened);
+ t.after(()=>reopened.close());
+ const replay=await engine.execute({type:'observe-runtime',project:'p',scope:reference(f.scope),obligation:'boundary',key:'one'}) as RuntimeObservationResult;
+ assert.equal(replay.observation.id,first.observation.id);assert.equal(replay.observation.revision,first.observation.revision);
+ assert.equal(replay.observation.value.status,'observed');assert.ok(replay.source);
+ assert.equal(readFileSync(f.marker,'utf8'),'executed\n','the reopen repeat must not launch the check again');
+ assert.equal(reopened.list('runtime-observation').length,1);assert.equal(reopened.list<Source>('source').filter(s=>s.value.provenance).length,1);
 });

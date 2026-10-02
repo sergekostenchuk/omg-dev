@@ -116,3 +116,18 @@ test('the macOS /var and /private/var spellings address one immutable lineage, n
   assert.deepEqual(alias, first); assert.equal(f.store.list('adapter-lineage').length, 1);
   assert.notEqual(adapterLineagePath(path + '.other'), adapterLineagePath(path));
 });
+
+test('a devin-stdio adapter is a known module for lineage, while unmeasured devin usage supplies no estimate', t => {
+  const f = fixture(t);
+  // A historical call made through the Devin adapter path accepts its declaration.
+  const old = join(f.root, 'old', 'devin-stdio.js');
+  f.store.write({ id: 'devin-sample', kind: 'model-call', expected: 0, value: { projectId: 'p', purpose: 'reading-planner',
+    requested: { ...f.role, command: { executable: process.execPath, args: [old] } },
+    request: { chars: 1000, bytes: 1000, hash: digest('devin-sample') }, usage: null, status: 'succeeded' } as unknown as ModelCall });
+  const declared = f.declare({ path: old });
+  assert.equal((declared.value as { path: string }).path, adapterLineagePath(old));
+  // Null usage is not zero and cannot be borrowed as a measured sample.
+  assert.throws(() => estimateCliCall(f.store, 'p',
+    { ...f.role, command: { executable: process.execPath, args: [join(f.root, 'current', 'devin-stdio.js')] } },
+    'reading-planner', 1000), { code: 'budget_estimate_missing' });
+});

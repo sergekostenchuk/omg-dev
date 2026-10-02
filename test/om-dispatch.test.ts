@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { digest, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
@@ -31,6 +31,8 @@ import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const adapterFixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+const devinAdapter = fileURLToPath(new URL('../src/adapters/devin-stdio.js', import.meta.url));
+const originalPath = process.env['PATH'];
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 const ENVIRONMENT = 'environment:garden';
 const ADAPTER = 'adapter:garden:codex-stdio';
@@ -339,10 +341,10 @@ test('R1 R3 R8 the catalog names exactly the codes this unit emits, and each has
   assert.deepEqual([...seen].sort(), [...DISPATCH_CODES].sort());
 });
 
-function chain(t: TestContext) {
+function chain(t: TestContext, provider: 'codex' | 'devin' = 'codex') {
   const root = mkdtempSync(join(tmpdir(), 'omg-dispatch-chain-')), path = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { store.close(); process.env['PATH'] = originalPath; rmSync(root, { recursive: true, force: true }); });
   let engine = new ProductEngine(store);
   const desired = gardenGraph('cross');
   desired.nodes.find(node => node.id === 'garden-produce-block')!.ports.push({ id: 'out-side', direction: 'out', contract: 'garden-contract' });
@@ -384,15 +386,39 @@ function chain(t: TestContext) {
   valueOf(openSeries(store, { project, block, line: 1, slice: 'dispatch-fact', predecessor: null, basis: null }));
   const series = valueOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
-  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
+  let command: { executable: string; args: string[] };
+  if (provider === 'devin') {
+    // The real compiled Devin adapter is the role command; a local `devin` binary stub answers it.
+    command = { executable: process.execPath, args: [devinAdapter] };
+    const bin = join(root, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'devin'), `#!${process.execPath}
+import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const args=process.argv.slice(2);
+if(args[0]==='--version'){console.log('devin 3000.11.3 (fixture)');process.exit(0);}
+const file=args[args.indexOf('--prompt-file')+1];
+const requestId=(readFileSync(file,'utf8').match(/"requestId":"([^"]+)"/)||[])[1];
+const trace=${JSON.stringify(trace)},scenario=${JSON.stringify(scenario)};
+const stepIndex=existsSync(trace)?readFileSync(trace,'utf8').split(/\\r?\\n/).filter(Boolean).length:0;
+appendFileSync(trace,JSON.stringify({args,requestId})+'\\n');
+const step=JSON.parse(readFileSync(scenario,'utf8')).steps[stepIndex];
+const replace=value=>value==='$requestId'?requestId:Array.isArray(value)?value.map(replace)
+  :value&&typeof value==='object'?Object.fromEntries(Object.entries(value).map(([key,item])=>[key,replace(item)])):value;
+console.log(JSON.stringify(replace(step.research)));
+`, { mode: 0o700 });
+    process.env['PATH'] = bin + delimiter + (originalPath ?? '');
+  } else command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const settings = (extra: Record<string, unknown> = {}) => ({ workspace: root,
-    implementer: { actor: 'dispatch-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
-    reviewer: { actor: 'dispatch-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    implementer: provider === 'devin'
+      ? { actor: 'dispatch-implementer', model: 'swe-2-high', effort: 'high', command }
+      : { actor: 'dispatch-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: provider === 'devin'
+      ? { actor: 'dispatch-reviewer', model: 'swe-2-medium', effort: 'medium', command }
+      : { actor: 'dispatch-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100_000, ...extra });
   const configure = (extra: Record<string, unknown> = {}) => engine.execute({ type: 'configure', project,
     expected: store.get(ENVIRONMENT)?.revision ?? 0, environment: settings(extra) }) as Revision<Environment>;
   // The settings under test: the environment, then its adapter, both through the command API.
-  const configured = configure(), dispatched = engine.execute(COMMAND) as OmDispatch;
+  const configured = configure(), dispatched = engine.execute(provider === 'devin' ? DEVIN_COMMAND : COMMAND) as OmDispatch;
   const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: dispatched.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   const questionId = batch.items[0]!.gap;
@@ -472,4 +498,115 @@ test('R9 C23 an old E2 packet with the config of a later environment revision is
   assert.equal(f.store.list('call-record').length, 0);
   assert.equal(f.store.list('model-call').length, 0);
   assert.equal(f.store.history(ADAPTER).length, 1);
+});
+
+const DEVIN = 'devin-stdio' as const;
+const ACTIVE = 'adapter:garden:active';
+const DEVIN_COMMAND = { type: 'configure-om-dispatch', project: 'garden', protocol: DEVIN };
+
+test('AD1 a Devin selection creates the active record, repeats without writes and survives reopen', t => {
+  const f = light(t);
+  const first = f.engine.execute(DEVIN_COMMAND) as OmDispatch;
+  assert.equal(first.dispatch.adapter.id, ACTIVE);
+  assert.equal(f.store.get(ADAPTER), null, 'the codex-era address stays empty');
+  const active = f.store.get<{ projectId: string; protocol: string }>(ACTIVE)!;
+  assert.equal(active.kind, 'dispatch-adapter'); assert.equal(active.revision, 1);
+  assert.deepEqual(active.value, { projectId: 'garden', protocol: 'devin-stdio' });
+  const saved = heads(f.store);
+  assert.deepEqual(f.engine.execute(DEVIN_COMMAND), first);
+  assert.deepEqual(valueOf(configureDispatch(f.store, { project: f.project, protocol: DEVIN })), first);
+  assert.deepEqual(valueOf(readDispatch(f.store, { project: f.project })), first);
+  assert.deepEqual(heads(f.store), saved);
+  f.reopen();
+  assert.deepEqual(valueOf(readDispatch(f.store, { project: f.project })), first);
+  assert.deepEqual(heads(f.store), saved);
+  assert.equal(f.store.history(ACTIVE).length, 1);
+  assert.equal(f.ran(), false);
+});
+
+test('AD1 codex → devin → codex revises the active record while the historical record keeps its exact ref', t => {
+  const f = light(t), first = f.dispatch();
+  assert.equal(first.dispatch.adapter.id, ADAPTER);
+  const devin = valueOf(configureDispatch(f.store, { project: f.project, protocol: DEVIN }));
+  assert.equal(devin.dispatch.adapter.id, ACTIVE);
+  assert.equal(f.store.get(ACTIVE)!.revision, 1);
+  // The historical codex record keeps serving its exact persisted ref, never redirected through the selection.
+  assert.deepEqual(f.store.get<{ protocol: string }>(ADAPTER)!.value, { projectId: 'garden', protocol: 'codex-stdio' });
+  assert.deepEqual(first.dispatch.adapter, reference(f.store.get(ADAPTER)!));
+  const back = valueOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' }));
+  assert.equal(back.dispatch.adapter.id, ACTIVE, 'switching back revises the active record, not the old address');
+  assert.equal(back.dispatch.adapter.revision, 2);
+  assert.equal(f.store.get<{ protocol: string }>(ACTIVE)!.value.protocol, 'codex-stdio');
+  const saved = heads(f.store);
+  assert.deepEqual(valueOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' })), back);
+  assert.deepEqual(valueOf(readDispatch(f.store, { project: f.project })), back);
+  assert.deepEqual(heads(f.store), saved);
+  assert.equal(f.store.history(ACTIVE).length, 2); assert.equal(f.store.history(ADAPTER).length, 1);
+});
+
+test('AD1 a competing Store never reports its different protocol as this request\'s success', t => {
+  const f = light(t), request = { project: f.project, protocol: DISPATCH_PROTOCOL } as const, other = f.other();
+  const writeMany = f.store.writeMany.bind(f.store); let raced = false;
+  f.store.writeMany = ((writes, guards) => {
+    if (!raced && writes.some(write => write.kind === 'dispatch-adapter')) {
+      raced = true;
+      // The contender selects Devin while our codex write is still inside its transaction.
+      assert.equal(valueOf(configureDispatch(other, { project: f.project, protocol: DEVIN })).dispatch.adapter.id, ACTIVE);
+    }
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  const refusedResult = configureDispatch(f.store, request);
+  f.store.writeMany = writeMany;
+  assert.equal(raced, true);
+  assert.equal(refusedResult.ok, false, 'a competing devin selection is never reported as the codex success');
+  assert.equal(f.store.get(ADAPTER), null, 'our codex record was not written');
+  assert.equal(f.store.get<{ protocol: string }>(ACTIVE)!.value.protocol, 'devin-stdio');
+  // A later codex request is a lawful switch of the active record, not a rewrite of history.
+  const switched = valueOf(configureDispatch(f.store, request));
+  assert.equal(switched.dispatch.adapter.id, ACTIVE);
+  assert.equal(f.store.get<{ protocol: string }>(ACTIVE)!.value.protocol, 'codex-stdio');
+  assert.equal(f.store.history(ACTIVE).length, 2);
+});
+
+test('AD1 a corrupt active record refuses instead of silently falling back to the codex-era address', t => {
+  const f = light(t), codex = f.dispatch();
+  assert.equal(codex.dispatch.adapter.id, ADAPTER);
+  valueOf(configureDispatch(f.store, { project: f.project, protocol: DEVIN }));
+  const broken = f.store.write({ id: ACTIVE, kind: 'dispatch-adapter', expected: 1,
+    value: { projectId: 'orchard', protocol: 'pretend' } });
+  const refusal = refusalOf(readDispatch(f.store, { project: f.project }));
+  assert.equal(refusal.code, 'dispatch_adapter_invalid');
+  assert.equal(refusal.at.target, ACTIVE);
+  assert.deepEqual(refusalOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' })).code, 'dispatch_adapter_invalid');
+  // The intact codex-era record is still there, unread because the active selection outranks it.
+  assert.equal(f.store.get<{ protocol: string }>(ADAPTER)!.value.protocol, 'codex-stdio');
+  assert.equal(f.store.get(ACTIVE)!.hash, broken.hash);
+});
+
+test('AD1 an end-to-end OM call over the devin dispatch, an independent E5 actor and a historical repeat after reopen', async t => {
+  // The chain runs OM → the real devin-stdio adapter → the local devin binary stub, never a protocol-only relabel.
+  const f = chain(t, 'devin'), { dispatch } = f.dispatched;
+  assert.equal(dispatch.adapter.id, `adapter:${f.project}:active`);
+  assert.equal(f.store.get(ADAPTER), null, 'the codex-era address stays empty on a Devin-only project');
+  const request = f.request();
+  const model = valueOf(await runModelCall(f.store, request));
+  assert.equal(model.record.value.status, 'succeeded');
+  assert.equal(model.outcome?.kind, 'fact-candidates');
+  assert.equal(model.record.value.usage, null, 'Devin usage is unknown, not borrowed or zeroed');
+  f.assessor();
+  const assessment = { project: f.project, modelCall: reference(model.record), questionId: f.questionId, dispatch };
+  const terminal = valueOf(await assessFact(f.store, assessment));
+  assert.equal(terminal.value.verdict, 'supported');
+  const sent = f.sent().length;
+  assert.equal(sent, 2, 'one implementer send and one independent reviewer send');
+  const sends = f.sent().map(line => JSON.parse(line) as { args: string[] });
+  assert.ok(sends.every(send => send.args.includes('--print') && send.args.includes('--prompt-file')),
+    'every send went through the Devin CLI argv, prompt carried by file');
+  f.reopen();
+  // A historical repeat reads the immutable call and sends nothing a second time.
+  const historical = valueOf(readModelCall(f.store, { project: f.project, record: reference(model.record) }));
+  assert.deepEqual(valueOf(await runModelCall(f.store, request)), historical);
+  assert.deepEqual(valueOf(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
+  assert.equal(f.sent().length, sent);
+  assert.equal(f.store.history(`adapter:${f.project}:active`).length, 1);
 });

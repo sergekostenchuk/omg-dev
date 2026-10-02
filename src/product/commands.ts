@@ -41,7 +41,7 @@ export type ProductCommand =
   | { type: "recover-execution"; project: string }
   | { type: "repair-plan"; project: string; run: Ref; maxTurns: number }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
-  | { type: "configure-om-dispatch"; project: string; protocol: "codex-stdio" }
+  | { type: "configure-om-dispatch"; project: string; protocol: "codex-stdio" | "devin-stdio" }
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
   | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
   | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
@@ -120,7 +120,7 @@ const schema = { oneOf: [
   command("recover-execution", { project }),
   command("repair-plan", { project, run: ref, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("configure", { project, expected, environment: environmentSettings }),
-  command("configure-om-dispatch", { project, protocol: { const: "codex-stdio" } }),
+  command("configure-om-dispatch", { project, protocol: { enum: ["codex-stdio", "devin-stdio"] } }),
   command("begin-research", { project, level: researchLevel }),
   command("finish-research", { project, level: researchLevel, draft: ref, expected }),
   command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),

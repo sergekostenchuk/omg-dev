@@ -1,5 +1,6 @@
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
+import { isStdioProtocol } from '../adapters/stdio-providers.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { uniqueTransactionGuards, type Environment } from '../runtime/environment.js';
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, transferring, type OmResult, type Refusal, type Sealed,
@@ -269,7 +270,7 @@ function sourceBody(store: Store, project: string, source: SourceBasis, dispatch
   if (!object(environment.value) || environment.value.projectId !== project
     || !object(environment.value.reviewer) || !text(environment.value.reviewer.actor)
     || !text(originalActor) || environment.value.reviewer.actor === originalActor
-    || !object(adapter.value) || adapter.value.projectId !== project || adapter.value.protocol !== 'codex-stdio')
+    || !object(adapter.value) || adapter.value.projectId !== project || !isStdioProtocol(adapter.value.protocol))
     fail('assessment_independence_invalid', dispatch.config.id, 'reviewer.actor', 'The actual reviewer must differ from the original MC1 actor', dispatch.config);
   const request = { project, packet: source.packet, raw: response.record.value.raw };
   const form = take(checkAnswerForm(store, request));

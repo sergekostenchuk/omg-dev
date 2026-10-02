@@ -8,6 +8,7 @@ import { EngineError } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
   prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
+import { isStdioProtocol } from '../adapters/stdio-providers.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { provenSourceReads, registerSourceOverlay, storeView } from '../storage/store-view.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
@@ -947,8 +948,8 @@ function requireModelRequest(store: Store, request: unknown): asserts request is
 function readDispatchAdapter(store: Store, ref: Ref) {
   const adapter = take(readRecord<{ protocol: string }>(store, ref,
     { unit: 'E4', target: ref.id, id: ref.id, kind: 'dispatch-adapter' }));
-  if (!object(adapter.value) || adapter.value.protocol !== 'codex-stdio')
-    fail('dispatch_contract_invalid', ref.id, 'protocol', 'E4 executes only the selected codex-stdio dispatch contract');
+  if (!object(adapter.value) || !isStdioProtocol(adapter.value.protocol))
+    fail('dispatch_contract_invalid', ref.id, 'protocol', 'E4 executes only a known stdio dispatch contract');
   return adapter;
 }
 function modelAssignment(store: Store, request: ModelCallRequest) {

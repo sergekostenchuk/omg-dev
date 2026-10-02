@@ -7,18 +7,19 @@ import { canonical, hashJson } from '../canonical.js';
 import { reference, uniqueRefs, type Ref } from '../pipeline/contracts.js';
 import { requireCondition } from '../errors.js';
 import { adapterFileHash, adapterLineage, adapterLineagePath, validAdapterHash } from './adapter-lineage.js';
+import { stdioProviderByModule } from './stdio-providers.js';
 
 /** Empirical CLI prediction includes all reported input/output, including wrapper
  * and reasoning costs. It is explicitly not a guaranteed transport cap. */
 function comparableRole(store: Store, project: string, role: RoleBinding, call?: ModelCall): { key: string; basis: Ref[] } | null {
   const entry = role.command.args[0];
-  if (!entry || basename(entry) !== 'codex-stdio.js') return { key: canonical({ commandRole: role }), basis: [] };
+  if (!entry || stdioProviderByModule(basename(entry)) === null) return { key: canonical({ commandRole: role }), basis: [] };
   let hash: string | null = null; const basis: Ref[] = [];
   const snapshot = call?.runtime?.snapshot;
   if (snapshot?.adapter?.hash !== undefined) {
     // An actual dispatch snapshot precedes a later replacement of the file.
     // Inconsistent telemetry must not fall back to a weaker declaration.
-    if (!call || call.runtime?.version !== 1 || !['captured', 'observed'].includes(call.runtime.status)
+    if (!call || (call.runtime?.version !== 1 && call.runtime?.version !== 2) || !['captured', 'observed'].includes(call.runtime.status)
       || call.runtime.requestHash !== call.request.hash || snapshot.roleHash !== hashJson(role)
       || canonical(snapshot.invocation.args) !== canonical(role.command.args) || !validAdapterHash(snapshot.adapter.hash)) return null;
     hash = snapshot.adapter.hash;

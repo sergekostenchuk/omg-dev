@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { basename, isAbsolute, normalize } from 'node:path';
+import { stdioProviderByModule } from './stdio-providers.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { requireCondition } from '../errors.js';
 import type { Store } from '../storage/store.js';
@@ -53,7 +54,7 @@ export function declareAdapterLineage(store: Store, project: string, request: Ad
   requireCondition(store.list<ModelCall>('model-call').some(call => {
     const entry = call.value.requested?.command.args[0];
     return call.value.projectId === project && typeof entry === 'string' && isAbsolute(entry)
-      && basename(entry) === 'codex-stdio.js' && adapterLineagePath(entry) === path;
+      && stdioProviderByModule(basename(entry)) !== null && adapterLineagePath(entry) === path;
   }), 'adapter_lineage_path_unknown', 'The declaration must identify an actual historical adapter path of this project');
   const value: AdapterLineage = { projectId: project, path, sha256: request.sha256, basis: [...request.basis], declaredBy };
   const existing = adapterLineage(store, project, path);

@@ -41,6 +41,14 @@ function omRuntimeDeclaration(store: Store, project: string, scope: Ref, current
   return { obligations: found.value.handoff.obligations, guards: current ? guards : [] };
 }
 
+/** The provider-classification set for the check module input: the sorted
+ * unique union of every executable the exact verified declaration names, not
+ * only the check being launched — a foreign provider may be declared by a
+ * sibling assignment. */
+function declaredExecutables(assignments: readonly { readonly runtimeCheck?: { readonly executables?: readonly string[] | null } | null }[]): string[] {
+  return [...new Set(assignments.flatMap(item => item.runtimeCheck?.executables ?? []))].sort();
+}
+
 /** Address selection does not prove authority; omRuntimeAssignment checks the
  * complete declaration before accepting this address for an observation. */
 export function runtimeObligationId(obligation: CarriedObligation): string {
@@ -59,18 +67,20 @@ export function omRuntimeAssignment(store: Store, project: string, scope: Ref, i
   const matches = declaration.obligations.filter(item => runtimeObligationId(item as CarriedObligation) === id);
   if (matches.length !== 1) throw new EngineError('runtime_check_not_declared',
     'An OM runtime check must address exactly one declared assignment', { scope, obligation: id });
-  return { assignment: matches[0]!, guards: declaration.guards };
+  return { assignment: matches[0]!, obligations: declaration.obligations, guards: declaration.guards };
 }
 
 function observationDeclaration(store: Store, project: string, request: RuntimeObservationRequest) {
   if (request.scope.id.startsWith('om-obligations:')) {
     const found = omRuntimeAssignment(store, project, request.scope, request.obligation, true);
-    return { scope: { ...found.assignment.scope }, assignment: found.assignment, guards: found.guards };
+    return { scope: { ...found.assignment.scope }, assignment: found.assignment, guards: found.guards,
+      executables: declaredExecutables(found.obligations) };
   }
   const scope = researchScope(store, project);
   requireCondition(scope && canonical(reference(scope)) === canonical(request.scope),
     'runtime_observation_scope_stale', 'Observe the exact current scope');
-  return { scope: reference(scope), assignment: obligationAssignment(scope.value, request.obligation), guards: [reference(scope)] };
+  return { scope: reference(scope), assignment: obligationAssignment(scope.value, request.obligation), guards: [reference(scope)],
+    executables: declaredExecutables(scope.value.policy?.assignments ?? []) };
 }
 
 export function runtimeContext(store: Store, project: string) {
@@ -238,7 +248,8 @@ export async function observeRuntime(store: Store, project: string, request: Run
     const invocation={executable:executable.path,args:[join(snapshot,codeRoot===null?'check.mjs':relative(codeRoot,script.value.origin.location)),...check.args]};
     record=store.write<RuntimeObservation>({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,snapshot,invocation}});
     result=await runProcess(invocation,current.root,
-      canonical({protocol:'omg-runtime-observation/v1',scope,obligation:assignment.original,runtime:current.binding}),check.timeoutMs,signal,true,pid=>{
+      canonical({protocol:'omg-runtime-observation/v1',scope,obligation:assignment.original,runtime:current.binding,
+        executables:declaration.executables}),check.timeoutMs,signal,true,pid=>{
         spawnedPid=pid;
         const started=processStart(pid);
         if(!started){

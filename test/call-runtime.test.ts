@@ -19,14 +19,15 @@ const originalPath = process.env['PATH'];
 // All provider invocations below are local Node fixtures, never real Codex or
 // paid requests. Scope rows seed telemetry tests; policy admission has its own
 // public-path tests in obligation-policy/runtime-observation suites.
-function fixture(t: test.TestContext, mode = 'normal', declareAdapter = true) {
+function fixture(t: test.TestContext, mode = 'normal', declareAdapter = true, provider: 'codex' | 'devin' = 'codex') {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-call-runtime-'))), bin = join(root, 'bin'); mkdirSync(bin);
   const store = new Store(join(root, 'db.sqlite')), engine = new ProductEngine(store);
   t.after(() => { process.env['PATH'] = originalPath; store.close(); rmSync(root, { recursive: true, force: true }); });
-  const codex = join(bin, 'codex'), adapter = join(root, 'adapter.mjs'), log = join(root, 'invocations.log');
-  writeFileSync(codex, `#!${process.execPath}\nimport{readFileSync,appendFileSync}from'node:fs';const log=${JSON.stringify(log)};if(process.argv[2]==='--version'){appendFileSync(log,'version\\n');console.log(${JSON.stringify(mode === 'bad-version' ? 'unknown-provider' : 'codex-cli fixture-1')});}else{appendFileSync(log,'provider\\n');const r=JSON.parse(readFileSync(0,'utf8'));if(${JSON.stringify(mode)}==='changed-provider')appendFileSync(process.argv[1],'\\n// changed during invocation\\n');if(${JSON.stringify(mode)}==='changed-adapter')appendFileSync(${JSON.stringify(adapter)},'\\n// changed during invocation\\n');console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'Local fixture'},runtime:{status:'observed',source:'fabricated by adapter'},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));}\n`);
-  chmodSync(codex, 0o700);
-  writeFileSync(adapter, `import{readFileSync}from'node:fs';import{spawnSync}from'node:child_process';const r=spawnSync('codex',['exec'],{input:readFileSync(0,'utf8'),encoding:'utf8'});process.stdout.write(r.stdout);process.stderr.write(r.stderr);process.exitCode=r.status??1;\n`);
+  const versionLine = provider === 'devin' ? 'devin 3000.11.3 (fixture)' : 'codex-cli fixture-1';
+  const cli = join(bin, provider), adapter = join(root, provider === 'devin' ? 'devin-stdio.js' : 'adapter.mjs'), log = join(root, 'invocations.log');
+  writeFileSync(cli, `#!${process.execPath}\nimport{readFileSync,appendFileSync}from'node:fs';const log=${JSON.stringify(log)};if(process.argv[2]==='--version'){appendFileSync(log,'version\\n');console.log(${JSON.stringify(mode === 'bad-version' ? 'unknown-provider' : versionLine)});}else{appendFileSync(log,'provider\\n');const r=JSON.parse(readFileSync(0,'utf8'));if(${JSON.stringify(mode)}==='changed-provider')appendFileSync(process.argv[1],'\\n// changed during invocation\\n');if(${JSON.stringify(mode)}==='changed-adapter')appendFileSync(${JSON.stringify(adapter)},'\\n// changed during invocation\\n');console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'Local fixture'},runtime:{status:'observed',source:'fabricated by adapter'},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));}\n`);
+  chmodSync(cli, 0o700);
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';import{spawnSync}from'node:child_process';const r=spawnSync(${JSON.stringify(provider)},['exec'],{input:readFileSync(0,'utf8'),encoding:'utf8'});process.stdout.write(r.stdout);process.stderr.write(r.stderr);process.exitCode=r.status??1;\n`);
   process.env['PATH'] = bin + delimiter + (originalPath ?? '');
   engine.execute({ type: 'create-project', project: 'p', title: 'Runtime telemetry fixture' });
   const command = { executable: process.execPath, args: [adapter] };
@@ -36,13 +37,13 @@ function fixture(t: test.TestContext, mode = 'normal', declareAdapter = true) {
   const source = engine.discovery.evidence.document('p', 'declared-check', 'export {};', 'text/plain', 0);
   const scope = store.write<ResearchScope>({ id: 'research-scope:p:R2', kind: 'research-scope', expected: 0,
     value: { projectId: 'p', policy: { version: 1, assignments: [{ runtimeCheck: { script: reference(source), dependencies: [],
-      subjects: declareAdapter ? [adapter] : [], executables: ['codex'], args: [], timeoutMs: 1000, purpose: 'Fixture evidence declaration' } }] } } });
+      subjects: declareAdapter ? [adapter] : [], executables: [provider], args: [], timeoutMs: 1000, purpose: 'Fixture evidence declaration' } }] } } });
   const draft = engine.discovery.create('p', 'features', 'R1', 'compilation', [{ field: 'fixture', kind: 'design', proof: 'assessment',
     prompt: 'Return a fixture observation', risk: 'Wrong installed runtime', schema: { type: 'string' } }], [reference(scope)]);
   const role = environment.value.implementer;
   const invoke = () => researchCall(role, environment.value, 'Read the fixture', { fixture: true }, undefined,
     { store, draftId: draft.id, questionId: draft.value.questions[0]!, purpose: 'analyst' });
-  return { root, bin, store, engine, codex, adapter, log, scope, draft, role, environment, invoke };
+  return { root, bin, store, engine, codex: cli, adapter, log, scope, draft, role, environment, invoke };
 }
 
 test('ordinary dispatch records the actual declared CLI, adapter and request without a second provider invocation', async t => {
@@ -53,9 +54,11 @@ test('ordinary dispatch records the actual declared CLI, adapter and request wit
   assert.equal(runtime.requestHash, call.value.request.hash); assert.deepEqual(runtime.declaration, reference(f.scope));
   assert.equal(runtime.snapshot!.roleHash, hashJson(f.role));
   assert.equal(runtime.snapshot!.adapter.path, f.adapter); assert.equal(runtime.snapshot!.adapter.hash, digest(readFileSync(f.adapter)));
-  assert.equal(runtime.snapshot!.subjects.find(subject => subject.requested === 'codex')!.path, f.codex);
-  assert.equal(runtime.snapshot!.subjects.find(subject => subject.requested === 'codex')!.hash, digest(readFileSync(f.codex)));
-  assert.equal(runtime.snapshot!.codex.result.stdout.trim(), 'codex-cli fixture-1');
+  assert.equal(runtime.version, 1);
+  if (runtime.version !== 1 || !runtime.snapshot) assert.fail('A Codex-era call keeps version 1 evidence');
+  assert.equal(runtime.snapshot.subjects.find(subject => subject.requested === 'codex')!.path, f.codex);
+  assert.equal(runtime.snapshot.subjects.find(subject => subject.requested === 'codex')!.hash, digest(readFileSync(f.codex)));
+  assert.equal(runtime.snapshot.codex.result.stdout.trim(), 'codex-cli fixture-1');
   assert.deepEqual(readFileSync(f.log, 'utf8').trim().split('\n'), ['version', 'provider']);
   assert.equal(f.store.list('model-call').length, 1); assert.equal(call.value.usage!.inputTokens, 10);
   assert.ok(call.value.request.record && call.value.response!.record);
@@ -131,4 +134,76 @@ test('preview stops before version telemetry as well as before provider dispatch
   assert.equal(preview.draft, f.draft.id); assert.equal(preview.hash, digest(preview.input));
   assert.equal(existsSync(f.log), false); assert.equal(f.store.list('model-call').length, 0);
   assert.equal(f.store.list('project-dispatch').length, 0);
+});
+
+test('a Devin adapter records version 2 evidence with its own provider probe, never the codex field', async t => {
+  const f = fixture(t, 'normal', true, 'devin');
+  assert.deepEqual(await f.invoke(), { action: 'pause', reason: 'Local fixture' });
+  const call = f.store.list<ModelCall>('model-call')[0]!, runtime = call.value.runtime!;
+  assert.equal(call.value.status, 'succeeded'); assert.equal(runtime.status, 'observed'); assert.equal(runtime.error, null);
+  assert.equal(runtime.version, 2);
+  if (runtime.version !== 2 || !runtime.snapshot) assert.fail('A Devin-era call must record version 2 evidence');
+  assert.equal(Object.hasOwn(runtime.snapshot, 'codex'), false, 'Devin is never witnessed under the codex field');
+  assert.equal(runtime.snapshot.provider.protocol, 'devin-stdio');
+  assert.equal(runtime.snapshot.provider.executable, f.codex);
+  assert.deepEqual(runtime.snapshot.provider.args, ['--version']);
+  assert.equal(runtime.snapshot.provider.result.stdout.trim(), 'devin 3000.11.3 (fixture)');
+  assert.equal(runtime.snapshot.adapter.path, f.adapter);
+  assert.equal(runtime.snapshot.subjects.find(subject => subject.requested === 'devin')!.path, f.codex);
+  assert.deepEqual(readFileSync(f.log, 'utf8').trim().split('\n'), ['version', 'provider']);
+});
+
+test('a Devin adapter without a declared devin executable cannot be witnessed as Codex', async t => {
+  const f = fixture(t, 'normal', true, 'devin');
+  // The scope declares only codex: a devin-stdio adapter must not pass on Codex's declaration.
+  const scope = f.store.write<ResearchScope>({ id: f.scope.id, kind: f.scope.kind, expected: f.scope.revision,
+    value: { ...f.scope.value, policy: { ...f.scope.value.policy!, assignments: [{ runtimeCheck: { script: f.scope.value.policy!.assignments[0]!.runtimeCheck!.script,
+      dependencies: [], subjects: [f.adapter], executables: ['codex'], args: [], timeoutMs: 1000, purpose: 'Codex-only declaration' } }] } } });
+  const draft = f.engine.discovery.create('p', 'features', 'R1', 'compilation', [{ field: 'fixture', kind: 'design', proof: 'assessment',
+    prompt: 'Return a fixture observation', risk: 'Wrong installed runtime', schema: { type: 'string' } }], [reference(scope)]);
+  const result = await captureCallRuntime(f.store, draft.value as DiscoveryDraft, f.role, f.environment.value, 'req');
+  assert.equal(result!.status, 'unavailable'); assert.equal(result!.error, 'call_runtime_not_declared');
+  assert.equal(result!.version, 2); assert.equal(result!.snapshot, null);
+});
+
+test('an unrecognized adapter module is never witnessed as a declared foreign provider', async t => {
+  for (const executables of [['codex', 'devin'], ['devin']]) {
+    const f = fixture(t, 'normal', true, 'devin');
+    // The real adapter bytes under an unrecognized module name, plus both provider stubs on PATH.
+    const wrapper = join(f.root, 'devin-wrapper.mjs');
+    writeFileSync(wrapper, readFileSync(f.adapter));
+    writeFileSync(join(f.bin, 'codex'), `#!${process.execPath}\nconsole.log('codex-cli fixture-old');\n`, { mode: 0o700 });
+    const command = { executable: process.execPath, args: [wrapper] };
+    const configured = f.engine.environments.configure('p', { ...f.environment.value,
+      implementer: { ...f.environment.value.implementer, command }, reviewer: { ...f.environment.value.reviewer, command } },
+      f.environment.revision);
+    const scope = f.store.write<ResearchScope>({ id: f.scope.id, kind: f.scope.kind, expected: f.scope.revision,
+      value: { ...f.scope.value, policy: { ...f.scope.value.policy!, assignments: f.scope.value.policy!.assignments.map(assignment => ({
+        ...assignment, runtimeCheck: { ...assignment.runtimeCheck!, subjects: [wrapper], executables } })) } } });
+    const draft = f.engine.discovery.create('p', 'features', 'R1', 'compilation', [{ field: 'wrapped', kind: 'design',
+      proof: 'assessment', prompt: 'Fixture', risk: 'Wrong provider', schema: { type: 'string' } }], [reference(scope)]);
+    await researchCall(configured.value.implementer, configured.value, 'Fixture', { fixture: true }, undefined,
+      { store: f.store, draftId: draft.id, questionId: draft.value.questions[0]!, purpose: 'analyst' });
+    const call = f.store.list<ModelCall>('model-call')[0]!, runtime = call.value.runtime!;
+    assert.equal(call.value.status, 'succeeded', 'the paid answer is preserved while telemetry is refused');
+    assert.equal(runtime.status, 'unavailable', JSON.stringify(executables));
+    assert.equal(runtime.error, 'call_runtime_provider_unknown');
+    assert.equal(runtime.snapshot, null, 'no Codex field is fabricated for an unattributable call');
+    // The unambiguous codex-era path is unchanged: an unrecognized module with only codex declared stays version 1.
+  }
+});
+
+test('a PATH substitution of the devin executable between capture and dispatch invalidates the claim', async t => {
+  const f = fixture(t, 'normal', true, 'devin'), alternative = join(f.root, 'other-bin'); mkdirSync(alternative);
+  writeFileSync(join(alternative, 'devin'), readFileSync(f.codex)); chmodSync(join(alternative, 'devin'), 0o700);
+  const original = f.store.writeMany.bind(f.store); let changed = false;
+  f.store.writeMany = ((writes: any[], guards: any[] = []) => {
+    if (!changed && writes.some(write => write.kind === 'model-call' && write.value.status === 'running')) {
+      changed = true; process.env['PATH'] = alternative + delimiter + process.env['PATH'];
+    }
+    return original(writes, guards);
+  }) as Store['writeMany'];
+  await f.invoke(); const call = f.store.list<ModelCall>('model-call')[0]!;
+  assert.equal(call.value.status, 'succeeded'); assert.equal(call.value.runtime!.status, 'stale');
+  assert.equal(call.value.runtime!.snapshot!.subjects.find(subject => subject.requested === 'devin')!.path, f.codex);
 });
