@@ -1572,10 +1572,11 @@
 - Отдаёт: —
 - Читает записи: конфигурация Codex CLI 0.160.0
 - Пишет записи: —
-- Разрешённые пути: `src/adapters/codex-stdio.ts`, `test/adapter-lineage.test.ts`
+- Разрешённые пути: `src/adapters/codex-stdio.ts`, `test/adapter-lineage.test.ts`, `test/model-usage.test.ts`
 - Из движка как есть: src/adapters/codex-stdio.ts — текущие аргументы codex exec (--ephemeral --sandbox --output-schema); src/runtime/process.ts:50 — ребёнку передаются только PATH/HOME/TMPDIR/LANG/…
 - После: AD1
 - Тесты сверх обязательных:
+  - ДОГОВОР №2742 (Codex; ~/REPORTS/review/omg-code-lp2_contract-2742.md; описи Sonnet №2733/№2734, позиция №2735): 3 пути (+test/model-usage.test.ts — фикстура читателя); изоляция для research без subject (пакет OM) и research с subject.role=reader — временная CODEX_HOME через env (0700, config.toml 0600 только из двух верхнеуровневых строк model_catalog_json/openai_base_url с разбором TOML, auth.json — ссылка, не читать), include_environment_context=false, features.shell_tool=false, web_search=disabled, skills.max_context_tokens=1, инструкция путей от корня проекта; ошибка подготовки → adapter_config_invalid до запуска, без отката к личной CODEX_HOME; project_doc_max_bytes не добавлять; прочие режимы без изменений; таблица исходов A–F; один короткий платный вызов-проба после кода разрешён
   - ДО КОДА — опись: как Codex CLI 0.160.0 грузит глобальные инструкции (~/.codex/AGENTS.md, CODEX_HOME), проектные AGENTS.md рабочей папки, и какие опции/ключи -c их отключают, не трогая config.toml и auth (codex exec --help, codex debug, бесплатные пробы без вызова модели где возможно; один короткий платный вызов-проба — только с разрешения оркестратора); если без process.ts или CODEX_HOME нельзя — вопрос до кода
   - регрессии: argv адаптера содержит выбранное отключение; прежние аргументы и конверт omg-agent/v1 (confirmed, usage) без изменений; тест на заглушке codex фиксирует флаги
 
@@ -1843,6 +1844,7 @@
 - Из движка как есть: src/graph/topology.ts safeRelativePath — правило проверки; src/om/answer-form.ts:229-236 checkReads — где правило применяется; ответы Codex в живой базе (копия): om-model-exchange вызовов 733640e1/84b72416
 - После: Q5
 - Тесты сверх обязательных:
+  - ОТЛОЖЕНА до конца прохода (Codex №2742-1, позиция №2735-1): правка readShapes меняет вывод пакета → без маркера эры ломает loadPacket 6 живых пакетов omg-answer/v2; безопасности не касается (E3 строже); правило путей модели на время прохода даёт инструкция адаптера в LP2
   - ДО КОДА — опись: все места схемы и текста пакета, где модель называет путь (read.path, search.within строкой, другие пути в ответах answer/proposal), и все проверки этих путей в E3; какие ограничения JSON Schema поддерживает --output-schema Codex (pattern без lookahead?) — проверить бесплатно на схеме без вызова модели либо по документации; таблица исходов (урок 46): относительный / абсолютный внутри проекта / абсолютный вне / .. / .git / пустой / с обратной косой — что даёт схема и что даёт проверка, они должны совпасть
   - регрессии: схема отвергает каждую форму, которую отвергает safeRelativePath (и .git), и принимает каждую, которую он принимает — один набор строк для обоих; текст пакета называет правило; прежние пакеты и ответы с относительными путями — без изменений
 
