@@ -14,8 +14,8 @@ import { ProductEngine } from "../src/product/engine.js";
 import { beginLegacyOperation, finishLegacyOperation, readLegacyOperation as productRead, type LegacyOperation } from "../src/product/preparation-run.js";
 import { readLegacyOperation as lowerRead, StageChecks } from "../src/product/stage-checks.js";
 import { processStart } from "../src/runtime/process-identity.js";
-import { Store, type Revision, type TransactionGuard, type Write } from "../src/storage/store.js";
-import { storeView } from "../src/storage/store-view.js";
+import { Store, observeStore, type Revision, type StoreObserver, type TransactionGuard, type Write } from "../src/storage/store.js";
+import { captureView, storeView } from "../src/storage/store-view.js";
 import { writeFeasibility, type FeasibilityRequest } from "../src/om/feasibility.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 
@@ -279,4 +279,58 @@ test("R2 №2427-4: the old export and the new lower entry read one lawful activ
     assert.deepEqual(newRefusal, oldRefusal);
     assert.ok(!(newRefusal as { value?: unknown }).value, `A damaged basis is refused alike: ${JSON.stringify(newRefusal)}`);
   } finally { damaged.close(); }
+});
+
+test("Q4 №2563-3: on a proven Store omProject picks era candidates by indexed prefix identities — a foreign namespace is never listed or decoded, a corrupt non-candidate stays unread; an opaque view keeps the conservative full walk", t => {
+  const directory = mkdtempSync(join(tmpdir(), "omg-q4-era-")), store = new Store(join(directory, "state.sqlite"));
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const era = "era44";
+  const recordMissing = (error: unknown) => error instanceof EngineError && error.code === "record_missing";
+  // Foreign neighbors a whole-Store walk would meet: a candidate namespace of another project, an unknown
+  // namespace, and a shared namespace whose body names a foreign project.
+  store.write({ id: "repair-series:other:m1", kind: "repair-series", expected: 0, value: { contract: "om-repair-series/v2" } });
+  store.write({ id: "foreign-ns:z", kind: "foreign", expected: 0, value: { v: 1 } });
+  store.write({ id: "writer-index:other", kind: "writer-index", expected: 0, value: { project: "other", contract: "writer-index/om-m8-v1" } });
+  const reads: [string, string, string | null][] = [];
+  const watcher: StoreObserver = { begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token, _source, method, mode, id) => { reads.push([method, mode, id ?? null]); } };
+  const previous = observeStore(watcher);
+  try {
+    assert.equal(new StageChecks(store).omProject(era), false, "No provenance marker of this project exists");
+    assert.ok(reads.some(row => row[0] === "identities" && row[1] === "prefix"), "Candidates are selected by indexed prefix identities");
+    assert.ok(!reads.some(row => row[0] === "list"), "No body list over the Store");
+    assert.ok(!reads.some(row => row[0] === "identities" && row[1] === "list"), "No identity enumeration of the whole Store");
+    assert.ok(!reads.some(row => row[0] === "get" && (row[2] === "repair-series:other:m1" || row[2] === "foreign-ns:z")),
+      "A foreign project's candidate-namespace row and an unknown namespace are never decoded");
+    assert.ok(reads.some(row => row[0] === "get" && row[2] === "writer-index:other"),
+      "A shared namespace whose owner lives in the body is still read as a candidate — and rejected by the predicate");
+    // Positive control: a lawful marker of THIS project is found by the same prefix selection and still refuses.
+    store.write({ id: "writer-index:ours", kind: "writer-index", expected: 0, value: { project: era, contract: "writer-index/om-m8-v1" } });
+    assert.throws(() => new StageChecks(store).omProject(era), recordMissing, "A saved B1 origin still demands the exact first B1");
+    // F3 (№2568-1): a bare namespace address — no colon at all — is still a candidate whose body owns the project;
+    // the era search must reach it and keep the previous record_missing refusal.
+    store.write({ id: "writer-index", kind: "probe", expected: 0, value: { project: era, contract: "writer-index/om-m8-v1" } });
+    assert.throws(() => new StageChecks(store).omProject(era), recordMissing,
+      "A bare 'writer-index' record whose body names the project is an era marker without an address shape");
+    try { new StageChecks(store).omProject(era); assert.fail('the bare marker must refuse'); }
+    catch (error) {
+      assert.ok(error instanceof EngineError);
+      assert.deepEqual(error.details, { unit: "product", target: `om-input:${era}`, field: "revision" },
+        "The refusal is the same first-B1 address as before the era search existed");
+    }
+    // An opaque view keeps the conservative complete read traversal — a capture Proxy proves nothing.
+    reads.length = 0;
+    const opaque = captureView(store, { rows: new Map() }).view;
+    assert.throws(() => new StageChecks(opaque).omProject(era), recordMissing, "The view sees the same marker through its own walk");
+    assert.ok(reads.some(row => row[0] === "list"), "An opaque view keeps its own complete read traversal");
+    assert.ok(!reads.some(row => row[0] === "identities"), "The optimized identity selection never runs under an unproven view");
+    // A corrupt row outside every candidate prefix never reaches a decoder.
+    const database = new DatabaseSync(store.path);
+    try {
+      database.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+      database.prepare("UPDATE revisions SET body=? WHERE entity_id=?").run("null", "repair-series:other:m1");
+    } finally { database.close(); }
+    assert.throws(() => new StageChecks(store).omProject(era), recordMissing, "A corrupt foreign row is invisible to the era search");
+    assert.equal(new StageChecks(store).omProject("era45"), false, "And a second unmarked project still answers cleanly");
+  } finally { observeStore(previous); }
 });

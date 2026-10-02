@@ -1359,7 +1359,7 @@ test("S1 distinct collectors traverse a deep repeated DAG once and keep unique r
   const { first } = historicalStores(t);
   const a = first.write({ id: 'proof:distinct-a', kind: 'proof', expected: 0, value: { value: 'a' } });
   const b = first.write({ id: 'proof:distinct-b', kind: 'proof', expected: 0, value: { value: 'b' } });
-  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' | 'prefix' };
   const expected: Observation[] = [
     { ref: reference(a), head: false, method: 'get' },
     { ref: reference(a), head: true, method: 'get' },
@@ -1413,7 +1413,7 @@ test("S1 observed repeated DAG preserves complete cold and replayed streams in o
   const { first } = historicalStores(t);
   const a = first.write({ id: 'proof:dag-a', kind: 'proof', expected: 0, value: { value: 'a' } });
   const b = first.write({ id: 'proof:dag-b', kind: 'proof', expected: 0, value: { value: 'b' } });
-  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' | 'prefix' };
   const atA: Observation = { ref: reference(a), head: false, method: 'get' };
   const atHead: Observation = { ref: reference(b), head: true, method: 'get' };
   const atHistory: Observation = { ref: reference(b), head: false, method: 'history' };
@@ -1651,7 +1651,7 @@ test("S1.3 observers of any view of the Store receive the full ordered and disti
   const a = first.write({ id: 'observed:a', kind: 'proof', expected: 0, value: { v: 'a' } });
   const b = first.write({ id: 'observed:b', kind: 'proof', expected: 0, value: { v: 'b' } });
   const key = { reader: 'S1.3.observed', project: 'garden', ref: reference(a) };
-  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' };
+  type Observation = { ref: Ref; head: boolean; method: 'get' | 'list' | 'history' | 'prefix' };
   const expected: Observation[] = [
     { ref: reference(a), head: false, method: 'get' }, { ref: reference(b), head: true, method: 'get' },
     { ref: reference(a), head: false, method: 'history' }, { ref: reference(a), head: false, method: 'get' },
@@ -1961,7 +1961,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
 // A reader of the audited list (S1.4, №2410 C1): its cases are told apart by parameters. Any other reader keeps S1.3 (C2).
 const LISTED = 'M6.route-result';
 
-test("S1.4 every read of a closure-captured Store is observed at the Store — head and exact get, absence, list with and without kind, an empty list, history, identities in three modes: the proof outlives its operation, and a dependency a second Store creates or changes is derived again, never answered stale", t => {
+test("S1.4 every read of a closure-captured Store is observed at the Store — head and exact get, absence, list with and without kind, an empty list, history, identities in four modes: the proof outlives its operation, and a dependency a second Store creates or changes is derived again, never answered stale", t => {
   const { first, second } = sameFileStores(t);
   const a = first.write({ id: 's14:a', kind: 'k', expected: 0, value: { v: 0 } });
   let n = 0;
@@ -1976,6 +1976,7 @@ test("S1.4 every read of a closure-captured Store is observed at the Store — h
     ['identities get', store => store.identities('get', 's14:ig'), () => bump('s14:ig')],
     ['identities list', store => store.identities('list', 'k3'), () => bump('s14:il', 'k3')],
     ['identities history', store => store.identities('history', 's14:ih'), () => bump('s14:ih')],
+    ['identities prefix', store => store.identities('prefix', 's14:ip:'), () => bump('s14:ip:x')],
   ];
   for (const [name, read, change] of cases) {
     let runs = 0;
@@ -1994,6 +1995,25 @@ test("S1.4 every read of a closure-captured Store is observed at the Store — h
   const saved = proveExact(first); bump(a.id);
   assert.equal(proveExact(first), saved); assert.equal(exact, 1, 'A later head leaves the proved exact revision lawful');
   assert.equal(proveExact(second), saved); assert.equal(exact, 2, 'Another Store instance starts cold');
+  // Q4: a prefix identity read is a dependency on its literal range only — outside changes keep the proof,
+  // a new head inside the range moves its signature and is derived again.
+  let prefixRuns = 0;
+  const provePrefix = () => withHistoricalReads(() => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'prefix-range' } },
+    () => { prefixRuns++; return canonical(first.identities('prefix', 's14:po:') as unknown as Json); }, noCycle));
+  const ranged = provePrefix();
+  bump('s14:outside');
+  assert.equal(provePrefix(), ranged); assert.equal(prefixRuns, 1, 'A change outside the prefix range keeps the proof');
+  bump('s14:po:new');
+  assert.notEqual(provePrefix(), ranged); assert.equal(prefixRuns, 2, 'A new head inside the range is a new dependency');
+  // Q4-F4: an EMPTY prefix result is a dependency too — a second Store's write inside the range retires it,
+  // exactly as an exact-get of an absent revision does.
+  let emptyRuns = 0;
+  const proveEmpty = () => withHistoricalReads(() => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { case: 'prefix-empty' } },
+    () => { emptyRuns++; return canonical(first.identities('prefix', 's14:empty:') as unknown as Json); }, noCycle));
+  const empty = proveEmpty();
+  assert.equal(proveEmpty(), empty); assert.equal(emptyRuns, 1, 'The empty range answer is kept while nothing lands inside');
+  bump('s14:empty:appeared');
+  assert.notEqual(proveEmpty(), empty); assert.equal(emptyRuns, 2, 'A second Store writing inside the once-empty range retires the saved proof');
 });
 
 test("S1.4 nested readers pass their trail and incompleteness up, also from a cache: cold and kept children, git, a foreign Store, a child over a non-proven view and a read that threw keep the parent out; the observer is released after an exception; a trace with the observer counts each read once and replays what the cold run showed", t => {

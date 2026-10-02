@@ -322,6 +322,58 @@ test("S1.3 the change stamp moves with every commit this Store or another connec
   assert.throws(() => { const closed = new Store(path); closed.close(); closed.changeStamp(); }, code("store_busy"));
 });
 
+test("S1.3/Q4 identities('prefix') selects the literal entity_id head range in id order without decoding bodies — open and exact boundaries, empty prefix, no match, and the read is counted and reported like every other", t => {
+  const { store, path } = fixture(t);
+  const identity = (row: { id: string; kind: string; revision: number; hash: string }) =>
+    ({ id: row.id, kind: row.kind, revision: row.revision, hash: row.hash });
+  const bare = store.write({ id: "q44", kind: "proof", expected: 0, value: { v: 0 } });
+  const a = store.write({ id: "q44:a", kind: "proof", expected: 0, value: { v: 1 } });
+  const nested = store.write({ id: "q44:a:b", kind: "note", expected: 0, value: { v: 2 } });
+  const z = store.write({ id: "q44:z", kind: "proof", expected: 0, value: { v: 3 } });
+  const neighbor = store.write({ id: "q44x:a", kind: "proof", expected: 0, value: { v: 9 } });
+  const edge = store.write({ id: "q44:\u{10ffff}x", kind: "proof", expected: 0, value: { v: 7 } });
+  const percent = store.write({ id: "q44:%", kind: "proof", expected: 0, value: { v: 8 } });
+  const underscored = store.write({ id: "q44:_x", kind: "proof", expected: 0, value: { v: 8 } });
+  const upper = store.write({ id: "q44:A", kind: "proof", expected: 0, value: { v: 8 } });
+  const foreignCase = store.write({ id: "Q44:a", kind: "proof", expected: 0, value: { v: 9 } });
+  assert.deepEqual(store.identities("prefix", "q44:"), [percent, upper, underscored, a, nested, z, edge].map(identity),
+    "The range is id order over heads of one kind or another — never bodies, never neighbors");
+  assert.deepEqual(store.identities("prefix", "q44:%").map(row => row.id), ["q44:%"],
+    "% is an ordinary literal character, never a pattern wildcard");
+  assert.deepEqual(store.identities("prefix", "q44:_").map(row => row.id), ["q44:_x"],
+    "_ is an ordinary literal character, never a pattern wildcard");
+  assert.deepEqual(store.identities("prefix", "Q44:").map(row => row.id), [foreignCase.id],
+    "Case is literal: 'Q44:' and 'q44:' are different ranges");
+  assert.deepEqual(store.identities("prefix", "q44"), [bare, percent, upper, underscored, a, nested, z, edge, neighbor].map(identity),
+    "A bare prefix is literal: 'q44x:a' shares it, colons are ordinary characters");
+  assert.deepEqual(store.identities("prefix", "q44:a").map(row => row.id), ["q44:a", "q44:a:b"], "A deeper address is still inside the prefix");
+  assert.deepEqual(store.identities("prefix", "q44:\u{10ffff}").map(row => row.id), ["q44:\u{10ffff}x"], "A prefix ending at the last code point has an open bound");
+  assert.deepEqual(store.identities("prefix", "q44:none"), [], "No match selects nothing");
+  assert.deepEqual(store.identities("prefix", ""), store.identities("list"), "The empty prefix is the whole head set, same as list's identities");
+  store.write({ id: a.id, kind: a.kind, expected: 1, value: { v: 5 } });
+  assert.deepEqual(store.identities("prefix", "q44:a").map(row => row.revision), [2, 1], "Heads only: an older revision is not an identity row");
+  const settled = storeReads();
+  store.identities("prefix", "q44:");
+  assert.equal(storeReads() - settled, 1, "A prefix select is one counted read");
+  const events: unknown[] = [];
+  const watcher: StoreObserver = { begin() { return {}; }, end(_token, source, method, mode, id, revision, rows) {
+    events.push([source === store, method, mode, id ?? null, revision ?? null, rows.map(row => row.id)]);
+  }, write() {}, untraced() {} };
+  const previous = observeStore(watcher);
+  try {
+    store.identities("prefix", "q44:a");
+    assert.deepEqual(events, [[true, "identities", "prefix", "q44:a", null, ["q44:a", "q44:a:b"]]],
+      "The observer hears mode 'prefix' with the literal argument and its identity rows");
+  } finally { observeStore(previous); }
+  const raw = new DatabaseSync(path);
+  try { raw.exec("DROP TRIGGER revisions_no_update; UPDATE revisions SET body='null' WHERE entity_id='q44:z'"); }
+  finally { raw.close(); }
+  assert.throws(() => store.get("q44:z"), code("record_corrupt"), "The corrupt body is still corrupt for a real read");
+  assert.deepEqual(store.identities("prefix", "q44:").map(row => row.id), ["q44:%", "q44:A", "q44:_x", "q44:a", "q44:a:b", "q44:z", "q44:\u{10ffff}x"],
+    "Identities never decode bodies: the corrupt row is still reported by its stored hash");
+  assert.deepEqual(store.identities("prefix", "q44x:"), [neighbor].map(identity), "The neighbor outside the range is untouched");
+});
+
 test("S1.3/S1.4 every Store counts its get, list, history and identities reads in one process-wide count (№2302-1); a stamp is no such read", t => {
   const { store, path } = fixture(t);
   const other = new Store(path);

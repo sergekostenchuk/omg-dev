@@ -21,7 +21,7 @@ function invalid(field: string): never {
 }
 
 export interface HistoricalReadKey { reader: string; project: string; ref: Ref; parameters?: Json }
-type ReadObservation = { source: Store; method: 'get' | 'list' | 'history'; id: string | undefined; revision: number | undefined; references: Ref[] };
+type ReadObservation = { source: Store; method: 'get' | 'list' | 'history' | 'prefix'; id: string | undefined; revision: number | undefined; references: Ref[] };
 /** `stamp`: the change stamp of the source's genuine Store under which `signature` is known to hold (S1.3), or null
  * when the source has no such Store. Events are shared by every enclosing journal, so one check serves them all. */
 type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observations: ReadObservation[]; stamp: string | null; key?: string };
@@ -246,7 +246,9 @@ function currentFootprint(footprint: readonly ReadEvent[]): boolean {
         continue;
       }
       const records = event.method === 'get' ? (() => { const row = event.source.get<unknown>(event.id!, event.revision); return row ? [row] : []; })()
-        : event.method === 'list' ? event.source.list<unknown>(event.id) : event.source.history<unknown>(event.id!);
+        : event.method === 'list' ? event.source.list<unknown>(event.id)
+        : event.method === 'prefix' ? event.source.identities('prefix', event.id!) as unknown as Revision<unknown>[]
+        : event.source.history<unknown>(event.id!);
       if (readSignature(event.source, records) !== event.signature) return false;
     }
     return true;

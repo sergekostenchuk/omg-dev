@@ -3,6 +3,7 @@ import { canonical, compareKeys, compositeKey, hashJson, type Json } from "../ca
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readPreparedSeriesTransition as readPreparedSeriesTransitionOf, prepareSeriesTransition as prepareSeriesTransitionOf,
   comparePreparedSeriesSlices as comparePreparedSeriesSlicesOf, type PreparedSeriesDecision } from "./series-transition.js";
@@ -2517,7 +2518,17 @@ function captureMembership(store: Store, project: string): CapturedMembership {
   const captured = store.get<SeriesMembership>(seriesMembershipId(project));
   const record = captured ? checkedMembership(store, project, reference(captured)) : null;
   const roots: SeriesMembership['roots'] = [], current = new Map<string, Revision<RepairSeries>>();
-  for (const raw of store.list(REPAIR_SERIES_KIND).filter(row => row.id.startsWith(`${REPAIR_SERIES_KIND}:${project}:`))) {
+  // Q4 (№2563-3): the project prefix is an indexed head range over identities — kind is selected from the same
+  // metadata before any body is decoded, so a foreign project's corrupt series is never read. A view without a
+  // proven Store keeps the previous list and filter.
+  const prefix = `${REPAIR_SERIES_KIND}:${project}:`;
+  const genuine = provenStore(store);
+  const lines: Revision<RepairSeries>[] = genuine
+    ? genuine.identities('prefix', prefix)
+      .filter(row => row.kind === REPAIR_SERIES_KIND && !row.id.startsWith(`${prefix}mechanism:`))
+      .flatMap(row => { const head = store.get<RepairSeries>(row.id); return head ? [head] : []; })
+    : store.list<RepairSeries>(REPAIR_SERIES_KIND).filter(row => row.id.startsWith(prefix));
+  for (const raw of lines) {
     if (raw.id.startsWith(`${REPAIR_SERIES_KIND}:${project}:mechanism:`)) continue;
     const series = mechanismTake(readAnySeriesAt(store, project, reference(raw))) as Revision<RepairSeries>;
     if (series.value.line === 1) roots.push({ block: series.value.block, root: rootOf(store, project, series) });
@@ -2855,15 +2866,28 @@ function currentBlockAdmission(store: Store, project: string, ref: Ref, work: bo
   const obsolete = currentLineProblem(store, address, ref);
   if (obsolete) mechanismTake(obsolete);
   if ('owner' in series.value) return { series, guards: [exactRef(ref)], pointer: null, activation: null, participation: 'legacy', references: [exactRef(ref)] };
-  const membership = captureMembership(store, project), activation = series.value.activation;
+  // Q4 (№2563-1): admission needs only the exact proof spine — the membership head proved by checkedMembership,
+  // this line's own root in its root set, the head/successor checks above, pointer and participation. Enumerating
+  // every repair-series line is the writer's business and stays there; an unrelated line no longer
+  // blocks this admission, while every exact basis — roots, membership history, applied, pointer, predecessors —
+  // keeps its refusal.
+  const captured = store.get<SeriesMembership>(seriesMembershipId(project));
+  const record = captured ? checkedMembership(store, project, reference(captured)) : null;
+  const activation = series.value.activation;
   const guards = [exactRef(ref)], references = [exactRef(ref)];
-  if (membership.record) references.push(reference(membership.record));
-  if (!work && membership.record) guards.push(reference(membership.record));
-  if (membership.value.mode === 'legacy') {
+  if (record) references.push(reference(record));
+  if (!work && record) guards.push(reference(record));
+  if (record === null || record.value.mode === 'legacy') {
+    // The absent/legacy verdicts of captureMembership still stand over the project's own namespace: no foreign
+    // managed line, no lost pointer, no root the record does not name — each an exact refusal there, not here.
+    captureMembership(store, project);
     mechanismCheck(activation === undefined && series.value.contract === undefined && !store.get(seriesCurrentId(project)), ref.id, 'activation', 'Legacy admission cannot replace missing managed proof');
     return { series, guards: refsUnique(guards), pointer: null, activation: null, participation: 'legacy', references: refsUnique(references) };
   }
   mechanismCheck(series.value.contract === MANAGED_SERIES_CONTRACT && activation, ref.id, 'activation', 'Managed membership requires the explicit series producer');
+  mechanismCheck(record.value.roots.some(row => row.block === (series.value as RepairSeries).block
+    && canonical(row.root) === canonical(rootOf(store, project, series))), record.id, 'roots',
+    'Membership does not name the exact root of this line');
   const rawPointer = store.get<CurrentSeriesPointer>(seriesCurrentId(project));
   mechanismCheck(rawPointer, ref.id, 'pointer', 'Managed admission requires the current pointer');
   const pointer = checkedCurrent(store, project, reference(rawPointer));

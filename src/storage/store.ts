@@ -41,13 +41,16 @@ let physicalReads = 0;
  * historical proof compares them with the reads it observed, so any read it did not see keeps that proof incomplete. */
 export function storeReads(): number { return physicalReads; }
 export type StoreReadMethod = 'get' | 'list' | 'history' | 'identities';
+/** The selection an identities() call applies: get one id or revision, list every head or one kind, prefix the
+ * literal entity_id range of heads (Q4, №2563-3) — never decoded bodies, so excluded corrupt rows stay unread. */
+export type IdentityMethod = 'get' | 'list' | 'history' | 'prefix';
 /**
  * S1.4 (№2302): what a historical proof observes at this implementation — a read only once it has completed, with its
  * request and result, and every write attempt before its first check. A read that throws is never reported.
  */
 export interface StoreObserver {
   begin(store: Store): object | undefined;
-  end(token: object, store: Store, method: StoreReadMethod, mode: 'get' | 'list' | 'history', id: string | undefined,
+  end(token: object, store: Store, method: StoreReadMethod, mode: IdentityMethod, id: string | undefined,
     revision: number | undefined, rows: readonly (Revision<unknown> | RevisionIdentity)[]): void;
   write(store: Store): void;
   /** A read answered through a view whose own answers no Store reports (S1.4, №2395). */
@@ -60,6 +63,17 @@ export function observeStore(next: StoreObserver | null): StoreObserver | null {
 export function noteWriteAttempt(store: Store): void { observer?.write(store); }
 /** A read projection, capture or other opaque view may answer without reaching any Store: the reading proof is incomplete. */
 export function noteUntracedRead(): void { observer?.untraced(); }
+
+/** The first entity_id after `prefix`'s whole prefix range, or none when it ends at the last Unicode point. The
+ * literal range shares no semantics with SQL patterns: %, _, case and colons are ordinary characters. */
+function prefixBound(prefix: string): string | null {
+  const chars = Array.from(prefix);
+  for (let index = chars.length - 1; index >= 0; index--) {
+    const point = chars[index]!.codePointAt(0)!;
+    if (point < 0x10ffff) return chars.slice(0, index).join('') + String.fromCodePoint(point + 1);
+  }
+  return null;
+}
 
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
@@ -91,8 +105,10 @@ export class Store {
     requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
     return `${this.#commits}:${String(this.#db.prepare("PRAGMA data_version").get()!['data_version'])}`;
   }
-  /** The identities get/list/history select, read without decoding bodies: saved revisions never change. */
-  identities(method: 'get' | 'list' | 'history', id?: string, revision?: number): RevisionIdentity[] {
+  /** The identities get/list/history/prefix select, read without decoding bodies: saved revisions never change.
+   * 'prefix' names a literal entity_id prefix and selects the current heads inside its indexed range, in the
+   * Store's own entity_id order — the same rows a startsWith filter over list() would name, without reading them. */
+  identities(method: IdentityMethod, id?: string, revision?: number): RevisionIdentity[] {
     physicalReads++;
     const token = observer?.begin(this);
     const columns = "r.entity_id, r.revision, r.kind, r.sha256";
@@ -102,6 +118,12 @@ export class Store {
       : method === 'list' ? id === undefined
         ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) ORDER BY entity_id`).all()
         : this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE kind=? ORDER BY entity_id`).all(id)
+      : method === 'prefix' ? (() => {
+          const bound = id === undefined ? null : prefixBound(id);
+          return bound === null
+            ? this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id>=? ORDER BY entity_id`).all(id!)
+            : this.#db.prepare(`SELECT ${columns} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id>=? AND r.entity_id<? ORDER BY entity_id`).all(id!, bound);
+        })()
       : this.#db.prepare(`SELECT ${columns} FROM revisions r WHERE entity_id=? ORDER BY revision`).all(id!);
     const found = rows.map(row => ({ id: String(row!['entity_id']), kind: String(row!['kind']), revision: Number(row!['revision']), hash: String(row!['sha256']) }));
     if (token) observer!.end(token, this, 'identities', method, id, revision, found);

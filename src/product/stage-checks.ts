@@ -170,6 +170,17 @@ function b1Candidate(project: string, id: string): boolean {
   return namespace === 'runtime-observation' || namespace === 'writer-index'
     || id.startsWith(`${namespace}:${project}:`) || id === `${namespace}:${project}`;
 }
+/**
+ * Q4 (№2563-3, №2568-1): the literal head prefixes whose union is a superset of b1Candidate. A shared namespace's
+ * `${namespace}:${project}` covers its exact address and every deeper one; the two spaces whose owner lives in the
+ * body are selected whole — bare `runtime-observation`/`writer-index` ids included — because savedB1Origin decides
+ * ownership from any revision, never from the address alone. The fixed B1 addresses stand as their own prefixes.
+ */
+function b1CandidatePrefixes(project: string): string[] {
+  return [`om-input:${project}`, `om-feasibility:${project}`, `om-series-current:${project}`, `om-run:${project}`,
+    `om-frame:${project}:`, 'runtime-observation', 'writer-index',
+    ...new Set([...B1_PRODUCERS, ...Object.keys(B1_SHARED_ORIGINS)].map(namespace => `${namespace}:${project}`))];
+}
 function savedB1Origin(project: string, record: Revision<unknown>): boolean {
   if (b1Address(project, record.id)) return true;
   const value = record.value;
@@ -350,9 +361,16 @@ export class StageChecks {
     // view — pending, trace, Proxy, subclass — keeps the full walk through its own reads, which its identities do not
     // describe. The predicate, its history walk and the refusal stay the same; a corrupt candidate still surfaces.
     const genuine = provenStore(this.store);
-    const records = genuine
-      ? genuine.identities('list').filter(row => b1Candidate(project, row.id)).flatMap(row => { const head = this.store.get(row.id); return head ? [head] : []; })
-      : this.store.list();
+    const seen = new Set<string>(), records: Revision<unknown>[] = [];
+    if (genuine) {
+      for (const prefix of b1CandidatePrefixes(project))
+        for (const row of genuine.identities('prefix', prefix))
+          if (b1Candidate(project, row.id) && !seen.has(row.id)) {
+            seen.add(row.id);
+            const head = this.store.get(row.id);
+            if (head) records.push(head);
+          }
+    } else records.push(...this.store.list());
     const savedOrigin = records.some(record => savedB1Origin(project, record)
       || this.store.history(record.id).some(revision => savedB1Origin(project, revision)));
     if (savedOrigin)

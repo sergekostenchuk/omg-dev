@@ -17,14 +17,15 @@ import { projectGraph } from '../src/graph/project.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
-import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { Store, observeStore, type Revision, type StoreObserver, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { captureView } from '../src/storage/store-view.js';
 import { writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from '../src/om/addressing.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeHorizon, writeHorizonIssuance, readHorizonIssuance, type HorizonRequest } from '../src/om/horizon.js';
 import { beginAttempt, completeAttempt, openSeries, prepareOpenSeries, readSeriesAt,
   readSeries, seriesEraId, readSeriesWorkAdmission, prepareBeginAttempt, readStopHistory, readStopHistoryAt, readCurrentSeriesPointer, readAppliedSeriesTransition, prepareSeriesActivation, applySeriesActivation, prepareSeriesParticipantAdmission,
-  prepareSeriesLineAdmission, seriesCurrentId, seriesMembershipId, type RepairSeries } from '../src/om/series.js';
+  prepareSeriesLineAdmission, readSeriesMembership, seriesCurrentId, seriesMembershipId, type RepairSeries } from '../src/om/series.js';
 import { prepareSeriesDiscard, writeSeriesDiscard, readDiscardedSeriesTransition } from '../src/om/series.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
 import type { FrameAttemptBinding } from '../src/om/layer-basis.js';
@@ -2026,4 +2027,103 @@ test('35 H1.0b root cessation retains all unchosen E2 candidates and defeats a p
   refusedWith(await runModelCall(f.store, first.request), 'series_conflict');
   assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(ceased))), ceased);
   assert.deepEqual(snapshot(f.store), history); assert.equal(f.sent().length, 0);
+});
+
+test("Q4 №2563-1/-3: membership capture and current admission select the project's own series by a prefix identity read — a foreign project's corrupt line is never decoded; an opaque view keeps its own complete walk", t => {
+  const f = product(fixture(t));
+  const admitted = head(f);
+  const reads: [string, string, string | null][] = [];
+  const watcher: StoreObserver = { begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token, _source, method, mode, id) => { reads.push([method, mode, id ?? null]); } };
+  // First through an opaque view: the membership capture keeps its complete traversal — a capture's list reaches the Store as a list.
+  const view = captureView(f.store, { rows: new Map() }).view;
+  const previous = observeStore(watcher);
+  try {
+    ok(readSeriesMembership(view, { project }));
+    assert.ok(reads.some(row => row[0] === 'list' && row[2] === 'repair-series'), "An opaque view keeps the whole-kind walk");
+    assert.ok(!reads.some(row => row[0] === 'identities'), "No identity selection runs under an unproven view");
+    ok(prepareSeriesLineAdmission(view, project, reference(admitted)));
+    reads.length = 0;
+    // On the genuine Store the same admission and the membership read are prefix-selected.
+    ok(prepareSeriesLineAdmission(f.store, project, reference(admitted)));
+    ok(readSeriesMembership(f.store, { project }));
+    assert.ok(reads.some(row => row[0] === 'identities' && row[1] === 'prefix' && row[2] === `repair-series:${project}:`),
+      "The project's own lines come from the indexed prefix range");
+    assert.ok(!reads.some(row => row[0] === 'list'), "No kind list is read on the proven Store");
+  } finally { observeStore(previous); }
+  // A foreign project's corrupt line is outside the prefix: it is never decoded and never blocks admission.
+  f.store.write({ id: 'repair-series:foreign:masquerade', kind: 'repair-series', expected: 0, value: { projectId: 'foreign' } });
+  const database = new DatabaseSync(f.store.path);
+  try {
+    database.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    database.prepare('UPDATE revisions SET body=? WHERE entity_id=?').run('null', 'repair-series:foreign:masquerade');
+  } finally { database.close(); }
+  ok(prepareSeriesLineAdmission(f.store, project, reference(admitted)));
+  const membership = readSeriesMembership(f.store, { project });
+  assert.ok(membership.ok, `Foreign corruption stays unread: ${membership.ok ? 'ok' : membership.refusal.code}`);
+});
+
+test("Q4-F1 (поправка к таблице C, решение оркестратора): on the legacy/absent-membership branch admission keeps captureMembership — a nonzero walk that never leaves repair-series:<project>:, so a foreign project's corrupt line cannot interfere", t => {
+  const f = fixture(t);
+  f.series();
+  const admitted = head(f);
+  // A foreign project's corrupt line waits outside the project's range before the admission runs.
+  f.store.write({ id: 'repair-series:foreign:f1', kind: 'repair-series', expected: 0, value: { projectId: 'foreign' } });
+  const database = new DatabaseSync(f.store.path);
+  try {
+    database.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    database.prepare('UPDATE revisions SET body=? WHERE entity_id=?').run('null', 'repair-series:foreign:f1');
+  } finally { database.close(); }
+  const reads: [string, string, string | null][] = [];
+  const watcher: StoreObserver = { begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token, _source, method, mode, id) => { reads.push([method, mode, id ?? null]); } };
+  const previous = observeStore(watcher);
+  try {
+    const admission = ok(prepareSeriesLineAdmission(f.store, project, reference(admitted)));
+    assert.equal(admission.participation, 'legacy', 'No membership and no managed marks admit the legacy line');
+    const prefix = `repair-series:${project}:`;
+    assert.ok(reads.length > 0, 'Table C as amended: legacy absence is decided BY the bounded walk, not without one');
+    assert.ok(reads.some(row => row[0] === 'identities' && row[1] === 'prefix' && row[2] === prefix),
+      "The project's own lines are enumerated through the indexed prefix range");
+    for (const [method, , id] of reads)
+      assert.ok(id === null || !id.startsWith('repair-series:') || id.startsWith(prefix),
+        `${method} ${id}: no series read leaves the project's own range`);
+    assert.ok(!reads.some(row => row[0] === 'get' && row[2] === 'repair-series:foreign:f1'),
+      'The corrupt foreign line is never decoded');
+    assert.ok(!reads.some(row => row[0] === 'list'), 'No whole-kind list is read on the proven Store');
+  } finally { observeStore(previous); }
+});
+
+test("Q4-F1 (таблица C): a managed line whose project lost its membership record keeps the previous refusal on the same entrance", t => {
+  const f = product(fixture(t));
+  const admitted = head(f);
+  erase(f.store, seriesMembershipId(project));
+  // The exact basis walks before the capture: the activation's applied record names the lost membership,
+  // so the same entrance answers with the same previous refusal as on the base.
+  refusedWith(prepareSeriesLineAdmission(f.store, project, reference(admitted)), 'record_missing');
+});
+
+test("Q4-F5 (№2568-2): a late corrupt revision named by the exact basis refuses admission; the same revision left unnamed is never read", t => {
+  const f = product(fixture(t));
+  const admitted = head(f);
+  const pointer = f.store.get(seriesCurrentId(project))!;
+  const applied = (pointer.value as unknown as { applied: Ref }).applied;
+  const appliedHead = f.store.get(applied.id)!;
+  // A later revision of the applied record: written lawfully, then corrupted in place — the pointer still names rev 1.
+  const late = f.store.write({ id: applied.id, kind: appliedHead.kind, expected: appliedHead.revision,
+    value: { ...appliedHead.value as object } });
+  const database = new DatabaseSync(f.store.path);
+  try {
+    database.exec('DROP TRIGGER IF EXISTS revisions_no_update');
+    database.prepare('UPDATE revisions SET body=? WHERE entity_id=? AND revision=?').run('null', applied.id, late.revision);
+  } finally { database.close(); }
+  ok(prepareSeriesLineAdmission(f.store, project, reference(admitted)));
+  assert.ok('participation' in ok(prepareSeriesLineAdmission(f.store, project, reference(admitted))),
+    'The unnamed late revision is outside the exact proof spine — it is never read');
+  // Now the pointer names the corrupt revision: the same bytes, this time inside the proof basis.
+  f.store.write({ id: pointer.id, kind: pointer.kind, expected: pointer.revision,
+    value: { ...pointer.value as object, applied: { id: applied.id, revision: late.revision, hash: late.hash } } });
+  const corrupt = (error: unknown) => error instanceof EngineError && error.code === 'record_corrupt';
+  assert.throws(() => prepareSeriesLineAdmission(f.store, project, reference(admitted)), corrupt,
+    'A basis naming the corrupt revision reads it and refuses');
 });
