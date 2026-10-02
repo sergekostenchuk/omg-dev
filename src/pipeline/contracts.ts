@@ -1,4 +1,4 @@
-import type { Json } from "../canonical.js";
+import { HASH_RE, type Json } from "../canonical.js";
 import type { Revision, TransactionGuard } from "../storage/store.js";
 
 export const STAGES = ["discovery", "concept", "operation-map", "specification", "features", "om-g2", "compilation", "execution"] as const;
@@ -35,7 +35,7 @@ export function isRef(value: unknown): value is Ref {
   if (!value || typeof value !== "object") return false;
   const ref = value as Record<string, unknown>;
   return typeof ref['id'] === "string" && ref['id'].length > 0 && Number.isSafeInteger(ref['revision'])
-    && Number(ref['revision']) > 0 && typeof ref['hash'] === "string" && /^[a-f0-9]{64}$/.test(ref['hash']);
+    && Number(ref['revision']) > 0 && typeof ref['hash'] === "string" && HASH_RE.test(ref['hash']);
 }
 export function predecessor(stage: Stage): Stage | null {
   const index = STAGES.indexOf(stage);

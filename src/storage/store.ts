@@ -1,7 +1,7 @@
 import { mkdirSync, lstatSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { canonical, digest, type Json } from "../canonical.js";
+import { canonical, digest, HASH_RE, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { migrate } from "./schema.js";
 import { createSnapshot, type Snapshot, type SnapshotOptions } from "./snapshots.js";
@@ -14,7 +14,9 @@ export interface ReadGuard { id: string; revision: number; hash: string }
 export interface AbsentGuard { id: string; absent: true }
 export type TransactionGuard = ReadGuard | AbsentGuard;
 
-function transactionGuards(value: unknown): TransactionGuard[] {
+/** The single guard-form check (Q5): every caller — this Store's writes, admission-guard normalization and capture
+ * views — shares it, so a malformed guard is refused identically wherever it arrives. */
+export function checkTransactionGuards(value: unknown): TransactionGuard[] {
   requireCondition(Array.isArray(value), "invalid_guard", "Transaction guards must be an array");
   return Array.from(value, (guard: unknown, index): TransactionGuard => {
     requireCondition(guard !== null && typeof guard === "object" && !Array.isArray(guard),
@@ -30,7 +32,7 @@ function transactionGuards(value: unknown): TransactionGuard[] {
     }
     const revision = fields['revision'], hash = fields['hash'];
     requireCondition(typeof revision === "number" && Number.isSafeInteger(revision) && revision > 0
-      && typeof hash === "string" && /^[a-f0-9]{64}$/i.test(hash),
+      && typeof hash === "string" && HASH_RE.test(hash),
     "invalid_guard", `Guard ${index} for ${id} needs an exact revision and SHA-256 hash`);
     return { id, revision, hash };
   });
@@ -165,7 +167,7 @@ export class Store {
     // Even a refused or rolled-back attempt: its guard reads are no pure proof (№2302-2).
     observer?.write(this);
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
-    const checkedGuards = transactionGuards(guards);
+    const checkedGuards = checkTransactionGuards(guards);
     const ids = new Set<string>();
     const prepared = inputs.map(input => {
       requireCondition(typeof input.id === "string" && input.id.length > 0 && input.id.length <= 200

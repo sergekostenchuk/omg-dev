@@ -1,7 +1,7 @@
 import { types } from 'node:util';
 import { EngineError, requireCondition } from '../errors.js';
 import { canonical, hashJson } from '../canonical.js';
-import { noteUntracedRead, noteWriteAttempt, Store, type Revision, type TransactionGuard, type Write } from './store.js';
+import { checkTransactionGuards, noteUntracedRead, noteWriteAttempt, Store, type Revision, type TransactionGuard, type Write } from './store.js';
 
 /** One storage view over a Store or a nearer view (№1728): the single
  * interception of BOTH write methods. One public call is exactly one policy
@@ -197,22 +197,6 @@ function validateWriteForm(write: Write): void {
   canonical(write.value); // serializability: the same error the Store would surface
 }
 
-function validateGuardForm(guard: TransactionGuard, index: number): void {
-  requireCondition(guard !== null && typeof guard === 'object' && !Array.isArray(guard),
-    'invalid_guard', `Guard ${index} must be a record`);
-  const fields = guard as unknown as Record<string, unknown>;
-  const id = fields['id'];
-  requireCondition(typeof id === 'string' && id.length > 0, 'invalid_guard', `Guard ${index} needs a nonempty ID`);
-  if ('absent' in fields)
-    requireCondition(fields['absent'] === true && !('revision' in fields) && !('hash' in fields),
-      'invalid_guard', `Guard ${index} for ${String(id)} must declare only absence`);
-  else
-    requireCondition(typeof fields['revision'] === 'number' && Number.isSafeInteger(fields['revision'])
-      && (fields['revision'] as number) > 0
-      && typeof fields['hash'] === 'string' && /^[a-f0-9]{64}$/i.test(fields['hash'] as string),
-      'invalid_guard', `Guard ${index} for ${String(id)} needs an exact revision and SHA-256 hash`);
-}
-
 /** The shared narrow core of both capture consumers (№1734-7): batch form
  * checks with the Store's own codes, one capture overlay, detached copies.
  * This checks the API arguments and the pack's atomicity — it never promises
@@ -231,7 +215,8 @@ export function captureView(target: Store, hooks: CaptureHooks = {}): { view: St
   const policy: StoreViewPolicy = {
     ...(overlay ? { get: overlay } : {}), capture: true,
     write(inputs, callerGuards) {
-      callerGuards.forEach(validateGuardForm);
+      // The same form check Store.writeMany applies (Q5): a malformed guard is refused at capture, not at commit.
+      const checkedGuards = checkTransactionGuards(callerGuards);
       // Validate the whole batch before publishing any element (№1728-2).
       const seen = new Set<string>();
       const prepared = inputs.map(input => {
@@ -255,13 +240,13 @@ export function captureView(target: Store, hooks: CaptureHooks = {}): { view: St
           value: JSON.parse(canonical(input.value)) as unknown };
       });
       if (hooks.absentGuards === 'refuse')
-        for (const guard of callerGuards)
+        for (const guard of checkedGuards)
           if ('absent' in guard)
             throw new EngineError('store_view_guard_unsupported',
               `This capture cannot carry the absent guard '${guard.id}'`, { id: guard.id });
       // Only now publish: accumulated writes keep the caller's exact expected;
       // input, returned Revision and the accumulated write share no mutable cell.
-      guards.push(...callerGuards);
+      guards.push(...checkedGuards);
       return prepared.map(write => {
         const accumulated: Write = { id: write.id, kind: write.kind, expected: write.expected,
           value: JSON.parse(canonical(write.value)) };

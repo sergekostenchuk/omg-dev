@@ -1,4 +1,4 @@
-import type { Json } from "../canonical.js";
+import { HASH_RE, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef } from "../pipeline/contracts.js";
 import type { Revision, Store, TransactionGuard, Write } from "../storage/store.js";
@@ -160,7 +160,7 @@ function referenceField(value: unknown): string {
   const ref = value as Record<string, unknown>;
   if (typeof ref['id'] !== "string" || ref['id'].length === 0) return "id";
   if (!Number.isSafeInteger(ref['revision']) || Number(ref['revision']) <= 0) return "revision";
-  if (typeof ref['hash'] !== "string" || !/^[a-f0-9]{64}$/.test(ref['hash'])) return "hash";
+  if (typeof ref['hash'] !== "string" || !HASH_RE.test(ref['hash'])) return "hash";
   return "reference";
 }
 

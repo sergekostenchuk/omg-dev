@@ -7,9 +7,12 @@ import { DatabaseSync } from "node:sqlite";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { observeStore, Store, storeReads, type AbsentGuard, type ReadGuard, type StoreObserver, type TransactionGuard } from "../src/storage/store.js";
+import { observeStore, Store, storeReads, checkTransactionGuards, type AbsentGuard, type ReadGuard, type StoreObserver, type TransactionGuard } from "../src/storage/store.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { isRef } from "../src/pipeline/contracts.js";
+import { HASH_PATTERN, HASH_RE } from "../src/canonical.js";
+import { uniqueTransactionGuards } from "../src/runtime/environment.js";
+import { readOmAdmissionGuards } from "../src/om/input.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
 import { EngineError } from "../src/errors.js";
 
@@ -182,7 +185,7 @@ test("mixed positive and absence guards retain duplicates and never erase contra
     assert.equal(store.get("forbidden"), null);
   }
   for (const guard of [{ ...positive, hash: "0".repeat(64) }, { ...positive, revision: 2 },
-    { ...positive, id: "foreign-source" }, { ...positive, hash: positive.hash.toUpperCase() }]) {
+    { ...positive, id: "foreign-source" }]) {
     assert.throws(() => store.writeMany([], [guard]), code("input_stale"));
   }
   const results = store.writeMany([
@@ -204,7 +207,7 @@ test("all guard forms are validated before database checks and writes", t => {
     { ...valid, absent: true }, { id: "guarded", absent: true, revision: undefined },
     { id: "guarded", absent: true, hash: undefined },
     ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1", null].map(revision => ({ ...valid, revision })),
-    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), 1, null].map(hash => ({ ...valid, hash })),
+    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), "A".repeat(64), 1, null].map(hash => ({ ...valid, hash })),
   ];
   const writes = ["left", "right"].map(id => ({ id, kind: "proof", expected: 0, value: {} }));
   for (const guard of malformed) {
@@ -215,6 +218,39 @@ test("all guard forms are validated before database checks and writes", t => {
   }
   assert.deepEqual(store.list(), []);
   assert.equal(store.writeMany(writes).length, 2);
+});
+
+test("a capture view refuses a malformed guard at capture, agreeing with the commit", t => {
+  const { store } = fixture(t);
+  const source = store.write({ id: "source", kind: "source", expected: 0, value: {} });
+  const capture = captureView(store, { rows: new Map() });
+  const malformed = { id: source.id, revision: source.revision, hash: source.hash.toUpperCase() };
+  assert.throws(() => capture.view.writeMany([{ id: "x", kind: "proof", expected: 0, value: {} }], [malformed]),
+    code("invalid_guard"));
+  assert.throws(() => store.writeMany([], [malformed]), code("invalid_guard"));
+  assert.deepEqual(capture.writes, []);
+  assert.deepEqual(capture.guards, []);
+});
+
+test("the exported hash-form surface cannot be mutated into accepting an uppercase hash", t => {
+  const { store } = fixture(t);
+  const source = store.write({ id: "source", kind: "source", expected: 0, value: {} });
+  const malformed = { id: source.id, revision: source.revision, hash: source.hash.toUpperCase() };
+  const capture = captureView(store, { rows: new Map() });
+  const mutable = HASH_RE as unknown as Record<string, unknown>;
+  try {
+    assert.throws(() => (mutable['compile'] as (s: string, f: string) => void)(HASH_PATTERN, "i"));
+    assert.equal(isRef(malformed), false);
+    assert.throws(() => checkTransactionGuards([malformed]), code("invalid_guard"));
+    assert.throws(() => uniqueTransactionGuards([malformed]), code("invalid_guard"));
+    assert.throws(() => store.writeMany([], [malformed]), code("invalid_guard"));
+    assert.throws(() => capture.view.writeMany([], [malformed]), code("invalid_guard"));
+    const om = readOmAdmissionGuards([malformed], "gate", "G1");
+    assert.equal(om.ok, false);
+    if (!om.ok) assert.equal(om.refusal.code, "om_admission_guard_invalid");
+    assert.deepEqual(capture.writes, []);
+    assert.deepEqual(capture.guards, []);
+  } finally { try { (mutable['compile'] as (s: string) => void)(HASH_PATTERN); } catch { /* absent */ } }
 });
 
 test("transaction guards read database heads directly and positive guards retain checksum validation", t => {

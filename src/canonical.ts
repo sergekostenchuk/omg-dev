@@ -39,3 +39,11 @@ export const compareKeys = (left: string, right: string): number => (left < righ
 
 export const digest = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 export const hashJson = (value: unknown): string => digest(canonical(value));
+
+/** The one SHA-256 hex form. Stored hashes are digest() output — lowercase only, so a corrupted form is a malformed
+ * input, never a stale one (Q5). HASH_PATTERN is the schema string; HASH_RE is an immutable facade: the RegExp it
+ * delegates to never leaves this module, so no caller can widen the shared rule through compile or lastIndex
+ * (№2709 — a frozen RegExp still compiles; a frozen plain object has no internal matcher to reach). */
+export const HASH_PATTERN = "^[a-f0-9]{64}$";
+const hashRule = new RegExp(HASH_PATTERN);
+export const HASH_RE: Readonly<{ test(value: string): boolean }> = Object.freeze({ test: value => hashRule.test(value) });

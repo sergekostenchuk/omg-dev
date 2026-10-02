@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { checkTransactionGuards, Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { digest, hashJson } from "../canonical.js";
 import type { Command, Graph } from "../graph/model.js";
@@ -18,24 +18,7 @@ export function isRequestCapacityChars(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 export function uniqueTransactionGuards(values: readonly TransactionGuard[]): TransactionGuard[] {
-  requireCondition(Array.isArray(values), "invalid_guard", "Transaction guards must be an array");
-  const checked = Array.from(values, (guard: unknown, index): TransactionGuard => {
-    requireCondition(guard !== null && typeof guard === "object" && !Array.isArray(guard),
-      "invalid_guard", `Guard ${index} must be a record`);
-    const fields = guard as Record<string, unknown>;
-    const id = fields['id'];
-    requireCondition(typeof id === "string" && id.length > 0, "invalid_guard", `Guard ${index} needs a nonempty ID`);
-    if ('absent' in fields) {
-      requireCondition(fields['absent'] === true && !('revision' in fields) && !('hash' in fields),
-        "invalid_guard", `Guard ${index} for ${id} must declare only absence`);
-      return { id, absent: true };
-    }
-    const revision = fields['revision'], hash = fields['hash'];
-    requireCondition(typeof revision === "number" && Number.isSafeInteger(revision) && revision > 0
-      && typeof hash === "string" && /^[a-f0-9]{64}$/i.test(hash),
-    "invalid_guard", `Guard ${index} for ${id} needs an exact revision and SHA-256 hash`);
-    return { id, revision, hash };
-  });
+  const checked = checkTransactionGuards(values);
   const key = (guard: TransactionGuard) => JSON.stringify('absent' in guard
     ? [guard.id, 'absent'] : [guard.id, 'ref', guard.revision, guard.hash]);
   // Preserve uniqueRefs ordering for positive guards while retaining both variants of an address.
