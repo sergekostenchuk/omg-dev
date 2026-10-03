@@ -1970,10 +1970,11 @@
 - Отдаёт: —
 - Читает записи: source:; om-read-delivery
 - Пишет записи: om-read-delivery
-- Разрешённые пути: `src/om/model-call.ts`, `src/om/question-packet.ts`, `test/om-model-call.test.ts`, `test/om-question-packet.test.ts`
+- Разрешённые пути: `src/om/answer-form.ts`, `src/om/model-call.ts`, `src/om/question-packet.ts`, `src/om/packet-brief.ts`, `test/om-answer-form.test.ts`, `test/om-model-call.test.ts`, `test/om-question-packet.test.ts`, `test/om-packet-brief.test.ts`
 - Из движка как есть: method/brief.mjs (правила 1–13, отбор материала), method/engine.mjs (цепочка приёмки), method/run4.mjs (порядок по потокам, контекст соседей), AUDIT-REPORT.md и EXPERIMENT-REVIEW.md (~/REPORTS/audit/omg-live-calls-031026/); наблюдение №57 (evidence.ts:68–70, accepted-answer.ts:468)
 - После: MP1, MP2
 - Тесты сверх обязательных:
+  - ДОГОВОР Codex-omg №2981 (опись Opus №2977): одна задача без деления, 8 путей; эра — манифест readings {contract:om-brief-readings/v1, snapshots, entries}, пакет без readings — прежний вывод; адресное чтение — data {contract:om-read-result/v1, outcome complete|clipped|outside|missing} с requested/served/length/unit utf16, json-pointer missing с parent/type/keys; E3 не проверяет длину через citationGround; финальные цитаты — прежняя строгость; новизна по фактически выданным сведениям (EOF с другим end — не новое); перенос из доказанных предков (части, попытки той же линии/goal) целыми доставками, readContinuationEvidence исторически + отдельная актуальность, набор фиксируется при первой выдаче, при вместимости опускается первым; таблица 24 строки; исполнитель Opus, код после MP2
   - ДО КОДА — опись и код — воркер Astra или Opus (кто первым освободится), ДОГОВОР И РЕВЬЮ — Codex-omg (слово пользователя 03.10 ~21:40): граница «чтение» против «цитата»; каталог; перенос прочитанного и эра; таблица исходов
   - регрессии: диапазон за концом — адресный результат с длиной; цитата за концом — прежний отказ; перенос неизменившегося источника между частями; изменившийся источник не выдаётся как текущий
 
