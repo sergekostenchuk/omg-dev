@@ -210,7 +210,7 @@ function ready(f: ReturnType<typeof product>) {
   return { packet, request };
 }
 function fact(f: ReturnType<typeof product>) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
     citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
 }
 

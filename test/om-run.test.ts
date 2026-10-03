@@ -167,7 +167,7 @@ type Fixture = ReturnType<typeof runFixture>;
 function addressAll(f: Fixture, routes: Ref, kind = "repository-fact") {
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
   const batch = saved.batches.find(item => item.model === "MC2" && item.task === "input-field" && item.items.every(row => row.consumers.length === 0))!;
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: { consumer: "garden-consume-block", kind } })) } };
 }
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
@@ -176,7 +176,7 @@ function factsAll(f: Fixture, routes: Ref, value: unknown = { answer: "UTF-8" })
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
   const batch = saved.batches.find(item => item.model === "MC1" && item.task === "fact")!;
   const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ questionId: item.gap, value, citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage };
 }
@@ -316,7 +316,7 @@ const stopAnswer = (f: Fixture, decided: boolean) => ({ research: { protocol: "o
 function cannotAnswer(f: Fixture, routes: Ref) {
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
   const batch = saved.batches.find(item => item.model === "MC2" && item.task === "input-field" && item.items.every(row => row.consumers.length === 0))!;
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
     action: "cannot_answer", reason: "The requested information is unavailable" }, usage };
 }
 
@@ -673,7 +673,7 @@ test("H1.2 R7 R7a R8 6 C54 M5 asks the owner while the independent block is work
   const b = f.bases("h12-independent"), request = f.request(b);
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: m5.items.map(item => item.gap), action: "need_owner",
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: m5.items.map(item => item.gap), action: "need_owner",
     reason: "The owner must name the optional format", decision: "Name it" }, usage }, factsAll(f, b.routes), assessor("supported")]);
   ok(startRun(f.store, { project }));
   const end = await ends(f, request, 80);
@@ -700,7 +700,7 @@ function frameAnswer(f: Fixture, step: { request: unknown }) {
   const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
   const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
   if (batch.model !== "MC1") return nodeAnswer(f, step);
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap), action: "need_owner",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap), action: "need_owner",
     reason: "Need a concrete source", decision: "Choose the source" }, usage };
 }
 
@@ -740,7 +740,7 @@ test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep the
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
   const facts = saved.batches.find(item => item.model === "MC1")!;
-  const ask = (gaps: string[], reason: string) => ({ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: gaps,
+  const ask = (gaps: string[], reason: string) => ({ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: gaps,
     action: "need_owner", reason, decision: "Decide it" }, usage });
   f.steps([ask(m5.items.map(item => item.gap), "The optional format is not named"), ask(facts.items.map(item => item.gap), "The encoding source is not named")]);
   ok(startRun(f.store, { project }));
@@ -788,10 +788,10 @@ function mixedAnswer(f: Fixture, step: { request: unknown }) {
   const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
   const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
   const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
-  if (batch.model === "MC2") return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+  if (batch.model === "MC2") return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
     action: "need_owner", reason: "Only the design decision needs the owner", decision: "Choose the design" }, usage };
   const brief = f.store.get<{ content: string }>(`source:${project}:brief`)!;
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", results: batch.items.map(item => ({
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.map(item => ({
     questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(brief), selector: { kind: "text-range", start: 0, end: brief.value.content.length } }] })) }, usage };
 }
 
@@ -1042,7 +1042,7 @@ test("H1.2 R7 R10a 15 16 C33 need_owner of a goal ends the pass on that goal at 
   const { m5, second, request } = await blockBases(f);
   const saved = f.store.get<RoutesRecord>(second.routes.id, second.routes.revision)!.value;
   const gap = saved.batches.find(item => item.model === "MC1")!.items[0]!.gap;
-  f.steps([m5, { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: [gap], action: "need_owner",
+  f.steps([m5, { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: [gap], action: "need_owner",
     reason: "Need a concrete source", decision: "Choose the source" }, usage }]);
   const end = await ends(f, request);
   assert.equal(end.performed.at(-1), "close", JSON.stringify(end.state));
@@ -1117,7 +1117,7 @@ test("H1.2 R12 R10a 27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2
       ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
+  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
   const performed: string[] = [];
   let phase = "", dirty = false;
   const readme = join(workspace, "README.md"), original = readFileSync(readme);
@@ -1191,7 +1191,7 @@ function nodeAnswer(f: Fixture, step: { request: unknown }) {
   const proposal = { nodes: [node], fills: obligations.map(item => ({ obligation: item.id, node: node.id,
     ...(item.kind === "connection-end" ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", proposal }, usage };
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal }, usage };
 }
 
 test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits for both, one bound C5, machine bases over it, a D2 event per goal and each own G7 across second stores, then L3", async t => {
@@ -1342,7 +1342,7 @@ function worksFixture(t: test.TestContext, late = false) {
         .map(item => ({ obligation: item.id, node: work.id, ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
         localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
         removes: [], replaces: [], redefines: [] };
-      steps.push({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage });
+      steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage });
       writeFileSync(scenario, JSON.stringify({ steps }));
     } };
 }
@@ -1439,7 +1439,7 @@ test("6 C54 H1 a lawfully changed required condition of an unfinished assignment
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
   // M5 waits for its owner, so the independent block is worked (row 3); its first packet is chosen.
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: m5.items.map(item => item.gap), action: "need_owner",
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: m5.items.map(item => item.gap), action: "need_owner",
     reason: "The owner must name the optional format", decision: "Name it" }, usage }]);
   ok(startRun(f.store, { project }));
   // The block's first packet is chosen (after M5 waits for its owner).
@@ -1794,7 +1794,7 @@ function nodeRefusal(f: { store: Store }, step: { request: unknown }) {
   const saved = (step.request as { packet: Ref }).packet;
   const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
   const questions = (packet.value.packet as unknown as { questions: { id: string }[] }).questions.map(row => row.id);
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: questions, action: "cannot_answer",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: questions, action: "cannot_answer",
     reason: "The requested information is unavailable" }, usage };
 }
 
@@ -2322,7 +2322,7 @@ test("H1.5 №2166 п.3 →№2221 a plan saved before this rule that holds an u
   const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
   openPlanned(f, bases, "garden-consume-block", [batch]);
   const request = f.request();
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
   const end = await ends(f, request, 12);
   assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
   assert.deepEqual(actions(f.store), ["register"], "The check is registered; the unserved root is neither packed nor cycled");
@@ -2389,7 +2389,7 @@ const LP3_BASE_COMMIT = "d519a6036f8b2cc4aee823ce24d7160262a08fb9";
 function lp3Need(f: Fixture, routes: Ref, reads: unknown[]) {
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
   const batch = saved.batches.find(item => item.model === "MC2" && item.task === "input-field" && item.items.every(row => row.consumers.length === 0))!;
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source", questionIds: batch.items.map(item => item.gap),
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source", questionIds: batch.items.map(item => item.gap),
     missing: "Need the addressed data", reads }, usage };
 }
 /** Where the root packet of the first mechanism attempt stands among its work's products against its blocked continuation. */
@@ -2528,7 +2528,7 @@ test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context r
         answered.add(ref.id);
         const saved = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!.value;
         assert.deepEqual([saved.packetContract, saved.state], ["om-packet/works-v1", "ready"]);
-        steps.push({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+        steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
           questionIds: (saved.packet as { questions: { id: string }[] }).questions.map(question => question.id),
           missing: "Read the three supplied context values", reads }, usage });
         writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps }));
@@ -2646,7 +2646,7 @@ test("LP4 (№2887 rows 1, 4, 9, §6.3, §6.4, §6.6) an addressed file the firs
       const packet = (state!.step!.request as { packet: Ref }).packet;
       if (cycled.some(ref => ref.id === packet.id)) continue;
       cycled.push(packet);
-      if (cycled.length === (hang === "first" ? 1 : 2)) steps.push({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+      if (cycled.length === (hang === "first" ? 1 : 2)) steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
         questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage });
       else { f.answer(packet); steps.push((JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps.at(-1)); }
       writeFileSync(scenario, JSON.stringify({ steps }));
@@ -2739,16 +2739,32 @@ out({ seen, request });`,
 test("LP4 (№2902, rows 3/4) a saved cycle whose step ceased, while its root also has a direct cause of higher priority (a lawfully replaced B1), is not performed: saved as the step or — by the code 202c470 in its own process — as the wait on completion_ceased, the new code goes back to the choice, which ceases the root by its direct cause, without a stop on completion_ceased and without another send", async t => {
   for (const saved of ["step", "waiting"] as const) await t.test(saved, async t => {
     const f = worksFixture(t);
-    ok(startRun(f.store, { project }));
     let step: RunStep | null = null;
-    for (let index = 0; index < 40 && !step; index++) {
-      const state = ok(await advanceRun(f.store, f.request)).record.value.state;
-      assert.notEqual(state.phase, "waiting", JSON.stringify(state));
-      if (state.phase === "step" && state.step.action === "cycle") step = state.step as unknown as RunStep;
+    if (saved === "waiting") {
+      // LP1 transfer: 202c470 can only write its old waiting state over a packet of its own era.
+      step = atCommit(f, LP4_COMMITS["202c470"], "lp4-direct-step", `const { startRun, advanceRun } = await import(src('om/run.js'));
+take(startRun(store, { project: args.project }));
+let step = null;
+for (let index = 0; index < 40 && !step; index++) {
+  const state = take(await advanceRun(store, args.request)).record.value.state;
+  if (state.phase === 'waiting') throw new Error(JSON.stringify(state));
+  if (state.phase === 'step' && state.step.action === 'cycle') step = state.step;
+}
+out(step);`, { project, request: f.request }) as RunStep | null;
+      f.restart();
+    } else {
+      ok(startRun(f.store, { project }));
+      for (let index = 0; index < 40 && !step; index++) {
+        const state = ok(await advanceRun(f.store, f.request)).record.value.state;
+        assert.notEqual(state.phase, "waiting", JSON.stringify(state));
+        if (state.phase === "step" && state.step.action === "cycle") step = state.step as unknown as RunStep;
+      }
     }
     assert.ok(step, "A cycle is chosen");
     const packet = (step.request as unknown as { packet: Ref }).packet;
-    writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps: [{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+    assert.equal(f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.answerProtocol,
+      saved === "waiting" ? "omg-answer/v2" : "omg-answer/v3");
+    writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
       questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage }] }));
     // The paid need_source is applied while the pass's cursor still stands on the saved step (the boundary of its recovery).
     const owner = ok(await runModelCall(f.store, step.request as never)).record.value.om.completionOwner!;

@@ -22,11 +22,17 @@ function options(args) {
   return result;
 }
 
-function replaceRequestId(value, requestId) {
-  if (value === "$requestId") return requestId;
-  if (Array.isArray(value)) return value.map(item => replaceRequestId(item, requestId));
+function replaceRequestMarkers(value, request) {
+  if (value === "$requestId") return request.requestId;
+  if (value === "$answerProtocol") {
+    const protocol = JSON.parse(request.prompt).responseForm?.protocol;
+    requireFixture(typeof protocol === "string" && protocol.trim().length > 0,
+      "$answerProtocol requires responseForm.protocol in the received packet");
+    return protocol;
+  }
+  if (Array.isArray(value)) return value.map(item => replaceRequestMarkers(item, request));
   if (isObject(value)) return Object.fromEntries(Object.entries(value)
-    .map(([key, item]) => [key, replaceRequestId(item, requestId)]));
+    .map(([key, item]) => [key, replaceRequestMarkers(item, request)]));
   return value;
 }
 
@@ -117,7 +123,7 @@ function main() {
   else process.stdout.write(`${JSON.stringify({
     protocol: "omg-agent/v1",
     requestId: request.requestId,
-    research: replaceRequestId(step.research, request.requestId),
+    research: replaceRequestMarkers(step.research, request),
     usage: has(step, "usage") ? step.usage : null,
     confirmed: has(step, "confirmed") ? step.confirmed : { model: null, effort: null, speed: null },
   })}\n`);

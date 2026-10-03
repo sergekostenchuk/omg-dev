@@ -359,7 +359,12 @@ out(reference(take(openSeries(store, args))));`, firstLine);
   const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal }, previous: [] };
-  const packet = valueOf((materialize ? writeQuestionPacket : prepareQuestionPacket)(store, packetRequest)).record;
+  // LP1: historical consumers receive the packet their producer issues, including its exact v2 candidate address.
+  const packet = seriesCommit ? h15AtCommit({ root, database }, seriesCommit, 'era-packet',
+    `const { ${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'} } = await import(src('om/question-packet.js'));
+out(take(${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'}(store, args)).record);`, packetRequest) as Revision<QuestionPacketRecord>
+    : valueOf((materialize ? writeQuestionPacket : prepareQuestionPacket)(store, packetRequest)).record;
+  if (seriesCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
   const frame = valueOf(prepareFrameProposals(store, sources.operations));
   const obligations = frame.frame.result.obligations.filter(item => item.upper.node === batch.node);
@@ -372,7 +377,7 @@ out(reference(take(openSeries(store, args))));`, firstLine);
   };
 }
 function e4Fact(f: ReturnType<typeof e4Fixture>) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
       citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
 }
@@ -389,7 +394,7 @@ function e4Node(f: ReturnType<typeof e4Fixture>, packet: Revision<QuestionPacket
   const proposal: PartProposalBody = { nodes: [node], fills: assigned.map(item => ({ obligation: item.id, node: node.id,
     ...(item.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', proposal };
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal };
 }
 
 /** A first works pass through C2/C4/C5, with a genuine owner assignment and no accepted L3. */
@@ -481,7 +486,7 @@ function e4WorksFixture(t: TestContext) {
         ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
       localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
       removes: [], replaces: [], redefines: [] };
-    return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', proposal,
+    return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal,
       bindings: position === plan.assignments.length - 1 ? bindings : [] };
   }
   return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured,
@@ -533,7 +538,7 @@ test('E4 saves node response, proposal, result and completed runtime atomically 
 
 test('E4 control and malformed outcomes complete their attempt once, preserve unanswered questions, and replay after restart', async t => {
   for (const action of ['need_owner', 'cannot_answer', 'pause', 'malformed', 'process_failure'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, action === 'need_owner' ? 1 : 0), common = { protocol: 'omg-answer/v2', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
+    const f = e4Fixture(t, 'fact', 100_000, action === 'need_owner' ? 1 : 0), common = { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
     f.steps([action === 'malformed' ? { research: { invalid: true }, usage }
       : action === 'process_failure' ? { rawStdout: '{broken', exitCode: 7 }
       : { research: { ...common, action, reason: 'Need a concrete source', ...(action === 'need_owner' ? { decision: 'Choose the source' } : {}) }, usage }]);
@@ -569,7 +574,7 @@ import { runModelCycle, readModelCycle, readContinuationEvidence, readPartAssemb
   assembleModelParts } from '../src/om/model-call.js';
 import { hashJson } from '../src/canonical.js';
 function e4NeedSource(f: ReturnType<typeof e4Fixture>, reads: unknown[]) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source',
     questionIds: f.batch.items.map(item => item.gap), missing: 'Need the addressed source data', reads };
 }
 
@@ -994,7 +999,7 @@ test('E4 analysis transport rejects another actual body and stale fresh-dispatch
 
 test('E4 mechanism field dispatch applies E3 decisions through D3 and does not manufacture accepted progress', async t => {
   const f = e4Fixture(t, 'field');
-  f.steps([{ research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
       value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) } }]);
   const sent = valueOf(await runModelCall(f.store, f.request));
@@ -1225,7 +1230,7 @@ test('E4 physical receipt survives a second race that prevents applying the reje
 
 test('E4 control completion cannot replace an outcome saved after the control response was received', async t => {
   const f = e4Fixture(t);
-  f.steps([{ research: { protocol: 'omg-answer/v2', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap],
+  f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap],
     action: 'cannot_answer', reason: 'The requested information is unavailable' }, usage }]);
   const get = f.store.get.bind(f.store); let completed: Revision<unknown> | null = null;
   f.store.get = ((id, revision) => {
@@ -1270,7 +1275,7 @@ function cycleCommitPhase(writes: Write[]): CycleCommitPhase {
   assert.fail(`Uncovered durable cycle transaction: ${writes.map(write => write.kind).join(', ')}`);
 }
 function e4CannotAnswer(f: ReturnType<typeof e4Fixture>) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'cannot_answer',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'cannot_answer',
     questionIds: [f.batch.items[0]!.gap], reason: 'The requested fact is unavailable in the named source' };
 }
 
@@ -2179,7 +2184,7 @@ test('14 H1.0a physical technical and control terminals keep their own diagnosti
   for (const kind of ['interrupted','awaiting-owner','refused','mechanism'] as const) await t.test(`${kind==='awaiting-owner'?'16':'14'} ${kind}`,async t => {
     const f=e4Fixture(t,kind==='mechanism'?'field':'fact',100_000,0,1000,true);
     const action=kind==='awaiting-owner'?'need_owner':'cannot_answer';
-    f.steps([kind==='interrupted' ? {exitCode:1,usage} : {research:{protocol:'omg-answer/v2',requestId:'$requestId',action,
+    f.steps([kind==='interrupted' ? {exitCode:1,usage} : {research:{protocol:'$answerProtocol',requestId:'$requestId',action,
       questionIds:[f.batch.items[0]!.gap],reason:'A concrete external source is required',...(action==='need_owner'?{decision:'Choose the source'}:{})},usage}]);
     const call=valueOf(await runModelCall(f.store,f.request));
     assert.ok(call.diagnostic);
@@ -2543,7 +2548,7 @@ test('10 H1.0a exact late paid bytes settle one recovered dispatch after G7 with
 
 test('34 H1.0a a completion ledger retains the exact journal context of a genuine mechanism origin analysis',async t=>{
   const f=e4Fixture(t,'field',100_000,0,1000,true);
-  f.steps([{research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'cannot_answer',
+  f.steps([{research:{protocol:'$answerProtocol',requestId:'$requestId',action:'cannot_answer',
     questionIds:[f.batch.items[0]!.gap],reason:'An external decision is required'},usage}]);
   valueOf(await runModelCall(f.store,f.request));
   const work=completionSnapshot(f);

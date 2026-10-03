@@ -137,7 +137,7 @@ function factFixture(t: TestContext) {
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(config),
     attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   const dispatch = { adapter: reference(adapter), config: reference(config) };
-  const original = { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  const original = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ questionId: item.gap, value: "UTF-8", citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage };
   const request = { project, packet: reference(packet), dispatch, role: "implementer" as const };
@@ -428,7 +428,7 @@ test("Т4 H1.3 an absent dispatch or pass and a masquerading control input are t
 
 test("R17 №2121-1 H1.3 a direct cycle keeps the one admission of its chain: a stop and resume between its first paid result and its continuation fence the old invocation, which sends nothing more", async t => {
   const f = factFixture(t);
-  const needSource = { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source", questionIds: [f.questionId],
+  const needSource = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source", questionIds: [f.questionId],
     missing: "Need the addressed source data", reads: [{ action: "read", path: "h13-source.txt", media: "text/plain" }] } };
   f.steps([needSource, f.original]);
   let resumed: Revision<RunControlRecord> | null = null;

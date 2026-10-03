@@ -1412,12 +1412,13 @@ const e4FixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs",
 
 const E50_COMMIT = "3eb5dac3c790ca988082840693969b06b5d81966";
 /**
- * Q3 (№2573-1): opens a series with the openSeries of one exact earlier commit, in its own process, so the line a
- * historical producer of that commit continues is of its own form. Every engine module comes from that commit.
+ * Q3 (№2573-1), LP1: a historical consumer receives its series and packet from the corresponding immutable producer.
+ * Every engine module comes from that commit, in its own process.
  */
-function openSeriesAt(root: string, path: string, commit: string, request: Json): Ref {
+function fixtureWriteAt<T>(root: string, path: string, commit: string,
+  operation: 'openSeries' | 'writeQuestionPacket', request: unknown): T {
   const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(root, "series-loader.mjs"), producer = join(root, "series-producer.mjs");
+  const loader = join(root, `${operation}-loader.mjs`), producer = join(root, `${operation}-producer.mjs`);
   const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
   writeFileSync(loader, `import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -1440,17 +1441,17 @@ const [repository, database, request] = process.argv.slice(2);
 const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
 const { Store } = await import(src('storage/store.js'));
 const { reference } = await import(src('pipeline/contracts.js'));
-const { openSeries } = await import(src('om/series.js'));
+const { ${operation} } = await import(src('${operation === 'openSeries' ? 'om/series.js' : 'om/question-packet.js'}'));
 const store = new Store(database);
 try {
-  const opened = openSeries(store, JSON.parse(request));
-  if (!opened.ok) throw Error(JSON.stringify(opened.refusal));
-  process.stdout.write(JSON.stringify(reference(opened.value)));
+  const written = ${operation}(store, JSON.parse(request));
+  if (!written.ok) throw Error(JSON.stringify(written.refusal));
+  process.stdout.write(JSON.stringify(${operation === 'openSeries' ? 'reference(written.value)' : 'written.value.record'}));
 } finally { store.close(); }`);
   const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
     { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
   return JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, path,
-    JSON.stringify(request)], { cwd: repository, encoding: "utf8", timeout: 60_000, maxBuffer: 10_000_000 })) as Ref;
+    JSON.stringify(request)], { cwd: repository, encoding: "utf8", timeout: 60_000, maxBuffer: 10_000_000 })) as T;
 }
 
 function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, seriesCommit?: string) {
@@ -1499,7 +1500,7 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const opening = { project, block, line: 1, slice: "e50-fact", predecessor: null, basis: null };
   // A historical producer continues a line of its own form: opened by its commit when the test asks for one (№2573-1).
-  if (seriesCommit) openSeriesAt(root, path, seriesCommit, opening);
+  if (seriesCommit) fixtureWriteAt<Ref>(root, path, seriesCommit, 'openSeries', opening);
   else deliveredOf(openSeries(store, opening));
   const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
@@ -1510,13 +1511,16 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
   const adapter = store.write({ id: `adapter:${project}:e50`, kind: "dispatch-adapter", expected: 0,
     value: { projectId: project, protocol: "codex-stdio" } });
-  const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
-    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const packetRequest = { project, routes: reference(routes), batch: batch.id,
+    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+  const packet = seriesCommit ? fixtureWriteAt<Revision<QuestionPacketRecord>>(root, path, seriesCommit, 'writeQuestionPacket', packetRequest)
+    : deliveredOf(writeQuestionPacket(store, packetRequest)).record;
+  if (seriesCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
   const questionId = batch.items[0]!.gap;
   const native = (packet as Revision<QuestionPacketRecord>).value.native.find(item => item.gap.id === `om-gap:${project}:${questionId}`)!;
   assert.ok(native);
   writeFileSync(join(root, "e50-source.txt"), "UTF-8 is the supported encoding.");
-  const originalStep = { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  const originalStep = { research: { protocol: seriesCommit ? "omg-answer/v2" : "$answerProtocol", requestId: "$requestId", action: "answer",
     results: [{ questionId, value: "UTF-8", citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] }] }, usage };
   writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));

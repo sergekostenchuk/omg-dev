@@ -856,7 +856,7 @@ function e4q(t: TestContext, managed = false) {
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
 }
 function e4qFact(f: ReturnType<typeof e4q>) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
       citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
 }

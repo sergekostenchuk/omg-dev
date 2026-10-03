@@ -422,7 +422,7 @@ console.log(JSON.stringify(replace(step.research)));
   const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: dispatched.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   const questionId = batch.items[0]!.gap;
-  const originalStep = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  const originalStep = { research: { protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
   writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));

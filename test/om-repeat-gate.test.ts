@@ -2484,7 +2484,7 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
   const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   writeFileSync(join(root, "e51-source.txt"), "UTF-8 is the supported encoding.");
-  const originalStep = { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  const originalStep = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ questionId: item.gap, value: "UTF-8", citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage: e51Usage };
   let secondOriginalStep = originalStep;
@@ -3808,7 +3808,7 @@ function m5Fixture(t: test.TestContext, managed = false) {
       environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
     return { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(config) }, role: "implementer" };
   };
-  const answer = (targets = batch.items.map(item => item.target), kind = "repository-fact") => ({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  const answer = (targets = batch.items.map(item => item.target), kind = "repository-fact") => ({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.filter(item => targets.includes(item.target)).map(item => ({ target: item.target, field: item.field, basis: item.record,
       value: { consumer: "garden-consume-block", kind } })) } });
   return { root, database, project, address, admission, goal, batch, routes, series, environment, call, answer,
@@ -4215,7 +4215,7 @@ test("C6 C7 H1.0d the key is the semantic addressing: another accepted kind is a
 
 test("O9 O17 H1.0d owner control accepts no addressing: the standalone finish keeps its own reason when no call of the attempt applied one", async t => {
   const f = m5Fixture(t);
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: [f.batch.items[0]!.gap],
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: [f.batch.items[0]!.gap],
     action: "need_owner", reason: "The consumer is the owner's choice", decision: "Choose the consumer" } }]);
   const sent = await runModelCall(f.store, f.call());
   const e4 = reference(f.store.list("model-call")[0]!);

@@ -1,13 +1,15 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
+import { Evidence } from '../src/evidence/evidence.js';
+import { assessFact } from '../src/om/assessment.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
@@ -27,7 +29,7 @@ import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CO
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
-import { checkAnswerForm, checkNodeAnswerForm } from '../src/om/answer-form.js';
+import { checkAnswerForm, prepareAnswerForm, checkNodeAnswerForm } from '../src/om/answer-form.js';
 import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
@@ -40,7 +42,7 @@ import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORI
 import { prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
+import { runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -608,13 +610,13 @@ function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<t
   const requestId = (record.value.packet as Record<string, Json>).requestId as string;
   assert.equal(typeof requestId, 'string');
   const responseForm = (record.value.packet as Record<string, any>).responseForm;
-  assert.equal(responseForm.protocol, PACKET_ANSWER_PROTOCOL); assert.equal(responseForm.requestId, requestId);
+  assert.equal(responseForm.protocol, record.value.answerProtocol); assert.equal(responseForm.requestId, requestId);
   const shape = responseForm.schema.oneOf[0].properties.proposal;
   assert.deepEqual([...shape.required].sort(), Object.keys(body).sort());
   assert.equal(shape.additionalProperties, false);
   const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(record), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body }) } };
+      raw: JSON.stringify({ protocol: record.value.answerProtocol, requestId, action: 'answer', proposal: body }) } };
   const response: Revision<PartResponseRecord> = options.pending ? { id: responseWrite.id, kind: responseWrite.kind,
     revision: 1, hash: hashJson(responseWrite.value), value: responseWrite.value as PartResponseRecord }
     : f.store.write<PartResponseRecord>(responseWrite);
@@ -1828,7 +1830,7 @@ async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' 
     const bindings: TaskObligationBinding[] = ledger.handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item as CarriedObligation)))
       .map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
         consumers: [{ node: work.id, tests: [...work.tests] }] }));
-    return { protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, action: 'answer', proposal, bindings };
+    return { protocol: packet.value.answerProtocol, requestId: payload.requestId, action: 'answer', proposal, bindings };
   }
   return { ...base, get store() { return store; }, root, database, ledger, gaps, lines, request, answer,
     restart() { store.close(); store = new Store(database); } };
@@ -2459,10 +2461,12 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
   assert.deepEqual(snapshot(f.store), before);
   const legacy = clone(ready.value) as QuestionPacketRecord;
   delete legacy.packetContract;
-  const legacyRequestId = hashJson({ protocol: PACKET_ANSWER_PROTOCOL, request });
+  legacy.answerProtocol = 'omg-answer/v2';
+  const legacyRequestId = hashJson({ protocol: legacy.answerProtocol, request });
   const legacyPayload = legacy.packet as Record<string, Json>;
   legacyPayload.version = 'om-question-packet/v2'; legacyPayload.requestId = legacyRequestId;
-  (legacyPayload.responseForm as Record<string, Json>).requestId = legacyRequestId;
+  legacyPayload.responseForm = { protocol: legacy.answerProtocol, requestId: legacyRequestId,
+    schema: clone(packetAnswerSchema('field', undefined, legacy.answerProtocol)) as Json };
   legacy.fullChars = canonical(legacyPayload).length;
   legacy.fingerprint = { hash: hashJson(legacyPayload), chars: canonical(legacyPayload).length, utf8Bytes: Buffer.byteLength(canonical(legacyPayload)) };
   const old = f.store.write({ id: `om-question-packet:${f.project}:${legacyRequestId}`, kind: 'question-packet', expected: 0, value: legacy });
@@ -2536,7 +2540,7 @@ function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<
     dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(packet.value.packet) as Json })).call;
   const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId,
-      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, action: 'need_source',
+      raw: JSON.stringify({ protocol: packet.value.answerProtocol, requestId: payload.requestId, action: 'need_source',
         questionIds: [...ids], missing: 'Need the exact original question text',
         reads: Array.isArray(read) ? read : [read ?? { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' }] }) } });
   const basis = { project: f.project, packet: reference(packet), call: reference(call), response: reference(response) };
@@ -2600,7 +2604,11 @@ test('E2 pre-continuation v2 blocked packets preserve their original refusal aft
   assert.equal(modern.value.state, 'blocked');
   const value = clone(modern.value) as QuestionPacketRecord;
   delete value.packetContract;
-  const requestId = hashJson({ protocol: PACKET_ANSWER_PROTOCOL, request: p.request });
+  value.answerProtocol = 'omg-answer/v2';
+  // Protocol/version markers and request hashes have equal length; only the schema changes the full payload size.
+  value.fullChars = modern.value.fullChars! - canonical(packetAnswerSchema('fact')).length
+    + canonical(packetAnswerSchema('fact', undefined, value.answerProtocol)).length;
+  const requestId = hashJson({ protocol: value.answerProtocol, request: p.request });
   const historical = f.store.write<QuestionPacketRecord>({ id: `om-question-packet:${f.project}:${requestId}`, kind: 'question-packet', expected: 0, value });
   f.restart();
   const before = snapshot(f.store);
@@ -2669,3 +2677,274 @@ test('E2 continuation preserves duplicate read positions using the same immutabl
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(continued) })), continued);
 });
 
+
+interface Lp1History {
+  root: string; database: string; project: string;
+  packets: Revision<QuestionPacketRecord>[];
+  parts: import('../src/om/question-packet.js').CheckedPartResult[];
+  next: QuestionPacketRequest | null;
+  raw: string;
+}
+function lp1OldProducer(t: TestContext): Lp1History[] {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-lp1-history-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(directory, 'base-loader.mjs');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/', root).href;
+  if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
+  const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+  let source = execFileSync('git', ['show', '7dd0848eb8f58df91b9c3e0952b619ba5688aeae:' + relative],
+    { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+  if (relative === 'test/om-question-packet.test.ts') {
+    source = source.replace(/import test,.*from 'node:test';/, 'const test = () => {};');
+    source += '\\nexport { packetFixture, expansionFixture, worksPacketFixture, partResult, sourceContinuation };';
+  }
+  return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+}
+`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const script = `
+const root = ${JSON.stringify(repositoryUrl)};
+const src = name => new URL('dist/src/' + name, root).href;
+const fixtures = await import(new URL('dist/test/om-question-packet.test.js', root).href);
+const { reference } = await import(src('pipeline/contracts.js'));
+const { writeQuestionPacket, prepareQuestionPacket, preparePartResult, readPartResult, partResponseId } = await import(src('om/question-packet.js'));
+const { recordCall } = await import(src('om/call-record.js'));
+const { writeGuarded } = await import(src('om/refs.js'));
+const ok = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const t = { after() {} };
+const output = [];
+{
+  const p = fixtures.packetFixture(t), f = p.f;
+  const first = ok(writeQuestionPacket(f.store, p.request)).record;
+  const delivered = fixtures.sourceContinuation(p, first);
+  const second = ok(writeQuestionPacket(f.store, { ...p.request, continuation: delivered.continuation })).record;
+  const repeated = fixtures.sourceContinuation(p, second);
+  output.push({ root: f.root, database: f.database, project: f.project, packets: [first, second], parts: [],
+    next: { ...p.request, continuation: repeated.continuation }, raw: delivered.response.value.raw });
+  f.store.close();
+}
+{
+  const p = fixtures.expansionFixture(t), f = p.f;
+  const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
+  const environment = p.environment(whole.fingerprint.chars - 1);
+  const request = { ...p.request, environment: reference(environment) };
+  const first = ok(writeQuestionPacket(f.store, request));
+  const part = fixtures.partResult(p, first);
+  output.push({ root: f.root, database: f.database, project: f.project, packets: [first.record],
+    parts: [ok(readPartResult(f.store, { project: f.project, record: reference(part.record) }))],
+    next: { ...request, previous: [{ packet: reference(first.record), proposal: reference(part.proposal), result: reference(part.record) }] },
+    raw: part.response.value.raw });
+  f.store.close();
+}
+{
+  const f = await fixtures.worksPacketFixture(t), request = f.request();
+  const packet = ok(writeQuestionPacket(f.store, request)).record;
+  const payload = packet.value.packet, raw = JSON.stringify(f.answer(packet));
+  const adapter = f.store.write({ id: 'adapter:garden:lp1', kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: 'config:garden:lp1', kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const series = f.store.get(request.attempt.series.id, request.attempt.series.revision);
+  const ids = new Set(payload.questions.map(q => q.id));
+  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
+    block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0].goal,
+    gaps: f.batch.items.filter(item => ids.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
+    dispatch: { adapter: reference(adapter), config: reference(config) }, packet: payload })).call;
+  const response = f.store.write({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
+    value: { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId, raw } });
+  const result = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call), response: reference(response) }));
+  ok(writeGuarded(f.store, { unit: 'LP1', target: result.record.id, writes: result.writes, guards: result.guards }));
+  output.push({ root: f.root, database: f.database, project: f.project, packets: [packet],
+    parts: [ok(readPartResult(f.store, { project: f.project, record: reference(result.record) }))], next: null, raw });
+  f.store.close();
+}
+process.stdout.write(JSON.stringify(output));
+`;
+  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+    '--input-type=module', '--eval', script], { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
+  const histories = JSON.parse(output) as Lp1History[];
+  for (const history of histories) t.after(() => rmSync(history.root, { recursive: true, force: true }));
+  return histories;
+}
+
+test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and parts retain their era across reopen and current admission', t => {
+  const histories = lp1OldProducer(t);
+  for (const history of histories) {
+    let store = new Store(history.database);
+    try {
+      const before = snapshot(store);
+      for (const packet of history.packets) {
+        assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
+        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+        assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
+        const repeated = ok(writeQuestionPacket(store, packet.value.request));
+        assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
+      }
+      for (const part of history.parts) {
+        assert.deepEqual(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), part);
+        assert.deepEqual(ok(preparePartResult(store, part.record.value.request)).writes, []);
+      }
+      const packet = history.packets[0]!;
+      const answer = { project: history.project, packet: reference(packet), raw: history.raw };
+      ok(prepareAnswerForm(store, answer));
+      rejected(readPacketAnswer(store, { ...answer, raw: JSON.stringify({ ...JSON.parse(history.raw), protocol: 'omg-answer/v3' }) }), 'part_answer_invalid');
+      assert.deepEqual(snapshot(store), before);
+      if (packet.value.packetContract === PACKET_CONTRACT && history.parts.length) {
+        // Two producers prepared the same independent assignment without seeing one another.
+        const newer = ok(prepareQuestionPacket(hiding(store, packet.id), packet.value.request));
+        assert.equal(newer.record.value.answerProtocol, 'omg-answer/v3');
+        const competing = pendingCallStore(store, newer.writes);
+        assert.deepEqual(ok(readQuestionPacket(competing, { project: history.project, record: reference(newer.record) })), newer.record);
+        for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
+          rejected(action(competing, packet.value.request), 'packet_chain_invalid');
+          const prior = history.next!.previous[0]!;
+          rejected(action(competing, { ...packet.value.request,
+            previous: [prior, { ...prior, packet: reference(newer.record) }] }), 'packet_chain_invalid');
+        }
+        assert.deepEqual(snapshot(store), before);
+      }
+      if (history.next) {
+        const continued = ok(writeQuestionPacket(store, history.next));
+        assert.equal(continued.record.value.answerProtocol, 'omg-answer/v2');
+        if (history.next.continuation) assert.equal(continued.record.value.refusal?.code, 'research_no_progress');
+        else assert.equal(continued.record.value.plan?.position, 1);
+        const after = snapshot(store);
+        store.close(); store = new Store(history.database);
+        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(continued.record) })), continued.record);
+        assert.deepEqual(ok(writeQuestionPacket(store, history.next)).record, continued.record);
+        assert.deepEqual(ok(prepareQuestionPacket(store, history.next)).record, continued.record);
+        assert.deepEqual(snapshot(store), after);
+      }
+    } finally { store.close(); }
+  }
+});
+
+test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', t => {
+  const p = packetFixture(t), { f } = p;
+  const prepared = ok(prepareQuestionPacket(f.store, p.request)), packet = prepared.record;
+  const ids = ['omg-answer/v2', 'omg-answer/v3'].map(protocol =>
+    `om-question-packet:${f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol, request: p.request })}`);
+  for (const id of ids) assert.ok(prepared.guards.some(guard => guard.id === id && 'absent' in guard && guard.absent));
+  assert.equal(packet.id, ids[1]);
+  const payload = packet.value.packet as Record<string, any>;
+  assert.equal(packet.value.answerProtocol, 'omg-answer/v3');
+  assert.equal(payload.responseForm.protocol, 'omg-answer/v3');
+  assert.equal(payload.requestId, packet.id.slice(packet.id.lastIndexOf(':') + 1));
+  assert.equal(payload.responseForm.requestId, payload.requestId);
+  for (const branch of payload.responseForm.schema.oneOf) assert.equal(branch.properties.protocol.const, 'omg-answer/v3');
+  for (const kind of ['node', 'fact', 'field'] as const) assert.ok(frozen(packetAnswerSchema(kind)));
+  const saved = ok(writeQuestionPacket(f.store, p.request));
+  f.restart();
+  const before = snapshot(f.store);
+  for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
+    const repeated = ok(action(f.store, p.request)); assert.deepEqual(repeated.record, saved.record); assert.deepEqual(repeated.writes, []);
+    const conflict = pendingCallStore(f.store, [{ id: ids[0]!, kind: 'question-packet', expected: 0, value: packet.value }]);
+    rejected(action(conflict, p.request), 'packet_chain_invalid');
+  }
+  const { packetContract: _contract, ...noContract } = clone(packet.value);
+  const { answerProtocol: _protocol, ...noProtocol } = clone(packet.value);
+  for (const value of [noContract, noProtocol, { ...clone(packet.value), answerProtocol: 'omg-answer/unknown' },
+    { ...clone(packet.value), packetContract: null }]) {
+    const foreign = { id: `${packet.id}:invalid-era`, kind: 'question-packet', expected: 0, value };
+    const view = pendingCallStore(f.store, [foreign]);
+    rejected(readQuestionPacket(view, { project: f.project,
+      record: { id: foreign.id, revision: 1, hash: hashJson(value) } }), 'packet_record_invalid');
+  }
+  const corrupted = { ...clone(packet.value), answerProtocol: 'omg-answer/unknown' };
+  const unissued = packetFixture(t);
+  const unissuedId = `om-question-packet:${unissued.f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol: 'omg-answer/v2', request: unissued.request })}`;
+  const badView = pendingCallStore(unissued.f.store, [{ id: unissuedId, kind: 'question-packet', expected: 0,
+    value: { ...corrupted, request: unissued.request } }]);
+  for (const action of [prepareQuestionPacket, writeQuestionPacket]) rejected(action(badView, unissued.request), 'packet_record_invalid');
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('LP1 a second Store creating an era address after preparation refuses the whole transaction', t => {
+  const p = expansionFixture(t), { f } = p;
+  const prepared = ok(prepareQuestionPacket(f.store, p.request));
+  const otherEra = `om-question-packet:${f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol: 'omg-answer/v2', request: p.request })}`;
+  const concurrent = new Store(f.database);
+  try {
+    // The condition protects identity occupancy before interpreting content, including an incomplete foreign writer.
+    concurrent.write({ id: otherEra, kind: 'question-packet', expected: 0, value: {} });
+  } finally { concurrent.close(); }
+  const before = snapshot(f.store);
+  const refused = writeGuarded(f.store, { unit: 'LP1', target: prepared.record.id,
+    writes: prepared.writes, guards: prepared.guards });
+  assert.equal(refused.ok, false);
+  if (refused.ok) assert.fail('The opposite era appeared before the write');
+  assert.equal(refused.refusal.code, 'input_stale'); assert.equal(refused.refusal.at.target, otherEra);
+  assert.deepEqual(snapshot(f.store), before);
+  assert.equal(f.store.get(prepared.record.id), null);
+});
+
+test('LP1 v3 end to end: relative source, continuation, independent assessment and reopen repeat send only three fixture calls', async t => {
+  const p = packetFixture(t), { f } = p;
+  const scenario = join(f.root, 'lp1-scenario.json'), trace = join(f.root, 'lp1-trace.ndjson');
+  const adapterFixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
+  const environment = f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'lp1-producer', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'lp1-reviewer', model: 'fixture-reviewer', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100_000 }, p.configured.revision);
+  const adapter = f.store.write({ id: `adapter:${f.project}:lp1`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const packet = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment) })).record;
+  writeFileSync(join(f.root, 'lp1-source.txt'), 'UTF-8');
+  const source = new Evidence(f.store).document(f.project, 'lp1-source', 'UTF-8', 'text/plain', 0);
+  const usage = { inputTokens: 12, outputTokens: 4, cachedInputTokens: null, reasoningOutputTokens: null };
+  writeFileSync(scenario, JSON.stringify({ steps: [
+    { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source', questionIds: p.batch.items.map(row => row.gap),
+      missing: 'Need the source', reads: [{ action: 'read', path: 'lp1-source.txt', media: 'text/plain' }] }, usage },
+    { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
+      results: p.batch.items.map(row => ({ questionId: row.gap, value: 'UTF-8', citations: [{ source: reference(source),
+        selector: { kind: 'text-range', start: 0, end: 5 } }] })) }, usage },
+    { research: { verdict: 'supported', reasons: [] }, usage },
+  ] }));
+  const dispatch = { adapter: reference(adapter), config: reference(environment) };
+  const request = { project: f.project, packet: reference(packet), dispatch, role: 'implementer' as const };
+  const cycle = ok(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'outcome'); assert.equal(cycle.last.outcome?.kind, 'fact-candidates');
+  const assessmentRequest = { project: f.project, modelCall: reference(cycle.last.record), questionId: p.batch.items[0]!.gap, dispatch };
+  const assessment = ok(await assessFact(f.store, assessmentRequest)); assert.ok(assessment.value.accepted);
+  const sent = () => readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(sent().length, 3);
+  const first = JSON.parse(sent()[0].prompt), second = JSON.parse(sent()[1].prompt);
+  assert.equal(first.responseForm.protocol, 'omg-answer/v3'); assert.equal(second.responseForm.protocol, 'omg-answer/v3');
+  assert.equal(second.sourceDeliveries[0].data[0].data, 'UTF-8');
+  assert.notEqual(sent()[1].model, sent()[2].model);
+  const before = snapshot(f.store);
+  f.restart();
+  assert.equal(ok(await runModelCycle(f.store, request)).repeated, true);
+  assert.deepEqual(ok(await assessFact(f.store, assessmentRequest)), assessment);
+  assert.equal(sent().length, 3); assert.deepEqual(snapshot(f.store), before);
+});
+
+test('LP1 adapter fixture takes the answer era only from the received prompt and refuses its absence', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-lp1-stub-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.ndjson');
+  const fixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+  writeFileSync(scenario, JSON.stringify({ steps: Array.from({ length: 4 }, () => ({ research: { protocol: '$answerProtocol', requestId: '$requestId' } })) }));
+  const request = { protocol: 'omg-agent/v1', requestId: 'lp1', mode: 'research', model: 'fixture', effort: 'high' };
+  for (const protocol of ['omg-answer/v2', 'omg-answer/v3']) {
+    const raw = execFileSync(process.execPath, [fixture, '--scenario', scenario, '--trace', trace], {
+      input: JSON.stringify({ ...request, prompt: JSON.stringify({ responseForm: { protocol } }) }), encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(raw).research, { protocol, requestId: request.requestId });
+  }
+  for (const packet of [{}, { responseForm: {} }]) assert.throws(() => execFileSync(process.execPath,
+    [fixture, '--scenario', scenario, '--trace', trace], { input: JSON.stringify({ ...request, prompt: JSON.stringify(packet) }),
+      encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }), error => {
+    const failure = error as { status: number; stdout: string; stderr: string };
+    assert.equal(failure.status, 2); assert.equal(failure.stdout, '');
+    assert.equal(JSON.parse(failure.stderr).error, 'om_adapter_fixture_invalid');
+    assert.match(JSON.parse(failure.stderr).message, /responseForm.protocol/); return true;
+  });
+});

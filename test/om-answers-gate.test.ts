@@ -32,7 +32,7 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { readOmInput, writeOmInput } from '../src/om/input.js';
 import { assembleModelParts, readModelCallState, readPartAssembly, runModelCall } from '../src/om/model-call.js';
 import { writeOmObligations } from '../src/om/obligations.js';
-import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket } from '../src/om/question-packet.js';
+import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { readRoutes, writeRoutes } from '../src/om/routes.js';
 import { beginAttempt, completeAttempt, openSeries, type AttemptGoal } from '../src/om/series.js';
@@ -235,7 +235,7 @@ async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' 
     value: { projectId: f.project, protocol: 'codex-stdio' } });
   const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-  const originalStep = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  const originalStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) },
     usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } };
@@ -304,8 +304,12 @@ out({ series: reference(take(openSeries(store, args))) });`, { project: f.projec
     requestCapacityChars: 100_000 }, 0);
   const adapter = f.store.write({ id: `adapter:${f.project}:answers:legacy-assessor`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'codex-stdio' } });
-  const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: batch.id,
-    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  // LP1: an old E5 consumer needs a packet issued by its own producer; current independent E2 issuance is v3.
+  const packet = atCommit(f, LEGACY_ASSESSOR_COMMIT, 'legacy-packet',
+    `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, { project: f.project, routes: reference(f.route), batch: batch.id,
+      environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] }) as Revision<QuestionPacketRecord>;
+  assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
   const originalStep = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0,
@@ -1378,7 +1382,7 @@ function unknownResult(f: { project: string }): Ref {
 }
 const traceUsage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 /** The MC1 batch of the fixture question with its series, environment, adapter and ready packet. */
-function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', completion = false, active = false) {
+function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', completion = false, active = false, packetCommit?: string) {
   const batch = f.route.value.batches.find(item => item.model === 'MC1'
     && item.items.some(question => question.target === f.target))!;
   assert.ok(batch);
@@ -1400,10 +1404,16 @@ function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'a
   const config = configure(reviewer, 0);
   const adapter = f.store.write({ id: `adapter:${f.project}:answers:${slice}`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'codex-stdio' } });
-  const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: batch.id,
-    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const packetRequest = { project: f.project, routes: reference(f.route), batch: batch.id,
+    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
+  // LP1 transfer: an era comparison must start with a packet that the compared producer actually issued.
+  const packet = packetCommit ? atCommit(f, packetCommit, `${slice}-era-packet`,
+    `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, packetRequest) as Revision<QuestionPacketRecord>
+    : ok(writeQuestionPacket(f.store, packetRequest)).record;
+  if (packetCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
   const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
-  const answer = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  const answer = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) },
   usage: traceUsage };
@@ -2024,8 +2034,8 @@ test('1 H1.0c readAnswersGateTrace checks the shape of every argument before sto
 
 // ---- H1.0c S2: registration of the managed check (№1616 п.1, №1628 Q2) ----
 /** A managed block attempt of the fixture fact, opened by the real G7 opening with its materialized MC1 packet. */
-function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = false) {
-  const exchange = mc1Exchange(f, slice, 'answers-independent', true, active);
+function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = false, packetCommit?: string) {
+  const exchange = mc1Exchange(f, slice, 'answers-independent', true, active, packetCommit);
   const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
   if (!binding) assert.fail('The managed opening writes its binding');
   const head = () => f.store.get<CompletionWork>(completionWorkId(f.project, binding.id))!;
@@ -2247,8 +2257,8 @@ test('C11 H1.0c registration arguments are EngineError before the store; a missi
 
 // ---- H1.0c S3: evaluation, finding groups, A2 sources and delivery (№1446 rows, №1616, №1628) ----
 /** A managed block attempt of the fixture fact with its registered check. */
-function registered(f: ReturnType<typeof fixture>, slice: string, active = false) {
-  const m = managedAttempt(f, slice, active);
+function registered(f: ReturnType<typeof fixture>, slice: string, active = false, packetCommit?: string) {
+  const m = managedAttempt(f, slice, active, packetCommit);
   const registration = ok(writeAnswersRegistration(f.store, { project: f.project, binding: reference(m.binding) }));
   return { ...m, registration };
 }
@@ -3232,8 +3242,8 @@ const closeRequest = (f: ReturnType<typeof fixture>, reason: Reason, refusals: r
   ({ project: f.project, block: f.block, line: 1, attempt: 1, outcome: { reason, accepting, cancelling: [], refusals: [...refusals] } });
 const canonicalRefs = (values: readonly Ref[]) => [...values].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
 /** Own E5 N of a registered, not yet evaluated check: the evaluation that resolves it and the close of the attempt. */
-async function linkedN(f: ReturnType<typeof fixture>, slice: string) {
-  const m = registered(f, slice), fact = factGap(f);
+async function linkedN(f: ReturnType<typeof fixture>, slice: string, packetCommit?: string) {
+  const m = registered(f, slice, false, packetCommit), fact = factGap(f);
   const { terminal } = await managedFact(f, m, 'insufficient');
   const work = m.work();
   const close = closeRequest(f, 'refused', work.refusals);
@@ -3936,13 +3946,13 @@ async function nodeTerminal(f: ReturnType<typeof fixture>, block: string, end: N
   if (end === 'research-no-progress') {
     // The model asks twice for the same source: the repeated read adds nothing, so the cycle ends without an answer.
     const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
-    const need = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source', questionIds: questions,
+    const need = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source', questionIds: questions,
       missing: 'Need the addressed source data', reads: [{ action: 'read_source', source: reference(source),
         selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] }, usage: traceUsage };
     steps = [need, need];
   } else steps = [end === 'off-form' ? { research: { invalid: true }, usage: traceUsage }
     : end === 'interrupted' ? { rawStdout: '{broken', exitCode: 7 }
-    : { research: { protocol: 'omg-answer/v2', requestId: '$requestId', questionIds: questions, action: end,
+    : { research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: questions, action: end,
       reason: 'The requested design is not available', ...(end === 'need_owner' ? { decision: 'Name the operation' } : {}) }, usage: traceUsage }];
   writeFileSync(scenario, JSON.stringify({ steps }));
   const cycle = ok(await runModelCycle(f.store, { project: f.project, packet: reference(packet),
@@ -4192,7 +4202,7 @@ test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prep
   assert.deepEqual(ok(writeAnswersDelivery(f.store, delivery)).groups.length, 2);
   assert.deepEqual(snapshot(f.store), stored, 'The repeated delivery writes nothing');
   // The evaluation linked with the close journals its G4b source through the same overlay inside the close.
-  const g = fixture(t, 'repository-fact'), s = await linkedN(g, 'pf1');
+  const g = fixture(t, 'repository-fact'), s = await linkedN(g, 'pf1', PF1_BASE);
   const linked = prepareAnswersEvaluation(g.store, s.linked);
   assert.ok(ok(linked).closed !== undefined && ok(linked).groups.length > 0);
   assert.equal(preparedHere(linked), preparedAtBase(g, 'pf1-linked', 'prepareAnswersEvaluation', s.linked), 'Linked with the close: the same bytes as the base');

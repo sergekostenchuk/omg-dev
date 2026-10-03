@@ -143,7 +143,7 @@ export interface QuestionPacketRequest {
 }
 export interface QuestionPacketRecord {
   project: string; request: QuestionPacketRequest; state: 'ready' | 'blocked' | 'empty';
-  answerProtocol?: 'omg-answer/v2';
+  answerProtocol?: 'omg-answer/v2' | 'omg-answer/v3';
   packetContract?: 'om-packet/v3' | 'om-packet/works-v1';
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
@@ -155,7 +155,9 @@ export interface PreparedQuestionPacket {
 }
 export const QUESTION_PACKET_KIND = 'question-packet';
 const packetNamespace = (project: string) => `om-question-packet:${project}:`;
-export const PACKET_ANSWER_PROTOCOL = 'omg-answer/v2' as const;
+export const PACKET_ANSWER_PROTOCOL = 'omg-answer/v3' as const;
+type AnswerProtocol = NonNullable<QuestionPacketRecord['answerProtocol']>;
+const answerProtocols: readonly AnswerProtocol[] = ['omg-answer/v2', PACKET_ANSWER_PROTOCOL];
 export const PACKET_CONTRACT = 'om-packet/v3' as const;
 export const WORKS_PACKET_CONTRACT = 'om-packet/works-v1' as const;
 const packetWorkContract = (packet: QuestionPacketRecord) => packet.packetContract === WORKS_PACKET_CONTRACT ? WORKS_FRAME_CONTRACT : undefined;
@@ -168,6 +170,26 @@ const packetKey = (request: QuestionPacketRequest, protocol: QuestionPacketRecor
   hashJson(contract ? { contract, protocol, request } : protocol ? { protocol, request } : request);
 const packetId = (request: QuestionPacketRequest, protocol: QuestionPacketRecord['answerProtocol'], contract?: QuestionPacketRecord['packetContract']) =>
   `${packetNamespace(request.project)}${packetKey(request, protocol, contract)}`;
+function packetEra(store: Store, request: QuestionPacketRequest) {
+  const contract = currentPacketContract(store, request);
+  const predecessors = [...(request.continuation ? [request.continuation.packet] : []), ...request.previous.map(part => part.packet)]
+    .map(ref => loadPacket(store, request.project, ref));
+  const inherited = predecessors[0]?.value.answerProtocol;
+  if (predecessors.some(prior => prior.value.answerProtocol === undefined || prior.value.answerProtocol !== inherited
+    || prior.value.packetContract !== contract))
+    fail('packet_chain_invalid', request.batch ?? request.project, 'request', 'A chain preserves one supported answer era and packet contract');
+  const candidates = answerProtocols.map(protocol => ({ protocol, id: packetId(request, protocol, contract) }))
+    .map(candidate => ({ ...candidate, record: store.get<QuestionPacketRecord>(candidate.id) }));
+  const present = candidates.filter(candidate => candidate.record);
+  if (present.length > 1)
+    fail('packet_chain_invalid', request.batch ?? request.project, 'request', 'The exact request has packets in two answer eras');
+  const found = present[0];
+  const checked = found?.record ? loadPacket(store, request.project, reference(found.record)) : undefined;
+  if (found && inherited && found.protocol !== inherited)
+    fail('packet_chain_invalid', request.batch ?? request.project, 'request', 'The packet era differs from its proven predecessor');
+  return { protocol: inherited ?? found?.protocol ?? PACKET_ANSWER_PROTOCOL, contract, checked,
+    guards: candidates.map(({ id, record }): TransactionGuard => record ? reference(record) : { id, absent: true }) };
+}
 const json = (value: unknown) => copy(value) as Json;
 function requirePacket(store: Store, value: unknown): asserts value is QuestionPacketRequest {
   if (!(store instanceof Store) || !object(value) || !text(value.project) || !isRef(value.routes)
@@ -538,17 +560,17 @@ function workAssignments(frame: FrameProposals, node: string, basis: OmObligatio
 }
 
 function deriveContinuation(store: Store, request: QuestionPacketRequest, current: boolean,
-  contract: NonNullable<QuestionPacketRecord['packetContract']>) {
+  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol']) {
   const continuation = request.continuation!;
   const prior = loadPacket(store, request.project, continuation.packet);
   const { continuation: _priorContinuation, ...priorRoot } = prior.value.request;
   const { continuation: _continuation, ...root } = request;
-  if (prior.value.packetContract !== contract || prior.value.state !== 'ready' || !object(prior.value.packet)
+  if (prior.value.packetContract !== contract || prior.value.answerProtocol !== protocol || prior.value.state !== 'ready' || !object(prior.value.packet)
     || !same(root, priorRoot))
     fail('packet_chain_invalid', continuation.packet.id, 'continuation',
       'A continuation preserves the exact ready assignment, sources and attempt of its current-contract predecessor');
   // Reuse the saved native questions and part assignment while checking today's admission dependencies.
-  const priorDerived = derivePacket(store, prior.value.request, current, prior.value as QuestionPacketRecord);
+  const priorDerived = derivePacket(store, prior.value.request, current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
   const evidence = take(readContinuationEvidence(store, { project: request.project, ...continuation }, current));
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
   const guards = [...priorDerived.guards, ...capacity.guards, ...evidence.guards];
@@ -557,7 +579,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
     // Admission is revision one; an already settled call legitimately has a later current head.
     guards.push(reference(store.get(continuation.call.id)!));
   }
-  const requestId = packetKey(request, PACKET_ANSWER_PROTOCOL, contract);
+  const requestId = packetKey(request, protocol, contract);
   const payload = prior.value.packet;
   const packet = json({ ...payload, requestId,
     responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
@@ -573,15 +595,14 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
   return { value, guards: unique(guards), references: unique([...priorDerived.references, continuation.packet,
     ...capacity.references, ...evidence.references]), writes: priorDerived.writes };
 }
-function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean, saved?: QuestionPacketRecord): {
+function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean,
+  protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): {
   value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[];
 } {
-  const protocol = saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL;
-  const contract = saved ? saved.packetContract : currentPacketContract(store, request);
   if (request.continuation) {
     if (contract !== PACKET_CONTRACT && contract !== WORKS_PACKET_CONTRACT)
       fail('packet_record_invalid', request.continuation.packet.id, 'packetContract', 'A historical packet cannot acquire continuation semantics');
-    return deriveContinuation(store, request, current, contract);
+    return deriveContinuation(store, request, current, contract, protocol);
   }
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
@@ -638,7 +659,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     : contract ? 'om-question-packet/v3' : protocol ? 'om-question-packet/v2' : 'om-question-packet/v1', requestId, model: batch.model,
     purpose: batch.model === 'MC1' ? 'model-research' : 'model-design', task: batch.task, kind: batch.kind, questions,
     responseForm: protocol ? { protocol, requestId, schema: packetAnswerSchema(batch.task === 'node-expansion' ? 'node' : batch.model === 'MC1' ? 'fact' : 'field',
-      packetWorkContract(base)) }
+      packetWorkContract(base), protocol) }
       : batch.task === 'node-expansion'
       ? { protocol: 'omg-part/v1', requestId, proposal: PART_PROPOSAL_SCHEMA }
       : batch.model === 'MC1'
@@ -727,14 +748,14 @@ function loadPacket(store: Store, project: string, ref: Ref): Revision<QuestionP
       throw error;
     }
     const request = record.value.request;
-    if (record.value.answerProtocol !== undefined && record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL)
+    if (record.value.answerProtocol !== undefined && !answerProtocols.includes(record.value.answerProtocol as AnswerProtocol))
       fail('packet_record_invalid', ref.id, 'answerProtocol', 'The packet answer contract era is unsupported');
-    if (record.value.packetContract !== undefined && (![PACKET_CONTRACT, WORKS_PACKET_CONTRACT].includes(record.value.packetContract)
-      || record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL))
+    if ((record.value.packetContract !== undefined && (![PACKET_CONTRACT, WORKS_PACKET_CONTRACT].includes(record.value.packetContract)
+      || record.value.answerProtocol === undefined)) || (record.value.answerProtocol === PACKET_ANSWER_PROTOCOL && record.value.packetContract === undefined))
       fail('packet_record_invalid', ref.id, 'packetContract', 'The packet derivation contract era is unsupported');
     if (request.project !== project || record.id !== packetId(request, record.value.answerProtocol, record.value.packetContract) || record.revision !== 1)
       fail('packet_record_invalid', ref.id, 'request', 'A packet preserves the identity of its exact immutable source request');
-    const expected = derivePacket(store, request, false, record.value as QuestionPacketRecord);
+    const expected = derivePacket(store, request, false, record.value.answerProtocol, record.value.packetContract, record.value as QuestionPacketRecord);
     if (!same(expected.value, record.value))
       fail('packet_record_invalid', ref.id, 'value', 'The complete packet, assignment and native bindings must follow from their exact sources');
     const completion = continuationFinish(store, record.value as QuestionPacketRecord);
@@ -757,9 +778,7 @@ function continuationFinish(store: Store, record: QuestionPacketRecord) {
 export function prepareQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
   requirePacket(store, request); request = copy(request);
   return result(() => {
-    const contract = currentPacketContract(store, request);
-    const old = store.get<QuestionPacketRecord>(packetId(request, PACKET_ANSWER_PROTOCOL, contract));
-    const checked = old ? loadPacket(store, request.project, reference(old)) : undefined;
+    const era = packetEra(store, request), { contract, protocol, checked } = era;
     // A completed no-progress transition is a technical repeat, not a new admission.
     if (checked?.value.refusal?.code === 'research_no_progress') {
       return { record: checked, existing: true, writes: [], guards: [], references: [reference(checked)] };
@@ -770,18 +789,18 @@ export function prepareQuestionPacket(store: Store, request: QuestionPacketReque
     const config = store.get(request.environment.id);
     if (!config || !same(reference(config), request.environment)) {
       const historical = checked ?? (() => {
-        const value = derivePacket(store, request, false).value;
-        return { id: packetId(request, PACKET_ANSWER_PROTOCOL, contract), kind: QUESTION_PACKET_KIND,
+        const value = derivePacket(store, request, false, protocol, contract).value;
+        return { id: packetId(request, protocol, contract), kind: QUESTION_PACKET_KIND,
           revision: 1, hash: hashJson(value), value };
       })();
       const proof = pendingCallStore(store, checked ? [] : [{ id: historical.id, kind: historical.kind, expected: 0, value: historical.value }]);
       environment = take(prepareManagedEnvironment(proof, request.project, { packet: reference(historical) }));
     }
     const admittedStore = environment?.store ?? store;
-    const derived = derivePacket(admittedStore, request, true, checked?.value);
+    const derived = derivePacket(admittedStore, request, true, protocol, contract, checked?.value);
     if (checked && !same(checked.value, derived.value))
       fail('packet_record_invalid', checked.id, 'value', 'An existing packet cannot change without a new source request');
-    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, PACKET_ANSWER_PROTOCOL, contract), kind: QUESTION_PACKET_KIND,
+    const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, protocol, contract), kind: QUESTION_PACKET_KIND,
       revision: 1, hash: hashJson(derived.value), value: derived.value };
     const finished = continuationFinish(store, record.value);
     const writes: Write[] = [...derived.writes, ...(finished?.writes ?? []),
@@ -792,7 +811,7 @@ export function prepareQuestionPacket(store: Store, request: QuestionPacketReque
     return { record, existing: Boolean(checked), references: derived.references,
       // H1.0d (№1715): the finish may rely on an absence (an admitted call without its E4); it stays a condition of
       // this write. Only exact references of records written here are dropped.
-      guards: unique((environment ? environment.remap : (guards: readonly TransactionGuard[]) => guards)([...derived.guards, ...(finished?.guards ?? []), ...completion.guards,
+      guards: unique((environment ? environment.remap : (guards: readonly TransactionGuard[]) => guards)([...era.guards, ...derived.guards, ...(finished?.guards ?? []), ...completion.guards,
         ...(environment?.guards ?? []), ...(checked ? [reference(checked)] : [])])
         .filter(guard => !isRef(guard) || !pending.has(canonical(guard)))), writes };
   });
@@ -803,10 +822,8 @@ export function writeQuestionPacket(store: Store, request: QuestionPacketRequest
     // Replaying a saved delivery transition does not admit another physical call.
     // Dispatch still requires prepareQuestionPacket's fresh current admission.
     const managed = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;
-    const old = managed || request.continuation || request.previous.length > 0
-      ? store.get(packetId(request, PACKET_ANSWER_PROTOCOL, currentPacketContract(store, request))) : null;
-    if (old) {
-      const record = loadPacket(store, request.project, reference(old));
+    const record = managed || request.continuation || request.previous.length > 0 ? packetEra(store, request).checked : undefined;
+    if (record) {
       return { record, existing: true, writes: [], guards: [], references: [reference(record)] };
     }
     const prepared = take(prepareQuestionPacket(store, request));
@@ -899,17 +916,26 @@ export interface CheckedPacketAnswer {
   packet: Revision<QuestionPacketRecord>; answer: PacketAnswer; references: Ref[];
 }
 const nonempty = { type: 'string', minLength: 1, pattern: '\\S' };
+// Segment alternatives encode safeRelativePath and the case-insensitive .git exclusion without lookahead.
+const forbiddenPathCharacters = '\\\\/*?\\u0000-\\u001f';
+const pathCharacter = `[^${forbiddenPathCharacters}]`;
+const exceptPath = (characters: string) => `[^${characters}${forbiddenPathCharacters}]`;
+const dottedPath = `\\.(?:${exceptPath('.gG')}${pathCharacter}*|\\.${pathCharacter}+|[gG](?:${exceptPath('iI')}${pathCharacter}*|[iI](?:${exceptPath('tT')}${pathCharacter}*|[tT]${pathCharacter}+)?)?)`;
+const pathSegment = `(?:${exceptPath('.')}${pathCharacter}*|${dottedPath})`;
+const firstPathSegment = `(?:(?:${exceptPath('.A-Za-z')}${pathCharacter}*|[A-Za-z](?:${exceptPath(':')}${pathCharacter}*)?)|${dottedPath})`;
+const readPathShape = sealed({ ...nonempty, allOf: [{ pattern: `^${firstPathSegment}(?:/${pathSegment})*$` }],
+  description: 'Path relative to the selected project root, for example package.json or src/file.ts. No absolute paths, ./, .., .git segments (any case), backslashes or glob patterns. For searching the whole context use its record Ref, not ".".' });
 const selectorShape = { oneOf: [
   { type: 'object', additionalProperties: false, required: ['kind', 'pointer'], properties: {
     kind: { const: 'json-pointer' }, pointer: { type: 'string' } } },
   { type: 'object', additionalProperties: false, required: ['kind', 'start', 'end'], properties: {
     kind: { const: 'text-range' }, start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } } },
 ] };
-const readShapes = [
-  { action: { const: 'read' }, path: nonempty, media: { enum: ['text/plain', 'application/json'] } },
+const readShapes = (protocol: AnswerProtocol) => [
+  { action: { const: 'read' }, path: protocol === 'omg-answer/v2' ? nonempty : readPathShape, media: { enum: ['text/plain', 'application/json'] } },
   { action: { const: 'read_source' }, source: refShape, selector: selectorShape },
   { action: { const: 'read_context' }, record: refShape, pointer: { type: 'string' } },
-  { action: { const: 'search' }, within: { oneOf: [nonempty, refShape] }, query: nonempty },
+  { action: { const: 'search' }, within: { oneOf: [protocol === 'omg-answer/v2' ? nonempty : readPathShape, refShape] }, query: nonempty },
 ].map(properties => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties }));
 const factResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
   required: ['questionId', 'value', 'citations'], properties: { questionId: nonempty, value: {},
@@ -917,35 +943,46 @@ const factResults = { type: 'array', minItems: 1, items: { type: 'object', addit
       required: ['source', 'selector'], properties: { source: refShape, selector: selectorShape } } } } } };
 const fieldResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
   required: ['target', 'field', 'value', 'basis'], properties: { target: nonempty, field: nonempty, value: {}, basis: refShape } } };
-function responseShape(properties: Record<string, unknown>) {
-  const fields = { protocol: { const: PACKET_ANSWER_PROTOCOL }, requestId: nonempty, ...properties };
-  return { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: fields };
+function answerSchemaFamily(protocol: AnswerProtocol) {
+  function responseShape(properties: Record<string, unknown>) {
+    const fields = { protocol: { const: protocol }, requestId: nonempty, ...properties };
+    return { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: fields };
+  }
+  const controls = [
+    responseShape({ action: { const: 'need_source' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
+      missing: nonempty, reads: { type: 'array', minItems: 1, items: { oneOf: readShapes(protocol) } } }),
+    responseShape({ action: { const: 'need_owner' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
+      reason: nonempty, decision: nonempty }),
+    ...['cannot_answer', 'pause'].map(action => responseShape({ action: { const: action },
+      questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty }, reason: nonempty })),
+  ];
+  return sealed({
+    node: { oneOf: [responseShape({ action: { const: 'answer' }, proposal: PART_PROPOSAL_SCHEMA }), ...controls] },
+    fact: { oneOf: [responseShape({ action: { const: 'answer' }, results: factResults }), ...controls] },
+    field: { oneOf: [responseShape({ action: { const: 'answer' }, results: fieldResults }), ...controls] },
+    works: { oneOf: [responseShape({ action: { const: 'answer' }, proposal: WORKS_PART_PROPOSAL_SCHEMA,
+      bindings: { type: 'array', items: taskObligationBindingSchema } }), ...controls] },
+  });
 }
-const controls = [
-  responseShape({ action: { const: 'need_source' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
-    missing: nonempty, reads: { type: 'array', minItems: 1, items: { oneOf: readShapes } } }),
-  responseShape({ action: { const: 'need_owner' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
-    reason: nonempty, decision: nonempty }),
-  ...['cannot_answer', 'pause'].map(action => responseShape({ action: { const: action },
-    questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty }, reason: nonempty })),
-];
-const answerSchemas = sealed({
-  node: { oneOf: [responseShape({ action: { const: 'answer' }, proposal: PART_PROPOSAL_SCHEMA }), ...controls] },
-  fact: { oneOf: [responseShape({ action: { const: 'answer' }, results: factResults }), ...controls] },
-  field: { oneOf: [responseShape({ action: { const: 'answer' }, results: fieldResults }), ...controls] },
-});
-const worksAnswerSchema = sealed({ oneOf: [responseShape({ action: { const: 'answer' }, proposal: WORKS_PART_PROPOSAL_SCHEMA,
-  bindings: { type: 'array', items: taskObligationBindingSchema } }), ...controls] });
-/** One stable schema family for producer payloads, E3 and E4; it is not compiled per packet. */
-export function packetAnswerSchema(kind: keyof typeof answerSchemas, worksContract?: typeof WORKS_FRAME_CONTRACT): Sealed<Json> {
+const answerSchemas = { 'omg-answer/v2': answerSchemaFamily('omg-answer/v2'), 'omg-answer/v3': answerSchemaFamily('omg-answer/v3') };
+/** One stable schema family per proven era for producer payloads, E3 and E4. */
+export function packetAnswerSchema(kind: 'node' | 'fact' | 'field', worksContract?: typeof WORKS_FRAME_CONTRACT,
+  protocol: AnswerProtocol = PACKET_ANSWER_PROTOCOL): Sealed<Json> {
   if (kind !== 'node' && kind !== 'fact' && kind !== 'field') invalid('answer.schema');
+  if (!answerProtocols.includes(protocol)) invalid('answer.protocol');
   if (worksContract !== undefined && (worksContract !== WORKS_FRAME_CONTRACT || kind !== 'node')) invalid('answer.worksContract');
-  return (worksContract ? worksAnswerSchema : answerSchemas[kind]) as Sealed<Json>;
+  return answerSchemas[protocol][worksContract ? 'works' : kind] as Sealed<Json>;
 }
 const answerSchemasAjv = new Ajv({ strict: true, allowUnionTypes: true });
-const answerValidators = { node: answerSchemasAjv.compile(answerSchemas.node), fact: answerSchemasAjv.compile(answerSchemas.fact),
-  field: answerSchemasAjv.compile(answerSchemas.field) };
-const worksAnswerValidator = answerSchemasAjv.compile(worksAnswerSchema);
+const compileAnswers = (family: ReturnType<typeof answerSchemaFamily>) => ({
+  node: answerSchemasAjv.compile(family.node), fact: answerSchemasAjv.compile(family.fact),
+  field: answerSchemasAjv.compile(family.field), works: answerSchemasAjv.compile(family.works),
+});
+const answerValidators = { 'omg-answer/v2': compileAnswers(answerSchemas['omg-answer/v2']),
+  'omg-answer/v3': compileAnswers(answerSchemas['omg-answer/v3']) };
+const readPathValidator = answerSchemasAjv.compile(readPathShape);
+/** The exact lexical rule used by the v3 schema, with no shared mutable RegExp exposed. */
+export function packetReadPath(value: unknown): value is string { return readPathValidator(value); }
 const legacyResultValidators = {
   fact: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: factResults } }),
   field: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: fieldResults } }),
@@ -966,7 +1003,7 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
   if (!object(parsed)) fail('part_answer_invalid', packet.id, 'raw', 'An answer has exactly one typed envelope');
   const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
   if (value.answerProtocol) {
-    const validate = packetWorkContract(value) ? worksAnswerValidator : answerValidators[kind];
+    const validate = answerValidators[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
     if (!validate(parsed)) fail('part_answer_invalid', packet.id, validate.errors?.[0]?.instancePath || 'reply',
       'The reply must use exactly one branch of the declared answer form without service fields');
     if (parsed.requestId !== payload.requestId)

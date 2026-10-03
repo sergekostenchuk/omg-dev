@@ -117,12 +117,12 @@ function mechanismBatch(f: Fixture) {
 }
 function addressAll(f: Fixture) {
   const batch = mechanismBatch(f);
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: { consumer: "garden-consume-block", kind: "repository-fact" } })) } };
 }
 function cannotAnswer(f: Fixture) {
   const batch = mechanismBatch(f);
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
     action: "cannot_answer", reason: "The requested information is unavailable" }, usage };
 }
 const undecided = { research: { protocol: "omg-stop-analysis/v1", cause: { kind: "hypothesis", text: "The brief does not settle the encoding", sources: [] },
@@ -317,7 +317,7 @@ function nodeAnswer(f: Fixture, step: { request: unknown }) {
   const proposal = { nodes: [node], fills: obligations.map(item => ({ obligation: item.id, node: node.id,
     ...(item.kind === "connection-end" ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", proposal }, usage };
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal }, usage };
 }
 
 test("R2 R6 №1991-4 №1991-7 H1.3 legacy N2 × the bases over it: a stop on the saved D2 of the accepted group (Ф3) performs nothing; after the resume the driver goes through both D2/G7 and the works ledger to the first L3 dispatch, never looping on bases_stale or d2_bases", async t => {

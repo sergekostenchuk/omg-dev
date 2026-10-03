@@ -1477,7 +1477,7 @@ function ordinarySpendFixture(t: test.TestContext) {
 test("E6 report: one assessed fact has its own physical expense beside the original MC1 call", async t => {
   const f = ordinarySpendFixture(t);
   const assessmentUsage = { inputTokens: 11, outputTokens: 3, cachedInputTokens: 2, reasoningOutputTokens: 1 };
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: [{ questionId: f.batch.items[0]!.gap, value: "UTF-8",
       citations: [{ source: reference(f.source), selector: { kind: "text-range", start: 0, end: f.source.value.content.length } }] }] },
     usage: actualUsage }, { research: { verdict: "supported" }, usage: assessmentUsage }]);
@@ -1524,10 +1524,10 @@ test("E6 ordinary E4: packet significance and exact physical expense survive lat
   for (const action of ["answer", "cannot_answer"] as const) await t.test(action, async nested => {
     const f = ordinarySpendFixture(nested);
     const research = action === "answer"
-      ? { protocol: "omg-answer/v2", requestId: "$requestId", action,
+      ? { protocol: "$answerProtocol", requestId: "$requestId", action,
         results: [{ questionId: f.batch.items[0]!.gap, value: "UTF-8",
           citations: [{ source: reference(f.source), selector: { kind: "text-range", start: 0, end: f.source.value.content.length } }] }] }
-      : { protocol: "omg-answer/v2", requestId: "$requestId", action,
+      : { protocol: "$answerProtocol", requestId: "$requestId", action,
         questionIds: [f.batch.items[0]!.gap], reason: "The requested fact is unavailable in the named source" };
     f.steps([{ research, usage: actualUsage }]);
     const applied = deliveredOf(await runModelCall(f.store, f.request));

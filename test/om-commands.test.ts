@@ -124,11 +124,11 @@ function mechanismBatch(f: Fixture) {
   return routes.batches.find(item => item.model === "MC2" && item.task === "input-field" && item.items.every(row => row.consumers.length === 0))!;
 }
 function addressAll(f: Fixture) {
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer",
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: mechanismBatch(f).items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: { consumer: "garden-consume-block", kind: "repository-fact" } })) } };
 }
 function cannotAnswer(f: Fixture) {
-  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", questionIds: mechanismBatch(f).items.map(item => item.gap),
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: mechanismBatch(f).items.map(item => item.gap),
     action: "cannot_answer", reason: "The requested information is unavailable" }, usage };
 }
 const undecided = { research: { protocol: "omg-stop-analysis/v1", cause: { kind: "hypothesis", text: "The brief does not settle the encoding", sources: [] },
@@ -373,7 +373,7 @@ test("H2 row 6 of №1821-2: a continue through execute drives the pass to its s
       ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
+  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
   const sent = () => existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).length : 0;
   const done = ok<PassOutcome>(await engine.execute({ type: "om-continue", project }));
   assert.deepEqual([done.end, done.refusal, done.run!.value.state.phase], ["complete", null, "complete"]);

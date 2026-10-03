@@ -209,7 +209,7 @@ async function produceAtomicSeed() {
     const bindings: TaskObligationBinding[] = ledger.handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item as CarriedObligation)))
       .map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
         consumers: [{ node: work.id, tests: [...work.tests] }] }));
-    steps.push({ research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer', proposal: body, bindings },
+    steps.push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal: body, bindings },
       usage: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 0, reasoningOutputTokens: 1 } });
     writeFileSync(scenario, JSON.stringify({ steps }));
     const call: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' };

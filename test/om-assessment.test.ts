@@ -139,7 +139,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   const questionId = batch.items[0]!.gap;
-  const originalStep = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  const originalStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
   const dispatch = { adapter: reference(adapter), config: reference(config) };
@@ -155,7 +155,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
       const next = ok(writeQuestionPacket(store,{project,routes:reference(routes),batch:other.id,environment:reference(config),
         attempt:{series:reference(series),ordinal:1},previous:[]})).record;
       return {request:{project,packet:reference(next),dispatch,role:'implementer' as const},questionId:other.items[0]!.gap,
-        step:{research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'answer',results:other.items.map(item=>({questionId:item.gap,
+        step:{research:{protocol:'$answerProtocol',requestId:'$requestId',action:'answer',results:other.items.map(item=>({questionId:item.gap,
           value:'UTF-8',citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]}))},usage}};
     },
     get store() { return store; },
@@ -1029,7 +1029,7 @@ function twoMc1Fixture(t: TestContext, deferredPackets = false) {
   function requestFor(index:number){return requests[index]??=(
     {project,dispatch,role:'implementer',packet:reference(ok(writeQuestionPacket(store,packetRequests[index]!)).record)});}
   if(!deferredPackets)batches.forEach((_,index)=>requestFor(index));
-  const steps=batches.map(batch=>({research:{protocol:'omg-answer/v2',requestId:'$requestId',action:'answer',results:batch.items.map(item=>({
+  const steps=batches.map(batch=>({research:{protocol:'$answerProtocol',requestId:'$requestId',action:'answer',results:batch.items.map(item=>({
     questionId:item.gap,value:'UTF-8',citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]}))},usage}));
   return {project,block,series,dispatch,requests,packetRequests,requestFor,batches,steps,scenario,opening,path,get store(){return store;},
     sent(){return readFileSync(trace,'utf8').trim().split('\n').filter(Boolean);},restart(){store.close();store=new Store(path);}};
@@ -1221,7 +1221,7 @@ test('31 H1.0b a different already-applied B1 fact is a required file prerequisi
   const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes), batch: batch.id,
     environment: f.dispatch.config, attempt: { series: reference(series), ordinal: 2 }, previous: [] })).record;
   const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
-  const nextStep = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  const nextStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
   writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, { research: { verdict: 'supported', reasons: [] }, usage },

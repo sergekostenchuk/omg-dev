@@ -1357,7 +1357,7 @@ function e4AnalysisRecoveryFixture(t: TestContext) {
 }
 
 function e4Fact(f: ReturnType<typeof e4RecoveryFixture>) {
-  return { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'answer',
+  return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
       citations: [{ source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } }] }] };
 }

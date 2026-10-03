@@ -13,7 +13,7 @@ import { readRoutes, prepareRoutes, type RoutesRequest } from './routes.js';
 import { readGaps, type GapReadRequest } from './gaps.js';
 import { inputDecisionWrite, deriveInputDecisions, prepareAddressing, type InputFieldDecision } from './addressing.js';
 import { readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
-import { readPacketAnswer, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
+import { readPacketAnswer, packetReadPath, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
   type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest, type WorksPartBindings } from './question-packet.js';
 import type { LayerProposal } from './frame-proposals.js';
 import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
@@ -230,7 +230,8 @@ function contextRecord(store: Store, project: string, task: Ref, ref: Ref) {
 function checkReads(store: Store, request: PacketAnswerRequest, packet: Revision<QuestionPacketRecord>, reads: PacketRead[], current: boolean): Ref[] {
   const refs: Ref[] = [];
   const path = (value: string) => {
-    if (!safeRelativePath(value) || value.split('/').some(part => part.toLowerCase() === '.git'))
+    if (packet.value.answerProtocol === 'omg-answer/v3' ? !packetReadPath(value)
+      : !safeRelativePath(value) || value.split('/').some(part => part.toLowerCase() === '.git'))
       fail('answer_form_address_invalid', request.packet, 'path', 'A read needs an explicit path inside the selected project');
     if (current) {
       const environment = take(readRecord<Environment>(store, packet.value.request.environment,

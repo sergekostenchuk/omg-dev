@@ -1,6 +1,8 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { Ajv } from 'ajv';
+import { safeRelativePath } from '../src/graph/topology.js';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
@@ -24,7 +26,7 @@ import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-
 import { writeHorizon } from '../src/om/horizon.js';
 import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment, writeOmObligations } from '../src/om/obligations.js';
 import { writeOmInput, readOmInput, withHistoricalReads } from '../src/om/input.js';
-import { normalizePartAnswer, prepareQuestionTasks, writeQuestionPacket, type PartProposalBody, derivePartProposal, PACKET_ANSWER_PROTOCOL } from '../src/om/question-packet.js';
+import { normalizePartAnswer, prepareQuestionTasks, writeQuestionPacket, type PartProposalBody, derivePartProposal, packetReadPath, PACKET_ANSWER_PROTOCOL } from '../src/om/question-packet.js';
 import { writeRoutes, type RoutedBatch } from '../src/om/routes.js';
 import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -753,4 +755,72 @@ test('E3 binding rows share one exact D7 proof per operation while callers, Stor
   onPrimaryRead = undefined;
   assert.deepEqual(check().findings, []);
   assert.equal(counts.get('primary'), 7, 'Cycle cleanup must not poison the next external operation');
+});
+
+
+test('LP1 v3 table: all 35 paths agree in the actual schema and E3 for read and search', async t => {
+  const f = fixture(t), payload = f.factPacket.value.packet as Record<string, any>;
+  const validate = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
+  assert.equal(f.factPacket.value.answerProtocol, 'omg-answer/v3');
+  const forms: [number, string, string, boolean][] = [
+    [1, 'relative file', 'package.json', true], [2, 'nested', 'src/om/question-packet.ts', true],
+    [3, 'dot prefix', './package.json', false], [4, 'absolute inside', `${f.root}/package.json`, false],
+    [5, 'absolute root', f.root, false], [6, 'absolute outside', '/outside/OWNER-POLICY.md', false],
+    [7, 'filesystem root', '/', false], [8, 'parent prefix', '../x', false], [9, 'parent segment', 'src/../package.json', false],
+    [10, 'dot', '.', false], [11, 'parent', '..', false], [12, 'git prefix', '.git/config', false],
+    [13, 'git middle', 'src/.git/x', false], [14, 'git uppercase', '.GIT/config', false], [15, 'git last', 'a/.git', false],
+    [16, 'gitignore', '.gitignore', true], [17, 'github', '.github/workflows/ci.yml', true], [18, 'git suffix', 'foo.git/x', true],
+    [19, 'empty', '', false], [20, 'blank', '   ', false], [21, 'literal tilde', '~/x', true],
+    [22, 'backslash', 'src\\x.ts', false], [23, 'Windows drive', 'C:\\x', false], [24, 'drive relative', 'C:x', false],
+    [25, 'file URL', 'file:///x', false], [26, 'colon filename', 'file:x', true], [27, 'trailing slash', 'src/', false],
+    [28, 'empty segment', 'a//b', false], [29, 'star', '*.ts', false], [30, 'question mark', 'src/?', false],
+    [31, 'newline', 'a\nb', false], [32, 'NUL', 'a\u0000b', false], [33, 'DEL', 'a\u007fb', true],
+    [34, 'inner space', 'my file.txt', true], [35, 'Unicode', 'док/файл.md', true],
+  ];
+  const before = snapshot(f.store);
+  for (const [row, label, path, accepted] of forms) await t.test(`LP1 row ${row}: ${label}`, () => {
+    assert.equal(path.trim().length > 0 && safeRelativePath(path) && !path.split('/').some(p => p.toLowerCase() === '.git'), accepted);
+    assert.equal(packetReadPath(path), accepted);
+    for (const read of [{ action: 'read', path, media: 'text/plain' }, { action: 'search', within: path, query: 'format' }]) {
+      const raw = f.answerRaw(f.factPacket, { action: 'need_source', questionIds: f.questionIds(f.factPacket), missing: 'Need source', reads: [read] });
+      assert.equal(validate(JSON.parse(raw)), accepted);
+      for (const check of [checkAnswerForm, prepareAnswerForm]) {
+        const result = check(f.store, { project: f.project, packet: reference(f.factPacket), raw });
+        if (accepted) {
+          const value = ok(result); assert.equal(value.kind, 'need-source');
+          if (value.kind === 'need-source') assert.deepEqual(value.reads, [read], 'The literal address is never normalized');
+        } else rejected(result, 'part_answer_invalid');
+      }
+    }
+  });
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('LP1 v3 preserves record scopes and rejects missing paths, foreign response eras and symlink escapes without writes', t => {
+  const f = fixture(t), before = snapshot(f.store), payload = f.factPacket.value.packet as Record<string, any>;
+  const validate = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
+  const raw = (read: object) => f.answerRaw(f.factPacket, { action: 'need_source', questionIds: f.questionIds(f.factPacket), missing: 'Need source', reads: [read] });
+  const request = (body: string) => ({ project: f.project, packet: reference(f.factPacket), raw: body });
+  const scoped = raw({ action: 'search', within: reference(f.input), query: 'format' });
+  assert.equal(validate(JSON.parse(scoped)), true);
+  for (const check of [checkAnswerForm, prepareAnswerForm]) {
+    assert.equal(ok(check(f.store, request(scoped))).kind, 'need-source');
+    for (const read of [{ action: 'read', media: 'text/plain' }, { action: 'search', query: 'format' },
+      { action: 'search', within: { id: f.input.id, revision: f.input.revision }, query: 'format' }]) {
+      const body = raw(read); assert.equal(validate(JSON.parse(body)), false);
+      rejected(check(f.store, request(body)), 'part_answer_invalid');
+    }
+    const otherEra = JSON.parse(scoped); otherEra.protocol = 'omg-answer/v2';
+    rejected(check(f.store, request(JSON.stringify(otherEra))), 'part_answer_invalid');
+  }
+  const outside = mkdtempSync(join(tmpdir(), 'omg-lp1-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  writeFileSync(join(outside, 'source.txt'), 'outside project');
+  symlinkSync(outside, join(f.root, 'escape'));
+  for (const read of [{ action: 'read', path: 'escape/source.txt', media: 'text/plain' }, { action: 'search', within: 'escape', query: 'outside' }]) {
+    const body = raw(read); assert.equal(validate(JSON.parse(body)), true);
+    assert.equal(ok(checkAnswerForm(f.store, request(body))).kind, 'need-source');
+    rejected(prepareAnswerForm(f.store, request(body)), 'answer_form_address_invalid');
+  }
+  assert.deepEqual(snapshot(f.store), before);
 });

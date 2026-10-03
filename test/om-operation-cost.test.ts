@@ -947,7 +947,7 @@ const project = h1.project;
 /** A negative reply of the model for the exact saved packet of a node expansion: nothing is invented for its questions. */
 const cannotExpand = (f, step) => {
   const saved = step.request.packet, packet = f.store.get(saved.id, saved.revision);
-  return { research: { protocol: 'omg-answer/v2', requestId: '$requestId', questionIds: packet.value.packet.questions.map(item => item.id),
+  return { research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: packet.value.packet.questions.map(item => item.id),
     action: 'cannot_answer', reason: 'The requested expansion is unavailable' }, usage: h1.usage };
 };
 function pass(f, request, prefix) {
@@ -1554,7 +1554,7 @@ try {
   // Row 11: the model asks twice for the same source; the continuation packet after the read derives its previous
   // refusals from the same root basis — attempt 1's causes — never from anything paid later in attempt 2.
   const questions = p2.packet.value.packet.questions.map(row => row.id);
-  const need = { research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source', questionIds: questions, missing: 'Need the addressed source data',
+  const need = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source', questionIds: questions, missing: 'Need the addressed source data',
     reads: [{ action: 'read_source', source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] }, usage: g4b.traceUsage };
   grow('e22-produce', need, need);
   const cycle2 = ok(await runModelCycle(f.store, { project, packet: reference(p2.packet), dispatch: p.cycle.record.value.request.dispatch, role: 'implementer' }));
