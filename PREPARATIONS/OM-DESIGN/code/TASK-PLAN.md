@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 115. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → H2.0 → T48 → Q2.2 → AD2 → PF1 → LP1 → LP2.
+Задач: 115. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → P1 → P2 → P3 → D8.4a → D8.4b → D8.4c → H1.0c → D8.5 → D8.4d → D8.4e → D8.3.1 → D8.4.1 → H1.0d → Q1 → H1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4.2 → V3 → T-DIET → H1.5 → S1.2 → S1.4 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → H2.0 → T48 → Q2.2 → AD2 → LP1 → LP2.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -1590,10 +1590,11 @@
 - Отдаёт: —
 - Читает записи: журнал отказов G4b; доказательства истории (S1.3/S1.4)
 - Пишет записи: —
-- Разрешённые пути: `src/storage/store-view.ts`, `src/om/refusal-journal.ts`, `src/history/proofs.ts`, `src/om/model-call.ts`, `test/store-view.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/storage/store-view.ts`, `src/om/refusal-journal.ts`, `src/history/proofs.ts`, `src/om/model-call.ts`, `test/store-view.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-model-call.test.ts`, `test/om-input.test.ts`, `test/om-operation-cost.test.ts`, `test/om-answers-gate.test.ts`
 - Из движка как есть: S1.3 удержание доказательств (src/history/proofs.ts), S1.4 наблюдатель чтений Store (store-view); профиль и снимки перед evaluate попыток 2 и 3: /tmp/omg-perf-opus/exp-grow2/out/
 - После: S1.4, S1.3, R5, Q5, AD1
 - Тесты сверх обязательных:
+  - ДОГОВОР №2797 (Codex; ~/REPORTS/review/omg-code-pf1_contract-2797.md): 10 путей (+test/om-input, om-operation-cost, om-answers-gate); конструктор накладки владеет глубоко замороженными копиями, метаданные доверия только у него; постоянен лишь get, разрешённый в неизменяемую ожидающую строку своего слоя (метод+id+revision), прочее — штамп Store, реально обслуживающего чтение; неизвестный Proxy/capture/Transaction.preview разрывает доверие; replay ≠ зависимости; накладка в замыкании не включает межоперационное удержание; общая накладка партии не расширяет видимость соседних источников (иначе прежняя область); таблица 8 случаев; равенство продуктовых данных и замер на снимках exp-grow2 (шаги 07 и 23); задача B — отдельно
   - ДО КОДА — договор ревьюера по отчёту Opus №2791: граница накладки (база + замороженные ожидающие записи), когда событие накладки постоянно, когда сверяется штампом базы; таблица случаев (урок 46) с границами №1672, №2395, №2410 (полнота replay ≠ полнота зависимостей; capture; Transaction-preview); замер на снимках exp-grow2 до/после (CPU evaluate попыток 2 и 3)
   - регрессии: результат evaluate и записи побайтно равны прежним на снимках; ожидающая запись, изменённая между построением накладки и проверкой, не принимается; второй Store двигает базу — сверка штампом ловит; число событий сверки на партию — O(1) по числу источников
 
@@ -2479,7 +2480,7 @@
 - Пишет записи: owner-result
 - Разрешённые пути: `src/om/owner-result.ts`, `test/om-owner-result.test.ts`, `src/product/engine.ts`, `src/product/commands.ts`, `src/server.ts`, `test/server.test.ts`, `src/om/answers-gate.ts`, `test/om-answers-gate.test.ts`, `src/cli.ts`, `src/product/owner-authority.ts`, `test/owner-authority.test.ts`, `ui/app.tsx`
 - Из движка как есть: D1/D4 — gaps, routes; H2 — полномочие источника команды (вердикт №244)
-- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5, R1, R2, R3, AD1
+- После: D4, B1.1, E4, G1.2, G1.3, G1.4, C1, B3.0b, E5, B3, D6, H2, Q4, T-DIET, H1.5, R1, R2, R3, AD1, PF1
 - Тесты сверх обязательных:
   - ДОГОВОР №2719 (Kimi; ~/REPORTS/review/omg-code-h20_contract-2719.md; опись Devin №2716 на 7dd0848): 12 путей ровно пакету, stage-checks.ts и run.ts не нужны, commands.ts без изменений; записи om-owner-result/v1 (пространство зафиксировано читателем answers-gate), owner-command/v1, owner-session-grant/v1, owner-session/v1 (authority вне OM-эры, без om-); свой договор вопроса om-owner-question/v1 (B1 om-input, D1 om-gap, M6 om-routes + строка); обнаружение результата сканом identities(prefix) внутри answers-gate, эмиссия owner-answered; om-owner-decision — ВНЕ H2.0 (отдельная H2.x); приглашение привязано при выпуске в CLI к базе+проекту+единственному действию owner-result; UI — om-state + projection; таблица исходов полномочия в договоре
   - УРОК 46 (каталог 26.09.2026 — ~/REPORTS/review/omg-lesson46-outcome-tables_260926.md; каркас — lesson46/lesson46-tasks.json): таблица исхода НУЖНА; в договоре — частичная; состояния приглашения/сессии/команды (№1353) — таблица ДО кода; ориентиры Jev (куда смотреть при описи, не судья): src/product/engine.ts:ProductEngine.validateStage:214; src/product/engine.ts:ProductEngine.#assess:405; src/product/engine.ts:ProductEngine.execute:459
