@@ -10,7 +10,7 @@ import { projectGraph } from '../graph/project.js';
 import { requireGraph, validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { WORKS_FRAME_CONTRACT, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
+import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
   type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
@@ -26,13 +26,15 @@ export const CANDIDATE_REFUSAL_CODES = Object.freeze([
 ] as const);
 export type CandidateResult<T> = { readonly ok: true; readonly value: Sealed<T> }
   | { readonly ok: false; readonly refusal: Sealed<Refusal & { findings?: Finding[] }> };
+export const JOIN_ASSEMBLY = 'identity-joins/v1' as const;
 export interface FrameCandidate {
+  joinAssembly?: typeof JOIN_ASSEMBLY;
   project: string; level: 2 | 3; works?: WorksCandidateInput; graphHash: string; layerHash: string; upperHash: string; graph: Graph;
   fills: ProposalResult['fills']; base: { graph: Ref; frame: Ref | null }; proposals: Ref[];
 }
 export type CandidateAssembly = { state: 'gaps'; gaps: FrameGap[] } | { state: 'candidate'; candidate: FrameCandidate };
 export interface WorksCandidateInput { contract: typeof WORKS_FRAME_CONTRACT; producer: Ref; ledger: Ref; bindings: TaskObligationBinding[] }
-export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput }
+export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput; joinAssembly?: typeof JOIN_ASSEMBLY }
 export interface FrameCandidateRecord extends FrameCandidate { request: CandidateRequest }
 export type PreparedCandidate = { guards: Ref[]; expected: PreparedFrame['expected']; writes: Write[] } & (
   { state: 'gaps'; gaps: FrameGap[]; existing: null }
@@ -96,6 +98,16 @@ function requireRequest(value: unknown): asserts value is CandidateRequest {
   if (frame['level'] === 2 ? frame['upper'] !== null : !object(frame['upper']) || !isRef(frame['upper']['horizon'])
     || (frame['upper']['frame'] !== null && !isRef(frame['upper']['frame']))) invalid('frame.upper');
   if (!Array.isArray(value['proposals']) || !value['proposals'].every(isRef)) invalid('proposals');
+  if (Object.hasOwn(value, 'joinAssembly') && (frame['level'] !== 3 || value['joinAssembly'] !== JOIN_ASSEMBLY)) invalid('joinAssembly');
+}
+function checkedEra(value: FrameCandidateRecord, target: string): typeof JOIN_ASSEMBLY | undefined {
+  if (!object(value.request) || !object(value.request.frame))
+    reject('candidate_graph_mismatch', target, 'request', 'The candidate must retain its complete source request');
+  const marked = Object.hasOwn(value, 'joinAssembly'), requested = Object.hasOwn(value.request, 'joinAssembly');
+  if (marked !== requested || marked && (value.level !== 3 || value.joinAssembly !== JOIN_ASSEMBLY
+    || value.request.frame.level !== 3 || value.request.joinAssembly !== JOIN_ASSEMBLY))
+    reject('candidate_graph_mismatch', target, 'joinAssembly', 'The saved candidate and its request must name the same known assembly era');
+  return marked ? JOIN_ASSEMBLY : undefined;
 }
 function requireWorks(value: unknown): asserts value is WorksCandidateInput {
   if (!object(value) || value['contract'] !== WORKS_FRAME_CONTRACT
@@ -114,6 +126,7 @@ function normalizedWorks(works: WorksCandidateInput): WorksCandidateInput {
 }
 function normalizeRequest(request: CandidateRequest): CandidateRequest {
   return copy({ frame: request.frame, proposals: sorted(request.proposals),
+    ...(Object.hasOwn(request, 'joinAssembly') ? { joinAssembly: request.joinAssembly! } : {}),
     ...(Object.hasOwn(request, 'works') ? { works: normalizedWorks(request.works!) } : {}) });
 }
 
@@ -123,7 +136,9 @@ function requireRead(value: unknown): asserts value is CandidateReadRequest {
 }
 function idOf(value: FrameCandidate): string {
   return `om-candidate:${value.project}:${hashJson(value.level === 3
-    ? [value.level, value.graphHash, value.base, value.proposals, value.works!] : [value.graphHash, value.base, value.proposals])}`;
+    ? (value.joinAssembly === JOIN_ASSEMBLY
+      ? [value.level, value.joinAssembly, value.graphHash, value.base, value.proposals, value.works!]
+      : [value.level, value.graphHash, value.base, value.proposals, value.works!]) : [value.graphHash, value.base, value.proposals])}`;
 }
 
 // Only typed node references count. Text and JSON Schema may legitimately contain a removed node's name.
@@ -366,7 +381,79 @@ function checkWorkObligations(store: Store, request: CandidateRequest, candidate
   for (const obligation of taskObligations(basis.handoff as OmObligationHandoff)) if (!candidate.graph.researchObligations?.some(binding => binding.id === taskBindingId(obligation)))
     reject('works_obligations_invalid', obligation.obligation, 'bindings', 'Every carried task assignment must retain its own binding');
 }
-function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput): CandidateAssembly {
+function directIdentityInputs(graph: Graph, consumer: string): string[] {
+  return graph.connectors.filter(connector => connector.bindings.some(binding => binding.level === 3
+    && binding.anchor === null && binding.producer.node !== consumer
+    && binding.consumers.some(endpoint => endpoint.node === consumer))).map(connector => connector.id).sort(order);
+}
+function structuralIdentityJoins(frame: FrameRead, result: ProposalResult, graph: Graph): ReadonlyMap<string, Graph['joins'][number] | null> {
+  const obligations = new Map(result.obligations.map(item => [item.id, item]));
+  const origins = (fills: readonly ProposalResult['fills'][number][]) => {
+    const mapped = new Map<string, string>();
+    for (const fill of fills.filter(item => item.source === 'identity')) {
+      const upper = obligations.get(fill.obligation)?.upper.node;
+      if (!upper || mapped.has(fill.node) && mapped.get(fill.node) !== upper)
+        reject('frame_record_invalid', fill.node, 'identity', 'The proven identity must name exactly one retained upper node');
+      mapped.set(fill.node, upper);
+    }
+    return mapped;
+  };
+  const current = origins(result.fills), previous = origins(frame.accepted?.frame?.value.fills ?? []);
+  const sourceOf = (node: string, upper: string) => {
+    const sources = frame.upper.joins.filter(join => join.consumer === upper);
+    if (sources.length > 1) reject('graph_invalid', node, 'joins', 'The upper consumer has ambiguous joins',
+      [{ code: 'join_duplicate', target: upper, message: 'A consumer has more than one upper join' }]);
+    return sources[0];
+  };
+  const mechanical = new Set<string>();
+  for (const [node, upper] of previous) {
+    const source = sourceOf(node, upper);
+    if (!source) continue;
+    const id = representativeJoinId(source.id, upper, 3), saved = frame.accepted!.graph.joins.find(join => join.id === id);
+    if (!saved) continue;
+    const connectors = directIdentityInputs(frame.accepted!.graph, node);
+    const structural = { id, consumer: node, connectors, ...(source.failures ? { failures: source.failures } : {}) };
+    const used = new Set(frame.accepted!.frame!.value.fills.filter(fill => fill.source === 'identity' && fill.node === node)
+      .map(fill => obligations.get(fill.obligation)?.connector));
+    const legacy = { ...source, id, consumer: node, connectors,
+      ...(source.required ? { required: source.required.filter(connector => used.has(connector)) } : {}),
+      ...(source.optional ? { optional: source.optional.filter(connector => used.has(connector)) } : {}) };
+    if (!same(saved, structural) && !same(saved, legacy))
+      reject('derived_field_conflict', id, 'joins', 'The accepted definition at the mechanical address has different authored content');
+    mechanical.add(id);
+  }
+  for (const [node, upper] of current) {
+    const representative = result.representatives.find(item => item.id === node);
+    if (!representative || graph.horizon.includes(node) || !frame.upper.nodes.some(item => item.id === upper && item.kind === 'operation')
+      || result.fills.some(fill => fill.node === node && (fill.source !== 'identity' || !same(fill.basis, frame.upperRef)
+        || obligations.get(fill.obligation)?.zone !== 'outside')))
+      reject('frame_record_invalid', node, 'identity', 'The exception requires the complete current C2/C3 representative outside the final horizon');
+  }
+  for (const proposal of result.proposals) for (const join of proposal.value.joins) {
+    if (current.has(join.consumer) || mechanical.has(join.id))
+      reject('derived_field_conflict', join.id, 'joins', 'A proposal cannot author or redefine a proven mechanical identity join');
+  }
+  graph.joins = graph.joins.filter(join => !mechanical.has(join.id));
+  const context = new Map<string, Graph['joins'][number] | null>();
+  for (const [node, upper] of current) {
+    const source = sourceOf(node, upper), connectors = directIdentityInputs(graph, node);
+    if (graph.joins.some(join => join.consumer === node)) reject('graph_invalid', node, 'joins',
+      'An authored definition conflicts with the proven identity join',
+      [{ code: 'join_duplicate', target: node, message: 'A representative has another authored join' }]);
+    if (connectors.length >= 3 && !source || connectors.length && source && !source.failures)
+      reject('layer_join_design_required', node, 'joins', 'Direct identity inputs require a proven upper join and its original failures');
+    const join = source && connectors.length ? { id: representativeJoinId(source.id, upper, 3), consumer: node,
+      connectors, failures: copy(source.failures!) } : null;
+    if (join) {
+      if (graph.joins.some(item => item.id === join.id))
+        reject('derived_field_conflict', join.id, 'joins', 'A mechanical join address is already used by another definition');
+      graph.joins.push(join);
+    }
+    context.set(node, join);
+  }
+  return context;
+}
+function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput, joinAssembly?: typeof JOIN_ASSEMBLY): CandidateAssembly {
   const level = frame.request.level;
   const gaps = take(openObligationsToGaps(frame, result)) as FrameGap[];
   if (gaps.length) return { state: 'gaps', gaps };
@@ -405,7 +492,7 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
     const index = graph.nodes.findIndex(item => item.id === node.id);
     if (index < 0) graph.nodes.push(structuredClone(node)); else graph.nodes[index] = structuredClone(node);
   }
-  for (const join of result.joins) {
+  for (const join of joinAssembly ? [] : result.joins) {
     const index = graph.joins.findIndex(item => item.id === join.id);
     if (index < 0) graph.joins.push(structuredClone(join));
   }
@@ -449,8 +536,9 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
     if (!same(projectGraph(graph, 2), projectGraph(frame.upper, 2)))
       reject('works_upper_drift', graph.id, 'upper', 'A works candidate cannot change the accepted operation projection');
     // Use the native typed assembly for the work-owned test and join relations.
+    const identities = joinAssembly ? structuralIdentityJoins(frame, result, graph) : undefined;
     try {
-      const native = assembleL3(frame.upper, layerDesignOf(graph, 3, L3_ASSEMBLY) as Record<string, unknown>);
+      const native = assembleL3(frame.upper, layerDesignOf(graph, 3, L3_ASSEMBLY) as Record<string, unknown>, identities);
       Object.assign(graph, native);
     } catch (error) {
       if (!(error instanceof EngineError)) throw error;
@@ -477,20 +565,24 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
     graph, reference: { ...frame.request.graph, hash: hashJson(graph) },
     frame: { reference: { id: `om-frame:${frame.request.project}:${level}`, revision: 1, hash: hashJson(mapping) }, value: mapping },
   }, frame.upperRef, level));
-  return { state: 'candidate', candidate: { project: frame.request.project, level, ...(level === 3 ? { works: normalizedWorks(works!) } : {}), graphHash: hashJson(graph),
+  return { state: 'candidate', candidate: { project: frame.request.project, level, ...(joinAssembly ? { joinAssembly } : {}), ...(level === 3 ? { works: normalizedWorks(works!) } : {}), graphHash: hashJson(graph),
     layerHash: hashJson(projectGraph(graph, level)), upperHash: hashJson(projectGraph(graph, (level - 1) as 1 | 2)), graph,
     fills: result.fills, base: { graph: frame.request.graph, frame: frame.request.frame },
     proposals: sorted(result.proposals.map(proposal => proposal.reference)) } };
 }
 /** Pure F4.5: open obligations remain M5 gaps; this function never invents a completion or writes a frame. */
 export function assembleCandidate(frame: FrameRead, proposals: ProposalObservation[], works?: WorksCandidateInput): CandidateResult<CandidateAssembly> {
+  return deriveCandidate(frame, proposals, works, frame?.request?.level === 3 ? JOIN_ASSEMBLY : undefined);
+}
+function deriveCandidate(frame: FrameRead, proposals: ProposalObservation[], works: WorksCandidateInput | undefined,
+  joinAssembly: typeof JOIN_ASSEMBLY | undefined): CandidateResult<CandidateAssembly> {
   return outcome(() => {
     requireLevel(frame, works);
     if (!Array.isArray(proposals)) invalid('proposals');
     const result = take(applyProposals(frame, proposals)) as ProposalResult;
     if (frame.request.level === 3 && proposals.some(item => item.value.worksContract !== WORKS_FRAME_CONTRACT))
       reject('works_contract_invalid', 'candidate:3', 'proposals', 'New works assembly needs proposals of its declared era');
-    return assemble(copy(frame), result, works && normalizedWorks(works));
+    return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly);
   });
 }
 function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project: string): void {
@@ -498,6 +590,7 @@ function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project
   if (row.kind !== 'frame-candidate' || row.revision !== 1 || !object(value) || value.project !== project
     || !object(value.request) || !object(value.graph) || !object(value.base) || !Array.isArray(value.proposals)
     || row.hash !== hashJson(value)) reject('candidate_graph_mismatch', row.id, 'record', 'An immutable candidate names its own exact content and source request');
+  checkedEra(value, row.id);
   try { requireRequest(value.request); }
   catch (error) {
     if (error instanceof EngineError && error.code === 'candidate_request_invalid')
@@ -515,7 +608,7 @@ function verifyRecordSources(store: Store, row: Revision<FrameCandidateRecord>):
   const value = row.value;
   const sources = take(readFrameProposals(store, value.request));
   if (value.level === 3) checkedWorksBasis(store, value.request, false);
-  const expected = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], value.request.works));
+  const expected = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], value.request.works, checkedEra(value, row.id)));
   if (expected.state === 'candidate' && value.level === 3) checkWorkObligations(store, value.request, expected.candidate as FrameCandidate);
   if (expected.state !== 'candidate' || !same(value, { ...expected.candidate, request: value.request }) || row.id !== idOf(expected.candidate as FrameCandidate))
     reject('candidate_graph_mismatch', row.id, 'graph', 'The complete candidate must be rederived from its saved sources');
@@ -546,6 +639,7 @@ export function observeCandidate(store: Store, request: CandidateReadRequest): C
       || value.base.frame !== null && !isRef(value.base.frame) || !Array.isArray(value.proposals) || !value.proposals.every(isRef)
       || !Array.isArray(value.fills) || ![value.graphHash, value.layerHash, value.upperHash].every(item => typeof item === 'string' && /^[a-f0-9]{64}$/.test(item)))
       reject('candidate_graph_mismatch', record.id, 'record', 'A candidate observation needs its readable immutable envelope and exact source addresses');
+    checkedEra(value, record.id);
     try { requireRequest(value.request); }
     catch (error) {
       if (error instanceof EngineError && error.code === 'candidate_request_invalid')
@@ -582,21 +676,33 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
     const sources = take(prepareFrameProposals(store, request));
     if (request.frame.level === 3) request = normalizeRequest({ ...request, frame: sources.frame.request as CandidateRequest['frame'] });
     const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
-    const built = take(assembleCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works));
-    if (built.state === 'candidate' && request.frame.level === 3) checkWorkObligations(store, request, built.candidate as FrameCandidate);
     const common = { guards: unique([...sources.guards, ...(basis?.guards ?? [])]) as Ref[], expected: sources.expected as PreparedFrame['expected'] };
+    const existingResult = (existing: Revision<FrameCandidateRecord>, candidate: FrameCandidate): PreparedCandidate => {
+      verifyRecord(store, existing, request.frame.project);
+      const { request: _request, ...content } = existing.value;
+      if (!same(content, candidate)) reject('candidate_graph_mismatch', existing.id, 'candidate', 'An existing candidate with this identity has a different derived result');
+      if (candidate.level === 3) checkWorkObligations(store, request, candidate);
+      return { ...common, guards: unique([...common.guards, reference(existing)]), state: 'candidate', candidate: existing.value, writes: [], existing };
+    };
+    // C5 repeats an unmarked saved request. Probe only its exact old address, after current admission.
+    if (request.frame.level === 3 && !Object.hasOwn(request, 'joinAssembly')) {
+      const legacy = deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, undefined);
+      if (legacy.ok && legacy.value.state === 'candidate') {
+        const candidate = legacy.value.candidate as FrameCandidate, existing = store.get<FrameCandidateRecord>(idOf(candidate));
+        if (existing) return existingResult(existing, candidate);
+      }
+    }
+    if (request.frame.level === 3) request = normalizeRequest({ ...request, joinAssembly: JOIN_ASSEMBLY });
+    const built = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, request.joinAssembly));
     if (built.state === 'gaps') return { ...common, state: 'gaps', gaps: built.gaps as FrameGap[], writes: [], existing: null };
     const candidate: FrameCandidateRecord = { ...built.candidate as FrameCandidate, request }, id = idOf(candidate);
     const existing = store.get<FrameCandidateRecord>(id);
     if (existing) {
-      verifyRecord(store, existing, request.frame.project);
       // Identity is graph/base/proposals. A different current horizon may reuse the same immutable candidate,
       // but its admission guards come from THIS preparation; its historical source request stays unchanged.
-      const { request: _request, ...content } = existing.value;
-      if (!same(content, built.candidate)) reject('candidate_graph_mismatch', id, 'candidate', 'An existing candidate with this identity has a different derived result');
-      common.guards = unique([...common.guards, reference(existing)]);
-      return { ...common, state: 'candidate', candidate: existing.value, writes: [], existing };
+      return existingResult(existing, built.candidate as FrameCandidate);
     }
+    if (candidate.level === 3) checkWorkObligations(store, request, candidate);
     return { ...common, state: 'candidate', candidate, writes: [{ id, kind: 'frame-candidate', expected: 0, value: candidate }], existing: null };
   });
 }

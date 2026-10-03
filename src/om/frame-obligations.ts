@@ -96,6 +96,10 @@ export function representativeId(upperId: string, level: FrameLevel): string {
   requireFrameLevel(level);
   return `om-identity:${level}:${hashJson(upperId)}`;
 }
+
+export function representativeJoinId(join: string, upper: string, level: FrameLevel): string {
+  return `om-identity-join:${level}:${hashJson([join, upper])}`;
+}
 interface FrameFlow { connector: string; artifact: string; key: string; producer: Endpoint; consumers: Endpoint[]; anchor: string | null }
 function upperFlows(upper: Graph, level: FrameLevel): FrameFlow[] {
   const flows = new Map<string, FrameFlow>(), consumers = new Map<string, Set<string>>();
@@ -529,7 +533,7 @@ function fillResolved(upper: Graph, accepted: AcceptedFrame | null, upperRef: Re
   const nodes = [...representatives.values()].map(({ node, upper: upperId, ports }) => {
     const result = { ...node, ports: node.ports.filter(port => ports.has(port.id)).sort((a, b) => frameOrder(a.id, b.id)) };
     for (const join of upper.joins.filter(item => item.consumer === upperId)) joins.push({ ...join,
-      id: `om-identity-join:${level}:${hashJson([join.id, upperId])}`, consumer: node.id });
+      id: representativeJoinId(join.id, upperId, level), consumer: node.id });
     return result;
   });
   return { obligations, fills: frameSorted(fills), open, representatives: nodes.sort((a, b) => frameOrder(a.id, b.id)), joins: frameSorted(joins) };

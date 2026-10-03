@@ -4,7 +4,7 @@ import { Ajv } from 'ajv';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 import { layerDesignOf, layerDesignSpec, composeLayer } from '../src/graph/layer-design.js';
-import { L3_ASSEMBLY, layerRelationContext } from '../src/graph/layer-assembly.js';
+import { L3_ASSEMBLY, layerRelationContext, assembleL3 } from '../src/graph/layer-assembly.js';
 import { projectGraph } from '../src/graph/project.js';
 import { validateGraph } from '../src/graph/validate.js';
 import type { Graph } from '../src/graph/model.js';
@@ -88,4 +88,47 @@ test('known join requests are present before design and assembly derives identit
     error.code === 'layer_join_design_required' && error.details[0].consumer === 'p-consume-work');
   const unspecified = structuredClone(f.design); delete unspecified.joins.find((item: any) => item.consumer === 'p-consume-work').required;
   assert.throws(() => composeLayer(f.base, 3, unspecified, L3_ASSEMBLY), { code: 'layer_join_design_required' });
+});
+
+test('FJ1 rows 7/8/11: native works remain strict inside and outside the horizon, including identity-looking JSON', () => {
+  for (const outside of [false, true]) {
+    const f = joined(); if (outside) f.design.horizon = [];
+    for (const field of ['condition', 'required', 'optional']) {
+      const bad = structuredClone(f.design), join = bad.joins.find((item: any) => item.consumer === f.join.consumer);
+      delete join[field]; join.identity = true; bad.identityJoins = [join.consumer];
+      assert.throws(() => assembleL3(f.base, bad), { code: 'layer_join_design_required' });
+    }
+    const bad = structuredClone(f.design); bad.joins.find((item: any) => item.consumer === f.join.consumer).required = [];
+    assert.throws(() => assembleL3(f.base, bad), { code: 'layer_join_inputs_invalid' });
+    const missing = structuredClone(f.design); missing.joins = missing.joins.filter((item: any) => item.consumer !== f.join.consumer);
+    assert.throws(() => assembleL3(f.base, missing), { code: 'layer_join_design_required' });
+    for (const count of [1, 2]) {
+      const few = structuredClone(missing);
+      for (const connector of few.connectors.filter((item: any) => f.ids.slice(count).includes(item.id)))
+        connector.bindings = connector.bindings.filter((binding: any) => binding.level !== 3);
+      assert.doesNotThrow(() => assembleL3(f.base, few));
+    }
+  }
+});
+
+test('FJ1 row 16: identity direct inputs deduplicate flows and ignore self and sleeping deliveries; ordinary native inputs retain their era', () => {
+  const f = joined(), id = f.join.consumer, ids = [...f.ids].sort();
+  const expected: Graph['joins'][number] = { id: f.join.id, consumer: id, connectors: ids, failures: structuredClone(f.join.failures) };
+  f.join.connectors = ids.map(id => ({ kind: 'connector', id }));
+  delete f.join.condition; delete f.join.required; delete f.join.optional;
+  const source = f.design.connectors.find((item: any) => item.id === f.ids[0]);
+  const direct = source.bindings.find((binding: any) => binding.level === 3);
+  source.bindings.push(structuredClone(direct), { ...structuredClone(direct), anchor: 'sleeping' });
+  const self = structuredClone(source); self.id = 'self-only';
+  self.bindings = [{ ...structuredClone(direct), producer: { ...direct.producer, node: id } }];
+  f.design.connectors.push(self);
+  const context = new Map([[id, expected]]), before = structuredClone(f.design);
+  const actual = assembleL3(f.base, f.design, context);
+  assert.deepEqual(actual.joins.find((join: any) => join.consumer === id), expected);
+  assert.deepEqual(f.design, before);
+  const reverse = structuredClone(f.design); reverse.connectors.reverse();
+  for (const connector of reverse.connectors) connector.bindings.reverse();
+  assert.deepEqual(assembleL3(f.base, reverse, context).joins, actual.joins);
+  assert.throws(() => assembleL3(f.base, f.design), { code: 'layer_join_design_required' });
+  assert.throws(() => assembleL3(f.base, f.design, new Map([[id, { ...expected, connectors: [] }]])), { code: 'layer_join_inputs_invalid' });
 });

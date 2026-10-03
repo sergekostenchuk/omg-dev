@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
@@ -15,7 +15,7 @@ import { Store } from "../src/storage/store.js";
 import { fillObligations, prepareFrame, readFrame, type FrameRead, type FrameRequest, type FrameScope, type ConnectionFrame } from "../src/om/frame-obligations.js";
 import { type LayerProposal, type ProposalObservation, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { assembleCandidate, observeCandidate, prepareCandidate, writeCandidate, readCandidate, gateCandidate,
-  CANDIDATE_REFUSAL_CODES, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
+  CANDIDATE_REFUSAL_CODES, type FrameCandidateRecord, type CandidateRequest, JOIN_ASSEMBLY } from "../src/om/frame-candidate.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
@@ -908,4 +908,469 @@ test("L3 outcome and connector dependencies remain protected while unrelated typ
   assert.deepEqual(delivered(readCandidate(f.store, saved)), written.record);
   assert.equal(delivered(gateCandidate(f.store, saved)).passed, true);
   assert.deepEqual(revisions(f.store).filter(item => item.head.id !== written.record.id), before);
+});
+
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import type { Write } from '../src/storage/store.js';
+import { settleCandidate, readAcceptedFrame, rebaseFrame } from '../src/om/frame-accept.js';
+import { writeGaps, type GapRequest } from '../src/om/gaps.js';
+import { writeGapLines } from '../src/om/gap-lines.js';
+import { writeOmObligations } from '../src/om/obligations.js';
+import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
+import { prepareWorksFrame, writeWorksFrame, readWorksFrame } from '../src/om/works-frame.js';
+import { preparedField } from './preparation-fixture.js';
+import { Evidence } from '../src/evidence/evidence.js';
+import { writeNeighbors } from '../src/om/neighbors.js';
+import { writeAtomicGate, readAtomicGate } from '../src/om/atomic-gate.js';
+import { readFrameProposals } from '../src/om/frame-proposals.js';
+
+function fjPut(store: Store, id: string, proposal: LayerProposal) { return reference(store.write({ id: `om-proposal:garden:${id}`, kind: 'layer-proposal', expected: 0, value: proposal })); }
+function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
+  if (frame.request.level === 3) {
+    graph = clone(graph);
+    for (const part of ['nodes', 'artifacts', 'contracts', 'anchors', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers'] as const) {
+      const upper = frame.upper[part] ?? [], ids = new Set(upper.map(item => item.id));
+      Object.assign(graph, { [part]: [...clone(upper), ...(graph[part] ?? []).filter(item => !ids.has(item.id))] });
+    }
+    graph.connectors = frame.upper.connectors.map(upper => {
+      const desired = graph.connectors.find(connector => connector.id === upper.id)!;
+      return { ...clone(upper), wakeTest: upper.wakeTest ?? desired.wakeTest,
+        bindings: [...clone(upper.bindings), ...desired.bindings.filter(binding => binding.level === 3)] };
+    });
+  }
+  const level = frame.request.level, projected = projectGraph(graph, level);
+  const mapped = delivered(fillObligations(frame.upper, frame.scope, { graph,
+    reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+  const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
+    && (level === 2 || frame.scope.nodes.includes(node.parent!)));
+  const selected = new Set(nodes.map(node => node.id));
+  return { base: { graph: frame.request.graph, frame: frame.request.frame }, level,
+    ...(level === 3 ? { worksContract: 'works-frame/v1' as const } : {}), source: 'decision', status: 'proposed', nodes,
+    fills: mapped.fills.filter(fill => selected.has(fill.node)).map(fill => {
+      const obligation = mapped.obligations.find(item => item.id === fill.obligation)!;
+      const node = nodes.find(item => item.id === fill.node)!;
+      const codeRef = level === 3 && obligation.kind === 'connection-end'
+        ? node.code[obligation.upper.port === 'out-alt' ? 1 : 0]! : undefined;
+      return { obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }),
+        ...(codeRef ? { codeRef: clone(codeRef) } : {}) };
+    }),
+    localConnectors: level === 3 ? [] : projected.connectors.map(connector => ({ ...connector,
+      bindings: connector.bindings.filter(binding => binding.level === level) })).filter(connector => connector.bindings.length),
+    artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
+    tests: projected.tests.filter(item => level === 2 || selected.has(item.node)),
+    edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+    anchors: level === 2 ? projected.anchors : [], removes: [], replaces: [], redefines: [] };
+}
+
+/** First L3 is genuinely absent: only the native C4/G3/C5 transition accepts L2. */
+function fjFirstWorks(t: TestContext, externalIdentity = false) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-first-works-')), database = join(root, 'state.sqlite');
+  const store = new Store(database), engine = new ProductEngine(store), desired = gardenGraph('cross');
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  if (externalIdentity) {
+    desired.artifacts.find(item => item.id === 'garden-data')!.external = true;
+    desired.joins.push({ id: 'fj-upper-designed', consumer: 'garden-later-operation', connectors: ['garden-flow'],
+      condition: 'Upper operation waits for its explicit input', required: ['garden-flow'], optional: [],
+      failures: { missing: 'missing', extra: 'extra', foreign: 'foreign', stale: 'stale', duplicate: 'duplicate', returnsTo: 'garden-refusal-operation' } });
+  }
+  const produce = desired.nodes.find(node => node.id === 'garden-produce-work')!;
+  produce.code.push({ path: 'src/garden-alternative.ts', access: 'read', status: 'planned', symbol: 'deliverAlternative' });
+  const { level: _level, ...l1 } = projectGraph(desired, 1);
+  preparedFeatures(engine, 'garden', l1 as Graph, field => preparedField('garden', field));
+  let input = delivered(writeOmInput(store, { project: 'garden', expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const initial = delivered(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(store.get('graph:garden')!),
+    refinement: null, available: {}, choice: { choiceVersion: 'first-works-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const frame2: FrameRequest = { project: 'garden', level: 2, graph: reference(store.get('graph:garden')!),
+    horizon: reference(initial.gate), layer: null, frame: null, upper: null };
+  const proposal2Value = fjProposalFor(clone(delivered(prepareFrame(store, frame2))) as unknown as FrameRead, desired);
+  const proposal2 = fjPut(store, 'first-works-upper', proposal2Value);
+  const candidate2 = delivered(writeCandidate(store, { frame: frame2, proposals: [proposal2] }));
+  assert.equal(candidate2.state, 'candidate'); if (candidate2.state !== 'candidate') throw new Error('L2 candidate missing');
+  const candidateRef = reference(candidate2.record);
+  const accepted = delivered(settleCandidate(store, { project: 'garden', level: 2, candidate: candidateRef,
+    outcome: { gate: 'G3', candidate: candidateRef, graphHash: candidate2.record.value.graphHash, passed: true, codes: [] } }));
+  const graph = reference(accepted.graph!), layer2 = reference(accepted.layer!), upperFrame = reference(accepted.frame!);
+  if (externalIdentity) {
+    const decisions: import('../src/om/addressing.js').InputDecisionProposal['decision'][] = [
+      { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] },
+      { target: 'garden-B1', field: 'state', value: { writer: 'garden-produce-block', authority: 'garden-consume-block', rollback: 'garden-consume-block' } },
+      { target: 'garden-R1#1', field: 'checkKind', value: 'test' },
+    ];
+    input = delivered(writeAddressing(store, { project: 'garden', input: reference(input), graph,
+      decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project: 'garden', input: reference(input), graph, layers: [], decision }) as Write })) }));
+  }
+  const horizon = delivered(writeHorizon(store, { project: 'garden', input: reference(input), graph, refinement: layer2,
+    available: {}, choice: { choiceVersion: 'first-real-works', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const frame: FrameRequest = { project: 'garden', level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: upperFrame } };
+  const read = clone(delivered(prepareFrame(store, frame))) as unknown as FrameRead;
+  const proposal = fjProposalFor(read, desired), proposalRef = fjPut(store, 'first-real-works', proposal);
+  const works: ProposalRequest = { frame: read.request, proposals: [proposalRef] };
+  const gaps = delivered(writeGaps(store, { project: 'garden', input: reference(input), graph, horizon: frame.horizon,
+    operations: { frame: { ...frame2, graph, horizon: frame.horizon, layer: layer2, frame: upperFrame }, proposals: [] }, works }));
+  const gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = delivered(writeGapLines(store, { project: 'garden', previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const ledger = delivered(writeOmObligations(store, { project: 'garden', gaps: gapRead, lines: reference(lines), assignments: [] }));
+  assert.deepEqual(ledger.handoff.obligations, []);
+  const request: CandidateRequest = { ...works, works: { contract: 'works-frame/v1', producer: reference(ledger.producer), ledger: reference(ledger.record), bindings: [] } };
+  return { root, database, store, desired, read, proposal, proposalRef, request, ledger, lines, gaps, graph, layer2, upperFrame };
+}
+
+test('FJ1 rows 12/14/15: pure C4, works wrappers, reopen, exact repeat, absent slots and invalid eras', t => {
+  const f = fjFirstWorks(t);
+  const pure = delivered(assembleCandidate(f.read, [{ reference: f.proposalRef, value: f.proposal }], f.request.works));
+  assert.equal(pure.state, 'candidate'); if (pure.state !== 'candidate') return;
+  assert.equal(pure.candidate.joinAssembly, JOIN_ASSEMBLY);
+  const prepared = delivered(prepareWorksFrame(f.store, f.request));
+  assert.equal(prepared.state, 'candidate'); if (prepared.state !== 'candidate') return;
+  assert.equal(prepared.candidate.request.joinAssembly, JOIN_ASSEMBLY);
+  const { request: _request, ...content } = prepared.candidate;
+  assert.deepEqual(content, pure.candidate);
+  const written = delivered(writeWorksFrame(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const before = revisions(f.store), ref = reference(written.record), reopened = new Store(f.database);
+  try {
+    assert.deepEqual(delivered(readWorksFrame(reopened, { project: 'garden', candidate: ref })), written.record);
+    assert.deepEqual(delivered(observeCandidate(reopened, { project: 'garden', candidate: ref })).record, written.record);
+    for (const request of [f.request, clone(written.record.value.request) as CandidateRequest]) {
+      const repeat = delivered(prepareCandidate(reopened, request));
+      assert.equal(repeat.state, 'candidate'); if (repeat.state !== 'candidate') continue;
+      assert.deepEqual(repeat.writes, []); assert.deepEqual(reference(repeat.existing!), ref);
+      assert.ok(repeat.guards.some(item => canonical(item) === canonical(f.request.frame.graph)));
+      assert.deepEqual(delivered(writeCandidate(reopened, request)), written);
+    }
+    assert.deepEqual(revisions(reopened), before);
+  } finally { reopened.close(); }
+  const open = delivered(assembleCandidate(f.read, [], f.request.works));
+  assert.equal(open.state, 'gaps');
+  for (const value of ['unknown', null, undefined]) assert.throws(() => prepareCandidate(f.store,
+    { ...f.request, joinAssembly: value } as unknown as CandidateRequest), malformed);
+  const l2 = firstPass(t);
+  assert.throws(() => prepareCandidate(l2.store, { ...l2.request, joinAssembly: JOIN_ASSEMBLY }), malformed);
+});
+
+function fjDirectCase(seed: ReturnType<typeof fjFirstWorks>, inputs: number, sleeping: number, designed = false) {
+  const frame = clone(seed.read), proposal = clone(seed.proposal);
+  const consumer = 'garden-later-operation', supplier = 'garden-outside-supplier';
+  const sourceNode = clone(frame.upper.nodes.find(node => node.id === 'garden-produce-operation')!);
+  sourceNode.id = supplier; sourceNode.ports = sourceNode.ports.filter(port => port.direction === 'out');
+  frame.upper.nodes.push(sourceNode);
+  const template = frame.upper.connectors.find(connector => connector.id === 'garden-flow')!;
+  const ids: string[] = [];
+  for (let index = 0; index < inputs; index++) {
+    const id = `fj-input-${index}`, connector = clone(template); connector.id = id;
+    connector.bindings = [{ level: 2, producer: { node: index < sleeping ? 'garden-produce-operation' : supplier, port: 'out' },
+      consumers: [{ node: consumer, port: 'in' }], anchor: null }];
+    frame.upper.connectors.push(connector); ids.push(id);
+    if (index < sleeping) for (const check of proposal.tests.filter(check => check.node === 'garden-produce-work')) check.covers.push(id);
+  }
+  const failures = { missing: 'missing', extra: 'extra', foreign: 'foreign', stale: 'stale', duplicate: 'duplicate', returnsTo: consumer };
+  frame.upper.joins.push({ id: 'fj-upper-join', consumer, connectors: ['garden-flow', ...ids], failures,
+    ...(designed ? { condition: 'opaque upper condition', required: ['garden-flow', ...ids], optional: [] } : {}) });
+  frame.result = clone(delivered(fillObligations(frame.upper, frame.scope, null, frame.upperRef, 3))) as FrameRead['result'];
+  // The new upper deliveries are outside-only consumer obligations; supply the active producer endpoints explicitly.
+  for (const obligation of frame.result.open.filter(item => ids.includes(item.connector ?? '') && item.role === 'producer'))
+    proposal.fills.push({ obligation: obligation.id, node: 'garden-produce-work', port: 'out',
+      codeRef: clone(proposal.nodes.find(node => node.id === 'garden-produce-work')!.code[0]!) });
+  return { frame, proposal: observe(proposal, 'fj'), ids };
+}
+
+test('FJ1 rows 1/2/3/4/5/6: C2/C3 representatives reach native graph validation across the six observed input reductions', t => {
+  const seed = fjFirstWorks(t);
+  // Six reductions in the method incident: 3→2, 5→3, 5→4, 3→1, 3→1, 4→3.
+  for (const [count, sleeping] of [[2, 0], [4, 1], [4, 0], [2, 1], [2, 1], [3, 0], [0, 0], [1, 0], [3, 3]]) {
+    for (const designed of [false, true]) {
+      const f = fjDirectCase(seed, count!, sleeping!, designed), before = clone(f);
+      const result = assembleCandidate(f.frame, [f.proposal], seed.request.works);
+      if (result.ok) {
+        assert.equal(result.value.state, 'candidate'); if (result.value.state !== 'candidate') throw new Error('Unexpected gaps');
+        const graph = result.value.candidate.graph as Graph;
+        assert.deepEqual(validateGraph(graph).findings, []);
+        const identity = graph.nodes.find(node => node.parent === 'garden-later-operation')!;
+        const join = graph.joins.find(item => item.consumer === identity.id);
+        assert.deepEqual(join?.connectors ?? [], f.ids.slice(sleeping).sort());
+        if (join) assert.ok(!('condition' in join) && !('required' in join) && !('optional' in join));
+      } else {
+        assert.equal(result.refusal.code, 'graph_invalid', canonical(result));
+        assert.ok(result.refusal.findings?.length);
+        assert.ok(!result.refusal.findings!.some(item => item.code.startsWith('join_')), canonical(result));
+      }
+      assert.deepEqual(f, before, 'Assembly leaves upper joins, fills and paid proposals intact');
+    }
+  }
+  for (const count of [2, 3]) {
+    const f = fjDirectCase(seed, count, 0); f.frame.upper.joins = [];
+    for (const binding of f.frame.upper.connectors.find(item => item.id === 'garden-flow')!.bindings)
+      binding.consumers = binding.consumers.filter(consumer => consumer.node !== 'garden-later-operation');
+    f.frame.result = clone(delivered(fillObligations(f.frame.upper, f.frame.scope, null, f.frame.upperRef, 3))) as FrameRead['result'];
+    const result = assembleCandidate(f.frame, [f.proposal], seed.request.works);
+    if (count === 3) refusedAs(result, 'layer_join_design_required');
+    else if (!result.ok) { assert.equal(result.refusal.code, 'graph_invalid'); assert.ok(!result.refusal.findings!.some(item => item.code.startsWith('join_'))); }
+    else assert.equal(result.value.state, 'candidate');
+  }
+});
+
+test('FJ1 row 11: a model-authored join cannot claim the proven representative exception', t => {
+  const seed = fjFirstWorks(t), f = fjDirectCase(seed, 2, 0);
+  const identity = f.frame.result.representatives.find(node => node.parent === 'garden-later-operation')!;
+  f.proposal.value.joins.push({ ...clone(f.frame.upper.joins.at(-1)!), id: 'model-identity-join', consumer: identity.id });
+  f.proposal = observe(f.proposal.value, 'fj');
+  refusedAs(assembleCandidate(f.frame, [f.proposal], seed.request.works), 'derived_field_conflict');
+  f.proposal.value.nodes.push(clone(identity));
+  refusedAs(assembleCandidate(f.frame, [observe(f.proposal.value, 'fj')], seed.request.works), 'proposal_node_reserved');
+});
+
+test('FJ1 rows 2/6/14: a complete legal C4 fixture succeeds with an unimplemented direct join', t => {
+  const f = fjFirstWorks(t, true), written = delivered(writeWorksFrame(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const graph = written.record.value.graph;
+  assert.deepEqual(validateGraph(graph as Graph).findings, []);
+  const identity = graph.nodes.find(node => node.parent === 'garden-later-operation')!;
+  const join = graph.joins.find(item => item.consumer === identity.id)!;
+  assert.ok(join); assert.deepEqual(join.connectors, ['garden-flow']);
+  for (const key of ['condition', 'required', 'optional']) assert.equal(Object.hasOwn(join, key), false);
+  assert.deepEqual(join.failures, f.read.upper.joins.find(item => item.id === 'fj-upper-designed')!.failures);
+  assert.deepEqual(projectGraph(graph as Graph, 2), projectGraph(f.read.upper, 2));
+});
+
+test('FJ1 row 14: source advancement between prepare and write publishes no candidate', t => {
+  const f = fjFirstWorks(t), prepared = delivered(prepareWorksFrame(f.store, f.request));
+  assert.equal(prepared.state, 'candidate'); if (prepared.state !== 'candidate') return;
+  const row = f.store.get(f.proposalRef.id)!;
+  f.store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+  const before = revisions(f.store);
+  refusedAs(writeGuarded(f.store, { unit: 'F4.5', target: 'fj-candidate', writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.deepEqual(revisions(f.store), before);
+});
+
+test('FJ1 row 15: read and observation refuse unknown and inconsistent saved eras at the read boundary without database mutation', t => {
+  const f = fjFirstWorks(t), written = delivered(writeWorksFrame(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const before = revisions(f.store);
+  const { joinAssembly: _era, ...unmarked } = clone(written.record.value);
+  const values = [
+    { ...clone(written.record.value), joinAssembly: 'future' },
+    { ...clone(written.record.value), request: { ...clone(written.record.value.request), joinAssembly: 'future' } },
+    unmarked,
+    { ...clone(written.record.value), level: 2 },
+  ];
+  for (const value of values) {
+    const row = { ...written.record, value, hash: hashJson(value) };
+    const view = new Proxy(f.store, { get(target, key) {
+      if (key === 'get') return (id: string, revision?: number) => id === row.id && (revision === undefined || revision === row.revision)
+        ? row : target.get(id, revision);
+      const item: unknown = Reflect.get(target, key, target); return typeof item === 'function' ? item.bind(target) : item;
+    } });
+    for (const reader of [readCandidate, observeCandidate]) {
+      const refusal = refusedAs(reader(view, { project: 'garden', candidate: reference(row) }), 'candidate_graph_mismatch');
+      assert.equal(refusal.at.field, 'joinAssembly');
+    }
+  }
+  assert.deepEqual(revisions(f.store), before);
+});
+
+function fjProduceHistory(directory: string) {
+  const f = fjFirstWorks({ after() {} } as unknown as TestContext, true);
+  const takeCandidate = delivered(writeWorksFrame(f.store, f.request));
+  assert.equal(takeCandidate.state, 'candidate'); if (takeCandidate.state !== 'candidate') throw new Error('Missing candidate');
+  const candidate = takeCandidate.record, ref = reference(candidate), project = 'garden';
+  const neighbors = delivered(writeNeighbors(f.store, { project, candidate: ref }));
+  const command = { executable: process.execPath, args: ['--version'] };
+  const environment = new ProductEngine(f.store).environments.configure(project, { workspace: f.root,
+    implementer: { actor: 'fj', model: 'fixture', effort: 'high', command }, reviewer: { actor: 'fj-review', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000, requestCapacityChars: 200_000 }, 0);
+  writeFileSync(join(f.root, 'input.txt'), 'captured external input');
+  const source = new Evidence(f.store).file(project, 'garden-data', f.root, 'input.txt', 'text/plain', 0);
+  const gate = delivered(writeAtomicGate(f.store, { project, candidate: ref, neighbors: reference(neighbors),
+    environment: reference(environment), gaps: clone(f.ledger.record.value.request.gaps) as import('../src/om/gaps.js').GapReadRequest,
+    results: [], sources: [reference(source)] }));
+  assert.equal(gate.value.result.passed, true, canonical(gate.value.result.findings));
+  const settlement = { project, level: 3 as const, candidate: ref,
+    outcome: { ...clone(gate.value.result), codes: [...gate.value.result.codes], basis: reference(gate) } };
+  const frameBytes = canonical(delivered(readFrame(f.store, f.request.frame)));
+  const proposalsBytes = canonical(delivered(readFrameProposals(f.store, f.request)));
+  f.store.close();
+  const pending = join(directory, 'pending.sqlite'); copyFileSync(f.database, pending);
+  const store = new Store(f.database);
+  const settled = delivered(settleCandidate(store, settlement));
+  assert.ok(settled.graph && settled.frame && settled.layer);
+  const event = { project, level: 3 as const, graph: reference(settled.graph), layer: reference(settled.layer), frame: reference(settled.frame) };
+  const acceptedBytes = canonical(delivered(readAcceptedFrame(store, event)));
+  const input = f.gaps.sources.input;
+  const choice = { choiceVersion: 'fj-after-work', features: [{ outcome: 'garden-result' }], excluded: [] };
+  const horizon = delivered(writeHorizon(store, { project, input, graph: event.graph, refinement: f.layer2, available: {}, choice }));
+  const from: FrameRequest = { ...f.request.frame, graph: event.graph, horizon: reference(horizon.gate), layer: event.layer, frame: event.frame,
+    upper: { horizon: reference(horizon.gate), frame: f.upperFrame } };
+  const nextUpper = delivered(writeCandidate(store, { frame: { project, level: 2, graph: event.graph,
+    horizon: from.horizon, layer: f.layer2, frame: f.upperFrame, upper: null }, proposals: [] }));
+  assert.equal(nextUpper.state, 'candidate'); if (nextUpper.state !== 'candidate') throw new Error('Missing next upper');
+  const upperRef = reference(nextUpper.record), upper = delivered(settleCandidate(store, { project, level: 2, candidate: upperRef,
+    outcome: { gate: 'G3', candidate: upperRef, graphHash: nextUpper.record.value.graphHash, passed: true, codes: [] } }));
+  const nextHorizon = delivered(writeHorizon(store, { project, input, graph: reference(upper.graph!), refinement: reference(upper.layer!),
+    available: {}, choice: { ...choice, choiceVersion: 'fj-rebase' } }));
+  const to: FrameRequest = { project, level: 3, graph: reference(upper.graph!), horizon: reference(nextHorizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(nextHorizon.gate), frame: reference(upper.frame!) } };
+  const request = { from, to }, moved = delivered(rebaseFrame(store, request));
+  const rebased = delivered(readFrame(store, { ...to, layer: reference(moved.layer), frame: reference(moved.frame) }));
+  store.close();
+  const unjoined = fjFirstWorks({ after() {} } as unknown as TestContext);
+  const plain = delivered(writeWorksFrame(unjoined.store, unjoined.request));
+  assert.equal(plain.state, 'candidate'); if (plain.state !== 'candidate') throw new Error('Missing plain candidate');
+  unjoined.store.close();
+  return { root: f.root, database: f.database, pending, candidate, settlement, frameBytes, proposalsBytes, event, acceptedBytes,
+    rebase: request, moved, rebased, plain: { root: unjoined.root, database: unjoined.database, candidate: plain.record } };
+}
+
+function fjAcceptedRead(prior: FrameRead, candidate: import('../src/om/frame-candidate.js').FrameCandidate): FrameRead {
+  const frame = clone(prior), graph = clone(candidate.graph);
+  const mapping: ConnectionFrame = { project: 'garden', level: 3, worksContract: 'works-frame/v1', candidateHash: hashJson(graph),
+    layerHash: hashJson(projectGraph(graph, 3)), fills: candidate.fills.map(fill => ({ ...fill, source: fill.source === 'proposed' ? 'accepted' as const : fill.source })) };
+  // Canonical ordering uses code-point order, independent of the host locale.
+  mapping.fills.sort((left, right) => canonical(left) < canonical(right) ? -1 : canonical(left) > canonical(right) ? 1 : 0);
+  const frameRef = { id: 'om-frame:garden:3', revision: frame.request.frame!.revision + 1, hash: hashJson(mapping) };
+  frame.request.graph = { ...frame.request.graph, revision: frame.request.graph.revision + 1, hash: hashJson(graph) };
+  frame.request.frame = frameRef;
+  frame.accepted = { graph, reference: frame.request.graph, frame: { reference: frameRef, value: mapping } };
+  frame.result = clone(delivered(fillObligations(frame.upper, frame.scope, frame.accepted, frame.upperRef, 3))) as FrameRead['result'];
+  return frame;
+}
+function fjEnterOperations(prior: FrameRead, operations: string[]) {
+  const frame = clone(prior), desired = gardenGraph('cross');
+  frame.scope = scope([...new Set([...frame.scope.nodes, ...operations])].sort());
+  frame.result = clone(delivered(fillObligations(frame.upper, frame.scope, frame.accepted, frame.upperRef, 3))) as FrameRead['result'];
+  const proposal = emptyProposal(frame, 'fj-enter').value; proposal.worksContract = 'works-frame/v1';
+  for (const operation of operations) {
+    const node = clone(desired.nodes.find(item => item.kind === 'work' && item.parent === operation)!);
+    if (!node.code.length) {
+      node.id = `${operation}-real-work`; node.code = [{ path: `${node.id}.ts`, access: 'write', status: 'planned' }];
+      const check = clone(desired.tests.find(item => item.node === 'garden-consume-work')!);
+      check.id = `${node.id}-test`; check.node = node.id; check.contract!.entrypoint.path = node.code[0]!.path;
+      node.tests = [check.id]; proposal.tests.push(check);
+    } else proposal.tests.push(...clone(desired.tests.filter(item => item.node === node.id)));
+    proposal.nodes.push(node);
+    for (const obligation of frame.result.open.filter(item => item.upper.node === operation))
+      proposal.fills.push({ obligation: obligation.id, node: node.id, ...(obligation.upper.port ? { port: obligation.upper.port, codeRef: clone(node.code[0]!) } : {}) });
+  }
+  return { frame, proposal: observe(proposal, 'fj-enter') };
+}
+
+test('FJ1 rows 4/9/10/13: b595c7b produces accepted and pending legacy C4, designed identity joins and rebase in a separate process', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-fj1-history-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  const ts = (await import('typescript')).default;
+  const original = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  const parsed = ts.createSourceFile('fixture.js', original, ts.ScriptTarget.ES2023, true, ts.ScriptKind.JS);
+  // Reuse only fixture declarations; every engine source in the child comes from the immutable Git revision.
+  const fixture = parsed.statements.filter(statement => ts.isImportDeclaration(statement) || ts.isFunctionDeclaration(statement) || ts.isVariableStatement(statement))
+    .map(statement => {
+      let text = statement.getText(parsed);
+      if (ts.isImportDeclaration(statement)) text = text.replace(/,\s*JOIN_ASSEMBLY\b/g, '')
+        .replace(/from (["'])(\.[^"']+)\1/, (_whole, _quote, relative: string) => `from ${JSON.stringify(new URL(relative, import.meta.url).href)}`);
+      return text;
+    }).join('\n') + '\nexport { fjProduceHistory };\n';
+  const fixtureFile = join(root, 'fixture.mjs'); writeFileSync(fixtureFile, fixture);
+  const loader = join(root, 'loader.mjs');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+const root = ${JSON.stringify(repositoryUrl)}, prefix = new URL('dist/', root).href;
+export async function load(url, context, next) {
+  if (url.startsWith(prefix) && url.endsWith('.js')) {
+    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', 'b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c:' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 20000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}`);
+  const metadata = join(root, 'history.json');
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`;
+  execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, '--input-type=module', '--eval',
+    `import {writeFileSync} from 'node:fs'; import {fjProduceHistory} from ${JSON.stringify(pathToFileURL(fixtureFile).href)}; writeFileSync(${JSON.stringify(metadata)}, JSON.stringify(fjProduceHistory(${JSON.stringify(root)})));`],
+  { cwd: repository, stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 });
+  const history = JSON.parse(readFileSync(metadata, 'utf8')) as ReturnType<typeof fjProduceHistory>;
+  t.after(() => { rmSync(history.root, { recursive: true, force: true }); rmSync(history.plain.root, { recursive: true, force: true }); });
+  assert.equal(Object.hasOwn(history.candidate.value, 'joinAssembly'), false);
+  assert.ok(history.candidate.value.graph.joins.some(item => item.consumer.startsWith('om-identity:') && item.condition));
+  for (const database of [history.pending, history.database]) {
+    const store = new Store(database);
+    try {
+      const before = revisions(store), ref = reference(history.candidate);
+      const savedRequest = clone(history.candidate.value.request) as CandidateRequest;
+      assert.equal(delivered(readAtomicGate(store, { project: 'garden', record: history.settlement.outcome.basis })).value.result.passed, true);
+      assert.deepEqual(delivered(readCandidate(store, { project: 'garden', candidate: ref })), history.candidate);
+      assert.deepEqual(delivered(observeCandidate(store, { project: 'garden', candidate: ref })).record, history.candidate);
+      assert.equal(canonical(delivered(readFrame(store, history.candidate.value.request.frame))), history.frameBytes);
+      assert.equal(canonical(delivered(readFrameProposals(store, savedRequest))), history.proposalsBytes);
+      assert.deepEqual(revisions(store), before);
+      if (database === history.pending) {
+        const repeated = delivered(prepareCandidate(store, savedRequest));
+        assert.equal(repeated.state, 'candidate'); if (repeated.state !== 'candidate') throw new Error('Missing legacy repeat');
+        assert.deepEqual(repeated.writes, []); assert.deepEqual(repeated.existing, history.candidate);
+        assert.deepEqual(delivered(writeCandidate(store, savedRequest)), { state: 'candidate', record: history.candidate });
+        assert.deepEqual(revisions(store), before);
+        const accepted = delivered(settleCandidate(store, history.settlement));
+        assert.equal(accepted.state, 'accepted');
+        assert.deepEqual(accepted.graph!.value, history.candidate.value.graph);
+      } else {
+        assert.equal(canonical(delivered(readAcceptedFrame(store, history.event))), history.acceptedBytes);
+        assert.deepEqual(delivered(rebaseFrame(store, history.rebase)).frame, history.moved.frame);
+        assert.deepEqual(delivered(readFrame(store, history.rebased.request)), history.rebased);
+        refusedAs(prepareCandidate(store, savedRequest), 'input_stale');
+        const prior = clone(delivered(readFrame(store, history.rebase.from))) as FrameRead;
+        const assembled = delivered(assembleCandidate(prior, [], savedRequest.works));
+        assert.equal(assembled.state, 'candidate'); if (assembled.state !== 'candidate') throw new Error('Missing carried candidate');
+        const carried = assembled.candidate as import('../src/om/frame-candidate.js').FrameCandidate;
+        const identity = carried.graph.nodes.find(node => node.parent === 'garden-later-operation')!;
+        const mechanical = carried.graph.joins.find(item => item.consumer === identity.id)!;
+        assert.ok(mechanical); assert.equal(mechanical.condition, undefined, 'row 9: the accepted legacy join is recomputed');
+        // A real producer can enter only after the upper project makes this artifact internally produced.
+        const productionBase = clone(prior), production = clone(carried);
+        productionBase.scope = scope([...new Set([...prior.scope.nodes, 'garden-produce-operation', 'garden-prep-operation'])].sort());
+        productionBase.upper.artifacts.find(item => item.id === 'garden-data')!.external = false;
+        production.graph.artifacts.find(item => item.id === 'garden-data')!.external = false;
+        const active = fjEnterOperations(fjAcceptedRead(productionBase, production), ['garden-produce-operation', 'garden-prep-operation']);
+        const sleepingResult = assembleCandidate(active.frame, [active.proposal], savedRequest.works);
+        assert.ok(sleepingResult.ok, canonical(sleepingResult));
+        const sleeping = delivered(sleepingResult);
+        assert.equal(sleeping.state, 'candidate'); if (sleeping.state !== 'candidate') throw new Error('Missing sleeping candidate');
+        assert.ok(!sleeping.candidate.graph.joins.some(item => item.consumer === identity.id), 'rows 4/9: all incoming deliveries sleep');
+        assert.ok(sleeping.candidate.graph.connectors.some(item => item.bindings.some(binding => binding.level === 3 && binding.anchor
+          && binding.consumers.some(endpoint => endpoint.node === identity.id))));
+        const again = fjAcceptedRead(active.frame, sleeping.candidate as import('../src/om/frame-candidate.js').FrameCandidate);
+        again.scope = clone(prior.scope);
+        again.result = clone(delivered(fillObligations(again.upper, again.scope, again.accepted, again.upperRef, 3))) as FrameRead['result'];
+        const awakeResult = assembleCandidate(again, [], savedRequest.works); assert.ok(awakeResult.ok, canonical(awakeResult));
+        const awake = delivered(awakeResult);
+        assert.equal(awake.state, 'candidate'); if (awake.state !== 'candidate') throw new Error('Missing awake candidate');
+        assert.deepEqual(awake.candidate.graph.joins.find(item => item.consumer === identity.id), mechanical, 'row 4: a later new assembly restores direct inputs');
+        const entered = fjEnterOperations(prior, ['garden-later-operation']);
+        const realResult = assembleCandidate(entered.frame, [entered.proposal], savedRequest.works); assert.ok(realResult.ok, canonical(realResult));
+        const real = delivered(realResult);
+        assert.equal(real.state, 'candidate'); if (real.state !== 'candidate') throw new Error('Missing real replacement');
+        assert.ok(!real.candidate.graph.nodes.some(node => node.id === identity.id));
+        assert.ok(!real.candidate.graph.joins.some(join => join.consumer === identity.id), 'row 10: the obsolete mechanical definition is removed');
+        for (const conflict of ['content', 'duplicate'] as const) {
+          const changed = clone(carried);
+          if (conflict === 'content') changed.graph.joins.find(join => join.id === mechanical.id)!.condition = 'authored content at the same address';
+          else changed.graph.joins.push({ ...mechanical, id: 'authored-other-join', condition: 'authored', required: [...mechanical.connectors], optional: [] });
+          const bad = fjAcceptedRead(prior, changed);
+          const failure = refusedAs(assembleCandidate(bad, [], savedRequest.works), conflict === 'content' ? 'derived_field_conflict' : 'graph_invalid');
+          if (conflict === 'duplicate') assert.equal((failure as typeof failure & { findings: Finding[] }).findings[0]!.code, 'join_duplicate');
+        }
+      }
+    } finally { store.close(); }
+  }
+  const plain = new Store(history.plain.database);
+  try {
+    const old = history.plain.candidate, request = clone(old.value.request) as CandidateRequest;
+    const next = delivered(writeCandidate(plain, { ...request, joinAssembly: JOIN_ASSEMBLY }));
+    assert.equal(next.state, 'candidate'); if (next.state !== 'candidate') return;
+    assert.equal(next.record.value.graphHash, old.value.graphHash); assert.notEqual(next.record.id, old.id);
+    assert.deepEqual(delivered(writeCandidate(plain, request)), { state: 'candidate', record: old });
+  } finally { plain.close(); }
 });

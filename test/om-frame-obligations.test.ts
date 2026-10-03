@@ -562,7 +562,7 @@ test("accepted fills follow explicit realizes even when containment belongs to a
   }
 });
 
-test("outside representatives carry only their own required ports and accepted identity never closes the horizon", () => {
+test("FJ1 row 10: outside representatives carry only their own required ports and accepted identity never closes the horizon", () => {
   for (const level of levels) {
     const view = upper(gardenGraph("cross"), level);
     const later = view.nodes.find(item => item.id === (level === 2 ? "garden-later-block" : "garden-later-operation"))!;

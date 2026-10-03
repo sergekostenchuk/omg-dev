@@ -228,9 +228,14 @@ export async function load(url, context, next) {
 /** Saved legal bases: M8 (the accepted works of om-feasibility.test, M8 written and handed off, not yet compiled) and legacy. */
 const BUILD = String.raw`
 const C = JSON.parse(process.argv[2]);
-const { readFileSync } = await import('node:fs');
+const { execFileSync } = await import('node:child_process');
+const ts = (await import(C.typescript)).default;
 const url = new URL('om-feasibility.test.js', C.tst);
-let source = readFileSync(url, 'utf8');
+// FJ1: the shared saved base belongs to the old reader's era, including its fixture declarations.
+const oldFixture = execFileSync('git', ['show', C.fixtureBase + ':test/om-feasibility.test.ts'],
+  { cwd: C.repository, encoding: 'utf8', maxBuffer: 10000000 });
+let source = ts.transpileModule(oldFixture,
+  { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText;
 const end = source.indexOf('const heads =');
 if (end < 0) throw new Error('The declared om-feasibility fixture seam moved');
 source = source.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g, (_match, _quote, path) => 'from ' + JSON.stringify(new URL(path, url).href));
@@ -358,7 +363,8 @@ after(() => {
 function savedBases(): Promise<Saved> {
   saved ??= (async () => {
     const directory = mkdtempSync(join(tmpdir(), 'omg-r34-bases-'));
-    const build = child(directory, 'build', BUILD, {}) as Saved['build'];
+    const build = child(directory, 'build', BUILD, { repository: ROOT, fixtureBase: BASE,
+      typescript: pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href }, true) as Saved['build'];
     const planned = join(directory, 'planned.sqlite');
     const config = { directory: '', database: build.database, project: build.project, m8: build.m8, legacy: build.legacy };
     const baseDirectory = mkdtempSync(join(directory, 'base-')), currentDirectory = mkdtempSync(join(directory, 'current-'));

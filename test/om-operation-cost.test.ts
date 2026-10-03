@@ -281,10 +281,45 @@ try {
   const { contract, binding, layer, ...originalAcceptance } = freshAcceptance.frame.value.acceptance;
   assert.equal(contract, 'om-frame-acceptance/v1'); assert.equal(binding, null);
   assert.deepEqual(layer, { id: freshAcceptance.layer.id, revision: freshAcceptance.layer.revision });
-  assert.deepEqual(originalAcceptance, legacy.frame.frame.value.acceptance);
-  assert.deepEqual(freshAcceptance.graph, legacy.frame.graph); assert.deepEqual(freshAcceptance.proposals, legacy.frame.proposals);
-  assert.deepEqual({ ...freshAcceptance.frame.value, acceptance: originalAcceptance }, legacy.frame.frame.value,
-    'The fresh producer changes the explicit acceptance era while preserving its candidate, gate and filled result');
+  // FJ1: a new independent C4 belongs to its new assembly era; the exact saved history above remains unchanged.
+  const { hashJson } = await imports('canonical');
+  const oldAcceptance = legacy.frame.frame.value.acceptance;
+  const oldCandidate = historical.get(oldAcceptance.candidate.id, oldAcceptance.candidate.revision);
+  const newCandidate = store.get(originalAcceptance.candidate.id, originalAcceptance.candidate.revision);
+  assert.ok(oldCandidate && newCandidate);
+  assert.deepEqual(reference(newCandidate), originalAcceptance.candidate);
+  const { joinAssembly, request: candidateRequest, ...candidateBody } = newCandidate.value;
+  const { joinAssembly: requestedEra, ...oldRequest } = candidateRequest;
+  assert.equal(joinAssembly, 'identity-joins/v1'); assert.equal(requestedEra, joinAssembly);
+  assert.equal(Object.hasOwn(oldCandidate.value, 'joinAssembly'), false);
+  assert.deepEqual({ ...candidateBody, request: oldRequest }, oldCandidate.value,
+    'Only the explicit C4 era changes this fixture candidate; the complete graph, sources and works stay equal');
+  assert.equal(newCandidate.id, 'om-candidate:' + f.project + ':' + hashJson([candidateBody.level, joinAssembly,
+    candidateBody.graphHash, candidateBody.base, candidateBody.proposals, candidateBody.works]));
+  assert.equal(newCandidate.hash, hashJson(newCandidate.value));
+  assert.notDeepEqual(reference(newCandidate), oldAcceptance.candidate);
+  const newGate = store.get(originalAcceptance.gate.basis.id, originalAcceptance.gate.basis.revision);
+  assert.ok(newGate);
+  assert.deepEqual(reference(newGate), originalAcceptance.gate.basis);
+  assert.equal(newGate.hash, hashJson(newGate.value));
+  assert.deepEqual(newGate.value.request.candidate, reference(newCandidate));
+  assert.deepEqual(newGate.value.result.candidate, reference(newCandidate));
+  assert.equal(newGate.value.result.graphHash, candidateBody.graphHash);
+  assert.deepEqual(originalAcceptance.gate.candidate, reference(newCandidate));
+  const sameEraAcceptance = { ...originalAcceptance, candidate: oldAcceptance.candidate,
+    gate: { ...originalAcceptance.gate, candidate: oldAcceptance.gate.candidate, basis: oldAcceptance.gate.basis } };
+  assert.deepEqual(sameEraAcceptance, oldAcceptance);
+  assert.deepEqual(freshAcceptance.graph, legacy.frame.graph);
+  const sameEraProposals = freshAcceptance.proposals.map(row => {
+    assert.equal(row.hash, hashJson(row.value));
+    assert.deepEqual(row.value.verdict.candidate, reference(newCandidate));
+    const value = { ...row.value, verdict: { ...row.value.verdict, candidate: oldAcceptance.candidate } };
+    return { ...row, value, hash: hashJson(value) };
+  });
+  assert.deepEqual(sameEraProposals, legacy.frame.proposals,
+    'Accepted proposal verdicts name the proved new candidate; their hashes and every other field stay exact');
+  assert.deepEqual({ ...freshAcceptance.frame.value, acceptance: sameEraAcceptance }, legacy.frame.frame.value,
+    'The fresh C4 and G5 references follow their proved new era; every other accepting-frame field stays equal');
   const sibling = cloneStore(seed.database, 'warm-acceptance');
   const warmAccepted = withHistoricalReads(() => {
     ok(readAcceptedFrame(sibling, { project: f.project, level: 2, graph: f.graph, layer: f.layer2, frame: f.upperFrame }));

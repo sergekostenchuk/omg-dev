@@ -8,10 +8,11 @@ export const connectorRef = (id: string) => ({ kind: 'connector' as const, id })
 export const connectorRefSchema = { type: 'object', additionalProperties: false, required: ['kind', 'id'],
   properties: { kind: { const: 'connector' }, id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$' } } };
 
-function incoming(graph: Pick<Graph, 'connectors'>, level: number) {
+function incoming(graph: Pick<Graph, 'connectors'>, level: number, identities?: ReadonlyMap<string, Graph['joins'][number] | null>) {
   const result = new Map<string, Set<string>>();
   for (const connector of graph.connectors) for (const binding of connector.bindings) if (binding.level === level && binding.anchor === null)
     for (const consumer of binding.consumers) {
+      if (identities?.has(consumer.node) && binding.producer.node === consumer.node) continue;
       const ids = result.get(consumer.node) ?? new Set<string>(); ids.add(connector.id); result.set(consumer.node, ids);
     }
   return result;
@@ -41,7 +42,10 @@ export function encodeLayerRelations(design: Record<string, any>): Record<string
   return result;
 }
 
-export function assembleL3(base: Graph, input: Record<string, any>): Record<string, any> {
+/** C4 supplies exact structural definitions only after proving the C2/C3 correspondence.
+ * Authoring JSON never supplies this context; ordinary native callers remain strict. */
+export function assembleL3(base: Graph, input: Record<string, any>,
+  identities?: ReadonlyMap<string, Graph['joins'][number] | null>): Record<string, any> {
   const design = structuredClone(input);
   requireCondition(['nodes', 'tests', 'connectors', 'joins', 'edges'].every(key => Array.isArray(design[key])
     && design[key].every((item: unknown) => item && typeof item === 'object' && !Array.isArray(item))),
@@ -72,7 +76,7 @@ export function assembleL3(base: Graph, input: Record<string, any>): Record<stri
     requireCondition(node.implements === undefined || Array.isArray(node.implements), 'layer_requirement_invalid', 'Additional requirement identities must be an array');
     node.implements = [...new Set([...(node.implements ?? []), ...known])].sort();
   }
-  const inputs = incoming({ connectors: design['connectors'] }, 3);
+  const inputs = incoming({ connectors: design['connectors'] }, 3, identities);
   for (const join of design['joins']) {
     for (const key of ['connectors', 'required', 'optional']) if (join[key] !== undefined) {
       requireCondition(Array.isArray(join[key]), 'layer_join_inputs_invalid', 'Join inputs must be typed connector arrays');
@@ -80,6 +84,13 @@ export function assembleL3(base: Graph, input: Record<string, any>): Record<stri
     }
     if (nodes.get(join.consumer)?.kind !== 'work') continue;
     const actual = [...(inputs.get(join.consumer) ?? [])].sort();
+    if (identities?.has(join.consumer)) {
+      const expected = identities.get(join.consumer);
+      requireCondition(expected != null && canonical(join) === canonical(expected)
+        && canonical(join.connectors) === canonical(actual),
+      'layer_join_inputs_invalid', 'A proven identity join must equal its exact structural definition and direct inputs');
+      continue;
+    }
     requireCondition(typeof join.condition === 'string' && join.condition.trim() && Array.isArray(join.required) && Array.isArray(join.optional),
       'layer_join_design_required', 'A concrete join needs a designed condition and explicit required/optional inputs');
     requireCondition(canonical([...join.required, ...join.optional].sort()) === canonical(actual),
