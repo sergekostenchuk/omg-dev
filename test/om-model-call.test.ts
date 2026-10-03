@@ -262,6 +262,7 @@ import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASS
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import { prepareAnswersGateTrace } from '../src/om/answers-gate.js';
+import { readRecord } from '../src/om/refs.js';
 import { runModelCall, readModelCall, readModelCallState, readManagedModelDiagnostic, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
 import { readCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
@@ -3612,4 +3613,92 @@ test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writ
   assert.ok(isProxy(opaque) && readServer(opaque, 'get', 'pf1m:c', undefined) === null, 'Over an unproved view the call store stays opaque');
   assert.throws(() => pendingCallStore(store, [{ id: 'pf1m:d', kind: 'k', expected: 0, value: { f: (() => 1) as unknown as Json } }]),
     (error: unknown) => error instanceof EngineError && error.code === 'invalid_json', 'A value that is no JSON is refused as before: its hash is taken first');
+});
+
+test('LP3 (№2817 row 2) a need_source that E3 admits but whose search names a context record as its scope ends the cycle as reads-invalid with the read\'s own record_foreign, before any read: the root is discharged, nothing more is sent, and the cycle reads and repeats the same after restart; a source scope and read_context of that record still deliver', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
+    { action: 'search', within: reference(f.input), query: 'question' }]);
+  f.steps([{ research: need, usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'reads-invalid');
+  assert.equal(f.sent().length, 1, 'One paid call; the unperformable read sends nothing more');
+  assert.deepEqual(f.store.list('om-read-delivery'), [], 'No read was performed — not even the lawful one before it');
+  const diagnostic = f.store.get<{ refusals: { code: string }[] }>(cycle.record.value.diagnostic!.id)!;
+  assert.equal(diagnostic.value.refusals[0]!.code, 'record_foreign', 'The read keeps its own addressed refusal');
+  assert.ok(canonical(diagnostic.value as unknown as Json).includes(f.input.id), 'and its exact record as evidence');
+  const work = completionSnapshot(f); assert.equal(work.complete, true); assert.ok(work.refusals.length);
+  const saved = f.store.list(); f.restart();
+  assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) })).record, cycle.record);
+  valueOf(await runModelCycle(f.store, f.request));
+  assert.deepEqual(f.store.list(), saved, 'The repeat writes nothing'); assert.equal(f.sent().length, 1);
+  // Control: the same record read as context, and a captured source as the scope, are performed as before.
+  const g = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  g.steps([{ research: e4NeedSource(g, [{ action: 'read_context', record: reference(g.input), pointer: '/input/questions/0/question' },
+    { action: 'search', within: reference(g.source), query: 'UTF' }]), usage }, { research: e4Fact(g), usage }]);
+  const lawful = valueOf(await runModelCycle(g.store, g.request));
+  assert.equal(lawful.record.value.terminal, 'outcome'); assert.equal(g.sent().length, 2);
+  assert.equal(g.store.list('om-read-delivery').length, 2);
+});
+
+test('LP3 (№2817 п.4, п.7) a cycle stopped between its transactions — after the call, the deliveries, the blocked continuation or its diagnostic; after the call or the diagnostic of an unperformable read — is finished by the same cycle without another send, with the same terminal and diagnostic, and repeats without a write after restart', async t => {
+  const windows = { blocked: ['call', 'deliveries', 'continuation', 'diagnostic'], 'reads-invalid': ['call', 'diagnostic'] } as const;
+  for (const [terminal, stops] of Object.entries(windows)) for (const stop of stops) await t.test(`${terminal} after ${stop}`, async t => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+    let request = f.request, packetRequest = f.packetRequest;
+    if (terminal === 'blocked') {
+      const config = f.environment(f.packet.value.fingerprint!.chars + 100);
+      packetRequest = { ...f.packetRequest, environment: reference(config) };
+      const packet = valueOf(writeQuestionPacket(f.store, packetRequest)).record;
+      request = { ...request, packet: reference(packet), dispatch: { ...request.dispatch, config: reference(config) } };
+      writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
+    }
+    const reads = terminal === 'blocked' ? [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]
+      : [{ action: 'search', within: reference(f.input), query: 'question' }];
+    f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4NeedSource(f, reads), usage }]);
+    const call = valueOf(await runModelCall(f.store, request));
+    const basis = { project: f.project, packet: request.packet, call: call.call, response: call.response! };
+    if (terminal === 'blocked' && stop !== 'call') {
+      const delivered = valueOf(deliverModelSources(f.store, basis));
+      if (stop !== 'deliveries') {
+        const next = valueOf(writeQuestionPacket(f.store, { ...packetRequest, previous: [], continuation: { packet: basis.packet, call: basis.call,
+          response: basis.response, deliveries: [...delivered.deliveries] } })).record;
+        assert.equal(next.value.state, 'blocked');
+        if (stop === 'diagnostic') valueOf(finishModelAttempt(f.store, { ...basis, code: next.value.refusal!.code, message: next.value.refusal!.message,
+          reason: 'refused', evidence: [reference(next)] }));
+      }
+    }
+    if (terminal === 'reads-invalid' && stop === 'diagnostic') {
+      const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: `source:${f.project}:`, kind: 'source' });
+      assert.ok(!read.ok && read.refusal.code === 'record_foreign');
+      valueOf(finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [scope] }));
+    }
+    f.restart();
+    const cycle = valueOf(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, terminal);
+    assert.equal(f.sent().length, 1, 'The saved call is finished, never sent again');
+    assert.equal(completionSnapshot(f).complete, true);
+    const saved = f.store.list(); f.restart();
+    valueOf(await runModelCycle(f.store, request));
+    assert.deepEqual(f.store.list(), saved, 'The repeat writes nothing'); assert.equal(f.sent().length, 1);
+  });
+});
+
+test('LP3 (№2817 п.3, п.7) the ground of reads-invalid is derived from the exact packet, call and response alone: another record as its evidence, or a response whose reads are performable, cannot close the attempt with that terminal', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  f.steps([{ research: e4NeedSource(f, [{ action: 'search', within: reference(f.input), query: 'question' }]), usage }]);
+  const call = valueOf(await runModelCall(f.store, f.request));
+  const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response! };
+  const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: `source:${f.project}:`, kind: 'source' });
+  assert.ok(!read.ok);
+  const before = f.store.list();
+  const foreign = finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [reference(f.source)] });
+  assert.ok(!foreign.ok && foreign.refusal.code === 'completion_invalid', 'Another record is no evidence of this read');
+  assert.deepEqual(f.store.list(), before, 'Nothing is written');
+  const g = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  g.steps([{ research: e4NeedSource(g, [{ action: 'search', within: reference(g.source), query: 'UTF' }]), usage }]);
+  const lawful = valueOf(await runModelCall(g.store, g.request));
+  const claimed = finishModelAttempt(g.store, { project: g.project, packet: g.request.packet, call: lawful.call, response: lawful.response!,
+    code: 'record_foreign', message: read.refusal.message, reason: 'refused', evidence: [reference(g.source)] });
+  assert.ok(!claimed.ok && claimed.refusal.code === 'completion_invalid', 'A performable read gives no such ground');
 });

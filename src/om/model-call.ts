@@ -356,6 +356,24 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
 }
 
 /** Executes only the addresses E3 validated; the sources and actual delivered values remain readable after restart. */
+/**
+ * LP3 (№2817-3, row 2): an addressed need_source that passed E3 may still ask the engine for an operation it cannot perform
+ * on the exact records it names — a search whose scope is a record of this project's context (an obligation basis, say)
+ * rather than one of its captured sources. Derived from the exact packet, call and response alone, before any read is
+ * performed, by the producer of the cycle and by its reader alike: the first such read in the order of the response, with
+ * the addressed refusal of the read itself. A missing, stale or unreadable source is no such ground (rows 6–9).
+ */
+function readsIssue(store: Store, basis: ReadDeliveryRequest): { code: string; message: string; ref: Ref } | null {
+  const response = take(readPacketResponse(store, basis));
+  const checked = take(checkAnswerForm(store, { project: basis.project, packet: basis.packet, raw: response.record.value.raw }));
+  if (checked.kind !== 'need-source') return null;
+  for (const read of checked.reads) {
+    if (read.action !== 'search' || typeof read.within === 'string') continue;
+    const scope = readRecord(store, read.within, { unit: 'E4', target: read.within.id, idPrefix: `source:${basis.project}:`, kind: 'source' });
+    if (!scope.ok && scope.refusal.code === 'record_foreign') return { code: scope.refusal.code, message: scope.refusal.message, ref: read.within };
+  }
+  return null;
+}
 export function deliverModelSources(store: Store, request: ReadDeliveryRequest): ModelCallResult<Sealed<{ deliveries: Ref[]; references: Ref[] }>> {
   requireDeliveryRequest(store, request); request = sealed(request) as ReadDeliveryRequest;
   return result(() => {
@@ -580,13 +598,15 @@ export interface ModelCycleRecord {
   assembly: Ref | null;
   next: Ref | null;
   diagnostic: Ref | null;
-  terminal: 'outcome' | 'assembled' | 'blocked' | 'parts-invalid' | 'research-no-progress';
+  terminal: 'outcome' | 'assembled' | 'blocked' | 'parts-invalid' | 'research-no-progress' | 'reads-invalid';
 }
 export interface ModelCycleOutcome {
   record: Revision<ModelCycleRecord>; last: ModelCallOutcome; assembly: Ref | null; diagnostic: Ref | null; repeated: boolean;
 }
 export const MODEL_CYCLE_KIND = 'om-model-cycle';
 const cycleId = (request: ModelCallRequest) => `om-model-cycle:${request.project}:${hashJson(request)}`;
+/** LP3: the pass finds a saved cycle of its exact request without performing anything. */
+export function modelCycleId(request: ModelCallRequest): string { return cycleId(request); }
 function knowledgeOf(store: Store, value: Json): string[] {
   if (!object(value) || !object(value.read) || !Array.isArray(value.questionIds) || !Array.isArray(value.sources)) invalid('knowledge');
   const read = value.read as unknown as PacketRead;
@@ -677,6 +697,12 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
     if (assembled.ok)
       fail('model_parts_invalid', project, 'terminal', 'Valid parts cannot stand for a failed assembly');
     completion = { code: assembled.refusal.code, message: assembled.refusal.message, evidence: results };
+  } else if (value.terminal === 'reads-invalid') {
+    if (!last.response || last.outcome?.kind !== 'need-source')
+      fail('model_delivery_invalid', project, 'terminal', 'An unperformable read needs an actual source request');
+    const issue = readsIssue(store, { project, packet: last.packet, call: last.call, response: last.response });
+    if (!issue) fail('model_delivery_invalid', project, 'terminal', 'Performable reads cannot stand for an unperformable one');
+    completion = { code: issue.code, message: issue.message, evidence: [issue.ref] };
   } else if (value.terminal === 'research-no-progress') {
     if (!last.response || last.outcome?.kind !== 'need-source') fail('model_delivery_invalid', project, 'terminal', 'No progress needs an actual repeated read request');
     const request = { project, packet: last.packet, call: last.call, response: last.response };
@@ -793,6 +819,13 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       };
       if (call.outcome?.kind === 'need-source' && call.response) {
         const basis = { project: request.project, packet: packetRef, call: call.call, response: call.response };
+        // Row 2: a read the engine cannot perform on its exact records ends this cycle with the read's own refusal; nothing
+        // is read and nothing more is sent for it.
+        const unperformable = readsIssue(store, basis);
+        if (unperformable) {
+          value.terminal = 'reads-invalid';
+          finish(unperformable.code, unperformable.message, [unperformable.ref]); break;
+        }
         const delivered = take(deliverModelSources(gate.view(), basis));
         const next = take(writeQuestionPacket(gate.view(), { ...packet.value.request, previous: [...packet.value.request.previous],
           continuation: { packet: packetRef, call: call.call, response: call.response, deliveries: delivered.deliveries as Ref[] } }));
@@ -2634,7 +2667,7 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
     for (const ref of products.filter(ref => store.get(ref.id, ref.revision)?.kind === MODEL_CYCLE_KIND)) {
       const cycle = take(readModelCycle(store, { project, record: ref }));
       if (packetCompletionAssignments(store, binding, cycle.record.value.request.packet).selected.value.batch !== root.value.batch) continue;
-      if (['blocked', 'research-no-progress', 'parts-invalid'].includes(cycle.record.value.terminal)
+      if (['blocked', 'research-no-progress', 'parts-invalid', 'reads-invalid'].includes(cycle.record.value.terminal)
         || cycle.record.value.terminal === 'outcome' && cycle.last.diagnostic !== null
           && cycle.last.record.value.om.application !== 'application-refused') {
         complete = true; if (cycle.record.value.diagnostic) diagnostics.push(cycle.record.value.diagnostic);
@@ -2929,6 +2962,9 @@ function validateManagedFinish(store: Store, request: FinishModelAttemptRequest,
       const reads = readContinuationEvidence(store, { project, packet: request.packet, call: request.call, response: request.response, deliveries: evidence });
       if (reads.ok && !reads.value.novel && request.code === 'research_no_progress'
         && request.message === 'The addressed reads add no information to this attempt') return;
+      // Row 2 (LP3): the read the engine cannot perform, derived again from the same exact response.
+      const issue = readsIssue(store, { project, packet: request.packet, call: request.call, response: request.response });
+      if (issue && issue.code === request.code && issue.message === request.message && same(evidence, [issue.ref])) return;
     }
     for (const ref of evidence) if (store.get(ref.id, ref.revision)?.kind === 'question-packet') {
       const next = take(readQuestionPacket(store, { project, record: ref }));

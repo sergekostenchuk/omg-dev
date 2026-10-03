@@ -11,7 +11,7 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import type { OmResult, Refusal } from "../src/om/refusal.js";
+import { refused, transfer, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
@@ -41,11 +41,12 @@ import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
-import { runModelCycle } from "../src/om/model-call.js";
-import { writeQuestionPacket } from "../src/om/question-packet.js";
+import { modelCallRecordId, runModelCycle } from "../src/om/model-call.js";
+import { ResearchSources } from "../src/discovery/research-sources.js";
+import { readQuestionPacket, writeQuestionPacket } from "../src/om/question-packet.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
-import { advanceRun, readRun, startRun, runId, type RunRequest, type RunRecord, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
+import { advanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
 
 const project = "garden";
@@ -2381,3 +2382,224 @@ out(performed);`, { request, project }) as string[];
   assert.ok(!end.performed.includes("cycle") || f.sent().length === 1, "A repeated cycle step only replays the saved call");
   await sameEnd(f, request, 1);
 });
+
+// ---- LP3 (№2817): a refusal caused by the content of a model answer or the size of its continuation ends the attempt ----
+const LP3_BASE_COMMIT = "d519a6036f8b2cc4aee823ce24d7160262a08fb9";
+/** A need_source of the M5 mechanism batch (MC2 input-field) asking for the given reads. */
+function lp3Need(f: Fixture, routes: Ref, reads: unknown[]) {
+  const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
+  const batch = saved.batches.find(item => item.model === "MC2" && item.task === "input-field" && item.items.every(row => row.consumers.length === 0))!;
+  return { research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source", questionIds: batch.items.map(item => item.gap),
+    missing: "Need the addressed data", reads }, usage };
+}
+/** Where the root packet of the first mechanism attempt stands among its work's products against its blocked continuation. */
+function lp3Order(f: Fixture): "root-first" | "continuation-first" {
+  const work = f.store.list<{ products: Ref[] }>("om-completion-work").map(row => f.store.history<{ products: Ref[] }>(row.id)[0]!).at(0)!;
+  const last = f.store.history<{ products: Ref[] }>(work.id).at(-1)!;
+  const packets = last.value.products.map(ref => f.store.get<{ packet?: Ref }>(ref.id, ref.revision)!).filter(row => row.kind === "om-completion-packet")
+    .map(row => f.store.get<QuestionPacketRecord>(row.value.packet!.id, row.value.packet!.revision)!.value.request.continuation ? "continuation" : "root");
+  assert.equal(packets.length, 2, "One root packet and its blocked continuation");
+  return packets[0] === "root" ? "root-first" : "continuation-first";
+}
+/** Every cycle of the pass ended blocked; nothing but the attempts' own packets and the one review was sent. */
+function lp3Blocked(f: Fixture, sends: number) {
+  const cycles = f.store.list<{ terminal: string; next: Ref | null }>("om-model-cycle");
+  assert.ok(cycles.length > 0 && cycles.every(row => row.value.terminal === "blocked" && row.value.next !== null), "Each cycle ends blocked on its continuation");
+  for (const cycle of cycles) {
+    const blocked = f.store.get<QuestionPacketRecord>(cycle.value.next!.id, cycle.value.next!.revision)!;
+    assert.equal(blocked.value.state, "blocked");
+    assert.equal(f.store.get(modelCallRecordId(project, (blocked.value.packet as { requestId?: string } | null)?.requestId ?? "none")), null,
+      "The blocked continuation was never sent");
+  }
+  assert.equal(f.sent().length, sends);
+}
+const LP3_CONTENTS = { "root-first": "UTF-8 ".repeat(40_000) };
+const LP3_UNPROVED: Record<string, string> = {};
+/** A view of the store in which one exact record cannot be read; everything else, writes included, goes to the store. */
+function lp3Hiding(store: Store, id: string): Store {
+  return new Proxy(store, { get(target, key) {
+    if (key === "get") return (at: string, revision?: number) => at === id ? null : target.get(at, revision);
+    const member: unknown = Reflect.get(target, key, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+}
+
+test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("lp3-52"), request = f.request(b);
+  writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
+  const need = lp3Need(f, b.routes, [{ action: "read", path: "big.txt", media: "text/plain" }]);
+  f.steps([need, need, need, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const first = await driveTo(f, request, "close", 20);
+  assert.deepEqual(first.performed.slice(-2), ["cycle", "close"], `The blocked root is closed by G7, not waited on (products ${lp3Order(f)})`);
+  // Both positions of the root packet and its blocked continuation, without relying on the order the hashes gave here.
+  const packets = f.store.list<QuestionPacketRecord>("question-packet");
+  const root = reference(packets.find(row => !row.value.request.continuation)!), continuation = reference(packets.find(row => row.value.request.continuation)!);
+  for (const order of [[root, continuation], [continuation, root]]) assert.deepEqual(cycleStartOf(f.store, project, order), { ok: true, value: root });
+  assert.deepEqual(cycleStartOf(f.store, project, [continuation]), { ok: true, value: null }, "A continuation alone starts no cycle");
+  // №2870: a packet whose place E2's reader does not prove is no continuation: its refusal stands, in either position.
+  const unproved = { missing: { ...continuation, id: `${continuation.id}-missing` }, stale: { ...continuation, hash: "0".repeat(64) }, foreign: lp3Context(f) };
+  for (const [name, ref] of Object.entries(unproved)) {
+    const refusals = [[root, ref], [ref, root]].map(order => cycleStartOf(f.store, project, order));
+    assert.ok(refusals.every(found => !found.ok), `${name}: ${JSON.stringify(refusals)}`);
+    assert.deepEqual(refusals[0], refusals[1], `${name}: the same refusal in both positions`);
+    LP3_UNPROVED[name] = (refusals[0] as { refusal: { code: string } }).refusal.code;
+  }
+  assert.deepEqual(LP3_UNPROVED, { missing: "record_missing", stale: "record_forged", foreign: "record_foreign" });
+  const end = await ends(f, request, 60);
+  assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
+  assert.equal(mechanismSeries(f).value.attempts.length, 3, "Three attempts of the ladder");
+  lp3Blocked(f, 4);
+  const roots = f.store.list<QuestionPacketRecord>("question-packet").filter(row => !row.value.request.continuation).map(reference);
+  const two = cycleStartOf(f.store, project, roots.slice(0, 2));
+  assert.ok(!two.ok && two.refusal.code === "run_record_invalid", "Two starts are an addressed refusal, never a second dispatch");
+  await sameEnd(f, request, 4);
+});
+
+/** The context record a search names as its scope: the B1 the mechanism packet supplies (a record of the project, no source). */
+const lp3Context = (f: Fixture): Ref => reference(f.store.get(`om-input:${project}`)!);
+
+test("LP3 (№2817 row 2, №53) a need_source whose search names a context record as its scope ends the cycle as reads-invalid with its record_foreign: the pass closes the attempt, goes on to the next and never waits on the refusal; a source scope and read_context of the same record still deliver", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("lp3-53"), request = f.request(b);
+  const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
+  f.steps([need, need, need, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const first = await driveTo(f, request, "close", 20);
+  assert.deepEqual(first.performed.slice(-2), ["cycle", "close"]);
+  const end = await ends(f, request, 60);
+  assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
+  const cycles = f.store.list<{ terminal: string; diagnostic: Ref }>("om-model-cycle");
+  assert.equal(cycles.length, 3); assert.ok(cycles.every(row => row.value.terminal === "reads-invalid"));
+  for (const cycle of cycles) assert.equal(f.store.get<{ refusals: { code: string }[] }>(cycle.value.diagnostic.id)!.value.refusals[0]!.code, "record_foreign");
+  assert.deepEqual(f.store.list("om-read-delivery"), [], "Nothing was read");
+  assert.equal(f.sent().length, 4, "Three attempts and the one review");
+  await sameEnd(f, request, 4);
+});
+
+test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never taken for a continuation: a saved cycle of it is performed as saved and its producer's record_missing stands as the pass's wait — no ready, no new packet, nothing sent; once the record is read again the same saved cycle goes on", async t => {
+  const f = runFixture(t, ["encoding"]);
+  const b = f.bases("lp3-2870"), request = f.request(b);
+  f.steps([lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }])]);
+  ok(startRun(f.store, { project }));
+  // The selection: ready after the packet step, the root's packet unreadable — the pass's addressed refusal, nothing written,
+  // never a second packet.
+  let head = ok(readRun(f.store, { project }))!;
+  for (let index = 0; index < 20 && !(head.value.state.phase === "ready" && head.value.last?.step.action === "packet"); index++)
+    head = ok(await advanceRun(f.store, request)).record;
+  assert.equal(head.value.last?.step.action, "packet");
+  const packet = head.value.last!.products.find(ref => ref.id.startsWith(`om-question-packet:${project}:`))!;
+  const chosen = await advanceRun(lp3Hiding(f.store, packet.id), request);
+  assert.deepEqual(chosen.ok ? chosen.value.record.value.state : [chosen.refusal.code, chosen.refusal.at.target], ["record_missing", packet.id]);
+  assert.equal(ok(readRun(f.store, { project }))!.revision, head.revision, "Nothing was written");
+  // The saved step: the root's cycle chosen, then its packet unreadable — performed as saved, its refusal stands.
+  const step = await until(f, request, "cycle");
+  assert.ok(isRefOf(step.request, packet), "The saved cycle is the root's own");
+  const before = ok(readRun(f.store, { project }))!.revision;
+  const performed = ok(await advanceRun(lp3Hiding(f.store, packet.id), request));
+  const state = performed.record.value.state;
+  assert.notEqual(state.phase, "ready", JSON.stringify(state));
+  assert.deepEqual([performed.record.revision, performed.performed?.action, performed.record.value.last?.refusal?.code, f.sent().length],
+    [before + 1, "cycle", "record_missing", 0], "The cycle was performed as saved and refused by its producer; nothing was sent");
+  assert.deepEqual(f.store.list("om-model-cycle"), []);
+  const again = ok(await advanceRun(f.store, request));
+  assert.deepEqual([again.performed?.action, f.sent().length], ["cycle", 1], "The same saved cycle goes on once its packet is read");
+  assert.equal(f.store.list<{ terminal: string }>("om-model-cycle")[0]!.value.terminal, "reads-invalid");
+});
+const isRefOf = (request: unknown, packet: Ref): boolean => canonical((request as { packet?: Ref }).packet ?? null) === canonical(packet);
+
+test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context reads leave a continuation the capacity cannot hold ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
+  const f = worksFixture(t), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
+  for (let index = 0; index < 3; index++) {
+    writeFileSync(join(f.root, `context-${index}.txt`), `context ${index} ${"x".repeat(90_000)}`);
+    reads.push({ action: "read_context", record: reference(capture.read(`context-${index}.txt`, "text/plain")), pointer: "/content" });
+  }
+  ok(startRun(f.store, { project }));
+  const steps: unknown[] = [], performed: string[] = [], answered = new Set<string>();
+  let closed = false;
+  for (let index = 0; index < 45 && !closed; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request)), state = advanced.record.value.state;
+    if (advanced.performed) performed.push(advanced.performed.action);
+    assert.notEqual(state.phase, "waiting", JSON.stringify({ state, performed }));
+    if (state.phase === "step" && state.step.action === "cycle") {
+      const ref = (state.step.request as unknown as { packet: Ref }).packet;
+      if (!answered.has(ref.id)) {
+        answered.add(ref.id);
+        const saved = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!.value;
+        assert.deepEqual([saved.packetContract, saved.state], ["om-packet/works-v1", "ready"]);
+        steps.push({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+          questionIds: (saved.packet as { questions: { id: string }[] }).questions.map(question => question.id),
+          missing: "Read the three supplied context values", reads }, usage });
+        writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps }));
+      }
+    }
+    if (advanced.performed?.action === "cycle") {
+      const cycles = f.store.list<{ terminal: string }>("om-model-cycle");
+      assert.ok(cycles.length > 0 && cycles.every(row => row.value.terminal === "blocked"), JSON.stringify(cycles.map(row => row.value.terminal)));
+      assert.equal(f.sent().length, steps.length, "The blocked continuation is never sent");
+      f.restart();
+    }
+    closed = advanced.performed?.action === "close";
+  }
+  assert.ok(closed, performed.join(","));
+  assert.ok(f.store.list("om-read-delivery").length >= 3, "The three lawful reads were delivered");
+  assert.equal(f.sent().length, steps.length);
+});
+
+// LP3 (№2876, Q2b №2518-2): the start of a root's cycle keeps the narrow codes of H1 — its own and E2's reader's, marked
+// with their source. The negative probe is real TypeScript: its `@ts-expect-error` line fails to compile for the stated
+// reason only, so an unused directive breaks the build (tsc over test/**).
+const asCycleStart = (result: ReturnType<typeof cycleStartOf>): ReturnType<typeof cycleStartOf> => result;
+const asRunResult = <T>(result: RunResult<T>): RunResult<T> => result;
+test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2's reader marked with its source; the refusal keeps the reader's bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "omg-lp3-codes-")), store = new Store(join(root, "state.sqlite"));
+  try {
+    const ghost: Ref = { id: `om-question-packet:${project}:${"0".repeat(64)}`, revision: 1, hash: "0".repeat(64) };
+    const read = readQuestionPacket(store, { project, record: ghost });
+    const lawful = transfer("question-packet", read), started = cycleStartOf(store, project, [ghost]);
+    // A lawful result of the reader, through its source, is a result of a cycle start; the result is one of H1's.
+    assert.equal(asCycleStart(lawful).ok, false);
+    assert.equal(asRunResult<Ref | null>(started).ok, false);
+    const unmarked = refused("reviewer_arbitrary_code", "probe", { unit: "H1", target: "probe" }, "producer");
+    // @ts-expect-error an unmarked refusal with an arbitrary code is no result of a cycle start (№2876)
+    asCycleStart(unmarked);
+    // Runtime: the mark is a type only — code, message, address and route are the reader's own.
+    assert.ok(!read.ok && !started.ok);
+    assert.equal(read.refusal.code, "record_missing");
+    assert.equal(JSON.stringify(started.refusal), JSON.stringify(read.refusal));
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("LP3 (№2817 п.4, п.7) the base d519a60 in its own process leaves the pass waiting on №52 and №53; the new code reopens it and finishes the saved work by an ordinary transition without paying the saved call again, the old revisions and records untouched", async t => {
+  for (const kase of ["52", "53"] as const) await t.test(kase, async t => {
+    const f = runFixture(t, ["encoding"]);
+    const b = f.bases(`lp3-era-${kase}`), request = f.request(b);
+    writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
+    const need = lp3Need(f, b.routes, kase === "52" ? [{ action: "read", path: "big.txt", media: "text/plain" }]
+      : [{ action: "search", within: lp3Context(f), query: "encoding" }]);
+    f.steps([need, need, need, stopAnswer(f, false)]);
+    const stuck = atCommit(f, LP3_BASE_COMMIT, `lp3-era-${kase}`, `const { advanceRun, startRun } = await import(src('om/run.js'));
+take(startRun(store, { project: args.project }));
+const seen = [];
+for (let index = 0; index < 30; index++) {
+  const advanced = take(await advanceRun(store, args.request));
+  const state = advanced.record.value.state;
+  seen.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code : state.phase);
+  if (state.phase === 'waiting' && seen.at(-2) === seen.at(-1)) break;
+}
+out(seen);`, { request, project }) as string[];
+    assert.match(stuck.at(-1)!, /^waiting:/, `The base code stands on a wait: ${stuck.join(",")}`);
+    assert.equal(f.sent().length, 1, "The base code paid once");
+    f.restart();
+    const before = f.store.list().map(reference);
+    const end = await ends(f, request, 60);
+    assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
+    assert.equal(f.sent().length, 4, "The saved call is not paid again: only the next attempts and the review are sent");
+    for (const ref of before) assert.deepEqual(reference(f.store.get(ref.id, ref.revision)!), ref, `${ref.id}@${ref.revision} stands as the base code wrote it`);
+    const terminals = f.store.list<{ terminal: string }>("om-model-cycle").map(row => row.value.terminal);
+    assert.ok(terminals.length === 3 && terminals.every(terminal => terminal === (kase === "52" ? "blocked" : "reads-invalid")), terminals.join(","));
+    await sameEnd(f, request, 4);
+  });
+});
+

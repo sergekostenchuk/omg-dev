@@ -17,9 +17,9 @@ import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readC
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
 import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
-import { modelCallRecordId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
+import { modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
   writeCompletionCessation as writeCompletionCessationOf, type CompletionSnapshot } from "./model-call.js";
-import { writeQuestionPacket as writeQuestionPacketOf } from "./question-packet.js";
+import { readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf } from "./question-packet.js";
 import { assessFact as assessFactOf, readAssessmentIntentAt as readAssessmentIntentAtOf, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
 import { NO_PRODUCER_EMISSIONS, prepareAnswersGate as prepareAnswersGateOf, prepareAnswersGateTrace as prepareAnswersGateTraceOf, readAnswersEvaluationAt as readAnswersEvaluationAtOf, readAnswersGate as readAnswersGateOf, readAnswersGateTrace as readAnswersGateTraceOf, readRouteProducers as readRouteProducersOf,
   writeAnswersCheckCessation as writeAnswersCheckCessationOf, writeAnswersEvaluation as writeAnswersEvaluationOf, writeAnswersRegistration as writeAnswersRegistrationOf, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
@@ -108,6 +108,7 @@ const readModelCycle = transferring("model-call", readModelCycleOf);
 const readPartAssembly = transferring("model-call", readPartAssemblyOf);
 const writeCompletionCessation = transferring("model-call", writeCompletionCessationOf);
 const writeQuestionPacket = transferring("question-packet", writeQuestionPacketOf);
+const readQuestionPacket = transferring("question-packet", readQuestionPacketOf);
 const readAssessmentIntentAt = transferring("assessment", readAssessmentIntentAtOf);
 const prepareAnswersGate = transferring("answers-gate", prepareAnswersGateOf);
 const prepareAnswersGateTrace = transferring("answers-gate", prepareAnswersGateTraceOf);
@@ -362,6 +363,12 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
     // payment is looked at; neither starts a second pass by itself (№1737 п.1, №1995 п.11).
     if (state.phase === "complete" || state.phase === "unable") return { record: head, performed: null, products: [] };
     const gate = new RunControlGate(store, request.project, control), hold = gate.admit().hold, guarded = gate.view();
+    // LP3 (№2817-4, №2870): a saved cycle of a packet E2's reader proves to be a step of a cycle (a continuation or a later
+    // part, chosen by the order of the products) and that was never cycled is not performed: the pass chooses again by an
+    // ordinary new transition, and its history and the saved records stay as they are. A cycle of it that was performed is
+    // found again by its own request; a packet whose place is not proved is performed as saved and keeps its refusal.
+    if (state.phase === "step" && misplacedCycle(store, state.step))
+      return transition(guarded, head, { phase: "ready" }, head.value.last, null, []);
     if (state.phase === "step") return settle(guarded, head, state.step, await perform(guarded, store, hold, request, state.step));
     const history = historyOf(store, head), performed = history.performed;
     let next = selectNext(store, request, history);
@@ -937,10 +944,20 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   const plan = take(readRoutes(store, { project, record: binding.value.plan.routes })).record as unknown as Revision<RoutesRecord>;
   const scope = plan.value.request.gaps as unknown as GapReadRequest;
   const resolved = new Set(work.resolved.map(ref => canonical(ref)));
-  const open = work.assignments.filter(row => !resolved.has(canonical(reference(row))));
+  const parentOf = new Map(work.assignments.map(row => [row.id, (row.value as CompletionAssignment).parent?.id ?? null]));
+  const resolvedIds = new Set(work.assignments.filter(row => resolved.has(canonical(reference(row)))).map(row => row.id));
+  // LP3 (№2817-2/-4): a part or continuation — a step of its root's own cycle — below a root that cycle already ended
+  // (blocked, no progress, invalid parts or reads) is no work of the pass: its root is resolved, and the attempt goes on to
+  // its close. A fact below an answered root is its own work (E5) and stays open until assessed.
+  const underResolved = (row: Revision<unknown>): boolean => {
+    const kind = (row.value as CompletionAssignment).kind;
+    if (kind !== "part" && kind !== "continuation") return false;
+    for (let at = parentOf.get(row.id) ?? null; at !== null; at = parentOf.get(at) ?? null) if (resolvedIds.has(at)) return true;
+    return false;
+  };
+  const open = work.assignments.filter(row => !resolved.has(canonical(reference(row))) && !underResolved(row));
   // An ancestor is resolved by its descendants (the facts of a root's part, the parts of a plan): only open assignments
   // that are no ancestor of another open one are worked, whatever the order of the registry.
-  const parentOf = new Map(work.assignments.map(row => [row.id, (row.value as CompletionAssignment).parent?.id ?? null]));
   const parents = new Set<string>();
   for (const row of open) for (let at = parentOf.get(row.id) ?? null; at !== null && !parents.has(at); at = parentOf.get(at) ?? null) parents.add(at);
   const byId = new Map(work.assignments.map(row => [row.id, row as Revision<CompletionAssignment>]));
@@ -973,7 +990,9 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if (!cause.ok) return { wait: waitOf(cause.refusal, project) };
     if (cause.value.cause) return step("cease", { project, binding: reference(binding), assignment: reference(assignment) }, series.id, ordinal);
     if (value.kind === "root") {
-      const packet = completionPacketOf(store, work, reference(assignment));
+      const found = completionPacketOf(store, project, work, reference(assignment));
+      if ("wait" in found) return found;
+      const packet = found.packet;
       // H1.5 (№2221): a root whose batch holds a question no answer producer serves is not sent: E4 would refuse it and
       // the pass would stand on that refusal for ever. Its blocking questions are grounds of the end of the pass (R13),
       // standing on the exact routes and D1 records that prove them; the attempt's other assignments and the other
@@ -1006,8 +1025,9 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if (value.kind === "part" || value.kind === "continuation") {
       let root: Revision<CompletionAssignment> | undefined = assignment as Revision<CompletionAssignment>;
       while (root && root.value.parent) root = byId.get(root.value.parent.id);
-      const packet = root && root.value.kind === "root" ? completionPacketOf(store, work, reference(root)) : null;
-      if (packet) return cycleOf(packet);
+      const found = root && root.value.kind === "root" ? completionPacketOf(store, project, work, reference(root)) : null;
+      if (found && "wait" in found) return found;
+      if (found?.packet) return cycleOf(found.packet);
       continue;
     }
     if (value.kind === "fact" && value.question) {
@@ -1138,12 +1158,63 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   if (!claim.ok) return { wait: waitOf(claim.refusal, project) };
   return step("close", { ...address, outcome: claim.value.outcome }, series.id, ordinal);
 }
-function completionPacketOf(store: Store, work: CompletionSnapshot, root: Ref): Ref | null {
+/**
+ * LP3 (№2817-4): the packet a root's cycle starts with — by its links, never by the order of the products: the one
+ * materialized packet of the root that continues no earlier call and follows no earlier part. Its continuations and later
+ * parts carry the same root and are steps of that cycle. A packet whose place is not proved, and two starts, are the
+ * pass's addressed wait on that refusal, never a second dispatch and never a new packet (№2870).
+ */
+function completionPacketOf(store: Store, project: string, work: CompletionSnapshot, root: Ref): { packet: Ref | null } | Held {
+  const packets: Ref[] = [];
   for (const product of work.products) {
     const record = store.get<{ root?: Ref; packet?: Ref }>(product.id, product.revision);
-    if (record?.kind === "om-completion-packet" && record.value.root && sameRef(record.value.root, root) && record.value.packet) return record.value.packet;
+    if (record?.kind === "om-completion-packet" && record.value.root && sameRef(record.value.root, root) && record.value.packet) packets.push(record.value.packet);
   }
-  return null;
+  const start = cycleStartOf(store, project, packets);
+  return start.ok ? { packet: start.value } : { wait: waitOf(start.refusal, project) };
+}
+/** LP3 (№2876): the codes a cycle start is refused with — its own, or E2's reader's, marked with its source (Q2b). */
+export type CycleStartCode = RunLocalCode | SourceCode<"question-packet">;
+/**
+ * LP3: the one packet among a root's materialized packets that starts its cycle, whatever their order; two are a refusal,
+ * and so is the first packet (in the order of its exact reference) whose place E2's reader refuses (№2870).
+ */
+export function cycleStartOf(store: Store, project: string, packets: readonly Ref[]): OmResult<Ref | null, CycleStartCode> {
+  const starts: Ref[] = [], seen = new Set<string>();
+  for (const packet of [...packets].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0)) {
+    if (seen.has(canonical(packet))) continue;
+    seen.add(canonical(packet));
+    const place = packetPlace(store, project, packet);
+    if (!place.ok) return place;
+    if (place.value === "start") starts.push(packet);
+  }
+  if (starts.length > 1) return refuse("run_record_invalid", "A root's cycle starts with exactly one packet",
+    { unit: UNIT, target: starts[1]!.id, field: "packet", ref: starts[1]! }, "producer");
+  return { ok: true, value: starts[0] ?? null };
+}
+/**
+ * LP3 (№2870): a packet's place in its cycle, proved by its complete checked record — E2's own reader, the one E4
+ * dispatches by: the start of a cycle, or a proved step of one (a continuation of an earlier call or a later part). Any
+ * refusal of that reader — a missing, foreign or malformed record, an exact reference that does not match, links that do
+ * not follow from their sources — is neither and stands as it is.
+ */
+function packetPlace(store: Store, project: string, packet: Ref): OmResult<"start" | "step", SourceCode<"question-packet">> {
+  const read = readQuestionPacket(store, { project, record: packet });
+  if (!read.ok) return read;
+  const request = read.value.value.request;
+  return { ok: true, value: !request.continuation && request.previous.length === 0 ? "start" : "step" };
+}
+/**
+ * A saved cycle that is no work of the pass: never performed (no cycle of its exact request) and started with a packet
+ * proved to be a step of a cycle. Whatever is not so proved — the start of a cycle, or any refusal of reading the packet —
+ * is performed as saved, and its producer gives its own result or refusal (№2870).
+ */
+function misplacedCycle(store: Store, step: RunStep): boolean {
+  if (step.action !== "cycle") return false;
+  const request = step.request as { project?: unknown; packet?: unknown };
+  if (typeof request.project !== "string" || !isRef(request.packet) || store.get(modelCycleId(step.request as never))) return false;
+  const place = packetPlace(store, request.project, request.packet);
+  return place.ok && place.value === "step";
 }
 /**
  * The current M6 of a saved route's own D1 scope, tasks and catalog: the route itself while M6 still derives it, or its

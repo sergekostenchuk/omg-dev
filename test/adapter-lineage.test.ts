@@ -406,7 +406,9 @@ test('LP2 A: an engine packet call runs in its own Codex home, with the listed s
     const rule = record!.stdin.slice(INSTRUCTIONS.research.length, record!.stdin.length - 'PACKET-TEXT'.length);
     assert.ok(record!.stdin.startsWith(INSTRUCTIONS.research) && record!.stdin.endsWith('PACKET-TEXT'), 'the original text is last and literal');
     for (const phrase of ['relative to the project root', 'current working directory', 'package.json', 'src/file.ts', 'absolute path', 'leading ./', '.. segment',
-      '.git segment in any letter case', 'backslash', 'glob', 'record reference', 'Record references and JSON pointers stay exactly as supplied', 'the engine checks every path'])
+      '.git segment in any letter case', 'backslash', 'glob', 'Record references and JSON pointers stay exactly as supplied', 'the engine checks every path',
+      // LP3 (№2817-5): the scope of a search is a path or a supplied source record; context is read, never searched.
+      'source:<project>:', 'read with read_context', 'never used as a search scope', 'Never invent a reference'])
       assert.ok(rule.includes(phrase), phrase);
     assert.deepEqual(envelope(result.stdout), { research: { action: 'pause', reason: 'Fixture completed' }, protocol: 'omg-agent/v1',
       requestId: 'lp2-request', usage: USAGE, confirmed: { model: null, effort: null, speed: null } });
@@ -590,4 +592,16 @@ test('LP2 F: two parallel isolated calls use different homes and each removes on
   assert.equal(readFileSync(join(f.tmp, 'omg-codex-foreign', 'keep.txt'), 'utf8'), 'foreign');
   assert.deepEqual(f.personalFiles(), before);
   assert.equal(lstatSync(join(f.personal, 'auth.json')).isSymbolicLink(), false, 'the real login file is not replaced by a link');
+});
+
+test('LP3 (№2817-5) the path rule no longer sends a search into a context record: a scope is a relative path or a supplied source record, any other record is read with read_context, nothing is invented, and the former phrase is gone; only the packet answer gets it', async t => {
+  const f = codexFixture(t);
+  const result = await runAdapter(f, adapterRequest());
+  assert.equal(result.exitCode, 0, result.stderr);
+  const [record] = f.records();
+  const rule = record!.stdin.slice(INSTRUCTIONS.research.length, record!.stdin.length - 'PACKET-TEXT'.length);
+  assert.ok(!rule.includes('To search the whole supplied context use the record reference the request provides'), 'the former phrase pointed at any record');
+  assert.match(rule, /search scope is either a concrete relative path or the exact reference of a supplied source record \(an id that starts with source:<project>:\)/);
+  assert.match(rule, /any other supplied record, such as an obligation basis, is read with read_context by its exact reference and a JSON pointer, never used as a search scope/);
+  assert.match(rule, /never use "\." or the absolute working directory as a scope/);
 });
