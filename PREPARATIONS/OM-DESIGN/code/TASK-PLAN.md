@@ -1951,10 +1951,11 @@
 - Отдаёт: —
 - Читает записи: принятые предложения каркаса; отказы приёмки
 - Пишет записи: —
-- Разрешённые пути: `src/om/run.ts`, `src/om/model-call.ts`, `src/om/packet-brief.ts`, `test/om-run.test.ts`, `test/om-model-call.test.ts`, `test/om-packet-brief.test.ts`
+- Разрешённые пути: `src/om/run.ts`, `src/om/model-call.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-run.test.ts`, `test/om-model-call.test.ts`, `test/om-packet-brief.test.ts`, `test/om-question-packet.test.ts`
 - Из движка как есть: method/brief.mjs (правила 1–13, отбор материала), method/engine.mjs (цепочка приёмки), method/run4.mjs (порядок по потокам, контекст соседей), AUDIT-REPORT.md и EXPERIMENT-REVIEW.md (~/REPORTS/audit/omg-live-calls-031026/); урок пробника v3: ложный отказ входов соединения до полной сборки
 - После: MP1
 - Тесты сверх обязательных:
+  - ДОГОВОР УТВЕРЖДЁН Codex-omg №2968 с поправками (черновик codex-worker2 №2951): вариант (а) — +question-packet.ts и его тест (8 путей); соседи — явная форма манифеста neighbors {contract:om-brief-neighbors/v1, sources} обязательна и при пустом наборе, сохранённый MP1-пакет без neighbors — прежний вывод; correction — существующий kind continuation с отдельным детерминированным ключом, не need_source, все потребители (packetCompletionAssignments, packetPlace/cycleStartOf, cycleSources, завершение); исправимость по происхождению отказа E3 цепочки, не по коду; один круг = одно ребро correction на цепочку; cyclePolicy brief-correction/v1; первый отказ остаётся в истории; порядок SCC; таблица 19 строк
   - ДО КОДА — опись Opus №2930; ИСПОЛНИТЕЛЬ КОДА — Opus, ДОГОВОР И РЕВЬЮ — Codex-omg (слово пользователя 03.10 ~21:40; текст codex-worker2 №2951 — черновик договора): порядок по потокам; состав контекста соседей; круг исправления — вход, исход, учёт, эра; таблица исходов
   - регрессии: последовательное проектирование 9 операций пробника без межоперационных конфликтов записи; круг исправления по точному отказу без повторной оплаты; входы соединений проверяются только полной сборкой
 
