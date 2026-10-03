@@ -1,60 +1,98 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runProcess } from '../src/runtime/process.js';
+import { computeDenyRules, findFencedBlocks, parsed, parseFenceCandidate, resolveOrgId } from '../src/adapters/devin-stdio.js';
 
 const adapter = fileURLToPath(new URL('../src/adapters/devin-stdio.js', import.meta.url));
 const originalPath = process.env['PATH'];
 
-/** A fake `devin` executable: it records argv, the prompt file's content and mode,
+interface TraceRecord {
+  args: string[];
+  prompt: string;
+  mode: string;
+  promptFile: string;
+  configFile?: string;
+  configRaw?: string;
+  configMode?: string;
+}
+
+/** A fake `devin` executable: it records argv, prompt, config, and permissions,
  * then answers from the rewritable scenario file. No live provider is ever called. */
-function fixture(t: test.TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-devin-stdio-')), bin = join(root, 'bin');
+function fixture(t: test.TestContext, homeDir?: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-devin-stdio-'))), bin = join(root, 'bin');
   const trace = join(root, 'trace.json'), scenario = join(root, 'scenario.txt');
   mkdirSync(bin);
+  const defaultHome = join(root, 'home');
+  mkdirSync(join(defaultHome, '.config', 'devin'), { recursive: true });
+  writeFileSync(join(defaultHome, '.config', 'devin', 'config.json'), JSON.stringify({ devin: { org_id: 'fixture-org-id' } }));
   writeFileSync(join(bin, 'devin'), `#!${process.execPath}
 import {readFileSync,writeFileSync,statSync} from 'node:fs';
 const args=process.argv.slice(2);
 if(args[0]==='--version'){console.log('devin 3000.11.3 (fixture)');process.exit(0);}
-const file=args[args.indexOf('--prompt-file')+1];
-const prompt=file?readFileSync(file,'utf8'):'';
-const mode=file?('0'+((statSync(file).mode)&0o777).toString(8)):'none';
-writeFileSync(${JSON.stringify(trace)},JSON.stringify({args,prompt,mode,promptFile:file}));
-const scenario=readFileSync(${JSON.stringify(scenario)},'utf8').trim();
-if(scenario==='fail'){console.error('fixture denial');process.exit(3);}
-if(scenario==='sleep'){setInterval(()=>{},1000);}
-else if(scenario==='empty'){}
-else if(scenario==='malformed')console.log('not json {');
-else if(scenario==='extra')console.log('{"action":"pause"}\\n{"unexpected":true}');
-else if(scenario==='array')console.log('[]');
-else if(scenario==='research')console.log(JSON.stringify({action:'pause',reason:'Fixture'}));
-else if(scenario==='reader')console.log(JSON.stringify({selections:[{sourceIndex:0,firstLine:1,lastLine:2}],unresolved:['u']}));
-else if(scenario==='reader-bad')console.log(JSON.stringify({selections:[{sourceIndex:-1,firstLine:0,lastLine:0}],unresolved:'x'}));
-else if(scenario==='implement')console.log(JSON.stringify({text:'done',artifacts:[{id:'a'}]}));
+const pIdx = args.indexOf('--prompt-file');
+const file = pIdx >= 0 ? args[pIdx + 1] : undefined;
+const prompt = file ? readFileSync(file, 'utf8') : '';
+const mode = file ? ('0' + ((statSync(file).mode) & 0o777).toString(8)) : 'none';
+const cIdx = args.indexOf('--config');
+const configFile = cIdx >= 0 ? args[cIdx + 1] : undefined;
+const configRaw = configFile ? readFileSync(configFile, 'utf8') : undefined;
+const configMode = configFile ? ('0' + ((statSync(configFile).mode) & 0o777).toString(8)) : undefined;
+writeFileSync(${JSON.stringify(trace)}, JSON.stringify({args, prompt, mode, promptFile: file, configFile, configRaw, configMode}));
+const rawScenario = readFileSync(${JSON.stringify(scenario)}, 'utf8');
+if(rawScenario.startsWith('raw:')){process.stdout.write(rawScenario.slice(4));}
+else {
+const scenario = rawScenario.trim();
+if(scenario === 'fail'){console.error('fixture denial');process.exit(3);}
+if(scenario === 'sleep'){setInterval(()=>{}, 1000);}
+else if(scenario === 'empty'){}
+else if(scenario === 'malformed')console.log('not json {');
+else if(scenario === 'extra')console.log('{"action":"pause"}\\n{"unexpected":true}');
+else if(scenario === 'array')console.log('[]');
+else if(scenario === 'research')console.log(JSON.stringify({action:'pause',reason:'Fixture'}));
+else if(scenario === 'reader')console.log(JSON.stringify({selections:[{sourceIndex:0,firstLine:1,lastLine:2}],unresolved:['u']}));
+else if(scenario === 'reader-bad')console.log(JSON.stringify({selections:[{sourceIndex:-1,firstLine:0,lastLine:0}],unresolved:'x'}));
+else if(scenario === 'implement')console.log(JSON.stringify({text:'done',artifacts:[{id:'a'}]}));
 else if(scenario.startsWith('implement='))console.log(scenario.slice('implement='.length));
-else if(scenario==='implement-bad')console.log(JSON.stringify({text:'done'}));
-else if(scenario==='review-pass')console.log(JSON.stringify({verdict:'pass',kind:'none',findings:[]}));
-else if(scenario==='review-changes')console.log(JSON.stringify({verdict:'request_changes',kind:'code',findings:['f']}));
-else if(scenario==='review-bad')console.log(JSON.stringify({verdict:'pass',kind:'code',findings:[]}));
+else if(scenario === 'implement-bad')console.log(JSON.stringify({text:'done'}));
+else if(scenario === 'review-pass')console.log(JSON.stringify({verdict:'pass',kind:'none',findings:[]}));
+else if(scenario === 'review-changes')console.log(JSON.stringify({verdict:'request_changes',kind:'code',findings:['f']}));
+else if(scenario === 'review-bad')console.log(JSON.stringify({verdict:'pass',kind:'code',findings:[]}));
+else if(scenario === 'fenced-review')console.log('\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`');
+else if(scenario === 'prose-fenced-review')console.log('Review summary:\\n\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`\\nEnd of analysis');
+else if(scenario === 'two-fenced')console.log('\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`\\n\`\`\`json\\n{"second":true}\\n\`\`\`');
+else if(scenario === 'fenced-triple-then-four')console.log('\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`\\n\`\`\`\`text\\nAdditional independent result\\n\`\`\`\`');
+else if(scenario === 'fenced-four-then-triple')console.log('\`\`\`\`text\\nAdditional independent result\\n\`\`\`\`\\n\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`');
+else if(scenario === 'fenced-single-four')console.log('\`\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`\`');
+else if(scenario === 'fenced-prose-inline-ticks')console.log('Use \`\`\` as delimiter.\\n\`\`\`json\\n{"verdict":"pass","kind":"none","findings":[]}\\n\`\`\`');
+else if(scenario === 'fenced-bad-json')console.log('\`\`\`json\\nnot valid json {\\n\`\`\`');
+else if(scenario === 'fenced-array')console.log('\`\`\`json\\n[]\\n\`\`\`');
+else if(scenario === 'fenced-empty')console.log('\`\`\`json\\n\\n\`\`\`');
 else console.log('plain answer text');
+}
 `, { mode: 0o700 });
   writeFileSync(scenario, 'text');
   process.env['PATH'] = bin + delimiter + (originalPath ?? '');
+  const prevHome = process.env['HOME'];
+  const activeHome = homeDir ?? defaultHome;
+  process.env['HOME'] = activeHome;
   t.after(() => {
     if (originalPath === undefined) delete process.env['PATH']; else process.env['PATH'] = originalPath;
+    if (prevHome === undefined) delete process.env['HOME']; else process.env['HOME'] = prevHome;
     rmSync(root, { recursive: true, force: true });
   });
-  const call = (request: Record<string, unknown> | string, options: string[] = []) =>
-    runProcess({ executable: process.execPath, args: [adapter, ...options] }, root,
+  const call = (request: Record<string, unknown> | string, options: string[] = [], cwd: string = root) =>
+    runProcess({ executable: process.execPath, args: [adapter, ...options] }, cwd,
       typeof request === 'string' ? request : JSON.stringify(request), 30_000);
   const req = (overrides: Record<string, unknown> = {}): Record<string, unknown> =>
     ({ protocol: 'omg-agent/v1', requestId: 'r1', mode: 'chat', model: 'swe-2-high', effort: 'high', prompt: 'Fixture question', ...overrides });
   const reset = () => { rmSync(trace, { force: true }); };
   const ran = () => existsSync(trace);
-  const traced = () => JSON.parse(readFileSync(trace, 'utf8')) as { args: string[]; prompt: string; mode: string; promptFile: string };
+  const traced = () => JSON.parse(readFileSync(trace, 'utf8')) as TraceRecord;
   return { root, call, req, reset, ran, traced, scenario: (value: string) => writeFileSync(scenario, value) };
 }
 
@@ -63,7 +101,7 @@ function errorOf(result: { stderr: string }): string {
   return JSON.parse(result.stderr.trim().split('\n').filter(line => line.startsWith('{')).pop() ?? '{}')['error'] ?? 'none';
 }
 
-test('all four modes and the reader role share the exact argv and the 0600 prompt file', async t => {
+test('all four modes and the reader role share the exact argv, the 0600 prompt file, and the isolated 0600 config', async t => {
   const f = fixture(t);
   const modes: [string, string, Record<string, unknown>, (payload: Record<string, unknown>) => void][] = [
     ['text', 'chat', {}, payload => assert.equal(payload['text'], 'plain answer text')],
@@ -84,11 +122,29 @@ test('all four modes and the reader role share the exact argv and the 0600 promp
     assert.deepEqual(payload['confirmed'], { model: null, effort: null, speed: null });
     check(payload);
     const trace = f.traced();
-    assert.deepEqual(trace.args.slice(0, -1), ['--print', '--model', 'swe-2-high', '--permission-mode',
+    assert.deepEqual(trace.args.slice(0, -1), ['--print', '--config', trace.configFile!, '--model', 'swe-2-high', '--permission-mode',
       mode === 'implement' ? 'accept-edits' : 'auto', '--sandbox', '--respect-workspace-trust=false', '--prompt-file'], `${mode} argv`);
     assert.equal(trace.args[trace.args.length - 1], trace.promptFile);
     assert.equal(trace.mode, '0600', 'the prompt file is private');
+    assert.equal(trace.configMode, '0600', 'the config file is private');
     assert.ok(trace.prompt.includes('Fixture question'));
+
+    // Verify isolated config schema
+    const config = JSON.parse(trace.configRaw!) as Record<string, unknown>;
+    assert.equal(config['version'], 1);
+    assert.equal((config['devin'] as Record<string, unknown>)['org_id'], 'fixture-org-id');
+    assert.equal((config['shell'] as Record<string, unknown>)['setup_complete'], true);
+    assert.equal(config['subagents_enabled'], false);
+    assert.deepEqual(config['mcpServers'], {});
+    assert.deepEqual(config['disabled_tools'], ['exec', 'mcp_list_tools', 'mcp_call_tool']);
+    assert.deepEqual(config['read_config_from'], {
+      cursor: false, windsurf: false, claude: false, opencode: false, zed: false, copilot: false, agents_standard: false,
+    });
+    assert.equal('hooks' in config, false, 'no hooks allowed in isolated config');
+    const deny = (config['permissions'] as Record<string, unknown>)['deny'] as string[];
+    assert.ok(deny.includes('Read(**/state.sqlite*)'), 'state.sqlite* is denied');
+    assert.ok(deny.includes('Exec(*)'), 'exec is denied');
+
     assert.equal(existsSync(dirname(trace.promptFile)), false, 'the temporary prompt directory is cleaned');
     if (extra['subject']) assert.ok(trace.prompt.endsWith(`Subject:\n${JSON.stringify(extra['subject'])}`));
   }
@@ -159,6 +215,66 @@ test('empty, malformed, extra or wrongly shaped output is a typed invalid result
   }
 });
 
+test('table of response forms (rows 1-7 from lesson 46 contract): clean JSON, fenced blocks, prose, multiple blocks', async t => {
+  const f = fixture(t);
+
+  // Row 1: Bare JSON object across stdout
+  f.scenario('review-pass'); f.reset();
+  const row1 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(row1.exitCode, 0);
+  assert.deepEqual((JSON.parse(row1.stdout) as Record<string, unknown>)['review'], { verdict: 'pass', kind: 'none', findings: [] });
+
+  // Row 2: Exactly one fenced ```json block without prose
+  f.scenario('fenced-review'); f.reset();
+  const row2 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(row2.exitCode, 0);
+  assert.deepEqual((JSON.parse(row2.stdout) as Record<string, unknown>)['review'], { verdict: 'pass', kind: 'none', findings: [] });
+
+  // Row 3: Prose + exactly one fenced ```json block (prose discarded, payload accepted)
+  f.scenario('prose-fenced-review'); f.reset();
+  const row3 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(row3.exitCode, 0);
+  assert.deepEqual((JSON.parse(row3.stdout) as Record<string, unknown>)['review'], { verdict: 'pass', kind: 'none', findings: [] });
+
+  // Row 4: Two or more fenced blocks of any kind -> provider_result_invalid (ambiguous)
+  f.scenario('two-fenced'); f.reset();
+  const row4 = await f.call(f.req({ mode: 'review' }));
+  assert.notEqual(row4.exitCode, 0);
+  assert.equal(errorOf(row4), 'provider_result_invalid');
+
+  // Row 5: One block with malformed JSON, array, or non-object -> provider_result_invalid
+  for (const scenario of ['fenced-bad-json', 'fenced-array', 'fenced-empty']) {
+    f.scenario(scenario); f.reset();
+    const row5 = await f.call(f.req({ mode: 'review' }));
+    assert.notEqual(row5.exitCode, 0);
+    assert.equal(errorOf(row5), 'provider_result_invalid', scenario);
+  }
+
+  // Row 6: Pure prose without blocks in structured modes -> provider_result_invalid
+  f.scenario('text'); f.reset();
+  for (const mode of ['research', 'implement', 'review'] as const) {
+    const row6 = await f.call(f.req({ mode }));
+    assert.notEqual(row6.exitCode, 0);
+    assert.equal(errorOf(row6), 'provider_result_invalid', `pure prose in ${mode}`);
+  }
+
+  // Row 7: Empty output -> provider_empty
+  f.scenario('empty'); f.reset();
+  for (const mode of ['chat', 'research', 'implement', 'review'] as const) {
+    const row7 = await f.call(f.req({ mode }));
+    assert.notEqual(row7.exitCode, 0);
+    assert.equal(errorOf(row7), 'provider_empty', `empty in ${mode}`);
+  }
+
+  // Chat mode accepts rows 1, 2, 3 and pure prose
+  for (const scenario of ['review-pass', 'fenced-review', 'prose-fenced-review', 'text']) {
+    f.scenario(scenario); f.reset();
+    const chatRes = await f.call(f.req({ mode: 'chat' }));
+    assert.equal(chatRes.exitCode, 0, `chat on ${scenario}`);
+    assert.ok(typeof (JSON.parse(chatRes.stdout) as Record<string, unknown>)['text'] === 'string');
+  }
+});
+
 test('a CLI failure maps to provider_failed with the bounded stderr, and chat keeps plain text', async t => {
   const f = fixture(t);
   f.scenario('fail');
@@ -225,3 +341,439 @@ test('the closed provider table cannot be mutated through any issued descriptor'
   assert.ok(new RegExp(row.versionPattern.source, row.versionPattern.flags).test('devin 9.9.9'));
   assert.deepEqual([...STDIO_PROTOCOLS].sort(), ['codex-stdio', 'devin-stdio']);
 });
+
+test('missing, empty or malformed devin.org_id refuses before CLI launch with adapter_config_invalid', async t => {
+  const fakeHome = mkdtempSync(join(tmpdir(), 'omg-fake-home-'));
+  t.after(() => rmSync(fakeHome, { recursive: true, force: true }));
+
+  // Missing config.json
+  const f1 = fixture(t, fakeHome);
+  const res1 = await f1.call(f1.req());
+  assert.notEqual(res1.exitCode, 0);
+  assert.equal(errorOf(res1), 'adapter_config_invalid');
+  assert.equal(f1.ran(), false, 'provider was not launched when config missing');
+
+  // Config without devin.org_id
+  const devinDir = join(fakeHome, '.config', 'devin');
+  mkdirSync(devinDir, { recursive: true });
+  writeFileSync(join(devinDir, 'config.json'), JSON.stringify({ version: 1, shell: { setup_complete: true } }));
+  const f2 = fixture(t, fakeHome);
+  const res2 = await f2.call(f2.req());
+  assert.notEqual(res2.exitCode, 0);
+  assert.equal(errorOf(res2), 'adapter_config_invalid');
+  assert.equal(f2.ran(), false, 'provider was not launched when org_id missing');
+
+  // Config with empty string org_id
+  writeFileSync(join(devinDir, 'config.json'), JSON.stringify({ version: 1, devin: { org_id: '   ' } }));
+  const f3 = fixture(t, fakeHome);
+  const res3 = await f3.call(f3.req());
+  assert.notEqual(res3.exitCode, 0);
+  assert.equal(errorOf(res3), 'adapter_config_invalid');
+  assert.equal(f3.ran(), false, 'provider was not launched when org_id is blank');
+
+  // Config with invalid JSON syntax
+  writeFileSync(join(devinDir, 'config.json'), '{ not json');
+  const f4 = fixture(t, fakeHome);
+  const res4 = await f4.call(f4.req());
+  assert.notEqual(res4.exitCode, 0);
+  assert.equal(errorOf(res4), 'adapter_config_invalid');
+  assert.equal(f4.ran(), false, 'provider was not launched when JSON is malformed');
+});
+
+test('form (c) deny rules computation: ancestor siblings chain inside home vs full home deny outside', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-tree-test-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const fakeH = join(root, 'home');
+  const fakeW = join(fakeH, 'sub', 'project');
+  mkdirSync(join(fakeH, 'sub'), { recursive: true });
+  mkdirSync(fakeW, { recursive: true });
+  mkdirSync(join(fakeH, '.ssh'));
+  writeFileSync(join(fakeH, 'secret.txt'), 'secret');
+  writeFileSync(join(fakeH, '.hidden-secret'), 'hidden');
+  mkdirSync(join(fakeH, 'sub', 'sibling-dir'));
+  writeFileSync(join(fakeH, 'sub', 'sibling-file.txt'), 'sibling');
+  writeFileSync(join(fakeW, 'code.ts'), 'open');
+
+  // Case 1: Workspace inside home -> denies all siblings along ancestor chain
+  const insideDeny = computeDenyRules(fakeW, fakeH);
+  // Sibling in home
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, '.ssh')})`));
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, '.ssh')}/**)`));
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, 'secret.txt')})`));
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, '.hidden-secret')})`));
+  // Sibling in sub
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, 'sub', 'sibling-dir')})`));
+  assert.ok(insideDeny.includes(`Read(${join(fakeH, 'sub', 'sibling-file.txt')})`));
+  // Workspace itself must NOT be denied
+  assert.equal(insideDeny.some(d => d.includes(fakeW)), false, 'workspace is never denied');
+  // Always state.sqlite* and Exec(*)
+  assert.ok(insideDeny.includes('Read(**/state.sqlite*)'));
+  assert.ok(insideDeny.includes('Exec(*)'));
+
+  // Case 2: Workspace outside home -> denies entire home
+  const outsideW = join(root, 'outside');
+  mkdirSync(outsideW);
+  const outsideDeny = computeDenyRules(outsideW, fakeH);
+  assert.ok(outsideDeny.includes(`Read(${fakeH})`));
+  assert.ok(outsideDeny.includes(`Read(${fakeH}/**)`));
+  assert.ok(outsideDeny.includes('Read(**/state.sqlite*)'));
+  assert.ok(outsideDeny.includes('Exec(*)'));
+  assert.equal(outsideDeny.some(d => d.includes(outsideW)), false, 'outside workspace is never denied');
+
+  // Case 3: readdir failure refuses with adapter_config_invalid
+  assert.throws(() => computeDenyRules('/nonexistent-dir-w', fakeH), (error: unknown) =>
+    (error as { code?: string }).code === 'adapter_config_invalid');
+});
+
+test('findFencedBlocks extracts bodies across single and multiline code fences', () => {
+  assert.deepEqual(findFencedBlocks(''), []);
+  assert.deepEqual(findFencedBlocks('just text without fences'), []);
+  assert.deepEqual(findFencedBlocks('```json\n{"ok":true}\n```'), ['{"ok":true}']);
+  assert.deepEqual(findFencedBlocks('Prose before\n```json\n{"v":1}\n```\nProse after'), ['{"v":1}']);
+  assert.deepEqual(findFencedBlocks('```\nfirst\n```\n```ts\nsecond\n```'), ['first', 'second']);
+  assert.deepEqual(findFencedBlocks('```json\n\n```'), ['']);
+});
+
+test('CommonMark fenced block parsing: mixed fence lengths, non-json language, inline ticks, and unclosed fences', () => {
+  const three = '```json\n{"verdict":"pass","kind":"none","findings":[]}\n```';
+  const four = '````text\nAdditional independent result\n````';
+
+  // Mixed lengths: 3-backtick JSON followed by 4-backtick text -> must recognize 2 blocks and refuse
+  assert.equal(findFencedBlocks(three + '\n' + four).length, 2);
+  assert.throws(() => parsed(three + '\n' + four), (err: unknown) => (err as { code?: string }).code === 'provider_result_invalid');
+
+  // Reversed: 4-backtick text followed by 3-backtick JSON -> must recognize 2 blocks and refuse
+  assert.equal(findFencedBlocks(four + '\n' + three).length, 2);
+  assert.throws(() => parsed(four + '\n' + three), (err: unknown) => (err as { code?: string }).code === 'provider_result_invalid');
+
+  // Single 4-backtick JSON block -> parses cleanly
+  assert.deepEqual(findFencedBlocks('````json\n{"a":1}\n````'), ['{"a":1}']);
+  assert.deepEqual(parsed('````json\n{"a":1}\n````'), { a: 1 });
+
+  // Two blocks of non-JSON languages -> recognizes 2 blocks and refuses
+  assert.equal(findFencedBlocks('```text\n{"a":1}\n```\n```python\npass\n```').length, 2);
+  assert.throws(() => parsed('```text\n{"a":1}\n```\n```python\npass\n```'), (err: unknown) => (err as { code?: string }).code === 'provider_result_invalid');
+
+  // Inline quoted ticks in prose before code fence -> does not count as block
+  assert.deepEqual(parsed('Use ``` as the fence delimiter.\n```json\n{"a":1}\n```'), { a: 1 });
+
+  // Unclosed fence at EOF -> counted as block
+  assert.equal(findFencedBlocks('```json\n{"a":1}').length, 1);
+});
+
+test('ambiguous response with multiple fenced blocks refuses through real adapter process with provider_result_invalid', async t => {
+  const f = fixture(t);
+
+  // Case 1: triple then four
+  f.scenario('fenced-triple-then-four');
+  const res1 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res1.exitCode, 1);
+  assert.equal(errorOf(res1), 'provider_result_invalid');
+
+  // Case 2: four then triple
+  f.scenario('fenced-four-then-triple');
+  const res2 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res2.exitCode, 1);
+  assert.equal(errorOf(res2), 'provider_result_invalid');
+
+  // Case 3: single four-backtick block passes
+  f.scenario('fenced-single-four');
+  const res3 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res3.exitCode, 0);
+  const payload3 = JSON.parse(res3.stdout) as Record<string, unknown>;
+  assert.deepEqual(payload3['review'], { verdict: 'pass', kind: 'none', findings: [] });
+
+  // Case 4: prose with inline ticks before fenced block passes
+  f.scenario('fenced-prose-inline-ticks');
+  const res4 = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res4.exitCode, 0);
+  const payload4 = JSON.parse(res4.stdout) as Record<string, unknown>;
+  assert.deepEqual(payload4['review'], { verdict: 'pass', kind: 'none', findings: [] });
+});
+
+test('CLI entry through symlink and realpath preserves direct execution and error envelopes', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-entry-test-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const link = join(root, 'adapter-link.js');
+  symlinkSync(adapter, link);
+
+  // Erroneous request (null) via direct path and via symlink
+  const directErr = spawnSync(process.execPath, [adapter], { input: 'null', encoding: 'utf8' });
+  const linkErr = spawnSync(process.execPath, [link], { input: 'null', encoding: 'utf8' });
+  assert.equal(directErr.status, 1);
+  assert.match(directErr.stderr, /adapter_input_invalid/);
+  assert.equal(linkErr.status, 1);
+  assert.match(linkErr.stderr, /adapter_input_invalid/);
+
+  // Valid request via symlink
+  const f = fixture(t);
+  const validBody = JSON.stringify(f.req({ mode: 'chat' }));
+  const linkValid = spawnSync(process.execPath, [link], {
+    input: validBody,
+    encoding: 'utf8',
+    env: process.env,
+  });
+  assert.equal(linkValid.status, 0, linkValid.stderr);
+  const payload = JSON.parse(linkValid.stdout) as Record<string, unknown>;
+  assert.equal(payload['protocol'], 'omg-agent/v1');
+});
+
+test('home descendant whose first name starts with two dots remains inside home', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-dot-test-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const work = join(home, '..project', 'workspace');
+  mkdirSync(work, { recursive: true });
+  writeFileSync(join(home, 'secret'), 'fixture');
+
+  const rules = computeDenyRules(work, home);
+  assert.ok(rules.includes(`Read(${join(home, 'secret')})`));
+  assert.equal(rules.includes(`Read(${home}/**)`), false, 'descendant starting with two dots must not deny the entire home');
+  assert.equal(rules.some(r => r.includes(work)), false, 'workspace is never denied');
+});
+
+test('ordinary, symlinked, same-home and outside homes follow the specified deny branches', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-branches-test-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const work = join(home, 'project', 'w');
+  mkdirSync(work, { recursive: true });
+  writeFileSync(join(home, '.secret'), 'fixture');
+  writeFileSync(join(home, 'project', 'neighbor'), 'fixture');
+  symlinkSync(home, join(root, 'home-link'));
+  symlinkSync(work, join(root, 'work-link'));
+
+  const expected = [
+    `Read(${join(home, '.secret')})`,
+    `Read(${join(home, '.secret')}/**)`,
+    `Read(${join(home, 'project', 'neighbor')})`,
+    `Read(${join(home, 'project', 'neighbor')}/**)`,
+    'Read(**/state.sqlite*)',
+    'Exec(*)',
+  ];
+  assert.deepEqual(computeDenyRules(work, home), expected);
+  assert.deepEqual(computeDenyRules(join(root, 'work-link'), join(root, 'home-link')), expected);
+  assert.deepEqual(computeDenyRules(home, home), ['Read(**/state.sqlite*)', 'Exec(*)']);
+  assert.deepEqual(computeDenyRules(root, home), [`Read(${home})`, `Read(${home}/**)`, 'Read(**/state.sqlite*)', 'Exec(*)']);
+});
+
+test('parsed helper validates bare JSON and single fenced JSON while rejecting malformed or multi blocks', () => {
+  assert.deepEqual(parsed('{"a":1}'), { a: 1 });
+  assert.deepEqual(parsed('```json\n{"b":2}\n```'), { b: 2 });
+  assert.throws(() => parsed('not json'), (err: unknown) => (err as { code?: string }).code === 'provider_result_invalid');
+  assert.throws(() => parsed('```json\n{"a":1}\n```\n```json\n{"b":2}\n```'), (err: unknown) => (err as { code?: string }).code === 'provider_result_invalid');
+});
+
+test('agreed conservative response acceptance regressions (construction #2756) through real adapter process', async t => {
+  const f = fixture(t);
+  const passPayload = { verdict: 'pass', kind: 'none', findings: [] };
+  const failPayload = { verdict: 'request_changes', kind: 'code', findings: ['second verdict'] };
+  const passJson = JSON.stringify(passPayload);
+  const failJson = JSON.stringify(failPayload);
+
+  // 1. чистый объект ✓
+  f.scenario('raw:' + passJson);
+  let res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 2. один ```json ✓
+  f.scenario('raw:```json\n' + passJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 3. проза + блок ✓
+  f.scenario('raw:Leading prose commentary\n```json\n' + passJson + '\n```\nTrailing prose commentary\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 4. один ```` ✓
+  f.scenario('raw:````json\n' + passJson + '\n````\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 5. один ~~~ ✓
+  f.scenario('raw:~~~json\n' + passJson + '\n~~~~\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 6. незакрытый с полным объектом ✓
+  f.scenario('raw:```json\n' + passJson);
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 7. незакрытый с оборванным JSON ✗
+  f.scenario('raw:```json\n{"verdict":');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 8. два верхнеуровневых (3+4 и 4+3) ✗
+  f.scenario('raw:```json\n' + passJson + '\n```\n````text\nsecond\n````\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  f.scenario('raw:````text\nsecond\n````\n```json\n' + passJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 9. верхнеуровневый + блок в цитате > (оба порядка) ✗
+  f.scenario('raw:```json\n' + passJson + '\n```\n\n> ```json\n> ' + failJson + '\n> ```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  f.scenario('raw:> ```json\n> ' + failJson + '\n> ```\n\n```json\n' + passJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 10. + блок в элементе списка (оба порядка) ✗
+  f.scenario('raw:```json\n' + passJson + '\n```\n\n- second verdict\n    ```json\n    ' + failJson + '\n    ```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  f.scenario('raw:- second verdict\n    ```json\n    ' + failJson + '\n    ```\n\n```json\n' + passJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 11. смешанный префикс '> - 1. > ```json' ✗
+  f.scenario('raw:> - 1. > ```json\n' + passJson + '\n> - 1. > ```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 12. второй блок с окончаниями CR ✗
+  f.scenario('raw:```json\n' + passJson + '\n```\n\n```json\r' + failJson + '\r```\r');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 13. CRLF один блок ✓
+  f.scenario('raw:```json\r\n' + passJson + '\r\n```\r\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 14. первый кандидат с табом / 4 пробелами ✗
+  f.scenario('raw:\t```json\n' + passJson + '\n\t```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  f.scenario('raw:    ```json\n' + passJson + '\n    ```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 15. inline ``` внутри строки прозы ✓
+  f.scenario('raw:Use ``` as delimiter.\n```json\n' + passJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], passPayload);
+
+  // 16. ~~~ закрывает ``` ✗
+  f.scenario('raw:```json\n' + passJson + '\n~~~\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 17. законный JSON со строковыми backticks/тильдами/\n (в чистом объекте и в блоке) ✓
+  const jsonWithTicks = {
+    verdict: 'request_changes',
+    kind: 'code',
+    findings: ['```json\n{"example":1}\n```', '~~~', 'Multi\nLine\nFinding']
+  };
+  // 17a. Чистый объект:
+  f.scenario('raw:' + JSON.stringify(jsonWithTicks));
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], jsonWithTicks);
+
+  // 17b. Внутри одного блока с JSON.stringify(v, null, 2):
+  f.scenario('raw:```json\n' + JSON.stringify(jsonWithTicks, null, 2) + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 0);
+  assert.deepEqual(JSON.parse(res.stdout)['review'], jsonWithTicks);
+
+  // 18. невалидная многострочная JSON-строка ✗
+  f.scenario('raw:```json\n{\n  "verdict": "pass",\n  "text": "\n```json\n  "\n}\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 19. минимум один конфликтующий review через процесс адаптера ✗
+  f.scenario('raw:```json\n' + passJson + '\n```\n\n```json\n' + failJson + '\n```\n');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+
+  // 20. пусто / только пробелы -> provider_empty ✗
+  f.scenario('raw:   \n\t  \n  ');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_empty');
+
+  // 21. проза без блоков ✗
+  f.scenario('raw:This is plain prose without any code blocks or JSON');
+  res = await f.call(f.req({ mode: 'review' }));
+  assert.equal(res.exitCode, 1);
+  assert.equal(errorOf(res), 'provider_result_invalid');
+});
+
+test('resolveOrgId extracts devin.org_id from valid config file', () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), 'omg-org-test-'));
+  const devinDir = join(fakeHome, '.config', 'devin');
+  mkdirSync(devinDir, { recursive: true });
+  writeFileSync(join(devinDir, 'config.json'), JSON.stringify({ version: 1, devin: { org_id: 'org-test-123' } }));
+  assert.equal(resolveOrgId(fakeHome), 'org-test-123');
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('fence recognition and refusal with Unicode line and paragraph separators U+2028 and U+2029', async t => {
+  const f = fixture(t);
+  const pass = { verdict: 'pass', kind: 'none', findings: [] };
+  const fail = { verdict: 'request_changes', kind: 'code', findings: ['second verdict'] };
+  const passJson = JSON.stringify(pass);
+  const failJson = JSON.stringify(fail);
+  const first = '```json\n' + passJson + '\n```';
+
+  for (const [name, sep] of [['LINE SEPARATOR', '\u2028'], ['PARAGRAPH SEPARATOR', '\u2029']] as const) {
+    // candidate recognition does not disappear due to separator in suffix
+    assert.notEqual(parseFenceCandidate('```json' + sep, 0), null, `candidate recognition for ${name} open fence`);
+    assert.notEqual(parseFenceCandidate('```' + sep, 0), null, `candidate recognition for ${name} close fence`);
+
+    // second fenced answer in parsed refuses for both orders
+    for (const reverse of [false, true]) {
+      const other = '```json' + sep + '\n' + failJson + '\n```' + sep;
+      assert.throws(() => parsed(reverse ? other + '\n\n' + first : first + '\n\n' + other), { code: 'provider_result_invalid' });
+    }
+
+    // real adapter refuses a contradictory second response with separator fence suffixes
+    f.scenario('raw:' + first + '\n\n```json' + sep + '\n' + failJson + '\n```' + sep + '\n');
+    f.reset();
+    const res = await f.call(f.req({ mode: 'review' }));
+    assert.equal(res.exitCode, 1, `exitCode for ${name}`);
+    assert.equal(errorOf(res), 'provider_result_invalid', `errorOf for ${name}`);
+  }
+
+  // Legal JSON literal line separators and fence-looking values survive direct and fenced forms
+  const v = { text: '```json\n{"a":1}\n```', other: '~~~\u2028\u2029\n> - 1. > ```' };
+  for (const s of [JSON.stringify(v), JSON.stringify(v, null, 2)]) {
+    assert.deepEqual(parsed(s), v);
+    assert.deepEqual(parsed('prefix\n```json\n' + s + '\n````\nsuffix'), v);
+  }
+  assert.deepEqual(parsed('```json\r' + passJson + '\r```'), pass);
+});
+
+
