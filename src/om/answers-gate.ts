@@ -76,7 +76,7 @@ export const ANSWERS_GATE_SOURCE_ROLES = sealed([
   'model-call', 'call', 'packet-routes', 'response', 'diagnostic', 'transport', 'terminal', 'intent', 'question',
   'accepted', 'binding', 'assignment', 'work', 'receipt', 'observed-source', 'prerequisite', 'replacement',
   'replacement-proof', 'appeared', 'appeared-graph', 'admission-series', 'admission-pointer', 'admission-applied',
-  'admission-current', 'cycle',
+  'admission-current', 'cycle', 'ceased-step', 'ceased-work',
 ] as const);
 export type AnswersGateSourceRole = typeof ANSWERS_GATE_SOURCE_ROLES[number];
 // Every violated condition of a composite emission point, so one emitted finding keeps all of its checked causes.
@@ -195,6 +195,9 @@ function cessation(cause: CompletionCause): { sources: AnswersGateSource[]; deta
       ...(cause.change.pointer ? [cite('admission-pointer', cause.change.pointer)] : []),
       cite('admission-applied', cause.change.applied), cite('admission-current', cause.change.currentPointer)],
     detail: { cessation: cause.kind, condition: cause.condition } };
+    // LP4 (№2887): the exact ceased step of the cycle and the exact work it is proved on.
+    case 'cycle-step-ceased': return { sources: [cite('ceased-step', cause.cessation), cite('ceased-work', cause.work)],
+      detail: { cessation: cause.kind } };
   }
 }
 function take<T>(result: OmResult<T>): T { if (!result.ok) throw new GateFailure(result.refusal); return result.value; }

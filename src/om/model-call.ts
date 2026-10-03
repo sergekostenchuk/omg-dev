@@ -3000,7 +3000,9 @@ function validateManagedFinish(store: Store, request: FinishModelAttemptRequest,
 export type CompletionCause = { kind: 'file-observation'; source: Ref; observation: ApplicationFileObservation }
   | { kind: 'required-record-replaced'; prerequisite: CompletionPrerequisite; replacement: Ref; proof: Ref | null }
   | { kind: 'required-absence-ended'; frame: FrameRequest; field: 'frame' | 'layer' | 'upper.frame'; appeared: Ref; graph: Ref }
-  | { kind: 'series-admission-change'; condition: 'same-line' | 'active-participation'; change: SeriesAdmissionChange };
+  | { kind: 'series-admission-change'; condition: 'same-line' | 'active-participation'; change: SeriesAdmissionChange }
+  // LP4 (№2887): a proved cessation of a step of this cycle in the exact predecessor work forbids its remaining work.
+  | { kind: 'cycle-step-ceased'; cessation: Ref; work: Ref };
 export interface CompletionDispositionContext {
   binding: Revision<CompletionOwner>; assignment: Revision<CompletionAssignment>; snapshot: CompletionSnapshot;
 }
@@ -3125,7 +3127,68 @@ export function readCompletionCause(store: Store, project: string, assignmentRef
         fail('completion_cause_invalid', assignment.id, 'cause', "The exact applied transition must remove this assignment's admission");
       return { references: [...original.references, ...change.references, assignmentRef] };
     }
+    if (cause.kind === 'cycle-step-ceased') {
+      if (!exactKeys(cause, ['kind', 'cessation', 'work']) || !isRef(cause.cessation) || !isRef(cause.work))
+        fail('completion_cause_invalid', assignment.id, 'cause', 'A ceased cycle step names its exact cessation and work');
+      const ceased = ceasedCycleStep(store, project, binding, assignment, cause.work);
+      if (!ceased || !same(reference(ceased), cause.cessation))
+        fail('completion_cause_invalid', assignment.id, 'cessation', 'Only the proved cessation of a step of this cycle forbids its remaining work');
+      return { references: [assignmentRef, cause.work, cause.cessation] };
+    }
     fail('completion_cause_invalid', assignment.id, 'cause', 'Unknown causes do not end application');
+  });
+}
+/**
+ * LP4 (№2887): the one derivation of a cycle-step-ceased cause, for its producer and its historical reader alike. In the
+ * exact open predecessor work of this binding, the target is an unresolved part or continuation of a cycle, or the
+ * unresolved root of a node (parts of a materialized plan, whose remainder is its assembly), below an unresolved root; the ground is a
+ * proved cessation of a part or continuation of the same root — by exact parent references — that forbids the cycle of
+ * their batch by the E4 rule itself. Facts, answers-gate checks and anything already resolved get no such cause. Of
+ * several grounds the first by exact reference is chosen, whatever the order of the products.
+ */
+function ceasedCycleStep(store: Store, project: string, binding: Revision<CompletionOwner>, assignment: Revision<CompletionAssignment>,
+  workRef: Ref): Sealed<Revision<CompletionCessation>> | null {
+  const snapshot = take(readCompletionWorkAt(store, project, workRef));
+  const resolved = (row: Revision<CompletionAssignment>) => snapshot.resolved.some(ref => same(ref, reference(row)));
+  const byId = new Map(snapshot.assignments.map(row => [row.id, row]));
+  const target = byId.get(assignment.id);
+  if (!snapshot.cessations.length || snapshot.work.value.closed || !same(reference(snapshot.binding), reference(binding)) || !target
+    || !same(reference(target), reference(assignment)) || resolved(target)) return null;
+  // The root of an assignment by its exact parent references: a link that does not lead to an exact row leads nowhere.
+  const rootOf = (row: Revision<CompletionAssignment>): Revision<CompletionAssignment> | null => {
+    for (let at = row; ;) {
+      if (!at.value.parent) return at.value.kind === 'root' ? at : null;
+      const parent = byId.get(at.value.parent.id);
+      if (!parent || !same(reference(parent), at.value.parent)) return null;
+      at = parent;
+    }
+  };
+  const root = rootOf(target);
+  if (!root || resolved(root)) return null;
+  if (target.value.kind === 'root' ? !snapshot.assignments.some(row => row.value.kind === 'part' && row.value.parent !== null
+    && same(row.value.parent, reference(root))) || !nodePlanned(store, project, snapshot, target.value.batch)
+    : target.value.kind !== 'part' && target.value.kind !== 'continuation') return null;
+  const below = completionBelow(snapshot);
+  const grounds = snapshot.cessations.filter(cessation => {
+    const step = byId.get(cessation.value.assignment.id);
+    return !!step && same(reference(step), cessation.value.assignment) && step !== target
+      && (step.value.kind === 'part' || step.value.kind === 'continuation') && step.value.batch === target.value.batch
+      && rootOf(step) === root && cessationForbids(store, snapshot, below, cessation, { batch: target.value.batch, action: 'cycle' }) !== null;
+  }).sort((a, b) => compareJson(reference(a), reference(b)));
+  return grounds[0] ?? null;
+}
+/**
+ * LP4 (№2887, №2902): the proof that the cycle of a root is forbidden by a ceased step of that cycle — the ground of a
+ * cycle-step-ceased cause on the current work — whatever cause the root is ceased by first. A direct cause keeps its
+ * priority when the root is ceased; it does not hide that the cycle itself is forbidden.
+ */
+export function ceasedCycleGround(store: Store, project: string, rootRef: Ref): ModelCallResult<Sealed<Ref> | null> {
+  return result(() => {
+    const { assignment } = readAnyCompletionAssignmentAt(store, project, rootRef);
+    const binding = take(readCompletionOwnerAt(store, project, assignment.value.binding)) as Revision<CompletionOwner>;
+    const head = store.get(completionWorkId(project, binding.id));
+    const ceased = head && assignment.value.kind === 'root' ? ceasedCycleStep(store, project, binding, assignment, reference(head)) : null;
+    return ceased ? reference(ceased) : null;
   });
 }
 export function prepareCompletionCause(store: Store, project: string, assignmentRef: Ref): ModelCallResult<Sealed<{
@@ -3242,6 +3305,14 @@ export function prepareCompletionCause(store: Store, project: string, assignment
     }
     const structureChanged = replaced(prerequisites.records.filter(row => ['graph', 'layer', 'frame'].includes(row.kind)));
     if (structureChanged) return structureChanged;
+    // LP4 (№2887): after every direct cause, the remaining work of a cycle a proved cessation of its own step forbids.
+    const workHead = store.get(completionWorkId(project, binding.id));
+    const ceased = workHead ? ceasedCycleStep(store, project, binding, assignment, reference(workHead)) : null;
+    if (ceased) {
+      const cause: CompletionCause = { kind: 'cycle-step-ceased', cessation: reference(ceased), work: reference(workHead!) };
+      take(readCompletionCause(store, project, assignmentRef, cause));
+      return { cause, guards: [reference(workHead!)] };
+    }
     return { cause: null, guards: [] };
   });
 }
@@ -3315,6 +3386,8 @@ function cessationValue(store: Store, project: string, request: {
 }): CompletionCessation {
   const context = take(readCompletionDispositionContext(store, project, request));
   take(readCompletionCause(store, project, request.assignment, request.cause));
+  if (request.cause.kind === 'cycle-step-ceased' && !same(request.cause.work, request.work))
+    fail('completion_invalid', request.assignment.id, 'cause', 'A ceased cycle step is proved on the exact predecessor of this cessation');
   const { assignment, snapshot, binding } = context;
   if (request.ledger) take(checkCompletionLedger(store, snapshot, request.ledger, snapshot.work.value.journal));
   const base = { contract: 'om-completion-cessation/v1' as const, project, binding: request.binding,
@@ -3351,12 +3424,8 @@ function cessationValue(store: Store, project: string, request: {
   if (assignment.value.kind === 'root') {
     const parts = snapshot.assignments.filter(row => row.value.kind === 'part' && row.value.parent?.id === assignment.id);
     const remainder = parts.length ? 'assembly' : 'expansion';
-    if (parts.length) {
-      const packets = snapshot.products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'question-packet')
-        .map(ref => take(readQuestionPacket(store, { project, record: ref })));
-      if (!packets.some(packet => packet.value.request.batch === assignment.value.batch && packet.value.plan))
-        fail('completion_invalid', assignment.id, 'remainder', 'Only a node plan has an assembly remainder');
-    }
+    if (parts.length && !nodePlanned(store, project, snapshot, assignment.value.batch))
+      fail('completion_invalid', assignment.id, 'remainder', 'Only a node plan has an assembly remainder');
     return { ...base, disposition: 'branch-ceased', remainder };
   }
   if (assignment.value.kind === 'part' || assignment.value.kind === 'continuation') {
@@ -3374,6 +3443,12 @@ function cessationValue(store: Store, project: string, request: {
     fail('completion_invalid', assignment.id, 'remainder', 'A remaining branch needs its exact prior response or unmaterialized plan position');
   }
   fail('completion_invalid', assignment.id, 'remainder', 'No unknown physical address may be fabricated for a remaining branch');
+}
+/** A batch of the work is a node: one of its own materialized packets carries the complete part plan. */
+function nodePlanned(store: Store, project: string, snapshot: Sealed<CompletionSnapshot>, batch: string): boolean {
+  return snapshot.products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'question-packet')
+    .map(ref => take(readQuestionPacket(store, { project, record: ref })))
+    .some(packet => packet.value.request.batch === batch && !!packet.value.plan);
 }
 export function readCompletionCessationAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionCessation>>> {
   return result(() => historicalRead(store, { reader: 'G7.completion-cessation', project, ref }, () => {
@@ -3451,28 +3526,37 @@ export function writeCompletionCessation(store: Store, request: { project: strin
   });
 }
 
+function completionBelow(snapshot: Sealed<CompletionSnapshot>): (child: string, ancestor: string) => boolean {
+  const parents = new Map(snapshot.assignments.map(row => [row.id, row.value.parent?.id ?? null]));
+  return (child, ancestor) => {
+    let id: string | null | undefined = child;
+    while (id) { if (id === ancestor) return true; id = parents.get(id); }
+    return false;
+  };
+}
+/** The one E4 rule by which a proved cessation forbids an action of its batch: the admission of every action and the
+ * ground of a ceased cycle step (LP4, №2887) read it alike. The ceased assignment when it forbids, otherwise null. */
+function cessationForbids(store: Store, snapshot: Sealed<CompletionSnapshot>, below: (child: string, ancestor: string) => boolean,
+  cessation: Sealed<Revision<CompletionCessation>>, request: { batch: string; assignment?: Ref; parent?: Ref; action: string }): Sealed<Revision<CompletionAssignment>> | null {
+  const assignment = take(readCompletionAssignmentAt(store, snapshot.binding.value.project, cessation.value.assignment));
+  if (assignment.value.batch !== request.batch) return null;
+  const sameStep = request.assignment && same(request.assignment, cessation.value.assignment);
+  const inherited = request.parent && below(request.parent.id, assignment.id)
+    || request.assignment && below(request.assignment.id, assignment.id);
+  const closedRoot = assignment.value.kind === 'root'
+    && (cessation.value.remainder === 'expansion' || request.action === 'materialize');
+  return request.action === 'cycle' || sameStep || closedRoot || inherited
+    && ['expansion', 'continuation'].includes(cessation.value.remainder ?? '') ? assignment : null;
+}
 /** Current action admission is separate from historical product reading. */
 export function checkCompletionDisposition(store: Store, snapshot: Sealed<CompletionSnapshot>, request: {
   batch: string; assignment?: Ref; parent?: Ref; action: 'dispatch' | 'materialize' | 'apply' | 'cycle';
 }): ModelCallResult<Sealed<true>> {
   return result(() => {
-    const parents = new Map(snapshot.assignments.map(row => [row.id, row.value.parent?.id ?? null]));
-    const below = (child: string, ancestor: string): boolean => {
-      let id: string | null | undefined = child;
-      while (id) { if (id === ancestor) return true; id = parents.get(id); }
-      return false;
-    };
+    const below = completionBelow(snapshot);
     for (const cessation of snapshot.cessations) {
-      const assignment = take(readCompletionAssignmentAt(store, snapshot.binding.value.project, cessation.value.assignment));
-      if (assignment.value.batch !== request.batch) continue;
-      const sameStep = request.assignment && same(request.assignment, cessation.value.assignment);
-      const inherited = request.parent && below(request.parent.id, assignment.id)
-        || request.assignment && below(request.assignment.id, assignment.id);
-      const closedRoot = assignment.value.kind === 'root'
-        && (cessation.value.remainder === 'expansion' || request.action === 'materialize');
-      if (request.action === 'cycle' || sameStep || closedRoot || inherited
-        && ['expansion', 'continuation'].includes(cessation.value.remainder ?? ''))
-        fail('completion_ceased', assignment.id, 'disposition', 'The exact step retains its proved cessation', reference(cessation));
+      const assignment = cessationForbids(store, snapshot, below, cessation, request);
+      if (assignment) fail('completion_ceased', assignment.id, 'disposition', 'The exact step retains its proved cessation', reference(cessation));
     }
     if (request.assignment) {
       for (const ref of snapshot.products) if (store.get(ref.id, ref.revision)?.kind === 'om-assessment-result') {

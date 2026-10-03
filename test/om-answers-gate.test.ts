@@ -4200,3 +4200,27 @@ test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prep
   const closed = snapshot(g.store), again = ok(writeAnswersEvaluation(g.store, s.linked));
   assert.ok(again.repeated); assert.deepEqual(snapshot(g.store), closed, 'The repeated linked evaluation writes nothing');
 });
+
+test('LP4 (№2887 rows 6, 7, 8) facts of an answered step keep their own grounds, a fact whose application ended on its own ground starts no cycle-step-ceased, and the answers-gate check is never ceased for a cycle', async t => {
+  const f = fixture(t, 'repository-fact'), m = registered(f, 'lp4-facts'), fact = factGap(f);
+  const { intent, transport } = await managedTransport(f, m);
+  const head = () => reference(f.store.get(completionWorkId(f.project, m.binding.id))!);
+  const kinds = () => m.work().assignments.filter(row => !m.work().resolved.some(ref => same(ref, reference(row))))
+    .map(row => ok(prepareCompletionCause(f.store, f.project, reference(row))).cause?.kind ?? null);
+  assert.ok(m.work().assignments.some(row => row.value.kind === 'fact'), 'The answered step has its mandatory facts');
+  assert.ok(!kinds().includes('cycle-step-ceased'), 'Row 6: a fact is no step of a cycle and gets no such cause');
+  // Row 7: the fact's application ends on its own ground (the assessor role moved); that ending starts nothing for others.
+  m.configure('answers-replacement-assessor', m.config.revision);
+  const terminal = ok(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(transport) }));
+  assert.equal(terminal.value.verdict, 'application-terminated');
+  assert.notEqual((terminal.value as { cause?: { kind: string } }).cause?.kind, 'cycle-step-ceased');
+  assert.ok(!kinds().includes('cycle-step-ceased'), 'Row 7: no fact ending propagates as a ceased cycle step');
+  const saved = ok(evaluate(f, m, [{ gap: reference(fact), result: reference(terminal), candidate: null }]));
+  assert.deepEqual(contributions(f, reference(saved.evaluation)), [['assessment-terminated', 'answer_missing_for_blocking_gap',
+    { kind: 'existing', producer: 'E5-T', basis: [reference(terminal)] }]], 'The fact keeps its own E5 T ground');
+  // Row 8: the answers-gate check ends only by its own admission change.
+  const check = m.work().answers!.assignment, anyCessation = { id: completionCessationId(f.project, m.binding.id, check.id), revision: 1, hash: '0'.repeat(64) };
+  assert.equal(ok(prepareCompletionCause(f.store, f.project, check)).cause, null);
+  const refused = readCompletionCause(f.store, f.project, check, { kind: 'cycle-step-ceased', cessation: anyCessation, work: head() });
+  assert.ok(!refused.ok && refused.refusal.code === 'completion_cause_invalid');
+});

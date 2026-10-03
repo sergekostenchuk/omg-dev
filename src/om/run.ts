@@ -12,12 +12,12 @@ import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunS
 import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
 import { writeApplyAnswer as writeApplyAnswerOf } from "./addressing.js";
-import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
+import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
   resumeSeries as resumeSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
 import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
-import { modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
+import { ceasedCycleGround as ceasedCycleGroundOf, modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
   writeCompletionCessation as writeCompletionCessationOf, type CompletionSnapshot } from "./model-call.js";
 import { readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf } from "./question-packet.js";
 import { assessFact as assessFactOf, readAssessmentIntentAt as readAssessmentIntentAtOf, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
@@ -102,6 +102,7 @@ const readStopContext = transferring("repeat-gate", readStopContextOf);
 const prepareStopAnalysis = transferring("stop-analysis", prepareStopAnalysisOf);
 const readStopAnalysis = transferring("stop-analysis", readStopAnalysisOf);
 const prepareCompletionCause = transferring("model-call", prepareCompletionCauseOf);
+const ceasedCycleGround = transferring("model-call", ceasedCycleGroundOf);
 const readCompletionWorkAt = transferring("model-call", readCompletionWorkAtOf);
 const readManagedModelDiagnostic = transferring("model-call", readManagedModelDiagnosticOf);
 const readModelCycle = transferring("model-call", readModelCycleOf);
@@ -367,7 +368,8 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
     // part, chosen by the order of the products) and that was never cycled is not performed: the pass chooses again by an
     // ordinary new transition, and its history and the saved records stay as they are. A cycle of it that was performed is
     // found again by its own request; a packet whose place is not proved is performed as saved and keeps its refusal.
-    if (state.phase === "step" && misplacedCycle(store, state.step))
+    // LP4 (№2887): so is a saved cycle never performed whose root's remaining work is proved ceased by a step of its own.
+    if (state.phase === "step" && (misplacedCycle(store, state.step) || ceasedCycle(store, state.step)))
       return transition(guarded, head, { phase: "ready" }, head.value.last, null, []);
     if (state.phase === "step") return settle(guarded, head, state.step, await perform(guarded, store, hold, request, state.step));
     const history = historyOf(store, head), performed = history.performed;
@@ -1215,6 +1217,26 @@ function misplacedCycle(store: Store, step: RunStep): boolean {
   if (typeof request.project !== "string" || !isRef(request.packet) || store.get(modelCycleId(step.request as never))) return false;
   const place = packetPlace(store, request.project, request.packet);
   return place.ok && place.value === "step";
+}
+/**
+ * LP4 (№2887, №2902): a saved cycle never performed (no cycle of its exact request) whose root — the root of its packet's
+ * batch in its exact attempt — is proved to have that cycle forbidden by a ceased step of its own: E4 refuses the cycle by
+ * that cessation, and the choice ends the remaining work by its producer instead, by whichever cause comes first (a direct
+ * cause of the root keeps its priority there). A packet that cannot be read, an attempt or root not found, a refused proof
+ * or no such proof keeps the saved step, performed as it is.
+ */
+function ceasedCycle(store: Store, step: RunStep): boolean {
+  if (step.action !== "cycle") return false;
+  const request = step.request as { project?: unknown; packet?: unknown };
+  if (typeof request.project !== "string" || !isRef(request.packet) || store.get(modelCycleId(step.request as never))) return false;
+  const packet = readQuestionPacket(store, { project: request.project, record: request.packet });
+  const attempt = packet.ok ? packet.value.value.request.attempt : null, batch = packet.ok ? packet.value.value.request.batch : null;
+  if (!attempt || !batch) return false;
+  const binding = readCompletionBinding(store, request.project, attempt.series, attempt.ordinal);
+  const root = binding.ok && binding.value ? completionRootAssignments(binding.value).find(row => row.value.batch === batch) : undefined;
+  if (!root) return false;
+  const ground = ceasedCycleGround(store, request.project, reference(root));
+  return ground.ok && ground.value !== null;
 }
 /**
  * The current M6 of a saved route's own D1 scope, tasks and catalog: the route itself while M6 still derives it, or its

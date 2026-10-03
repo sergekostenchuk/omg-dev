@@ -3702,3 +3702,192 @@ test('LP3 (№2817 п.3, п.7) the ground of reads-invalid is derived from the e
     code: 'record_foreign', message: read.refusal.message, reason: 'refused', evidence: [reference(g.source)] });
   assert.ok(!claimed.ok && claimed.refusal.code === 'completion_invalid', 'A performable read gives no such ground');
 });
+
+// ---- LP4 (№2887): the remaining work of a cycle that a proved cessation of its own step forbids ----
+/** A need_source of a node packet, for the exact questions of that packet. */
+const lp4Need = (f: ReturnType<typeof e4Fixture>, packet: { value: { packet: unknown } }) => ({
+  ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
+  questionIds: (packet.value.packet as { questions: { id: string }[] }).questions.map(row => row.id) });
+/** The node fixture's own step, paid with an applied need_source, then ceased on the step's own ground (another capacity). */
+async function lp4CeasedStep(f: ReturnType<typeof e4Fixture>, request: ModelCallRequest = f.request) {
+  const { writeCompletionCessation } = await import('../src/om/model-call.js');
+  const first = valueOf(await runModelCall(f.store, request));
+  assert.equal(first.outcome?.kind, 'need-source');
+  return { first, owner: first.record.value.om.completionOwner!, cease: () => {
+    const owner = first.record.value.om.completionOwner!;
+    const step = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: owner.assignment }));
+    assert.deepEqual([step.value.disposition, step.value.remainder, step.value.cause.kind], ['branch-ceased', 'continuation', 'required-record-replaced']);
+    return step;
+  } };
+}
+const lp4Root = (f: ReturnType<typeof e4Fixture>) => completionSnapshot(f).assignments.find(row => row.value.kind === 'root')!;
+
+test('LP4 (№2887 row 4, row 9, §6.8, §6.9) a node whose only step ceased on its own ground is ceased by a cycle-step-ceased cause with its assembly remainder: E4 keeps refusing the cycle, the paid need_source is never sent again, the cause and the cessation read back exactly after a restart, and nothing else proves the cause', async t => {
+  const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  f.steps([{ research: lp4Need(f, f.packet), usage }]);
+  const { owner, cease } = await lp4CeasedStep(f), root = lp4Root(f);
+  // Row 9: without a proved ground nothing is ceased — neither the step nor its root; a changed environment alone gives the root none.
+  assert.deepEqual([valueOf(prepareCompletionCause(f.store, f.project, reference(root))).cause,
+    valueOf(prepareCompletionCause(f.store, f.project, owner.assignment)).cause], [null, null]);
+  f.environment(90_000);
+  assert.equal(valueOf(prepareCompletionCause(f.store, f.project, reference(root))).cause, null);
+  const step = cease();
+  assert.equal(completionSnapshot(f).complete, false, 'The node still needs its assembly or its own cessation');
+  f.restart();
+  const work = reference(f.store.get(completionWorkId(f.project, owner.binding.id))!);
+  const cause = valueOf(prepareCompletionCause(f.store, f.project, reference(root))).cause!;
+  assert.deepEqual(cause, { kind: 'cycle-step-ceased', cessation: reference(step), work }, 'Row 4: the ceased step of its own cycle on the exact work');
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(root) }));
+  assert.deepEqual([ceased.value.disposition, ceased.value.remainder, ceased.value.work, ceased.value.cause],
+    ['branch-ceased', 'assembly', work, cause]);
+  assert.equal(completionSnapshot(f).complete, true);
+  const cycle = await runModelCycle(f.store, f.request);
+  assert.ok(!cycle.ok && cycle.refusal.code === 'completion_ceased', 'E4 still refuses the cycle of the ceased batch');
+  assert.equal(f.sent().length, 1, 'The paid need_source is never sent again');
+  f.restart(); const history = f.store.list();
+  assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased);
+  valueOf(readCompletionCause(f.store, f.project, reference(root), cause));
+  assert.deepEqual(valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(root) })), ceased);
+  const later = reference(f.store.get(completionWorkId(f.project, owner.binding.id))!);
+  const code = (target: Ref, value: unknown) => { const read = readCompletionCause(f.store, f.project, target, value as never); return read.ok ? 'ok' : read.refusal.code; };
+  assert.deepEqual([
+    code(reference(root), { kind: 'cycle-step-ceased', cessation: reference(step) }),
+    code(reference(root), { ...cause, extra: true }),
+    code(reference(root), { ...cause, cessation: reference(ceased) }),
+    code(reference(root), { ...cause, work: later }),
+    code(owner.assignment, cause),
+  ], Array(5).fill('completion_cause_invalid'), 'No missing field, foreign field, a root\'s own cessation, a later work or a resolved target proves it');
+  assert.deepEqual(f.store.list(), history, 'Reading and the repeat write nothing'); assert.equal(f.sent().length, 1);
+});
+
+test('LP4 (№2887 row 3) a root with a direct cause of its own is ceased by that cause: the new ground never replaces it', async t => {
+  const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, true);
+  f.steps([{ research: lp4Need(f, f.packet), usage }]);
+  const { owner, cease } = await lp4CeasedStep(f), root = lp4Root(f);
+  f.environment(90_000); cease();
+  assert.equal(valueOf(prepareCompletionCause(f.store, f.project, reference(root))).cause!.kind, 'cycle-step-ceased');
+  valueOf(writeAddressing(f.store, { project: f.project, input: reference(f.input), graph: reference(f.graph),
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project: f.project, input: reference(f.input), graph: reference(f.graph), layers: [],
+      decision: { target: 'discovery:spare', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const direct = valueOf(prepareCompletionCause(f.store, f.project, reference(root))).cause!;
+  assert.equal(direct.kind, 'required-record-replaced');
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(root) }));
+  assert.deepEqual([ceased.value.remainder, ceased.value.cause], ['assembly', direct]);
+  assert.equal(completionSnapshot(f).complete, true); assert.equal(f.sent().length, 1);
+});
+
+test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, with no ground of their own (the environment configured back as it was), are ceased by the new cause with their own remainders: an unmaterialized part — expansion; a continuation inside the part materialized without a claim — not-dispatched; received and unapplied — application with its response and usage kept; with an applied need_source — continuation; a live call stays the common recovery\'s; the old cycle stays refused', async t => {
+  const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
+  await t.test('expansion', async t => {
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = f.packet.value.fullChars! - 1, config = f.environment(capacity);
+    const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+    assert.ok(packet.value.plan!.assignments.length > 1);
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    f.steps([{ research: lp4Need(f, packet), usage }]);
+    const { cease, owner } = await lp4CeasedStep(f, request);
+    f.environment(90_000); const step = cease(); f.environment(capacity);
+    const later = completionSnapshot(f).assignments.filter(row => row.value.kind === 'part' && row.id !== owner.assignment.id);
+    assert.ok(later.length > 0);
+    for (const part of later) {
+      assert.deepEqual(valueOf(prepareCompletionCause(f.store, f.project, reference(part))).cause, { kind: 'cycle-step-ceased',
+        cessation: reference(step), work: reference(f.store.get(completionWorkId(f.project, owner.binding.id))!) });
+      const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(part) }));
+      assert.deepEqual([ceased.value.disposition, ceased.value.remainder, ceased.value.packet], ['branch-ceased', 'expansion', null]);
+    }
+    const root = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) }));
+    assert.deepEqual([root.value.remainder, root.value.cause.kind], ['assembly', 'cycle-step-ceased']);
+    assert.equal(completionSnapshot(f).complete, true);
+    const cycle = await runModelCycle(f.store, request);
+    assert.ok(!cycle.ok && cycle.refusal.code === 'completion_ceased', '§6.4: the environment configured back revives no ceased cycle');
+    assert.equal(f.sent().length, 1);
+  });
+  for (const variant of ['not-dispatched', 'application', 'continuation', 'live'] as const) await t.test(`continuation inside the part: ${variant}`, async t => {
+    const f = e4Fixture(t, 'node', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'lp4-live.json');
+    const need = { research: lp4Need(f, f.packet), usage };
+    f.steps([need, variant === 'live' ? { ...need, pauseAfterRequest: checkpoint } : need]);
+    const { first, owner, cease } = await lp4CeasedStep(f);
+    const basis = { project: f.project, packet: f.request.packet, call: first.call, response: first.response! };
+    const delivered = valueOf(deliverModelSources(f.store, basis));
+    const next = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, previous: [], continuation: { packet: basis.packet, call: basis.call,
+      response: basis.response, deliveries: [...delivered.deliveries] } })).record;
+    assert.equal(next.value.state, 'ready');
+    const continued = { ...f.request, packet: reference(next) };
+    let driver: ReturnType<typeof fixtureDriver> | null = null, provider: { pid: number; started: string } | null = null;
+    if (variant === 'not-dispatched') valueOf(recordCall(f.store, f.project, completionE1(f, next)));
+    if (variant === 'continuation') assert.equal(valueOf(await runModelCall(f.store, continued)).outcome?.kind, 'need-source');
+    if (variant === 'application') {
+      const write = f.store.writeMany.bind(f.store); let raced = false;
+      f.store.writeMany = ((writes, guards) => {
+        if (!raced && writes.some(row => row.kind === 'model-call' && (row.value as OmModelCall).om?.application === 'applied')) {
+          raced = true;
+          // A legal configure of the same environment in another Store moves the guarded head before the application.
+          const other = new Store(f.database);
+          try {
+            const old = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+            const { projectId: _project, ...config } = structuredClone(old.value);
+            new ProductEngine(other).environments.configure(f.project, config, old.revision);
+          } finally { other.close(); }
+        }
+        return write(writes, guards);
+      }) as Store['writeMany'];
+      const refused = await runModelCall(f.store, continued); f.store.writeMany = write;
+      assert.ok(raced && !refused.ok);
+    }
+    if (variant === 'live') {
+      driver = fixtureDriver(t, f.database, f.root, 'call', continued);
+      await fixtureCheckpoint(checkpoint, driver.child);
+      const running = f.store.list<ModelCall>('model-call').find(row => (row.value as unknown as OmModelCall).om?.request.packet.id === next.id)!;
+      provider = running.value.execution!.provider!;
+      t.after(() => { signalFixtureProvider(provider!.pid, provider!.started); });
+    }
+    const sent = f.sent().length, calls = f.store.list('model-call');
+    f.environment(90_000); const step = cease(); f.environment(100_000);
+    const continuation = completionSnapshot(f).assignments.find(row => row.value.kind === 'continuation')!;
+    const cause = valueOf(prepareCompletionCause(f.store, f.project, reference(continuation))).cause!;
+    assert.deepEqual([cause.kind, (cause as { cessation: Ref }).cessation], ['cycle-step-ceased', reference(step)]);
+    const ceased = writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(continuation) });
+    if (variant === 'live') {
+      assert.ok(!ceased.ok && ceased.refusal.code === 'completion_claim_exists', 'A live call stays the common recovery\'s');
+      assert.equal(f.store.list('om-completion-cessation').length, 1);
+      await killFixtureProvider(provider!.pid, provider!.started); await driver!.exit;
+      return;
+    }
+    const value = valueOf(ceased).value;
+    assert.deepEqual([value.disposition, value.remainder], variant === 'not-dispatched' ? ['not-dispatched', null] : ['branch-ceased', variant]);
+    assert.deepEqual(f.store.list('model-call'), calls, 'Every paid response, its exchange and its usage stay as they were');
+    const root = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) }));
+    assert.deepEqual([root.value.remainder, root.value.cause.kind], ['assembly', 'cycle-step-ceased']);
+    assert.equal(completionSnapshot(f).complete, true);
+    for (const request of [f.request, continued]) {
+      const repeated = await runModelCycle(f.store, request);
+      assert.ok(!repeated.ok && repeated.refusal.code === 'completion_ceased');
+    }
+    assert.equal(f.sent().length, sent, 'Nothing is sent again');
+  });
+});
+
+test('LP4 (№2887 §6.7) a work moved by another Store between the preparation of a cycle-step-ceased cessation and its write — the other step ceased there — refuses that write as a whole; the write prepared afresh stands', async t => {
+  const { prepareCompletionCessation, writeCompletionCessation } = await import('../src/om/model-call.js');
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = f.packet.value.fullChars! - 1, config = f.environment(capacity);
+  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  f.steps([{ research: lp4Need(f, packet), usage }]);
+  const { owner, cease } = await lp4CeasedStep(f, request);
+  f.environment(90_000); cease(); f.environment(capacity);
+  const part = completionSnapshot(f).assignments.find(row => row.value.kind === 'part' && row.id !== owner.assignment.id)!;
+  const prepared = valueOf(prepareCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(part) }));
+  assert.equal(prepared.record.value.cause.kind, 'cycle-step-ceased');
+  const other = new Store(f.database);
+  try { valueOf(writeCompletionCessation(other, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) })); }
+  finally { other.close(); }
+  const before = f.store.list();
+  const stale = writeGuarded(f.store, { unit: 'G7', target: prepared.record.id, writes: prepared.writes as Write[], guards: prepared.guards as never });
+  assert.ok(!stale.ok, 'The moved work refuses the prepared write');
+  assert.deepEqual(f.store.list(), before, 'Nothing of it is written');
+  const fresh = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(part) }));
+  assert.deepEqual([fresh.value.remainder, fresh.value.cause.kind], ['expansion', 'cycle-step-ceased']);
+  assert.notDeepEqual(fresh.value.work, prepared.record.value.work, 'Proved on the work as it stands now');
+  assert.equal(f.sent().length, 1);
+});

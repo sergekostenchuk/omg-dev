@@ -41,7 +41,7 @@ import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
-import { modelCallRecordId, runModelCycle } from "../src/om/model-call.js";
+import { modelCallRecordId, prepareCompletionCause, runModelCall, runModelCycle, writeCompletionCessation } from "../src/om/model-call.js";
 import { ResearchSources } from "../src/discovery/research-sources.js";
 import { readQuestionPacket, writeQuestionPacket } from "../src/om/question-packet.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
@@ -2603,3 +2603,190 @@ out(seen);`, { request, project }) as string[];
   });
 });
 
+
+// ---- LP4 (№2887): a step of a node's cycle ceased on a changed environment no longer stops the pass ----
+const LP4_COMMITS = { "3cba953": "3cba9536e2d8fd8ad4fdb0b04b7a84014c9b7da0", "202c470": "202c4709a02316338275e66c7acb173498b30a39" } as const;
+type WorksRun = ReturnType<typeof worksFixture>;
+/** The roles moved onto another copy of the adapter: a lawful configure that ends their old steps (№2872). */
+function lp4Configure(f: WorksRun, request: RunRequest): RunRequest {
+  const moved = join(f.root, "adapter-next.mjs"), old = f.store.get<Record<string, Json>>(`environment:${project}`)!;
+  writeFileSync(moved, readFileSync(adapterFixture));
+  const { projectId: _project, ...environment } = structuredClone(old.value) as Record<string, Json> & { implementer: { command: { args: string[] } }; reviewer: { command: { args: string[] } } };
+  for (const role of ["implementer", "reviewer"] as const) environment[role].command.args = [moved, ...environment[role].command.args.slice(1)];
+  const current = f.engine.environments.configure(project, environment as never, old.revision);
+  return { ...request, dispatch: { ...request.dispatch, config: reference(current) } };
+}
+const lp4Questions = (f: WorksRun, packet: Ref) =>
+  (f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.packet as { questions: { id: string }[] }).questions.map(row => row.id);
+const lp4Sent = (f: WorksRun, packet: Ref) => {
+  const requestId = (f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.packet as { requestId: string }).requestId;
+  return f.sent().filter(line => (JSON.parse(line as string) as { requestId?: string }).requestId === requestId).length;
+};
+/** Every step of the pass on a new Store (a stop after each transaction), until the first attempt's close. */
+async function lp4Close(f: WorksRun, request: RunRequest, bound = 40) {
+  const seen: string[] = [];
+  for (let index = 0; index < bound; index++) {
+    f.restart();
+    const advanced = ok(await advanceRun(f.store, request)), state = advanced.record.value.state;
+    seen.push(state.phase === "waiting" ? `waiting:${state.wait.code}` : `${state.phase}:${advanced.performed?.action ?? (state.phase === "step" ? (state as { step: RunStep }).step.action : "")}`);
+    assert.notEqual(state.phase, "waiting", seen.join(","));
+    if (advanced.performed?.action === "close") return seen;
+  }
+  return assert.fail(`The first attempt did not close: ${seen.join(",")}`);
+}
+
+test("LP4 (№2887 rows 1, 4, 9, §6.3, §6.4, §6.6) an addressed file the first or the second root waits for: without another environment the pass waits lawfully and nothing is ceased; once the roles move, the waiting step and then its node are ceased, the other root is worked by its own rules, the first attempt closes by G7 — on a new Store after every transaction, never waiting on completion_ceased and never sending the paid need_source again", async t => {
+  for (const hang of ["first", "second"] as const) await t.test(`the ${hang} root waits`, async t => {
+    const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], cycled: Ref[] = [];
+    ok(startRun(f.store, { project }));
+    let state = null as { phase: string; step?: { action: string; request: unknown } } | null;
+    for (let index = 0; index < 40 && state?.phase !== "waiting"; index++) {
+      const advanced = ok(await advanceRun(f.store, f.request)); state = advanced.record.value.state as unknown as typeof state;
+      if (state!.phase !== "step" || state!.step!.action !== "cycle") continue;
+      const packet = (state!.step!.request as { packet: Ref }).packet;
+      if (cycled.some(ref => ref.id === packet.id)) continue;
+      cycled.push(packet);
+      if (cycled.length === (hang === "first" ? 1 : 2)) steps.push({ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+        questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage });
+      else { f.answer(packet); steps.push((JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps.at(-1)); }
+      writeFileSync(scenario, JSON.stringify({ steps }));
+    }
+    assert.equal(state?.phase, "waiting", JSON.stringify(state));
+    const waiting = cycled[hang === "first" ? 0 : 1]!, other = cycled.find(ref => ref.id !== waiting.id) ?? null;
+    // Row 9: the lawful wait for an external input stays as it is without another environment; nothing is ceased.
+    // Row 9: a lawful wait for an external input; without another environment nothing is ceased and nothing sent again.
+    const saved = (state as unknown as { wait: { code: string } }).wait.code;
+    assert.deepEqual([saved, f.store.list("om-completion-cessation").length, lp4Sent(f, waiting)], ["model_read_unavailable", 0, 1]);
+    f.restart();
+    assert.equal(ok(prepareCompletionCause(f.store, project, (f.store.list<{ om: { completionOwner: { assignment: Ref } } }>("model-call")
+      .find(row => row.value.om?.completionOwner)!).value.om.completionOwner.assignment)).cause, null);
+    const request = lp4Configure(f, f.request), seen = await lp4Close(f, request);
+    const cessations = f.store.list<{ assignment: Ref; remainder: string; cause: { kind: string } }>("om-completion-cessation");
+    assert.deepEqual(cessations.map(row => row.value.cause.kind).sort(), ["cycle-step-ceased", "required-record-replaced"], seen.join(","));
+    const root = cessations.find(row => row.value.cause.kind === "cycle-step-ceased")!;
+    assert.equal(root.value.remainder, "assembly");
+    assert.equal(f.store.get<{ kind: string }>(root.value.assignment.id)!.value.kind, "root");
+    assert.equal(lp4Sent(f, waiting), 1, "The paid need_source is never sent again");
+    // §6.3: the other root is worked by its own rules — its own cycle, never ceased because of the waiting one.
+    const cycles = f.store.list<{ request: { packet: Ref }; terminal: string }>("om-model-cycle");
+    const own = cycles.filter(row => row.value.request.packet.id !== waiting.id);
+    assert.ok(own.length >= 1 && own.every(row => ["outcome", "assembled"].includes(row.value.terminal)), JSON.stringify(cycles.map(row => row.value.terminal)));
+    if (other) assert.ok(own.some(row => row.value.request.packet.id === other.id));
+    assert.ok(!cycles.some(row => row.value.request.packet.id === waiting.id), "No cycle terminal is invented for the ceased cycle");
+    const series = f.store.list<RepairSeries>("repair-series")[0]!;
+    assert.notEqual(series.value.attempts[0]!.outcome, null, "G7 closed the first attempt");
+  });
+});
+
+test("LP4 (№2887 row 10, §6.2, §6.6) the producers 3cba953 and 202c470, each from its whole Git code in its own process, leave the pass on completion_ceased after the roles move — saved as a wait or as the step about to be performed; the new code on a new Store ends the remaining work by cease and G7 without sending the paid need_source again, every saved revision as the old code wrote it", async t => {
+  for (const [name, commit] of Object.entries(LP4_COMMITS)) for (const stop of ["waiting", "step"] as const) await t.test(`${name} ${stop}`, async t => {
+    const f = worksFixture(t), moved = join(f.root, "adapter-next.mjs");
+    writeFileSync(moved, readFileSync(adapterFixture));
+    const reads = name === "3cba953" ? [{ action: "search", within: reference(f.store.get(`om-input:${project}`)!), query: "question" }]
+      : [{ action: "read", path: "lp4-later.txt", media: "text/plain" }];
+    const stuck = atCommit(f, commit, `lp4-${name}-${stop}`, `const { advanceRun, startRun } = await import(src('om/run.js'));
+const { ProductEngine } = await import(src('product/engine.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const { writeFileSync } = await import('node:fs');
+take(startRun(store, { project: args.project }));
+let request = args.request, ceased = false;
+const seen = [], steps = [];
+async function drive(stopAtStep) {
+  for (let index = 0; index < 40; index++) {
+    const advanced = take(await advanceRun(store, request)), state = advanced.record.value.state;
+    if (advanced.performed?.action === 'cease') ceased = true;
+    if (state.phase === 'step' && state.step.action === 'cycle' && !steps.length) {
+      const packet = store.get(state.step.request.packet.id, state.step.request.packet.revision);
+      steps.push({ research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source',
+        questionIds: packet.value.packet.questions.map(row => row.id), missing: 'The addressed data', reads: args.reads }, usage: args.usage });
+      writeFileSync(args.scenario, JSON.stringify({ steps }));
+    }
+    seen.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code : state.phase + ':' + (advanced.performed?.action ?? ''));
+    if (stopAtStep && ceased && state.phase === 'step' && state.step.action === 'cycle') return;
+    if (state.phase === 'waiting' && seen.at(-2) === seen.at(-1)) return;
+  }
+}
+await drive(false);
+const engine = new ProductEngine(store), old = store.get('environment:' + args.project), environment = structuredClone(old.value);
+delete environment.projectId;
+for (const role of ['implementer', 'reviewer']) environment[role].command.args = [args.moved, ...environment[role].command.args.slice(1)];
+request = { ...request, dispatch: { ...request.dispatch, config: reference(engine.environments.configure(args.project, environment, old.revision)) } };
+await drive(args.stop === 'step');
+out({ seen, request });`,
+      { request: f.request, project, reads, usage, scenario: join(f.root, "scenario.json"), moved, stop }) as { seen: string[]; request: RunRequest };
+    const last = stuck.seen.at(-1)!;
+    assert.equal(last, stop === "waiting" ? "waiting:completion_ceased" : "step:", `The old code stands on its cessation: ${stuck.seen.join(",")}`);
+    f.restart();
+    const before = f.store.list().map(reference), head = ok(readRun(f.store, { project }))!;
+    const step = head.value.state.phase === "step" ? head.value.state.step : head.value.last!.step;
+    assert.equal(step.action, "cycle");
+    const packet = (step.request as unknown as { packet: Ref }).packet, paid = lp4Sent(f, packet);
+    assert.equal(paid, 1);
+    if (stop === "step") {
+      // §6.6: the saved step is not performed — an ordinary transition back to the choice, no cycle product invented.
+      const first = ok(await advanceRun(f.store, stuck.request));
+      assert.deepEqual([first.performed, first.record.value.state.phase, first.record.revision], [null, "ready", head.revision + 1]);
+      assert.equal(f.store.list<{ request: { packet: Ref } }>("om-model-cycle").filter(row => row.value.request.packet.id === packet.id).length, 0);
+    }
+    const seen = await lp4Close(f, stuck.request);
+    const roots = f.store.list<{ cause: { kind: string }; remainder: string }>("om-completion-cessation").filter(row => row.value.cause.kind === "cycle-step-ceased");
+    assert.deepEqual(roots.map(row => row.value.remainder), ["assembly"], seen.join(","));
+    assert.equal(lp4Sent(f, packet), 1, "The paid need_source of the old code is never sent again");
+    for (const ref of before) assert.deepEqual(reference(f.store.get(ref.id, ref.revision)!), ref, `${ref.id}@${ref.revision} stands as the old code wrote it`);
+  });
+});
+
+test("LP4 (№2902, rows 3/4) a saved cycle whose step ceased, while its root also has a direct cause of higher priority (a lawfully replaced B1), is not performed: saved as the step or — by the code 202c470 in its own process — as the wait on completion_ceased, the new code goes back to the choice, which ceases the root by its direct cause, without a stop on completion_ceased and without another send", async t => {
+  for (const saved of ["step", "waiting"] as const) await t.test(saved, async t => {
+    const f = worksFixture(t);
+    ok(startRun(f.store, { project }));
+    let step: RunStep | null = null;
+    for (let index = 0; index < 40 && !step; index++) {
+      const state = ok(await advanceRun(f.store, f.request)).record.value.state;
+      assert.notEqual(state.phase, "waiting", JSON.stringify(state));
+      if (state.phase === "step" && state.step.action === "cycle") step = state.step as unknown as RunStep;
+    }
+    assert.ok(step, "A cycle is chosen");
+    const packet = (step.request as unknown as { packet: Ref }).packet;
+    writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps: [{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "need_source",
+      questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage }] }));
+    // The paid need_source is applied while the pass's cursor still stands on the saved step (the boundary of its recovery).
+    const owner = ok(await runModelCall(f.store, step.request as never)).record.value.om.completionOwner!;
+    const request = lp4Configure(f, f.request);
+    ok(writeCompletionCessation(f.store, { project, binding: owner.binding, assignment: owner.assignment }));
+    const root = f.store.list<{ kind: string; batch: string }>("om-completion-assignment")
+      .find(row => row.value.kind === "root" && row.value.batch === f.store.get<{ batch: string }>(owner.assignment.id)!.value.batch)!;
+    assert.equal(ok(prepareCompletionCause(f.store, project, reference(root))).cause!.kind, "cycle-step-ceased");
+    const inventory = f.store.write({ id: `repo-inventory:${project}`, kind: "repo-inventory", expected: 0, value: { projectId: project, paths: [] } });
+    const before = f.store.get(`om-input:${project}`)!;
+    const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+    ok(writeOmInput(f.store, { project, stages, inventory: reference(inventory), expected: before.revision }));
+    const direct = ok(prepareCompletionCause(f.store, project, reference(root))).cause!;
+    assert.deepEqual([direct.kind, (direct as { prerequisite: { kind: string } }).prerequisite.kind], ["required-record-replaced", "input"], "The direct cause keeps its priority");
+    if (saved === "waiting") {
+      const stood = atCommit(f, LP4_COMMITS["202c470"], "lp4-direct-waiting", `const { advanceRun } = await import(src('om/run.js'));
+const advanced = take(await advanceRun(store, args.request));
+out(advanced.record.value.state);`, { request }) as { phase: string; wait?: { code: string } };
+      assert.deepEqual([stood.phase, stood.wait?.code], ["waiting", "completion_ceased"], "The code 202c470 performs the forbidden cycle and stands");
+    }
+    const sent = f.sent().length;
+    f.restart();
+    const head = ok(readRun(f.store, { project }))!;
+    const first = ok(await advanceRun(f.store, request));
+    if (saved === "step") assert.deepEqual([first.performed, first.record.value.state.phase, first.record.revision], [null, "ready", head.revision + 1],
+      "The saved forbidden cycle goes back to the choice by an ordinary transition");
+    else assert.notEqual(first.record.value.state.phase, "waiting", "The saved wait goes on to the choice");
+    // On a new Store after every transaction, until the root is ceased: never a stop on completion_ceased.
+    const seen: string[] = [];
+    const rootCessation = () => f.store.list<{ assignment: Ref }>("om-completion-cessation").find(row => row.value.assignment.id === root.id);
+    for (let index = 0; index < 12 && !rootCessation(); index++) {
+      f.restart();
+      const state = ok(await advanceRun(f.store, request)).record.value.state;
+      seen.push(state.phase === "waiting" ? `waiting:${state.wait.code}` : state.phase);
+      assert.ok(!seen.includes("waiting:completion_ceased"), seen.join(","));
+    }
+    const ceased = f.store.get<{ cause: { kind: string; prerequisite?: { kind: string } }; remainder: string }>(rootCessation()!.id)!;
+    assert.deepEqual([ceased.value.cause.kind, ceased.value.cause.prerequisite?.kind, ceased.value.remainder], ["required-record-replaced", "input", "assembly"], seen.join(","));
+    assert.equal(f.sent().length, sent, "Nothing of the ceased cycle is sent again");
+  });
+});
