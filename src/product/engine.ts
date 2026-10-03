@@ -50,8 +50,14 @@ import { RefinementResearch } from "./refinement-research.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { configureSavedSynthesis } from "../discovery/saved-synthesis.js";
+import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority } from "./owner-authority.js";
+import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/owner-result.js";
+import { readOmInput } from "../om/input.js";
+import { readRoutes } from "../om/routes.js";
 
 export type { Project, StageContent } from "./stage-checks.js";
+/** H2.0: the om readers the owner producer shares with the G4b gate — handed in so om/owner-result stays off the ring. */
+const ENGINE_OWNER_READERS: OwnerReaders = { routes: readRoutes, input: readOmInput };
 
 export class ProductEngine {
   readonly discovery: Discovery;
@@ -67,7 +73,10 @@ export class ProductEngine {
   readonly refinementResearch: RefinementResearch;
   /** The lower kit of stage checks, era and compile (R2, №2419): the fields above are its very instances. */
   readonly checks: StageChecks;
+  /** H2.0: the in-memory owner-session registry — its bearer map dies with this engine (and its server). */
+  readonly owners: OwnerSessions;
   constructor(readonly store: Store, private readonly actor = "local-owner") {
+    this.owners = new OwnerSessions(store);
     this.checks = new StageChecks(store);
     this.discovery = this.checks.discovery; this.graphs = this.checks.graphs; this.pipeline = this.checks.pipeline;
     this.environments = this.checks.environments; this.refinement = this.checks.refinement; this.compiler = this.checks.compiler;
@@ -109,6 +118,7 @@ export class ProductEngine {
         || ["discovery_stale", "research_context_stale"].includes(finding.code));
       return { ...question, assessment: { state: question.value.status === "answered" && findings.length ? "stale" : question.value.status, findings } };
     });
+    const ownerQuestions = om ? listOwnerQuestions(this.store, project, ENGINE_OWNER_READERS) : null;
     return { project: this.#project(project), stages: this.pipeline.project(project), graph: this.store.get<Graph>(`graph:${project}`),
       mapStatus: mapStatus(this.store, project),
       graphGate: this.graphs.gate(project),
@@ -126,7 +136,25 @@ export class ProductEngine {
       preparationRun: this.store.get(`preparation-run:${project}`),
       researchRuns: this.store.list<ResearchRun>("research-run").filter(item => item.value.projectId === project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
+      // H2.0 (№2719-7): the owner-question detail for the UI — om-state names the wait, this projection names the
+      // exact questions and their answered state. Listing proves nothing and grants nothing. The key exists only
+      // where it has content (or a refusal to report): era tests compare old-producer projections byte-for-byte,
+      // and a database without owner-routed questions must keep its exact historical shape (G1.2, B3).
+      ...(ownerQuestions === null || ownerQuestions.ok && ownerQuestions.value.length === 0 ? {}
+        : { ownerQuestions }),
     };
+  }
+  /**
+   * H2.0 owner authority — deliberately outside execute(): no ProductCommand, actor name, `owner:true` field, record
+   * hash or transport header is a credential. The CLI issues an invitation; the server exchanges it once for a bearer;
+   * the producer accepts only the opaque OwnerAuthority object these calls mint.
+   */
+  ownerInvitation(project: string) { return issueOwnerInvitation(this.store, { project }); }
+  ownerSessionExchange(request: unknown) { return this.owners.exchange(request); }
+  ownerAuthority(bearer: unknown): OwnerAuthority | null { return this.owners.authority(bearer); }
+  ownerLogout(bearer: unknown) { return this.owners.revoke(bearer); }
+  ownerDecision(authority: unknown, request: unknown) {
+    return writeOwnerResult(this.store, authority, request, ENGINE_OWNER_READERS);
   }
   /** Capture the absent dependency before resolving the project era. It belongs only to new production. */
   legacyRoute(project: string): { om: boolean; guards: TransactionGuard[] } { return this.checks.legacyRoute(project); }

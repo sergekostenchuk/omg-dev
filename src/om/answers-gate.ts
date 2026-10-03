@@ -21,6 +21,8 @@ import { answersGateAssignment, completionWorkId, readCompletionBinding, readCom
 import { UNIT_REFUSAL_KIND, answersSourceMarks, journalId, prepareJournalBatch, readJournalAt, registerAnswersSourceReader,
   unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { readPartResult, readQuestionPacket } from './question-packet.js';
+import { ownerResultNamespace, readOwnerResult, OWNER_RESULT_KIND,
+  type OwnerReaders, type OwnerResult } from './owner-result.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from './refusal.js';
 import { readRoutes, prepareRoutes, type RoutesRequest, type RoutedGap, type SavedRoutesRequest } from './routes.js';
@@ -33,7 +35,8 @@ export const ANSWERS_GATE_CODES = sealed([
   'answers_gate_request_invalid', 'answers_gate_record_invalid', 'answers_missing', 'gap_source_missing', 'input_stale',
   'revision_conflict', 'record_foreign', 'answer_missing_for_blocking_gap', 'answer_version_stale',
   'answer_route_foreign', 'answer_duplicate', 'answer_gap_unknown', 'route_result_missing',
-  'route_result_unsupported', 'owner_result_unavailable', 'deferral_not_permitted',
+  'route_result_unsupported', 'owner_result_unavailable', 'owner_result_answered', 'owner_result_foreign',
+  'deferral_not_permitted',
   'delta_not_verified', 'delta_stale', 'answers_binding_invalid', 'answers_evaluation_owner_unsupported',
   'answers_evaluation_invalid',
 ] as const);
@@ -54,7 +57,7 @@ export interface PreparedAnswersGate {
 export const ANSWERS_GATE_EMISSIONS = sealed([
   'gap-revision-stale', 'gap-ref-inexact', 'gap-unknown', 'gap-unrouted', 'deferral-declared', 'deferral-inherited', 'duplicate',
   'owner-absent', 'unsupported-absent', 'blocking-absent', 'route-disallowed', 'candidate-without-result',
-  'owner-offered', 'unsupported-offered', 'blocking-null', 'result-route-disallowed', 'fact-candidate',
+  'owner-offered', 'unsupported-offered', 'owner-answered', 'blocking-null', 'result-route-disallowed', 'fact-candidate',
   'answer-foreign-project', 'answer-without-fact-task', 'answer-search-missing', 'answer-outside-search',
   'answer-inapplicable', 'answer-route-not-code', 'answer-unselected', 'answer-candidate',
   'decision-unapplied', 'decision-foreign', 'offered-known-foreign', 'offered-unrecognized',
@@ -119,7 +122,7 @@ function fail(code: string, target: string, field: string, message: string, ref?
   throw new Error('Unreachable refusal');
 }
 function finding(code: string, target: string, field: string, message: string, ref?: Ref): Refusal {
-  const route: RefusalRoute = code === 'owner_result_unavailable' ? 'owner'
+  const route: RefusalRoute = code.startsWith('owner_result_') ? 'owner'
     : code === 'route_result_unsupported' ? 'producer' : 'readiness';
   const result = refused(code, message, { unit: 'G4b', target, field, ref }, route);
   if (!result.ok) return result.refusal;
@@ -154,6 +157,18 @@ export function answerProducerOf(gap: Pick<Gap, 'code' | 'field' | 'kind'>): Ans
 /** The emission points of derive that name a question without an answer producer (`answerProducerOf` says absent). */
 export const NO_PRODUCER_EMISSIONS: readonly AnswersGateEmission[] = Object.freeze(['owner-absent', 'owner-offered',
   'unsupported-absent', 'unsupported-offered'] as const);
+/**
+ * H2.0: positive emissions carry a proof of acceptance, not a refusal. They still appear in the trace — every cause is
+ * observable — but they are not findings: `result.findings`, `result.codes` and `passed` count only the negative half,
+ * and the evaluation journals only refusals. A positive entry's `finding` field stays a populated Refusal (the
+ * informational verdict of the admission), so every historical consumer that types it non-null keeps working.
+ */
+export const POSITIVE_EMISSIONS: readonly AnswersGateEmission[] = Object.freeze(['owner-answered'] as const);
+const isPositive = (entry: AnswersGateTraceEntry): boolean =>
+  (POSITIVE_EMISSIONS as readonly string[]).includes(entry.cause.emission);
+// H2.0: the producer and the gate share one reader — the same om readers this file already uses, handed in so the
+// owner-result module itself stays off the OM import ring.
+const OWNER_READERS: OwnerReaders = { routes: readRoutes, input: readOmInput };
 // The E5 terminal verdict is the checked distinction between N, T and cessation under one G4b code.
 const TERMINAL_EMISSIONS: Readonly<Record<AssessmentResultRecord['verdict'], AnswersGateEmission>> = Object.freeze({
   supported: 'assessment-supported', insufficient: 'assessment-insufficient', conflicting: 'assessment-conflicting',
@@ -390,6 +405,26 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
   const target = gap.target, producer = answerProducerOf(gap);
   if (route.route === 'owner' || !producer.present && producer.code === 'owner_result_unavailable') {
     const recognized = row.result ? proveOfferedRecord(store, request.project, row.result) : null;
+    // H2.0: an offered om-owner-result is proved by the common reader, and admitted only when its om-owner-question/v1
+    // binds this exact gap record, this exact M6 routes Ref and this exact B1 input — a valid result of another
+    // question or route version is foreign here, and a forged or unreadable record is no result at all.
+    if (row.result) {
+      const proved = readOwnerResult(store, { project: request.project, record: row.result }, OWNER_READERS);
+      if (proved.ok) {
+        const question = proved.value.question;
+        if (same(question.gap, route.record) && same(question.routes, request.routes)
+          && same(question.input, request.gaps.sources.input) && question.route.gap === gap.id
+          && question.route.target === gap.target && question.route.field === gap.field) {
+          if (current) guards.push(row.result);
+          references.push(row.result, reference(proved.value.command));
+          return traced('owner-answered', finding('owner_result_answered', target, OWNER_ABSENT.field,
+            'The owner answered this gap through the separately authenticated H2 producer', row.result),
+            [cite('answer', row.result), cite('receipt', reference(proved.value.command))]);
+        }
+        return traced('owner-offered', finding('owner_result_foreign', target, OWNER_ABSENT.field,
+          'This owner result answers another question', row.result), offered(row.result), { recognized: true });
+      }
+    }
     return traced('owner-offered', finding(OWNER_ABSENT.code, target, OWNER_ABSENT.field, OWNER_ABSENT.message, row.result ?? row.gap),
       offered(row.result), recognized === null ? {} : { recognized });
   }
@@ -594,8 +629,38 @@ function mc2Terminal(store: Store, request: AnswersGateRequest, row: AnswerRoute
     'A proved MC2 terminal without assembly does not fill this gap', ref), sources,
   { state: cycle.terminal, outcome: diagnostic.reason, level: batch!.level });
 }
+/**
+ * H2.0 (№2719-4): current-mode admission of owner results. The om-owner-result:<project>: namespace is scanned by
+ * identity (Q4 metadata, no body decode); every candidate is proved by the common reader (re-derivation, not its own
+ * claim), and a proved result is attached as the exact result row of the gap its om-owner-question/v1 binds — same gap
+ * record, same routes version, same B1 input. A result that binds no gap of this request's exact D1/M6 answers nothing
+ * here; a record the reader refuses answers nothing anywhere. Historical derivations never scan: the admitted rows are
+ * part of the saved request itself, so an old gate re-derives unchanged even after later results appear.
+ */
+function admitOwnerResults(store: Store, request: AnswersGateRequest): AnswersGateRequest {
+  const declared = new Map(request.gaps.records.map(record => [record.id, record]));
+  const offered = new Set(request.results.map(row => row.gap.id));
+  const additions: AnswerRouteResult[] = [];
+  // list() over the kind — never identities(): the gate runs under store views whose declared read surface is
+  // get/list/history (om-commands drives through them), and a scan is a body read anyway.
+  for (const head of store.list<OwnerResult>(OWNER_RESULT_KIND)) {
+    if (!head.id.startsWith(ownerResultNamespace(request.project))) continue;
+    const proved = readOwnerResult(store, { project: request.project,
+      record: { id: head.id, revision: head.revision, hash: head.hash } }, OWNER_READERS);
+    if (!proved.ok) continue;
+    const question = proved.value.question;
+    if (!same(question.routes, request.routes) || !same(question.input, request.gaps.sources.input)) continue;
+    const gap = question.gap;
+    if (!declared.has(gap.id) || !same(declared.get(gap.id), gap) || offered.has(gap.id)) continue;
+    additions.push({ gap: exactRef(gap), result: { id: head.id, revision: head.revision, hash: head.hash },
+      candidate: null });
+  }
+  if (additions.length === 0) return request;
+  return normalized({ ...request, results: [...request.results, ...additions] });
+}
 function derive(store: Store, request: AnswersGateRequest, current: boolean): DerivedAnswersGate {
   requireRequest(store, request); request = normalized(request);
+  if (current) request = admitOwnerResults(store, request);
   const gaps = take(readGaps(store, request.gaps));
   if (gaps.sources.project !== request.project) fail('gap_source_missing', request.project, 'gaps', 'G4b needs this project\'s complete exact D1 set');
   if (!gaps.gate.passed) fail('gap_source_missing', request.project, 'gaps', 'The D1 source has not passed its complete derivation gate');
@@ -691,7 +756,9 @@ function derive(store: Store, request: AnswersGateRequest, current: boolean): De
   // Ties in the finding keep the v1 order (they are equal findings); the cause only makes the trace order total.
   const trace = [...emitted].sort((a, b) => order(canonical(a.finding), canonical(b.finding))
     || order(canonical(a.cause), canonical(b.cause)));
-  const findings = trace.map(item => item.finding);
+  // H2.0: a positive emission (owner-answered) is proof of acceptance, not a refusal — it stays in the trace but
+  // never counts as a finding, so a fully answered gate passes.
+  const findings = trace.filter(item => !isPositive(item)).map(item => item.finding);
   const outcome: AnswersGateOutcome = { passed: findings.length === 0, codes: unique(findings.map(item => item.code)), findings };
   const value: AnswersGateRecord = { contract: ANSWERS_GATE_CONTRACT, project: request.project, request, result: outcome };
   const record: Revision<AnswersGateRecord> = { id: idOf(request), kind: ANSWERS_GATE_KIND, revision: 1, hash: hashJson(value), value };
@@ -754,6 +821,9 @@ export function prepareAnswersGateTrace(store: Store, request: AnswersGateReques
 export function writeAnswersGate(store: Store, request: AnswersGateRequest): OmResult<Sealed<Revision<AnswersGateRecord>>> {
   return run(() => {
     requireRequest(store, request); request = normalized(request);
+    // H2.0: the admitted owner results are part of the request identity — the same submission re-checks the exact
+    // record the admission produced, and a result written later derives a new gate, never mutates the old one.
+    request = admitOwnerResults(store, request);
     const old = store.get(idOf(request));
     if (old) return take(readAnswersGate(store, { project: request.project, record: reference(old) })) as Revision<AnswersGateRecord>;
     const prepared = take(prepareAnswersGate(store, request));
@@ -994,6 +1064,9 @@ const CONTRIBUTION_RULES: Readonly<Record<AnswersGateEmission, ContributionRule>
   'assessment-conflicting': 'E5-N', 'assessment-off-form': 'E5-T', 'assessment-interrupted': 'E5-T',
   'assessment-terminated': 'E5-T', 'assessment-legacy-transport': 'submission',
   'mc2-terminal': 'E4-terminal', 'mc2-terminal-foreign': 'submission',
+  // H2.0: an accepted owner answer is not a finding — positive entries are filtered before grouping, so this rule is
+  // structurally unreachable and must stay so.
+  'owner-answered': 'unreachable',
 });
 function evaluationFail(target: string, field: string, message: string, ref?: Ref): never {
   return fail('answers_evaluation_invalid', target, field, message, ref);
@@ -1146,6 +1219,7 @@ function deriveAnswersGroups(store: Store, evaluation: Revision<AnswersEvaluatio
   const project = evaluation.value.project, grouped = new Map<string, { entry: AnswersGateTraceEntry;
     area: AnswersGroupScope; item: AnswersScopeItem | null; occurrences: number[] }>();
   trace.forEach((entry, index) => {
+    if (isPositive(entry)) return;   // H2.0: admissions prove a row, they journal no refusal
     const scoped = groupScope(entry.cause, evaluation.value.scope);
     if (!scoped) return;
     const key = canonical({ finding: entry.finding, cause: entry.cause, scope: scoped.area });

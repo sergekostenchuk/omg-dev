@@ -5,6 +5,7 @@ import { EngineError } from "./errors.js";
 import { readFileSync } from "node:fs";
 import { ProductEngine } from "./product/engine.js";
 import { createProductServer } from "./server.js";
+import { issueOwnerInvitation } from "./product/owner-authority.js";
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const [command, database = ".omg/state.sqlite", directory = ".omg/backups"] = args;
@@ -18,8 +19,19 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "restore") {
     console.log(JSON.stringify(restoreSnapshot(directory, database))); return;
   }
+  // H2.0 (№2719): invitation issuance is CLI-only — `serve`, `command` and HTTP can never mint one. The secret reaches
+  // the owner's terminal exactly once; the Store keeps only its hash inside the grant.
+  if (command === "owner-invite") {
+    const store = new Store(resolve(database));
+    try {
+      const minted = issueOwnerInvitation(store, { project: args[2] });
+      if (!minted.ok) throw new EngineError(minted.refusal.code, minted.refusal.message);
+      console.log(JSON.stringify(minted.value));
+    } finally { store.close(); }
+    return;
+  }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|command [database] [backup-directory]; command reads JSON from stdin");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|command [database] [backup-directory]; command reads JSON from stdin");
   }
   const store = new Store(resolve(database));
   try {

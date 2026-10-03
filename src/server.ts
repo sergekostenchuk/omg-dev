@@ -18,6 +18,14 @@ async function body(request: IncomingMessage): Promise<unknown> {
 function respond(response: ServerResponse, status: number, data: unknown) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }); response.end(JSON.stringify(data));
 }
+/** The owner bearer lives only in the HttpOnly SameSite=Strict cookie scoped to /api/owner — never in a body or header. */
+function ownerBearer(request: IncomingMessage): string | null {
+  for (const part of (request.headers.cookie ?? "").split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === "omg-owner") return rest.join("=") || null;
+  }
+  return null;
+}
 export function createProductServer(engine: ProductEngine) {
   const token = randomBytes(32).toString("hex"); const chat = new Chat(engine.store, engine.environments);
   const server = createServer(async (request, response) => {
@@ -40,6 +48,45 @@ export function createProductServer(engine: ProductEngine) {
       }
       const supplied = request.headers['x-omg-token'];
       requireCondition(typeof supplied === "string" && /^[a-f0-9]{64}$/.test(supplied) && timingSafeEqual(Buffer.from(supplied), Buffer.from(token)), "session_forbidden", "Open the connection link printed by the local engine");
+      // H2.0 (№1353/№2719): the owner session is a separate trust boundary. The general token only reaches the
+      // one-time invitation exchange; owner authority comes solely from the bearer cookie scoped to /api/owner.
+      if (url.pathname === "/api/owner/session" && request.method === "POST") {
+        requireCondition(request.headers.origin === `http://${request.headers.host}`, "origin_forbidden",
+          "Owner requests need the exact local origin");
+        const input = await body(request) as { project?: unknown; invitation?: unknown };
+        requireCondition(input && typeof input === "object" && typeof input.project === "string"
+          && typeof input.invitation === "string" && Object.keys(input).sort().join(",") === "invitation,project",
+          "command_invalid", "Owner login needs the project and the invitation secret");
+        const exchanged = engine.ownerSessionExchange({ project: input.project, invitation: input.invitation });
+        if (!exchanged.ok) throw new EngineError(exchanged.refusal.code, exchanged.refusal.message, exchanged.refusal.at);
+        const secure = (request.socket as { encrypted?: boolean }).encrypted === true ? "; Secure" : "";
+        response.setHeader("Set-Cookie",
+          `omg-owner=${exchanged.value.bearer}; HttpOnly; SameSite=Strict; Path=/api/owner; Max-Age=1800${secure}`);
+        respond(response, 200, { session: exchanged.value.session, expiresAt: exchanged.value.expiresAt }); return;
+      }
+      if (url.pathname.startsWith("/api/owner/")) {
+        // Owner-mutating requests demand the exact local Origin — the absent-Origin tolerance of ordinary routes does
+        // not apply here, and the general token alone is no owner authority.
+        requireCondition(request.headers.origin === `http://${request.headers.host}`, "origin_forbidden",
+          "Owner requests need the exact local origin");
+        requireCondition(request.method === "POST", "owner_request_invalid", "Owner endpoints accept POST only");
+        const bearer = ownerBearer(request);
+        const authority = engine.ownerAuthority(bearer);
+        requireCondition(authority !== null, "owner_session_missing",
+          "Owner endpoints need a live owner session — log in with an invitation first");
+        if (url.pathname === "/api/owner/logout") {
+          const closed = engine.ownerLogout(bearer);
+          response.setHeader("Set-Cookie", "omg-owner=; HttpOnly; SameSite=Strict; Path=/api/owner; Max-Age=0");
+          if (!closed.ok) throw new EngineError(closed.refusal.code, closed.refusal.message, closed.refusal.at);
+          respond(response, 200, { closed: closed.value.session }); return;
+        }
+        if (url.pathname === "/api/owner/decision") {
+          const decided = engine.ownerDecision(authority, await body(request));
+          if (!decided.ok) throw new EngineError(decided.refusal.code, decided.refusal.message, decided.refusal.at);
+          respond(response, 200, decided.value); return;
+        }
+        respond(response, 404, { error: "not_found", message: "Route not found" }); return;
+      }
       if (url.pathname === "/api/projects" && request.method === "GET") { respond(response, 200, engine.store.list<Project>("project")); return; }
       if (url.pathname === "/api/project" && request.method === "GET") { respond(response, 200, engine.projection(url.searchParams.get("id") ?? "")); return; }
       if (url.pathname === "/api/command" && request.method === "POST") { respond(response, 200, await engine.execute(await body(request))); return; }
@@ -65,7 +112,9 @@ export function createProductServer(engine: ProductEngine) {
       respond(response, 404, { error: "not_found", message: "Route not found" });
     } catch (error) {
       const code = error instanceof EngineError ? error.code : "request_failed";
-      respond(response, ["host_forbidden", "origin_forbidden", "session_forbidden"].includes(code) ? 403 : 400,
+      respond(response, ["host_forbidden", "origin_forbidden", "session_forbidden"].includes(code)
+        || code.startsWith("owner_session_") || code.startsWith("owner_authority_")
+        || code.startsWith("owner_invitation_") ? 403 : 400,
         { error: code, message: error instanceof Error ? error.message : "Request failed", details: error instanceof EngineError ? error.details : null });
     }
   });

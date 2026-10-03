@@ -34,7 +34,7 @@ import { assembleModelParts, readModelCallState, readPartAssembly, runModelCall 
 import { writeOmObligations } from '../src/om/obligations.js';
 import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket } from '../src/om/question-packet.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { writeRoutes } from '../src/om/routes.js';
+import { readRoutes, writeRoutes } from '../src/om/routes.js';
 import { beginAttempt, completeAttempt, openSeries, type AttemptGoal } from '../src/om/series.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { createOmFixture, gardenGraph } from './om-fixture.js';
@@ -44,8 +44,9 @@ import { isRef } from '../src/pipeline/contracts.js';
 import type { Revision } from '../src/storage/store.js';
 import type { Sealed } from '../src/om/refusal.js';
 import { applyAssessmentResult, readAssessmentIntentAt, writeAssessmentIntent } from '../src/om/assessment.js';
-import { ANSWERS_GATE_EMISSIONS, ANSWERS_GATE_MISMATCHES, ANSWERS_GATE_SOURCE_ROLES, prepareAnswersGateTrace,
-  readAnswersGateTrace, type AnswerRouteResult, type AnswersGateRecord, type AnswersGateTraceEntry } from '../src/om/answers-gate.js';
+import { ANSWERS_GATE_EMISSIONS, ANSWERS_GATE_MISMATCHES, ANSWERS_GATE_SOURCE_ROLES, POSITIVE_EMISSIONS,
+  prepareAnswersGateTrace, readAnswersGateTrace, type AnswerRouteResult, type AnswersGateRecord,
+  type AnswersGateTraceEntry } from '../src/om/answers-gate.js';
 import { readFileSync } from 'node:fs';
 import { readMc1Question } from '../src/om/accepted-answer.js';
 import { runModelTransport } from '../src/om/model-call.js';
@@ -58,6 +59,8 @@ import { answersGateAssignment, completionAssignmentId, completionCloseId, compl
   readAnswersGateAssignmentAt, readCompletionBinding, type CompletionWork } from '../src/om/series.js';
 import { readCompletionAssignmentAt, readCompletionWorkAt } from '../src/om/model-call.js';
 import { closeAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
+import { issueOwnerInvitation, OwnerSessions } from '../src/product/owner-authority.js';
+import { writeOwnerResult } from '../src/om/owner-result.js';
 import { runModelCycle } from '../src/om/model-call.js';
 import { ANSWERS_EVALUATION_KIND, ANSWERS_FINDING_KIND, answersEvaluationId, answersRefusalId,
   prepareAnswersDelivery, prepareAnswersEvaluation, readAnswersEvaluationAt, readAnswersFindingAt, readAnswersGateRefusalAt,
@@ -441,6 +444,82 @@ test('G4b does not accept an actor owner field or an owner-result-shaped record 
   f.restart();
   for (const record of saved)
     assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(record) })), record);
+});
+
+const OWNER_READERS = { routes: readRoutes, input: readOmInput };
+function ownerLogin(store: Store, project: string, sessions = new OwnerSessions(store)) {
+  const { invitation } = ok(issueOwnerInvitation(store, { project }));
+  const exchanged = ok(sessions.exchange({ project, invitation }));
+  const authority = sessions.authority(exchanged.bearer);
+  assert.ok(authority, 'A live bearer yields its opaque authority');
+  return { sessions, invitation, ...exchanged, authority };
+}
+function ownerResult(f: ReturnType<typeof fixture>, value: Json = 'JSON', basis = 'The owner chose JSON') {
+  const login = ownerLogin(f.store, f.project);
+  const owner = f.blocking.find(row => row.value.gap.target === f.target)!;
+  const decided = ok(writeOwnerResult(f.store, login.authority,
+    { project: f.project, routes: reference(f.route), gap: reference(owner), value, basis }, OWNER_READERS));
+  return { ...login, decided, owner };
+}
+
+test('G4b admits a proved owner result through the common reader and emits owner-answered without a finding', t => {
+  const f = fixture(t, 'owner-decision');
+  const { decided, owner } = ownerResult(f);
+  const saved = ok(writeAnswersGate(f.store, f.request));
+  // The admitted result became a row of the saved request — the exact Ref is pinned into the gate identity.
+  const admitted = saved.value.request.results.find(row => row.gap.id === owner.id);
+  assert.deepEqual(admitted?.result, reference(decided.result));
+  assert.equal(admitted?.candidate, null);
+  const trace = traceOf(f, saved);
+  const admission = trace.filter(entry => entry.cause.emission === 'owner-answered');
+  assert.equal(admission.length, 1, 'The admitted owner result journals one owner-answered cause');
+  assert.equal(admission[0]!.cause.gap?.id, owner.id);
+  assert.equal(admission[0]!.finding.code, 'owner_result_answered');
+  // The positive emission is no finding: the owner target carries no refusal, codes and findings stay negative only.
+  assert.ok(!saved.value.result.codes.includes('owner_result_answered'));
+  assert.ok(!saved.value.result.findings.some(finding => finding.at.target === owner.value.gap.target
+    && finding.code === 'owner_result_unavailable'));
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved,
+    'The saved gate rederives unchanged — the pinned request already names the result');
+});
+
+test('G4b owner answer also works through an explicitly declared result row', t => {
+  const f = fixture(t, 'owner-decision');
+  const { decided, owner } = ownerResult(f);
+  const saved = ok(writeAnswersGate(f.store, { ...f.request,
+    results: [{ gap: reference(owner), result: reference(decided.result), candidate: null }] }));
+  assert.equal(saved.value.request.results.length, 1, 'Admission never doubles a caller-declared row');
+  const trace = traceOf(f, saved);
+  assert.equal(trace.filter(entry => entry.cause.emission === 'owner-answered').length, 1);
+  assert.ok(!saved.value.result.findings.some(finding => finding.code === 'owner_result_unavailable'
+    && finding.at.target === owner.value.gap.target));
+});
+
+test('G4b pins the result into the saved request: a later result yields a new gate, the old one never changes', t => {
+  const f = fixture(t, 'owner-decision');
+  const before = ok(writeAnswersGate(f.store, f.request));
+  assert.equal(before.value.request.results.length, 0);
+  assert.ok(before.value.result.codes.includes('owner_result_unavailable'));
+  const { decided } = ownerResult(f);
+  f.restart();
+  // The historical read of the earlier gate is byte-identical — the scan is never part of derivation.
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(before) })), before);
+  const after = ok(writeAnswersGate(f.store, f.request));
+  assert.notEqual(after.id, before.id, 'A new owner answer is a new gate identity');
+  assert.deepEqual(ok(writeAnswersGate(f.store, f.request)), after, 'The same submission repeats idempotently');
+  // A bare resubmission is a current ask, not a replay: admission pins the now-existing result and converges to the
+  // same gate — while the earlier saved record stays the untouched history it was.
+  assert.deepEqual(ok(writeAnswersGate(f.store, before.value.request as AnswersGateRequest)), after);
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(before) })), before);
+  // A second, different result for the same gap collides instead of winning — the duplicate is a finding, not a pick.
+  ownerResult(f, 'XML', 'The owner revised');
+  const contested = ok(writeAnswersGate(f.store, f.request));
+  assert.ok(contested.value.result.codes.includes('answer_duplicate'),
+    `Two valid results of one gap are a duplicate, not a choice: ${contested.value.result.codes.join(', ')}`);
+  assert.ok(!contested.value.result.findings.some(finding => finding.code === 'owner_result_unavailable'
+    && finding.at.target === f.target));
+  void decided;
 });
 
 test('G4b refuses missing, duplicate and unknown declarations rather than selecting the first result', t => {
@@ -1250,8 +1329,9 @@ function traceOf(f: { store: Store; project: string }, saved: SavedGate): readon
   const read = ok(readAnswersGateTrace(f.store, { project: f.project, record: reference(saved) }));
   assert.deepEqual(read.record, saved);
   assert.equal(hashJson(read.record.value), saved.hash, 'The delivered record hashes to the saved record');
-  assert.deepEqual(read.trace.map(entry => entry.finding), saved.value.result.findings,
-    'Exactly one trace entry per finding, in the saved order and multiplicity');
+  // H2.0: positive emissions (owner-answered) stay in the trace as observable causes but are never gate findings.
+  assert.deepEqual(read.trace.filter(entry => !POSITIVE_EMISSIONS.includes(entry.cause.emission)).map(entry => entry.finding),
+    saved.value.result.findings, 'Exactly one negative trace entry per finding, in the saved order and multiplicity');
   const submitted = saved.value.request.results.map(row => canonical(row as unknown as Json));
   for (const { cause } of read.trace) {
     assert.ok(ANSWERS_GATE_EMISSIONS.includes(cause.emission), cause.emission);

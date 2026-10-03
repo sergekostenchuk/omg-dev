@@ -5,6 +5,7 @@ import type { Revision } from "../src/storage/store.js";
 import type { Stage } from "../src/pipeline/contracts.js";
 import type { Graph } from "../src/graph/model.js";
 import type { Environment } from "../src/runtime/environment.js";
+import type { OwnerQuestionItem } from "../src/om/owner-result.js";
 import "./app.css";
 import { PlanPanel } from "./plan.js";
 import { ExecutionPanel } from "./execution.js";
@@ -77,7 +78,7 @@ function App() {
       {notice && <div role={notice.error ? "alert" : "status"} className={`notice ${notice.error ? "error" : "success"}`}>{notice.text}<button className="icon-button" aria-label="Скрыть уведомление" onClick={() => setNotice(null)}>×</button></div>}
       {busy && <div className="working" role="status">Движок выполняет команду…</div>}
       {loading ? <div className="empty" role="status"><div className="spinner"/>Загрузка состояния…</div> : !view ? <div className="empty"><div className="empty-symbol">◇</div><h2>Начните с исходного поручения</h2><p>Создайте проект. Движок свяжет его карту, вопросы, доказательства и результаты в один конвейер.</p><button onClick={() => setCreating(true)}>Создать проект</button></div> : <div className="page-content">
-        {tab === "overview" && <><div className="summary-strip"><div><small>Принято стадий</small><strong>{view.stages.filter(s => s.state === "accepted").length}<span> / 8</span></strong></div><div><small>Узлов карты</small><strong>{view.graph?.value.nodes.length ?? 0}</strong></div><div><small>Открытых вопросов</small><strong>{view.questions.filter(q => q.value.status !== "answered").length}</strong></div><div><small>Проверяемых источников</small><strong>{view.sources.length}</strong></div></div><Field label="Выбор стадии"><select value={stage} onChange={event => setStage(event.target.value as Stage)}>{view.stages.map(item => <option key={item.stage} value={item.stage}>{labels[item.stage]} · {states[item.state]}</option>)}</select></Field><StagePanel view={view} stage={stage} cmd={cmd} run={run} busy={busy}/></>}
+        {tab === "overview" && <>{view.ownerQuestions && <OwnerPanel view={view} run={run} busy={busy}/>}<div className="summary-strip"><div><small>Принято стадий</small><strong>{view.stages.filter(s => s.state === "accepted").length}<span> / 8</span></strong></div><div><small>Узлов карты</small><strong>{view.graph?.value.nodes.length ?? 0}</strong></div><div><small>Открытых вопросов</small><strong>{view.questions.filter(q => q.value.status !== "answered").length}</strong></div><div><small>Проверяемых источников</small><strong>{view.sources.length}</strong></div></div><Field label="Выбор стадии"><select value={stage} onChange={event => setStage(event.target.value as Stage)}>{view.stages.map(item => <option key={item.stage} value={item.stage}>{labels[item.stage]} · {states[item.state]}</option>)}</select></Field><StagePanel view={view} stage={stage} cmd={cmd} run={run} busy={busy}/></>}
         {tab === "map" && <GraphPanel view={view} cmd={cmd} run={run} busy={busy}/>}
         {tab === "research" && <section><h2>Вопросы и основания решений</h2><p className="muted">Факты подтверждаются источниками. Цели и предпочтения фиксируются как решения владельца.</p>{view.questions.length === 0 ? <p className="empty-inline">Начните discovery выбранной стадии — вопросы появятся здесь.</p> : view.questions.map(q => <QuestionPanel key={`${q.id}:${q.revision}`} question={q} view={view} cmd={cmd} run={run} busy={busy}/>)}</section>}
         {tab === "sources" && <Sources view={view} cmd={cmd} run={run} busy={busy}/>}
@@ -202,6 +203,38 @@ function ChatPanel({ view, run, busy }: { view: View; run: Run; busy: boolean })
     finally { setSending(false); }
   };
   return <section><h2>Чат о продукте</h2><p className="muted">{view.environment ? `Модель: ${view.environment.value.implementer.model}. Чат использует выбранного исполнителя в режиме чтения.` : "Выберите среду и модель в разделе «Среда и роли»."}</p><div className="chat-history">{view.chat.length === 0 && <div className="empty-inline">Обсудите требования, карту или причину закрытого перехода.</div>}{view.chat.map(turn => <div className="chat-turn" key={turn.id}><div className="bubble user"><small>Вы</small>{turn.value.message}</div><div className={`bubble assistant ${turn.value.status === "failed" ? "failed" : ""}`}><small>{turn.value.model}</small>{turn.value.status === "completed" ? turn.value.text : turn.value.status === "running" ? "Ожидание ответа…" : `Ответ не получен: ${turn.value.error}`}</div></div>)}</div>{sending && <p role="status" className="muted">Модель готовит ответ. Остальные разделы доступны.</p>}<form className="chat-composer" onSubmit={e => { e.preventDefault(); void send(); }}><Field label="Сообщение"><textarea rows={3} value={message} onChange={e => setMessage(e.target.value)} placeholder="Например: какие вопросы ещё мешают перейти к следующей стадии?"/></Field><button disabled={busy || sending || !view.environment || !message.trim()}>Отправить выбранной модели</button></form></section>;
+}
+
+/** H2.0: owner authority is a separate session (invitation → HttpOnly cookie on /api/owner) — the product token never answers owner questions. */
+function OwnerPanel({ view, run, busy }: { view: View; run: Run; busy: boolean }) {
+  const project = view.project.value.id;
+  const [invitation, setInvitation] = useState(""); const [session, setSession] = useState<{ session: { id: string }; expiresAt: number } | null>(null);
+  const listed = view.ownerQuestions; const items = listed && listed.ok ? listed.value : [];
+  const pending = items.filter(item => !item.answered);
+  return <section className="stage-panel owner-panel"><div className="section-heading"><div><div className="eyebrow">РЕШЕНИЯ ВЛАДЕЛЬЦА</div><h2>Вопросы операционной карты</h2></div>{session && <Badge state="open"/>}</div>
+    {listed && !listed.ok && <p className="muted">Список вопросов владельца недоступен: {listed.refusal.message}</p>}
+    {!session ? <>
+      <p className="muted">Ответы на вопросы маршрута «владелец» подписываются отдельной сессией. Выпустите приглашение командой <code>npm start -- owner-invite .omg/state.sqlite {project}</code> и введите показанный секрет — он виден один раз.</p>
+      <form onSubmit={e => { e.preventDefault(); void run(async () => { setSession(await api("owner/session", { project, invitation })); setInvitation(""); }, "Сессия владельца открыта на 30 минут"); }}>
+        <Field label="Одноразовое приглашение"><input required value={invitation} onChange={e => setInvitation(e.target.value)} autoComplete="off"/></Field>
+        <button disabled={busy || !invitation.trim()}>Войти как владелец</button></form></> : <>
+      <p className="muted">Сессия владельца <code>{session.session.id.slice(0, 40)}…</code> действует до {new Date(session.expiresAt).toLocaleTimeString()} без продления.</p>
+      {pending.length === 0 && <p className="empty-inline">Нет вопросов, ожидающих решения владельца.</p>}
+      {pending.map(item => <OwnerAnswerForm key={item.address} item={item} project={project} run={run} busy={busy}/>)}
+      {items.filter(item => item.answered).map(item => <article className="question" key={item.address}><div className="question-top"><span className="eyebrow">РЕШЕНИЕ ВЛАДЕЛЬЦА</span><Badge state="answered"/></div><h3>{item.question.question.text}</h3><p className="muted">Ответ зафиксирован записью {item.answered!.id} rev.{item.answered!.revision}.</p></article>)}
+      <div className="action-row"><button className="secondary" disabled={busy} onClick={() => run(async () => { await api("owner/logout", {}); setSession(null); }, "Сессия владельца закрыта")}>Выйти из сессии владельца</button></div></>}
+  </section>;
+}
+
+function OwnerAnswerForm({ item, project, run, busy }: { item: OwnerQuestionItem; project: string; run: Run; busy: boolean }) {
+  const [value, setValue] = useState(""); const [basis, setBasis] = useState("");
+  const parseValue = () => { try { return JSON.parse(value); } catch { return value; } };
+  return <article className="question"><div className="question-top"><span className="eyebrow">РЕШЕНИЕ ВЛАДЕЛЬЦА · {item.question.route.field}</span><Badge state="open"/></div>
+    <h3>{item.question.question.text}</h3><p className="muted">Вопрос {item.question.question.id} · пробел {item.question.route.gap} · поле {item.question.route.target}</p>
+    <form onSubmit={e => { e.preventDefault(); void run(() => api("owner/decision", { project, routes: item.question.routes, gap: item.question.gap, value: parseValue(), basis }), "Решение владельца записано"); }}>
+      <Field label="Ваше решение (JSON — для структурного значения)"><textarea required rows={3} value={value} onChange={e => setValue(e.target.value)}/></Field>
+      <Field label="Основание решения"><textarea required rows={2} value={basis} onChange={e => setBasis(e.target.value)}/></Field>
+      <button disabled={busy || !value.trim() || !basis.trim()}>Записать решение владельца</button></form></article>;
 }
 
 createRoot(document.getElementById("root")!).render(<App/>);
