@@ -46,7 +46,7 @@
 - Читает записи: доказательства истории (S1.3/S1.4/PF1); чтения cycle
 - Пишет записи: —
 - Из движка как есть: PF1 (5b4d252): pendingOverlay, ReadJournal.chains/methods, chainsIntact; профиль ~/REPORTS/OMG-PERF-EVALUATE_031026-0332.md, снимки /tmp/omg-perf-opus/exp-grow2/out/
-- Уже сделано до тебя: LP4 «Завершение работы после прекращения части: смена среды не стопорит проход» (src/om/model-call.ts, src/om/run.ts, src/om/answers-gate.ts); PF1 «Одна накладка ожидающих записей на партию журнала отказов» (src/storage/store-view.ts, src/om/refusal-journal.ts, src/history/proofs.ts, src/om/model-call.ts); LP3 «Неисполнимый ответ модели — неудача попытки, а не остановка прохода» (src/om/run.ts, src/om/model-call.ts, src/om/question-packet.ts, src/adapters/codex-stdio.ts)
+- Уже сделано до тебя: LP4 «Завершение работы после прекращения части: смена среды не стопорит проход» (src/om/model-call.ts, src/om/run.ts, src/om/answers-gate.ts); PF1 «Одна накладка ожидающих записей на партию журнала отказов» (src/storage/store-view.ts, src/om/refusal-journal.ts, src/history/proofs.ts, src/om/model-call.ts); LP3 «Неисполнимый ответ модели — неудача попытки, а не остановка прохода» (src/om/run.ts, src/om/model-call.ts, src/om/question-packet.ts, src/adapters/codex-stdio.ts); FJ1 «Соединения представителей каркаса: сборка уровня работ проходит при полном закрытии слотов» (src/om/frame-candidate.ts, src/om/frame-obligations.ts, src/graph/layer-assembly.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -66,6 +66,9 @@
 - `src/history/proofs.ts`
 - `src/om/question-packet.ts`
 - `src/adapters/codex-stdio.ts`
+- `src/om/frame-candidate.ts`
+- `src/om/frame-obligations.ts`
+- `src/graph/layer-assembly.ts`
 
 ### Границы незавершённой интеграции
 
