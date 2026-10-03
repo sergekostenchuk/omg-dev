@@ -1608,10 +1608,11 @@
 - Отдаёт: —
 - Читает записи: доказательства истории (S1.3/S1.4/PF1); чтения cycle
 - Пишет записи: —
-- Разрешённые пути: `src/history/proofs.ts`, `src/storage/store-view.ts`, `src/om/model-call.ts`, `src/om/input.ts`, `test/om-input.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/history/proofs.ts`, `src/storage/store-view.ts`, `src/om/model-call.ts`, `src/om/input.ts`, `test/om-input.test.ts`, `test/store-view.test.ts`, `test/om-operation-cost.test.ts`, `test/om-model-call.test.ts`, `test/om-question-packet.test.ts`
 - Из движка как есть: PF1 (5b4d252): pendingOverlay, ReadJournal.chains/methods, chainsIntact; профиль ~/REPORTS/OMG-PERF-EVALUATE_031026-0332.md, снимки /tmp/omg-perf-opus/exp-grow2/out/
 - После: LP4, PF1, LP3
 - Тесты сверх обязательных:
+  - ПУТЬ +1 (вопрос исполнителя №2913, решение оркестратора по §6 договора №2905): test/om-question-packet.test.ts — прежнее ожидание S1.1 «через накладку ничего не делится» (hotReads === callerMade, worksAlone > 0) кодирует отменяемый PF2 инвариант; заменить явно было → стало (холодный замер на новом Store, hot < callerMade), прочие проверки теста неизменны; ревьюер проверяет правку отдельно
   - ДО КОДА — опись исполнителя (пути по факту) и договор ревьюера (Astra) со своей таблицей случаев: границы №1672, №2395 (capture), №2410 (Transaction-preview), №2797/№2846 (доверие к слою и тождество методов), №55; межоперационное удержание — только с доказанной полнотой зависимостей
   - регрессии: побайтное равенство результата cycle и записей на снимках до/после; замер CPU cycle и машинерии вызова; изменение базы вторым Store между операциями ловится; накладка с ожидающими id не даёт удержания с корнем в настоящем Store
 
