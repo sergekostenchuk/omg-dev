@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,16 @@ function fixture(t: test.TestContext) {
       reviewer: { actor: "assessor", model: "fixture-assessor", effort: "high", command }, fullCheck: command, timeoutMs: scenario === "timeout" ? 150 : 3000 };
   };
   return { root, store, environment };
+}
+
+/** A fictitious personal Codex home: the isolated reader call takes its router settings from it and links its login file. */
+function fictitiousCodexHome(t: test.TestContext) {
+  const home = mkdtempSync(join(tmpdir(), "omg-home-")), previous = process.env["HOME"];
+  mkdirSync(join(home, ".codex"));
+  writeFileSync(join(home, ".codex", "config.toml"), 'model_catalog_json = "/fixture/models.json"\nopenai_base_url = "http://127.0.0.1:9/v1"\n');
+  writeFileSync(join(home, ".codex", "auth.json"), '{"fixture":"not a credential"}');
+  process.env["HOME"] = home;
+  t.after(() => { if (previous === undefined) delete process.env["HOME"]; else process.env["HOME"] = previous; rmSync(home, { recursive: true, force: true }); });
 }
 
 test("usage counts every audited role and failed response without adding cached or reasoning tokens twice", async t => {
@@ -154,6 +164,7 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:30,output_
 
 test("Codex reader uses an output schema with numeric source indices", async t => {
   const { root, store, environment } = fixture(t);
+  fictitiousCodexHome(t);
   writeFileSync(join(root,'codex'),`#!${process.execPath}\nimport {readFileSync,writeFileSync} from 'node:fs';readFileSync(0,'utf8');const args=process.argv.slice(2);
 writeFileSync('reader-schema-copy.json',readFileSync(args[args.indexOf('--output-schema')+1],'utf8'));
 writeFileSync(args[args.indexOf('-o')+1],JSON.stringify({selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]}));
