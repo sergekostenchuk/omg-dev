@@ -3,7 +3,7 @@ import { canonical, digest, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { observeStore, Store, storeReads, type Revision } from "../storage/store.js";
-import { pendingLayer, provenStore, readServer } from "../storage/store-view.js";
+import { observePendingReads, pendingLayer, pendingSelections, pendingWithin, provenStore, readServer } from "../storage/store-view.js";
 import { gitCalls } from "../runtime/environment.js";
 
 /**
@@ -28,7 +28,9 @@ type ReadObservation = { source: Store; method: 'get' | 'list' | 'history' | 'pr
  * the witness of the check; the event, its key and its replay stay the overlay's. */
 type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observations: ReadObservation[]; stamp: string | null; key?: string; witness?: Store;
   /** The signature covers the whole rows: the read came through a pending layer whose base has no proved chain. */
-  bodies?: true };
+  bodies?: true;
+  /** PF2 (№2905): a pending layer answered this read from its own rows — constant for that layer, never its base's. */
+  pending?: true };
 /** `accounted`: physical Store reads this journal traced (its own and its nested proofs'); `complete`: every read of the
  * proof and of every proof nested in it was traced and none of them ran git — the only journal whose footprint is its
  * whole dependency area. */
@@ -47,14 +49,27 @@ interface ReadJournal {
   methods: Map<object, Map<string, unknown>>; conflict: boolean;
   /** A listed reader over the proven family of a genuine Store: its closure reads are observed (S1.4, №2410). */
   observing: boolean;
+  /** PF2 (№2905): the proved pending layer this proof observes its closure reads through. */
+  layer: Store | null;
+  /** PF2 (№2932-1): the pending layer this proof is derived at, whose own answers — and those of every layer beneath it —
+   * the proof records whoever reads them; null at any other source. */
+  root: Store | null;
+  /** PF2 (№2932-2): the source this journal's observations are labelled for — where it was derived, or the receiver of an
+   * adopted proof. `alias`: for an adoption, the home of the adopted journal, whose observations are the receiver's. */
+  home: Store | null; alias?: Store;
 }
 interface HistoricalProof { value: unknown; events: ReadJournal; footprint: ReadEvent[]; complete: boolean }
 interface HistoricalView { active: Set<string>; proven: Map<string, HistoricalProof> }
-interface HistoricalTrace { source: Store; observe: ((ref: Ref, head: boolean, method: ReadEvent['method']) => void) | undefined; mode: 'ordered' | 'distinct'; seen: Set<string>; journals: WeakSet<ReadJournal> }
+/** `journals`: for a declared set, the journals already replayed to it, each with the sources it was replayed for. */
+interface HistoricalTrace { source: Store; observe: ((ref: Ref, head: boolean, method: ReadEvent['method']) => void) | undefined; mode: 'ordered' | 'distinct'; seen: Set<string>; journals: WeakMap<ReadJournal, Set<Store>> }
 const historicalTraces = new WeakMap<Store, HistoricalTrace>();
 // Only internally constructed, frozen overlays qualify; an arbitrary Proxy has no snapshot guarantee.
 const historicalSnapshots = new WeakSet<Store>();
 let historicalViews: WeakMap<Store, HistoricalView> | null = null;
+/** PF2 (№2905): proofs derived through a layer that are its base's, offered to the base's other layers — in this operation
+ * and kept across operations — apart from the base's own views, whose proofs and retention keep their old rules. */
+let sharedProofs: WeakMap<Store, Map<string, HistoricalProof & { frozen: boolean }>> | null = null;
+const sharedRetained = new WeakMap<Store, Map<string, HistoricalProof & { frozen: boolean }>>();
 let proofCaptures: ReadJournal[] = [];
 let readStack: ReadObservation[][] = [];
 let checkingFootprint = 0;
@@ -184,6 +199,19 @@ observeStore({
   // An opaque view answered (№2395): every enclosing proof is incomplete; checking a footprint is no such read.
   untraced() { if (!checkingFootprint) for (const capture of proofCaptures) capture.tainted = true; },
 });
+/**
+ * PF2 (№2905, №2932-1): a closure read that a layer answers from its own rows is an exact event of that layer — constant
+ * for it, no dependency of its base, and the end of any claim that the proof is its base's — when that layer is one a
+ * proof being derived reads through: its root or a layer beneath it, of this proof or of one enclosing it. The innermost
+ * proof records it, and every enclosing one inherits it. A layer a reader builds inside its action is rebuilt by every
+ * derivation (S1.4) and stays as silent as before; a read inside a traced read is that read's own.
+ */
+observePendingReads((layer, id, revision, row) => {
+  const capture = historicalViews && !readStack.length && !checkingFootprint ? proofCaptures.at(-1) : undefined;
+  if (!capture || !proofCaptures.some(open => open.root !== null && pendingWithin(open.root, layer))) return;
+  capture.entries.push({ source: layer, method: 'get', id, revision, references: [reference(row)], observations: [], stamp: null,
+    signature: readSignature(layer, [row]), mutable: false, pending: true });
+});
 function observedRead<T>(store: Store, method: ReadEvent['method'], id: string | undefined, revision: number | undefined, action: () => T): T {
   // Taken before the read: a commit between the stamp and the read can only make the stamp older, never mask a change.
   const recorded = !readStack.length && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
@@ -194,8 +222,7 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
   const stamp = witness?.changeStamp() ?? null;
   // №2846: the function a delegated read invokes, and the object it is invoked on, fixed before the read — the witness
   // beneath a trusted layer, or the source a trusted recovery snapshot delegates to.
-  const delegate = !recorded ? null : pendingLayer(sourceView(store)) && witness ? witness
-    : snapshotBases.get(sourceView(store)) ?? null;
+  const delegate = !recorded ? null : pendingLayer(sourceView(store)) && witness ? witness : snapshotDelegate(sourceView(store));
   const invoked = delegate ? Reflect.get(delegate, method, delegate) : undefined;
   const outermost = !readStack.length, reads = storeReads(), starts = proofStarts;
   const observations: ReadObservation[] = []; readStack.push(observations);
@@ -222,7 +249,8 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
     if (snapshotBases.has(source)) proofCaptures.at(-1)!.chains.set(source, null);
     if (delegate) noteMethod(proofCaptures.at(-1)!, delegate, method, invoked);
     recordRead({ source, method, id, revision, references: refs, observations, stamp, ...(witness && witness !== source ? { witness } : {}),
-      ...(bodies ? { bodies: true as const } : {}), signature: readSignature(source, records, bodies), mutable: served !== 'pending'
+      ...(bodies ? { bodies: true as const } : {}), ...(served === 'pending' ? { pending: true as const } : {}),
+      signature: readSignature(source, records, bodies), mutable: served !== 'pending'
         && (bodies || isProxy(source) && !historicalSnapshots.has(source) || method !== 'get' || revision === undefined || value === null) });
   }
   return value;
@@ -239,7 +267,7 @@ export function historicalTrace(store: Store, observe?: (ref: Ref, head: boolean
     const value: unknown = Reflect.get(target, key, target);
     return typeof value === 'function' ? value.bind(target) : value;
   } });
-  historicalTraces.set(view, { source: store, observe, mode, seen: new Set(), journals: new WeakSet() });
+  historicalTraces.set(view, { source: store, observe, mode, seen: new Set(), journals: new WeakMap() });
   return view;
 }
 function completeJournal(journal: ReadJournal): void {
@@ -305,29 +333,137 @@ function currentFootprint(footprint: readonly ReadEvent[]): boolean {
   } finally { checkingFootprint--; }
 }
 function replayProof(store: Store, events: ReadJournal): void {
-  const source = sourceIdentity(store), observers = traceObservers(store);
-  const replay = (journal: ReadJournal, active: HistoricalTrace[]): void => {
+  const observers = traceObservers(store);
+  const replay = (journal: ReadJournal, active: HistoricalTrace[], source: Store): void => {
     if (!journal.sources.has(source)) return;
-    const collecting = active.filter(trace => trace.mode === 'ordered' || !trace.journals.has(journal));
+    const collecting = active.filter(trace => trace.mode === 'ordered' || !trace.journals.get(journal)?.has(source));
     if (!collecting.length) return;
-    for (const trace of collecting) if (trace.mode === 'distinct') trace.journals.add(journal);
+    for (const trace of collecting) if (trace.mode === 'distinct') {
+      let sources = trace.journals.get(journal);
+      if (!sources) { sources = new Set(); trace.journals.set(journal, sources); }
+      sources.add(source);
+    }
+    // PF2 (№2932-2): within an adoption, what the adopted proof observed at its home is what this source observes.
+    const within = journal.alias && journal.home === source ? journal.alias : source;
     for (const entry of journal.entries) {
-      if ('entries' in entry) replay(entry, collecting);
-      else for (const observation of entry.observations) if (observation.source === source)
+      if ('entries' in entry) replay(entry, collecting, within);
+      else for (const observation of entry.observations) if (observation.source === within)
         for (const trace of collecting) for (const ref of observation.references)
           observeReference(trace, ref, observation.method === 'get' && observation.revision === undefined, observation.method);
     }
   };
   // Ordered observers receive the full stream; declared sets visit shared subproofs only once.
-  if (observers.length) replay(events, observers);
+  if (observers.length) replay(events, observers, sourceIdentity(store));
   recordRead(events);
+}
+/**
+ * PF2 (№2932-2): the journal a receiver keeps for a proof adopted from another source — the adopted journal itself under
+ * one more link that reads its home as the receiver. Each read of the adopted proof went through its home to the base that
+ * also serves the receiver (servesBase), so the receiver's cold derivation would observe the very same references, heads
+ * and methods in the same order. Recorded in a parent, replayed now or later, adopted further: every observer gets the
+ * stream a cold derivation at the receiver gives. One link per journal and receiver.
+ */
+const adoptions = new WeakMap<ReadJournal, WeakMap<Store, ReadJournal>>();
+function adoptedJournal(events: ReadJournal, receiver: Store): ReadJournal {
+  if (events.home === receiver || events.home === null) return events;
+  let links = adoptions.get(events);
+  if (!links) { links = new WeakMap(); adoptions.set(events, links); }
+  let link = links.get(receiver);
+  if (!link) {
+    link = { entries: [events], sources: new Set([...events.sources].map(source => source === events.home ? receiver : source)),
+      footprint: events.footprint, accounted: 0, complete: events.complete, tainted: events.tainted, stamps: events.stamps,
+      stores: events.stores, chains: events.chains, methods: events.methods, conflict: events.conflict, observing: events.observing,
+      layer: null, root: null, home: receiver, alias: events.home };
+    links.set(receiver, link);
+  }
+  return link;
+}
+/**
+ * PF2 (№2905): the genuine Store a view's reads are proved to reach through its pending layers — for a registered layer
+ * only (a genuine Store and its write-only views already are that Store's own identity).
+ */
+function layerBase(source: Store): Store | null {
+  if (!pendingLayer(source)) return null;
+  const server = readServer(source, 'list', undefined, undefined);
+  return server instanceof Store ? server : null;
+}
+/** PF2 (№2905): what served every read of a completed journal, transitively: `pending` when a layer answered any of them
+ * from its own rows; otherwise the one genuine Store that served them all, null when any came from elsewhere (another
+ * Store, an unknown projection, a snapshot, a view with no proved chain). A completed journal never changes. */
+const provenances = new WeakMap<ReadJournal, { pending: boolean; server: Store | null | undefined }>();
+function provenance(journal: ReadJournal): { pending: boolean; server: Store | null | undefined } {
+  const known = provenances.get(journal);
+  if (known) return known;
+  const found: { pending: boolean; server: Store | null | undefined } = { pending: false, server: undefined };
+  const serve = (server: Store | null | undefined) => {
+    if (server !== undefined) found.server = found.server === undefined || found.server === server ? server : null;
+  };
+  for (const entry of journal.entries) {
+    if ('entries' in entry) { const child = provenance(entry); if (child.pending) found.pending = true; serve(child.server); }
+    else if (entry.pending) found.pending = true;
+    else serve(entry.bodies ? null : entry.witness ?? (provenStore(entry.source) === entry.source ? entry.source : null));
+  }
+  provenances.set(journal, found);
+  return found;
+}
+/**
+ * PF2 (№2905): a proof that is its base's — complete, non-empty, without conflicting functions, no read a layer answered
+ * itself, every read served by that one genuine Store and every chain leading to it — and the
+ * exact get selections (id → head or revisions, absences included) a receiver's own rows must not answer. Built once
+ * per journal; every other proof keeps its old local scope.
+ */
+const shareable = new WeakMap<ReadJournal, Map<string, Set<number | null>> | null>();
+function baseSelections(events: ReadJournal, base: Store): Map<string, Set<number | null>> | null {
+  const origin = provenance(events);
+  if (origin.server !== base) return null;
+  if (shareable.has(events)) return shareable.get(events)!;
+  // An adoption link reads exactly what the adopted journal read (№2932-2).
+  if (events.alias) { const found = baseSelections(events.entries[0] as ReadJournal, base); shareable.set(events, found); return found; }
+  let selections: Map<string, Set<number | null>> | null = null;
+  if (events.complete && events.entries.length > 0 && !events.conflict && !origin.pending
+    && [...events.chains.values()].every(witness => witness === base)) {
+    selections = new Map();
+    const seen = new Set<ReadJournal>();
+    const visit = (journal: ReadJournal): void => {
+      if (seen.has(journal)) return;
+      seen.add(journal);
+      for (const entry of journal.entries) {
+        if ('entries' in entry) { visit(entry); continue; }
+        if (entry.method !== 'get' || entry.id === undefined) continue;
+        let revisions = selections!.get(entry.id);
+        if (!revisions) { revisions = new Set(); selections!.set(entry.id, revisions); }
+        revisions.add(entry.revision ?? null);
+      }
+    };
+    visit(events);
+  }
+  shareable.set(events, selections);
+  return selections;
+}
+/** PF2 (№2905): whether a proof's value may be handed to another view — plain data, shared when deeply frozen and
+ * otherwise copied (S1.3), a kept or promoted copy as recorded with it — decided once per proof. */
+const sharedValues = new WeakMap<object, { frozen: boolean } | null>();
+function sharedValue(proof: HistoricalProof & { frozen?: boolean }): { frozen: boolean } | null {
+  if (typeof proof.frozen === 'boolean') return { frozen: proof.frozen };
+  if (sharedValues.has(proof)) return sharedValues.get(proof)!;
+  // A proof kept only in its own view holds the very object its caller received: shared further only while no one can change it.
+  const frozen = { all: true }, found = plainValue(proof.value, frozen) && frozen.all ? { frozen: true } : null;
+  sharedValues.set(proof, found);
+  return found;
+}
+/** PF2 (№2905, table rows 3–5): a receiver gives every selection of a base proof to the same Store — no own row of its
+ * chain answers a get the proof made (its head, that revision or an absence), and the chain itself is intact. */
+function servesBase(receiver: Store, base: Store, selections: Map<string, Set<number | null>>): boolean {
+  const rows = pendingSelections(receiver);
+  if (rows === null || readServer(receiver, 'list', undefined, undefined) !== base) return false;
+  return rows.every(([id, revision]) => { const read = selections.get(id); return !read || !read.has(null) && !read.has(revision); });
 }
 /** Share exact proofs for one synchronous product operation; heads and current admission stay fresh. */
 export function withHistoricalReads<T>(action: () => T): T {
   if (historicalViews) return synchronous(action);
-  historicalViews = new WeakMap();
+  historicalViews = new WeakMap(); sharedProofs = new WeakMap();
   try { return synchronous(action); }
-  finally { historicalViews = null; proofCaptures = []; }
+  finally { historicalViews = null; sharedProofs = null; proofCaptures = []; }
 }
 function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (source: Store) => T,
   onCycle: () => T, cacheable: (value: T) => boolean, traced: boolean): T {
@@ -335,10 +471,38 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     || typeof action !== 'function' || typeof onCycle !== 'function' || typeof cacheable !== 'function') invalid('history');
   const exact = canonical(key);
   return withHistoricalReads(() => {
-    const views = historicalViews!, source = sourceIdentity(store);
+    const views = historicalViews!, source = sourceIdentity(store), base = layerBase(source);
     let view = views.get(source);
     if (!view) { view = { active: new Set(), proven: new Map() }; views.set(source, view); }
     if (view.active.has(exact)) return synchronous(onCycle);
+    /**
+     * PF2 (№2905, №2932-2/3): a proof of the base — proved there or through a layer of it, in this operation or kept —
+     * serves this view when no own row of its chain answers what the proof read and the proof is current. The receiver
+     * keeps it under its own identity (adoptedJournal), so it replays to observers attached now or later the stream a
+     * cold derivation here gives.
+     */
+    const adopt = (home: Store, scopes: (Map<string, HistoricalProof & { frozen?: boolean }> | null | undefined)[]): { value: T } | null => {
+      for (const scope of scopes) {
+        const kept = scope?.get(exact);
+        if (!kept || (traced || historicalTraces.has(store)) && !kept.complete) continue;
+        const selections = baseSelections(kept.events, home);
+        if (!selections || !servesBase(source, home, selections)) continue;
+        if (!chainsIntact(kept.events) || !currentFootprint(kept.footprint)) { scope!.delete(exact); continue; }
+        const value = sharedValue(kept);
+        if (!value) continue;
+        // What a view keeps is what its caller received (№2932): no `frozen` of a kept copy travels with it (sharedValue).
+        const adopted = { value: value.frozen ? kept.value : structuredClone(kept.value), events: adoptedJournal(kept.events, source),
+          footprint: kept.footprint, complete: kept.complete };
+        view.proven.set(exact, adopted);
+        replayProof(store, adopted.events);
+        return { value: adopted.value as T };
+      }
+      return null;
+    };
+    if (base && !view.proven.has(exact)) {
+      const adopted = adopt(base, [views.get(base)?.proven, retainedArea(base), sharedProofs!.get(base), sharedRetained.get(base)]);
+      if (adopted) return adopted.value;
+    }
     const area = retainedArea(source), kept = view.proven.has(exact) ? undefined : area?.get(exact);
     // A traced caller replays a proof to its observers; one derived through a closure read shows them nothing (S1.4).
     if (kept && (!(traced || historicalTraces.has(store)) || kept.complete)) {
@@ -346,16 +510,21 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       area!.delete(exact);
       if (chainsIntact(kept.events) && currentFootprint(kept.footprint)) {
         area!.set(exact, kept);
-        const adopted = { ...kept, value: kept.frozen ? kept.value : structuredClone(kept.value) };
+        const adopted = { value: kept.frozen ? kept.value : structuredClone(kept.value), events: kept.events, footprint: kept.footprint, complete: kept.complete };
         view.proven.set(exact, adopted);
         replayProof(store, adopted.events);
         return adopted.value as T;
       }
     }
+    // PF2 (№2932-3, row 1): the base itself, with nothing of its own, takes what its layers proved of it.
+    if (area && !view.proven.has(exact)) {
+      const adopted = adopt(source, [sharedProofs!.get(source), sharedRetained.get(source)]);
+      if (adopted) return adopted.value;
+    }
     const complete = traced || historicalTraces.has(store), previous = view.proven.get(exact);
     // An untraced action is observed at the Store (S1.4, №2302, №2410): only a listed reader over the proven family of a
     // genuine Store; every other one keeps the S1.3 semantics.
-    const observing = OBSERVED_READERS.has(key.reader) && provenStore(source) === source, observable = complete || observing;
+    const observing = OBSERVED_READERS.has(key.reader) && (provenStore(source) === source || base !== null), observable = complete || observing;
     if (previous && (!complete || previous.complete)) {
       if (chainsIntact(previous.events) && currentFootprint(previous.footprint)) { replayProof(store, previous.events); return previous.value as T; }
       // A proof of a genuine Store is checked on its own at every use, so only the moved one goes (S1.3). A mutable opaque
@@ -364,7 +533,10 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       else view.proven.clear();
     }
     view.active.add(exact);
-    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing };
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing,
+      layer: observing && base ? source : null, root: base ? source : null, home: source };
+    // PF2: closure reads through a layer reach its base only while the layer still reads through the members it bound.
+    if (events.layer) events.chains.set(source, base);
     proofCaptures.push(events);
     const reads = storeReads(), gits = gitCalls(); proofStarts++;
     let completed = false;
@@ -387,6 +559,19 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
           && [...events.stores].every(observed => observed === source) && plainValue(result, frozen)) {
           area.set(exact, { ...proof, value: frozen.all ? result : structuredClone(result), frozen: frozen.all });
           for (const oldest of area.keys()) { if (area.size <= RETAINED_LIMIT) break; area.delete(oldest); }
+        }
+        // PF2 (№2905, №2932-3, row 1): derived through a layer, yet its base's — it serves the base itself and its other
+        // layers in this and the next operations; a proof that read a layer's own row stays this layer's (row 2). The base's
+        // own views and kept proofs keep their rules, and the base takes a layer's proof only with nothing of its own.
+        const shared = { all: true };
+        if (base && baseSelections(events, base) && plainValue(result, shared)) {
+          const owned = { ...proof, value: shared.all ? result : structuredClone(result), frozen: shared.all };
+          let current = sharedProofs!.get(base), kept = sharedRetained.get(base);
+          if (!current) { current = new Map(); sharedProofs!.set(base, current); }
+          if (!kept) { kept = new Map(); sharedRetained.set(base, kept); }
+          current.set(exact, owned);
+          kept.set(exact, owned);
+          for (const oldest of kept.keys()) { if (kept.size <= RETAINED_LIMIT) break; kept.delete(oldest); }
         }
       }
       return result;
@@ -424,11 +609,18 @@ function deepFreeze(value: unknown, seen = new Set<object>()): void {
 export function pendingSnapshotView(store: Store, rows: readonly Revision<unknown>[]): Store {
   // A deep own copy, frozen at every level: no reference into the caller's rows, and the caller's objects stay its own.
   const pending = new Map(rows.map(row => { const owned = structuredClone(row); deepFreeze(owned); return [owned.id, owned]; }));
-  const view = new Proxy(store, { get(target, property) {
-    if (property === "get") return <T = Json>(id: string, revision?: number): Revision<T> | null => {
+  // №55: one wrapper of each read for the life of the view — the same function at every access — that calls the source's
+  // current member on the source itself, so a later replacement of that member still reaches the reads and their checks.
+  const reads: Record<string, unknown> = {
+    get: <T = Json>(id: string, revision?: number): Revision<T> | null => {
       const row = pending.get(id);
-      return row && (revision === undefined || row.revision === revision) ? row as Revision<T> : target.get<T>(id, revision);
-    };
+      return row && (revision === undefined || row.revision === revision) ? row as Revision<T> : store.get<T>(id, revision);
+    },
+    list: <T = Json>(kind?: string): Revision<T>[] => store.list<T>(kind),
+    history: <T = Json>(id: string): Revision<T>[] => store.history<T>(id),
+  };
+  const view = new Proxy(store, { get(target, property) {
+    if (typeof property === "string" && Object.hasOwn(reads, property)) return reads[property];
     const member: unknown = Reflect.get(target, property, target);
     return typeof member === "function" ? member.bind(target) : member;
   } });
@@ -439,6 +631,14 @@ export function pendingSnapshotView(store: Store, rows: readonly Revision<unknow
   return view;
 }
 const snapshotBases = new WeakMap<Store, Store>();
+/** №2846, №55: the source a trusted recovery snapshot — through every snapshot nested in it — finally reads from; the
+ * functions a read invokes are fixed on it, never on a nested snapshot's wrapper. */
+function snapshotDelegate(view: Store): Store | null {
+  let delegate = snapshotBases.get(view) ?? null;
+  while (delegate && snapshotBases.has(sourceView(delegate))) delegate = snapshotBases.get(sourceView(delegate))!;
+  // A trace forwards each read to its source afresh: the functions that run are the source's.
+  return delegate && sourceView(delegate);
+}
 /** A trusted recovery snapshot still stands over a proved source: a genuine Store as it is now (an own replaced read
  * makes it none), a write-only view still bound to its reads, a pending layer with its chain, or such a snapshot (№2827). */
 function snapshotIntact(view: Store): boolean {

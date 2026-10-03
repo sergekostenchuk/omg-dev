@@ -1628,9 +1628,47 @@ test('PF1 (№2797-8) one overlay for a batch of N sources: the history they sha
     return { gets: counts.gets - before.gets, identities: counts.identities - before.identities, stamps: counts.stamps - before.stamps };
   };
   const one = batch(1, 'shared'), four = batch(4, 'shared');
-  assert.deepEqual([four.gets, four.identities], [one.gets, 0], 'Through one overlay the shared history is read once whatever N is, and an unchanged stamp needs no identities');
+  // PF2 (№2905, changed expectation): the history proved for the base through the first operation's overlay serves the
+  // next operation's overlay — it is no longer read once per operation but not at all; an unchanged stamp needs no identities.
+  assert.ok(one.gets >= 30, `The first operation reads the whole history: ${one.gets}`);
+  assert.deepEqual([four.gets, four.identities], [0, 0], 'Through one overlay of the next operation the shared history is not read again whatever N is');
   assert.ok(four.stamps - one.stamps <= 3, `A stamp per further source at most, never per event of the history: ${one.stamps} → ${four.stamps}`);
   const opaqueOne = batch(1, 'opaque'), opaqueFour = batch(4, 'opaque');
   assert.ok(opaqueFour.gets >= 4 * 30 && opaqueFour.gets >= 4 * opaqueOne.gets - 4,
     `The former shape — one opaque view per source — derives the history N times: ${opaqueOne.gets} → ${opaqueFour.gets}`);
+});
+
+test('PF2 (№2905) one registered layer per source — the shape of one call store per call — proves the shared history once for their base: body reads do not grow with N; a layer that answers a row of that history derives its own', t => {
+  const counts = { gets: 0, runs: 0 };
+  const original = Store.prototype.get;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { counts.gets++; return original.apply(this, args); } as typeof original;
+  const root = mkdtempSync(join(tmpdir(), 'omg-pf2-cost-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { Store.prototype.get = original; store.close(); rmSync(root, { recursive: true, force: true }); });
+  const chain: Revision<unknown>[] = [];
+  for (let i = 0; i < 30; i++) chain.push(store.write({ id: `pf2c:h:${i}`, kind: 'k', expected: 0, value: { i, previous: i ? reference(chain[i - 1]!) : null } }));
+  const last = chain.at(-1)!;
+  const row = (id: string, body: Json, revision = 1): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(body), value: body });
+  const noCycle = (): never => { throw new Error('Unexpected cycle'); };
+  const history = (view: Store) => historicalProof(view, { reader: 'PF2.shared', project: 'garden', ref: reference(last) }, source => {
+    counts.runs++;
+    let cursor: Revision<unknown> | null = source.get(last.id)!, length = 0;
+    while (cursor) {
+      length++;
+      const previous: { id: string; revision: number } | null = (cursor.value as { previous: { id: string; revision: number } | null }).previous;
+      cursor = previous ? source.get(previous.id, previous.revision) : null;
+    }
+    return length;
+  }, noCycle);
+  const batch = (n: number) => {
+    const before = { ...counts };
+    const lengths = withHistoricalReads(() => Array.from({ length: n }, (_, i) => history(pendingOverlay(store, [row(`pf2c:source:${n}:${i}`, { i })]))));
+    assert.deepEqual(lengths, lengths.map(() => 30));
+    return { gets: counts.gets - before.gets, runs: counts.runs - before.runs };
+  };
+  const one = batch(1), four = batch(4);
+  assert.deepEqual([one.runs, four.runs], [1, 0], 'The history proved for the base by one layer serves the next ones, here and in the next operation');
+  assert.ok(four.gets < one.gets, `Body reads do not grow with N: ${one.gets} → ${four.gets}`);
+  const runs = counts.runs;
+  withHistoricalReads(() => assert.equal(history(pendingOverlay(store, [row(last.id, { i: 29, previous: null }, 2)])), 1));
+  assert.equal(counts.runs, runs + 1, 'A layer whose own row answers the head derives its own history');
 });

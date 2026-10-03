@@ -2522,3 +2522,285 @@ test("PF1 (№2846 rows 1, 6, list/history) list and history a recovery snapshot
     assert.notEqual(prove(), cold, 'Row 6 is conditional: the data still have to be current, the stamp still checks them');
   });
 });
+
+// ---- PF2 (№2905): a proof derived through a pending layer that is its base's serves the base's other layers ----
+/** A listed reader's closure over one view: head, exact revision, an absence, a list and a history of the base. */
+function pf2Reader(counts: { runs: number }, dep: Revision<Json>, parameters: Json = null) {
+  const key = { reader: LISTED, project: 'garden', ref: reference(dep), ...(parameters === null ? {} : { parameters }) };
+  return (view: Store) => historicalRead(view, key, () => {
+    counts.runs++;
+    return { head: view.get(dep.id)?.value ?? null, exact: view.get(dep.id, 1)?.value ?? null, absent: view.get('pf2:absent')?.value ?? null,
+      list: view.list('k').map(row => row.id), history: view.history(dep.id).map(row => row.revision) };
+  }, noCycle);
+}
+
+test("PF2 (№2905 rows 1, 3, 4, 13) a listed reader proved through one layer serves the base's other layers in this and the next operation; a layer whose own row answers the head, or a former absence, derives again and replaces nothing; a row of another revision of the same id does not; every receiver gets its own copy", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const read = pf2Reader(counts, dep);
+  const layer = (rows: Revision<Json>[]) => pendingOverlay(first, rows);
+  const a = layer([pf1Row('pf2:a', 1, { a: 1 })]), b = layer([pf1Row('pf2:b', 1, { b: 1 })]);
+  const head = layer([pf1Row(dep.id, 2, { d: 9 })]), absence = layer([pf1Row('pf2:absent', 1, { x: 1 })]);
+  withHistoricalReads(() => {
+    const cold = read(a);
+    assert.equal(counts.runs, 1);
+    assert.deepEqual(read(b), cold); assert.equal(counts.runs, 1, 'Row 1: another layer of the base adopts the proof');
+    (read(b) as { list: string[] }).list.push('changed');
+    assert.deepEqual(read(a), cold, 'Row 13: a receiver changing its copy changes no one else\'s');
+    assert.deepEqual((read(head) as { head: unknown }).head, { d: 9 }); assert.equal(counts.runs, 2, 'Row 3: the receiver\'s own head row derives again');
+    assert.deepEqual((read(absence) as { absent: unknown }).absent, { x: 1 }); assert.equal(counts.runs, 3, 'Row 3: so does a row where the proof read an absence');
+    assert.deepEqual(read(layer([pf1Row('pf2:c', 1, {})])), cold); assert.equal(counts.runs, 3, 'Row 3: the base proof was replaced by neither');
+  });
+  withHistoricalReads(() => {
+    assert.deepEqual(read(layer([pf1Row('pf2:d', 1, {})])), { head: { d: 1 }, exact: { d: 1 }, absent: null, list: ['pf2:dep'], history: [1] });
+    assert.equal(counts.runs, 3, 'Row 1: the next operation adopts it too, while its footprint holds');
+  });
+  // Row 4: a proof that read only an exact revision, a list and a history is served to a layer holding another revision.
+  const exactOnly = { reader: LISTED, project: 'garden', ref: reference(dep), parameters: 'exact' } as HistoricalReadKey;
+  const readExact = (view: Store) => historicalRead(view, exactOnly, () => { counts.runs++;
+    return { exact: view.get(dep.id, 1)?.value ?? null, list: view.list('k').map(row => row.id), history: view.history(dep.id).map(row => row.revision) }; }, noCycle);
+  withHistoricalReads(() => {
+    const cold = readExact(a), runs = counts.runs;
+    assert.deepEqual(readExact(head), cold); assert.equal(counts.runs, runs, 'Row 4: a row of revision 2 answers no exact read of revision 1, no list and no history');
+  });
+});
+
+test("PF2 (№2905 rows 2, 5, 11) a proof that read a layer's own row — even with no Store read at all, flat or through a nested layer — stays that layer's; nested layers keep their own answers; a view of unknown origin in the chain, a reader not listed, a write attempt and a value that is not plain data share nothing", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2n:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const own = (view: Store, kase: string, action: () => unknown, reader = LISTED) =>
+    historicalRead(view, { reader, project: 'garden', ref: reference(dep), parameters: kase }, () => { counts.runs++; return action(); }, noCycle);
+  const a = pendingOverlay(first, [pf1Row('pf2n:a', 1, { a: 1 })]), b = pendingOverlay(first, [pf1Row('pf2n:b', 1, { b: 1 })]);
+  withHistoricalReads(() => {
+    own(a, 'pending', () => a.get('pf2n:a')?.value ?? null);
+    own(b, 'pending', () => b.get('pf2n:a')?.value ?? null);
+    assert.equal(counts.runs, 2, 'Row 2: an answer of a layer\'s own row (no Store read) is no proof of the base');
+    // Row 5: nested layers — the inner row answers through the outer layer; a proof through the outer one that read only the
+    // base serves the inner layer; a nested proof that read the inner layer's row stays its own.
+    const inner = pendingOverlay(first, [pf1Row('pf2n:x', 1, { x: 1 })]), outer = pendingOverlay(inner, [pf1Row('pf2n:x', 2, { x: 2 })]);
+    const runs = counts.runs;
+    own(outer, 'base', () => outer.get(dep.id)?.value ?? null);
+    own(inner, 'base', () => inner.get(dep.id)?.value ?? null);
+    assert.equal(counts.runs, runs + 1, 'Row 5: the inner layer adopts what the outer one proved of their base');
+    assert.deepEqual(own(outer, 'x', () => outer.get('pf2n:x')?.value ?? null), { x: 2 });
+    assert.deepEqual(own(inner, 'x', () => inner.get('pf2n:x')?.value ?? null), { x: 1 }, 'Row 5: nested layers are not merged');
+    const opaque = new Proxy(first, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+    const unknown = pendingOverlay(opaque, [pf1Row('pf2n:u', 1, {})]), before = counts.runs;
+    own(unknown, 'base', () => unknown.get(dep.id)?.value ?? null);
+    assert.equal(counts.runs, before + 1, 'Row 5: a view of unknown origin in the chain gets nothing through it');
+    // Row 11: a reader that is not listed, a write attempt, a value that is not plain data.
+    const cases: [string, (view: Store) => unknown, string?][] = [
+      ['unlisted', view => view.get(dep.id)?.value ?? null, 'PF2.unlisted'],
+      ['write', view => { try { view.write({ id: 'pf2n:w', kind: 'k', expected: 0, value: {} }); } catch { /* refused or written: an attempt */ } return view.get(dep.id)?.value ?? null; }],
+      ['instance', view => new Map([['d', view.get(dep.id)?.value ?? null]])],
+    ];
+    for (const [kase, action, reader] of cases) {
+      const from: number = counts.runs;
+      own(a, kase, () => action(a), reader); own(b, kase, () => action(b), reader);
+      assert.equal(counts.runs, from + 2, `Row 11: ${kase} — nothing is shared`);
+    }
+  });
+});
+
+test("PF2 (№2905 rows 6, 7) a layer over a capture or a Transaction preview proves nothing of a base; read methods replaced after warming end the sharing until the very functions are back, and a replacement before the first derivation is that derivation's", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2m:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const read = pf2Reader(counts, dep, 'methods');
+  withHistoricalReads(() => {
+    for (const view of [captureView(first, { rows: new Map() }).view, transactionForTests(first).view]) {
+      const from: number = counts.runs;
+      read(pendingOverlay(view, [pf1Row('pf2m:a', 1, {})])); read(pendingOverlay(view, [pf1Row('pf2m:b', 1, {})]));
+      assert.equal(counts.runs, from + 2, 'Row 6: an opaque base is no proved base');
+    }
+  });
+  const list = Store.prototype.list, replaced = function (this: Store, ...args: Parameters<typeof list>) { return list.apply(this, args); } as typeof list;
+  withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2m:a', 1, {})])));
+  const runs = counts.runs;
+  Store.prototype.list = replaced; Store.prototype.list = list;
+  withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2m:b', 1, {})])));
+  assert.equal(counts.runs, runs, 'Row 7: replaced and restored to the very same function — the proof still serves');
+  Store.prototype.list = replaced;
+  try {
+    withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2m:c', 1, {})])));
+    assert.equal(counts.runs, runs + 1, 'Row 7: replaced after warming — the receiver derives again');
+  } finally { Store.prototype.list = list; }
+  withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2m:d', 1, {})])));
+  assert.equal(counts.runs, runs + 2, 'Row 7: what was proved under the replaced function does not stand once it is gone');
+});
+
+test("PF2 (№2905 rows 8, 9, 14) a second Store moving a dependency derives again on the next receiver; a disjoint write moves only the stamp and the dependencies are checked as identities; a reopened Store starts cold with the same value", t => {
+  const counts = countingStore(t);
+  const { first, second } = sameFileStores(t);
+  const dep = first.write({ id: 'pf2s:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const read = pf2Reader(counts, dep, 'stores');
+  const cold = withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:a', 1, {})])));
+  second.write({ id: 'pf2s:other', kind: 'other', expected: 0, value: {} });
+  const identities = counts.identities;
+  assert.deepEqual(withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:b', 1, {})]))), cold);
+  assert.equal(counts.runs, 1, 'Row 9: a disjoint write — no derivation'); assert.ok(counts.identities > identities, 'Row 9: checked as identities');
+  second.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
+  assert.deepEqual((withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:c', 1, {})]))) as { head: unknown }).head, { d: 2 });
+  assert.equal(counts.runs, 2, 'Row 8: a moved head derives again');
+  const reopened = new Store(first.path); t.after(() => reopened.close());
+  assert.deepEqual(withHistoricalReads(() => read(pendingOverlay(reopened, [pf1Row('pf2s:d', 1, {})]))),
+    withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:e', 1, {})]))));
+  assert.equal(counts.runs, 3, 'Row 14: another Store instance of the same file starts cold and proves the same value');
+});
+
+test("PF2 (№2905 row 10, №55) nested trusted recovery snapshots repeat get, list and history without a false derivation; a real replacement of the base's read still ends the repeat", t => {
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2r:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  for (const method of ['get', 'list', 'history'] as const) {
+    let runs = 0;
+    const inner = proofs.pendingSnapshotView(first, []), outer = proofs.pendingSnapshotView(inner, []);
+    const prove = () => historicalProof(outer, { reader: 'PF2.nested', project: 'garden', ref: reference(dep), parameters: method }, source => {
+      runs++;
+      return method === 'get' ? source.get(dep.id, 1)?.value ?? null : method === 'list' ? source.list('k').map(row => row.id) : source.history(dep.id).map(row => row.revision);
+    }, noCycle);
+    withHistoricalReads(() => { prove(); prove(); });
+    assert.equal(runs, 1, `№55 ${method}: one derivation through two nested snapshots`);
+    const original = Store.prototype[method] as (...args: never[]) => unknown;
+    (Store.prototype as unknown as Record<string, unknown>)[method] = function (this: Store, ...args: never[]) { return original.apply(this, args); };
+    try { withHistoricalReads(() => { prove(); prove(); }); }
+    finally { (Store.prototype as unknown as Record<string, unknown>)[method] = original; }
+    assert.equal(runs, 2, `№2846 ${method}: a replaced base read still ends the repeat`);
+  }
+});
+
+/** PF2 (№2932-2): the stream an observer of a view gets from one call, as `method:id@revision:head`. */
+function pf2Stream(view: Store, mode: 'ordered' | 'distinct', call: (view: Store) => unknown): string[] {
+  const into: string[] = [];
+  call(historicalTrace(view, (ref, isHead, method) => into.push(`${method}:${ref.id}@${ref.revision}:${isHead}`), mode));
+  return into;
+}
+/** The stream of a cold derivation: a new Store instance of the same file shares and keeps nothing yet. */
+function pf2ColdStream(path: string, mode: 'ordered' | 'distinct', call: (view: Store) => unknown): string[] {
+  const fresh = new Store(path);
+  try { return withHistoricalReads(() => pf2Stream(fresh, mode, call)); } finally { fresh.close(); }
+}
+
+test("PF2 (№2905 row 12, №2932-2) a receiver adopts a proof under its own identity: observers attached at the adoption, after an unobserved one, under a parent that recorded the adopted proof, and at a parent adopted further get the stream a cold derivation gives, ordered and distinct, first and repeated; a traced receiver adopts only a traced derivation", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2o:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const key = { reader: 'PF2.traced', project: 'garden', ref: reference(dep) };
+  const prove = (view: Store) => historicalProof(view, key, source => { counts.runs++; return { head: source.get(dep.id)?.value ?? null, list: source.list('k').map(row => row.id) }; }, noCycle);
+  const parentOf = (parameters: string) => (view: Store) => historicalProof(view, { ...key, parameters }, source => { counts.runs++; return { child: prove(source), exact: source.get(dep.id, 1)?.value ?? null }; }, noCycle);
+  const parent = parentOf('parent');
+  const layer = (name: string) => pendingOverlay(first, [pf1Row(`pf2o:${name}`, 1, {})]);
+  const cold = {
+    child: { ordered: pf2ColdStream(first.path, 'ordered', prove), distinct: pf2ColdStream(first.path, 'distinct', prove) },
+    parent: { ordered: pf2ColdStream(first.path, 'ordered', parent), distinct: pf2ColdStream(first.path, 'distinct', parent) },
+  };
+  assert.deepEqual(cold.child.ordered, ['get:pf2o:dep@1:true', 'list:pf2o:dep@1:false']);
+  assert.deepEqual(cold.parent.ordered, [...cold.child.ordered, 'get:pf2o:dep@1:false']);
+  assert.deepEqual(cold.child.distinct, cold.child.ordered); assert.deepEqual(cold.parent.distinct, cold.parent.ordered);
+  for (const mode of ['ordered', 'distinct'] as const) withHistoricalReads(() => {
+    const value = prove(layer(`a-${mode}`)), runs = counts.runs;
+    const observed = layer(`c-${mode}`), later = layer(`b-${mode}`);
+    assert.deepEqual(pf2Stream(observed, mode, prove), cold.child[mode], `${mode}: observed at the adoption`);
+    assert.deepEqual(pf2Stream(observed, mode, prove), cold.child[mode], `${mode}: and repeated`);
+    assert.deepEqual(prove(later), value);
+    assert.deepEqual(pf2Stream(later, mode, prove), cold.child[mode], `${mode}: observed after an unobserved adoption (№2932-2)`);
+    assert.equal(counts.runs, runs, `${mode}: every receiver adopted`);
+    // A parent derived without observers records the adopted child; observed later — and at a layer that adopts the parent.
+    const host = layer(`p-${mode}`), next = layer(`q-${mode}`), parent = parentOf(`parent-${mode}`);
+    parent(host);
+    assert.equal(counts.runs, runs + 1, `${mode}: the parent derived, its child adopted`);
+    assert.deepEqual(pf2Stream(host, mode, parent), cold.parent[mode], `${mode}: the parent's adopted child replays its stream`);
+    assert.deepEqual(pf2Stream(next, mode, parent), cold.parent[mode], `${mode}: so does the parent adopted further`);
+    assert.deepEqual(pf2Stream(next, mode, parent), cold.parent[mode], `${mode}: and repeated`);
+    assert.equal(counts.runs, runs + 1, `${mode}: the parent adopted, never derived again`);
+  });
+  // A traced receiver takes no proof derived untraced; an untraced one takes it.
+  const listedKey = { reader: LISTED, project: 'garden', ref: reference(dep), parameters: 'untraced' };
+  withHistoricalReads(() => {
+    const from = counts.runs;
+    const untraced = layer('u');
+    historicalRead(untraced, listedKey, () => { counts.runs++; return untraced.get(dep.id)?.value ?? null; }, noCycle);
+    historicalProof(layer('v'), listedKey, source => { counts.runs++; return source.get(dep.id)?.value ?? null; }, noCycle);
+    assert.equal(counts.runs, from + 2, 'A traced receiver derives what was derived untraced');
+    const other = layer('w');
+    historicalRead(other, listedKey, () => { counts.runs++; return other.get(dep.id)?.value ?? null; }, noCycle);
+    assert.equal(counts.runs, from + 2, 'An untraced receiver adopts');
+  });
+});
+
+test("PF2 (№2932-1, rows 2, 5) a row an inner layer answers to a proof derived through an outer one is that proof's own — at the head or an exact revision, in this or the next operation, read by the proof itself, by a cold or a warmed child of it, or by a child under a parent derived at the base: no other layer and no base receives it", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 'pf2i:anchor', kind: 'k', expected: 0, value: { v: 1 } });
+  const listed = (view: Store, parameters: Json, action: () => unknown) =>
+    historicalRead(view, { reader: LISTED, project: 'garden', ref: reference(anchor), parameters }, () => { counts.runs++; return action(); }, noCycle);
+  const both = (view: Store, revision?: number) => [view.get(anchor.id, 1)?.value ?? null, view.get('pf2i:own', revision)?.value ?? null];
+  const outerOf = (v: number) => pendingOverlay(pendingOverlay(first, [pf1Row('pf2i:own', 1, { v })]), []);
+  for (const revision of [undefined, 1]) for (const across of [false, true]) {
+    const label = `${revision === undefined ? 'head' : 'exact'}${across ? ', next operation' : ''}`;
+    const outer = outerOf(7), receiver = pendingOverlay(first, []);
+    const run = (view: Store) => listed(view, { case: 'flat', revision: revision ?? null, across }, () => both(view, revision));
+    const from = counts.runs;
+    const got = across ? [outer, receiver, first].map(view => withHistoricalReads(() => run(view))) : withHistoricalReads(() => [outer, receiver, first].map(run));
+    assert.deepEqual(got, [[{ v: 1 }, { v: 7 }], [{ v: 1 }, null], [{ v: 1 }, null]], `${label}: another layer and the base read their own absence`);
+    assert.equal(counts.runs, from + 2, `${label}: the outer proof went to no one; the other layer's went on to the base`);
+  }
+  for (const warm of [false, true]) {
+    const label = warm ? 'warmed child' : 'cold child';
+    const outer = outerOf(7), receiver = pendingOverlay(first, []);
+    const child = (view: Store) => listed(view, { case: 'child', warm }, () => both(view));
+    const parent = (view: Store) => listed(view, { case: 'parent', warm }, () => ({ child: child(view), anchor: view.get(anchor.id)?.value ?? null }));
+    withHistoricalReads(() => {
+      if (warm) child(outer);
+      const from = counts.runs;
+      assert.deepEqual(parent(outer), { child: [{ v: 1 }, { v: 7 }], anchor: { v: 1 } });
+      assert.deepEqual(parent(receiver), { child: [{ v: 1 }, null], anchor: { v: 1 } }, `${label}: the receiver reads its own absence`);
+      assert.deepEqual(parent(first), { child: [{ v: 1 }, null], anchor: { v: 1 } }, `${label}: so does the base`);
+      assert.equal(counts.runs, from + (warm ? 3 : 4), `${label}: the parent through the outer layer went to no one`);
+    });
+  }
+  // A parent at the base whose child reads through an outer layer is not the base's: the next operation's other outer
+  // layer reads its own row.
+  const atBase = (outer: Store) => listed(first, { case: 'base-parent' }, () => ({ child: listed(outer, { case: 'base-child' }, () => both(outer)) }));
+  assert.deepEqual(withHistoricalReads(() => atBase(outerOf(7))), { child: [{ v: 1 }, { v: 7 }] });
+  assert.deepEqual(withHistoricalReads(() => atBase(outerOf(8))), { child: [{ v: 1 }, { v: 8 }] }, 'The base kept nothing its layer answered');
+});
+
+test("PF2 (№2932-3, rows 1, 13) the base itself takes what a layer proved of it, in this and the next operation, and hands it on to another layer; observers of the base get the cold stream; what the base handed its caller, taken from a layer or from its own kept proof, reaches no other view after that caller changed it", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf2b:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const layer = (name: string) => pendingOverlay(first, [pf1Row(`pf2b:${name}`, 1, {})]);
+  for (const across of [false, true]) {
+    const label = across ? 'next operation' : 'this operation';
+    const read = pf2Reader(counts, dep, { base: across });
+    const from = counts.runs, views = [layer(`a-${across}`), first, layer(`b-${across}`)];
+    const [cold, atBase, onward] = across ? views.map(view => withHistoricalReads(() => read(view))) : withHistoricalReads(() => views.map(read));
+    assert.deepEqual(atBase, cold); assert.deepEqual(onward, cold);
+    assert.equal(counts.runs, from + 1, `${label}: layer → base → layer, one derivation`);
+  }
+  for (const owned of ['layer', 'kept'] as const) {
+    const read = pf2Reader(counts, dep, { owned });
+    if (owned === 'kept') withHistoricalReads(() => read(first));
+    withHistoricalReads(() => {
+      if (owned === 'layer') read(layer(`m-${owned}`));
+      const handed = read(first) as { list: string[] }, cold = structuredClone(handed);
+      handed.list.push('changed');
+      assert.deepEqual(read(layer(`n-${owned}`)), cold, `Row 13 (${owned}): the base's caller changed only its own copy`);
+    });
+  }
+  const key = { reader: 'PF2.base-traced', project: 'garden', ref: reference(dep) };
+  const prove = (view: Store) => historicalProof(view, key, source => { counts.runs++; return [source.get(dep.id)?.value ?? null, source.history(dep.id).length]; }, noCycle);
+  for (const mode of ['ordered', 'distinct'] as const) {
+    const cold = pf2ColdStream(first.path, mode, prove);
+    assert.deepEqual(cold, ['get:pf2b:dep@1:true', 'history:pf2b:dep@1:false']);
+    withHistoricalReads(() => {
+      prove(layer(`t-${mode}`));
+      const runs = counts.runs;
+      assert.deepEqual(pf2Stream(first, mode, prove), cold, `${mode}: the base's observers get the adopted proof's stream`);
+      assert.deepEqual(pf2Stream(first, mode, prove), cold, `${mode}: and repeated`);
+      assert.equal(counts.runs, runs, `${mode}: the base adopted`);
+    });
+  }
+});

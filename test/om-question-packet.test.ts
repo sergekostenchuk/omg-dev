@@ -2066,23 +2066,36 @@ test('S1.1 the unwritten response and the works preview are read through the com
   // E2 only the rest, measured on caller-made overlays of the same unwritten response.
   const preview = { id: `om-proposal:${f.project}:answer-content:${cold.proposal.hash}`, kind: 'layer-proposal', revision: 1, hash: cold.proposal.hash, value: cold.proposal.value };
   const previewWrite: Write = { id: preview.id, kind: preview.kind, expected: 0, value: preview.value as unknown as Json };
+  // PF2 (№2905): a proof a layer proved for its base serves the base's other layers in this and the next operations of
+  // one Store instance; each later measure therefore runs cold, on a new Store of the same file.
+  f.restart();
   const tracedReads = withHistoricalReads(() => {
     reads.reset(); assert.deepEqual(ok(preparePartResult(historicalTrace(f.store), partRequest)), cold); return reads.of(graph.id);
   });
   assert.ok(graphReads < tracedReads, 'Over a plain Store the overlay is replayable: ' + graphReads + ' graph reads against ' + tracedReads + ' over a traced base');
-  const { callerMade, rest, worksAlone } = withHistoricalReads(() => {
+  f.restart();
+  const callerMade = withHistoricalReads(() => {
     const outer = pendingCallStore(f.store, [responseWrite]); reads.reset();
-    const viaCaller = ok(preparePartResult(outer, { ...partRequest, response: reference(response) })), callerMade = reads.of(graph.id);
+    const viaCaller = ok(preparePartResult(outer, { ...partRequest, response: reference(response) }));
     assert.deepEqual([viaCaller.record, viaCaller.proposal], [cold.record, cold.proposal]);
+    return reads.of(graph.id);
+  });
+  // The works-content proof alone, cold, then the rest of E2 over the same caller-made overlay: under PF2 E2 takes the
+  // proof the caller made through its own layer instead of deriving it again.
+  f.restart();
+  const { rest, worksAlone } = withHistoricalReads(() => {
     const inner = pendingCallStore(f.store, [responseWrite]); reads.reset();
     historicalRead(inner, { reader: 'E2.works-proposal-content', project: f.project, ref: reference(preview), parameters: clone(frameSource) as unknown as Json },
       () => ok(readFrameProposals(pendingCallStore(inner, [previewWrite]), { frame: frameSource.frame, proposals: [...frameSource.proposals, reference(preview)] })),
       () => assert.fail('The works-content proof is not cyclic'));
     const worksAlone = reads.of(graph.id); reads.reset();
     assert.deepEqual(ok(preparePartResult(inner, { ...partRequest, response: reference(response) })).record, cold.record);
-    return { callerMade, rest: reads.of(graph.id), worksAlone };
+    return { rest: reads.of(graph.id), worksAlone };
   });
-  assert.equal(hotReads, callerMade, 'The overlay E2 makes for the unwritten response is the common replayable overlay: a hot repeat of E2 (its own new overlay, the rest cached) costs exactly a derivation over a caller-made common overlay');
+  // PF2 (№2905, changed expectation): was hotReads === callerMade; a hot repeat of E2 in the operation of the cold one now
+  // takes, through its own new overlay, what the cold one proved for the base — cheaper than a cold derivation over a
+  // caller-made common overlay.
+  assert.ok(hotReads < callerMade, `The overlay E2 makes for the unwritten response is the common replayable overlay: a hot repeat of E2 (its own new overlay) costs ${hotReads}, less than a cold derivation over a caller-made common overlay (${callerMade})`);
   assert.ok(worksAlone > 0 && rest < callerMade, 'The works-content proof proved first by the caller is hit inside E2');
   assert.equal(callerMade, rest + worksAlone, 'The works-content derivation inside E2 costs exactly one derivation of the same frame proposals over the common overlay of the same preview');
   // Different temporary content is another proof: its own preview, its own derivation, nothing inherited.
@@ -2093,6 +2106,7 @@ test('S1.1 the unwritten response and the works preview are read through the com
   other.proposal.fills = other.proposal.fills.map(fill => ({ ...fill, node: extra.id, ...(fill.codeRef ? { codeRef: extra.code[0]! } : {}) }));
   other.bindings = other.bindings.map(binding => ({ ...binding, consumers: binding.consumers.map(consumer => ({ ...consumer, node: extra.id, tests: [...extra.tests] })) }));
   const otherWrite: Write = { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(other) } };
+  f.restart();
   const different = withHistoricalReads(() => {
     ok(preparePartResult(f.store, partRequest)); reads.reset();
     const different = ok(preparePartResult(f.store, { ...partRequest, response: { pending: otherWrite } }));

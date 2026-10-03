@@ -10,7 +10,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
-import { captureView, genuineStore, pendingOverlay, provenReads, provenStore, readServer, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { captureView, genuineStore, observePendingReads, pendingOverlay, pendingSelections, provenReads, provenStore, readServer, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -1198,4 +1198,27 @@ test('PF1 (№2797-2, -3) a pending overlay owns detached frozen copies of its r
     assert.equal(readServer(overlay, 'get', 'pf1:x', undefined), 'pending', 'its own frozen row does not depend on the base');
   } finally { Store.prototype.history = original; }
   assert.equal(readServer(overlay, 'history', 'pf1:x', undefined), store, 'with the original read restored the chain is proved again');
+});
+
+test('PF2 (№2905) the selections a chain of pending layers answers itself are handed out only as frozen id/revision pairs — none over a link of unknown origin or a base whose bound reads were replaced — and only a registered layer reports its own answers, as itself', t => {
+  const { store } = fixture(t);
+  const row = (id: string, revision: number, body: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(body), value: body });
+  const inner = pendingOverlay(store, [row('pf2:a', 1, { a: 1 })]), outer = pendingOverlay(inner, [row('pf2:b', 2, { b: 2 }), row('pf2:a', 3, { a: 3 })]);
+  const selections = pendingSelections(outer)!;
+  assert.deepEqual(selections, [['pf2:b', 2], ['pf2:a', 3], ['pf2:a', 1]]);
+  assert.ok(Object.isFrozen(selections) && selections.every(pair => Object.isFrozen(pair)) && pendingSelections(outer) !== selections, 'A new frozen list of pairs, no row');
+  assert.deepEqual(pendingSelections(store), []);
+  const proxy = new Proxy(store, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  const opaque = pendingOverlay(proxy, [row('pf2:p', 1, {})]);
+  assert.deepEqual([pendingSelections(opaque), pendingSelections(pendingOverlay(captureView(store).view, [row('pf2:c', 1, {})]))], [null, null]);
+  const seen: [string, string, number | undefined][] = [];
+  const previous = observePendingReads((layer, id, revision) => { seen.push([layer === outer ? 'outer' : layer === inner ? 'inner' : 'other', id, revision]); });
+  try {
+    outer.get('pf2:b'); outer.get('pf2:a', 3); outer.get('pf2:a', 1); outer.get('pf2:none'); opaque.get('pf2:p');
+  } finally { observePendingReads(previous); }
+  assert.deepEqual(seen, [['outer', 'pf2:b', undefined], ['outer', 'pf2:a', 3], ['inner', 'pf2:a', 1]], 'Each answer by its own layer; the opaque Proxy stays silent');
+  const list = Store.prototype.list;
+  Store.prototype.list = function (this: Store, ...args: Parameters<typeof list>) { return list.apply(this, args); } as typeof list;
+  try { assert.equal(pendingSelections(outer), null, 'A base read replaced after the layers were built ends the proved chain'); }
+  finally { Store.prototype.list = list; }
 });

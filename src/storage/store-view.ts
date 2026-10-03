@@ -83,9 +83,12 @@ const pendingLayers = new WeakMap<object, PendingLayer>();
 export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]): Store {
   const owned = new Map<string, Revision<unknown>>();
   for (const row of rows) { const copy = structuredClone(row); deepFreeze(copy); owned.set(copy.id, copy); }
+  // PF2 (№2905): only a registered layer reports what it answers itself; the opaque Proxy below keeps its old silence.
+  let layer: Store | null = null;
   const get = <T,>(id: string, revision?: number): Revision<T> | null => {
     const row = owned.get(id);
-    return row && (revision === undefined || revision === row.revision) ? row as Revision<T> : base.get<T>(id, revision);
+    if (row && (revision === undefined || revision === row.revision)) { if (layer) pendingReads?.(layer, id, revision, row); return row as Revision<T>; }
+    return base.get<T>(id, revision);
   };
   if (!provenSourceReads(base)) return new Proxy(base, { get(target, key) {
     if (key === 'get') return get;
@@ -114,10 +117,44 @@ export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]):
   const overlay = Object.freeze(view) as Store;
   sourceOverlays.add(overlay);
   pendingLayers.set(overlay, { base, rows: owned, bound });
+  layer = overlay;
   return overlay;
+}
+/**
+ * PF2 (№2905): a read a pending layer answers from its own rows reaches no Store, so no Store reports it; the one
+ * observer of such answers (the historical proofs) learns of it as a read of that very layer, never of its base.
+ */
+type PendingReads = (layer: Store, id: string, revision: number | undefined, row: Revision<unknown>) => void;
+let pendingReads: PendingReads | null = null;
+export function observePendingReads(next: PendingReads | null): PendingReads | null { const previous = pendingReads; pendingReads = next; return previous; }
+/**
+ * PF2 (№2905): the exact selections the chain of pending layers of a view answers itself — each row's id and revision
+ * (a get of its head or of that revision), from the view down to the genuine Store it is proved to read through. Null
+ * when any link is of unknown origin or its base no longer reads through the members it bound. Only the pairs are
+ * handed out, a new frozen list: never a row, a body or a layer's own map.
+ */
+export function pendingSelections(view: unknown): readonly (readonly [string, number])[] | null {
+  const found: (readonly [string, number])[] = [];
+  for (let cursor = view; ;) {
+    const layer = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
+    if (!layer) return provenStore(cursor) ? Object.freeze(found) : null;
+    if ([...layer.bound].some(([name, member]) => Reflect.get(layer.base, name, layer.base) !== member)) return null;
+    for (const row of layer.rows.values()) found.push(Object.freeze([row.id, row.revision] as const));
+    cursor = layer.base;
+  }
 }
 /** Whether a view is a pending layer this module built; nothing of the layer is handed out. */
 export const pendingLayer = (view: unknown): boolean => typeof view === 'object' && view !== null && pendingLayers.has(view);
+/** PF2 (№2932-1): whether a pending layer is one a view reads through — the view itself or a layer beneath it, down to
+ * the first link that is no layer. Only the answer is handed out. */
+export function pendingWithin(view: unknown, layer: unknown): boolean {
+  for (let cursor = view; ;) {
+    const found = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
+    if (!found) return false;
+    if (cursor === layer) return true;
+    cursor = found.base;
+  }
+}
 /**
  * Who answers one read of a view (PF1, №2797-3): 'pending' when a layer answers it from its own frozen rows — a get of a
  * row's id at its head or own revision, decided by method, id and revision; otherwise the genuine Store that serves it
