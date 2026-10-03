@@ -3,7 +3,7 @@ import { canonical, digest, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { observeStore, Store, storeReads, type Revision } from "../storage/store.js";
-import { provenStore } from "../storage/store-view.js";
+import { pendingLayer, provenStore, readServer } from "../storage/store-view.js";
 import { gitCalls } from "../runtime/environment.js";
 
 /**
@@ -23,8 +23,12 @@ function invalid(field: string): never {
 export interface HistoricalReadKey { reader: string; project: string; ref: Ref; parameters?: Json }
 type ReadObservation = { source: Store; method: 'get' | 'list' | 'history' | 'prefix'; id: string | undefined; revision: number | undefined; references: Ref[] };
 /** `stamp`: the change stamp of the source's genuine Store under which `signature` is known to hold (S1.3), or null
- * when the source has no such Store. Events are shared by every enclosing journal, so one check serves them all. */
-type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observations: ReadObservation[]; stamp: string | null; key?: string };
+ * when the source has no such Store. Events are shared by every enclosing journal, so one check serves them all.
+ * `witness`: the genuine Store that served a read of a pending overlay through its proved layers (PF1, №2797-3) — only
+ * the witness of the check; the event, its key and its replay stay the overlay's. */
+type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observations: ReadObservation[]; stamp: string | null; key?: string; witness?: Store;
+  /** The signature covers the whole rows: the read came through a pending layer whose base has no proved chain. */
+  bodies?: true };
 /** `accounted`: physical Store reads this journal traced (its own and its nested proofs'); `complete`: every read of the
  * proof and of every proof nested in it was traced and none of them ran git — the only journal whose footprint is its
  * whole dependency area. */
@@ -33,6 +37,14 @@ interface ReadJournal {
   /** A write was attempted or an opaque view answered while this proof ran (S1.4, №2302-2, №2395); change stamps its observed Stores had before their reads;
    * the Stores those reads came from — apart from `sources`, which decide replay through a view and never see them. */
   tainted: boolean; stamps: Map<Store, string | null>; stores: Set<Store>;
+  /** PF1 (№2827): the pending layers this proof or a nested one read through, each with the witness its delegated reads
+   * had — exact ones included, which no footprint holds — and the trusted recovery snapshots it read (null). Any reuse
+   * needs every one of these chains intact. */
+  chains: Map<Store, Store | null>;
+  /** PF1 (№2846): the read methods each delegated read actually invoked, by the object it was invoked on, taken before the
+   * read; a reuse resolves them the same way and needs the very same functions. Never overwritten: one object and method
+   * seen with two functions is a `conflict`, and such a proof is not reused as one derived under one unchanged chain. */
+  methods: Map<object, Map<string, unknown>>; conflict: boolean;
   /** A listed reader over the proven family of a genuine Store: its closure reads are observed (S1.4, №2410). */
   observing: boolean;
 }
@@ -111,8 +123,24 @@ function observeReference(trace: HistoricalTrace, ref: Ref, head: boolean, metho
 function recordRead(event: ReadEvent | ReadJournal): void {
   if (!checkingFootprint) proofCaptures.at(-1)?.entries.push(event);
 }
-function readSignature(source: Store, records: readonly Revision<unknown>[]): string {
-  return digest(canonical(isProxy(source) && !historicalSnapshots.has(source) ? records : records.map(row => ({ ...reference(row), kind: row.kind }))));
+function readSignature(source: Store, records: readonly Revision<unknown>[], bodies = false): string {
+  return digest(canonical(bodies || isProxy(source) && !historicalSnapshots.has(source) ? records : records.map(row => ({ ...reference(row), kind: row.kind }))));
+}
+function noteMethod(journal: ReadJournal, holder: object, name: string, invoked: unknown): void {
+  let names = journal.methods.get(holder);
+  if (!names) { names = new Map(); journal.methods.set(holder, names); }
+  if (!names.has(name)) names.set(name, invoked);
+  else if (names.get(name) !== invoked) journal.conflict = true;
+}
+/** PF1 (№2827): every pending layer a proof read through still reaches the witness its reads had, and every trusted
+ * recovery snapshot still reads through the very members of the base it was trusted over. */
+function chainsIntact(journal: ReadJournal): boolean {
+  if (journal.conflict) return false;
+  for (const [holder, names] of journal.methods)
+    for (const [name, invoked] of names) if (Reflect.get(holder, name, holder) !== invoked) return false;
+  for (const [view, witness] of journal.chains)
+    if (witness === null ? !snapshotIntact(view) : readServer(view, 'list', undefined, undefined) !== witness) return false;
+  return true;
 }
 /**
  * S1.4 (№2410, C1/C2): the readers whose untraced action is observed at the Store and may be kept on that observation.
@@ -159,7 +187,16 @@ observeStore({
 function observedRead<T>(store: Store, method: ReadEvent['method'], id: string | undefined, revision: number | undefined, action: () => T): T {
   // Taken before the read: a commit between the stamp and the read can only make the stamp older, never mask a change.
   const recorded = !readStack.length && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
-  const stamp = recorded ? provenStore(sourceView(store))?.changeStamp() ?? null : null;
+  // PF1 (№2797-3): a row a pending layer answers from its own frozen rows is constant for that overlay; any other read is
+  // witnessed by the genuine Store that serves it through proved layers, or by none.
+  const served = recorded ? readServer(sourceView(store), method, id, revision) : null;
+  const witness = served === 'pending' ? null : served;
+  const stamp = witness?.changeStamp() ?? null;
+  // №2846: the function a delegated read invokes, and the object it is invoked on, fixed before the read — the witness
+  // beneath a trusted layer, or the source a trusted recovery snapshot delegates to.
+  const delegate = !recorded ? null : pendingLayer(sourceView(store)) && witness ? witness
+    : snapshotBases.get(sourceView(store)) ?? null;
+  const invoked = delegate ? Reflect.get(delegate, method, delegate) : undefined;
   const outermost = !readStack.length, reads = storeReads(), starts = proofStarts;
   const observations: ReadObservation[] = []; readStack.push(observations);
   let value: T;
@@ -179,8 +216,14 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
     observations.push({ source, method, id, revision, references: refs });
   if (readStack.length) readStack.at(-1)!.push(...observations);
   else if (!checkingFootprint && historicalViews && proofCaptures.length) {
-    recordRead({ source, method, id, revision, references: refs, observations, stamp,
-      signature: readSignature(source, records), mutable: isProxy(source) && !historicalSnapshots.has(source) || method !== 'get' || revision === undefined || value === null });
+    // A read a layer delegated without a proved chain is an unknown projection: whole rows, always checked (№2827).
+    const layer = pendingLayer(sourceView(store)), bodies = layer && served === null;
+    if (layer && witness && witness !== source) proofCaptures.at(-1)!.chains.set(source, witness);
+    if (snapshotBases.has(source)) proofCaptures.at(-1)!.chains.set(source, null);
+    if (delegate) noteMethod(proofCaptures.at(-1)!, delegate, method, invoked);
+    recordRead({ source, method, id, revision, references: refs, observations, stamp, ...(witness && witness !== source ? { witness } : {}),
+      ...(bodies ? { bodies: true as const } : {}), signature: readSignature(source, records, bodies), mutable: served !== 'pending'
+        && (bodies || isProxy(source) && !historicalSnapshots.has(source) || method !== 'get' || revision === undefined || value === null) });
   }
   return value;
 }
@@ -214,6 +257,9 @@ function completeJournal(journal: ReadJournal): void {
       children.add(entry);
       for (const source of entry.sources) journal.sources.add(source);
       for (const store of entry.stores) journal.stores.add(store);
+      for (const [layer, witness] of entry.chains) journal.chains.set(layer, witness);
+      if (entry.conflict) journal.conflict = true;
+      for (const [holder, names] of entry.methods) for (const [name, invoked] of names) noteMethod(journal, holder, name, invoked);
       for (const event of entry.footprint) remember(event);
     } else {
       if (!entry.observations.length) journal.stores.add(entry.source);
@@ -226,14 +272,18 @@ function completeJournal(journal: ReadJournal): void {
  * S1.3 (№2185): a dependency of a genuine Store is read again only when that Store's change stamp moved since the
  * dependency was last proved, and then only as identities — the same rows, never decoded. A proved event keeps its new
  * stamp, so a dependency shared by nested proofs is checked once per change, not once per path through the proof tree.
- * Sources without a genuine Store (overlays, captures, subclasses, arbitrary views) keep the full read below.
+ * Sources without a genuine Store or a witness (captures, subclasses, arbitrary views) keep the full read below.
  */
 function currentFootprint(footprint: readonly ReadEvent[]): boolean {
   checkingFootprint++;
   const stamps = new Map<Store, string>();
   try {
     for (const event of footprint) {
-      const genuine = event.stamp === null ? null : provenStore(event.source);
+      // A witnessed event of an overlay is checked at its witness only while the same proved layers still lead there; a
+      // broken chain is no current source at all, never a weaker check of what an unknown view now answers (№2827).
+      if (event.witness && readServer(event.source, event.method, event.id, event.revision) !== event.witness) return false;
+      if (snapshotBases.has(event.source) && !snapshotIntact(event.source)) return false;
+      const genuine = event.stamp === null ? null : event.witness ?? provenStore(event.source);
       if (genuine) {
         let now = stamps.get(genuine);
         // A Store closed since (S1.4: an observed closure read of another Store) is no current source: derive again.
@@ -249,7 +299,7 @@ function currentFootprint(footprint: readonly ReadEvent[]): boolean {
         : event.method === 'list' ? event.source.list<unknown>(event.id)
         : event.method === 'prefix' ? event.source.identities('prefix', event.id!) as unknown as Revision<unknown>[]
         : event.source.history<unknown>(event.id!);
-      if (readSignature(event.source, records) !== event.signature) return false;
+      if (readSignature(event.source, records, event.bodies) !== event.signature) return false;
     }
     return true;
   } finally { checkingFootprint--; }
@@ -294,7 +344,7 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     if (kept && (!(traced || historicalTraces.has(store)) || kept.complete)) {
       // Another operation proved it: it serves this one only while its whole footprint is current.
       area!.delete(exact);
-      if (currentFootprint(kept.footprint)) {
+      if (chainsIntact(kept.events) && currentFootprint(kept.footprint)) {
         area!.set(exact, kept);
         const adopted = { ...kept, value: kept.frozen ? kept.value : structuredClone(kept.value) };
         view.proven.set(exact, adopted);
@@ -307,14 +357,14 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     // genuine Store; every other one keeps the S1.3 semantics.
     const observing = OBSERVED_READERS.has(key.reader) && provenStore(source) === source, observable = complete || observing;
     if (previous && (!complete || previous.complete)) {
-      if (currentFootprint(previous.footprint)) { replayProof(store, previous.events); return previous.value as T; }
+      if (chainsIntact(previous.events) && currentFootprint(previous.footprint)) { replayProof(store, previous.events); return previous.value as T; }
       // A proof of a genuine Store is checked on its own at every use, so only the moved one goes (S1.3). A mutable opaque
       // view now exposes another snapshot: no proof of its previous snapshot survives.
       if (area) view.proven.delete(exact);
       else view.proven.clear();
     }
     view.active.add(exact);
-    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), observing };
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing };
     proofCaptures.push(events);
     const reads = storeReads(), gits = gitCalls(); proofStarts++;
     let completed = false;
@@ -382,8 +432,19 @@ export function pendingSnapshotView(store: Store, rows: readonly Revision<unknow
     const member: unknown = Reflect.get(target, property, target);
     return typeof member === "function" ? member.bind(target) : member;
   } });
-  // This map is complete before use and never changes. Exact fallback reads are immutable only for a known source.
+  // This map is complete before use and never changes. Exact fallback reads are immutable only for a known source, and
+  // only while that source is still a proved one (PF1, №2827): the view reads through it afresh on every call.
   const base = sourceView(store);
-  if (!isProxy(base) || historicalSnapshots.has(base)) historicalSnapshots.add(view);
+  if (!isProxy(base) || historicalSnapshots.has(base)) { historicalSnapshots.add(view); snapshotBases.set(view, store); }
   return view;
+}
+const snapshotBases = new WeakMap<Store, Store>();
+/** A trusted recovery snapshot still stands over a proved source: a genuine Store as it is now (an own replaced read
+ * makes it none), a write-only view still bound to its reads, a pending layer with its chain, or such a snapshot (№2827). */
+function snapshotIntact(view: Store): boolean {
+  const stored = snapshotBases.get(view);
+  if (!stored) return false;
+  const base = sourceView(stored);
+  if (snapshotBases.has(base)) return snapshotIntact(base);
+  return pendingLayer(base) ? readServer(base, 'list', undefined, undefined) !== null : provenStore(base) !== null;
 }

@@ -60,6 +60,83 @@ const sourceOverlays = new WeakSet<object>();
 export function registerSourceOverlay(view: Store): void { sourceOverlays.add(view); }
 export const provenSourceReads = (candidate: unknown): candidate is Store => provenReads(candidate) || sourceOverlays.has(candidate as object);
 
+function deepFreeze(value: unknown, seen = new Set<object>()): void {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  for (const item of Object.values(value)) deepFreeze(item, seen);
+  Object.freeze(value);
+}
+/** One layer of a pending overlay this module built: its base, its own frozen rows and the base members it bound. */
+interface PendingLayer { base: Store; rows: ReadonlyMap<string, Revision<unknown>>; bound: ReadonlyMap<string, unknown> }
+/** Written only by pendingOverlay; never handed out (PF1, №2797-2). Transaction previews and other source overlays are
+ * not layers: they may change under their callers. */
+const pendingLayers = new WeakMap<object, PendingLayer>();
+/**
+ * The rows a bundle is about to write, readable before they are written (E4 pending calls, journal batches). The overlay
+ * owns detached, deeply frozen copies of the rows behind a private index — the caller's objects are neither frozen nor
+ * shared, and a later change to them leaves this snapshot as it was. Only `get` of a row's id, at its head or at its own
+ * revision, is answered here; another revision, another id, an absence, list, history, identities and the writes go to
+ * the base exactly as before, and later rows of one id replace earlier ones. Over a base with proved reads it is a frozen
+ * object and a registered layer of that base (№2012-2); over anything else it stays an opaque Proxy, whose reads may reach
+ * another source beneath it.
+ */
+export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]): Store {
+  const owned = new Map<string, Revision<unknown>>();
+  for (const row of rows) { const copy = structuredClone(row); deepFreeze(copy); owned.set(copy.id, copy); }
+  const get = <T,>(id: string, revision?: number): Revision<T> | null => {
+    const row = owned.get(id);
+    return row && (revision === undefined || revision === row.revision) ? row as Revision<T> : base.get<T>(id, revision);
+  };
+  if (!provenSourceReads(base)) return new Proxy(base, { get(target, key) {
+    if (key === 'get') return get;
+    const member: unknown = Reflect.get(target, key, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const methods = Object.create(Store.prototype) as Store;
+  const view = Object.create(methods) as Store;
+  Object.defineProperty(view, 'path', { value: base.path });
+  const bound = new Map<string, unknown>();
+  for (const name of Object.getOwnPropertyNames(Store.prototype)) {
+    if (name === 'constructor') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Store.prototype, name)!;
+    if (descriptor.get) {
+      Object.defineProperty(methods, name, { get: () => Reflect.get(base, name, base) });
+      continue;
+    }
+    const member: unknown = Reflect.get(base, name, base);
+    if (typeof member !== 'function') continue;
+    // The reads a proof's events go through (get, list, history) are the ones a witness must still reach; a member the
+    // base refuses afresh on every access (a write-only view's undeclared method) proves nothing either way.
+    if (READ_METHODS.has(name)) bound.set(name, member);
+    Object.defineProperty(methods, name, { value: name === 'get' ? get : member.bind(base) });
+  }
+  Object.freeze(methods);
+  const overlay = Object.freeze(view) as Store;
+  sourceOverlays.add(overlay);
+  pendingLayers.set(overlay, { base, rows: owned, bound });
+  return overlay;
+}
+/** Whether a view is a pending layer this module built; nothing of the layer is handed out. */
+export const pendingLayer = (view: unknown): boolean => typeof view === 'object' && view !== null && pendingLayers.has(view);
+/**
+ * Who answers one read of a view (PF1, №2797-3): 'pending' when a layer answers it from its own frozen rows — a get of a
+ * row's id at its head or own revision, decided by method, id and revision; otherwise the genuine Store that serves it
+ * through a proved chain of pending layers and write-only views; null when any link is of unknown origin (a caller's
+ * Proxy, a capture, a Transaction preview, a projection) or a base no longer reads through the members a layer bound.
+ */
+export function readServer(view: unknown, method: string, id: string | undefined, revision: number | undefined): Store | 'pending' | null {
+  for (let cursor = view; ;) {
+    const layer = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
+    if (!layer) return provenStore(cursor);
+    if (method === 'get' && id !== undefined) {
+      const row = layer.rows.get(id);
+      if (row && (revision === undefined || row.revision === revision)) return 'pending';
+    }
+    if ([...layer.bound].some(([name, member]) => Reflect.get(layer.base, name, layer.base) !== member)) return null;
+    cursor = layer.base;
+  }
+}
+
 const READ_METHODS = new Set(['get', 'list', 'history']);
 const READ_PROPERTIES = new Set(['path', 'databaseId']);
 

@@ -2,6 +2,7 @@ import { canonical, compositeKey, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { pendingOverlay } from "../storage/store-view.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import type { FrameRequest } from "./frame-obligations.js";
@@ -537,12 +538,20 @@ export function prepareJournalBatch(store: Store, request: JournalBatchRequest):
   const additions: JournalRow[] = [];
   const stored: Ref[] = [];
   const creations: JournalWrite[] = [];
+  // PF1 (№2797-5): one frozen overlay of this batch's pending records, built at the first source the batch creates and
+  // shared by every created source after it, so the history beneath them is proved once and not again per source. A G4b
+  // source's typed reader reads, of these ids, only its own row at its exact reference — the ids derive from content and
+  // are absent beneath, and list, history and identities never show pending rows — and any other source is read alone:
+  // the rows it can now see beside its own change nothing it derives. A pending row that stands already is the stored
+  // row byte for byte, and its source is read from the store as before.
+  let overlay: Store | undefined;
   for (const ref of named) {
     const staged = pending.get(ref.id);
     // A pending record whose exact bytes stand already has been created: its write could only fail now, so it is read
     // and guarded as any stored record (T5 — a repeat adds no revision).
     const creates = staged !== undefined && !standsAlready(store, staged.record) ? staged : undefined;
-    const read = readSource(creates ? withPending(store, creates.record) : store, ref, project, target);
+    const read = readSource(creates ? (overlay ??= pendingOverlay(store, [...pending.values()].map(item => item.record))) : store,
+      ref, project, target);
     if (!read.ok) return read;
     const source = reference(read.value);
     appendRows(read.value.value, source, known, additions, order);
@@ -674,16 +683,6 @@ function pendingRecords(writes: readonly unknown[]): Map<string, Pending> {
     });
   }
   return records;
-}
-
-// A pending record is read exactly as a stored one, from a view that holds it at the revision its write creates.
-function withPending(store: Store, record: Revision<unknown>): Store {
-  return new Proxy(store, { get(target, key) {
-    if (key === "get") return (id: string, revision?: number) =>
-      id === record.id && (revision === undefined || revision === record.revision) ? record : target.get(id, revision);
-    const member: unknown = Reflect.get(target, key, target);
-    return typeof member === "function" ? member.bind(target) : member;
-  } });
 }
 
 function standsAlready(store: Store, record: Revision<unknown>): boolean {

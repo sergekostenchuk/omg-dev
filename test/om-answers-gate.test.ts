@@ -4082,3 +4082,41 @@ out(args.map(request => reference(take(writeAnswersGate(store, request)))));`, r
     });
   }
 });
+
+// PF1 (№2797-7): the base of the overlay change, loaded whole from Git into its own process.
+const PF1_BASE = 'd519a6036f8b2cc4aee823ce24d7160262a08fb9';
+const preparedAtBase = (f: { root: string; path: string }, name: string, entry: 'prepareAnswersEvaluation' | 'prepareAnswersDelivery', request: unknown) =>
+  atCommit(f, PF1_BASE, name, `const gate = await import(src('om/answers-gate.js'));
+const { canonical } = await import(src('canonical.js'));
+const prepared = gate[${JSON.stringify(entry)}](store, args);
+out(prepared.ok ? canonical(prepared.value) : canonical({ refusal: prepared.refusal }));`, request) as string;
+const preparedHere = (result: OmResult<unknown>) => result.ok ? canonical(result.value as Json) : canonical({ refusal: result.refusal } as unknown as Json);
+
+test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write', async t => {
+  const f = fixture(t, 'repository-fact'), batch = nodeBatch(f, 'garden-consume-block');
+  const m = managedOn(f, 'garden-consume-block', [batch.id], 1, 'pf1');
+  const request = { project: f.project, binding: reference(m.binding), request: { ...f.request, results: [] } };
+  const two = prepareAnswersEvaluation(f.store, request);
+  assert.equal(ok(two).groups.length, 2, 'Two new G4b sources are journalled by one batch');
+  assert.equal(preparedHere(two), preparedAtBase(f, 'pf1-two', 'prepareAnswersEvaluation', request), 'Two new sources: the same bytes as the base');
+  // A late delivery: one group delivered alone, then the rest — the stored source is read from the store, the new one through the overlay.
+  const saved = ok(writeAnswersEvaluation(f.store, { ...request, deliver: 'none' }));
+  const [one] = saved.groups;
+  ok(writeAnswersDelivery(f.store, { project: f.project, evaluation: reference(saved.evaluation), group: one!.proof.id }));
+  const delivery = { project: f.project, evaluation: reference(saved.evaluation) };
+  const late = prepareAnswersDelivery(f.store, delivery);
+  assert.ok(ok(late).writes.length > 0, 'The rest is still to deliver');
+  assert.equal(preparedHere(late), preparedAtBase(f, 'pf1-late', 'prepareAnswersDelivery', delivery), 'A stored and a new source: the same bytes as the base');
+  ok(writeAnswersDelivery(f.store, delivery));
+  const stored = snapshot(f.store);
+  assert.deepEqual(ok(writeAnswersDelivery(f.store, delivery)).groups.length, 2);
+  assert.deepEqual(snapshot(f.store), stored, 'The repeated delivery writes nothing');
+  // The evaluation linked with the close journals its G4b source through the same overlay inside the close.
+  const g = fixture(t, 'repository-fact'), s = await linkedN(g, 'pf1');
+  const linked = prepareAnswersEvaluation(g.store, s.linked);
+  assert.ok(ok(linked).closed !== undefined && ok(linked).groups.length > 0);
+  assert.equal(preparedHere(linked), preparedAtBase(g, 'pf1-linked', 'prepareAnswersEvaluation', s.linked), 'Linked with the close: the same bytes as the base');
+  ok(writeAnswersEvaluation(g.store, s.linked));
+  const closed = snapshot(g.store), again = ok(writeAnswersEvaluation(g.store, s.linked));
+  assert.ok(again.repeated); assert.deepEqual(snapshot(g.store), closed, 'The repeated linked evaluation writes nothing');
+});

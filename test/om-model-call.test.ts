@@ -243,7 +243,7 @@ import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { historicalProof, historicalTrace, withHistoricalReads, writeOmInput } from '../src/om/input.js';
-import { storeView } from '../src/storage/store-view.js';
+import { readServer, storeView } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
@@ -3591,4 +3591,25 @@ catch (error) { out({ threw: String(error.message), stopped }); }`, { request: f
   const applied = await paidByBase(false), received = await paidByBase(true);
   assert.deepEqual(received, applied, 'The new code finishes and accounts a received call exactly as the base code finishes and accounts its own');
   assert.equal(applied.sent, 1);
+});
+
+test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writes of one id replace earlier ones, rows are sealed copies, a nested call store keeps its layer, a proved base gives a frozen registered layer and an unproved one the opaque Proxy, and a value that is no JSON is refused as before', t => {
+  const { isProxy } = types;
+  const root = mkdtempSync(join(tmpdir(), 'omg-pf1-call-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const written = store.write({ id: 'pf1m:b', kind: 'k', expected: 0, value: { b: 1 } });
+  const value = { v: 2, nested: { n: 1 } };
+  const view = pendingCallStore(store, [{ id: 'pf1m:a', kind: 'k', expected: 0, value: { v: 1 } }, { id: 'pf1m:a', kind: 'k', expected: 0, value }]);
+  value.nested.n = 9;
+  assert.deepEqual(view.get('pf1m:a')!.value, { v: 2, nested: { n: 1 } }, 'The later write of one id replaces the earlier one, as a sealed copy');
+  assert.ok(!isProxy(view) && Object.isFrozen(view.get('pf1m:a')));
+  const outer = pendingCallStore(view, [{ id: 'pf1m:b', kind: 'k', expected: 1, value: { b: 2 } }]);
+  assert.deepEqual([outer.get('pf1m:b')!.revision, outer.get('pf1m:b', 1), outer.get('pf1m:a')!.value], [2, store.get(written.id, 1), { v: 2, nested: { n: 1 } }],
+    'A nested call store keeps its layer over the one beneath');
+  assert.deepEqual([readServer(outer, 'get', 'pf1m:b', undefined), readServer(outer, 'get', 'pf1m:b', 1), readServer(outer, 'list', 'k', undefined)], ['pending', store, store]);
+  const opaque = pendingCallStore(new Proxy(store, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } }),
+    [{ id: 'pf1m:c', kind: 'k', expected: 0, value: {} }]);
+  assert.ok(isProxy(opaque) && readServer(opaque, 'get', 'pf1m:c', undefined) === null, 'Over an unproved view the call store stays opaque');
+  assert.throws(() => pendingCallStore(store, [{ id: 'pf1m:d', kind: 'k', expected: 0, value: { f: (() => 1) as unknown as Json } }]),
+    (error: unknown) => error instanceof EngineError && error.code === 'invalid_json', 'A value that is no JSON is refused as before: its hash is taken first');
 });

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { writeGuarded } from "../src/om/refs.js";
@@ -2113,4 +2113,29 @@ test("37 X7 H1.0c a real journal-only G4b row is refused any classification by a
   const earlier = readJournalAt(store, project, reference(journal));
   assert.deepEqual(earlier.ok ? reference(earlier.value) : earlier.refusal.code, reference(journal),
     "The revision before the forgery still reads through the real typed reader");
+});
+
+test("PF1 (№2797-5, -6 row 8) one shared overlay for a batch: new sources, a stored one and a pending record that stands already keep their rows in naming order, a write only for what is absent, the guards of every stored record read; the trusted overlay and the opaque one over an unproved base prepare the same bytes; each new source is read from the overlay, never from the base; the written batch repeats without a revision", t => {
+  const { store } = fixture(t);
+  const stored = gateRecord(store, "g4:pf1", gateFailure({ gate: "G4" }));
+  const first = pendingWrite("pf1:1", stagedFailure()), second = pendingWrite("pf1:2", stagedFailure({ gate: "G5" }));
+  const standing = pendingWrite("pf1:3", stagedFailure({ gate: "G3" }));
+  store.write({ id: standing.id, kind: standing.kind, expected: 0, value: standing.value as Json });
+  const request = batchOf({ sources: [pendingRef(first), reference(stored), pendingRef(second), pendingRef(standing)], pending: [first, second, standing] });
+  const seen: string[] = [];
+  const trusted = deliveredOf(prepareJournalBatch(store, request));
+  const opaque = deliveredOf(prepareJournalBatch(counting(store, id => seen.push(id)), request));
+  assert.equal(canonical(transition(opaque) as unknown as Json), canonical(transition(trusted) as unknown as Json),
+    "The overlay over the genuine Store and the opaque one over an unproved view prepare the same bytes");
+  assert.deepEqual(trusted.writes.map(write => [write.id, write.expected]), [[first.id, 0], [second.id, 0], [journalId(PROJECT), 0]],
+    "Only the absent sources are written; the one that stands already is read and guarded as stored (T5)");
+  assert.deepEqual([...new Set(trusted.value.rows.map(row => row.source.id))], [first.id, stored.id, second.id, standing.id], "Rows in the order the sources are named");
+  for (const ref of [reference(stored), pendingRef(standing)])
+    assert.ok(trusted.guards.some(guard => "hash" in guard && guard.id === ref.id && guard.hash === ref.hash), `${ref.id}: a stored record read is guarded`);
+  assert.deepEqual(seen.filter(id => id === first.id || id === second.id), [first.id, second.id],
+    "A new source is looked up in the base once — to know it does not stand — and then read from the overlay alone");
+  deliveredOf(commit(store, trusted));
+  const head = journalOf(store)!;
+  const again = deliveredOf(prepareJournalBatch(store, request));
+  assert.deepEqual([again.writes.length, again.result], [0, reference(head)], "After the write the same batch adds no revision");
 });

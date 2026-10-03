@@ -10,7 +10,7 @@ import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readMo
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { isStdioProtocol } from '../adapters/stdio-providers.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
-import { provenSourceReads, registerSourceOverlay, storeView } from '../storage/store-view.js';
+import { pendingOverlay, storeView } from '../storage/store-view.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
@@ -895,40 +895,10 @@ export function modelCallRecordId(project: string, name: string): string { retur
 const exchangeId = (request: ModelCallRequest) => `${EXCHANGE_KIND}:${request.project}:${hashJson(request)}`;
 const writeRef = (write: Write): Ref => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) });
 export function pendingCallStore(store: Store, writes: readonly Write[]): Store {
-  const pending = new Map(writes.map(write => [write.id,
-    sealed({ ...writeRef(write), kind: write.kind, value: write.value })]));
-  const get = (id: string, revision?: number) => {
-    const value = pending.get(id);
-    return value && (revision === undefined || revision === value.revision) ? value : store.get(id, revision);
-  };
-  // A frozen locally constructed overlay over proved reads is an immutable source view (№2012-2): a genuine Store, a
-  // write-only guarded view of the storage helper, an overlay of this function or a preview of the acceptance's
-  // Transaction — each registered by its own constructor. A caller's Proxy, a traced Store, a frozen shell with its own
-  // reading members or any unknown lower view keeps the opaque Proxy: their reads may reach another source beneath.
-  if (provenSourceReads(store)) {
-    const methods = Object.create(Store.prototype) as Store;
-    const view = Object.create(methods) as Store;
-    Object.defineProperty(view, 'path', { value: store.path });
-    for (const name of Object.getOwnPropertyNames(Store.prototype)) {
-      if (name === 'constructor') continue;
-      const descriptor = Object.getOwnPropertyDescriptor(Store.prototype, name)!;
-      if (descriptor.get) {
-        Object.defineProperty(methods, name, { get: () => Reflect.get(store, name, store) });
-        continue;
-      }
-      const member: unknown = Reflect.get(store, name, store);
-      if (typeof member === 'function') Object.defineProperty(methods, name, { value: name === 'get' ? get : member.bind(store) });
-    }
-    Object.freeze(methods);
-    const overlay = Object.freeze(view) as Store;
-    registerSourceOverlay(overlay);
-    return overlay;
-  }
-  return new Proxy(store, { get(target, key) {
-    if (key === 'get') return get;
-    const member: unknown = Reflect.get(target, key, target);
-    return typeof member === 'function' ? member.bind(target) : member;
-  } });
+  // The common pending overlay of the storage helper (PF1, №2797-2): a frozen registered layer over proved reads — a
+  // genuine Store, a write-only guarded view, another such overlay or a preview of the acceptance's Transaction — and the
+  // opaque Proxy over anything else. Later writes of one id replace earlier ones, as they always did here.
+  return pendingOverlay(store, writes.map(write => sealed({ ...writeRef(write), kind: write.kind, value: write.value })));
 }
 function externalGuards(guards: readonly Ref[], writes: readonly Write[]): Ref[];
 function externalGuards(guards: readonly TransactionGuard[], writes: readonly Write[]): TransactionGuard[];

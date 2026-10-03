@@ -7,6 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { hashJson, type Json } from '../src/canonical.js';
+import { reference } from '../src/pipeline/contracts.js';
+import { Store, type Revision } from '../src/storage/store.js';
+import { pendingOverlay } from '../src/storage/store-view.js';
+import { historicalProof, withHistoricalReads } from '../src/history/proofs.js';
 
 // Observe the actual compiled producer and proof bodies without changing a production module or the accepted fixture.
 const loader = String.raw`
@@ -1551,4 +1556,46 @@ test('E2.2 №1801 rows 1/2/3/5/9/10/12 on the real MC1 producers: two fact ques
 
 test('E2.2 №1801 rows 5/7/8/11 on the real MC2 producers: cannot_answer and a cycle without progress are delivered at the exact addresses of the admitted call with their own codes, a continuation packet keeps the root basis, and interrupted or off-form ends are no task for the model', async t => {
   checkScenario(t, await runScenario(t, 'e22-node', e22NodeScenario));
+});
+
+test('PF1 (№2797-8) one overlay for a batch of N sources: the history they share is derived once and, under an unchanged stamp, never checked again per source — body reads, identities and stamps do not grow with N, while N opaque views of the former shape read it N times', t => {
+  const counts = { gets: 0, identities: 0, stamps: 0 };
+  const original = { get: Store.prototype.get, identities: Store.prototype.identities, changeStamp: Store.prototype.changeStamp };
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original.get>) { counts.gets++; return original.get.apply(this, args); } as typeof original.get;
+  Store.prototype.identities = function (this: Store, ...args: Parameters<typeof original.identities>) { counts.identities++; return original.identities.apply(this, args); } as typeof original.identities;
+  Store.prototype.changeStamp = function (this: Store) { counts.stamps++; return original.changeStamp.apply(this); };
+  const root = mkdtempSync(join(tmpdir(), 'omg-pf1-cost-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { Object.assign(Store.prototype, original); store.close(); rmSync(root, { recursive: true, force: true }); });
+  const chain: Revision<unknown>[] = [];
+  for (let i = 0; i < 30; i++) chain.push(store.write({ id: `pf1c:h:${i}`, kind: 'k', expected: 0, value: { i, previous: i ? reference(chain[i - 1]!) : null } }));
+  const last = chain.at(-1)!;
+  const row = (i: number): Revision<Json> => ({ id: `pf1c:source:${i}`, kind: 'k', revision: 1, hash: hashJson({ source: i }), value: { source: i } });
+  const binding = (base: Store) => new Proxy(base, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  const noCycle = (): never => { throw new Error('Unexpected cycle'); };
+  // The shared history: its head, then every exact revision back to the first — the shape of a series or a work registry.
+  const history = (view: Store) => historicalProof(view, { reader: 'PF1.shared', project: 'garden', ref: reference(last) }, source => {
+    const head = source.get(last.id)!; let cursor: Revision<unknown> | null = head, length = 0;
+    while (cursor) {
+      length++;
+      const previous: { id: string; revision: number } | null = (cursor.value as { previous: { id: string; revision: number } | null }).previous;
+      cursor = previous ? source.get(previous.id, previous.revision) : null;
+    }
+    return length;
+  }, noCycle);
+  const batch = (n: number, shape: 'shared' | 'opaque') => {
+    const rows = Array.from({ length: n }, (_, i) => row(i));
+    const shared = pendingOverlay(store, rows);
+    const views = rows.map(item => shape === 'shared' ? shared : pendingOverlay(binding(store), [item]));
+    const before = { ...counts };
+    const lengths = withHistoricalReads(() => rows.map((item, i) => historicalProof(views[i]!, { reader: 'PF1.source', project: 'garden', ref: reference(item) },
+      source => { source.get(item.id, 1); return history(source); }, noCycle)));
+    assert.deepEqual(lengths, rows.map(() => 30), 'Every source is checked and sees the whole history');
+    return { gets: counts.gets - before.gets, identities: counts.identities - before.identities, stamps: counts.stamps - before.stamps };
+  };
+  const one = batch(1, 'shared'), four = batch(4, 'shared');
+  assert.deepEqual([four.gets, four.identities], [one.gets, 0], 'Through one overlay the shared history is read once whatever N is, and an unchanged stamp needs no identities');
+  assert.ok(four.stamps - one.stamps <= 3, `A stamp per further source at most, never per event of the history: ${one.stamps} → ${four.stamps}`);
+  const opaqueOne = batch(1, 'opaque'), opaqueFour = batch(4, 'opaque');
+  assert.ok(opaqueFour.gets >= 4 * 30 && opaqueFour.gets >= 4 * opaqueOne.gets - 4,
+    `The former shape — one opaque view per source — derives the history N times: ${opaqueOne.gets} → ${opaqueFour.gets}`);
 });

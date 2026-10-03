@@ -13,7 +13,7 @@ import { collectGaps, GAP_MOMENTS, type GapSources } from "../src/om/gaps.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
-import { captureView, storeView } from "../src/storage/store-view.js";
+import { captureView, pendingOverlay, storeView } from "../src/storage/store-view.js";
 import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.js";
 import { sealed } from "../src/om/refusal.js";
 import { pendingCallStore } from "../src/om/model-call.js";
@@ -2252,4 +2252,273 @@ test("R5 (return №1, №2471) the recovery's pending view owns a deep frozen c
     assert.equal(canonical(view.get('r5d:pending', 1)!.value as Json), cold);
   });
   assert.ok(!Object.isFrozen(value) && !Object.isFrozen(value.nested) && !Object.isFrozen(value.list), "The caller's objects are not frozen in place");
+});
+
+// PF1 (№2797): proofs through the pending overlays of the storage helper.
+function countingStore(t: TestContext) {
+  // Installed before any overlay is built: an overlay binds the reads it finds, and a read replaced later breaks its chain.
+  const counts = { runs: 0, gets: 0, identities: 0 };
+  const original = { get: Store.prototype.get, identities: Store.prototype.identities };
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original.get>) { counts.gets++; return original.get.apply(this, args); } as typeof original.get;
+  Store.prototype.identities = function (this: Store, ...args: Parameters<typeof original.identities>) { counts.identities++; return original.identities.apply(this, args); } as typeof original.identities;
+  t.after(() => { Store.prototype.get = original.get; Store.prototype.identities = original.identities; });
+  return counts;
+}
+const pf1Row = (id: string, revision: number, value: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(value), value });
+
+test("PF1 (№2797-6 rows 1–3) through a pending overlay over a genuine Store a reused proof reads no pending row, checks a delegated read by the Store's stamp alone, keeps itself over a disjoint write and an unchanged identity, and derives again when a dependency moves or an absent record appears — also when a second Store of the same file writes it", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const second = new Store(first.path); t.after(() => second.close());
+  const dep = first.write({ id: 'pf1i:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const overlay = pendingOverlay(first, [pf1Row('pf1i:pending', 1, { p: 1 })]);
+  const prove = () => historicalProof(overlay, { reader: 'PF1.rows', project: 'garden', ref: reference(dep) }, source => {
+    counts.runs++;
+    return canonical([source.get('pf1i:pending')?.value ?? null, source.get(dep.id)?.value ?? null, source.get('pf1i:absent')?.value ?? null] as Json);
+  }, noCycle);
+  const reuse = () => {
+    const before = { ...counts }, value = prove();
+    return { value, runs: counts.runs - before.runs, gets: counts.gets - before.gets, identities: counts.identities - before.identities };
+  };
+  withHistoricalReads(() => {
+    const cold = prove();
+    assert.deepEqual(reuse(), { value: cold, runs: 0, gets: 0, identities: 0 }, 'Rows 1–2: under an unchanged stamp nothing is read again — neither the pending row nor the base');
+    first.write({ id: 'pf1i:other', kind: 'k', expected: 0, value: {} });
+    const disjoint = reuse();
+    assert.deepEqual([disjoint.value, disjoint.runs, disjoint.gets, disjoint.identities], [cold, 0, 0, 2],
+      'Row 3: a disjoint write moves the stamp; the two delegated reads are checked as identities, the pending row never, and nothing is derived again');
+    assert.deepEqual(reuse(), { value: cold, runs: 0, gets: 0, identities: 0 }, 'The checked events keep the new stamp');
+    first.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
+    const moved = reuse();
+    assert.equal(moved.runs, 1); assert.match(moved.value, /"d":2/, 'Row 2: a moved head of the base derives again');
+    second.write({ id: 'pf1i:absent', kind: 'k', expected: 0, value: { a: 1 } });
+    const appeared = reuse();
+    assert.equal(appeared.runs, 1); assert.match(appeared.value, /"a":1/, 'Row 2: an absence belongs to the base, and its appearance through a second Store of the file moves the stamp');
+  });
+});
+
+test("PF1 (№2797-6 rows 4–5) nested overlays answer by layers and both are proved links; an unknown view between them is not bypassed; an overlay owns its rows, so a changed argument changes nothing it proved and a new overlay of the changed rows proves on its own", t => {
+  const counts = countingStore(t);
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 'pf1n:x', kind: 'k', expected: 0, value: { x: 1 } });
+  const changing = { x: 3, nested: { n: 1 } };
+  const rows = [pf1Row('pf1n:x', 3, changing as unknown as Json)];
+  const inner = pendingOverlay(first, [pf1Row('pf1n:x', 2, { x: 2 })]);
+  const outer = pendingOverlay(inner, rows);
+  const binding = (store: Store) => new Proxy(store, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  const behindUnknown = pendingOverlay(binding(inner), [pf1Row('pf1n:x', 3, { x: 3, nested: { n: 1 } })]);
+  const prove = (view: Store, kase: string) => historicalProof(view, { reader: 'PF1.layers', project: 'garden', ref: reference(anchor), parameters: { case: kase } },
+    source => { counts.runs++; return canonical([source.get('pf1n:x'), source.get('pf1n:x', 2), source.get('pf1n:x', 1), source.get('pf1n:y')] as Json); }, noCycle);
+  withHistoricalReads(() => {
+    const layered = prove(outer, 'outer');
+    assert.match(layered, /"x":3.*"x":2.*"x":1/, 'Row 4: the head and X@3 from the outer layer, X@2 from the inner, X@1 from the base');
+    const before = { ...counts };
+    assert.equal(prove(outer, 'outer'), layered);
+    assert.deepEqual([counts.runs - before.runs, counts.gets - before.gets], [0, 0], 'Through two proved layers a reuse reads nothing');
+    assert.equal(prove(behindUnknown, 'unknown'), layered, 'An overlay over an unknown view still answers the same rows');
+    const unknownBefore = { ...counts };
+    prove(behindUnknown, 'unknown');
+    assert.ok(counts.gets > unknownBefore.gets, 'Row 4: an unknown view between the layers is not bypassed: its footprint is read again');
+    changing.nested.n = 2; (rows[0]!.value as { x: number }).x = 4;
+    assert.equal(prove(outer, 'outer'), layered, 'Row 5: the overlay proved its own copy; the changed argument changes nothing it holds');
+    assert.throws(() => { (outer.get('pf1n:x')!.value as { nested: { n: number } }).nested.n = 9; }, TypeError);
+    const fresh = pendingOverlay(inner, rows), freshBefore = counts.runs;
+    const changed = prove(fresh, 'outer');
+    assert.equal(counts.runs - freshBefore, 1, 'Row 5: a new overlay of the changed rows inherits no proof of the old one');
+    assert.match(changed, /"x":4/); assert.notEqual(changed, layered);
+  });
+  assert.ok(!Object.isFrozen(changing) && !Object.isFrozen(changing.nested), "The caller's objects are not frozen in place");
+});
+
+test("PF1 (№2797-6 row 6) an overlay over a Transaction preview or a capture has no witness beneath its own rows: read from a closure or traced, get, list and history of the next operation see what the preview holds now, flat and as a child warmed before its parent, and neither is kept", t => {
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 'pf1t:anchor', kind: 'k', expected: 0, value: {} });
+  const counts: Record<string, number> = {};
+  const prove = (kase: string, action: () => unknown) => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(anchor), parameters: { case: kase } },
+    () => { counts[kase] = (counts[kase] ?? 0) + 1; return canonical(action() as Json); }, noCycle);
+  const tx = transactionForTests(first);
+  const capture = captureView(first, { rows: new Map() });
+  const overlays = { tx: pendingOverlay(tx.view, [pf1Row('pf1t:own', 1, { own: true })]), capture: pendingOverlay(capture.view, [pf1Row('pf1t:own', 1, { own: true })]) };
+  const reads = (view: Store): [string, () => unknown][] => [
+    ['get', () => view.get('pf1t:candidate')?.value ?? null],
+    ['list', () => view.list('k').map(row => row.id)],
+    ['history', () => view.history('pf1t:candidate').map(row => row.revision)],
+  ];
+  const round = () => Object.fromEntries(Object.entries(overlays).flatMap(([name, view]) => reads(view).map(([method, read]) => {
+    const child = () => prove(`${name}.${method}`, () => [first.get(anchor.id, 1), view.get('pf1t:own')?.value ?? null, read()]);
+    const parent = () => prove(`${name}.${method}.parent`, () => [child(), first.get(anchor.id, 1)]);
+    const traced = historicalProof(view, { reader: 'PF1.traced', project: 'garden', ref: reference(anchor), parameters: { name, method } },
+      source => canonical([source.get('pf1t:candidate')?.value ?? null, source.list('k').map(row => row.id), source.history('pf1t:candidate').map(row => row.revision)] as Json), noCycle);
+    return [`${name}.${method}`, withHistoricalReads(() => [child(), parent(), traced])];
+  })));
+  const before = round();
+  tx.add({ writes: [{ id: 'pf1t:candidate', kind: 'k', expected: 0, value: { pending: true } }], guards: [] });
+  capture.view.write({ id: 'pf1t:candidate', kind: 'k', expected: 0, value: { pending: true } });
+  const after = round();
+  for (const name of Object.keys(before)) {
+    assert.notDeepEqual(after[name], before[name], `${name}: the next operation sees the row the representation holds now — closure child, parent and traced proof`);
+    assert.deepEqual([counts[name], counts[`${name}.parent`]], [2, 2], `${name}: neither the child nor its parent was kept`);
+  }
+  assert.equal(first.get('pf1t:candidate'), null, 'The physical Store never held the row: its stamp could not reveal the change');
+  withHistoricalReads(() => {
+    const view = overlays.tx, key = { reader: 'PF1.within', project: 'garden', ref: reference(anchor) };
+    let runs = 0;
+    const within = () => historicalProof(view, key, source => { runs++; return canonical(source.get('pf1t:late')?.value ?? null); }, noCycle);
+    within();
+    tx.add({ writes: [{ id: 'pf1t:late', kind: 'k', expected: 0, value: { late: true } }], guards: [] });
+    assert.match(within(), /"late":true/, 'Inside one operation a read the preview answers is checked in full, never by the Store\'s stamp');
+    assert.equal(runs, 2);
+  });
+});
+
+test("PF1 (№2797-6 row 7) a proof through a pending overlay replays the same stream to ordered and distinct observers, cold and reused, nested observers included; a complete replay neither keeps it beyond its operation nor merges its key with the base's", t => {
+  const { first } = historicalStores(t);
+  const dep = first.write({ id: 'pf1r:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const overlay = pendingOverlay(first, [pf1Row('pf1r:pending', 1, { p: 1 })]);
+  let runs = 0;
+  const key = { reader: 'PF1.replay', project: 'garden', ref: reference(dep) };
+  const body = (source: Store) => { runs++; return canonical([source.get('pf1r:pending'), source.get(dep.id), source.get(dep.id), source.get(dep.id, 1)] as Json); };
+  const streams = (mode: 'ordered' | 'distinct') => {
+    const outerSeen: string[] = [], innerSeen: string[] = [];
+    const outerTrace = historicalTrace(overlay, (ref, head, method) => outerSeen.push(`${ref.id}@${ref.revision}:${head}:${method}`), mode);
+    const innerTrace = historicalTrace(outerTrace, (ref, head, method) => innerSeen.push(`${ref.id}@${ref.revision}:${head}:${method}`), mode);
+    return withHistoricalReads(() => {
+      historicalProof(innerTrace, key, body, noCycle);
+      const cold = [[...outerSeen], [...innerSeen]];
+      outerSeen.length = 0; innerSeen.length = 0;
+      historicalProof(innerTrace, key, body, noCycle);
+      return { cold, reused: [[...outerSeen], [...innerSeen]] };
+    });
+  };
+  const ordered = streams('ordered');
+  assert.deepEqual(ordered.cold[0], ['pf1r:pending@1:true:get', 'pf1r:dep@1:true:get', 'pf1r:dep@1:true:get', 'pf1r:dep@1:false:get'],
+    'The pending row is observed like any other: reference, head, method, order and multiplicity');
+  assert.deepEqual(ordered.reused, ordered.cold, 'A reused proof replays the whole ordered stream to both observers');
+  assert.deepEqual(ordered.cold[1], ordered.cold[0], 'The nested observer sees the same stream');
+  const distinct = streams('distinct');
+  assert.deepEqual(distinct.cold[0], ['pf1r:pending@1:true:get', 'pf1r:dep@1:true:get', 'pf1r:dep@1:false:get'], 'A distinct observer sees each reference once');
+  assert.deepEqual(distinct.reused, [[], []], 'and nothing again on a reuse');
+  const before = runs;
+  withHistoricalReads(() => historicalProof(overlay, key, body, noCycle));
+  withHistoricalReads(() => historicalProof(overlay, key, body, noCycle));
+  assert.equal(runs - before, 2, 'Every operation derives a proof of the overlay again: no proof of it is kept beyond its operation');
+  const base = runs;
+  withHistoricalReads(() => { historicalProof(overlay, key, body, noCycle); historicalProof(first, key, body, noCycle); });
+  assert.equal(runs - base, 2, 'The overlay and its base keep separate keys');
+});
+
+test("PF1 (№2827) a proof through a pending overlay is reused only while its proved chain holds: once the base's get is replaced — an exact read now answering another revision, or the head answering a projected body under the same metadata — the reuse, flat and as the parent of a warmed child, derives again and agrees with the direct read; under the intact chain it reads nothing", t => {
+  for (const kind of ['exact', 'head'] as const) {
+    const { first } = historicalStores(t);
+    const before = first.write({ id: 'pf1c:dep', kind: 'k', expected: 0, value: { value: 'before' } });
+    const after = first.write({ id: 'pf1c:dep', kind: 'k', expected: 1, value: { value: 'after' } });
+    const overlay = pendingOverlay(first, [pf1Row('pf1c:own', 1, { own: true })]);
+    const revision = kind === 'exact' ? 1 : undefined;
+    const counts = { child: 0, parent: 0 };
+    const child = () => historicalProof(overlay, { reader: 'PF1.chain', project: 'garden', ref: reference(before), parameters: { kind } },
+      source => { counts.child++; return (source.get('pf1c:dep', revision)!.value as { value: string }).value; }, noCycle);
+    const parent = () => historicalProof(overlay, { reader: 'PF1.chain.parent', project: 'garden', ref: reference(before), parameters: { kind } },
+      source => { counts.parent++; return `${child()}|${(source.get('pf1c:own')!.value as { own: boolean }).own}`; }, noCycle);
+    withHistoricalReads(() => {
+      const warm = parent();
+      assert.equal(warm, `${kind === 'exact' ? 'before' : 'after'}|true`);
+      assert.deepEqual([parent(), counts.child, counts.parent], [warm, 1, 1], `${kind}: under the intact chain the reuse derives nothing`);
+      const original = first.get.bind(first);
+      Object.defineProperty(first, 'get', { configurable: true, writable: true, value: (id: string, rev?: number) => id !== 'pf1c:dep' ? original(id, rev)
+        : kind === 'exact' ? after : { ...after, value: { value: 'projected' } } });
+      try {
+        const direct = (overlay.get('pf1c:dep', revision)!.value as { value: string }).value;
+        assert.equal(child(), direct, `${kind}: the reused child agrees with what the overlay answers now`);
+        assert.equal(parent(), `${direct}|true`, `${kind}: so does its parent, which carries the child's chain`);
+        assert.deepEqual(counts, { child: 2, parent: 2 }, `${kind}: both derived again once the chain broke`);
+      } finally { delete (first as unknown as { get?: unknown }).get; }
+    });
+  }
+});
+
+test("PF1 (№2827, same class) a trusted recovery snapshot (R5) keeps a reused proof only while its base still reads through the members it was trusted over: a replaced get — another revision for an exact read, or a projected body under the head's metadata — derives again; an untouched base still reads nothing", t => {
+  for (const kind of ['exact', 'head'] as const) {
+    const { first } = historicalStores(t);
+    const before = first.write({ id: 'pf1s:dep', kind: 'k', expected: 0, value: { value: 'before' } });
+    const after = first.write({ id: 'pf1s:dep', kind: 'k', expected: 1, value: { value: 'after' } });
+    const snapshot = proofs.pendingSnapshotView(first, [pf1Row('pf1s:own', 1, { own: true })]);
+    const revision = kind === 'exact' ? 1 : undefined;
+    let runs = 0;
+    const prove = () => historicalProof(snapshot, { reader: 'PF1.snapshot', project: 'garden', ref: reference(before), parameters: { kind } },
+      source => { runs++; return (source.get('pf1s:dep', revision)!.value as { value: string }).value; }, noCycle);
+    withHistoricalReads(() => {
+      const warm = prove();
+      assert.deepEqual([prove(), runs], [warm, 1], `${kind}: an untouched base — the reuse derives nothing`);
+      const original = first.get.bind(first);
+      Object.defineProperty(first, 'get', { configurable: true, writable: true, value: (id: string, rev?: number) => id !== 'pf1s:dep' ? original(id, rev)
+        : kind === 'exact' ? after : { ...after, value: { value: 'projected' } } });
+      try {
+        const direct = (snapshot.get('pf1s:dep', revision)!.value as { value: string }).value;
+        assert.deepEqual([prove(), runs], [direct, 2], `${kind}: the reuse derives again and agrees with what the snapshot answers now`);
+      } finally { delete (first as unknown as { get?: unknown }).get; }
+    });
+  }
+});
+
+test("PF1 (№2846 rows 1–3, 5) the read methods a delegated read invoked are part of its proof: replaced after warming through the instance or the prototype — exact read or head with a projected body, through a pending overlay or a recovery snapshot — the child and a parent rooted at the Store over the prewarmed child derive again and agree with the direct read; unchanged methods reuse without a derivation", t => {
+  const original = Store.prototype.get;
+  for (const representation of ['overlay', 'snapshot'] as const) for (const place of ['instance', 'prototype'] as const) for (const read of ['exact', 'head'] as const) {
+    const { first } = historicalStores(t);
+    t.after(() => { Store.prototype.get = original; delete (first as unknown as { get?: unknown }).get; });
+    const before = first.write({ id: 'pf1m:dep', kind: 'k', expected: 0, value: { v: 'before' } });
+    const after = first.write({ id: 'pf1m:dep', kind: 'k', expected: 1, value: { v: 'after' } });
+    const own = pf1Row('pf1m:own', 1, { own: true });
+    const view = representation === 'overlay' ? pendingOverlay(first, [own]) : proofs.pendingSnapshotView(first, [own]);
+    const revision = read === 'exact' ? 1 : undefined;
+    const counts = { child: 0, parent: 0 };
+    const key = { reader: 'PF1.methods', project: 'garden', ref: reference(before), parameters: { representation, place, read } };
+    const child = () => historicalProof(view, key, source => { counts.child++; return (source.get('pf1m:dep', revision)!.value as { v: string }).v; }, noCycle);
+    const parent = () => historicalProof(first, { ...key, reader: 'PF1.methods.parent' }, source => { counts.parent++; source.get('pf1m:anchor'); return child(); }, noCycle);
+    const label = `${representation}/${place}/${read}`;
+    withHistoricalReads(() => {
+      const cold = child();
+      assert.equal(parent(), cold);
+      assert.deepEqual([child(), parent(), counts.child, counts.parent], [cold, cold, 1, 1], `${label}: unchanged methods — the reuse derives nothing (row 1)`);
+      const replacement = function (this: Store, id: string, rev?: number) {
+        if (this !== first || id !== 'pf1m:dep') return original.call(this, id, rev);
+        return read === 'exact' ? after : { ...after, value: { v: 'projected' } };
+      } as typeof original;
+      if (place === 'instance') Object.defineProperty(first, 'get', { configurable: true, writable: true, value: replacement });
+      else Store.prototype.get = replacement;
+      const direct = (view.get('pf1m:dep', revision)!.value as { v: string }).v;
+      assert.equal(parent(), direct, `${label}: the parent over the prewarmed child sees what is read now (rows 2–3, 5)`);
+      assert.deepEqual(counts, { child: 2, parent: 2 }, `${label}: both derived again`);
+    });
+    Store.prototype.get = original; delete (first as unknown as { get?: unknown }).get;
+  }
+});
+
+test("PF1 (№2846 rows 1, 6, list/history) list and history a recovery snapshot delegates follow the same rule, and a method replaced and restored to the very same function lets the reuse stand under the same chain and current data", t => {
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 'pf1h:a', kind: 'k', expected: 0, value: { a: 1 } });
+  const snapshot = proofs.pendingSnapshotView(first, [pf1Row('pf1h:own', 1, { own: true })]);
+  let runs = 0;
+  const prove = () => historicalProof(snapshot, { reader: 'PF1.list', project: 'garden', ref: reference(anchor) },
+    source => { runs++; return canonical([source.list('k').map(row => row.id), source.history(anchor.id).map(row => row.revision)] as Json); }, noCycle);
+  const original = { list: Store.prototype.list, history: Store.prototype.history };
+  t.after(() => { Store.prototype.list = original.list; Store.prototype.history = original.history; });
+  withHistoricalReads(() => {
+    const cold = prove();
+    for (const name of ['list', 'history'] as const) {
+      const before = runs;
+      const replaced = function (this: Store, ...args: unknown[]) { return (original[name] as (...a: unknown[]) => unknown).apply(this, args); };
+      (Store.prototype as unknown as Record<string, unknown>)[name] = replaced;
+      assert.equal(prove(), cold); assert.equal(runs, before + 1, `${name}: a replaced delegated read derives again`);
+      (Store.prototype as unknown as Record<string, unknown>)[name] = original[name];
+      assert.equal(prove(), cold); assert.equal(runs, before + 2, `${name}: the proof made under the replacement is again no proof of the restored method`);
+      assert.equal(prove(), cold); assert.equal(runs, before + 2, `${name}: under the restored, unchanged method the reuse stands (row 6)`);
+    }
+    const restored = runs;
+    const get = Store.prototype.get;
+    Store.prototype.get = function (this: Store, ...args: Parameters<typeof get>) { return get.apply(this, args); } as typeof get;
+    Store.prototype.get = get;
+    assert.equal(prove(), cold); assert.equal(runs, restored, 'Row 6: the very same function again — the reuse stands');
+    first.write({ id: anchor.id, kind: 'k', expected: 1, value: { a: 2 } });
+    assert.notEqual(prove(), cold, 'Row 6 is conditional: the data still have to be current, the stamp still checks them');
+  });
 });

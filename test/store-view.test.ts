@@ -10,7 +10,8 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
-import { captureView, genuineStore, provenReads, provenStore, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { captureView, genuineStore, pendingOverlay, provenReads, provenStore, readServer, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { transactionForTests } from '../src/om/atomic-gate.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { Discovery, type Question } from '../src/discovery/discovery.js';
@@ -1135,4 +1136,66 @@ test('S1.3 (№2194-1) provenStore names the genuine Store beneath the write-onl
     assert.equal(provenStore(guardView(store, []).view), store, 'a view built after the replacement binds the current read');
   } finally { Store.prototype.history = original; }
   assert.equal(provenStore(view), store, 'with the original read restored the kinship is proved again');
+});
+
+test('PF1 (№2797-2, -3) a pending overlay owns detached frozen copies of its rows: get answers a row at its head and own revision, every other read and both writes go to the base, later rows of one id replace earlier ones, layers stay layers, and readServer names the row, the genuine Store through proved layers, or nobody', t => {
+  const { store } = fixture(t);
+  const x1 = store.write({ id: 'pf1:x', kind: 'k', expected: 0, value: { v: 1 } });
+  store.write({ id: 'pf1:x', kind: 'k', expected: 1, value: { v: 2 } });
+  const y = store.write({ id: 'pf1:y', kind: 'k', expected: 0, value: { y: 1 } });
+  const value = { v: 3, nested: { n: 1 } };
+  const row = (id: string, revision: number, body: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(body), value: body });
+  const rows = [row('pf1:x', 3, value as unknown as Json), row('pf1:z', 1, { z: 'first' }), row('pf1:z', 1, { z: 'last' })];
+  const overlay = pendingOverlay(store, rows);
+  value.nested.n = 2; (rows[1]!.value as { z: string }).z = 'changed';
+  assert.ok(!types.isProxy(overlay) && overlay instanceof Store && Object.isFrozen(overlay), 'over a genuine Store the overlay is a frozen object');
+  assert.deepEqual([overlay.get('pf1:x')!.value, overlay.get('pf1:x', 3)!.value], [{ v: 3, nested: { n: 1 } }, { v: 3, nested: { n: 1 } }],
+    'the head and the own revision are the row as it was given, whatever the caller does with its objects later');
+  assert.deepEqual(overlay.get('pf1:z')!.value, { z: 'last' }, 'a later row of one id replaces an earlier one');
+  assert.ok(!Object.isFrozen(value) && !Object.isFrozen(value.nested), 'the caller\'s objects are not frozen in place');
+  assert.throws(() => { (overlay.get('pf1:x')!.value as { nested: { n: number } }).nested.n = 9; }, TypeError, 'a returned row cannot change the snapshot');
+  assert.deepEqual(overlay.get('pf1:x', 2)!.value, { v: 2 }, 'another revision of the same id is the base\'s');
+  assert.deepEqual([overlay.get('pf1:x', 1), overlay.get(y.id), overlay.get('pf1:absent')], [store.get(x1.id, 1), store.get(y.id), null]);
+  assert.deepEqual([overlay.list('k').map(item => item.id), overlay.history('pf1:x').map(item => item.revision), overlay.history('pf1:z')],
+    [store.list('k').map(item => item.id), [1, 2], []], 'list and history show no pending row');
+  assert.deepEqual(overlay.identities('get', 'pf1:z'), store.identities('get', 'pf1:z'), 'identities are the base\'s too');
+  // Layers: an inner X@2 under an outer X@3 — the head and X@3 are the outer's, X@2 the inner's, X@1 the base's.
+  const inner = pendingOverlay(store, [row('pf1:w', 2, { w: 2 })]);
+  const outer = pendingOverlay(inner, [row('pf1:w', 3, { w: 3 })]);
+  assert.deepEqual([outer.get('pf1:w')!.value, outer.get('pf1:w', 3)!.value, outer.get('pf1:w', 2)!.value, outer.get('pf1:w', 1)], [{ w: 3 }, { w: 3 }, { w: 2 }, null]);
+  assert.deepEqual([readServer(outer, 'get', 'pf1:w', undefined), readServer(outer, 'get', 'pf1:w', 2), readServer(outer, 'get', 'pf1:w', 1),
+    readServer(outer, 'get', 'pf1:y', undefined), readServer(outer, 'list', 'k', undefined), readServer(outer, 'history', 'pf1:w', undefined)],
+    ['pending', 'pending', store, store, store, store], 'the row of a layer is answered by that layer; everything else by the Store beneath');
+  assert.equal(readServer(overlay, 'list', 'pf1:x', undefined), store, 'a method other than get is never a pending row');
+  // Writes go to the nearest view with its own restrictions; a write-only view of this module is a proved link.
+  const written: string[] = [];
+  const guard = storeView(store, { write: (inputs, guards) => { written.push(...inputs.map(input => input.id)); return store.writeMany(inputs, guards); } });
+  const overGuard = pendingOverlay(guard, [row('pf1:g', 1, { g: 1 })]);
+  overGuard.write({ id: 'pf1:written', kind: 'k', expected: 0, value: {} });
+  overGuard.writeMany([{ id: 'pf1:written', kind: 'k', expected: 1, value: { again: true } }], []);
+  assert.deepEqual(written, ['pf1:written', 'pf1:written'], 'both write forms reach the nearest view\'s policy');
+  assert.equal(readServer(overGuard, 'get', 'pf1:y', undefined), store);
+  // Unknown links break the chain: a caller's Proxy, a capture, a Transaction preview; an opaque base keeps the opaque overlay.
+  const proxy = new Proxy(store, { get: (target, key) => { const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  const overProxy = pendingOverlay(proxy, [row('pf1:p', 1, { p: 1 })]);
+  assert.ok(types.isProxy(overProxy), 'over an unproved base the overlay stays an opaque Proxy');
+  assert.deepEqual([overProxy.get('pf1:p')!.value, overProxy.get(y.id)], [{ p: 1 }, store.get(y.id)]);
+  assert.equal(readServer(overProxy, 'get', 'pf1:p', undefined), null, 'an opaque overlay is no layer, not even for its own row');
+  const capture = captureView(store, { rows: new Map() });
+  assert.equal(readServer(pendingOverlay(capture.view, [row('pf1:c', 1, {})]), 'get', 'pf1:y', undefined), null, 'a capture is no proved link');
+  const tx = transactionForTests(store);
+  const overPreview = pendingOverlay(tx.view, [row('pf1:t', 1, {})]);
+  assert.ok(!types.isProxy(overPreview), 'a Transaction preview is admitted beneath as before (№2012-2)');
+  assert.deepEqual([readServer(overPreview, 'get', 'pf1:t', undefined), readServer(overPreview, 'get', 'pf1:y', undefined)], ['pending', null],
+    'its own row is still constant, but a read the mutable preview answers has no witness');
+  assert.equal(readServer(proxy, 'get', 'pf1:y', undefined), null);
+  assert.equal(readServer(store, 'get', 'pf1:y', undefined), store, 'a genuine Store serves itself');
+  // A base whose read members change after the overlay was built is no longer the overlay's proved base.
+  const original = Store.prototype.history;
+  Store.prototype.history = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+  try {
+    assert.equal(readServer(overlay, 'history', 'pf1:x', undefined), null, 'the overlay bound the replaced read: no witness');
+    assert.equal(readServer(overlay, 'get', 'pf1:x', undefined), 'pending', 'its own frozen row does not depend on the base');
+  } finally { Store.prototype.history = original; }
+  assert.equal(readServer(overlay, 'history', 'pf1:x', undefined), store, 'with the original read restored the chain is proved again');
 });
