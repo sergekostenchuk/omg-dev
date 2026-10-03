@@ -6,9 +6,12 @@ import { readFileSync } from "node:fs";
 import { ProductEngine } from "./product/engine.js";
 import { createProductServer } from "./server.js";
 import { issueOwnerInvitation } from "./product/owner-authority.js";
+import { probeCommand } from "./om/probe.js";
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const [command, database = ".omg/state.sqlite", directory = ".omg/backups"] = args;
+  // PR1 (№2943): the probe reads only the frozen snapshot it is given and copies it first; it never opens the default database.
+  if (command === "probe") { process.exitCode = await probeCommand(args.slice(1)); return; }
   if (command === "serve") {
     const store = new Store(resolve(database)); const server = createProductServer(new ProductEngine(store));
     const port = Number(args[2] ?? 4318);
@@ -31,7 +34,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|command [database] [backup-directory]; command reads JSON from stdin");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|command [database] [backup-directory]; command reads JSON from stdin; probe --help");
   }
   const store = new Store(resolve(database));
   try {
