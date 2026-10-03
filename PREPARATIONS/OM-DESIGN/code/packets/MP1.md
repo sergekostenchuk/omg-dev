@@ -48,7 +48,7 @@
 - Читает записи: om-question-packet (новая эра); graph (узлы, требования, связи, тесты); стадии (критерии); source: репозитория
 - Пишет записи: om-question-packet новой эры
 - Из движка как есть: method/brief.mjs (правила 1–13, отбор материала), method/engine.mjs (цепочка приёмки), method/run4.mjs (порядок по потокам, контекст соседей), AUDIT-REPORT.md и EXPERIMENT-REVIEW.md (~/REPORTS/audit/omg-live-calls-031026/); LP1 (принята №2852, вливается до MP1): правило путей и эра answerProtocol
-- Уже сделано до тебя: FJ1 «Соединения представителей каркаса: сборка уровня работ проходит при полном закрытии слотов» (src/om/frame-candidate.ts, src/om/frame-obligations.ts, src/graph/layer-assembly.ts); PF2 «Доказательство через накладку служит базе и следующим операциям (машинерия cycle)» (src/history/proofs.ts, src/storage/store-view.ts, src/om/model-call.ts, src/om/input.ts); LP1 «Пути чтения в схеме ответа модели — как в проверке движка» (src/om/question-packet.ts, src/om/answer-form.ts)
+- Уже сделано до тебя: FJ1 «Соединения представителей каркаса: сборка уровня работ проходит при полном закрытии слотов» (src/om/frame-candidate.ts, src/om/frame-obligations.ts, src/graph/layer-assembly.ts); PF2 «Доказательство через накладку служит базе и следующим операциям (машинерия cycle)» (src/history/proofs.ts, src/storage/store-view.ts, src/om/model-call.ts, src/om/input.ts); LP1 «Пути чтения в схеме ответа модели — как в проверке движка» (src/om/question-packet.ts, src/om/answer-form.ts); PR1 «Пробник движка: выборочная проверка запросов к модели на копии базы до платного прохода» (src/om/probe.ts, src/cli.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -69,6 +69,8 @@
 - `src/om/input.ts`
 - `src/om/question-packet.ts`
 - `src/om/answer-form.ts`
+- `src/om/probe.ts`
+- `src/cli.ts`
 
 ### Границы незавершённой интеграции
 
