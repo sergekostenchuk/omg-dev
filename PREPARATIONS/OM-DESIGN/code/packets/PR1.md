@@ -45,7 +45,7 @@
 - Читает записи: копия базы проекта; пакеты/обмены; среда (адаптер)
 - Пишет записи: отчёт пробника (вне базы)
 - Из движка как есть: ~/REPORTS/audit/omg-live-calls-031026/sampler/sampler.mjs (побайтная сверка запросов движка); method/engine.mjs (приёмка: normalizePartAnswer → readFrameProposals F4.3 → applyProposals → assembleCandidate; поля — deriveInputDecisions); урок: входы соединений проверять только полной сборкой
-- Уже сделано до тебя: H2.0 «Ответ владельца на пробел: производитель owner-result и общий читатель» (src/om/owner-result.ts, src/product/engine.ts, src/product/commands.ts, src/server.ts, src/om/answers-gate.ts, src/cli.ts, src/product/owner-authority.ts); MP1 «Сборщик задания для модели: постановка словами, материал по связям карты, правила приёмки словами, проверенный пример, метки вместо хешей» (src/om/question-packet.ts, src/om/packet-brief.ts, src/om/model-call.ts, src/om/answer-form.ts, src/graph/validate.ts, src/graph/semantics.ts, src/graph/layer-assembly.ts, src/om/call-record.ts); MP2 «Порядок и исправление: операции по потокам карты с контекстом принятых соседей; один круг исправления по точному списку отказов» (src/om/run.ts, src/om/model-call.ts, src/om/packet-brief.ts, src/om/question-packet.ts); MP3 «Протокол дочитывания: каталог источников с длинами, исправимая ошибка диапазона, перенос прочитанного» (src/om/answer-form.ts, src/om/model-call.ts, src/om/question-packet.ts, src/om/packet-brief.ts)
+- Уже сделано до тебя: H2.0 «Ответ владельца на пробел: производитель owner-result и общий читатель» (src/om/owner-result.ts, src/product/engine.ts, src/product/commands.ts, src/server.ts, src/om/answers-gate.ts, src/cli.ts, src/product/owner-authority.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -64,15 +64,6 @@
 - `src/om/answers-gate.ts`
 - `src/cli.ts`
 - `src/product/owner-authority.ts`
-- `src/om/question-packet.ts`
-- `src/om/packet-brief.ts`
-- `src/om/model-call.ts`
-- `src/om/answer-form.ts`
-- `src/graph/validate.ts`
-- `src/graph/semantics.ts`
-- `src/graph/layer-assembly.ts`
-- `src/om/call-record.ts`
-- `src/om/run.ts`
 
 ### Границы незавершённой интеграции
 
@@ -85,7 +76,7 @@
 - отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4)
 - подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля
 - окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7)
-- ПРИОРИТЕТ (слово пользователя 03.10 ~22:40): сначала MP1, MP2, MP3 — ревью, вливание и очередь прогонов; PR1 вливается после MP3
+- ВЛИВАНИЕ (слово пользователя 03.10 ~22:45): PR1 вливается сразу после принятия ревью Codex-omg, не дожидаясь MP; приоритет MP — только когда прогоны/ревью конкурируют
 - ДОГОВОР №2943 (Codex-omg; опись №2937): D1 — MC1 и MC2 (факты, input-field, node-expansion L2/L3), диагностика, не ворота прохода и не запись E1/E4; D2 — точки: сохранённые вызовы/пакеты, ближайший cycle из readRun, явная точка — без открытия серий; D3 — до трёх уникальных точек вида (первая/наибольшая/последняя); D4 — --source неподвижный снимок, Store только на своей копии, отказ при WAL/изменении источника; D5–D6 — paid только со всеми пределами, cwd изолированный, лимиты в canonical(wire) code units; сохраняемый автомат отправки (резерв до stdin, onSpawn), «результат неизвестен» без повторной оплаты, один владелец report-dir; D7 — совместная сборка штатной связкой из принятых E3, k из n / candidate / gaps; D8 — тесты самодостаточны, калибровка отдельно; D9 — omg-probe-report/v1, коды 0/1/2; D10 — настоящие коды отказов, rule только при доказанном соответствии; таблица O1–O26; пути ровно три
 - ДО КОДА — опись исполнителя (Sonnet) №2937 и договор ревьюера (Codex-omg — по слову пользователя 03.10 ~21:00 передан от Astra для разгрузки; он же ревью кода): выбор точек, режимы free/paid, копия базы (живая не открывается), отчёт
 - регрессии: на копии omg-live free-режим воспроизводит wire сохранённых обменов 01/06/11/18/20 побайтно; paid-режим на заглушке адаптера; приёмка калибруется: известный отказ v1 E2 — slot_fill_foreign, принятый v2 — ok
