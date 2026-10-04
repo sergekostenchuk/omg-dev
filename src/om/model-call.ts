@@ -1,4 +1,4 @@
-import { packetPrompt } from './packet-brief.js';
+import { briefAnswerRepairable, briefContract, packetPrompt } from './packet-brief.js';
 import type { AnswerGround } from './accepted-answer.js';
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance as readLayerAcceptanceOf, readLayerEnvelope as readLayerEnvelopeOf, readUnacceptedLayer as readUnacceptedLayerOf } from './layer-basis.js';
 import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
@@ -463,7 +463,7 @@ function deriveAssembly(store: Store, request: PartAssemblyRequest, current: boo
   if ((worksContract !== undefined) !== (works !== undefined))
     fail('model_parts_invalid', first.id, 'works', 'A works assembly retains the checked final part handoff', reference(first));
   const root = (packet: QuestionPacketRecord) => {
-    const { previous: _previous, continuation: _continuation, ...rest } = packet.request; return rest;
+    const { previous: _previous, continuation: _continuation, correction: _correction, ...rest } = packet.request; return rest;
   };
   if (!plan || plan.assignments.length !== parts.length || new Set(request.results.map(canonical)).size !== parts.length)
     fail('model_parts_invalid', request.project, 'results', 'A node assembly contains every assigned part exactly once');
@@ -600,7 +600,10 @@ export interface ModelCycleRecord {
   next: Ref | null;
   diagnostic: Ref | null;
   terminal: 'outcome' | 'assembled' | 'blocked' | 'parts-invalid' | 'research-no-progress' | 'reads-invalid';
+  /** MP2 (№2968 §4): a cycle of a brief chain begun after MP2; a saved cycle without it keeps its era's transitions. */
+  cyclePolicy?: typeof CYCLE_POLICY;
 }
+export const CYCLE_POLICY = 'brief-correction/v1' as const;
 export interface ModelCycleOutcome {
   record: Revision<ModelCycleRecord>; last: ModelCallOutcome; assembly: Ref | null; diagnostic: Ref | null; repeated: boolean;
 }
@@ -626,6 +629,94 @@ function knowledgeOf(store: Store, value: Json): string[] {
   }) : value.data;
   return value.questionIds.map(question => hashJson({ question, address, data }));
 }
+/** MP2 (№2968 §3.4): whether a chain already spent its one correction — through any continuation, correction or earlier
+ * part of its ancestry. Several paths to one old correction are one spent round. */
+function correctionUsed(store: Store, project: string, packet: Revision<QuestionPacketRecord>): boolean {
+  const seen = new Set<string>(), stack = [packet];
+  while (stack.length) {
+    const row = stack.pop()!;
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    const request = row.value.request;
+    if (request.correction) return true;
+    for (const ref of [...(request.continuation ? [request.continuation.packet] : []), ...request.previous.map(item => item.packet)])
+      stack.push(take(readQuestionPacket(store, { project, record: ref })) as Revision<QuestionPacketRecord>);
+  }
+  return false;
+}
+export interface CorrectionGround { packet: Ref; call: Ref; response: Ref; diagnostic: Ref }
+export type CorrectionDecision = { eligible: true; refusal: Refusal; raw: string; references: Ref[] } | { eligible: false };
+/**
+ * MP2 (№2968 §3): the one ground of a correction — the saved answer of an applied call of a brief chain whose E3 refusal,
+ * proved again by the common historical E3 on that same raw, is exactly the recorded failure with its derived diagnostic,
+ * belongs to MP1's closed repairable class and stands in an open managed chain that has not spent its correction. The cycle producer, the
+ * cycle reader, the packet derivation and the completion snapshot decide by this same derivation; neither the answer nor
+ * a caller grants it. A refusal of transport, admission, freshness, reads or assembly is no such ground.
+ */
+export function correctionGround(store: Store, project: string, ground: CorrectionGround): CorrectionDecision {
+  const packet = take(readQuestionPacket(store, { project, record: ground.packet })) as Revision<QuestionPacketRecord>;
+  const payload = packet.value.packet, requestId = object(payload) ? payload.requestId : undefined;
+  if (!briefContract(packet.value.packetContract) || packet.value.state !== 'ready' || !text(requestId)) return { eligible: false };
+  // Only a managed attempt stays open past a diagnostic: a standalone finish closes its attempt, nothing is left to correct.
+  const attempt = packet.value.request.attempt;
+  if (!attempt || !take(readCompletionBinding(store, project, attempt.series, attempt.ordinal))) return { eligible: false };
+  const head = store.get<OmModelCall>(modelCallRecordId(project, requestId));
+  if (!head) return { eligible: false };
+  const state = take(readModelCallState(store, { project, record: reference(head) }));
+  if (state.state !== 'applied') return { eligible: false };
+  const outcome = state.outcome, failure = outcome.record.value.om.failure, exchange = outcome.record.value.om.exchange;
+  if (!same(outcome.packet, ground.packet) || !same(outcome.call, ground.call) || !same(outcome.response, ground.response)
+    || !same(outcome.diagnostic, ground.diagnostic) || outcome.part !== null || outcome.outcome !== null || !failure || !exchange
+    || !briefAnswerRepairable(failure.code, failure.at.field ?? '')) return { eligible: false };
+  if (correctionUsed(store, project, packet)) return { eligible: false };
+  const response = take(readPacketResponse(store, { project, packet: ground.packet, call: ground.call, response: ground.response }));
+  const raw = response.record.value.raw;
+  const historical = checkAnswerForm(store, { project, packet: ground.packet, raw });
+  if (historical.ok || !same(historical.refusal, failure)) return { eligible: false };
+  const finish = prepareModelFinish(store, { project, packet: ground.packet, call: ground.call, response: ground.response,
+    reason: 'off-form', code: failure.code, message: failure.message, evidence: [exchange] });
+  if (!same(finish.diagnostic, ground.diagnostic)) return { eligible: false };
+  return { eligible: true, refusal: failure, raw, references: refs([ground.packet, ground.call, ground.response, ground.diagnostic, reference(head)]) };
+}
+/** The same decision for E2, as a typed result of this module. */
+export function readCorrectionGround(store: Store, project: string, ground: CorrectionGround): ModelCallResult<Sealed<CorrectionDecision>> {
+  return result(() => correctionGround(store, project, ground));
+}
+/** MP2: the correctable ground of an applied call, when it has one. */
+function callCorrection(store: Store, project: string,
+  call: { packet: Ref; call: Ref; response: Ref | null; diagnostic: Ref | null; part: unknown; outcome: unknown }): CorrectionGround | null {
+  if (!call.diagnostic || !call.response || call.part !== null || call.outcome !== null) return null;
+  const ground = { packet: call.packet, call: call.call, response: call.response, diagnostic: call.diagnostic };
+  return correctionGround(store, project, ground).eligible ? ground : null;
+}
+/**
+ * MP2 (№3147): an applied call whose chain still owes its correction in this exact registry — the ground is proved and no
+ * call of a packet naming it is among the products. Like an addressed source request, it is the remaining branch of its
+ * step: the step is ceased with that remainder, keeping the paid answer, its diagnostic and its expense. A correction packet
+ * the registry holds is owed only while unclaimed: a dispatched correction resolves through its own physical outcome and is
+ * never declared undispatched; the claim addresses are returned for a cessation to keep absent until it commits.
+ */
+function owedCorrection(store: Store, project: string, products: readonly Ref[],
+  call: { packet: Ref; call: Ref; response: Ref | null; diagnostic: Ref | null; part: unknown; outcome: unknown }): { claims: string[] } | null {
+  const ground = callCorrection(store, project, call);
+  if (!ground) return null;
+  const claims = new Set<string>();
+  for (const ref of products) {
+    const row = store.get<{ packet?: unknown }>(ref.id, ref.revision);
+    if (row?.kind === 'model-call') {
+      const state = take(readModelCallState(store, { project, record: ref }));
+      const record = state.state === 'running' || state.state === 'received' ? state.record : state.outcome.record;
+      if (same(take(readQuestionPacket(store, { project, record: record.value.om.request.packet })).value.request.correction ?? null, ground)) return null;
+      continue;
+    }
+    const packet = row?.kind === 'question-packet' ? ref : row?.kind === COMPLETION_PACKET_KIND && isRef(row.value.packet) ? row.value.packet : null;
+    const source = packet ? store.get<QuestionPacketRecord>(packet.id, packet.revision)?.value : undefined;
+    if (source?.state === 'ready' && same(source.request.correction ?? null, ground))
+      claims.add(modelRecordId(project, (source.packet as { requestId: string }).requestId));
+  }
+  for (const claim of claims) if (store.get(claim)) fail('completion_claim_exists', claim, 'claim', 'A dispatched correction resolves through its own physical outcome');
+  return { claims: [...claims] };
+}
 function addsKnowledge(store: Store, packet: QuestionPacketRecord, data: readonly Json[]): boolean {
   const payload = packet.packet as Record<string, Json>;
   const delivered = Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries.flatMap(item =>
@@ -634,12 +725,17 @@ function addsKnowledge(store: Store, packet: QuestionPacketRecord, data: readonl
   return data.flatMap(value => knowledgeOf(store, value)).some(value => !previous.has(value));
 }
 function cycleSources(store: Store, project: string, value: ModelCycleRecord): ModelCallOutcome {
+  const policy = object(value) && Object.hasOwn(value, 'cyclePolicy');
   if (!object(value) || !object(value.request) || value.request.project !== project || !Array.isArray(value.steps)
     || !value.steps.length || !Array.isArray(value.results) || !value.results.every(isRef)
-    || !exactKeys(value, ['request', 'steps', 'results', 'assembly', 'next', 'diagnostic', 'terminal'])
+    || !exactKeys(value, ['request', 'steps', 'results', 'assembly', 'next', 'diagnostic', 'terminal', ...(policy ? ['cyclePolicy'] : [])])
     || ![value.assembly, value.next, value.diagnostic].every(ref => ref === null || isRef(ref))
     || !value.steps.every(step => object(step) && isRef(step.packet) && isRef(step.record)))
     fail('model_delivery_invalid', project, 'cycle', 'A cycle retains its physical dispatches and exact results');
+  // MP2 (№2968 §4): the marker is known, belongs only to a brief chain, and only it admits a correction edge.
+  if (policy && (value.cyclePolicy !== CYCLE_POLICY
+    || !briefContract(take(readQuestionPacket(store, { project, record: value.request.packet })).value.packetContract)))
+    fail('model_delivery_invalid', project, 'cyclePolicy', 'Only a brief chain carries the known correction policy');
   const calls = value.steps.map(step => take(readModelCall(store, { project, record: step.record })));
   for (let i = 0; i < calls.length; i++) {
     const call = calls[i]!, step = value.steps[i]!;
@@ -658,8 +754,13 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
           fail('model_delivery_invalid', step.record.id, 'continuation', 'Repeated knowledge terminates this cycle before another call');
       } else if (prior.part) {
         const previous = packet.value.request.previous.at(-1);
-        if (!previous || !same(previous, { packet: priorStep.packet, ...prior.part }))
+        if (!previous || packet.value.request.correction || !same(previous, { packet: priorStep.packet, ...prior.part }))
           fail('model_parts_invalid', step.record.id, 'previous', 'The next part must follow this prior result');
+      } else if (policy && packet.value.request.correction) {
+        // MP2: the one correction edge — exactly the prior rejected step, by the common ground of the producer.
+        if (!same(packet.value.request.correction, { packet: priorStep.packet, call: prior.call, response: prior.response, diagnostic: prior.diagnostic })
+          || !callCorrection(store, project, prior))
+          fail('model_delivery_invalid', step.record.id, 'correction', 'A correction follows only the proved correctable refusal of its prior step');
       } else fail('model_delivery_invalid', step.record.id, 'cycle', 'A terminal response does not start another call automatically');
     }
   }
@@ -684,12 +785,17 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
       const set = store.get<ContinuationEvidenceRequest>(deliverySetId(basis));
       if (!set || set.kind !== DELIVERY_SET_KIND) fail('model_delivery_invalid', project, 'deliveries', 'A blocked continuation needs its deliveries');
       take(readContinuationEvidence(store, set.value));
-      expected = { ...prior.value.request, previous: [...prior.value.request.previous],
+      const { correction: _correction, ...base } = prior.value.request;
+      expected = { ...base, previous: [...base.previous],
         continuation: { packet: last.packet, call: last.call, response: last.response, deliveries: [...set.value.deliveries] } };
     } else if (last.part) {
-      const { continuation: _continuation, ...root } = prior.value.request;
+      const { continuation: _continuation, correction: _correction, ...root } = prior.value.request;
       expected = { ...root, previous: [...root.previous, { packet: last.packet, ...last.part }] };
-    } else fail('model_delivery_invalid', project, 'next', 'Only a source request or completed part can have a successor');
+    } else if (policy && callCorrection(store, project, last)) {
+      const { continuation: _continuation, correction: _correction, ...root } = prior.value.request;
+      expected = { ...root, previous: [...root.previous],
+        correction: { packet: last.packet, call: last.call, response: last.response!, diagnostic: last.diagnostic! } };
+    } else fail('model_delivery_invalid', project, 'next', 'Only a source request, completed part or correctable refusal can have a successor');
     if (next.value.state !== 'blocked' || !same(next.value.request, expected) || !next.value.refusal)
       fail('model_delivery_invalid', project, 'next', 'Overflow belongs to this exact cycle successor');
     completion = { code: next.value.refusal.code, message: next.value.refusal.message, evidence: [value.next] };
@@ -715,6 +821,8 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
     completion = { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt', evidence: set.value.deliveries };
   } else if (value.terminal !== 'outcome' || last.outcome?.kind === 'need-source' || last.part !== null) {
     fail('model_delivery_invalid', project, 'terminal', 'A nonterminal source/part response cannot end the cycle');
+  } else if (policy && callCorrection(store, project, last)) {
+    fail('model_delivery_invalid', project, 'terminal', 'A correctable refusal of a brief chain continues with its correction');
   }
   if (completion) {
     const finished = prepareModelFinish(store, { project, packet: last.packet, call: last.call, response: last.response,
@@ -799,7 +907,12 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
     return null;
   });
   if (!selected.ok) return selected;
-  const value: ModelCycleRecord = { request, steps: [], results: [], assembly: null, next: null, diagnostic: null, terminal: 'outcome' };
+  // MP2 (№2968 §4): a new cycle of a brief chain — also one MP1 began without a saved cycle — carries the correction
+  // policy; its already received or applied calls are reused below, never sent again.
+  const chain = result(() => briefContract(take(readQuestionPacket(store, { project: request.project, record: request.packet })).value.packetContract));
+  if (!chain.ok) return chain;
+  const value: ModelCycleRecord = { request, steps: [], results: [], assembly: null, next: null, diagnostic: null, terminal: 'outcome',
+    ...(chain.value ? { cyclePolicy: CYCLE_POLICY } : {}) };
   let packetRef = request.packet;
   // H1.3 (№2121-1): one admission for the whole chain of this invocation. Its first new work — a dispatch, a delivery
   // or a next packet — takes it once, and every later call, continuation and part writes under that same admission: a
@@ -828,7 +941,9 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
           finish(unperformable.code, unperformable.message, [unperformable.ref]); break;
         }
         const delivered = take(deliverModelSources(gate.view(), basis));
-        const next = take(writeQuestionPacket(gate.view(), { ...packet.value.request, previous: [...packet.value.request.previous],
+        // A read after a correction is a new immediate edge; the correction stays in the chain through its packet.
+        const { correction: _correction, ...base } = packet.value.request;
+        const next = take(writeQuestionPacket(gate.view(), { ...base, previous: [...base.previous],
           continuation: { packet: packetRef, call: call.call, response: call.response, deliveries: delivered.deliveries as Ref[] } }));
         if (next.record.value.state !== 'ready') {
           if (next.record.value.refusal?.code === 'research_no_progress') {
@@ -842,7 +957,7 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
       }
       if (call.part && packet.value.plan) {
         if (packet.value.plan.position + 1 < packet.value.plan.assignments.length) {
-          const { continuation: _continuation, ...root } = packet.value.request;
+          const { continuation: _continuation, correction: _correction, ...root } = packet.value.request;
           const next = take(writeQuestionPacket(gate.view(), { ...root, previous: [...root.previous, { packet: packetRef, ...call.part }] }));
           if (next.record.value.state !== 'ready') {
             value.terminal = 'blocked'; value.next = reference(next.record);
@@ -853,6 +968,20 @@ export async function runModelCycle(store: Store, request: ModelCallRequest, sig
         const assembly = assembleModelParts(store, { project: request.project, results: value.results });
         if (assembly.ok) { value.assembly = reference(assembly.value.record); value.terminal = 'assembled'; }
         else { value.terminal = 'parts-invalid'; finish(assembly.refusal.code, assembly.refusal.message, value.results); }
+        break;
+      }
+      // MP2 (№2968 §3): one correction of the chain — the same material, the exact refusal and the previous answer under
+      // a new request, admitted and sent under this same gate. An occupied cycle address is never written over.
+      const correction = value.cyclePolicy ? callCorrection(store, request.project, call) : null;
+      if (correction) {
+        if (store.get(id)) fail('model_delivery_invalid', id, 'cycle', 'A cycle at this exact address was saved meanwhile');
+        const { continuation: _continuation, correction: _correction, ...root } = packet.value.request;
+        const next = take(writeQuestionPacket(gate.view(), { ...root, previous: [...root.previous], correction }));
+        if (next.record.value.state !== 'ready') {
+          value.terminal = 'blocked'; value.next = reference(next.record);
+          finish(next.record.value.refusal?.code ?? 'packet_too_large', next.record.value.refusal?.message ?? 'The complete correction does not fit', [value.next]); break;
+        }
+        packetRef = reference(next.record); continue;
       }
       break;
     }
@@ -2299,6 +2428,94 @@ function completionRoot(binding: Revision<CompletionOwner>, batch: string): Revi
   if (!root) fail('completion_foreign', binding.id, 'batch', 'This packet is outside the original whole assignment');
   return root;
 }
+/** MP2 (№2968 §2): one neighbour of a brief root — the finished node expansion of another root of its managed attempt. */
+export interface NeighbourSource { root: Ref; batch: string; node: string; assembly: Ref; proposal: Ref }
+export interface NeighbourWork {
+  node: string; root: Ref; assembly: Ref; proposal: Ref; writes: string[];
+  nodes: { id: string; kind: string; title: string; parent: string | null; ports: Json; code: Json }[];
+}
+export interface NeighbourRequest {
+  project: string; attempt: { series: Ref; ordinal: number } | null; routes: Ref; batch: string;
+  saved: readonly NeighbourSource[] | null; current: boolean;
+}
+/**
+ * MP2 (№2968 §2, rows 5, 6, 19): the neighbours of a brief root. Without a saved set they are chosen once, at issuance,
+ * from the current registry of the attempt — the assembled results of its other resolved, not ceased node-expansion roots
+ * of the same level, read by the common assembly reader; never by a look-alike id or an accepted flag. A saved set is
+ * proved again, member by member, from its exact references and, for a current admission, still stands: not ceased, the
+ * registry guarded before the check. A later neighbour never enters an issued packet.
+ */
+export function readNeighbourResults(store: Store, request: NeighbourRequest): ModelCallResult<Sealed<{
+  sources: NeighbourSource[]; works: NeighbourWork[]; guards: TransactionGuard[]; references: Ref[];
+}>> {
+  return result(() => {
+    const { project, attempt } = request;
+    const binding = attempt ? take(readCompletionBinding(store, project, attempt.series, attempt.ordinal)) as Revision<CompletionOwner> | null : null;
+    if (!binding) {
+      if (request.saved?.length) fail('completion_foreign', project, 'neighbors', 'Neighbours belong only to a managed attempt');
+      return { sources: [], works: [], guards: [], references: [] };
+    }
+    if (!same(binding.value.plan.routes, request.routes))
+      fail('completion_foreign', binding.id, 'neighbors', 'Neighbours belong to the exact plan of this attempt');
+    const own = completionRoot(binding, request.batch);
+    const routes = take(readRoutes(store, { project, record: binding.value.plan.routes })).record.value;
+    const level = routes.batches.find(row => row.id === request.batch)?.level ?? null;
+    const nodeOf = (batch: string): string | null => {
+      const row = routes.batches.find(item => item.id === batch);
+      return row?.task === 'node-expansion' && row.level === level && text(row.node) ? row.node : null;
+    };
+    const references: Ref[] = [reference(binding), binding.value.plan.routes], guards: TransactionGuard[] = [];
+    const registry = () => {
+      const head = store.get<CompletionWork>(completionWorkId(project, binding.id));
+      if (!head) fail('completion_invalid', binding.id, 'work', 'A managed attempt keeps its registry');
+      // The registry is guarded before anything is read from it.
+      guards.push(reference(head));
+      return take(readCompletionWorkAt(store, project, reference(head)));
+    };
+    const rootOf = (assembly: Sealed<{ record: Revision<PartAssemblyRecord> }>) => {
+      const part = take(readPartResult(store, { project, record: assembly.record.value.results[0]! }));
+      const packet = packetCompletionAssignments(store, binding, part.record.value.request.packet).packet;
+      return completionRoot(binding, packet.value.request.batch!);
+    };
+    let sources: NeighbourSource[];
+    if (request.saved === null) {
+      const snapshot = registry();
+      const ceased = new Set(snapshot.cessations.map(row => row.value.assignment.id));
+      const resolved = new Set(snapshot.resolved.map(ref => ref.id));
+      const found = new Map<string, NeighbourSource>();
+      for (const ref of snapshot.products) {
+        if (store.get(ref.id, ref.revision)?.kind !== PART_ASSEMBLY_KIND) continue;
+        const assembly = take(readPartAssembly(store, { project, record: ref }));
+        const root = rootOf(assembly), node = nodeOf(root.value.batch);
+        if (root.id === own.id || !node || ceased.has(root.id) || !resolved.has(root.id)) continue;
+        const source = { root: reference(root), batch: root.value.batch, node, assembly: ref, proposal: reference(assembly.proposal) };
+        found.set(canonical(source), source);
+      }
+      sources = [...found.values()].sort((a, b) => a.node.localeCompare(b.node) || canonical(a.assembly).localeCompare(canonical(b.assembly)));
+    } else {
+      sources = request.saved.map(source => ({ ...source }));
+      if (request.current) {
+        const ceased = new Set(registry().cessations.map(row => row.value.assignment.id));
+        for (const source of sources) if (ceased.has(source.root.id))
+          fail('input_stale', source.root.id, 'neighbors', 'A saved neighbour no longer stands in the current line', source.root);
+      }
+    }
+    const works = sources.map((source): NeighbourWork => {
+      const assembly = take(readPartAssembly(store, { project, record: source.assembly }));
+      const root = rootOf(assembly);
+      if (!same(reference(assembly.proposal), source.proposal) || !same(reference(root), source.root) || root.value.batch !== source.batch
+        || root.id === own.id || nodeOf(source.batch) !== source.node)
+        fail('completion_foreign', source.assembly.id, 'neighbors', 'A neighbour is the exact finished expansion of another root of this attempt', source.assembly);
+      references.push(source.root, source.assembly, source.proposal, ...assembly.references);
+      const nodes = assembly.proposal.value.nodes.map(node => ({ id: node.id, kind: node.kind, title: node.title, parent: node.parent ?? null,
+        ports: JSON.parse(canonical(node.ports)) as Json, code: JSON.parse(canonical(node.code ?? [])) as Json }));
+      const writes = [...new Set(assembly.proposal.value.nodes.flatMap(node => (node.code ?? [])
+        .filter(code => code.access === 'write').map(code => code.path)))].sort();
+      return { node: source.node, root: source.root, assembly: source.assembly, proposal: source.proposal, nodes, writes };
+    });
+    return { sources, works, guards, references: refs(references) };
+  });
+}
 function packetCompletionAssignments(store: Store, binding: Revision<CompletionOwner>, packetRef: Ref): {
   records: Revision<CompletionAssignment>[]; selected: Revision<CompletionAssignment>; packet: Revision<QuestionPacketRecord>;
 } {
@@ -2315,8 +2532,8 @@ function packetCompletionAssignments(store: Store, binding: Revision<CompletionO
   if (packet.value.state !== 'ready') return { records: [], selected: root, packet };
   let first = packet;
   if (request.previous.length) first = take(readQuestionPacket(store, { project, record: request.previous[0]!.packet })) as Revision<QuestionPacketRecord>;
-  while (first.value.request.continuation)
-    first = take(readQuestionPacket(store, { project, record: first.value.request.continuation.packet })) as Revision<QuestionPacketRecord>;
+  for (let edge = first.value.request.continuation ?? first.value.request.correction; edge; edge = first.value.request.continuation ?? first.value.request.correction)
+    first = take(readQuestionPacket(store, { project, record: edge.packet })) as Revision<QuestionPacketRecord>;
   if (!same(first.value.request.routes, request.routes) || first.value.request.batch !== request.batch
     || !same(first.value.plan?.assignments ?? null, packet.value.plan?.assignments ?? null))
     fail('completion_foreign', packet.id, 'plan', 'Parts and continuations preserve the first proved complete E2 plan');
@@ -2334,6 +2551,14 @@ function packetCompletionAssignments(store: Store, binding: Revision<CompletionO
       source: packetRef, batch: request.batch, position, question: null });
     records.push(...parent.records.filter(row => !records.some(own => own.id === row.id)), continuation);
     selected = continuation;
+  } else if (request.correction) {
+    // MP2 (№2968 §2): the correction is a physical child step of the rejected one, under its own key; old keys stay.
+    const parent = packetCompletionAssignments(store, binding, request.correction.packet);
+    const correction = completionRecord({ contract: 'om-completion-assignment/v1', project, binding: reference(binding),
+      key: `${root.value.key}:correct:${hashJson(request.correction)}`, kind: 'continuation', parent: reference(parent.selected),
+      source: packetRef, batch: request.batch, position, question: null });
+    records.push(...parent.records.filter(row => !records.some(own => own.id === row.id)), correction);
+    selected = correction;
   }
   return { records, selected, packet };
 }
@@ -2588,7 +2813,8 @@ function checkPacketMaterialization(store: Store, snapshot: Sealed<CompletionSna
   const chosen = snapshot.assignments.filter(row => row.value.kind === 'part' && row.value.batch === selected.value.batch);
   if (chosen.length && source.records.filter(row => row.value.kind === 'part').some(row => !chosen.some(old => same(old, row))))
     fail('completion_conflict', selected.id, 'plan', 'Materialization cannot replace the already selected executable plan');
-  if (chosen.length && source.packet.value.state !== 'ready' && !source.packet.value.request.previous.length && !source.packet.value.request.continuation)
+  if (chosen.length && source.packet.value.state !== 'ready' && !source.packet.value.request.previous.length && !source.packet.value.request.continuation
+    && !source.packet.value.request.correction)
     fail('completion_conflict', selected.id, 'plan', 'A blocked new first candidate cannot replace the selected plan');
 }
 /** E2 registers an immutable candidate, while E1 selects its executable plan and all parts. */
@@ -2615,15 +2841,34 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
   const project = binding.value.project, completed = new Set<string>();
   const accepting: Ref[] = [], negative: Ref[] = [], technical: CompletionSnapshot['technical'] = [], waiting: Ref[] = [];
   const diagnostics: Ref[] = [], products = work.value.products;
+  // MP2 (№2968 §3): the refusals a dispatched correction replaced (a call of its packet is registered — never a packet only
+  // written or blocked), and the calls a saved cycle already ended.
+  const corrected = new Set(products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'model-call').flatMap(ref => {
+    const state = take(readModelCallState(store, { project, record: ref }));
+    const record = state.state === 'running' || state.state === 'received' ? state.record : state.outcome.record;
+    const correction = take(readQuestionPacket(store, { project, record: record.value.om.request.packet })).value.request.correction;
+    return correction ? [canonical(correction)] : [];
+  }));
+  const cycled = new Set(products.filter(ref => store.get(ref.id, ref.revision)?.kind === MODEL_CYCLE_KIND)
+    .flatMap(ref => take(readModelCycle(store, { project, record: ref })).record.value.steps.map(step => step.record.id)));
+  // №3147: a step owes nothing more once it, or its correction (a direct continuation), is ceased.
+  const ceased = new Set(graph.cessations.flatMap(row => [row.value.assignment.id,
+    ...graph.assignments.filter(item => item.id === row.value.assignment.id && item.value.parent).map(item => item.value.parent!.id)]));
   for (const call of graph.calls.values()) {
     const step = packetCompletionAssignments(store, binding, call.packet).selected;
     if (call.record.value.om.application === 'application-refused') continue;
     if (call.outcome?.kind === 'need-source') continue;
+    const replaced = call.diagnostic !== null && call.response !== null
+      && corrected.has(canonical({ packet: call.packet, call: call.call, response: call.response, diagnostic: call.diagnostic }));
+    // A refusal its chain still owes the correction keeps its step open: the root is not closed before it (MP2). Once the
+    // step or its correction is ceased (№3147) the refusal is final: it completes its step and decides with its rows.
+    if (call.diagnostic && !replaced && !cycled.has(call.record.id) && !ceased.has(step.id) && callCorrection(store, project, call)) continue;
     completed.add(step.id);
     if (call.diagnostic) {
       diagnostics.push(call.diagnostic);
       const checked = take(readManagedModelDiagnostic(store, binding, call.diagnostic));
-      if (checked.reason === 'off-form' || checked.reason === 'interrupted') technical.push({ source: reference(call.record), reason: checked.reason });
+      // The replaced refusal stays in the history; the corrected chain decides the outcome.
+      if (!replaced && (checked.reason === 'off-form' || checked.reason === 'interrupted')) technical.push({ source: reference(call.record), reason: checked.reason });
       if (checked.reason === 'awaiting-owner') waiting.push(call.diagnostic);
     }
   }
@@ -2966,8 +3211,10 @@ function validateManagedFinish(store: Store, request: FinishModelAttemptRequest,
   }
   if (request.reason === 'refused' && request.response) {
     const source = take(readPacketResponse(store, { project, packet: request.packet, call: request.call, response: request.response }));
-    const checked = take(checkAnswerForm(store, { project, packet: request.packet, raw: source.record.value.raw }));
-    if (checked.kind === 'need-source') {
+    // MP2: a blocked correction stands on a refused answer; only an admitted one can be a read request.
+    const form = checkAnswerForm(store, { project, packet: request.packet, raw: source.record.value.raw });
+    const checked = form.ok ? form.value : null;
+    if (checked?.kind === 'need-source') {
       const reads = readContinuationEvidence(store, { project, packet: request.packet, call: request.call, response: request.response, deliveries: evidence });
       if (reads.ok && !reads.value.novel && request.code === 'research_no_progress'
         && request.message === 'The addressed reads add no information to this attempt') return;
@@ -2977,7 +3224,7 @@ function validateManagedFinish(store: Store, request: FinishModelAttemptRequest,
     }
     for (const ref of evidence) if (store.get(ref.id, ref.revision)?.kind === 'question-packet') {
       const next = take(readQuestionPacket(store, { project, record: ref }));
-      const parent = next.value.request.continuation;
+      const parent = next.value.request.continuation ?? next.value.request.correction;
       const last = next.value.request.previous.at(-1);
       if (next.value.state === 'blocked' && next.value.refusal?.code === request.code && next.value.refusal.message === request.message
         && (parent && same(parent.packet, request.packet) && same(parent.call, request.call) && same(parent.response, request.response)
@@ -3438,10 +3685,11 @@ function cessationValue(store: Store, project: string, request: {
     return { ...base, disposition: 'branch-ceased', remainder };
   }
   if (assignment.value.kind === 'part' || assignment.value.kind === 'continuation') {
+    // Its remaining continuation: an addressed source request, or (MP2, №3147) the correction its chain still owes.
     const outcomes = snapshot.products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'model-call')
       .map(ref => take(readModelCallState(store, { project, record: ref })))
-      .filter(state => state.state === 'applied' && state.outcome.outcome?.kind === 'need-source'
-        && same(state.outcome.record.value.om.completionOwner?.assignment, request.assignment));
+      .filter(state => state.state === 'applied' && same(state.outcome.record.value.om.completionOwner?.assignment, request.assignment)
+        && (state.outcome.outcome?.kind === 'need-source' || owedCorrection(store, project, snapshot.products, state.outcome) !== null));
     if (outcomes.length === 1) return { ...base, disposition: 'branch-ceased', remainder: 'continuation' };
     // A part is reserved by the original complete plan before its E2 can be materialized.
     // It has no physical identity until then; cease only that exact planned remainder.
@@ -3502,11 +3750,16 @@ export function prepareCompletionCessation(store: Store, request: { project: str
     const address = assignmentCallAddress(store, context, packet);
     const physicalHead = address ? store.get<OmModelCall>(address.physicalId) : null;
     let physical: Ref | null = null;
+    const unclaimed: TransactionGuard[] = [];
     if (physicalHead) {
       if (context.assignment.value.kind === 'fact') fail('completion_claim_exists', physicalHead.id, 'claim', 'An assessor claim resolves through its physical E5 outcome');
       const state = take(readModelCallState(store, { project, record: reference(physicalHead) }));
-      if (state.state === 'applied' && state.outcome.outcome?.kind === 'need-source') packet = null;
-      else if (state.state === 'received' || state.state === 'application-refused') physical = reference(physicalHead);
+      const owed = state.state === 'applied' ? owedCorrection(store, project, context.snapshot.products, state.outcome) : null;
+      if (state.state === 'applied' && (state.outcome.outcome?.kind === 'need-source' || owed)) {
+        packet = null;
+        // MP2 (№3147): a packet written for the owed correction stays unclaimed until this cessation commits.
+        unclaimed.push(...(owed?.claims ?? []).map(id => ({ id, absent: true as const })));
+      } else if (state.state === 'received' || state.state === 'application-refused') physical = reference(physicalHead);
       else fail('completion_claim_exists', physicalHead.id, 'claim', 'This physical claim is unresolved or already applied');
     }
     const value = cessationValue(store, project, { ...request, work: reference(work), cause: cause.cause,
@@ -3516,7 +3769,7 @@ export function prepareCompletionCessation(store: Store, request: { project: str
     const completion = take(prepareCompletionProducts(pendingCallStore(store, [write]), binding, [reference(record)]));
     const writes = [write, ...completion.writes];
     const guards: TransactionGuard[] = [...cause.guards, ...completion.guards,
-      ledgerHead ? reference(ledgerHead) : { id: callLedgerId(project), absent: true }];
+      ledgerHead ? reference(ledgerHead) : { id: callLedgerId(project), absent: true }, ...unclaimed];
     if (value.disposition === 'not-dispatched') {
       const callHead = store.get(value.callId!);
       if (!same(callHead ? reference(callHead) : null, value.call)) fail('input_stale', value.callId!, 'call', 'The admitted call changed during preparation');

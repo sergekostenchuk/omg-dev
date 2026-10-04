@@ -313,7 +313,7 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
 }
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
-  seriesCommit?: string, material?: (store: Store, project: string, root: string) => void) {
+  seriesCommit?: string, material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
   const extra = extraQuestion || kind === 'design';
   const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : kind === 'design' ? 'design' : 'addressed'}:${extra}`,
@@ -354,7 +354,22 @@ out(reference(take(openSeries(store, args))));`, firstLine);
     valueOf(beginAttempt(store, kind === 'field' ? { ...address, attempt, goal, admission } as never : { ...address, attempt, goal } as never));
     valueOf(completeAttempt(store, { ...address, attempt, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
   }
-  const ordinal = priorNoProgress + 1;
+  // MP2 (№3153): the preceding attempt refused by the model itself (its E2 packet, E1 and the common E4 finish), so the
+  // packets of the next attempt stand on a non-empty refusal journal.
+  if (priorRefused) {
+    assert.equal(kind, 'node');
+    const attempt = priorNoProgress + 1, refused = valueOf(beginAttempt(store, { ...address, attempt, goal } as never));
+    const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
+      attempt: { series: reference(refused), ordinal: attempt }, previous: [] })).record;
+    const payload = packet.value.packet as Record<string, Json>, assigned = new Set((payload.questions as { id: string }[]).map(item => item.id));
+    const call = valueOf(recordCall(store, project, { call: payload.requestId as string, purpose: payload.purpose as never, basis: null, block: batch.node!,
+      series: reference(refused), attempt, goal, gaps: batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers
+        .map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
+      dispatch: { adapter: reference(adapter), config: reference(configured) }, packet: structuredClone(payload) })).call;
+    valueOf(finishModelAttempt(store, { project, packet: reference(packet), call: reference(call), response: null,
+      code: 'cannot_answer', message: 'The node needs another design', reason: 'refused' }));
+  }
+  const ordinal = priorNoProgress + (priorRefused ? 2 : 1);
   const opening = { ...address, attempt: ordinal, goal, ...(kind === 'field' ? { admission } : {}),
     ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) };
   const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
@@ -3928,4 +3943,422 @@ test('MP1 field examples pass the genuine E3 parser with exact gap labels and pe
     if (example.action === 'answer') assert.equal(actual.kind, 'input-decisions');
   }
   assert.equal(JSON.stringify(f.store.list()), before);
+});
+
+// ---- MP2 (№2968): one correction of a managed brief chain ----
+import { CYCLE_POLICY, correctionGround as mp2Ground, runModelCycle as mp2Cycle, readModelCycle as mp2ReadCycle } from '../src/om/model-call.js';
+/** A node answer the engine refuses for one repairable reason: an unissued slot label (answer_label_unknown). */
+function mp2Refused(f: ReturnType<typeof e4Fixture>, packet: Revision<QuestionPacketRecord> = f.packet as Revision<QuestionPacketRecord>) {
+  const answer = e4Node(f, packet);
+  answer.proposal.fills = answer.proposal.fills.map((fill, index) => index === 0 ? { ...fill, obligation: 'X999' } : fill);
+  return answer;
+}
+/** The applied outcome of one saved step of a cycle. */
+function mp2Step(f: ReturnType<typeof e4Fixture>, step: { record: Ref }) {
+  const state = valueOf(readModelCallState(f.store, { project: f.project, record: step.record }));
+  if (state.state !== 'applied') assert.fail(`Expected an applied call, got ${state.state}`);
+  return state.outcome;
+}
+const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 0, 1000, true, true, false, undefined, undefined, retry);
+
+test('MP2 (№2968 rows 7, 8, 14) a proved repairable E3 refusal of a managed brief chain gets one correction — the same material and labels, the exact refusal and the verbatim answer under a new request — and the corrected part assembles; a restart repeats without a send', async t => {
+  const f = mp2Managed(t);
+  assert.equal(f.packet.value.packetContract, 'om-packet/brief-v1');
+  f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  assert.equal(cycle.record.value.cyclePolicy, CYCLE_POLICY, 'Row 7: a new brief cycle carries the correction policy');
+  assert.equal(cycle.record.value.terminal, 'assembled', 'Row 8: the corrected answer is the normal result');
+  assert.equal(f.sent().length, 2, 'Row 7: exactly one new call');
+  const [first, second] = cycle.record.value.steps;
+  const rejected = mp2Step(f, first!), corrected = f.store.get<QuestionPacketRecord>(second!.packet.id)!;
+  assert.ok(rejected.diagnostic && rejected.response && rejected.record.value.om.failure);
+  assert.equal(rejected.record.value.om.failure!.code, 'answer_label_unknown');
+  assert.deepEqual(corrected.value.request.correction, { packet: first!.packet, call: rejected.call, response: rejected.response, diagnostic: rejected.diagnostic });
+  const { correction: _correction, ...root } = corrected.value.request;
+  assert.deepEqual(root, f.packetRequest, 'Row 7: the same root, attempt and assignment, no new attempt');
+  const prior = f.packet.value.packet as Record<string, any>, payload = corrected.value.packet as Record<string, any>;
+  assert.notEqual(payload.requestId, prior.requestId, 'A new request and response form');
+  assert.equal(payload.responseForm.requestId, payload.requestId);
+  assert.deepEqual(payload.brief.labels, prior.brief.labels, 'The same label map');
+  assert.deepEqual(payload.brief.manifest, prior.brief.manifest, 'The same material');
+  assert.deepEqual(corrected.value.plan, f.packet.value.plan, 'The same assignment');
+  const raw = f.store.get<{ raw: string }>(rejected.response!.id)!.value.raw;
+  assert.deepEqual(payload.correction, { refusals: [{ code: 'answer_label_unknown', field: rejected.record.value.om.failure!.at.field,
+    message: rejected.record.value.om.failure!.message, rule: 'Use the issued label in its declared reference domain.' }], answer: raw });
+  const sent = f.sent()[1] as { prompt: string; requestId: string };
+  assert.equal(sent.requestId, payload.requestId);
+  assert.ok(sent.prompt.includes('# Correction of your previous answer') && sent.prompt.includes('answer_label_unknown') && sent.prompt.includes('X999'));
+  // Row 14: the first refusal keeps its journal; a restart reads and repeats the cycle without any new record or send.
+  assert.ok(f.store.get(rejected.diagnostic!.id));
+  const snapshot = f.store.list().map(reference); f.restart();
+  valueOf(mp2ReadCycle(f.store, { project: f.project, record: reference(cycle.record) }));
+  assert.equal(valueOf(await mp2Cycle(f.store, f.request)).repeated, true);
+  assert.equal(f.sent().length, 2); assert.deepEqual(f.store.list().map(reference), snapshot);
+});
+
+test('MP2 (№2968 rows 9, 4) a refused correction ends the cycle by its own diagnostic: no third call and no second correction', async t => {
+  const f = mp2Managed(t);
+  f.steps([{ research: mp2Refused(f) }, { research: mp2Refused(f) }, { research: e4Node(f) }]);
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'outcome'); assert.equal(f.sent().length, 2);
+  const last = mp2Step(f, cycle.record.value.steps[1]!);
+  assert.deepEqual(cycle.record.value.diagnostic, last.diagnostic, 'The second refusal is the terminal diagnostic');
+  assert.equal(mp2Ground(f.store, f.project, { packet: last.packet, call: last.call, response: last.response!, diagnostic: last.diagnostic! }).eligible, false,
+    'The round is spent: the corrected chain has no second correction');
+  f.restart(); valueOf(mp2ReadCycle(f.store, { project: f.project, record: reference(cycle.record) }));
+});
+
+test('MP2 (№2968 row 10) no correction for what is no repairable answer content: a wrong request id, a control answer, a transport failure, a standalone attempt', async t => {
+  const cases: [string, (f: ReturnType<typeof e4Fixture>) => Record<string, unknown>, boolean][] = [
+    ['request', f => ({ research: { ...e4Node(f), requestId: 'another-request' } }), true],
+    ['cannot', f => ({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'cannot_answer',
+      questionIds: (f.packet.value.packet as { questions: { id: string }[] }).questions.map(question => question.id), reason: 'The fact is unknown.' } }), true],
+    ['transport', () => ({ rawStdout: 'not json' }), true],
+    ['standalone', f => ({ research: mp2Refused(f) }), false],
+  ];
+  for (const [name, answer, managed] of cases) {
+    await t.test(name, async t => {
+      const f = e4Fixture(t, 'node', 100_000, 0, 1000, managed);
+      f.steps([answer(f), { research: e4Node(f) }]);
+      const cycle = await mp2Cycle(f.store, f.request);
+      assert.equal(f.sent().length, 1, `${name}: one call, no correction`);
+      assert.ok(!f.store.list<QuestionPacketRecord>('question-packet').some(row => row.value.request.correction), `${name}: no correction packet`);
+      if (cycle.ok) assert.equal(cycle.value.record.value.terminal, 'outcome');
+    });
+  }
+});
+
+test('MP2 (№2968 row 11; №3153) reads before and inside the correction carry their material; the round is one for the chain and a read does not renew it — in a first attempt and in a later one standing on a non-empty refusal journal', async t => {
+  for (const retry of [false, true]) await t.test(retry ? 'attempt 2 on a non-empty journal' : 'attempt 1', async t => {
+    const f = mp2Managed(t, 100_000, retry);
+    if (retry) assert.ok(f.packet.value.journal, 'The chain root stands on the journal of the refused attempt');
+    writeFileSync(join(f.root, 'e4-more.txt'), 'More context for the correction.');
+    const needFirst = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
+    const needInside = e4NeedSource(f, [{ action: 'read', path: 'e4-more.txt', media: 'text/plain' }]);
+    f.steps([{ research: needFirst }, { research: mp2Refused(f) }, { research: needInside }, { research: e4Node(f) }]);
+    const cycle = valueOf(await mp2Cycle(f.store, f.request));
+    assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, 4);
+    const packets = cycle.record.value.steps.map(step => f.store.get<QuestionPacketRecord>(step.packet.id)!.value);
+    assert.ok(packets[1]!.request.continuation && packets[2]!.request.correction && packets[3]!.request.continuation);
+    assert.equal(packets[3]!.request.correction, undefined, 'A read after the correction is a new immediate edge');
+    const delivered = (packet: QuestionPacketRecord) => (packet.packet as { sourceDeliveries?: unknown[] }).sourceDeliveries ?? [];
+    assert.equal(delivered(packets[2]!).length, 1, 'The correction keeps the delivered material');
+    assert.equal(delivered(packets[3]!).length, 2, 'The read inside the correction adds to it');
+    assert.equal(f.store.list('om-read-delivery').length, 2, 'Each read delivered once');
+    const last = mp2Step(f, cycle.record.value.steps[3]!);
+    assert.equal(last.diagnostic, null);
+    if (retry) assert.deepEqual(packets.map(packet => packet.journal), packets.map(() => f.packet.value.journal), 'Every step stands on the chain root\'s saved journal');
+  });
+});
+
+test('MP2 (№2968 rows 15, 16) a correction request is proved before anything is written: another call, a mixed edge or a non-brief packet refuse; a moved head between preparation and writing refuses without a partial write', async t => {
+  const f = mp2Managed(t);
+  f.steps([{ research: mp2Refused(f) }]);
+  const call = valueOf(await runModelCall(f.store, f.request));
+  assert.ok(call.diagnostic && call.response);
+  const ground = { packet: call.packet, call: call.call, response: call.response!, diagnostic: call.diagnostic! };
+  assert.equal(mp2Ground(f.store, f.project, ground).eligible, true);
+  const before = f.store.list().map(reference);
+  const refusedWith = (request: unknown) => { const result = writeQuestionPacket(f.store, request as QuestionPacketRequest);
+    if (result.ok) assert.fail('Expected a refusal'); return result.refusal.code; };
+  assert.equal(refusedWith({ ...f.packetRequest, correction: { ...ground, diagnostic: call.call } }), 'packet_chain_invalid', 'Row 15: a diagnostic of another record');
+  assert.throws(() => writeQuestionPacket(f.store, { ...f.packetRequest, correction: ground,
+    continuation: { packet: call.packet, call: call.call, response: call.response!, deliveries: [call.call] } } as QuestionPacketRequest),
+  (error: EngineError) => error.code === 'question_packet_request_invalid', 'Row 15: a correction never stands beside a continuation');
+  assert.deepEqual(f.store.list().map(reference), before, 'Row 15: nothing is written');
+  // Row 16: the prepared correction stands on its guards; a moved environment refuses the write without a partial record.
+  const prepared = valueOf(prepareQuestionPacket(f.store, { ...f.packetRequest, correction: ground }));
+  const second = new Store(f.database);
+  try {
+    // A legal configure in the other Store changes the guarded head, without changing the assignment.
+    const old = second.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+    const { projectId: _project, ...config } = structuredClone(old.value);
+    new ProductEngine(second).environments.configure(f.project, config, old.revision);
+  } finally { second.close(); }
+  const written = writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes as Write[], guards: prepared.guards as never });
+  assert.equal(written.ok, false, 'Row 16: the guard refuses');
+  assert.equal(f.store.get(prepared.record.id), null);
+});
+
+test('MP2 (№2968 row 17) a correction that does not fit is the old blocked successor without a send; one that fits is sent', async t => {
+  const f = mp2Managed(t), config = f.environment(f.packet.value.fullChars! + 40);
+  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+  assert.equal(packet.value.state, 'ready');
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
+  const cycle = valueOf(await mp2Cycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'blocked'); assert.equal(f.sent().length, 1);
+  const next = f.store.get<QuestionPacketRecord>(cycle.record.value.next!.id)!;
+  assert.ok(next.value.request.correction); assert.equal(next.value.state, 'blocked'); assert.equal(next.value.packet, null);
+  assert.ok(next.value.refusal && ['node_unexpandable', 'packet_too_large'].includes(next.value.refusal.code));
+  assert.deepEqual(next.value.plan, packet.value.plan, 'No hidden re-planning of the assignment');
+  f.restart(); valueOf(mp2ReadCycle(f.store, { project: f.project, record: reference(cycle.record) }));
+  assert.equal(valueOf(await mp2Cycle(f.store, request)).repeated, true); assert.equal(f.sent().length, 1);
+});
+
+test('MP2 (№2968 rows 14, 18) stopped after the first applied refusal the root stays open; the continued cycle reuses the paid call, corrects once, and the registry decides by the corrected chain with the first refusal kept in its history', async t => {
+  const f = mp2Managed(t);
+  f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+  const call = valueOf(await runModelCall(f.store, f.request));
+  assert.ok(call.diagnostic);
+  const pending = completionSnapshot(f);
+  assert.equal(pending.resolved.length, 0, 'Row 14: the owed correction keeps the root open');
+  assert.ok(!pending.technical.length, 'The owed refusal decides nothing yet');
+  // Stop after the correction packet is written, before its call: the cycle finds the same packet and sends once.
+  const ground = { packet: call.packet, call: call.call, response: call.response!, diagnostic: call.diagnostic! };
+  const written = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, correction: ground })).record;
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  assert.equal(f.sent().length, 2, 'The paid first call is never sent again');
+  assert.deepEqual(cycle.record.value.steps[1]!.packet, reference(written));
+  const done = completionSnapshot(f);
+  const root = done.assignments.find(row => row.value.kind === 'root')!;
+  assert.ok(done.resolved.some(ref => ref.id === root.id), 'Row 18: the corrected chain resolves the root');
+  assert.ok(!done.technical.some(row => row.source.id === call.record.id), 'Row 18: the replaced refusal does not decide the outcome');
+  const journal = f.store.list('om-unit-refusal').some(row => row.id === call.diagnostic!.id);
+  assert.ok(journal, 'The first refusal stays in the history');
+  const correction = done.assignments.find(row => row.value.kind === 'continuation' && row.value.key.includes(':correct:'));
+  assert.ok(correction, 'The correction is its own physical step under the rejected one');
+});
+
+/** The accepted MP1 producer (its merged commit) and the base before it. */
+const MP1_COMMIT = '5ccc463e8c8520019a10e2ab52761650b4817cfd', MP2_BASE_COMMIT = 'dd5fc67dec910d3c26c6516c0c2ebfc60413f981';
+/** A managed node fixture whose root packet is issued by the given producer in its own process, not by this code. */
+function mp2IssuedBy(t: TestContext, commit: string) {
+  const f = e4Fixture(t, 'node', 100_000, 0, 1000, true, false);
+  const issued = h15AtCommit(f, commit, `mp2-packet-${commit.slice(0, 7)}`, `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+const { runModelCall } = await import(src('om/model-call.js'));
+out(reference(take(writeQuestionPacket(store, args)).record));`, f.packetRequest) as Ref;
+  const packet = f.store.get<QuestionPacketRecord>(issued.id)!;
+  return { f, packet, request: { ...f.request, packet: issued } };
+}
+
+test('MP2 (№2968 rows 12, 19; regression 5) the accepted MP1 producer in its own process: its brief root keeps its bytes and no neighbour section; a cycle it ended keeps its era — no policy, no correction, no send; a chain it only began and paid continues under the policy without paying again', async t => {
+  await t.test('ended by MP1', async t => {
+    const { f, packet, request } = mp2IssuedBy(t, MP1_COMMIT);
+    assert.equal(packet.value.packetContract, 'om-packet/brief-v1');
+    assert.equal(Object.hasOwn(packet.value, 'briefNeighbors'), false, 'Row 19: MP1 saved no neighbour form');
+    assert.ok(!(packet.value.packet as { brief: { text: string } }).brief.text.includes('neighbouring roots'));
+    // Row 19: the exact repeat finds and proves the saved packet; it is not replaced by one with neighbours.
+    assert.deepEqual(reference(valueOf(prepareQuestionPacket(f.store, f.packetRequest)).record), reference(packet));
+    assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })).value, packet.value);
+    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
+    const ended = h15AtCommit(f, MP1_COMMIT, 'mp2-mp1-cycle', `const { runModelCycle } = await import(src('om/model-call.js'));
+out(reference(take(await runModelCycle(store, args)).record));`, request) as Ref;
+    assert.equal(f.sent().length, 1);
+    const saved = valueOf(mp2ReadCycle(f.store, { project: f.project, record: ended }));
+    assert.equal(Object.hasOwn(saved.record.value, 'cyclePolicy'), false); assert.equal(saved.record.value.terminal, 'outcome');
+    const snapshot = f.store.list().map(reference); f.restart();
+    assert.equal(valueOf(await mp2Cycle(f.store, request)).repeated, true, 'Row 12: the saved cycle repeats in its era');
+    assert.equal(f.sent().length, 1); assert.deepEqual(f.store.list().map(reference), snapshot);
+  });
+  await t.test('begun by MP1', async t => {
+    const { f, packet, request } = mp2IssuedBy(t, MP1_COMMIT);
+    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
+    const paid = h15AtCommit(f, MP1_COMMIT, 'mp2-mp1-call', `const { runModelCall } = await import(src('om/model-call.js'));
+out(reference(take(await runModelCall(store, args)).record));`, request) as Ref;
+    assert.equal(f.sent().length, 1);
+    const cycle = valueOf(await mp2Cycle(f.store, request));
+    assert.equal(cycle.record.value.cyclePolicy, CYCLE_POLICY, 'A brief chain MP1 began without a saved cycle gets the policy');
+    assert.equal(cycle.record.value.steps[0]!.record.id, paid.id, 'The paid call is reused');
+    assert.equal(f.sent().length, 2, 'Only the correction is sent'); assert.equal(cycle.record.value.terminal, 'assembled');
+  });
+  await t.test('a packet of the base before MP1', async t => {
+    const { f, packet, request } = mp2IssuedBy(t, MP2_BASE_COMMIT);
+    assert.equal(packet.value.packetContract, 'om-packet/v3');
+    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
+    const cycle = valueOf(await mp2Cycle(f.store, request));
+    assert.equal(Object.hasOwn(cycle.record.value, 'cyclePolicy'), false, 'Row 12: an old protocol chain keeps its path');
+    assert.equal(f.sent().length, 1); assert.equal(cycle.record.value.terminal, 'outcome');
+    const correction = writeQuestionPacket(f.store, { ...f.packetRequest, correction: { packet: reference(packet), call: mp2Step(f, cycle.record.value.steps[0]!).call,
+      response: mp2Step(f, cycle.record.value.steps[0]!).response!, diagnostic: mp2Step(f, cycle.record.value.steps[0]!).diagnostic! } });
+    assert.equal(correction.ok, false, 'Row 15: no correction for another era');
+  });
+});
+
+test('MP2 (№2968 row 13) join inputs are no answer check: a part whose join names only some inputs passes E3 without a correction; only the full assembly judges them', async t => {
+  const f = mp2Managed(t);
+  const answer = e4Node(f), node = answer.proposal.nodes[0]!;
+  answer.proposal.joins = [{ id: 'mp2-partial-join', consumer: node.id, connectors: ['garden-flow'],
+    failures: { missing: 'missing input', extra: 'extra input', foreign: 'foreign input', stale: 'stale input', duplicate: 'duplicate input', returnsTo: node.id } }];
+  f.steps([{ research: answer }, { research: e4Node(f) }]);
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  assert.equal(f.sent().length, 1, 'No correction for what only the assembly checks');
+  const first = mp2Step(f, cycle.record.value.steps[0]!);
+  assert.equal(first.diagnostic, null); assert.ok(first.part, 'E3 accepted the part');
+  assert.ok(['assembled', 'parts-invalid'].includes(cycle.record.value.terminal), 'The assembly decides');
+  assert.ok(!f.store.list<QuestionPacketRecord>('question-packet').some(row => row.value.request.correction));
+});
+
+test('MP2 (№2968 rows 11, 19; №3153) a correction of a part keeps the earlier parts and the root neighbour form of the chain, the parts after it stand on the corrected answer; the chain has one correction — in a first attempt and in a later one standing on a non-empty refusal journal', async t => {
+  for (const retry of [false, true]) for (const refused of [1, 0]) await t.test(`${refused ? 'a later' : 'the first'} part, ${retry ? 'attempt 2 on a non-empty journal' : 'attempt 1'}`, async t => {
+    const f = mp2Managed(t, 100_000, retry), config = f.environment(f.packet.value.fullChars! - 1);
+    const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record as Revision<QuestionPacketRecord>;
+    assert.equal(packet.value.plan!.mode, 'parts');
+    const total = packet.value.plan!.assignments.length;
+    assert.ok(total >= 2, 'The node is split into parts');
+    const at = (position: number) => ({ ...packet, value: { ...packet.value, plan: { ...packet.value.plan!, position } } }) as Revision<QuestionPacketRecord>;
+    f.steps(Array.from({ length: total }, (_, position) => position === refused ? [{ research: mp2Refused(f, at(position)) }, { research: e4Node(f, at(position)) }]
+      : [{ research: e4Node(f, at(position)) }]).flat());
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    const cycle = valueOf(await mp2Cycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, total + 1);
+    const steps = cycle.record.value.steps, packets = steps.map(step => f.store.get<QuestionPacketRecord>(step.packet.id)!.value);
+    const correction = packets[refused + 1]!;
+    assert.ok(correction.request.correction, 'The step after the refused part corrects it');
+    assert.equal(correction.request.previous.length, refused, 'It keeps the earlier parts');
+    assert.equal(correction.plan!.position, refused);
+    for (const later of packets.slice(refused + 2))
+      assert.deepEqual(later.request.previous[refused]!.packet, steps[refused + 1]!.packet, 'A part after the correction stands on the corrected answer');
+    for (const value of packets) assert.deepEqual(value.briefNeighbors, packet.value.briefNeighbors, 'Row 19: one neighbour form for the whole chain');
+    assert.equal(packets.filter(value => value.request.correction).length, 1, 'One correction for the chain');
+    if (retry) {
+      assert.ok(packet.value.journal, 'The chain root stands on the journal of the refused attempt');
+      assert.deepEqual(packets.map(value => value.journal), packets.map(() => packet.value.journal), 'Every step stands on the chain root\'s saved journal');
+    }
+  });
+});
+
+test('MP2 (№2968 regression 4) the one correction for an MC1 fact and for input fields: an unissued label is corrected once; the corrected fact still awaits its E5 assessment, the corrected fields are applied', async t => {
+  await t.test('MC1 fact', async t => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+    const refused = e4Fact(f); refused.results = refused.results.map(row => ({ ...row, questionId: 'Q999' }));
+    f.steps([{ research: refused }, { research: e4Fact(f) }]);
+    const cycle = valueOf(await mp2Cycle(f.store, f.request));
+    assert.equal(f.sent().length, 2); assert.equal(cycle.record.value.cyclePolicy, CYCLE_POLICY);
+    const last = mp2Step(f, cycle.record.value.steps[1]!);
+    assert.equal(last.diagnostic, null); assert.equal(last.outcome?.kind, 'fact-candidates');
+    const snapshot = completionSnapshot(f);
+    const facts = snapshot.assignments.filter(row => row.value.kind === 'fact');
+    assert.ok(facts.length > 0 && facts.every(row => !snapshot.resolved.some(ref => ref.id === row.id)), 'The fact still awaits E5; E3 is no assessment');
+  });
+  await t.test('input fields', async t => {
+    const f = e4Fixture(t, 'field', 100_000, 0, 1000, true);
+    const answer = (basis: (item: typeof f.batch.items[number]) => unknown) => ({ protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
+      results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: basis(item), value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) });
+    f.steps([{ research: answer(() => 'G999') }, { research: answer(item => item.record) }]);
+    const cycle = valueOf(await mp2Cycle(f.store, f.request));
+    assert.equal(f.sent().length, 2);
+    const first = mp2Step(f, cycle.record.value.steps[0]!), last = mp2Step(f, cycle.record.value.steps[1]!);
+    assert.equal(first.record.value.om.failure?.code, 'answer_label_unknown');
+    assert.equal(last.outcome?.kind, 'input-decisions'); assert.ok(last.record.value.om.input);
+  });
+});
+
+test('MP2 (№2968 row 14) stopped after the correction call was applied, before the cycle record: the cycle reuses both paid calls and sends nothing', async t => {
+  const f = mp2Managed(t);
+  f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+  const first = valueOf(await runModelCall(f.store, f.request));
+  const ground = { packet: first.packet, call: first.call, response: first.response!, diagnostic: first.diagnostic! };
+  const correction = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, correction: ground })).record;
+  const second = valueOf(await runModelCall(f.store, { ...f.request, packet: reference(correction) }));
+  assert.ok(second.part); assert.equal(f.sent().length, 2);
+  f.restart();
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  assert.equal(f.sent().length, 2, 'No call is sent again'); assert.equal(cycle.record.value.terminal, 'assembled');
+  assert.deepEqual(cycle.record.value.steps.map(step => step.record.id), [first.record.id, second.record.id]);
+});
+
+test('MP2 return №3147 (rows 14, 16; §4) a step whose chain owes its correction is ceased lawfully when the environment changes — before the correction is written and after it is written but not sent: branch ceased with its continuation remainder, the paid answer, diagnostic and expense kept, nothing sent, the root ceased by its ceased step, the cessation read back after a restart', async t => {
+  const { prepareCompletionCause, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
+  for (const boundary of ['not written', 'written, not sent'] as const) await t.test(boundary, async t => {
+    const f = mp2Managed(t);
+    f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+    const first = valueOf(await runModelCall(f.store, f.request));
+    const owner = first.record.value.om.completionOwner!;
+    const ground = { packet: first.packet, call: first.call, response: first.response!, diagnostic: first.diagnostic! };
+    if (boundary === 'written, not sent') valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, correction: ground }));
+    assert.equal(completionSnapshot(f).resolved.length, 0, 'The owed correction keeps the root open');
+    f.environment(90_000);
+    assert.ok(valueOf(prepareCompletionCause(f.store, f.project, owner.assignment)).cause, 'The changed environment ends the owed step');
+    const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: owner.assignment }));
+    assert.deepEqual([ceased.value.disposition, ceased.value.remainder, ceased.value.packet, ceased.value.physical],
+      ['branch-ceased', 'continuation', null, null], 'The paid call is no never-dispatched claim; its remainder is the owed continuation');
+    const rootCessation = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) }));
+    assert.equal(rootCessation.value.cause.kind, 'cycle-step-ceased');
+    const snapshot = completionSnapshot(f);
+    assert.equal(snapshot.complete, true, 'The attempt can close');
+    assert.ok(snapshot.refusals.length > 0, 'The paid refusal keeps its journal rows for the close');
+    assert.ok(snapshot.technical.some(row => row.reason === 'interrupted'), 'The cessation is the technical outcome');
+    f.restart();
+    assert.deepEqual(valueOf(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased, 'The common derivation reads it back');
+    const cycle = await mp2Cycle(f.store, f.request);
+    assert.equal(cycle.ok, false); if (!cycle.ok) assert.equal(cycle.refusal.code, 'completion_ceased');
+    assert.equal(f.sent().length, 1, 'Nothing is sent: neither the paid answer again nor its correction');
+    assert.ok(f.store.get(first.diagnostic!.id) && f.store.get(first.response!.id), 'The paid answer and its diagnostic stay');
+  });
+});
+
+/** The cycle stops after the correction call's durable boundary: the second of its kind, the first being the refused call's. */
+async function mp2StopAfter(f: ReturnType<typeof e4Fixture>, boundary: 'admitted' | 'running' | 'received' | 'applied') {
+  const phaseOf = (writes: Write[]) => {
+    const runtime = writes.find(write => write.kind === 'model-call')?.value as unknown as OmModelCall | undefined;
+    if (runtime) return runtime.status === 'running' ? runtime.execution?.phase === 'authorized' ? 'authorized' : 'running' : runtime.om.application;
+    return writes.some(write => write.kind === 'call-record' && write.expected === 0) ? 'admitted' : null;
+  };
+  const writeMany = f.store.writeMany.bind(f.store);
+  let seen = 0;
+  f.store.writeMany = ((writes, guards) => {
+    const committed = writeMany(writes, guards);
+    if (writes.length && phaseOf(writes) === boundary && ++seen === 2) throw new Error('MP2 stop after the correction boundary');
+    return committed;
+  }) as Store['writeMany'];
+  try { await assert.rejects(mp2Cycle(f.store, f.request), /MP2 stop after the correction boundary/); }
+  finally { f.store.writeMany = writeMany; }
+}
+test('MP2 return №3147 (§4): a correction admitted but never claimed is still owed — the rejected step\'s cessation guards the absence of its claim; once claimed, received or applied the rejected step owes nothing: its cessation is refused on the correction\'s own claim or as resolved, nothing written, nothing sent again', async t => {
+  const { prepareCompletionCessation, writeCompletionCessation, modelCallRecordId } = await import('../src/om/model-call.js');
+  for (const boundary of ['admitted', 'running', 'received', 'applied'] as const) await t.test(boundary, async t => {
+    const f = mp2Managed(t);
+    f.steps([{ research: mp2Refused(f) }, { research: mp2Refused(f) }]);
+    await mp2StopAfter(f, boundary);
+    const rejected = f.store.list<OmModelCall>('model-call').find(row => row.value.om.request.packet.id === f.packet.id)!;
+    const correction = f.store.list<QuestionPacketRecord>('question-packet').find(row => row.value.request.correction)!;
+    const claim = modelCallRecordId(f.project, (correction.value.packet as { requestId: string }).requestId);
+    const owner = rejected.value.om.completionOwner!, sent = f.sent().length;
+    assert.equal(sent, ['admitted', 'running'].includes(boundary) ? 1 : 2);
+    f.environment(90_000);
+    const before = f.store.list().map(reference);
+    if (boundary === 'admitted') {
+      assert.equal(f.store.get(claim) ?? null, null, 'Admitted, never claimed');
+      const prepared = valueOf(prepareCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: owner.assignment }));
+      assert.deepEqual([prepared.record.value.disposition, prepared.record.value.remainder], ['branch-ceased', 'continuation'], 'The correction is still owed');
+      assert.ok(prepared.guards.some(guard => guard.id === claim && (guard as { absent?: boolean }).absent === true),
+        'Its claim stays absent until the cessation commits');
+    } else {
+      const refused = writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: owner.assignment });
+      assert.equal(refused.ok, false, 'A dispatched correction leaves no owed remainder on the rejected step');
+      if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.target],
+        boundary === 'applied' ? ['completion_resolved', owner.assignment.id] : ['completion_claim_exists', claim]);
+    }
+    assert.deepEqual(f.store.list().map(reference), before, 'Nothing is written');
+    assert.equal(f.sent().length, sent, 'Nothing is sent again');
+  });
+});
+
+test('MP2 return №3147 (§4; №2968 ¶25): once admitted the correction is the leaf the pass ceases first — admitted but never claimed as never dispatched with its unpaid E1, received by its application; the rejected step is resolved by it and its refusal stays final: it completes the step and decides the close with its rows, as when the step itself is ceased', async t => {
+  const { writeCompletionCessation } = await import('../src/om/model-call.js');
+  for (const boundary of ['admitted', 'received'] as const) await t.test(boundary, async t => {
+    const f = mp2Managed(t);
+    f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+    await mp2StopAfter(f, boundary);
+    const rejected = f.store.list<OmModelCall>('model-call').find(row => row.value.om.request.packet.id === f.packet.id)!;
+    const owner = rejected.value.om.completionOwner!, diagnostic = rejected.value.om.diagnostic!, sent = f.sent().length;
+    const correction = completionSnapshot(f).assignments.find(row => row.value.kind === 'continuation' && row.value.parent?.id === owner.assignment.id)!;
+    assert.ok(correction, 'The correction is the leaf of the rejected step');
+    f.environment(90_000);
+    const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(correction) }));
+    assert.deepEqual([ceased.value.disposition, ceased.value.remainder, ceased.value.call !== null],
+      boundary === 'received' ? ['branch-ceased', 'application', true] : ['not-dispatched', null, true]);
+    const snapshot = completionSnapshot(f);
+    assert.ok(snapshot.resolved.some(ref => ref.id === owner.assignment.id), 'The rejected step is resolved through its ceased correction');
+    assert.ok(snapshot.technical.some(row => row.source.id === rejected.id && row.reason === 'off-form'), 'Its refusal is final: no verified answer replaced it');
+    const rows = f.store.get<{ rows: { id: string; source: Ref }[] }>(`om-refusal-journal:${f.project}`)!.value.rows.filter(row => row.source.id === diagnostic.id);
+    assert.ok(rows.length && rows.every(row => snapshot.refusals.some(item => item.row === row.id)), 'It decides the close with its journal rows');
+    const root = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) }));
+    assert.equal(root.value.cause.kind, 'cycle-step-ceased');
+    assert.equal(completionSnapshot(f).complete, true, 'The attempt can close');
+    const cycle = await mp2Cycle(f.store, f.request);
+    assert.equal(cycle.ok, false); if (!cycle.ok) assert.equal(cycle.refusal.code, 'completion_ceased');
+    assert.equal(f.sent().length, sent, 'Nothing is sent again');
+  });
 });

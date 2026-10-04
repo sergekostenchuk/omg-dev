@@ -37,6 +37,8 @@ import { stageId } from "../pipeline/contracts.js";
 import { StageChecks } from "../product/stage-checks.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readGaps as readGapsOf, type GapReadRequest } from "./gaps.js";
+import { readFrameProposals as readFrameProposalsOf } from "./frame-proposals.js";
+import type { Graph } from "../graph/model.js";
 import type { DispatchContract } from "./call-record.js";
 import { RunControlGate, RunControlLost, type RunControlHold } from "./run-control.js";
 
@@ -74,7 +76,7 @@ export type RunErrorCode = typeof RUN_ERROR_CODES[number];
 export type RunSource = "refs" | "routes" | "queue" | "horizon" | "run-bases" | "input" | "accepted-answer" | "addressing" | "series"
   | "repeat-gate" | "stop-analysis" | "model-call" | "question-packet" | "assessment" | "answers-gate" | "frame-candidate"
   | "frame-accept" | "layer-basis" | "atomic-gate" | "gap-lines" | "obligations" | "feasibility" | "handoff" | "gaps"
-  | "stage-checks" | "run-control";
+  | "stage-checks" | "run-control" | "frame-proposals";
 export type RunResultCode = RunLocalCode | SourceCodes<RunSource>;
 export type RunResult<T> = OmResult<T, RunResultCode>;
 
@@ -135,6 +137,7 @@ const readFeasibility = transferring("feasibility", readFeasibilityOf);
 const writeFeasibility = transferring("feasibility", writeFeasibilityOf);
 const writeHandoff = transferring("handoff", writeHandoffOf);
 const readGaps = transferring("gaps", readGapsOf);
+const readFrameProposals = transferring("frame-proposals", readFrameProposalsOf);
 const runStopAnalysis = async (...args: Parameters<typeof runStopAnalysisOf>) => transfer("stop-analysis", await runStopAnalysisOf(...args));
 const runModelCycle = async (...args: Parameters<typeof runModelCycleOf>) => transfer("model-call", await runModelCycleOf(...args));
 const assessFact = async (...args: Parameters<typeof assessFactOf>) => transfer("assessment", await assessFactOf(...args));
@@ -924,6 +927,78 @@ function sameStop(store: Store, project: string, series: Revision<AnyRepairSerie
 }
 
 /**
+ * MP2 (№2968 §2): the order of still unstarted node-expansion roots — producer before consumer by the direct flows of the
+ * expanded level in the exact upper graph of their frame: strongly connected components in the topological order of their
+ * condensation, the ready component with the least node id first, inside it by node id, one node's batches by batch and
+ * then assignment id. Sleeping flows, other levels and self-references set no order; every binding and consumer counts.
+ */
+export function rankExpansions(items: readonly { id: string; node: string; batch: string; level: 2 | 3 }[],
+  upperOf: (level: 2 | 3) => Graph): string[] {
+  const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  const nodes = [...new Set(items.map(item => item.node))].sort(compare);
+  const succ = new Map(nodes.map(node => [node, new Set<string>()]));
+  for (const level of [...new Set(items.map(item => item.level))].sort()) {
+    for (const connector of upperOf(level).connectors) for (const binding of connector.bindings) {
+      if (binding.anchor !== null || binding.level !== level - 1 || !succ.has(binding.producer.node)) continue;
+      for (const consumer of binding.consumers)
+        if (consumer.node !== binding.producer.node && succ.has(consumer.node)) succ.get(binding.producer.node)!.add(consumer.node);
+    }
+  }
+  // Tarjan's components, then Kahn over the condensation with the least member id among the ready components.
+  const index = new Map<string, number>(), low = new Map<string, number>(), stack: string[] = [], on = new Set<string>();
+  const component = new Map<string, number>(), members: string[][] = [];
+  let counter = 0;
+  const connect = (node: string): void => {
+    index.set(node, counter); low.set(node, counter++); stack.push(node); on.add(node);
+    for (const next of [...succ.get(node)!].sort(compare)) {
+      if (!index.has(next)) { connect(next); low.set(node, Math.min(low.get(node)!, low.get(next)!)); }
+      else if (on.has(next)) low.set(node, Math.min(low.get(node)!, index.get(next)!));
+    }
+    if (low.get(node) !== index.get(node)) return;
+    const own: string[] = [];
+    for (let member = stack.pop()!; ; member = stack.pop()!) { on.delete(member); component.set(member, members.length); own.push(member); if (member === node) break; }
+    members.push(own.sort(compare));
+  };
+  for (const node of nodes) if (!index.has(node)) connect(node);
+  const indegree = members.map(() => 0), after = members.map(() => new Set<number>());
+  for (const [node, next] of succ) for (const to of next) {
+    const from = component.get(node)!, into = component.get(to)!;
+    if (from !== into && !after[from]!.has(into)) { after[from]!.add(into); indegree[into]!++; }
+  }
+  const order: string[] = [], ready = members.map((_, at) => at).filter(at => indegree[at] === 0);
+  while (ready.length) {
+    ready.sort((a, b) => compare(members[a]![0]!, members[b]![0]!));
+    const at = ready.shift()!;
+    order.push(...members[at]!);
+    for (const into of after[at]!) if (--indegree[into]! === 0) ready.push(into);
+  }
+  const rank = new Map(order.map((node, at) => [node, at]));
+  return [...items].sort((a, b) => rank.get(a.node)! - rank.get(b.node)! || compare(a.batch, b.batch) || compare(a.id, b.id)).map(item => item.id);
+}
+/**
+ * The attempt's leaves in the order they are worked: every leaf that is not an unstarted node-expansion root keeps its place
+ * in front — a saved step or begun physical work is never overtaken by a rank — and the unstarted roots follow by their rank.
+ */
+function flowOrder(store: Store, scope: GapReadRequest, batches: readonly RouteBatch[], leaves: Revision<unknown>[],
+  started: (root: Ref) => boolean): Revision<unknown>[] {
+  const ranked = leaves.flatMap(row => {
+    const value = row.value as CompletionAssignment;
+    const batch = value.kind === "root" ? batches.find(item => item.id === value.batch) : undefined;
+    return batch?.task === "node-expansion" && typeof batch.node === "string" && batch.level !== null && !started(reference(row))
+      ? [{ id: row.id, node: batch.node, batch: batch.id, level: batch.level }] : [];
+  });
+  if (!ranked.length) return leaves;
+  // Begun work goes first even beside a single unstarted root; only two or more need the rank of their frame.
+  const upper = new Map<2 | 3, Graph>();
+  const order = ranked.length < 2 ? ranked.map(item => item.id) : rankExpansions(ranked, level => {
+    if (!upper.has(level)) upper.set(level, (take(readFrameProposals(store, (level === 2 ? scope.sources.operations : scope.sources.works) as never)) as unknown as
+      { frame: { upper: Graph } }).frame.upper);
+    return upper.get(level)!;
+  });
+  const byId = new Map(leaves.map(row => [row.id, row]));
+  return [...leaves.filter(row => !ranked.some(item => item.id === row.id)), ...order.map(id => byId.get(id)!)];
+}
+/**
  * The open attempt continues by its registry. A standalone attempt (no binding) is never adopted: the pass waits for
  * its own E4/E5/G7 way (№1737 п.3). For a managed one the next unfinished assignment is chosen from the work itself,
  * never from today's E1 ledger (C23); a complete work is checked (block G4b) and closed through G7 with its derived claim.
@@ -984,7 +1059,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     });
   };
   const explained = new Set<string>();
-  for (const assignment of open.filter(row => !parents.has(row.id))) {
+  const started = (root: Ref): boolean => work.products.some(product => {
+    const record = store.get<{ root?: Ref; packet?: Ref }>(product.id, product.revision);
+    return record?.kind === "om-completion-packet" && isRef(record.value.root) && sameRef(record.value.root, root) && isRef(record.value.packet);
+  });
+  for (const assignment of flowOrder(store, scope, plan.value.batches, open.filter(row => !parents.has(row.id)), started)) {
     const value = assignment.value as CompletionAssignment;
     // Row 6, №1737 п.9: an unfinished assignment whose required condition lawfully changed is ended by the common H1.0b
     // producer with its proved cause; a live or unknown claim stays that producer's refusal and so an addressed wait.
@@ -1204,7 +1283,7 @@ function packetPlace(store: Store, project: string, packet: Ref): OmResult<"star
   const read = readQuestionPacket(store, { project, record: packet });
   if (!read.ok) return read;
   const request = read.value.value.request;
-  return { ok: true, value: !request.continuation && request.previous.length === 0 ? "start" : "step" };
+  return { ok: true, value: !request.continuation && !request.correction && request.previous.length === 0 ? "start" : "step" };
 }
 /**
  * A saved cycle that is no work of the pass: never performed (no cycle of its exact request) and started with a packet

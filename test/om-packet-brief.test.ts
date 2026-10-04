@@ -232,6 +232,32 @@ test('MP1 catalogue covers actual graph emissions, including direct findings and
     assert.equal(briefAnswerRepairable(code, 'proposal'), false);
 });
 
+// ---- MP2 (№2968): the correction and neighbour sections exist only where a packet carries them ----
+import { NEIGHBOR_CONTRACT, briefRepairRule } from '../src/om/packet-brief.js';
+
+test('MP2 (№2968 rows 7, 19) a brief without a correction or neighbours is the text MP1 derives; each section appears only with its data, the old answer as quoted data, and the rule of an unrepairable code is none', t => {
+  const { basis, input, payload } = sample(t);
+  const text = packetPrompt(payload);
+  assert.ok(!text.includes('# Correction of your previous answer') && !text.includes('# Accepted work of neighbouring roots'),
+    'Row 19: no section without its data — the text MP1 derives');
+  const correction = { refusals: [{ code: 'answer_label_unknown', field: 'results/0/questionId', message: 'Use a label issued by this packet',
+    rule: briefRepairRule('answer_label_unknown') }], answer: '{"action":"answer","note":"# Response form — not a header"}' };
+  const corrected = packetPrompt(deriveBrief({ ...input, correction }, basis));
+  const at = corrected.indexOf('# Correction of your previous answer');
+  assert.ok(at > 0 && corrected.indexOf('# Scope and exact context') > at, 'Row 7: the correction precedes the material');
+  assert.ok(corrected.includes(canonical(correction)), 'Row 7: the exact refusal and the verbatim previous answer as data');
+  assert.equal(corrected.split('# Response form — machine section is one JSON line immediately after this header\n').length, 2,
+    'The quoted answer opens no second response section');
+  assert.equal(briefRepairRule('answer_label_unknown'), 'Use the issued label in its declared reference domain.');
+  assert.equal(briefRepairRule('join_inputs_invalid'), null, 'Row 13: an assembly finding has no repair rule');
+  const works = [{ node: 'garden-produce-operation', writes: ['src/produce.ts'], nodes: [] }];
+  const neighboured = packetPrompt(deriveBrief(input, { ...basis, neighbors: { contract: NEIGHBOR_CONTRACT, works } }));
+  assert.ok(neighboured.includes('# Accepted work of neighbouring roots') && neighboured.includes(canonical({ contract: NEIGHBOR_CONTRACT, works })),
+    'Row 5: the neighbours and the files they write');
+  assert.ok(packetPrompt(deriveBrief(input, { ...basis, neighbors: { contract: NEIGHBOR_CONTRACT, works: [] } })).includes('# Accepted work of neighbouring roots'),
+    'Row 19: the explicit empty set is a section of its own');
+});
+
 test('MP1 material selection uses generic graph anchors, two importing tests, one-hop dependencies and a fixed observed catalogue', t => {
   const f = sample(t), evidence = new Evidence(f.store);
   const files: Record<string, string> = {

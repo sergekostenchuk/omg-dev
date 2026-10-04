@@ -1,11 +1,11 @@
-import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, briefContract, briefMaterial, boundedBrief, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel } from './packet-brief.js';
+import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel } from './packet-brief.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
 import { ANSWER_FORM_CODES } from './answer-form.js';
 import { Ajv } from 'ajv';
 import type { Selector } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall, type AnyCallRecord } from './call-record.js';
-import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic } from './model-call.js';
+import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic, readCorrectionGround, readNeighbourResults, type NeighbourSource } from './model-call.js';
 import { readAssessmentRefusalAt } from './assessment.js';
 import { readDefinitions } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -148,12 +148,16 @@ export interface QuestionPacketRequest {
   previous: { packet: Ref; proposal: Ref; result: Ref }[];
   works?: { producer: Ref; ledger: Ref };
   continuation?: { packet: Ref; call: Ref; response: Ref; deliveries: Ref[] };
+  /** MP2 (№2968 §3): the exact rejected step this packet corrects — never beside a continuation. */
+  correction?: { packet: Ref; call: Ref; response: Ref; diagnostic: Ref };
 }
 export interface QuestionPacketRecord {
   project: string; request: QuestionPacketRequest; state: 'ready' | 'blocked' | 'empty';
   answerProtocol?: 'omg-answer/v2' | 'omg-answer/v3';
   packetContract?: 'om-packet/v3' | 'om-packet/works-v1' | typeof BRIEF_PACKET_CONTRACT | typeof WORKS_BRIEF_PACKET_CONTRACT;
   briefCatalogue?: Ref[];
+  /** MP2 (№2968 §2, row 19): the neighbour set a brief root issued after MP2 saved; absent in a packet MP1 issued. */
+  briefNeighbors?: { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -184,7 +188,8 @@ const packetId = (request: QuestionPacketRequest, protocol: QuestionPacketRecord
 function packetEra(store: Store, request: QuestionPacketRequest) {
   const oldContract = currentPacketContract(store, request);
   const newContract = oldContract === WORKS_PACKET_CONTRACT ? WORKS_BRIEF_PACKET_CONTRACT : BRIEF_PACKET_CONTRACT;
-  const predecessors = [...(request.continuation ? [request.continuation.packet] : []), ...request.previous.map(part => part.packet)]
+  const predecessors = [...(request.continuation ? [request.continuation.packet] : []), ...(request.correction ? [request.correction.packet] : []),
+    ...request.previous.map(part => part.packet)]
     .map(ref => loadPacket(store, request.project, ref));
   const inherited = predecessors[0]?.value;
   if (predecessors.some(prior => prior.value.answerProtocol !== inherited!.answerProtocol
@@ -222,11 +227,24 @@ function requirePacket(store: Store, value: unknown): asserts value is QuestionP
       || !Array.isArray(value.continuation.deliveries) || !value.continuation.deliveries.length
       || !value.continuation.deliveries.every(isRef)
       || Object.keys(value.continuation).some(key => !['packet', 'call', 'response', 'deliveries'].includes(key)))
-    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous', 'continuation', 'works'].includes(key))) invalid('request');
+    || Object.hasOwn(value, 'correction') && (Object.hasOwn(value, 'continuation') || !object(value.correction)
+      || ![value.correction.packet, value.correction.call, value.correction.response, value.correction.diagnostic].every(isRef)
+      || Object.keys(value.correction).some(key => !['packet', 'call', 'response', 'diagnostic'].includes(key)))
+    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous', 'continuation', 'correction', 'works'].includes(key))) invalid('request');
 }
 function head(store: Store, ref: Ref) {
   const found = store.get(ref.id);
   if (!found || !same(reference(found), ref)) fail('input_stale', ref.id, 'head', 'A packet source changed before this preparation');
+}
+/**
+ * MP2 (№2968 §3, №3153): a correction is a step of its chain — it stands on its root's saved journal, which the very refusal
+ * it corrects has already moved past. Everything derived inside it stands there too, wherever it is called from: the earlier
+ * steps, the E3 recheck of a need_source behind a continuation, the current admission of a packet already answered.
+ */
+let chainSteps = 0;
+function inChainStep<T>(derive: () => T): T {
+  chainSteps++;
+  try { return derive(); } finally { chainSteps--; }
 }
 function previousRefusals(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, gaps: GapRecords, current: boolean,
   savedJournal: Ref | null | undefined, guards: TransactionGuard[], references: Ref[], contract: QuestionPacketRecord['packetContract']) {
@@ -288,7 +306,7 @@ function previousRefusals(store: Store, request: QuestionPacketRequest, batch: R
   // operation — never today's head, and never through a view of its own that would derive the history again.
   const checkedJournal = take(readJournalAt(store, request.project, reference(journal)));
   references.push(journalRef);
-  if (current && !root) { head(store, journalRef); guards.push(journalRef); }
+  if (current && !root && !chainSteps) { head(store, journalRef); guards.push(journalRef); }
   // The line this series continues: the exact original series of a claimed cause must be this one or one it inherits
   // from — a cause of another line of the same block is foreign, however alike its goal reads (№1801, rows 5–6).
   const line = new Set<string>([checked.id]);
@@ -584,7 +602,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
   contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol']) {
   const continuation = request.continuation!;
   const prior = loadPacket(store, request.project, continuation.packet);
-  const { continuation: _priorContinuation, ...priorRoot } = prior.value.request;
+  const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
   const { continuation: _continuation, ...root } = request;
   if (prior.value.packetContract !== contract || prior.value.answerProtocol !== protocol || prior.value.state !== 'ready' || !object(prior.value.packet)
     || !same(root, priorRoot))
@@ -631,6 +649,61 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
   return { value, guards: unique(guards), references: unique([...priorDerived.references, continuation.packet,
     ...capacity.references, ...evidence.references]), writes: priorDerived.writes, ...(basis ? { briefBasis: basis } : {}) };
 }
+/**
+ * MP2 (№2968 §3): the one correction of a brief chain — the same material, labels, assignment, neighbours, earlier parts and
+ * delivered reads as the rejected step, plus its exact proved refusal and its verbatim answer, under a new request and
+ * response form. The ground is proved again by the common derivation; a caller cannot hand one in.
+ */
+function deriveCorrection(store: Store, request: QuestionPacketRequest, current: boolean,
+  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol']) {
+  const correction = request.correction!;
+  const prior = loadPacket(store, request.project, correction.packet);
+  const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
+  const { correction: _correction, ...root } = request;
+  if (prior.value.packetContract !== contract || prior.value.answerProtocol !== protocol || prior.value.state !== 'ready' || !object(prior.value.packet)
+    || !same(root, priorRoot))
+    fail('packet_chain_invalid', correction.packet.id, 'correction',
+      'A correction preserves the exact ready assignment, sources and attempt of the rejected step');
+  const priorDerived = derivePacket(store, prior.value.request, current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
+  const basis = priorDerived.briefBasis;
+  if (!basis) fail('packet_record_invalid', prior.id, 'brief', 'A correction needs the rederived prior assignment');
+  const ground = take(readCorrectionGround(store, request.project, correction));
+  if (!ground.eligible)
+    fail('packet_chain_invalid', correction.response.id, 'correction', 'Only a proved correctable refusal of this chain, once, grants its correction');
+  const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
+  const guards = [...priorDerived.guards, ...capacity.guards];
+  if (current) {
+    for (const ref of [correction.packet, correction.response, correction.diagnostic]) { head(store, ref); guards.push(ref); }
+    // Admission is revision one; an already settled call legitimately has a later current head.
+    guards.push(reference(store.get(correction.call.id)!));
+  }
+  const requestId = packetKey(request, protocol, contract);
+  const payload = prior.value.packet as Record<string, Json>;
+  const refusal = ground.refusal;
+  const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
+  const packet = json(boundedBrief({ ...payload, requestId,
+    correction: { refusals: [{ code: refusal.code, field: refusal.at.field ?? null, message: refusal.message, rule: briefRepairRule(refusal.code) }],
+      answer: ground.raw },
+    responseForm: { protocol, requestId, schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } },
+  { ...basis, priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars));
+  const fingerprint = bounded(packet, capacity.maxRequestChars);
+  const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: contract,
+    briefCatalogue: basis.material.references, state: fingerprint ? 'ready' : 'blocked', packet: fingerprint ? packet : null,
+    fingerprint, fullChars: packetPrompt(packet).length,
+    refusal: fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
+  return { value, guards: unique(guards), references: unique([...priorDerived.references, correction.packet, correction.call, correction.response,
+    correction.diagnostic, ...capacity.references, ...ground.references]), writes: priorDerived.writes, briefBasis: basis };
+}
+/** MP2 (№2968 §1): the explicit saved neighbour form — its known contract and exact finished sources; anything else refuses. */
+function neighbourForm(value: unknown, target: string): { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] } {
+  if (!object(value) || value.contract !== NEIGHBOR_CONTRACT || !Array.isArray(value.sources)
+    || Object.keys(value).some(key => !['contract', 'sources'].includes(key))
+    || value.sources.some(row => !object(row) || !isRef(row.root) || !text(row.batch) || !text(row.node) || !isRef(row.assembly)
+      || !isRef(row.proposal) || Object.keys(row).some(key => !['root', 'batch', 'node', 'assembly', 'proposal'].includes(key)))
+    || new Set(value.sources.map(row => canonical(row))).size !== value.sources.length)
+    fail('packet_record_invalid', target, 'briefNeighbors', 'The neighbour form names its known contract and exact finished sources');
+  return value as unknown as { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
+}
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean,
   protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): {
   value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[]; briefBasis?: BriefBasis;
@@ -639,6 +712,11 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     if (!currentContract(contract))
       fail('packet_record_invalid', request.continuation.packet.id, 'packetContract', 'A historical packet cannot acquire continuation semantics');
     return deriveContinuation(store, request, current, contract!, protocol);
+  }
+  if (request.correction) {
+    if (!briefContract(contract))
+      fail('packet_record_invalid', request.correction.packet.id, 'packetContract', 'Only a brief chain can acquire a correction');
+    return inChainStep(() => deriveCorrection(store, request, current, contract!, protocol));
   }
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
@@ -734,6 +812,21 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     if (priorBrief) {
       briefBasis.priorLabels = (priorBrief.value.packet as unknown as { brief: { labels: BriefLabel[] } }).brief.labels;
     }
+    // MP2 (№2968 §2, row 19): the saved form decides — a packet MP1 issued keeps no section, a later part keeps its root's
+    // form and set, and only a new root chooses its neighbours, once. Only node expansions have neighbours of a frame.
+    const form = saved ? (Object.hasOwn(saved, 'briefNeighbors') ? neighbourForm(saved.briefNeighbors, requestId) : undefined)
+      : priorBrief ? (Object.hasOwn(priorBrief.value, 'briefNeighbors') ? neighbourForm(priorBrief.value.briefNeighbors, requestId) : undefined)
+      : null;
+    if (form !== undefined) {
+      if (batch.task !== 'node-expansion' && form?.sources.length)
+        fail('packet_record_invalid', requestId, 'briefNeighbors', 'Only a node expansion has neighbours of its frame');
+      const read = batch.task === 'node-expansion' ? take(readNeighbourResults(store, { project: request.project, attempt: request.attempt,
+        routes: request.routes, batch: batch.id, saved: form ? form.sources : null, current })) : { sources: [], works: [], guards: [], references: [] };
+      base.briefNeighbors = { contract: NEIGHBOR_CONTRACT, sources: read.sources as NeighbourSource[] };
+      // The text names the work, not its private references: those stay in the saved form.
+      briefBasis.neighbors = { contract: NEIGHBOR_CONTRACT, works: json(read.works.map(work => ({ node: work.node, nodes: work.nodes, writes: work.writes }))) as Json[] };
+      references.push(...read.references); guards.push(...read.guards);
+    }
   }
   const encode = (value: unknown): Json => {
     if (!briefBasis) return json(value);
@@ -747,6 +840,12 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     const frame = take(readFrameProposals(store, source)) as FrameProposals;
     references.push(...frame.references);
     if (briefBasis) { briefBasis.graph = frame.frame.upper; briefBasis.contexts = unique([...briefBasis.contexts, frame.frame.upperRef]); }
+    // The same work is never given twice: what the accepted graph of the frame already holds stays MP1's material.
+    if (briefBasis?.neighbors) {
+      const accepted = new Set((frame.frame.accepted?.graph.nodes ?? []).map(node => node.id));
+      briefBasis.neighbors = { ...briefBasis.neighbors, works: briefBasis.neighbors.works.map(work => json({ ...(work as Record<string, Json>),
+        nodes: ((work as { nodes: { id: string }[] }).nodes).filter(node => !accepted.has(node.id)) })) };
+    }
     if (current) guards.push(...take(prepareFrameProposals(store, source)).guards);
     const context = expansionContext(frame, batch.node), open = frame.result.open.filter(item => item.upper.node === batch.node);
     const worksBasis = worksPacketContract(contract) ? worksTaskBasis(store, request,
@@ -896,7 +995,7 @@ export function writeQuestionPacket(store: Store, request: QuestionPacketRequest
     // Replaying a saved delivery transition does not admit another physical call.
     // Dispatch still requires prepareQuestionPacket's fresh current admission.
     const managed = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;
-    const record = managed || request.continuation || request.previous.length > 0 ? packetEra(store, request).checked : undefined;
+    const record = managed || request.continuation || request.correction || request.previous.length > 0 ? packetEra(store, request).checked : undefined;
     if (record) {
       return { record, existing: true, writes: [], guards: [], references: [reference(record)] };
     }
@@ -1363,8 +1462,8 @@ function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNu
   if (request.previous.length > plan.assignments.length) fail('packet_chain_invalid', request.batch!, 'previous', 'The chain exceeds its assigned parts');
   return request.previous.map((item, index) => {
     const prior = loadPacket(store, request.project, item.packet);
-    const { continuation: _continuation, ...priorRequest } = prior.value.request;
-    const { continuation: _currentContinuation, ...rootRequest } = request;
+    const { continuation: _continuation, correction: _correction, ...priorRequest } = prior.value.request;
+    const { continuation: _currentContinuation, correction: _currentCorrection, ...rootRequest } = request;
     const expected = { ...rootRequest, previous: request.previous.slice(0, index) };
     if (prior.value.answerProtocol !== protocol || prior.value.packetContract !== contract
       || !same(priorRequest, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'

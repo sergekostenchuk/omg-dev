@@ -2537,27 +2537,33 @@ test("LP3 (№2817 row 2, №53) a need_source whose search names a context reco
   await sameEnd(f, request, 4);
 });
 
-test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is refused by E2 label decoding during E3 admission; the pass closes all three attempts without waiting or delivering reads", async t => {
+test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is refused by E2 label decoding during E3 admission; the pass closes all three attempts without waiting or delivering reads — MP2 (№2968): each managed attempt corrects that repairable answer once", async t => {
   const f = runFixture(t, ["encoding"]), b = f.bases("mp1-lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
-  f.steps([need, need, need, stopAnswer(f, false)]);
+  // MP2 (№2968 §3): an unissued label in reads is answer content of MP1's closed repairable class (briefAnswerRepairable):
+  // each attempt gets its one correction, answered here the same way.
+  f.steps([need, need, need, need, need, need, stopAnswer(f, false)]);
   ok(startRun(f.store, { project }));
   const end = await ends(f, request, 80);
   assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
   const packets = f.store.list<QuestionPacketRecord>("question-packet");
-  assert.equal(packets.length, 3);
+  const roots = packets.filter(row => !row.value.request.correction), corrections = packets.filter(row => row.value.request.correction);
+  assert.equal(roots.length, 3); assert.equal(corrections.length, 3);
   assert.ok(packets.every(row => row.value.packetContract === "om-packet/brief-v1"));
+  for (const correction of corrections) assert.ok(roots.some(root => root.id === correction.value.request.correction!.packet.id),
+    "Each correction names the rejected step of its own chain");
   const calls = f.store.list<{ error: string | null; status: string; om?: { failure?: Refusal } }>("model-call")
     .filter(row => row.value.error === "answer_label_unknown");
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 6);
   for (const call of calls) assert.deepEqual([call.value.status, call.value.om?.failure?.at.unit, call.value.om?.failure?.at.field],
     ["failed", "E2", "reads/0/within"]);
-  const cycles = f.store.list<{ terminal: string }>("om-model-cycle");
-  assert.equal(cycles.length, 3); assert.ok(cycles.every(row => row.value.terminal === "outcome"));
+  const cycles = f.store.list<{ terminal: string; cyclePolicy?: string }>("om-model-cycle");
+  assert.equal(cycles.length, 3);
+  assert.ok(cycles.every(row => row.value.terminal === "outcome" && row.value.cyclePolicy === "brief-correction/v1"));
   assert.deepEqual(f.store.list("om-read-delivery"), []);
   assert.equal(end.performed.filter(action => action === "close").length, 3);
-  assert.equal(f.sent().length, 4, "Three answers and one review; no repeated delivery or paid call");
-  await sameEnd(f, request, 4);
+  assert.equal(f.sent().length, 7, "Six answers — one correction per attempt — and one review; no repeated delivery or paid call");
+  await sameEnd(f, request, 7);
 });
 
 test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never taken for a continuation: a saved cycle of it is performed as saved and its producer's record_missing stands as the pass's wait — no ready, no new packet, nothing sent; once the record is read again the same saved cycle goes on", async t => {
@@ -2888,4 +2894,252 @@ out(advanced.record.value.state);`, { request }) as { phase: string; wait?: { co
     assert.deepEqual([ceased.value.cause.kind, ceased.value.cause.prerequisite?.kind, ceased.value.remainder], ["required-record-replaced", "input", "assembly"], seen.join(","));
     assert.equal(f.sent().length, sent, "Nothing of the ceased cycle is sent again");
   });
+});
+
+// ---- MP2 (№2968): the still unstarted roots of an attempt by the flows of their frame; neighbours of a brief root ----
+import { rankExpansions } from "../src/om/run.js";
+/** The upper graph the rank reads: only its connectors matter. */
+const mp2Upper = (flows: readonly { id?: string; level?: number; producer: string; consumers: string[]; anchor?: string | null }[]) =>
+  ({ connectors: [...new Map(flows.map((flow, index) => [flow.id ?? `c${index}`, flow.id ?? `c${index}`])).keys()].map(id => ({ id, artifact: "a", returnsTo: "x", wakeTest: null,
+    bindings: flows.filter((flow, index) => (flow.id ?? `c${index}`) === id).map(flow => ({ level: flow.level ?? 2, anchor: flow.anchor ?? null,
+      producer: { node: flow.producer, port: "out" }, consumers: flow.consumers.map(node => ({ node, port: "in" })) })) })) }) as unknown as Graph;
+const mp2Items = (nodes: readonly string[]) => nodes.map((node, index) => ({ id: `assignment-${String.fromCharCode(122 - index)}`, node, batch: `batch-${node}`, level: 3 as const }));
+const mp2Rank = (nodes: readonly string[], flows: Parameters<typeof mp2Upper>[0]) => {
+  const items = mp2Items(nodes), byId = new Map(items.map(item => [item.id, item.node]));
+  return rankExpansions(items, () => mp2Upper(flows)).map(id => byId.get(id)!);
+};
+
+test("MP2 (№2968 rows 1, 2) the rank of unstarted expansion roots: producer before consumer on a chain and a fork, equal ranks by node id; a cycle keeps its outer producer before and outer consumer after; every binding and consumer counts; sleeping flows, other levels and self-references set no order", () => {
+  // Row 1: a chain whose ids run against the flow, and a fork; the ready component with the least id goes first.
+  assert.deepEqual(mp2Rank(["c-op", "b-op", "a-op"], [{ producer: "c-op", consumers: ["b-op"] }, { producer: "b-op", consumers: ["a-op"] }]), ["c-op", "b-op", "a-op"]);
+  assert.deepEqual(mp2Rank(["z-root", "b-leaf", "a-leaf"], [{ producer: "z-root", consumers: ["b-leaf", "a-leaf"] }]), ["z-root", "a-leaf", "b-leaf"]);
+  assert.deepEqual(mp2Rank(["m", "k", "q"], []), ["k", "m", "q"], "Without flows: by node id, never by the hash of an assignment");
+  // Row 2: a strongly connected pair with an outer producer and an outer consumer keeps both outer dependencies.
+  assert.deepEqual(mp2Rank(["y", "p", "x", "q"], [{ producer: "p", consumers: ["y"] }, { producer: "x", consumers: ["y"] },
+    { producer: "y", consumers: ["x"] }, { producer: "x", consumers: ["q"] }]), ["p", "x", "y", "q"]);
+  // Two bindings of one connector and several consumers of one binding: each counts, not only the first.
+  assert.deepEqual(mp2Rank(["a", "b", "c"], [{ id: "one", producer: "c", consumers: ["a"] }, { id: "one", producer: "b", consumers: ["c"] }]), ["b", "c", "a"]);
+  assert.deepEqual(mp2Rank(["a", "b", "c"], [{ producer: "c", consumers: ["b", "a"] }]), ["c", "a", "b"]);
+  // A sleeping flow, a flow of another level and a self-reference set no order.
+  assert.deepEqual(mp2Rank(["a", "b"], [{ producer: "b", consumers: ["a"], anchor: "sleeping" }]), ["a", "b"]);
+  assert.deepEqual(mp2Rank(["a", "b"], [{ producer: "b", consumers: ["a"], level: 1 }]), ["a", "b"]);
+  assert.deepEqual(mp2Rank(["a", "b"], [{ producer: "b", consumers: ["b"] }]), ["a", "b"]);
+  // One node with two batches: by batch, then by assignment.
+  const items = [{ id: "z", node: "n", batch: "batch-2", level: 3 as const }, { id: "y", node: "n", batch: "batch-1", level: 3 as const },
+    { id: "x", node: "n", batch: "batch-1", level: 3 as const }];
+  assert.deepEqual(rankExpansions(items, () => mp2Upper([])), ["x", "y", "z"]);
+});
+
+/** Drives the works pass, answering each paid cycle for its exact saved packet, until the produce block closes. */
+async function mp2Works(f: ReturnType<typeof worksFixture>, onStep?: (step: { action: string; request: { packet?: Ref } }) => void, bound = 200) {
+  const cycles: Ref[] = [], answered = new Set<string>();
+  for (let index = 0; index < bound; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; step?: { action: string; request: { packet?: Ref } } };
+    if (state.phase === "step" && state.step) {
+      onStep?.(state.step);
+      if (state.step.action === "cycle" && state.step.request.packet && !answered.has(state.step.request.packet.id)) {
+        answered.add(state.step.request.packet.id); cycles.push(state.step.request.packet); f.answer(state.step.request.packet);
+      }
+    }
+    if (state.phase === "waiting" || state.phase === "complete") break;
+    if (blockSeries(f as unknown as Fixture, "garden-produce-block")?.value.attempts[0]?.outcome) break;
+  }
+  return cycles;
+}
+
+test("MP2 (№2968 rows 1, 3, 4, 5) through the pass a block designs its producer operation first; the consumer's brief carries the producer's finished work with its write paths; the producer's own brief has the explicit empty set; a saved step goes on before any rank", async t => {
+  const f = worksFixture(t);
+  const works = f.routes.value.batches.filter(row => row.level === 3 && row.task === "node-expansion");
+  const prep = works.find(row => row.node === "garden-prep-operation")!, produce = works.find(row => row.node === "garden-produce-operation")!;
+  assert.ok(prep && produce, "The produce block owns two operations joined by garden-prep-flow");
+  ok(startRun(f.store, { project }));
+  let restarted = false;
+  const trail: string[] = [];
+  const cycles = await mp2Works(f, step => {
+    const request = step.request as { batch?: string; packet?: Ref };
+    const batch = request.batch ?? (request.packet ? f.store.get<QuestionPacketRecord>(request.packet.id)?.value.request.batch : undefined);
+    trail.push(`${step.action}:${batch === prep.id ? "prep" : batch === produce.id ? "produce" : batch ?? "-"}`);
+    // Row 4: a saved packet step of the producer continues after a restart, before the other root is ranked.
+    if (!restarted && step.action === "cycle") { restarted = true; f.restart(); }
+  });
+  const batchOf = (packet: Ref) => f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.request.batch;
+  const order = cycles.map(batchOf).filter(batch => batch === prep.id || batch === produce.id);
+  assert.deepEqual(order, [prep.id, produce.id], `Row 1: the producer operation is designed first: ${trail.join(" ")}`);
+  const at = (step: string) => trail.indexOf(step);
+  assert.ok(at("packet:prep") < at("cycle:prep") && at("cycle:prep") < at("packet:produce"),
+    `Row 4: begun work goes on before the next root is started, whatever the order of ids: ${trail.join(" ")}`);
+  const root = (batch: string) => f.store.list<QuestionPacketRecord>("question-packet").find(row => row.value.request.batch === batch
+    && !row.value.request.previous.length && !row.value.request.continuation && !row.value.request.correction)!;
+  assert.deepEqual(root(prep.id).value.briefNeighbors, { contract: "om-brief-neighbors/v1", sources: [] }, "Row 19: the explicit empty set");
+  const neighbours = root(produce.id).value.briefNeighbors!;
+  assert.deepEqual(neighbours.sources.map(source => [source.node, source.batch]), [["garden-prep-operation", prep.id]], "Row 5: the finished producer");
+  const text = (root(produce.id).value.packet as { brief: { text: string } }).brief.text;
+  assert.ok(text.includes("# Accepted work of neighbouring roots"));
+  const section = JSON.parse(text.split("# Accepted work of neighbouring roots\n")[1]!.split("\n")[1]!) as { works: { node: string; writes: string[]; nodes: { id: string }[] }[] };
+  assert.equal(section.works[0]!.node, "garden-prep-operation");
+  assert.ok(section.works[0]!.nodes.some(node => node.id === "garden-prep-work"), "Row 5: the producer's work node");
+  assert.ok(section.works[0]!.writes.length > 0, "Row 5: the files it declared for writing");
+});
+
+test("MP2 (№2968 row 6) a packet issued before its neighbour finished keeps its set: the run reuses it as it is, with no later neighbour", async t => {
+  const f = worksFixture(t);
+  const works = f.routes.value.batches.filter(row => row.level === 3 && row.task === "node-expansion");
+  const prep = works.find(row => row.node === "garden-prep-operation")!, produce = works.find(row => row.node === "garden-produce-operation")!;
+  ok(startRun(f.store, { project }));
+  const early: { ref: Ref | null } = { ref: null };
+  await mp2Works(f, step => {
+    // As soon as the producer's packet is issued, the consumer's root packet is issued too, before the producer finished.
+    if (early.ref || step.action !== "cycle" || !step.request.packet) return;
+    const saved = f.store.get<QuestionPacketRecord>(step.request.packet.id)!;
+    if (saved.value.request.batch !== prep.id) return;
+    early.ref = reference(ok(writeQuestionPacket(f.store, { ...saved.value.request, batch: produce.id })).record);
+  });
+  assert.ok(early.ref, "The consumer's packet was issued early");
+  const issued = f.store.get<QuestionPacketRecord>(early.ref.id)!;
+  assert.deepEqual(issued.value.briefNeighbors, { contract: "om-brief-neighbors/v1", sources: [] }, "Issued before the producer finished");
+  assert.deepEqual(reference(f.store.get(early.ref.id)!), early.ref, "The issued packet is never replaced");
+  const sentFor = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.request.batch === produce.id
+    && !row.value.request.previous.length && !row.value.request.continuation && !row.value.request.correction);
+  assert.equal(sentFor.length, 1, "No second root packet with the later neighbour");
+});
+
+/** The works answer of worksFixture for an exact saved packet, as research data: the desired work of its operation. */
+function mp2WorkAnswer(f: ReturnType<typeof worksFixture>, saved: Ref) {
+  const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+  const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+  const payload = packet.value.packet as unknown as { expansion: { assigned: string[]; obligations: { id: string; kind: string; upper: { port?: string } }[] } };
+  const work: Node = structuredClone(f.desired.nodes.find(node => node.kind === "work" && node.parent === batch.node)!);
+  const tests = structuredClone(f.desired.tests.filter(item => work.tests.includes(item.id)));
+  if (!work.code.length) {
+    work.code = [{ path: `${work.id}.ts`, access: "write", status: "planned" }]; work.tests = [`${work.id}-test`];
+    const proof = structuredClone(f.desired.tests.find(item => item.node === "garden-consume-work")!);
+    proof.id = work.tests[0]!; proof.node = work.id; proof.covers = [];
+    proof.contract!.entrypoint.path = work.code[0]!.path; proof.contract!.counterfactuals = [];
+    tests.push(proof);
+  }
+  return { batch: batch.id, research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", bindings: [], proposal: {
+    nodes: [work], tests, fills: payload.expansion.obligations.filter(item => payload.expansion.assigned.includes(item.id))
+      .map(item => ({ obligation: item.id, node: work.id, ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
+    localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+    removes: [], replaces: [], redefines: [] } } };
+}
+
+test("MP2 (№2968 rows 8, 18) through the pass a refused works answer is corrected once; G7 closes the block attempt with its result, every physical call sent once, the first refusal kept in its history", async t => {
+  const f = worksFixture(t);
+  const works = f.routes.value.batches.filter(row => row.level === 3 && row.task === "node-expansion");
+  const produce = works.find(row => row.node === "garden-produce-operation")!;
+  const scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>();
+  let refused = 0;
+  ok(startRun(f.store, { project }));
+  for (let index = 0; index < 200; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; step?: { action: string; request: { packet?: Ref } } };
+    if (state.phase === "step" && state.step?.action === "cycle" && state.step.request.packet && !answered.has(state.step.request.packet.id)) {
+      answered.add(state.step.request.packet.id);
+      const answer = mp2WorkAnswer(f, state.step.request.packet);
+      if (answer.batch === produce.id && !refused++) {
+        const wrong = structuredClone(answer.research);
+        wrong.proposal.fills = wrong.proposal.fills.map((fill, at) => at === 0 ? { ...fill, obligation: "X999" } : fill);
+        steps.push({ research: wrong, usage });
+      }
+      steps.push({ research: answer.research, usage });
+      writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+    }
+    if (state.phase === "waiting" || state.phase === "complete") break;
+    if (blockSeries(f as unknown as Fixture, "garden-produce-block")?.value.attempts[0]?.outcome) break;
+  }
+  const attempt = blockSeries(f as unknown as Fixture, "garden-produce-block").value.attempts[0]!;
+  assert.equal(attempt.outcome?.reason, "result", "Row 18: the corrected result decides, not the first refusal");
+  const corrections = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.request.correction);
+  assert.equal(corrections.length, 1, "Row 8: one correction");
+  assert.equal(corrections[0]!.value.request.batch, produce.id);
+  assert.equal(f.sent().length, steps.length, "Every scripted answer was asked for exactly once, nothing twice");
+  const first = f.store.list<{ om: { failure: { code: string } | null; diagnostic: Ref | null } }>("model-call")
+    .find(row => row.value.om?.failure?.code === "answer_label_unknown")!;
+  assert.ok(first?.value.om.diagnostic, "The first refusal has its diagnostic");
+  const rows = f.store.list<{ rows: { source: Ref; id: string }[] }>("om-refusal-journal").flatMap(row => row.value.rows ?? []);
+  assert.ok(rows.some(row => row.source.id === first.value.om.diagnostic!.id), "Row 18: and its journal row stays in the history");
+});
+
+test("MP2 return №3147: through the pass after a restart, a changed environment between the paid repairable refusal and its correction ceases the step and its root and closes the attempt by G7 — never waiting on completion_claim_exists, nothing sent again", async t => {
+  const f = worksFixture(t);
+  ok(startRun(f.store, { project }));
+  let cycle: { request: { packet: Ref } } | null = null;
+  for (let index = 0; index < 40 && !cycle; index++) {
+    const state = ok(await advanceRun(f.store, f.request)).record.value.state as unknown as { phase: string; step?: { action: string; request: { packet: Ref } } };
+    assert.notEqual(state.phase, "waiting", JSON.stringify(state));
+    if (state.phase === "step" && state.step!.action === "cycle") cycle = state.step!;
+  }
+  assert.ok(cycle, "A cycle step is chosen");
+  const answer = mp2WorkAnswer(f, cycle!.request.packet).research;
+  answer.proposal.fills = answer.proposal.fills.map((fill, at) => at === 0 ? { ...fill, obligation: "X999" } : fill);
+  writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: answer, usage }] }));
+  const first = ok(await runModelCall(f.store, cycle!.request as never));
+  assert.equal(first.record.value.om.failure?.code, "answer_label_unknown");
+  const moved = lp4Configure(f, f.request);
+  const seen: string[] = [];
+  for (let index = 0; index < 40; index++) {
+    f.restart();
+    const advanced = ok(await advanceRun(f.store, moved)), state = advanced.record.value.state;
+    seen.push(state.phase === "waiting" ? `waiting:${(state as unknown as { wait: { code: string } }).wait.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    assert.ok(!(state.phase === "waiting" && (state as unknown as { wait: { code: string } }).wait.code === "completion_claim_exists"), seen.join(","));
+    if (advanced.performed?.action === "close") break;
+  }
+  assert.ok(seen.some(step => step.endsWith(":close")), `The attempt closes: ${seen.join(",")}`);
+  const cessations = f.store.list<{ cause: { kind: string }; remainder: string }>("om-completion-cessation");
+  assert.ok(cessations.some(row => row.value.cause.kind === "required-record-replaced" && row.value.remainder === "continuation"), "The owed step ceased");
+  assert.ok(cessations.some(row => row.value.cause.kind === "cycle-step-ceased"), "Its root ceased by the ceased step");
+  // §6.3: the other root is worked by its own rules in the new environment, so the sends are counted by packet.
+  assert.equal(lp4Sent(f, cycle!.request.packet), 1, "The paid answer is never sent again");
+  const corrections = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.request.correction && row.value.state === "ready");
+  assert.ok(!corrections.some(row => lp4Sent(f, reference(row)) > 0
+    || f.store.get(modelCallRecordId(project, (row.value.packet as { requestId: string }).requestId))), "The correction is never sent and no correction call exists");
+});
+
+test("MP2 №3153: through the pass in a second attempt, standing on the non-empty refusal journal of the first, a repairable refusal after a read is corrected — the correction is written and sent once, never input_stale on the journal head the refusal itself moved", async t => {
+  const f = worksFixture(t);
+  const produce = f.routes.value.batches.find(row => row.level === 3 && row.task === "node-expansion" && row.node === "garden-produce-operation")!;
+  writeFileSync(join(f.root, "mp2-retry.txt"), "The produced artifact is written to the garden store.");
+  const scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>(), trail: string[] = [];
+  let corrected = false;
+  const sentCorrection = () => f.store.list<QuestionPacketRecord>("question-packet")
+    .some(row => row.value.request.correction && row.value.state === "ready" && lp4Sent(f, reference(row)) > 0);
+  ok(startRun(f.store, { project }));
+  for (let index = 0; index < 300 && !sentCorrection(); index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref } } };
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    assert.ok(state.phase !== "waiting" && state.phase !== "complete", trail.join(","));
+    if (state.phase !== "step" || state.step?.action !== "cycle" || !state.step.request.packet || answered.has(state.step.request.packet.id)) continue;
+    const packet = state.step.request.packet; answered.add(packet.id);
+    if (f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.request.attempt!.ordinal === 1)
+      steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer", questionIds: lp4Questions(f, packet),
+        reason: "The node needs another design" }, usage });
+    else {
+      const answer = mp2WorkAnswer(f, packet);
+      if (answer.batch === produce.id && !corrected) {
+        corrected = true;
+        const wrong = structuredClone(answer.research);
+        wrong.proposal.fills = wrong.proposal.fills.map((fill, at) => at === 0 ? { ...fill, obligation: "X999" } : fill);
+        steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source", questionIds: lp4Questions(f, packet),
+          missing: "Where the produced artifact is written", reads: [{ action: "read", path: "mp2-retry.txt", media: "text/plain" }] }, usage },
+        { research: wrong, usage });
+      }
+      steps.push({ research: answer.research, usage });
+    }
+    writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+  }
+  assert.equal(blockSeries(f as unknown as Fixture, "garden-produce-block").value.attempts[0]!.outcome?.reason, "refused", "The model refused the first attempt");
+  const correction = f.store.list<QuestionPacketRecord>("question-packet").find(row => row.value.request.correction)!;
+  assert.ok(correction && sentCorrection(), `The correction is written and sent: ${trail.join(",")}`);
+  const rejected = f.store.get<QuestionPacketRecord>(correction.value.request.correction!.packet.id)!.value;
+  assert.ok(rejected.request.continuation, "It corrects the step after the read");
+  assert.equal(correction.value.request.attempt!.ordinal, 2);
+  assert.ok(correction.value.journal, "The chain stands on the journal of the refused attempt");
+  assert.deepEqual(correction.value.journal, rejected.journal, "On its root's saved journal, not on the head its refusal moved");
+  assert.notDeepEqual(reference(f.store.get(correction.value.journal!.id)!), correction.value.journal, "The refusal moved the head");
+  assert.equal(lp4Sent(f, reference(correction)), 1, "The correction is sent once");
+  assert.equal(f.sent().length, steps.length, "Every scripted answer was asked for exactly once, nothing twice");
 });
