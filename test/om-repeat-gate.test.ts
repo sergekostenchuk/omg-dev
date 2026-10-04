@@ -2489,7 +2489,7 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage: e51Usage };
   let secondOriginalStep = originalStep;
   const dispatch = { adapter: reference(adapter), config: reference(config) };
-  writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
+  writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
   return { root, path, project, block, series, attemptGoal, frame,
     engine, config, scenario, originalStep,
     questionIds: batch.items.map(item => item.gap),
@@ -2512,16 +2512,16 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
         previous: [] })).record;
       secondOriginalStep = { ...originalStep, research: { ...originalStep.research,
         results: originalStep.research.results.map(item => ({ ...item, value })) } };
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, secondOriginalStep] }));
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, secondOriginalStep] }));
       const model = deliveredOf(await runModelCall(store, { project, packet: reference(nextPacket), dispatch, role: "implementer" }));
       assert.equal(model.outcome?.kind, "fact-candidates");
       return { project, modelCall: reference(model.record), questionId: nextBatch.items[0]!.gap, dispatch };
     },
     assessor(...verdicts: E51Verdict[]) {
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, ...verdicts.map(e51AssessorStep)] }));
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, ...verdicts.map(e51AssessorStep)] }));
     },
     assessorsForTwoOriginals(...verdicts: E51Verdict[]) {
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, secondOriginalStep,
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, secondOriginalStep,
         ...verdicts.map(e51AssessorStep)] }));
     },
     sent() { return readFileSync(trace, "utf8").trim().split("\n").filter(Boolean); },
@@ -3260,7 +3260,7 @@ test("E5.1 lets a proved native D5 achievement close a technical E5 set as resul
   assert.ok(issued);
   const nativeQuestion = deliveredOf(writeMc1Question(f.store, { ...mc1.value.request,
     engineQuestion: reference(issued), draft: reference(nativeDraft) }));
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep,
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep,
     e51AssessorStep("supported"), e51AssessorStep("off-form")] }));
   const assessment = await assessAnswer(f.store, issued, { action: "answer", question: issued.id, value: "UTF-8",
     citations: [{ source: reference(source), selector: { kind: "text-range", start: 0,
@@ -3535,7 +3535,7 @@ test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once
   const issued = f.store.get<Question>(nativeDraft.value.questions[0]!)!;
   const nativeQuestion = deliveredOf(writeMc1Question(f.store, { ...mc1.value.request,
     engineQuestion: reference(issued), draft: reference(nativeDraft) }));
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, e51AssessorStep("supported")] }));
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported")] }));
   const assessment = await assessAnswer(f.store, issued, { action: "answer", question: issued.id, value: "UTF-8",
     citations: [{ source: reference(source), selector: { kind: "text-range", start: 0,
       end: source.value.content.length } }] }, f.config, f.root);
@@ -3546,7 +3546,7 @@ test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once
     answer: answered.value.answer!, answeredQuestion: reference(answered), draft: reference(researchedDraft),
     attempt: { series: reference(f.series), attempt: 1 } }));
   // Native assessment consumed the second fixture response; E5's independent assessor gets the third.
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep,
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep,
     e51AssessorStep("supported"), e51AssessorStep("supported")] }));
   const originalWrite = f.store.writeMany.bind(f.store);
   f.store.writeMany = ((writes, guards) => {
@@ -3630,7 +3630,7 @@ async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
   const issued = f.store.get<Question>(nativeDraft.value.questions[0]!)!;
   const nativeQuestion = deliveredOf(writeMc1Question(f.store, { ...mc1.value.request,
     engineQuestion: reference(issued), draft: reference(nativeDraft) }));
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, e51AssessorStep("supported")] }));
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported")] }));
   const assessment = await assessAnswer(f.store, issued, { action: "answer", question: issued.id, value: "UTF-8",
     citations: [{ source: reference(source), selector: { kind: "text-range", start: 0,
       end: source.value.content.length } }] }, f.config, f.root);
@@ -3658,7 +3658,7 @@ async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
   const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
     batch: batch.id, environment: reference(f.config),
     attempt: { series: reference(secondSeries!), ordinal: 2 }, previous: [] })).record;
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, e51AssessorStep("supported"),
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported"),
     f.originalStep, e51AssessorStep("supported")] }));
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet),
     dispatch: first.dispatch, role: "implementer" }));
@@ -3813,7 +3813,7 @@ function m5Fixture(t: test.TestContext, managed = false) {
       value: { consumer: "garden-consume-block", kind } })) } });
   return { root, database, project, address, admission, goal, batch, routes, series, environment, call, answer,
     get store() { return store; },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
 }
 /** The key formula of №1449 §2, over the admitted slice row and the accepted consumer/kind. */
@@ -4023,7 +4023,7 @@ async function representativeAttempt(t: test.TestContext, variant: "D2" | "D5"):
   assert.ok(batch);
   const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
     batch: batch.id, environment: reference(f.config), attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: "implementer" }));
   const second = { ...first, modelCall: reference(model.record) };
   const originalWrite = f.store.writeMany.bind(f.store);
@@ -4129,7 +4129,7 @@ async function d2RepresentedAttempt(t: test.TestContext, choice: string): Promis
   assert.ok(batch);
   const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
     batch: batch.id, environment: reference(f.config), attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: "implementer" }));
   const second = { ...first, modelCall: reference(model.record) };
   const originalWrite = f.store.writeMany.bind(f.store);

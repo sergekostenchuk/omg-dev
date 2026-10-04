@@ -185,3 +185,42 @@ export function requireGraph(input: unknown): Graph {
   if (!result.graph) throw new EngineError("graph_invalid", "Operation map failed validation", result.findings);
   return result.graph;
 }
+
+/** Codes emitted by this module; kept complete by the brief catalogue regression. */
+export const GRAPH_VALIDATION_CODES = Object.freeze([
+  'anchor_outcome_missing',
+  'artifact_missing',
+  'boundary_mismatch',
+  'code_path_invalid',
+  'connector_test_missing',
+  'contract_invalid',
+  'contract_missing',
+  'dependency_cycle',
+  'duplicate_id',
+  'endpoint_invalid',
+  'external_outcome',
+  'future_dependency_unanchored',
+  'graph_invalid',
+  'graph_shape',
+  'hierarchy_disconnected',
+  'hierarchy_invalid',
+  'horizon_invalid',
+  'join_duplicate',
+  'join_inputs_invalid',
+  'join_missing',
+  'l3_evidence_missing',
+  'multiple_producers',
+  'orphan_artifact',
+  'outcome_missing',
+  'port_duplicate',
+  'product_root',
+  'refinement_gap',
+  'return_missing',
+  'sleeping_contract_incomplete',
+  'test_connector_missing',
+  'test_missing',
+  'test_obligation_missing',
+  'test_owner_missing',
+  'wake_test_missing',
+  'write_ownership_overlap',
+] as const);

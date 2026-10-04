@@ -1523,7 +1523,7 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
   const originalStep = { research: { protocol: seriesCommit ? "omg-answer/v2" : "$answerProtocol", requestId: "$requestId", action: "answer",
     results: [{ questionId, value: "UTF-8", citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] }] }, usage };
-  writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
+  writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
   const modelRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(config) },
     role: "implementer" as const };
   async function original() {
@@ -1547,7 +1547,7 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     return { model, research, basis, intent, assessment };
   }
   return { project, block, path, root, series, packet, native, questionId, get store() { return store; }, original,
-    assessorScenario() { writeFileSync(scenario, JSON.stringify({ steps: [originalStep,
+    assessorScenario() { writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep,
       { research: { verdict: "supported", reasons: [] }, usage }] })); },
     sent() { return readFileSync(trace, "utf8").trim().split("\n").filter(Boolean); },
     restart() { store.close(); store = new StoreType(path); } };
@@ -1831,4 +1831,27 @@ test("fact assessment recovers a lost claimed E4 owner without another physical 
   assert.equal(deliveredOf(readModelTransport(f.store, { project: f.project, record: reference(recovered) })).result.kind, "interrupted");
   assert.equal(deliveredOf(await runModelTransport(f.store, request)).repeated, true);
   assert.equal(f.sent().length, 1);
+});
+
+test('MP1 E1 measures the sent Cyrillic/non-BMP text while binding the complete semantic packet', t => {
+  const f = fixture(t, 'brief-fingerprint');
+  const call = 'research-price-1', text = 'Задание 😀: установи цену';
+  const packet: Json = { version: 'om-question-packet/brief-v1', requestId: call,
+    responseForm: { protocol: 'omg-answer/v3', requestId: call, schema: { type: 'object' } },
+    brief: { contract: 'om-brief/v1', requestId: call, text, labels: [], manifest: [], references: [], examples: [] },
+    semanticBasis: { meaning: 'price for cart' } };
+  const saved = deliveredOf(recordCall(f.store, PROJECT, request(f, { packet }))).call;
+  assert.deepEqual(saved.value.packet, { hash: hashJson(packet), chars: text.length, bytes: Buffer.byteLength(text, 'utf8') });
+  assert.notEqual(text.length, [...text].length); assert.ok(Buffer.byteLength(text) > text.length);
+  assert.deepEqual(deliveredOf(recordCall(f.store, PROJECT, request(f, { packet }))).call, saved);
+  const other = { ...packet as object, semanticBasis: { meaning: 'foreign cart' } } as Json;
+  assert.notEqual(hashJson(packet), hashJson(other));
+  const before = f.store.list().map(reference);
+  assert.equal(recordCall(f.store, PROJECT, request(f, { packet: other })).ok, false);
+  assert.deepEqual(f.store.list().map(reference), before);
+  for (const field of ['text', 'labels', 'manifest', 'references', 'contract', 'requestId']) {
+    const broken = structuredClone(packet) as Record<string, any>; delete broken.brief[field];
+    addressed(recordCall(f.store, PROJECT, request(f, { packet: broken })), 'packet_invalid');
+    assert.deepEqual(f.store.list().map(reference), before);
+  }
 });

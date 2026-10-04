@@ -143,7 +143,7 @@ function factFixture(t: TestContext) {
   const request = { project, packet: reference(packet), dispatch, role: "implementer" as const };
   return { root, database, project, request, original, dispatch, questionId: batch.items[0]!.gap, pause: join(root, "pause.json"),
     get store() { return store; }, restart(make: (path: string) => Store = path => new Store(path)) { store.close(); store = make(database); },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; } };
 }
 const assessorStep = { research: { verdict: "supported", reasons: [] }, usage };

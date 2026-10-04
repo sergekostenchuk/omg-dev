@@ -81,7 +81,7 @@ function driverFixture(t: TestContext, cold = false, questions = ["encoding"], r
   return { root, database, dispatch,
     get store() { return store; },
     request(): RunRequest { return { project, dispatch }; },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     sent(): { requestId: string }[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; },
     pause(name: string) { return join(root, `${name}.pause.json`); },
     restart(make: (path: string) => Store = path => new Store(path)) { store.close(); store = make(database); engine = new ProductEngine(store); } };

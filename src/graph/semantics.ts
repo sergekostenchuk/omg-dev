@@ -116,3 +116,43 @@ export function continuityFindings(previous: Graph, current: Graph): Finding[] {
   }
   return findings;
 }
+
+/** Codes emitted by this module; kept complete by the brief catalogue regression. */
+export const GRAPH_SEMANTIC_CODES = Object.freeze([
+  'actor_journey_missing',
+  'anchor_semantic_drift',
+  'concept_requirement_uncovered',
+  'connector_identity_fork',
+  'control_dependency_cycle',
+  'control_endpoint_missing',
+  'control_level_mismatch',
+  'counterfactual_missing',
+  'counterfactual_unbound',
+  'endpoint_code_foreign',
+  'endpoint_code_missing',
+  'join_failure_ambiguous',
+  'join_return_missing',
+  'journey_abstract_entry',
+  'journey_binding_missing',
+  'journey_disconnected',
+  'journey_node_missing',
+  'journey_outcome_unobserved',
+  'node_beneficiary_foreign',
+  'node_beneficiary_missing',
+  'node_benefit_unbound',
+  'node_outcome_requirement_missing',
+  'node_requirement_missing',
+  'ownership_transfer_cycle',
+  'ownership_transfer_invalid',
+  'ownership_transfer_missing',
+  'realization_boundary_conflict',
+  'realization_level_mismatch',
+  'realization_requirement_missing',
+  'requirement_binding_missing',
+  'semantic_id_duplicate',
+  'terminal_outcome_unobserved',
+  'test_entrypoint_invalid',
+  'test_entrypoint_unbound',
+  'test_resource_missing',
+  'work_packet_boundary',
+] as const);

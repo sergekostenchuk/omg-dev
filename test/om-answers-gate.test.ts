@@ -1,3 +1,5 @@
+const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
+
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -242,7 +244,7 @@ async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' 
   const assessorStep = verdict === 'off-form'
     ? { research: { answer: 'untyped reviewer reply' }, usage: originalStep.usage }
     : { research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: originalStep.usage };
-  writeFileSync(scenario, JSON.stringify({ steps: [originalStep, assessorStep] }));
+  writeFileSync(scenario, JSON.stringify({ database: f.path, steps: [originalStep, assessorStep] }));
   const dispatch = { adapter: reference(adapter), config: reference(config) };
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
@@ -315,7 +317,7 @@ out(take(writeQuestionPacket(store, args)).record);`, { project: f.project, rout
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0,
         end: source.value.content.length } }] })) },
     usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } };
-  writeFileSync(scenario, JSON.stringify({ steps: [originalStep, { research: { verdict: 'insufficient',
+  writeFileSync(scenario, JSON.stringify({ database: f.path, steps: [originalStep, { research: { verdict: 'insufficient',
     reasons: ['The original source does not establish the fact'] }, usage: originalStep.usage }] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet),
     dispatch: { adapter: reference(adapter), config: reference(config) }, role: 'implementer' }));
@@ -379,7 +381,7 @@ function assembledOperation(f: ReturnType<typeof fixture>, block = 'garden-produ
     packet: clone(packet.value.packet) as Json })).call;
   const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(packet), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body }) } };
+      raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body })) } };
   const prepared = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call),
     response: { pending: responseWrite } }));
   ok(writeGuarded(f.store, { unit: 'G4b-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
@@ -1249,7 +1251,7 @@ test('G4b discovers an N3 batch only after a real C5 upper-frame acceptance', t 
     packet: clone(packet.value.packet) as Json })).call;
   const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(packet), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body, bindings: [] }) } };
+      raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body, bindings: [] })) } };
   const prepared = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call),
     response: { pending: responseWrite } }));
   ok(writeGuarded(f.store, { unit: 'G4b-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
@@ -1423,7 +1425,7 @@ out(take(writeQuestionPacket(store, args)).record);`, packetRequest) as Revision
 /** Row 9: the process stops right after the durable MC1 receipt, so the call stays unfinished. */
 async function receivedMc1(f: ReturnType<typeof fixture>) {
   const exchange = mc1Exchange(f, 'received');
-  writeFileSync(exchange.scenario, JSON.stringify({ steps: [exchange.answer] }));
+  writeFileSync(exchange.scenario, JSON.stringify({ database: f.path, steps: [exchange.answer] }));
   const writeMany = f.store.writeMany.bind(f.store);
   let stopped = false;
   f.store.writeMany = ((writes, guards) => {
@@ -1450,7 +1452,7 @@ async function receivedMc1(f: ReturnType<typeof fixture>) {
  */
 async function e5Terminal(f: ReturnType<typeof fixture>, assessor: Json, ended = false) {
   const exchange = mc1Exchange(f, ended ? 'e5-ended' : 'e5-terminal', 'answers-independent', ended);
-  writeFileSync(exchange.scenario, JSON.stringify({ steps: [exchange.answer, assessor] }));
+  writeFileSync(exchange.scenario, JSON.stringify({ database: f.path, steps: [exchange.answer, assessor] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(exchange.packet),
     dispatch: exchange.dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
@@ -1962,7 +1964,7 @@ function worksAssembly(t: TestContext) {
     packet: clone(packet.value.packet) as Json })).call;
   const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(packet), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body, bindings: [] }) } };
+      raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body, bindings: [] })) } };
   const prepared = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call),
     response: { pending: responseWrite } }));
   ok(writeGuarded(f.store, { unit: 'G4b-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
@@ -2044,7 +2046,7 @@ function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = f
 }
 /** Pays MC1 and its supported E5 through the real producers, so every root of the managed work is complete. */
 async function supportedManaged(f: ReturnType<typeof fixture>, m: ReturnType<typeof managedAttempt>) {
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer,
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer,
     { research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet),
     dispatch: m.dispatch, role: 'implementer' }));
@@ -2281,7 +2283,7 @@ async function managedFact(f: ReturnType<typeof fixture>, m: ReturnType<typeof m
   verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form') {
   const assessor = verdict === 'off-form' ? { research: { answer: 'untyped reviewer reply' }, usage: traceUsage }
     : { research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: traceUsage };
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer, assessor] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer, assessor] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet),
     dispatch: m.dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
@@ -2453,7 +2455,7 @@ test('2 X4 H1.0c a racing second store rolls back the whole evaluation bundle an
 
 test('3 17 X2 H1.0c an applicable D5 on a later M6 completes the check without A2, achievement or A3', async t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'row3');
-  writeFileSync(m.scenario, JSON.stringify({ steps: [{ research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [{ research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
   const fact = await acceptedFact(f);
   const journal = f.store.get(journalId(f.project)), series = f.store.get(m.binding.value.series.id)!;
   const before = m.head();
@@ -2560,7 +2562,7 @@ test('6 7 H1.0c a standing gate enters only through full current preparation; an
 
 test('9 H1.0c an unfinished managed MC1 is a journal-only wait for work and dispatches nothing', async t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'row9'), fact = factGap(f);
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer] }));
   const writeMany = f.store.writeMany.bind(f.store);
   let stopped = false;
   f.store.writeMany = ((writes, guards) => {
@@ -2589,7 +2591,7 @@ test('9 H1.0c an unfinished managed MC1 is a journal-only wait for work and disp
 
 test('10 H1.0c MC1 fact candidates keep every child assessment mandatory', async t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'row10'), fact = factGap(f);
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet), dispatch: m.dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
   const saved = ok(evaluate(f, m, [{ gap: reference(fact), result: reference(original.record), candidate: null }]));
@@ -2626,7 +2628,7 @@ test('11 X3 H1.0c a supported E5 offered for its D5 is journal-only and unpaid; 
 
 /** The paid managed assessor transport of the fixture fact, not yet applied to its E5 terminal. */
 async function managedTransport(f: ReturnType<typeof fixture>, m: ReturnType<typeof managedAttempt>) {
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer, { research: { verdict: 'insufficient', reasons: ['x'] }, usage: traceUsage }] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer, { research: { verdict: 'insufficient', reasons: ['x'] }, usage: traceUsage }] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet), dispatch: m.dispatch, role: 'implementer' }));
   const intent = ok(writeAssessmentIntent(f.store, { project: f.project, modelCall: reference(original.record),
     questionId: m.batch.items[0]!.gap, dispatch: m.dispatch }));
@@ -2677,7 +2679,7 @@ test('14 H1.0c E5 T, E4 T and an H1.0b root cessation stay their own grounds, ne
   });
   await t.test('own ordinary MC1 off-form: existing E4-T', async child => {
     const f = fixture(child, 'repository-fact'), m = registered(f, 'row14-e4'), fact = factGap(f);
-    writeFileSync(m.scenario, JSON.stringify({ steps: [{ research: { invalid: true }, usage: traceUsage }] }));
+    writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [{ research: { invalid: true }, usage: traceUsage }] }));
     const call = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet), dispatch: m.dispatch, role: 'implementer' }));
     assert.ok(call.diagnostic);
     const saved = ok(evaluate(f, m, [{ gap: reference(fact), result: reference(call.record), candidate: null }]));
@@ -2747,7 +2749,7 @@ test('16 H1.0c a legacy E5.0 transport of an earlier attempt stays journal-only'
 
 test('18 19 H1.0c an inapplicable D5 or a D3 decision offered as an answer keeps its addressed journal-only finding', async t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'row18'), fact = factGap(f);
-  writeFileSync(m.scenario, JSON.stringify({ steps: [{ research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [{ research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
   const prior = await acceptedFact(f);
   const task = ok(prepareAnswerTask(f.store, { project: f.project, input: reference(f.input), gaps: f.request.gaps,
     gap: reference(prior.fact), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string', minLength: 1 } }));
@@ -3183,7 +3185,7 @@ async function twoManagedFacts(f: ReturnType<typeof fixture>, slice: string, ver
   assert.equal(m.batch.items.length, 2, 'Both addressed facts share the one MC1 batch');
   const assessor = (verdict: string) => verdict === 'off-form' ? { research: { answer: 'untyped reviewer reply' }, usage: traceUsage }
     : { research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: traceUsage };
-  writeFileSync(m.scenario, JSON.stringify({ steps: [m.answer, ...verdicts.map(assessor)] }));
+  writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer, ...verdicts.map(assessor)] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet), dispatch: m.dispatch, role: 'implementer' }));
   const terminals = [];
   for (const [index, verdict] of verdicts.entries()) {
@@ -3954,7 +3956,7 @@ async function nodeTerminal(f: ReturnType<typeof fixture>, block: string, end: N
     : end === 'interrupted' ? { rawStdout: '{broken', exitCode: 7 }
     : { research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: questions, action: end,
       reason: 'The requested design is not available', ...(end === 'need_owner' ? { decision: 'Name the operation' } : {}) }, usage: traceUsage }];
-  writeFileSync(scenario, JSON.stringify({ steps }));
+  writeFileSync(scenario, JSON.stringify({ database: f.path, steps }));
   const cycle = ok(await runModelCycle(f.store, { project: f.project, packet: reference(packet),
     dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' }));
   const offers = (ref: Ref) => batch.items.map(item => ({ gap: item.record, result: ref, candidate: null }));

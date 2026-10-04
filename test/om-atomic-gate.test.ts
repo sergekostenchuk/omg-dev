@@ -211,7 +211,7 @@ async function produceAtomicSeed() {
         consumers: [{ node: work.id, tests: [...work.tests] }] }));
     steps.push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal: body, bindings },
       usage: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 0, reasoningOutputTokens: 1 } });
-    writeFileSync(scenario, JSON.stringify({ steps }));
+    writeFileSync(scenario, JSON.stringify({ database: store.path, steps }));
     const call: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' };
     const cycle = ok(await runModelCycle(store, call));
     assert.equal(cycle.record.value.terminal, 'assembled', batch.node ?? 'node'); assert.ok(cycle.assembly);

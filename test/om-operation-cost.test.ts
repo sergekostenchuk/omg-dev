@@ -691,7 +691,7 @@ try {
   const assessor = verdict => ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: g4b.traceUsage });
   // The adapter fixture answers request k with step k: the scenario grows with every paid call of every attempt.
   async function pay(packet, verdict) {
-    steps.push(m.answer, assessor(verdict)); writeFileSync(m.scenario, JSON.stringify({ steps }));
+    steps.push(m.answer, assessor(verdict)); writeFileSync(m.scenario, JSON.stringify({ database: f.store.path, steps }));
     const original = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: m.dispatch, role: 'implementer' }));
     assert.equal(original.outcome?.kind, 'fact-candidates');
     const terminal = ok(await assessFact(f.store, { project, modelCall: reference(original.record), questionId: batch.items[0].gap, dispatch: m.dispatch }));
@@ -1304,7 +1304,7 @@ try {
   // The adapter answers request k with step k: one MC1 answer to both questions, then the assessor's verdict on A and
   // its untyped reply on B — a negative E5 beside a technical E5 of the same attempt.
   async function pay(packet, verdictA) {
-    steps.push(m.answer, assessor(verdictA), assessor('off-form')); writeFileSync(m.scenario, JSON.stringify({ steps }));
+    steps.push(m.answer, assessor(verdictA), assessor('off-form')); writeFileSync(m.scenario, JSON.stringify({ database: f.store.path, steps }));
     const original = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: m.dispatch, role: 'implementer' }));
     assert.equal(original.outcome?.kind, 'fact-candidates');
     const terminalA = ok(await assessFact(f.store, { project, modelCall: reference(original.record), questionId: a.gap, dispatch: m.dispatch }));

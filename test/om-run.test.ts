@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, symlinkSync } from "node:fs";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
@@ -46,7 +46,7 @@ import { ResearchSources } from "../src/discovery/research-sources.js";
 import { readQuestionPacket, writeQuestionPacket } from "../src/om/question-packet.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
-import { advanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
+import { advanceRun as currentAdvanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
 
 const project = "garden";
@@ -158,7 +158,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
     dispatch: { adapter: reference(adapter), config: reference(store.get(`environment:${project}`)!) } });
   return { root, database, input, graph, configured, environment, bases, request, activate,
     get store() { return store; }, get engine() { return engine; },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database, steps })); },
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
     restart(make: (path: string) => Store = path => new Store(path)) { store.close(); store = make(database); engine = new ProductEngine(store); } };
 }
@@ -1117,7 +1117,7 @@ test("H1.2 R12 R10a 27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2
       ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
+  writeFileSync(scenario, JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
   const performed: string[] = [];
   let phase = "", dirty = false;
   const readme = join(workspace, "README.md"), original = readFileSync(readme);
@@ -1343,7 +1343,7 @@ function worksFixture(t: test.TestContext, late = false) {
         localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
         removes: [], replaces: [], redefines: [] };
       steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage });
-      writeFileSync(scenario, JSON.stringify({ steps }));
+      writeFileSync(scenario, JSON.stringify({ database, steps }));
     } };
 }
 
@@ -2385,6 +2385,65 @@ out(performed);`, { request, project }) as string[];
 
 // ---- LP3 (№2817): a refusal caused by the content of a model answer or the size of its continuation ends the attempt ----
 const LP3_BASE_COMMIT = "d519a6036f8b2cc4aee823ce24d7160262a08fb9";
+const LP3_PACKET_COMMIT = "dd5fc67dec910d3c26c6516c0c2ebfc60413f981";
+const lp3NativePacketFixtures = new Set<{ database: string; store: Store }>();
+let lp3PacketProducer: string | undefined;
+let lp3PacketDirectory: string | undefined;
+process.once("exit", () => { if (lp3PacketDirectory) rmSync(lp3PacketDirectory, { recursive: true, force: true }); });
+/** One genuine pre-brief build for the entire suite; each packet step runs in a separate process. */
+function lp3Producer(): string {
+  if (lp3PacketProducer) return lp3PacketProducer;
+  const repository = fileURLToPath(new URL("../../", import.meta.url));
+  const root = mkdtempSync(join(tmpdir(), "omg-lp3-native-packets-"));
+  lp3PacketDirectory = root;
+  const archive = execFileSync("git", ["archive", LP3_PACKET_COMMIT, "src", "package.json"], { cwd: repository, maxBuffer: 50_000_000 });
+  execFileSync("tar", ["-x", "-C", root], { input: archive });
+  symlinkSync(join(repository, "node_modules"), join(root, "node_modules"), "dir");
+  const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
+  const files = execFileSync("git", ["ls-tree", "-r", "--name-only", LP3_PACKET_COMMIT, "src"], { cwd: repository, encoding: "utf8" })
+    .trim().split("\n").filter(path => path.endsWith(".ts"));
+  for (const path of files) {
+    const output = join(root, "dist", path.replace(/\.ts$/, ".js"));
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, ts.transpileModule(readFileSync(join(root, path), "utf8"),
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText);
+  }
+  lp3PacketProducer = join(root, "packet.mjs");
+  writeFileSync(lp3PacketProducer, `import assert from 'node:assert/strict';
+import { Store } from './dist/src/storage/store.js';
+import { advanceRun, readRun } from './dist/src/om/run.js';
+const store = new Store(process.argv[2]), request = JSON.parse(process.argv[3]);
+try {
+  const before = readRun(store, { project: request.project });
+  assert.ok(before.ok && before.value?.value.state.phase === 'step' && before.value.value.state.step.action === 'packet');
+  const result = await advanceRun(store, request);
+  assert.ok(result.ok && result.value.performed?.action === 'packet');
+  process.stdout.write(JSON.stringify(result));
+} finally { store.close(); }
+`);
+  return lp3PacketProducer;
+}
+function lp3NativePackets<T extends { database: string; store: Store }>(t: test.TestContext, f: T): T {
+  lp3NativePacketFixtures.add(f);
+  t.after(() => lp3NativePacketFixtures.delete(f));
+  return f;
+}
+/** Only opted-in LP3 roots use the old packet producer; selection, cycles, closure and recovery use today's code. */
+async function advanceRun(...args: Parameters<typeof currentAdvanceRun>): ReturnType<typeof currentAdvanceRun> {
+  const [store, request, control] = args;
+  const fixture = [...lp3NativePacketFixtures].find(f => f.store === store);
+  if (fixture && control === undefined) {
+    const found = readRun(store, { project: request.project });
+    const state = found.ok ? found.value?.value.state : null;
+    if (state?.phase === "step" && state.step.action === "packet") {
+      const body = state.step.request as { continuation?: unknown; previous?: unknown[] };
+      assert.ok(!body.continuation && !body.previous?.length, "The legacy producer intercepts only an independent root's saved packet step");
+      return JSON.parse(execFileSync(process.execPath, [lp3Producer(), fixture.database, JSON.stringify(request)],
+        { encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 })) as Awaited<ReturnType<typeof currentAdvanceRun>>;
+    }
+  }
+  return currentAdvanceRun(...args);
+}
 /** A need_source of the M5 mechanism batch (MC2 input-field) asking for the given reads. */
 function lp3Need(f: Fixture, routes: Ref, reads: unknown[]) {
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
@@ -2461,7 +2520,7 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
 const lp3Context = (f: Fixture): Ref => reference(f.store.get(`om-input:${project}`)!);
 
 test("LP3 (№2817 row 2, №53) a need_source whose search names a context record as its scope ends the cycle as reads-invalid with its record_foreign: the pass closes the attempt, goes on to the next and never waits on the refusal; a source scope and read_context of the same record still deliver", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
   const b = f.bases("lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
   f.steps([need, need, need, stopAnswer(f, false)]);
@@ -2478,8 +2537,31 @@ test("LP3 (№2817 row 2, №53) a need_source whose search names a context reco
   await sameEnd(f, request, 4);
 });
 
+test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is refused by E2 label decoding during E3 admission; the pass closes all three attempts without waiting or delivering reads", async t => {
+  const f = runFixture(t, ["encoding"]), b = f.bases("mp1-lp3-53"), request = f.request(b);
+  const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
+  f.steps([need, need, need, stopAnswer(f, false)]);
+  ok(startRun(f.store, { project }));
+  const end = await ends(f, request, 80);
+  assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
+  const packets = f.store.list<QuestionPacketRecord>("question-packet");
+  assert.equal(packets.length, 3);
+  assert.ok(packets.every(row => row.value.packetContract === "om-packet/brief-v1"));
+  const calls = f.store.list<{ error: string | null; status: string; om?: { failure?: Refusal } }>("model-call")
+    .filter(row => row.value.error === "answer_label_unknown");
+  assert.equal(calls.length, 3);
+  for (const call of calls) assert.deepEqual([call.value.status, call.value.om?.failure?.at.unit, call.value.om?.failure?.at.field],
+    ["failed", "E2", "reads/0/within"]);
+  const cycles = f.store.list<{ terminal: string }>("om-model-cycle");
+  assert.equal(cycles.length, 3); assert.ok(cycles.every(row => row.value.terminal === "outcome"));
+  assert.deepEqual(f.store.list("om-read-delivery"), []);
+  assert.equal(end.performed.filter(action => action === "close").length, 3);
+  assert.equal(f.sent().length, 4, "Three answers and one review; no repeated delivery or paid call");
+  await sameEnd(f, request, 4);
+});
+
 test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never taken for a continuation: a saved cycle of it is performed as saved and its producer's record_missing stands as the pass's wait — no ready, no new packet, nothing sent; once the record is read again the same saved cycle goes on", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
   const b = f.bases("lp3-2870"), request = f.request(b);
   f.steps([lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }])]);
   ok(startRun(f.store, { project }));
@@ -2510,7 +2592,7 @@ test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never
 const isRefOf = (request: unknown, packet: Ref): boolean => canonical((request as { packet?: Ref }).packet ?? null) === canonical(packet);
 
 test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context reads leave a continuation the capacity cannot hold ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
-  const f = worksFixture(t), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
+  const f = lp3NativePackets(t, worksFixture(t)), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
   for (let index = 0; index < 3; index++) {
     writeFileSync(join(f.root, `context-${index}.txt`), `context ${index} ${"x".repeat(90_000)}`);
     reads.push({ action: "read_context", record: reference(capture.read(`context-${index}.txt`, "text/plain")), pointer: "/content" });
@@ -2574,6 +2656,7 @@ test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2
 test("LP3 (№2817 п.4, п.7) the base d519a60 in its own process leaves the pass waiting on №52 and №53; the new code reopens it and finishes the saved work by an ordinary transition without paying the saved call again, the old revisions and records untouched", async t => {
   for (const kase of ["52", "53"] as const) await t.test(kase, async t => {
     const f = runFixture(t, ["encoding"]);
+    if (kase === "53") lp3NativePackets(t, f);
     const b = f.bases(`lp3-era-${kase}`), request = f.request(b);
     writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
     const need = lp3Need(f, b.routes, kase === "52" ? [{ action: "read", path: "big.txt", media: "text/plain" }]
@@ -2649,7 +2732,7 @@ test("LP4 (№2887 rows 1, 4, 9, §6.3, §6.4, §6.6) an addressed file the firs
       if (cycled.length === (hang === "first" ? 1 : 2)) steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
         questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage });
       else { f.answer(packet); steps.push((JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps.at(-1)); }
-      writeFileSync(scenario, JSON.stringify({ steps }));
+      writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
     }
     assert.equal(state?.phase, "waiting", JSON.stringify(state));
     const waiting = cycled[hang === "first" ? 0 : 1]!, other = cycled.find(ref => ref.id !== waiting.id) ?? null;
@@ -2764,7 +2847,7 @@ out(step);`, { project, request: f.request }) as RunStep | null;
     const packet = (step.request as unknown as { packet: Ref }).packet;
     assert.equal(f.store.get<QuestionPacketRecord>(packet.id, packet.revision)!.value.answerProtocol,
       saved === "waiting" ? "omg-answer/v2" : "omg-answer/v3");
-    writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
+    writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
       questionIds: lp4Questions(f, packet), missing: "The addressed file", reads: [{ action: "read", path: "lp4-later.txt", media: "text/plain" }] }, usage }] }));
     // The paid need_source is applied while the pass's cursor still stands on the saved step (the boundary of its recovery).
     const owner = ok(await runModelCall(f.store, step.request as never)).record.value.om.completionOwner!;

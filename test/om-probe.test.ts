@@ -44,6 +44,7 @@ import { parseProbeArgs, probeCommand, replayVerdict, runProbe, wireDifference, 
 // PR1 (№2943). Every fixture below is made by the engine's own producers; the probe only ever reads a copy of it.
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const PROJECT = 'garden';
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
@@ -55,6 +56,7 @@ process.env.TMPDIR = PRIVATE_TMP;
 /** The adapter stand-in: it records the exact stdin, directory and arguments, then answers by its scripted cursor. */
 const STUB = String.raw`import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fixtureResearch } from ${JSON.stringify(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href)};
 const dir = process.argv[2];
 const stdin = readFileSync(0, 'utf8');
 mkdirSync(join(dir, 'records'), { recursive: true });
@@ -70,18 +72,10 @@ const step = scenario.steps[cursor];
 if (!step) { process.stderr.write('Missing scenario step ' + cursor + '\n'); process.exit(2); }
 let request = null; try { request = JSON.parse(stdin); } catch { request = null; }
 const requestId = request && typeof request.requestId === 'string' ? request.requestId : null;
-// The answer era is the one the received packet names, as the common adapter fixture reads it.
-let protocol = null; try { protocol = JSON.parse(request.prompt).responseForm.protocol; } catch { protocol = null; }
-const answerProtocol = () => {
-  if (typeof protocol === 'string' && protocol.trim()) return protocol;
-  process.stderr.write('$answerProtocol requires responseForm.protocol in the received packet\n'); process.exit(2);
-};
-const replace = value => value === '$requestId' ? requestId : value === '$answerProtocol' ? answerProtocol() : Array.isArray(value) ? value.map(replace)
-  : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replace(item)])) : value;
 if (step.delayMs) await new Promise(resolve => setTimeout(resolve, step.delayMs));
 if (step.stderr) process.stderr.write(step.stderr);
 if (Object.hasOwn(step, 'rawStdout')) process.stdout.write(step.rawStdout);
-else process.stdout.write(JSON.stringify({ protocol: 'omg-agent/v1', requestId, research: replace(step.research), usage: step.usage ?? null,
+else process.stdout.write(JSON.stringify({ protocol: 'omg-agent/v1', requestId, research: fixtureResearch(request, step.research, scenario.database), usage: step.usage ?? null,
   confirmed: step.confirmed ?? { model: null, effort: null, speed: null } }) + '\n');
 process.exitCode = step.exitCode ?? 0;
 `;
@@ -91,8 +85,8 @@ function stubRecords(stubDir: string): StubRecord[] {
   return existsSync(folder) ? readdirSync(folder).filter(name => name.endsWith('.json')).sort()
     .map(name => JSON.parse(readFileSync(join(folder, name), 'utf8')) as StubRecord) : [];
 }
-function script(stubDir: string, steps: Record<string, unknown>[]): void {
-  writeFileSync(join(stubDir, 'scenario.json'), JSON.stringify({ steps })); writeFileSync(join(stubDir, 'cursor'), '0');
+function script(stubDir: string, steps: Record<string, unknown>[], database: string): void {
+  writeFileSync(join(stubDir, 'scenario.json'), JSON.stringify({ steps, database })); writeFileSync(join(stubDir, 'cursor'), '0');
 }
 
 /** The engine modules the garden recipe uses; a historical run hands it the same names from the base commit instead. */
@@ -158,7 +152,7 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
     m.symlinkSync(outside, m.join(root, 'outside'));
     const stubPath = m.join(root, 'stub.mjs'), stubDir = m.join(root, 'stub');
     m.mkdirSync(stubDir); m.writeFileSync(stubPath, m.STUB);
-    const steps = (list: unknown[]) => { m.writeFileSync(m.join(stubDir, 'scenario.json'), JSON.stringify({ steps: list })); m.writeFileSync(m.join(stubDir, 'cursor'), '0'); };
+    const steps = (list: unknown[]) => { m.writeFileSync(m.join(stubDir, 'scenario.json'), JSON.stringify({ steps: list, database })); m.writeFileSync(m.join(stubDir, 'cursor'), '0'); };
     const environment = (args: string[], capacity: number) => engine.environments.configure(project, { workspace: root,
       implementer: { actor: 'pr1-implementer', model: 'fixture', effort: 'high', speed: 'fast', command: { executable: m.execPath, args } },
       reviewer: { actor: 'pr1-reviewer', model: 'fixture-reviewer', effort: 'medium', command: { executable: m.execPath, args } },
@@ -372,7 +366,7 @@ const works = () => once('works', async (): Promise<WorksData> => {
       localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
       return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal, bindings } as unknown as Json;
     };
-    script(stubDir, [{ research: answer(true), usage }]);
+    script(stubDir, [{ research: answer(true), usage }], database);
     ok(await runModelCycle(store, { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' } as ModelCallRequest));
     const calls = store.list<Record<string, unknown>>('model-call').filter(row => row.id.startsWith(`model-call:${project}:om:`) && 'om' in row.value).map(row => row.id);
     return { root, database, stubDir, packet: reference(packet), calls, answers: { complete: answer(true), noCodeRef: answer(false) } };
@@ -439,16 +433,16 @@ function snapshotOf(path: string): { sha256: string; listing: string[] } {
     .map(name => { const stat = lstatSync(join(folder, name)); return `${name}:${stat.size}:${stat.mtimeMs}`; }) };
 }
 
-const answerFile = (body: Json, requestId: string, protocol: string): string => {
+const answerFile = (body: Json, requestId: string, packet: QuestionPacketRecord): string => {
   const path = join(directory('omg-pr1-answer-'), 'answer.json');
-  writeFileSync(path, JSON.stringify(body).split('"$requestId"').join(JSON.stringify(requestId)).split('"$answerProtocol"').join(JSON.stringify(protocol)));
+  assert.ok(packet.answerProtocol);
+  writeFileSync(path, JSON.stringify(fixtureAnswer(packet.packet, body)).split('"$requestId"').join(JSON.stringify(requestId))
+    .split('"$answerProtocol"').join(JSON.stringify(packet.answerProtocol)));
   return path;
 };
 const requestIdOf = (report: ProbeReport, packet: Ref): string => { const wire = pointOf(report, packet).wire; assert.ok(wire); return wire.requestId; };
-/** The answer era the exact saved packet asks for. */
-const protocolOf = (database: string, packet: Ref): string => {
-  const protocol = rawRecord<QuestionPacketRecord>(database, packet).answerProtocol; assert.ok(protocol); return protocol;
-};
+/** Both answer era and address labels come from the exact saved packet. */
+const answerPacketOf = (database: string, packet: Ref): QuestionPacketRecord => rawRecord<QuestionPacketRecord>(database, packet);
 const refusalCode = (report: ProbeReport): string | null => report.refusal?.code ?? null;
 const newWorkspace = (): string => directory('omg-pr1-ws-');
 const newReport = (): string => join(directory('omg-pr1-report-'), 'report');
@@ -458,7 +452,7 @@ interface Paid { report: ProbeReport; sent: StubRecord[]; reportDir: string; wor
 async function paidRun(source: string, stubDir: string, steps: Record<string, unknown>[], options: Partial<ProbeOptions> = {}, limits = { maxCalls: 10, maxChars: 10_000_000 },
   reuse?: { reportDir: string; workspace: string }): Promise<Paid> {
   const before = stubRecords(stubDir).length;
-  if (steps.length) script(stubDir, steps);
+  if (steps.length) script(stubDir, steps, source);
   const workspace = reuse?.workspace ?? newWorkspace(), reportDir = reuse?.reportDir ?? newReport();
   const report = await probe({ source, paid: { ...limits, workspace }, reportDir, ...options });
   return { report, sent: stubRecords(stubDir).slice(before), reportDir, workspace };
@@ -732,7 +726,7 @@ test('PR1 O13 the replay verdict: an applied outcome is the same or changed; any
 test('PR1 D7 joint assembly of E3-accepted answers: a complete candidate, partial coverage, a conflict in one frame, separate frames, a late refusal and nothing to assemble', async () => {
   const field = await fields(), base = await probe({ source: field.database, points: 9 });
   const id = (name: string) => requestIdOf(base, field.packets[name]!);
-  const answer = (point: string, body: string) => ({ point: field.packets[point]!.id, file: answerFile(field.answers[body]!, id(point), protocolOf(field.database, field.packets[point]!)) });
+  const answer = (point: string, body: string) => ({ point: field.packets[point]!.id, file: answerFile(field.answers[body]!, id(point), answerPacketOf(field.database, field.packets[point]!)) });
   const run = (answers: { point: string; file: string }[]) => probe({ source: field.database, ...ONLY('node-l3'), answers });
   const complete = await run([answer('produce', 'produce'), answer('consume', 'consume')]);
   assert.equal(complete.joint.state, 'assembled'); assert.equal(complete.joint.groups.length, 1);
@@ -772,27 +766,28 @@ test('PR1 D7 joint assembly of E3-accepted answers: a complete candidate, partia
   assert.deepEqual(none.joint, { state: 'nothing-to-assemble', groups: [] }); assert.equal(none.exit, 0);
 });
 
-test('PR1 calibration on own fixtures: an L3 answer without the end code reference is slot_fill_foreign under its rule, the corrected one is accepted; a field answer is accepted', async () => {
+test('PR1 calibration on own fixtures: an L3 answer without the end code reference is refused by the brief schema, the corrected one is accepted; a field answer is accepted', async () => {
   const work = await works(), field = await fields();
-  const base = await probe({ source: work.database }), requestId = requestIdOf(base, work.packet), protocol = protocolOf(work.database, work.packet);
-  const missing = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.noCodeRef!, requestId, protocol) }] });
+  const base = await probe({ source: work.database }), requestId = requestIdOf(base, work.packet), packet = answerPacketOf(work.database, work.packet);
+  const missing = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.noCodeRef!, requestId, packet) }] });
   const refused = pointOf(missing, work.packet).answer!.acceptance;
   assert.equal(refused.ok, false);
   if (!refused.ok) {
-    assert.equal(refused.refusal.code, 'slot_fill_foreign'); assert.equal(refused.refusal.at.unit, 'F4.3'); assert.equal(refused.refusal.at.field, 'codeRef');
-    assert.deepEqual(refused.rule, { list: 'rules', code: 'slot_fill_foreign', row: null });
+    assert.deepEqual([refused.refusal.code, refused.refusal.at.unit, refused.refusal.at.field],
+      ['part_answer_invalid', 'E2', '/proposal/fills/0'], JSON.stringify(refused));
+    assert.equal(refused.rule, null, 'No native rules/refusals row names this earlier schema refusal');
   }
   assert.equal(missing.exit, 2);
-  const corrected = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.complete!, requestId, protocol) }] });
+  const corrected = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.complete!, requestId, packet) }] });
   const accepted = pointOf(corrected, work.packet).answer!.acceptance;
   assert.ok(accepted.ok && accepted.kind === 'node-proposal' && (accepted.detail as { bindings: number }).bindings > 0);
   assert.equal(corrected.joint.groups[0]!.level, 3); assert.ok(corrected.joint.groups[0]!.works);
-  const foreign = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.complete!, 'another-request', protocol) }] });
+  const foreign = await probe({ source: work.database, answers: [{ point: work.packet.id, file: answerFile(work.answers.complete!, 'another-request', packet) }] });
   const unmatched = pointOf(foreign, work.packet).answer!.acceptance;
   assert.ok(!unmatched.ok && unmatched.refusal.code === 'part_result_invalid' && unmatched.rule === null, 'no rule is named without an exact match');
   const fieldBase = await probe({ source: field.database, points: 9 });
   const fieldAccepted = await probe({ source: field.database, ...ONLY('node-l3'), answers: [{ point: field.packets.field!.id,
-    file: answerFile(field.answers.field!, requestIdOf(fieldBase, field.packets.field!), protocolOf(field.database, field.packets.field!)) }] });
+    file: answerFile(field.answers.field!, requestIdOf(fieldBase, field.packets.field!), answerPacketOf(field.database, field.packets.field!)) }] });
   const fieldOutcome = pointOf(fieldAccepted, field.packets.field!).answer!.acceptance;
   assert.ok(fieldOutcome.ok && fieldOutcome.kind === 'input-decisions' && fieldOutcome.unanswered.length === 0);
 });
@@ -883,7 +878,9 @@ test('PR1 O16 O17 O18 the outcomes are the engine\'s own: a failed process, a ti
     ['cannot_answer', { research: control(questions, 'cannot_answer', { reason: 'No basis' }) }, 0,
       paid => { assert.ok(paid.acceptance?.ok && paid.acceptance.kind === 'no-result'); }],
     ['an answer E3 refuses', { research: invalid as unknown as Json }, 2, paid => {
-      assert.ok(paid.acceptance && !paid.acceptance.ok && paid.acceptance.refusal.code === 'answer_form_task_invalid' && paid.acceptance.refusal.at.unit === 'E3'); }],
+      assert.ok(paid.acceptance && !paid.acceptance.ok);
+      assert.deepEqual([paid.acceptance.refusal.code, paid.acceptance.refusal.at.unit, paid.acceptance.refusal.at.field],
+        ['answer_label_unknown', 'E2', 'results/0/questionId']); }],
   ];
   for (const [name, step, exit, check] of cases) {
     const run = await paidRun(garden.database, garden.stubDir, [step], select);
@@ -900,7 +897,7 @@ test('PR1 O16 O17 O18 the outcomes are the engine\'s own: a failed process, a ti
 test('PR1 O19 an interruption stops the adapter through the common runner and keeps a partial report; O16 an unproven group stop halts every later send', async () => {
   const garden = await facts(), select = { ...ONLY('node-l3'), select: [garden.packets.fact!.id, garden.packets.node!.id] };
   const controller = new AbortController(), before = stubRecords(garden.stubDir).length;
-  script(garden.stubDir, [{ research: garden.answers.fact!, delayMs: 20_000 }, { research: garden.answers.node!, usage }]);
+  script(garden.stubDir, [{ research: garden.answers.fact!, delayMs: 20_000 }, { research: garden.answers.node!, usage }], garden.database);
   const reportDir = newReport(), workspace = newWorkspace();
   const running = probe({ source: garden.database, ...select, paid: { maxCalls: 5, maxChars: 10_000_000, workspace }, reportDir, signal: controller.signal });
   await until(() => stubRecords(garden.stubDir).length > before, 'the request to reach the adapter');
@@ -968,7 +965,7 @@ test('PR1 O20 O25 a saved result is decided again without a send; a send whose r
 
 test('PR1 O25 O26 a probe killed after its send is unknown on resume; a second probe of the same directory is refused while the first lives and admitted after it dies', async () => {
   const garden = await facts(), reportDir = newReport(), workspace = newWorkspace(), before = stubRecords(garden.stubDir).length;
-  script(garden.stubDir, [{ research: garden.answers.fact!, delayMs: 60_000 }]);
+  script(garden.stubDir, [{ research: garden.answers.fact!, delayMs: 60_000 }], garden.database);
   const args = ['probe', '--source', garden.database, '--project', PROJECT, '--kind', 'node-l3', '--point', garden.packets.fact!.id, '--paid', '--max-calls', '5',
     '--max-chars', '100000000', '--workspace', workspace, '--report-dir', reportDir];
   const environment = { ...process.env }; delete environment['NODE_TEST_CONTEXT'];
@@ -983,7 +980,7 @@ test('PR1 O25 O26 a probe killed after its send is unknown on resume; a second p
     await new Promise(resolve => first.exitCode !== null || first.signalCode !== null ? resolve(null) : first.once('exit', resolve));
     for (const record of stubRecords(garden.stubDir).slice(before)) { try { process.kill(record.pid, 'SIGKILL'); } catch { /* already gone */ } }
   }
-  script(garden.stubDir, [{ research: garden.answers.fact!, usage }, { research: garden.answers.fact!, usage }]);
+  script(garden.stubDir, [{ research: garden.answers.fact!, usage }, { research: garden.answers.fact!, usage }], garden.database);
   const resumed = await probe({ source: garden.database, ...ONLY('node-l3'), select: [garden.packets.fact!.id, garden.packets.factRefused!.id],
     paid: { maxCalls: 1, maxChars: 100_000_000, workspace }, reportDir });
   assert.equal(resumed.refusal, null, 'the dead owner left no lock behind');
@@ -1212,7 +1209,7 @@ test('PR1 O24 №3019 an unfinished start is this probe\'s only by the bytes of 
     await refusedAsFound('С27 two copies of one result', path, 'probe_report_invalid', 'results'); }
   // С25: a real interruption of an authorization; no request has reached the adapter, so the point may still be sent.
   { const path = newReport(), workspace = newWorkspace(), before = stubRecords(garden.stubDir).length;
-    script(garden.stubDir, [{ research: garden.answers.fact!, usage }]);
+    script(garden.stubDir, [{ research: garden.answers.fact!, usage }], garden.database);
     const cutSend = await probe({ source: garden.database, ...select, paid: { maxCalls: 5, maxChars: 100_000_000, workspace }, reportDir: path,
       testHooks: { beforeCommit: file => { if (/[\\/]sends[\\/]/.test(file)) throw new Error('interrupted authorization'); } } });
     assert.equal(cutSend.refusal!.code, 'probe_report_unwritable'); assert.equal(cutSend.refusal!.at.field, 'send');

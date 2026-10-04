@@ -1,3 +1,4 @@
+import { packetPrompt } from './packet-brief.js';
 import { prepareCompletionCall, prepareManagedCallEnvironment } from './model-call.js';
 import { canonical, compareKeys, compositeKey, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -582,7 +583,7 @@ function checkRequest(project: string, value: unknown): OmResult<Sealed<CheckedR
   if (!dispatch.ok) return dispatch;
   if (request['packet'] === undefined) return problem("packet_invalid", "A complete packet is explicit, even when empty", target, "packet");
   let text: string;
-  try { text = canonical(request['packet']); }
+  try { text = packetPrompt(request['packet'], request['call'] as string); }
   catch (error) {
     if (!(error instanceof EngineError)) throw error;
     return problem("packet_invalid", "A packet is finite acyclic JSON that can be fingerprinted exactly", target, "packet");

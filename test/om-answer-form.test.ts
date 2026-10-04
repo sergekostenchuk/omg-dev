@@ -36,6 +36,7 @@ import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
+const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const clone = structuredClone;
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function ok<T>(result: OmResult<T>): T {
@@ -56,7 +57,7 @@ const valueForm: Json = { type: 'object', additionalProperties: false, required:
   format: { type: 'string', enum: ['json', 'xml'] }, versions: { type: 'array', minItems: 1, items: { type: 'integer', minimum: 1 } },
 } };
 
-function fixture(t: TestContext, schema: Json = valueForm, multiple = false) {
+function fixture(t: TestContext, schema: Json = valueForm, multiple = false, material?: (store: Store, project: string, root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'omg-answer-form-')), database = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(database);
   const engine = new ProductEngine(store);
@@ -108,6 +109,7 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false) {
     return ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
       environment: reference(environment), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   }
+  material?.(store, project, root);
   const factBatch = routes.value.batches.find(batch => batch.model === 'MC1')!;
   const factPacket = issue(factBatch, 'garden-consume-block'), question = factPacket.value.native[0]!.question;
   const nodeBatch = routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === 'garden-produce-block')!;
@@ -123,9 +125,9 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false) {
     ...(item.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [], joins: [],
     tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
   const requestId = (nodePacket.value.packet as Record<string, Json>).requestId as string;
-  const raw = (proposal: unknown = body) => JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal });
-  const answerRaw = (packet: typeof nodePacket, answer: object) => JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL,
-    requestId: (packet.value.packet as Record<string, Json>).requestId, ...answer });
+  const raw = (proposal: unknown = body) => JSON.stringify(fixtureAnswer(nodePacket.value.packet, { protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal }));
+  const answerRaw = (packet: typeof nodePacket, answer: object) => JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: PACKET_ANSWER_PROTOCOL,
+    requestId: (packet.value.packet as Record<string, Json>).requestId, ...answer }));
   const questionIds = (packet: typeof nodePacket) => ((packet.value.packet as Record<string, Json>).questions as unknown as { id: string }[]).map(item => item.id);
   const fieldBatch = routes.value.batches.find(batch => batch.model === 'MC2' && batch.task === 'input-field'
     && batch.items.some(item => item.target === 'discovery:unaddressed-format'))!;
@@ -299,10 +301,14 @@ test('E3 derives node proposals with the E2 assignment checks and cannot create 
 });
 
 test('E3 derives MC1 grounds from exact citations while reported documents remain below execution proof', t => {
-  const f = fixture(t), evidence = new Evidence(f.store);
-  mkdirSync(join(f.root, 'src')); writeFileSync(join(f.root, 'src/format.ts'), 'export const format = "json";\n');
-  const file = evidence.file(f.project, 'form-code', f.root, 'src/format.ts', 'text/plain', 0);
-  const document = evidence.document(f.project, 'form-document', JSON.stringify({ format: 'json', versions: [2, 1] }), 'application/json', 0);
+  const f = fixture(t, valueForm, false, (store, project, root) => {
+    const evidence = new Evidence(store);
+    mkdirSync(join(root, 'src')); writeFileSync(join(root, 'src/format.ts'), 'export const format = "json";\n');
+    evidence.file(project, 'form-code', root, 'src/format.ts', 'text/plain', 0);
+    evidence.document(project, 'form-document', JSON.stringify({ format: 'json', versions: [2, 1] }), 'application/json', 0);
+  });
+  const file = f.store.get<import('../src/evidence/evidence.js').Source>(`source:${f.project}:form-code`)!;
+  const document = f.store.get(`source:${f.project}:form-document`)!;
   const citations = [{ source: reference(file), selector: { kind: 'text-range' as const, start: 0, end: file.value.content.length } },
     { source: reference(document), selector: { kind: 'json-pointer' as const, pointer: '/format' } }];
   const results = [{ questionId: f.questionIds(f.factPacket)[0]!, value: { format: 'json', versions: [2, 1] }, citations }];
@@ -325,7 +331,8 @@ test('E3 derives MC1 grounds from exact citations while reported documents remai
 });
 
 test('E3 rejects fact omissions, duplicate or foreign questions, forged citations and model supplied grounds', t => {
-  const f = fixture(t), source = new Evidence(f.store).document(f.project, 'form-fact', '{"format":"json"}', 'application/json', 0);
+  const f = fixture(t, valueForm, false, (store, project) => { new Evidence(store).document(project, 'form-fact', '{"format":"json"}', 'application/json', 0); });
+  const source = f.store.get(`source:${f.project}:form-fact`)!;
   const foreign = new Evidence(f.store).document('another-project', 'form-fact', '{"format":"json"}', 'application/json', 0);
   const result = { questionId: f.questionIds(f.factPacket)[0]!, value: { format: 'json', versions: [1] },
     citations: [{ source: reference(source), selector: { kind: 'json-pointer', pointer: '/format' } }] };
@@ -345,7 +352,8 @@ test('E3 rejects fact omissions, duplicate or foreign questions, forged citation
 });
 
 test('E3 checks every declared control outcome against its exact task without delivering reads or changing attempt state', t => {
-  const f = fixture(t), source = new Evidence(f.store).document(f.project, 'form-navigation', '{"format":"json"}', 'application/json', 0);
+  const f = fixture(t, valueForm, false, (store, project) => { new Evidence(store).document(project, 'form-navigation', '{"format":"json"}', 'application/json', 0); });
+  const source = f.store.get(`source:${f.project}:form-navigation`)!;
   mkdirSync(join(f.root, 'src')); writeFileSync(join(f.root, 'src/format.ts'), 'export const format = "json";\n');
   const questions = f.questionIds(f.factPacket), reads = [
     { action: 'read', path: 'src/format.ts', media: 'text/plain' },
@@ -382,7 +390,8 @@ test('E3 checks every declared control outcome against its exact task without de
 });
 
 test('E3 refuses unaddressed, foreign, malformed and executable control requests', t => {
-  const f = fixture(t), source = new Evidence(f.store).document(f.project, 'form-navigation', '{"format":"json"}', 'application/json', 0);
+  const f = fixture(t, valueForm, false, (store, project) => { new Evidence(store).document(project, 'form-navigation', '{"format":"json"}', 'application/json', 0); });
+  const source = f.store.get(`source:${f.project}:form-navigation`)!;
   const questionIds = f.questionIds(f.factPacket), base = { action: 'need_source', questionIds, missing: 'Need format evidence' };
   const foreign = new Evidence(f.store).document('foreign', 'form-navigation', '{"format":"json"}', 'application/json', 0);
   const badReads: object[] = [
@@ -500,7 +509,8 @@ test('E3 validates source-only MC2 request envelopes before reading routes and p
 });
 
 test('E3 partial MC1 and MC2 result sets explicitly retain the unanswered task addresses', t => {
-  const f = fixture(t, valueForm, true), source = new Evidence(f.store).document(f.project, 'partial-evidence', '{"format":"json"}', 'application/json', 0);
+  const f = fixture(t, valueForm, true, (store, project) => { new Evidence(store).document(project, 'partial-evidence', '{"format":"json"}', 'application/json', 0); });
+  const source = f.store.get(`source:${f.project}:partial-evidence`)!;
   const factIds = f.questionIds(f.factPacket);
   assert.equal(factIds.length, 2); assert.equal(f.fieldBatch.items.length, 2);
   const factRequest = { project: f.project, packet: reference(f.factPacket), raw: f.answerRaw(f.factPacket, { action: 'answer',
@@ -796,20 +806,21 @@ test('LP1 v3 table: all 35 paths agree in the actual schema and E3 for read and 
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('LP1 v3 preserves record scopes and rejects missing paths, foreign response eras and symlink escapes without writes', t => {
+test('MP1 preserves LP1 path refusals and reads saved context through its declared label without writes', t => {
   const f = fixture(t), before = snapshot(f.store), payload = f.factPacket.value.packet as Record<string, any>;
   const validate = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
   const raw = (read: object) => f.answerRaw(f.factPacket, { action: 'need_source', questionIds: f.questionIds(f.factPacket), missing: 'Need source', reads: [read] });
   const request = (body: string) => ({ project: f.project, packet: reference(f.factPacket), raw: body });
-  const scoped = raw({ action: 'search', within: reference(f.input), query: 'format' });
+  const scoped = raw({ action: 'read_context', record: reference(f.input), pointer: '/input' });
   assert.equal(validate(JSON.parse(scoped)), true);
   for (const check of [checkAnswerForm, prepareAnswerForm]) {
     assert.equal(ok(check(f.store, request(scoped))).kind, 'need-source');
     for (const read of [{ action: 'read', media: 'text/plain' }, { action: 'search', query: 'format' },
       { action: 'search', within: { id: f.input.id, revision: f.input.revision }, query: 'format' }]) {
       const body = raw(read); assert.equal(validate(JSON.parse(body)), false);
-      rejected(check(f.store, request(body)), 'part_answer_invalid');
+      rejected(check(f.store, request(body)), 'within' in read ? 'answer_label_unknown' : 'part_answer_invalid');
     }
+    rejected(check(f.store, request(raw({ action: 'search', within: reference(f.input), query: 'format' }))), 'answer_label_unknown');
     const otherEra = JSON.parse(scoped); otherEra.protocol = 'omg-answer/v2';
     rejected(check(f.store, request(JSON.stringify(otherEra))), 'part_answer_invalid');
   }
@@ -823,4 +834,24 @@ test('LP1 v3 preserves record scopes and rejects missing paths, foreign response
     rejected(prepareAnswerForm(f.store, request(body)), 'answer_form_address_invalid');
   }
   assert.deepEqual(snapshot(f.store), before);
+});
+
+test('MP1 MC1 and L2 examples pass the same E3 admission as model content and controls', t => {
+  const f = fixture(t, valueForm, false, (store, project) => {
+    new Evidence(store).document(project, 'example-evidence', '{"format":"json","versions":[1]}', 'application/json', 0);
+  });
+  for (const packet of [f.factPacket, f.nodePacket]) {
+    const payload = packet.value.packet as Record<string, any>;
+    const schema = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
+    assert.ok(payload.brief.examples.some((example: { action: string }) => example.action === 'answer'));
+    const before = snapshot(f.store);
+    for (const example of payload.brief.examples) {
+      assert.equal(schema(example), true, canonical(schema.errors));
+      const request = { project: f.project, packet: reference(packet), raw: canonical(example) };
+      const actual = ok(checkAnswerForm(f.store, request));
+      if (example.action === 'answer' && packet === f.nodePacket) assert.equal(actual.kind, 'node-proposal');
+      if (example.action === 'answer' && packet === f.factPacket) assert.equal(actual.kind, 'fact-candidates');
+    }
+    assert.deepEqual(snapshot(f.store), before);
+  }
 });

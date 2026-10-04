@@ -39,6 +39,7 @@ import { openSeries, beginAttempt } from '../src/om/series.js';
 import { readWorksFrame } from '../src/om/works-frame.js';
 
 const clone = structuredClone;
+const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message} ${canonical(result.refusal.at)}`);
   return result.value;
@@ -167,7 +168,8 @@ async function lateObligationsFixture(t: TestContext) {
     removes: [], replaces: [], redefines: [] };
   const bindings = initialObligations.map(item => ({ id: taskBindingId(item), scope: item.scope,
     obligation: item.obligation, consumers: [{ node: work.id, tests: [] }] }));
-  writeFileSync(scenario, JSON.stringify({ protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer', proposal: body, bindings }));
+  writeFileSync(scenario, JSON.stringify(fixtureAnswer(packet.value.packet,
+    { protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer', proposal: body, bindings })));
   const cycle = ok(await runModelCycle(store, { project, packet: reference(packet), role: 'implementer',
     dispatch: { adapter: reference(adapter), config: reference(environment) } }));
   assert.equal(cycle.record.value.terminal, 'assembled', canonical(cycle)); assert.ok(cycle.assembly);

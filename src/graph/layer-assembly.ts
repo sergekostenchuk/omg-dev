@@ -104,3 +104,13 @@ export function assembleL3(base: Graph, input: Record<string, any>,
     missing.map(([consumer, ids]) => ({ consumer, connectors: [...ids].sort().map(connectorRef), requested: ['condition', 'required', 'optional', 'failures'] })));
   return design;
 }
+
+/** Codes emitted by this module; kept complete by the brief catalogue regression. */
+export const LAYER_ASSEMBLY_CODES = Object.freeze([
+  'layer_connector_ref_invalid',
+  'layer_counterfactual_ref_invalid',
+  'layer_design_invalid',
+  'layer_join_design_required',
+  'layer_join_inputs_invalid',
+  'layer_requirement_invalid',
+] as const);

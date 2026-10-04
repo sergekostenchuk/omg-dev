@@ -497,7 +497,7 @@ process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.
         ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: '$answerProtocol', requestId: '$requestId',
+  writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [{ research: { protocol: '$answerProtocol', requestId: '$requestId',
     action: 'answer', proposal: body, bindings: [] }, usage: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 0, reasoningOutputTokens: 1 } }] }));
   const cycle = ok(await runModelCycle(store, { project, packet: reference(packet), role: 'implementer',
     dispatch: { adapter: reference(adapter), config: reference(environment) } }));

@@ -1,4 +1,6 @@
-import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from 'node:url';
+import { appendFileSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { createRequire } from 'node:module';
 
 const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const has = (value, key) => Object.hasOwn(value, key);
@@ -22,10 +24,54 @@ function options(args) {
   return result;
 }
 
+function requestForm(request) {
+  if (request.prompt.startsWith("{")) return JSON.parse(request.prompt);
+  const marker = "# Response form — machine section is one JSON line immediately after this header\n";
+  const pieces = request.prompt.split(marker);
+  requireFixture(pieces.length === 2, "A brief needs exactly one declared response section");
+  const form = JSON.parse(pieces[1].split("\n")[0]);
+  requireFixture(form.contract === "om-brief-response/v1" && form.responseForm?.requestId === request.requestId,
+    "The response section must belong to this request");
+  return form;
+}
+
+// Current scenario data is authored in native engine identities. Translate only declared
+// answer address fields, and only for the explicitly requested current-protocol marker.
+function currentLabels(value, request, enabled, labels) {
+  if (!enabled) return value;
+  const form = requestForm(request);
+  if (form.contract !== "om-brief-response/v1") return value;
+  const lookup = (item, domain) => (labels ?? form.labels).find(label => label.domain === domain
+    && (isObject(item) && isObject(label.value)
+      ? ["id", "revision", "hash"].every(key => label.value[key] === item[key]) : label.value === item))?.label ?? item;
+  if (!isObject(value)) return value;
+  if (Array.isArray(value.questionIds)) value.questionIds = value.questionIds.map(item => lookup(item, "question"));
+  for (const result of Array.isArray(value.results) ? value.results : []) {
+    if (!isObject(result)) continue;
+    if (has(result, "questionId")) result.questionId = lookup(result.questionId, "question");
+    if (has(result, "basis")) result.basis = lookup(result.basis, "gap");
+    for (const citation of Array.isArray(result.citations) ? result.citations : []) if (isObject(citation)) citation.source = lookup(citation.source, "source");
+  }
+  for (const key of ["fills", "replaces"]) for (const fill of Array.isArray(value.proposal?.[key]) ? value.proposal[key] : []) {
+    if (!isObject(fill)) continue;
+    fill.obligation = lookup(fill.obligation, "slot");
+    if (key === "replaces" && fill.base) fill.base.graph = lookup(fill.base.graph, "context");
+  }
+  for (const read of Array.isArray(value.reads) ? value.reads : []) {
+    if (!isObject(read)) continue;
+    if (read.action === "read_source") read.source = lookup(read.source, "source");
+    if (read.action === "read_context") read.record = lookup(read.record, "context");
+    if (read.action === "search" && isObject(read.within) && !has(read.within, "label")) {
+      const label = lookup(read.within, "source"); if (typeof label === "string") read.within = { label };
+    }
+  }
+  return value;
+}
+
 function replaceRequestMarkers(value, request) {
   if (value === "$requestId") return request.requestId;
   if (value === "$answerProtocol") {
-    const protocol = JSON.parse(request.prompt).responseForm?.protocol;
+    const protocol = requestForm(request).responseForm?.protocol;
     requireFixture(typeof protocol === "string" && protocol.trim().length > 0,
       "$answerProtocol requires responseForm.protocol in the received packet");
     return protocol;
@@ -123,14 +169,14 @@ function main() {
   else process.stdout.write(`${JSON.stringify({
     protocol: "omg-agent/v1",
     requestId: request.requestId,
-    research: replaceRequestMarkers(step.research, request),
+    research: fixtureResearch(request, step.research, scenario.database),
     usage: has(step, "usage") ? step.usage : null,
     confirmed: has(step, "confirmed") ? step.confirmed : { model: null, effort: null, speed: null },
   })}\n`);
   process.exitCode = step.exitCode ?? 0;
 }
 
-try {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) try {
   if (process.argv[2] === "--driver") {
     requireFixture(process.argv.length === 4, "Expected --driver <JSON path>");
     await driver(process.argv[3]);
@@ -138,4 +184,28 @@ try {
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ error: "om_adapter_fixture_invalid", message: error.message })}\n`);
   process.exitCode = 2;
+}
+
+// Direct test builders use the same addressed transformation as current adapter scenarios.
+export function fixtureResearch(request, answer, database) {
+  const enabled = answer?.protocol === "$answerProtocol";
+  let labels;
+  // Native scenario answers use the exact issued map from their explicitly named fixture database.
+  // Service identities stay out of the model prompt. This reader never creates or changes a database.
+  if (enabled && database && requestForm(request).contract === 'om-brief-response/v1') {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const db = new DatabaseSync(database, { readOnly: true });
+    try {
+      const rows = db.prepare("SELECT body FROM revisions WHERE json_extract(body, '$.packet.requestId') = ?").all(request.requestId);
+      const packets = rows.map(row => JSON.parse(row.body).packet).filter(packet => packet?.brief?.text === request.prompt);
+      requireFixture(packets.length === 1, 'The fixture needs one exact saved packet matching the request and text');
+      labels = packets[0].brief.labels;
+    } finally { db.close(); }
+  }
+  return currentLabels(replaceRequestMarkers(answer, request), request, enabled, labels);
+}
+
+export function fixtureAnswer(packet, answer) {
+  if (!packet?.brief || !['om-question-packet/brief-v1', 'om-question-packet/works-brief-v1'].includes(packet.version)) return answer;
+  return currentLabels(structuredClone(answer), { requestId: packet.requestId, prompt: packet.brief.text }, true, packet.brief.labels);
 }

@@ -1,3 +1,4 @@
+import { bindingFlowIdentity } from "../graph/flow-identity.js";
 import { Ajv } from "ajv";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
@@ -84,7 +85,7 @@ function requireFlow(binding: unknown): asserts binding is Binding {
 }
 export function flowKey(binding: Binding): string {
   requireFlow(binding);
-  return hashJson([binding.producer.node, binding.producer.port, binding.anchor]);
+  return bindingFlowIdentity(binding);
 }
 export function workAnchorId(connector: string, flow: string, producer: Pick<Endpoint, "node" | "port">): string {
   if (!frameText(connector) || !frameHash(flow) || !frameObject(producer) || !frameText(producer.node) || !frameText(producer.port))

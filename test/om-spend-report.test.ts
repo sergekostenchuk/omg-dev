@@ -1471,7 +1471,7 @@ function ordinarySpendFixture(t: test.TestContext) {
   const packet = deliveredOf(writeQuestionPacket(store, packetRequest)).record;
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" };
   return { database, store, project, source, routes, gaps, batch, packet, request, address, goal, series, environment,
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); } };
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); } };
 }
 
 test("E6 report: one assessed fact has its own physical expense beside the original MC1 call", async t => {

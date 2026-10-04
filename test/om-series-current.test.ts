@@ -201,7 +201,7 @@ function product(f: Fixture, managed = true, begin = true, priorNoProgress = 0) 
     attempt: { series: reference(series), ordinal }, previous: [] };
   const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
   return { ...f, get store() { return f.store; }, get engine() { return f.engine; }, first, running: series, goal, packetRequest, environment, adapter, source, batch, gapRequest, gaps, routes,
-    scenario, trace, steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    scenario, trace, steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: f.store.path, steps })); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
 }
 function ready(f: ReturnType<typeof product>) {

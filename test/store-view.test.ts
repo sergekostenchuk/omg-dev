@@ -852,7 +852,7 @@ function e4q(t: TestContext, managed = false) {
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
   return { root, database, project, source, batch, packet, request, scenario, trace, store, engine,
     adapter, configured, series, packetRequest, reconfigure,
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
 }
 function e4qFact(f: ReturnType<typeof e4q>) {

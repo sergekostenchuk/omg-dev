@@ -1,3 +1,4 @@
+import { packetPrompt } from '../src/om/packet-brief.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { types } from "node:util";
@@ -312,7 +313,7 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
 }
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
-  seriesCommit?: string) {
+  seriesCommit?: string, material?: (store: Store, project: string, root: string) => void) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
   const extra = extraQuestion || kind === 'design';
   const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : kind === 'design' ? 'design' : 'addressed'}:${extra}`,
@@ -357,6 +358,7 @@ out(reference(take(openSeries(store, args))));`, firstLine);
   const opening = { ...address, attempt: ordinal, goal, ...(kind === 'field' ? { admission } : {}),
     ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) };
   const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
+  material?.(store, project, root);
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal }, previous: [] };
   // LP1: historical consumers receive the packet their producer issues, including its exact v2 candidate address.
@@ -372,7 +374,7 @@ out(take(${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'}(store,
     configured, adapter, series, obligations, scenario, trace, environment,
     get store() { return store; }, get engine() { return engine; },
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database, steps })); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; },
   };
 }
@@ -491,7 +493,7 @@ function e4WorksFixture(t: TestContext) {
   }
   return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured,
     get store() { return store; }, restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database, steps })); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
 }
 
@@ -588,8 +590,16 @@ test('E4 cycle delivers all addressed read forms then answers once in the same a
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'outcome'); assert.equal(cycle.last.outcome?.kind, 'fact-candidates');
   const sent = f.sent(); assert.equal(sent.length, 2); assert.notEqual(sent[0].requestId, sent[1].requestId);
-  const first = JSON.parse(sent[0].prompt), second = JSON.parse(sent[1].prompt);
+  const payloadOf = (wire: { requestId: string; prompt: string }) => {
+    const payload = f.store.list<{ packet: Record<string, any> }>('question-packet').find(row => row.value.packet?.requestId === wire.requestId)!.value.packet;
+    assert.equal(wire.prompt, packetPrompt(payload, wire.requestId)); return payload;
+  };
+  const first = payloadOf(sent[0]), second = payloadOf(sent[1]);
   assert.deepEqual(second.questions, first.questions); assert.equal(second.responseForm.requestId, sent[1].requestId);
+  assert.deepEqual(second.brief.labels.slice(0, first.brief.labels.length), first.brief.labels);
+  const deliveredSource = second.sourceDeliveries[0].data[0].sources[0];
+  assert.ok(second.brief.labels.some((label: any) => label.domain === 'source' && canonical(label.value) === canonical(deliveredSource)));
+  assert.ok(!first.brief.labels.some((label: any) => canonical(label.value) === canonical(deliveredSource)));
   assert.equal(second.sourceDeliveries[0].data.length, 4);
   assert.equal(second.sourceDeliveries[0].data[0].data, 'UTF-8 is the supported encoding.');
   assert.deepEqual(second.sourceDeliveries[0].data[3].data.map((item: {line: number; text: string}) => [item.line, item.text]), [[1, 'UTF-8 is the supported encoding.']]);
@@ -870,10 +880,15 @@ test('E4 carries checked works handoffs through local dispatch, split assembly, 
     parts.forEach((part, position) => {
       const issued = f.store.get<QuestionPacketRecord>(part.record.value.request.packet.id, part.record.value.request.packet.revision)!;
       const context = issued.value.packet as { works: { obligations: unknown[]; nodeAssignments: string[]; assigned: string[] } };
+      if (position > 0) {
+        const previous = (issued.value.packet as Record<string, any>).expansion.previous;
+        assert.deepEqual(previous.map((item: any) => item.tests), parts.slice(0, position).map(item => item.proposal.value.tests));
+        assert.deepEqual(previous.map((item: any) => item.edges), parts.slice(0, position).map(item => item.proposal.value.edges));
+      }
       assert.deepEqual(context.works.obligations, f.ledger.handoff.obligations);
       assert.deepEqual(context.works.nodeAssignments, payload.works.nodeAssignments);
       assert.deepEqual(context.works.assigned, position === count - 1 ? payload.works.nodeAssignments : []);
-      assert.equal(issued.value.fingerprint!.chars, canonical(issued.value.packet).length);
+      assert.equal(issued.value.fingerprint!.chars, packetPrompt(issued.value.packet).length);
       assert.ok(issued.value.fingerprint!.chars <= config.value.requestCapacityChars!);
       assert.deepEqual(part.record.value.works, { ...expected, bindings: position === count - 1 ? f.bindings : [] });
       const response = f.store.get<{ raw: string }>(part.record.value.request.response.id, part.record.value.request.response.revision)!;
@@ -1085,8 +1100,10 @@ test('E4 node result conflict leaves no partial response/proposal/result, accoun
 import { Evidence } from '../src/evidence/evidence.js';
 test('E4 retains terminal evidence when environment or captured file changes during the physical call before E3 preparation', async t => {
   for (const change of ['environment', 'file'] as const) {
-    const f = e4Fixture(t), reply = e4Fact(f);
-    const file = new Evidence(f.store).file(f.project, 'transport-file', f.root, 'e4-source.txt', 'text/plain', 0);
+    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, false, true, false, undefined, (store, project, root) => {
+      new Evidence(store).file(project, 'transport-file', root, 'e4-source.txt', 'text/plain', 0);
+    }), reply = e4Fact(f);
+    const file = f.store.get<import('../src/evidence/evidence.js').Source>(`source:${f.project}:transport-file`)!;
     if (change === 'file') reply.results[0]!.citations = [{ source: reference(file), selector: { kind: 'text-range', start: 0, end: file.value.content.length } }];
     f.steps([{ research: reply, usage }]);
     const get = f.store.get.bind(f.store); let injected = false;
@@ -3620,8 +3637,9 @@ test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writ
     (error: unknown) => error instanceof EngineError && error.code === 'invalid_json', 'A value that is no JSON is refused as before: its hash is taken first');
 });
 
+// These regressions exercise the historical permissive E3 form; its genuine producer owns the era.
 test('LP3 (№2817 row 2) a need_source that E3 admits but whose search names a context record as its scope ends the cycle as reads-invalid with the read\'s own record_foreign, before any read: the root is discharged, nothing more is sent, and the cycle reads and repeats the same after restart; a source scope and read_context of that record still deliver', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
   const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
     { action: 'search', within: reference(f.input), query: 'question' }]);
   f.steps([{ research: need, usage }, { research: e4Fact(f), usage }]);
@@ -3638,7 +3656,7 @@ test('LP3 (№2817 row 2) a need_source that E3 admits but whose search names a 
   valueOf(await runModelCycle(f.store, f.request));
   assert.deepEqual(f.store.list(), saved, 'The repeat writes nothing'); assert.equal(f.sent().length, 1);
   // Control: the same record read as context, and a captured source as the scope, are performed as before.
-  const g = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
   g.steps([{ research: e4NeedSource(g, [{ action: 'read_context', record: reference(g.input), pointer: '/input/questions/0/question' },
     { action: 'search', within: reference(g.source), query: 'UTF' }]), usage }, { research: e4Fact(g), usage }]);
   const lawful = valueOf(await runModelCycle(g.store, g.request));
@@ -3649,12 +3667,14 @@ test('LP3 (№2817 row 2) a need_source that E3 admits but whose search names a 
 test('LP3 (№2817 п.4, п.7) a cycle stopped between its transactions — after the call, the deliveries, the blocked continuation or its diagnostic; after the call or the diagnostic of an unperformable read — is finished by the same cycle without another send, with the same terminal and diagnostic, and repeats without a write after restart', async t => {
   const windows = { blocked: ['call', 'deliveries', 'continuation', 'diagnostic'], 'reads-invalid': ['call', 'diagnostic'] } as const;
   for (const [terminal, stops] of Object.entries(windows)) for (const stop of stops) await t.test(`${terminal} after ${stop}`, async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
     let request = f.request, packetRequest = f.packetRequest;
     if (terminal === 'blocked') {
       const config = f.environment(f.packet.value.fingerprint!.chars + 100);
       packetRequest = { ...f.packetRequest, environment: reference(config) };
-      const packet = valueOf(writeQuestionPacket(f.store, packetRequest)).record;
+      const packet = h15AtCommit(f, 'b595c7b', 'era-window-packet',
+        `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store,args)).record);`, packetRequest) as Revision<QuestionPacketRecord>;
       request = { ...request, packet: reference(packet), dispatch: { ...request.dispatch, config: reference(config) } };
       writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
     }
@@ -3690,7 +3710,7 @@ test('LP3 (№2817 п.4, п.7) a cycle stopped between its transactions — afte
 });
 
 test('LP3 (№2817 п.3, п.7) the ground of reads-invalid is derived from the exact packet, call and response alone: another record as its evidence, or a response whose reads are performable, cannot close the attempt with that terminal', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
   f.steps([{ research: e4NeedSource(f, [{ action: 'search', within: reference(f.input), query: 'question' }]), usage }]);
   const call = valueOf(await runModelCall(f.store, f.request));
   const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response! };
@@ -3700,7 +3720,7 @@ test('LP3 (№2817 п.3, п.7) the ground of reads-invalid is derived from the e
   const foreign = finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [reference(f.source)] });
   assert.ok(!foreign.ok && foreign.refusal.code === 'completion_invalid', 'Another record is no evidence of this read');
   assert.deepEqual(f.store.list(), before, 'Nothing is written');
-  const g = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
   g.steps([{ research: e4NeedSource(g, [{ action: 'search', within: reference(g.source), query: 'UTF' }]), usage }]);
   const lawful = valueOf(await runModelCall(g.store, g.request));
   const claimed = finishModelAttempt(g.store, { project: g.project, packet: g.request.packet, call: lawful.call, response: lawful.response!,
@@ -3895,4 +3915,17 @@ test('LP4 (№2887 §6.7) a work moved by another Store between the preparation 
   assert.deepEqual([fresh.value.remainder, fresh.value.cause.kind], ['expansion', 'cycle-step-ceased']);
   assert.notDeepEqual(fresh.value.work, prepared.record.value.work, 'Proved on the work as it stands now');
   assert.equal(f.sent().length, 1);
+});
+
+
+test('MP1 field examples pass the genuine E3 parser with exact gap labels and permitted field values', t => {
+  const f = e4Fixture(t, 'field');
+  const payload = f.packet.value.packet as Record<string, any>;
+  assert.ok(payload.brief.examples.some((example: { action: string }) => example.action === 'answer'));
+  const before = JSON.stringify(f.store.list());
+  for (const example of payload.brief.examples) {
+    const actual = valueOf(checkAnswerForm(f.store, { project: f.project, packet: reference(f.packet), raw: canonical(example) }));
+    if (example.action === 'answer') assert.equal(actual.kind, 'input-decisions');
+  }
+  assert.equal(JSON.stringify(f.store.list()), before);
 });

@@ -1,3 +1,4 @@
+import { packetPrompt, packetFingerprint, BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION } from '../src/om/packet-brief.js';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -34,7 +35,7 @@ import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   preparePartResult, readPartResult, readPacketResponse, partResponseId, type PartResponseRecord,
-  normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, WORKS_PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, PART_PROPOSAL_SCHEMA, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
+  normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { readCall, recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
 import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalRow, type RefusalJournal } from '../src/om/refusal-journal.js';
@@ -47,6 +48,7 @@ import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
+const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const clone = structuredClone;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
@@ -338,7 +340,7 @@ test('E2 issues native MC1 only after M6 and atomically saves the complete selec
   assert.equal(value.state, 'ready'); assert.equal(value.refusal, null); assert.ok(value.packet); assert.ok(value.fingerprint);
   assert.equal((value.packet as Record<string, Json>).purpose, 'model-research');
   assert.equal(value.native.length, p.batch.items.length);
-  const payload = canonical(value.packet);
+  const payload = packetPrompt(value.packet);
   assert.deepEqual(value.fingerprint, { hash: hashJson(value.packet), chars: payload.length, utf8Bytes: Buffer.byteLength(payload, 'utf8') });
   assert.equal(value.fullChars, payload.length);
   for (const task of p.tasks.tasks.filter(task => p.batch.items.some(item => item.task?.id === task.record.id))) {
@@ -349,7 +351,14 @@ test('E2 issues native MC1 only after M6 and atomically saves the complete selec
   for (const question of f.input.value.input.questions.filter(question => !f.active.some(gap => gap.value.gap.target === question.id)))
     assert.equal(payload.includes(question.question), false, question.question);
   assert.equal(payload.includes(canonical(f.input.value.input)), false);
-  assert.equal(payload.includes(canonical(f.input.value.input.requirements)), false);
+  const selectedRequirements = new Set(p.tasks.tasks.filter(task => p.batch.items.some(item => item.task?.id === task.record.id))
+    .flatMap(task => task.contract.requirements.flatMap(contract => (contract as { requirements: string[] }).requirements)));
+  const scope = JSON.parse(payload.split('# Scope and exact context\n')[1]!.split('\n')[0]!) as {
+    input: { requirements: { id: string }[]; requirementText: { requirement: { id: string } }[] };
+  };
+  assert.deepEqual(scope.input.requirements, f.input.value.input.requirements.filter(row => selectedRequirements.has(row.id)),
+    'The brief includes exactly the requirements of the assigned contracts, even when they cover this entire small fixture');
+  assert.deepEqual(scope.input.requirementText.map(row => row.requirement.id).sort(), [...selectedRequirements].sort());
   for (const field of ['conceptSections', 'featurePreparation', 'operationRequirements', 'mapDesign'])
     assert.equal(payload.includes(`"${field}"`), false, field);
   assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(p.request.environment)));
@@ -506,7 +515,7 @@ test('E1 records the actual E2 purpose and whole packet fingerprint in its durab
   const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
   const config = f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
   const purpose = (packet.packet as Record<string, Json>).purpose as CallPurpose;
-  const admitted = ok(recordCall(f.store, f.project, { call: 'packet-facts-1', purpose, basis: null, block: p.block,
+  const admitted = ok(recordCall(f.store, f.project, { call: String((packet.packet as Record<string, Json>).requestId), purpose, basis: null, block: p.block,
     gaps: p.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
     series: reference(p.series), attempt: 1, goal: p.goal, dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(packet.packet) as Json }));
   assert.equal(admitted.call.value.status, 'open'); assert.equal(admitted.call.value.purpose, 'model-research');
@@ -616,7 +625,7 @@ function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<t
   assert.equal(shape.additionalProperties, false);
   const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(record), call: reference(call), requestId,
-      raw: JSON.stringify({ protocol: record.value.answerProtocol, requestId, action: 'answer', proposal: body }) } };
+      raw: JSON.stringify(fixtureAnswer(record.value.packet, { protocol: record.value.answerProtocol, requestId, action: 'answer', proposal: body })) } };
   const response: Revision<PartResponseRecord> = options.pending ? { id: responseWrite.id, kind: responseWrite.kind,
     revision: 1, hash: hashJson(responseWrite.value), value: responseWrite.value as PartResponseRecord }
     : f.store.write<PartResponseRecord>(responseWrite);
@@ -867,12 +876,18 @@ test('E2 part-result admission rejects a foreign purpose, another declared attem
   const sourceRequest: RecordCallRequest = { call: 'alternative', purpose: admitted.purpose, basis: admitted.basis, block: admitted.block,
     gaps: clone(admitted.gaps), series: admitted.series, attempt: admitted.attempt, goal: admitted.goal, dispatch: admitted.dispatch,
     packet: clone(packet.record.value.packet) as Json };
-  const anotherCall = ok(recordCall(f.store, f.project, sourceRequest)).call;
-  const foreignPurpose = ok(recordCall(f.store, f.project, { ...sourceRequest, call: 'foreign-purpose', purpose: 'model-research' })).call;
+  const foreignCall = (changes: Partial<RecordCallRequest> = {}) => {
+    const configured = p.environment(environment.value.requestCapacityChars!);
+    const other = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(configured) })).record;
+    const payload = other.value.packet as Record<string, Json>;
+    return ok(recordCall(f.store, f.project, { ...sourceRequest, ...changes, call: String(payload.requestId), packet: clone(payload) })).call;
+  };
+  const anotherCall = foreignCall();
+  const foreignPurpose = foreignCall({ purpose: 'model-research' });
   const block = 'different-attempt';
   ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'another-attempt', predecessor: null, basis: null }));
   const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal: p.goal }));
-  const foreignAttempt = ok(recordCall(f.store, f.project, { ...sourceRequest, call: 'foreign-attempt', block, series: reference(series) })).call;
+  const foreignAttempt = foreignCall({ block, series: reference(series) });
   for (const call of [anotherCall, foreignPurpose, foreignAttempt]) {
     const before = snapshot(f.store);
     rejected(preparePartResult(f.store, { ...result.request, call: reference(call) }), 'part_result_invalid');
@@ -986,7 +1001,7 @@ test('E2.2 rows 5, 7, 10: the repeated packet delivers the causes of the last pr
     assert.ok(own.rows.some(row => row.id === item.row), 'The row is the one the preceding attempt claimed');
   }
   assert.ok(packet.value.journal);
-  const payload = canonical(packet.value.packet);
+  const payload = packetPrompt(packet.value.packet);
   assert.equal(payload.includes(older.message), false, 'The older attempt is not substituted');
   assert.equal(payload.includes(own.message), true, 'The remedy of the proved source reaches the model, not a code alone');
   // Row 10: the journal moves on; the saved packet is read on its own journal revision, cold and after a restart.
@@ -1533,7 +1548,7 @@ for (const model of ['MC1', 'MC2'] as const) {
     const value = clone(saved.record.value) as QuestionPacketRecord;
     value.request = request;
     const payload = value.packet as Record<string, Json>;
-    const requestId = hashJson({ contract: PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request });
+    const requestId = hashJson({ contract: value.packetContract, protocol: value.answerProtocol, request });
     payload.requestId = requestId;
     (payload.responseForm as Record<string, Json>).requestId = requestId;
     value.fingerprint = { hash: hashJson(payload), chars: canonical(payload).length, utf8Bytes: Buffer.byteLength(canonical(payload)) };
@@ -1840,20 +1855,20 @@ test('E2.1 measures the complete L3 form and authentic D7 task before issuing a 
   const f = await worksPacketFixture(t, 'multiple'), request = f.request(), before = snapshot(f.store);
   const prepared = ok(prepareQuestionPacket(f.store, request)), packet = prepared.record, payload = packet.value.packet as Record<string, any>;
   assert.deepEqual(snapshot(f.store), before);
-  assert.equal(packet.value.packetContract, WORKS_PACKET_CONTRACT);
-  assert.equal(payload.version, 'om-question-packet/works-v1');
+  assert.equal(packet.value.packetContract, WORKS_BRIEF_PACKET_CONTRACT);
+  assert.equal(payload.version, WORKS_BRIEF_VERSION);
   assert.equal(payload.responseForm.schema.oneOf[0].properties.bindings.type, 'array');
-  assert.ok(payload.responseForm.schema.oneOf[0].properties.proposal.properties.fills.items.properties.codeRef);
+  assert.ok(payload.responseForm.schema.oneOf[0].properties.proposal.properties.fills.items.oneOf.some((shape: any) => shape.required.includes('codeRef')));
   assert.deepEqual(payload.works.obligations, f.ledger.handoff.obligations);
   assert.equal(payload.works.assigned.length, 2, 'Two consumers of one original gap retain separate identities');
   assert.equal(new Set(payload.works.assigned).size, 2);
   assert.deepEqual(payload.works.assigned, payload.works.nodeAssignments);
   assert.equal(packet.value.fingerprint!.hash, hashJson(payload));
-  assert.equal(packet.value.fingerprint!.chars, canonical(payload).length);
-  assert.equal(packet.value.fullChars, canonical(payload).length);
+  assert.equal(packet.value.fingerprint!.chars, packetPrompt(payload).length);
+  assert.equal(packet.value.fullChars, packetPrompt(payload).length);
   for (const ref of [request.works.producer, request.works.ledger, reference(f.lines)])
     assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)));
-  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(f.answer(saved));
+  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(fixtureAnswer(saved.value.packet, f.answer(saved)));
   const checked = ok(checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw }));
   assert.equal(checked.kind, 'node-proposal'); if (checked.kind !== 'node-proposal') return;
   assert.equal(checked.proposal.worksContract, 'works-frame/v1');
@@ -1867,7 +1882,7 @@ test('E2.1 measures the complete L3 form and authentic D7 task before issuing a 
   proof.contract!.entrypoint.path = extra.code[0]!.path;
   multiple.proposal.nodes.push(extra); multiple.proposal.tests.push(proof);
   multiple.bindings[0]!.consumers.push({ node: extra.id, tests: [...extra.tests] });
-  const plural = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw: JSON.stringify(multiple) }));
+  const plural = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw: JSON.stringify(fixtureAnswer(saved.value.packet, multiple)) }));
   assert.equal(plural.works!.bindings.find(row => row.id === multiple.bindings[0]!.id)!.consumers.length, 2);
   assert.equal(f.store.list('om-part-result:').length, 0, 'Checking the form claims neither a call nor provenance');
   const history = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw }));
@@ -1901,7 +1916,7 @@ test('E2.1 requires an explicit complete same-task D7 basis and refuses forged o
 test('E2.1 rejects omitted assignments foreign work tests and code references through the shared E3 derivation', async t => {
   const f = await worksPacketFixture(t, 'multiple'), packet = ok(writeQuestionPacket(f.store, f.request())).record;
   const good = f.answer(packet), before = snapshot(f.store);
-  const parse = (value: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(value) });
+  const parse = (value: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(fixtureAnswer(packet.value.packet, value)) });
   const mutations: ((value: typeof good) => void)[] = [
     value => { value.bindings.pop(); },
     value => { value.bindings.push(clone(value.bindings[0]!)); },
@@ -1925,15 +1940,15 @@ test('E2.1 rejects omitted assignments foreign work tests and code references th
 test('E2.1 explicit empty bindings survive normal parsing but absence does not', async t => {
   const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record, good = f.answer(packet);
   assert.deepEqual(good.bindings, []);
-  const parsed = ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(good) }));
+  const parsed = ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(fixtureAnswer(packet.value.packet, good)) }));
   assert.deepEqual(parsed.works!.bindings, []);
   const { bindings: _bindings, ...absent } = good;
-  rejected(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(absent) }), 'part_answer_invalid');
+  rejected(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(fixtureAnswer(packet.value.packet, absent)) }), 'part_answer_invalid');
 });
 
 test('E2.1 D7 source race is atomic while the exact saved assignment remains readable after restart', async t => {
   const f = await worksPacketFixture(t, 'multiple'), request = f.request();
-  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(f.answer(saved));
+  const saved = ok(writeQuestionPacket(f.store, request)).record, raw = JSON.stringify(fixtureAnswer(saved.value.packet, f.answer(saved)));
   const history = ok(derivePartProposal(f.store, { project: f.project, packet: reference(saved), raw }));
   const next = f.request('garden-consume-operation', 'garden-consume-block'), prepared = ok(prepareQuestionPacket(f.store, next));
   const owner = f.ledger.producer.value.request.assignments[0]!;
@@ -1953,7 +1968,7 @@ test('E2.1 overlapping node assignments keep the same D7 identity and each concr
   const f = await worksPacketFixture(t, 'overlap');
   const packets = [f.request(), f.request('garden-consume-operation', 'garden-consume-block')]
     .map(request => ok(writeQuestionPacket(f.store, request)).record);
-  const transfers = packets.map(packet => ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(f.answer(packet)) })).works!);
+  const transfers = packets.map(packet => ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(fixtureAnswer(packet.value.packet, f.answer(packet))) })).works!);
   assert.equal(transfers[0]!.bindings.length, 1); assert.equal(transfers[1]!.bindings.length, 1);
   assert.equal(transfers[0]!.bindings[0]!.id, transfers[1]!.bindings[0]!.id);
   assert.deepEqual(transfers.map(item => item.bindings[0]!.consumers[0]!.node).sort(), ['garden-consume-work', 'garden-produce-work']);
@@ -1973,7 +1988,7 @@ for (const late of ['multiple', 'initial-realizes'] as const) test(`E2.1 initial
   answer.proposal.tests = answer.proposal.tests.map(test => ({ ...test, id: `${test.id}-additional`, node: extra.id,
     contract: { ...test.contract!, entrypoint: { ...test.contract!.entrypoint, path: extra.code[0]!.path } } }));
   answer.proposal.fills = answer.proposal.fills.map(fill => ({ ...fill, node: extra.id, ...(fill.codeRef ? { codeRef: extra.code[0]! } : {}) }));
-  const raw = JSON.stringify(answer), at = { project: f.project, packet: reference(packet), raw }, before = snapshot(f.store);
+  const raw = JSON.stringify(fixtureAnswer(packet.value.packet, answer)), at = { project: f.project, packet: reference(packet), raw }, before = snapshot(f.store);
   const form = ok(checkAnswerForm(f.store, at)), content = ok(derivePartProposal(f.store, at));
   assert.equal(form.kind, 'node-proposal'); if (form.kind !== 'node-proposal') return;
   assert.deepEqual(form.works, content.works);
@@ -1984,7 +1999,7 @@ for (const late of ['multiple', 'initial-realizes'] as const) test(`E2.1 initial
     const wrong = clone(answer);
     if (foreign === 'work') wrong.bindings[0]!.consumers[0]!.node = 'garden-consume-work';
     else wrong.bindings[0]!.consumers[0]!.tests = [...initial.value.nodes.find(node => node.id === 'garden-consume-work')!.tests];
-    rejected(checkAnswerForm(f.store, { ...at, raw: JSON.stringify(wrong) }), 'part_result_invalid');
+    rejected(checkAnswerForm(f.store, { ...at, raw: JSON.stringify(fixtureAnswer(packet.value.packet, wrong)) }), 'part_result_invalid');
   }
   assert.deepEqual(snapshot(f.store), before);
   const series = f.store.get<RepairSeries>(request.attempt.series.id, request.attempt.series.revision)!;
@@ -2028,7 +2043,7 @@ function readsById(t: TestContext) {
 
 test('S1.1 the unwritten response and the works preview are read through the common pending overlay: the derivation costs one unfolding per key under it, the same part cold, hot, saved and traced; a differing saved response is refused without writes', async t => {
   const f = await worksPacketFixture(t, 'multiple', true), request = f.request(), packet = ok(writeQuestionPacket(f.store, request)).record;
-  const payload = packet.value.packet as Record<string, any>, answer = f.answer(packet), raw = JSON.stringify(answer);
+  const payload = packet.value.packet as Record<string, any>, answer = f.answer(packet), raw = JSON.stringify(fixtureAnswer(packet.value.packet, answer));
   const routes = ok(readRoutes(f.store, { project: f.project, record: request.routes })).record;
   const frameSource = routes.value.request.gaps.sources.works; assert.ok(!('state' in frameSource));
   const graph = frameSource.frame.graph, prior = frameSource.proposals[0]!;
@@ -2105,7 +2120,7 @@ test('S1.1 the unwritten response and the works preview are read through the com
     contract: { ...test.contract!, entrypoint: { ...test.contract!.entrypoint, path: extra.code[0]!.path } } }));
   other.proposal.fills = other.proposal.fills.map(fill => ({ ...fill, node: extra.id, ...(fill.codeRef ? { codeRef: extra.code[0]! } : {}) }));
   other.bindings = other.bindings.map(binding => ({ ...binding, consumers: binding.consumers.map(consumer => ({ ...consumer, node: extra.id, tests: [...extra.tests] })) }));
-  const otherWrite: Write = { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(other) } };
+  const otherWrite: Write = { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(fixtureAnswer(packet.value.packet, other)) } };
   f.restart();
   const different = withHistoricalReads(() => {
     ok(preparePartResult(f.store, partRequest)); reads.reset();
@@ -2116,7 +2131,7 @@ test('S1.1 the unwritten response and the works preview are read through the com
   assert.notDeepEqual(different.proposal.value, cold.proposal.value); assert.notEqual(different.record.id, cold.record.id);
   // The former negative checks of works content stay: a consumer outside this node assignment is refused, without writes.
   const foreign = clone(answer); foreign.bindings[0]!.consumers[0]!.node = 'garden-consume-work';
-  rejected(preparePartResult(f.store, { ...partRequest, response: { pending: { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(foreign) } } } }), 'part_result_invalid');
+  rejected(preparePartResult(f.store, { ...partRequest, response: { pending: { ...responseWrite, value: { ...responseValue, raw: JSON.stringify(fixtureAnswer(packet.value.packet, foreign)) } } } }), 'part_result_invalid');
   assert.deepEqual(snapshot(f.store), before);
   // A lower transparent collector receives the dependencies on both readings — cold, and after the proof was warmed on
   // the plain Store before the collector was attached: over a traced Store the overlay keeps its opaque branch.
@@ -2152,13 +2167,13 @@ test('E2 declares every new content and control branch before dispatch and share
   const p = expansionFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
   const payload = packet.value.packet as Record<string, any>, before = snapshot(f.store);
   assert.equal(packet.value.answerProtocol, PACKET_ANSWER_PROTOCOL);
-  assert.equal(payload.version, 'om-question-packet/v3');
-  assert.equal(packet.value.packetContract, PACKET_CONTRACT);
+  assert.equal(payload.version, BRIEF_VERSION);
+  assert.equal(packet.value.packetContract, BRIEF_PACKET_CONTRACT);
   const form = payload.responseForm;
   assert.deepEqual(form.schema.oneOf.map((branch: any) => branch.properties.action.const),
     ['answer', 'need_source', 'need_owner', 'cannot_answer', 'pause']);
-  assert.equal(packet.id, `om-question-packet:${f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request: p.request })}`);
-  assert.equal(payload.requestId, hashJson({ contract: PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request: p.request }));
+  assert.equal(packet.id, `om-question-packet:${f.project}:${hashJson({ contract: BRIEF_PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request: p.request })}`);
+  assert.equal(payload.requestId, hashJson({ contract: BRIEF_PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request: p.request }));
   const questionIds = [payload.questions[0].id];
   const controls = [
     { action: 'need_source', questionIds, missing: 'Read the addressed source', reads: [
@@ -2172,7 +2187,7 @@ test('E2 declares every new content and control branch before dispatch and share
     { action: 'pause', questionIds, reason: 'Stop this attempt' },
   ];
   for (const answer of controls) {
-    const raw: string = JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...answer });
+    const raw: string = JSON.stringify(fixtureAnswer(payload, { protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...answer }));
     const actual = ok(readPacketAnswer(f.store, { project: f.project, packet: reference(packet), raw })).answer;
     assert.deepEqual(actual, { ...answer, ...('reads' in answer
       ? { reads: [...answer.reads!].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0) } : {}) });
@@ -2189,7 +2204,7 @@ test('E2 declares every new content and control branch before dispatch and share
     { ...controls[2], status: 'accepted' },
     { ...controls[3], action: 'read_plan' },
   ]) rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
-    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...bad }) }), 'part_answer_invalid');
+    raw: JSON.stringify(fixtureAnswer(payload, { protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...bad })) }), (bad as { questionIds?: string[] }).questionIds?.[0] === 'foreign-question' ? 'answer_label_unknown' : 'part_answer_invalid');
   rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
     raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: 'foreign-request', ...controls[2] }) }), 'part_result_invalid');
   assert.deepEqual(snapshot(f.store), before, 'Parsing and content derivation create no calls, records or series outcomes');
@@ -2198,10 +2213,11 @@ test('E2 declares every new content and control branch before dispatch and share
 test('E2 counts the added response branches in capacity and never silently emits the former smaller form', t => {
   const p = packetFixture(t), { f } = p, prepared = ok(prepareQuestionPacket(f.store, p.request));
   const payload = clone(prepared.record.value.packet) as Record<string, any>;
-  const currentChars = canonical(payload).length;
+  const currentChars = packetPrompt(payload).length;
   const legacy = { ...payload, responseForm: { results: 'One result per question id', value: 'The question contract resultForm',
     citations: 'Exact source reference and text-range or JSON-pointer selector' } };
-  assert.ok(canonical(legacy).length < currentChars - 1);
+  assert.ok(canonical(legacy).length < canonical(payload).length - 1);
+  assert.ok(canonical(payload).length > currentChars, 'Capacity measures the sent brief, not the larger semantic packet');
   const environment = p.environment(currentChars - 1), before = snapshot(f.store);
   const blocked = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(environment) }));
   assert.equal(blocked.record.value.state, 'blocked');
@@ -2220,7 +2236,7 @@ test('E2 common proposal derivation checks assignment without inventing response
   assert.ok(!Object.hasOwn(derived, 'call') && !Object.hasOwn(derived, 'record'));
   const parsed = JSON.parse(request.raw);
   parsed.proposal.fills[0].obligation = 'foreign-obligation';
-  rejected(derivePartProposal(f.store, { ...request, raw: JSON.stringify(parsed) }), 'part_result_invalid');
+  rejected(derivePartProposal(f.store, { ...request, raw: JSON.stringify(parsed) }), 'answer_label_unknown');
   const noCall = { id: 'call-record:garden:unissued', revision: 1, hash: '0'.repeat(64) };
   const attempted = preparePartResult(f.store, { ...actual.request, call: noCall });
   assert.equal(attempted.ok, false, 'Well-shaped content cannot substitute for the full admitted-call chain');
@@ -2228,45 +2244,29 @@ test('E2 common proposal derivation checks assignment without inventing response
 });
 
 test('E2 preserves original packet and part-result history strictly in its old answer era after restart', t => {
-  const p = expansionFixture(t), { f } = p;
-  const modern = ok(writeQuestionPacket(f.store, p.request)).record;
-  const value = clone(modern.value) as QuestionPacketRecord;
-  delete value.answerProtocol; delete value.packetContract;
-  const payload = value.packet as Record<string, Json>, requestId = hashJson(p.request);
-  payload.version = 'om-question-packet/v1'; payload.requestId = requestId;
-  payload.responseForm = { protocol: 'omg-part/v1', requestId, proposal: clone(PART_PROPOSAL_SCHEMA) as unknown as Json };
-  value.fullChars = canonical(payload).length;
-  value.fingerprint = { hash: hashJson(payload), chars: canonical(payload).length, utf8Bytes: Buffer.byteLength(canonical(payload)) };
-  const packet = f.store.write<QuestionPacketRecord>({ id: `om-question-packet:${f.project}:${requestId}`, kind: 'question-packet', expected: 0, value });
-  assert.notEqual(modern.id, packet.id);
-  assert.notEqual((modern.value.packet as Record<string, Json>).requestId, requestId);
-  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-  const modernPart = partResult(p, ok(writeQuestionPacket(f.store, p.request)));
-  const raw = JSON.stringify({ protocol: 'omg-part/v1', requestId, proposal: modernPart.body });
-  const proposalValue = ok(derivePartProposal(f.store, { project: f.project, packet: reference(packet), raw })).proposal;
-  const prior = modernPart.call.value;
-  const admission = ok(recordCall(f.store, f.project, { call: requestId, purpose: prior.purpose, basis: prior.basis,
-    block: prior.block, gaps: clone(prior.gaps), series: prior.series, attempt: prior.attempt, goal: clone(prior.goal),
-    dispatch: clone(prior.dispatch), packet: payload })).call;
-  const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(admission)), kind: 'part-response', expected: 0,
-    value: { project: f.project, packet: reference(packet), call: reference(admission), requestId, raw } });
-  const request = { project: f.project, packet: reference(packet), call: reference(admission), response: reference(response) }, key = hashJson(request);
-  const proposal = f.store.write<LayerProposal>({ id: `om-proposal:${f.project}:part:${key}`, kind: 'layer-proposal', expected: 0,
-    value: proposalValue as LayerProposal });
-  const result = f.store.write({ id: `om-part-result:${f.project}:${key}`, kind: 'part-result', expected: 0,
-    value: { project: f.project, request, proposal: reference(proposal) } });
-  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(result) })).proposal, proposal);
-  f.restart();
-  const before = snapshot(f.store);
-  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-  assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(result) })).proposal, proposal);
-  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
-    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'pause',
+  const history = lp1OldProducer(t, 'ff25519', { node: true, capacity: 100_000 })[0]!;
+  let store = new Store(history.database);
+  try {
+    const packet = history.packets[0]!, part = history.parts[0]!, payload = packet.value.packet as Record<string, Json>;
+    assert.equal(packet.value.answerProtocol, undefined); assert.equal(packet.value.packetContract, undefined);
+    const before = snapshot(store);
+    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+    const checked = ok(readPartResult(store, { project: history.project, record: reference(part.record) }));
+    assert.deepEqual([checked.record, checked.proposal], [part.record, part.proposal]);
+    for (const ref of part.references) assert.ok(checked.references.some(actual => canonical(actual) === canonical(ref)));
+    store.close(); store = new Store(history.database);
+    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+    const reopened = ok(readPartResult(store, { project: history.project, record: reference(part.record) }));
+    assert.deepEqual([reopened.record, reopened.proposal], [part.record, part.proposal]);
+    assert.deepEqual(reopened, checked);
+    rejected(readPacketAnswer(store, { project: history.project, packet: reference(packet), raw: JSON.stringify({
+      protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, action: 'pause',
       questionIds: [(payload.questions as Record<string, Json>[])[0]!.id], reason: 'New control' }) }), 'part_result_invalid');
-  const changed = clone(value); changed.answerProtocol = PACKET_ANSWER_PROTOCOL;
-  const wrong = f.store.write({ id: `${packet.id}:changed-era`, kind: 'question-packet', expected: 0, value: changed as unknown as Json });
-  rejected(readQuestionPacket(f.store, { project: f.project, record: reference(wrong) }), 'packet_record_invalid');
-  assert.equal(snapshot(f.store).length, before.length + 1);
+    const changed = { ...packet.value, answerProtocol: PACKET_ANSWER_PROTOCOL };
+    const wrong = store.write({ id: `${packet.id}:changed-era`, kind: 'question-packet', expected: 0, value: changed as unknown as Json });
+    rejected(readQuestionPacket(store, { project: history.project, record: reference(wrong) }), 'packet_record_invalid');
+    assert.equal(snapshot(store).length, before.length + 1);
+  } finally { store.close(); }
 });
 
 /** Runs in another process: every production module and imported fixture is loaded from the accepted Git base. */
@@ -2403,7 +2403,7 @@ test('E2 normalizes reply sets while preserving duplicate results citations read
   const rows = payload.questions.map((question: { id: string }) => ({ questionId: question.id,
     value: ['second', 'first', 'second'], citations: [b, a, b] }));
   const parse = (body: unknown) => ok(readPacketAnswer(f.store, { project: f.project, packet: reference(packet),
-    raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...body as object }) })).answer;
+    raw: JSON.stringify(fixtureAnswer(payload, { protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...body as object })) })).answer;
   const initial = parse({ action: 'answer', results: [rows[0], rows[1], rows[0]] });
   const permuted = parse({ action: 'answer', results: [rows[1], rows[0], rows[0]].map(row => ({ ...row, citations: [...row.citations].reverse() })) });
   assert.deepEqual(permuted, initial);
@@ -2425,8 +2425,8 @@ test('E2 normalizes reply sets while preserving duplicate results citations read
   assert.equal(control.reads.length, 3);
   assert.equal(control.reads.filter(item => canonical(item) === canonical(search)).length, 2);
   assert.ok(control.reads.some(item => item.action === 'read' && item.path === read.path));
-  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify({
-    protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...request, questionIds: [questionIds[0], questionIds[0]] }) }), 'part_answer_invalid');
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(packet), raw: JSON.stringify(fixtureAnswer(payload, {
+    protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, ...request, questionIds: [questionIds[0], questionIds[0]] })) }), 'part_answer_invalid');
 });
 
 
@@ -2453,7 +2453,7 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
   const series = ok(beginAttempt(f.store, { ...address, attempt: 1, goal, admission }));
   const request = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
   const ready = ok(writeQuestionPacket(f.store, request)).record;
-  assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.packetContract, PACKET_CONTRACT);
+  assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.packetContract, BRIEF_PACKET_CONTRACT);
   assert.equal((ready.value.packet as Record<string, Json>).task, 'input-field');
   const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'fixture' } });
@@ -2539,7 +2539,7 @@ for (const conflict of ['response', 'environment'] as const) test(`E2 pending at
   else rejected(preparePartResult(f.store, pending.source), 'part_result_invalid');
 });
 
-type ContextRead = { action: 'read_context'; record: Ref; pointer: string };
+type ContextRead = { action: 'read_context'; record: Ref; pointer: string } | { action: 'read_source'; source: Ref; selector: { kind: 'text-range'; start: number; end: number } };
 function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<Revision<QuestionPacketRecord>>,
   read?: ContextRead | ContextRead[]) {
   const { f } = p, payload = packet.value.packet as Record<string, any>;
@@ -2554,9 +2554,9 @@ function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<
     dispatch: { adapter: reference(adapter), config: reference(config) }, packet: clone(packet.value.packet) as Json })).call;
   const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId,
-      raw: JSON.stringify({ protocol: packet.value.answerProtocol, requestId: payload.requestId, action: 'need_source',
+      raw: JSON.stringify(fixtureAnswer(payload, { protocol: packet.value.answerProtocol, requestId: payload.requestId, action: 'need_source',
         questionIds: [...ids], missing: 'Need the exact original question text',
-        reads: Array.isArray(read) ? read : [read ?? { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' }] }) } });
+        reads: Array.isArray(read) ? read : [read ?? { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' }] })) } });
   const basis = { project: f.project, packet: reference(packet), call: reference(call), response: reference(response) };
   const delivered = ok(deliverModelSources(f.store, basis));
   const continuation = { packet: reference(packet), call: reference(call), response: reference(response), deliveries: [...delivered.deliveries] };
@@ -2578,7 +2578,7 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
   assert.equal(payload.sourceDeliveries[0].data[0].data, f.input.value.input.questions[0]!.question);
   assert.deepEqual(payload.sourceDeliveries[0].deliveries, delivery.continuation.deliveries);
   assert.notEqual(payload.requestId, original.requestId); assert.equal(payload.responseForm.requestId, payload.requestId);
-  assert.deepEqual(second.value.fingerprint, { hash: hashJson(payload), chars: canonical(payload).length, utf8Bytes: Buffer.byteLength(canonical(payload)) });
+  assert.deepEqual(second.value.fingerprint, packetFingerprint(payload));
   assert.ok(second.value.fingerprint!.chars > first.value.fingerprint!.chars);
   const before = snapshot(f.store);
   assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record, second);
@@ -2590,18 +2590,17 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
 });
 
 test('E2 continuation saves overflow without truncating or reissuing native questions', t => {
-  const p = packetFixture(t, 10_000), { f } = p;
+  const p = packetFixture(t, 50_000), { f } = p;
   // A complete addressed read can exceed capacity even though the original assignment fits.
-  const source = f.store.write({ id: `context:${f.project}:large`, kind: 'context', expected: 0,
-    value: { project: f.project, text: 'delivered-information-'.repeat(1000) } });
+  const source = new Evidence(f.store).document(f.project, 'large', 'delivered-information-'.repeat(6000), 'text/plain', 0);
   const first = ok(writeQuestionPacket(f.store, p.request)).record;
-  const delivery = sourceContinuation(p, first, { action: 'read_context', record: reference(source), pointer: '/text' });
+  const delivery = sourceContinuation(p, first, { action: 'read_source', source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } });
   const nativeCount = f.store.list('question').length;
   const request = { ...p.request, continuation: delivery.continuation };
   const prepared = ok(writeQuestionPacket(f.store, request));
   assert.equal(prepared.record.value.state, 'blocked');
   assert.equal(prepared.record.value.refusal?.code, 'packet_too_large');
-  assert.ok(prepared.record.value.fullChars! > 10_000);
+  assert.ok(prepared.record.value.fullChars! > 50_000);
   assert.equal(prepared.record.value.packet, null); assert.equal(prepared.record.value.fingerprint, null);
   assert.deepEqual(prepared.record.value.native, first.value.native);
   assert.equal(f.store.list('question').length, nativeCount);
@@ -2613,22 +2612,15 @@ test('E2 continuation saves overflow without truncating or reissuing native ques
 });
 
 test('E2 pre-continuation v2 blocked packets preserve their original refusal after restart', t => {
-  const p = packetFixture(t, 100), { f } = p;
-  const modern = ok(writeQuestionPacket(f.store, p.request)).record;
-  assert.equal(modern.value.state, 'blocked');
-  const value = clone(modern.value) as QuestionPacketRecord;
-  delete value.packetContract;
-  value.answerProtocol = 'omg-answer/v2';
-  // Protocol/version markers and request hashes have equal length; only the schema changes the full payload size.
-  value.fullChars = modern.value.fullChars! - canonical(packetAnswerSchema('fact')).length
-    + canonical(packetAnswerSchema('fact', undefined, value.answerProtocol)).length;
-  const requestId = hashJson({ protocol: value.answerProtocol, request: p.request });
-  const historical = f.store.write<QuestionPacketRecord>({ id: `om-question-packet:${f.project}:${requestId}`, kind: 'question-packet', expected: 0, value });
-  f.restart();
-  const before = snapshot(f.store);
-  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(historical) })), historical);
-  assert.deepEqual(historical.value.refusal, modern.value.refusal);
-  assert.deepEqual(snapshot(f.store), before);
+  const history = lp1OldProducer(t, '29fa27e', { node: false, capacity: 100 })[0]!;
+  const store = new Store(history.database);
+  try {
+    const historical = history.packets[0]!, before = snapshot(store);
+    assert.equal(historical.value.packetContract, undefined); assert.equal(historical.value.answerProtocol, 'omg-answer/v2');
+    assert.equal(historical.value.state, 'blocked'); assert.equal(historical.value.refusal?.code, 'packet_too_large');
+    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(historical) })), historical);
+    assert.deepEqual(snapshot(store), before);
+  } finally { store.close(); }
 });
 
 test('E2 continuation rejects omitted evidence and foreign exact response or delivery without writes', t => {
@@ -2699,7 +2691,7 @@ interface Lp1History {
   next: QuestionPacketRequest | null;
   raw: string;
 }
-function lp1OldProducer(t: TestContext): Lp1History[] {
+function lp1OldProducer(t: TestContext, commit = '7dd0848eb8f58df91b9c3e0952b619ba5688aeae', standalone?: { node: boolean; capacity: number }): Lp1History[] {
   const directory = mkdtempSync(join(tmpdir(), 'omg-lp1-history-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
@@ -2714,18 +2706,30 @@ export async function load(url, context, next) {
   const prefix = new URL('dist/', root).href;
   if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
   const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-  let source = execFileSync('git', ['show', '7dd0848eb8f58df91b9c3e0952b619ba5688aeae:' + relative],
+  let source = execFileSync('git', ['show', ${JSON.stringify(commit + ':')} + relative],
     { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
   if (relative === 'test/om-question-packet.test.ts') {
     source = source.replace(/import test,.*from 'node:test';/, 'const test = () => {};');
-    source += '\\nexport { packetFixture, expansionFixture, worksPacketFixture, partResult, sourceContinuation };';
+    source += '\\nexport { ${standalone ? 'packetFixture, expansionFixture, partResult' : 'packetFixture, expansionFixture, worksPacketFixture, partResult, sourceContinuation'} };';
   }
   return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
     { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
 }
 `);
   const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const script = `
+  const script = standalone ? `
+const root = ${JSON.stringify(repositoryUrl)}, src = name => new URL('dist/src/' + name, root).href;
+const fixtures = await import(new URL('dist/test/om-question-packet.test.js', root).href);
+const { reference } = await import(src('pipeline/contracts.js'));
+const { writeQuestionPacket, readPartResult } = await import(src('om/question-packet.js'));
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const p = fixtures.${standalone.node ? 'expansionFixture' : 'packetFixture'}({ after() {} }, ${standalone.capacity}), f = p.f;
+const packet = take(writeQuestionPacket(f.store, p.request));
+const part = ${standalone.node} ? fixtures.partResult(p, packet) : null;
+process.stdout.write(JSON.stringify([{ root: f.root, database: f.database, project: f.project, packets: [packet.record],
+  parts: part ? [take(readPartResult(f.store, { project: f.project, record: reference(part.record) }))] : [], next: null,
+  raw: part ? part.response.value.raw : '' }]));
+f.store.close();` : `
 const root = ${JSON.stringify(repositoryUrl)};
 const src = name => new URL('dist/src/' + name, root).href;
 const fixtures = await import(new URL('dist/test/om-question-packet.test.js', root).href);
@@ -2846,7 +2850,9 @@ test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambi
   const ids = ['omg-answer/v2', 'omg-answer/v3'].map(protocol =>
     `om-question-packet:${f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol, request: p.request })}`);
   for (const id of ids) assert.ok(prepared.guards.some(guard => guard.id === id && 'absent' in guard && guard.absent));
-  assert.equal(packet.id, ids[1]);
+  const briefId = `om-question-packet:${f.project}:${hashJson({ contract: BRIEF_PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request: p.request })}`;
+  assert.ok(prepared.guards.some(guard => guard.id === briefId && 'absent' in guard && guard.absent));
+  assert.equal(packet.id, briefId);
   const payload = packet.value.packet as Record<string, any>;
   assert.equal(packet.value.answerProtocol, 'omg-answer/v3');
   assert.equal(payload.responseForm.protocol, 'omg-answer/v3');
@@ -2910,11 +2916,11 @@ test('LP1 v3 end to end: relative source, continuation, independent assessment a
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100_000 }, p.configured.revision);
   const adapter = f.store.write({ id: `adapter:${f.project}:lp1`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'codex-stdio' } });
-  const packet = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment) })).record;
   writeFileSync(join(f.root, 'lp1-source.txt'), 'UTF-8');
   const source = new Evidence(f.store).document(f.project, 'lp1-source', 'UTF-8', 'text/plain', 0);
+  const packet = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment) })).record;
   const usage = { inputTokens: 12, outputTokens: 4, cachedInputTokens: null, reasoningOutputTokens: null };
-  writeFileSync(scenario, JSON.stringify({ steps: [
+  writeFileSync(scenario, JSON.stringify({ database: f.database, steps: [
     { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source', questionIds: p.batch.items.map(row => row.gap),
       missing: 'Need the source', reads: [{ action: 'read', path: 'lp1-source.txt', media: 'text/plain' }] }, usage },
     { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
@@ -2930,7 +2936,11 @@ test('LP1 v3 end to end: relative source, continuation, independent assessment a
   const assessment = ok(await assessFact(f.store, assessmentRequest)); assert.ok(assessment.value.accepted);
   const sent = () => readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.equal(sent().length, 3);
-  const first = JSON.parse(sent()[0].prompt), second = JSON.parse(sent()[1].prompt);
+  const sentPacket = (wire: { requestId: string; prompt: string }) => {
+    const row = f.store.list<QuestionPacketRecord>('question-packet').find(row => (row.value.packet as Record<string, any>)?.requestId === wire.requestId)!;
+    assert.equal(wire.prompt, packetPrompt(row.value.packet)); return row.value.packet as Record<string, any>;
+  };
+  const first = sentPacket(sent()[0]), second = sentPacket(sent()[1]);
   assert.equal(first.responseForm.protocol, 'omg-answer/v3'); assert.equal(second.responseForm.protocol, 'omg-answer/v3');
   assert.equal(second.sourceDeliveries[0].data[0].data, 'UTF-8');
   assert.notEqual(sent()[1].model, sent()[2].model);
@@ -2961,4 +2971,136 @@ test('LP1 adapter fixture takes the answer era only from the received prompt and
     assert.equal(JSON.parse(failure.stderr).error, 'om_adapter_fixture_invalid');
     assert.match(JSON.parse(failure.stderr).message, /responseForm.protocol/); return true;
   });
+});
+
+test('MP1 rows 1-3,6-8,10-12,16: new brief, exact labels, catalogue repeat, source race and history', t => {
+  const p = packetFixture(t), { f } = p;
+  const source = new Evidence(f.store).document(f.project, 'encoding-reference', 'Кодировка UTF-8 😀', 'text/plain', 0);
+  const prepared = ok(prepareQuestionPacket(f.store, p.request));
+  assert.equal(prepared.record.value.packetContract, 'om-packet/brief-v1');
+  assert.equal(prepared.record.value.state, 'ready', canonical(prepared.record.value.refusal));
+  assert.equal(prepared.guards.filter(guard => 'absent' in guard && guard.id.startsWith(`om-question-packet:${f.project}:`)).length, 5);
+  const saved = ok(writeQuestionPacket(f.store, p.request)).record;
+  const payload = saved.value.packet as Record<string, any>;
+  assert.equal(payload.version, 'om-question-packet/brief-v1');
+  assert.equal(saved.value.fingerprint!.hash, hashJson(payload));
+  assert.equal(saved.value.fingerprint!.chars, payload.brief.text.length);
+  assert.equal(saved.value.fingerprint!.utf8Bytes, Buffer.byteLength(payload.brief.text));
+  assert.deepEqual(saved.value.briefCatalogue, f.store.list('source').map(reference));
+  const labels = payload.brief.labels as { label: string; domain: string; value: unknown }[];
+  const q = labels.find(label => label.domain === 'question')!;
+  const d = labels.find(label => label.domain === 'source' && same(label.value, reference(source)))!;
+  const raw = { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'answer',
+    results: [{ questionId: q.label, value: 'UTF-8', citations: [{ source: d.label, selector: { kind: 'text-range', start: 0, end: 9 } }] }] };
+  const answer = ok(readPacketAnswer(f.store, { project: f.project, packet: reference(saved), raw: canonical(raw) }));
+  assert.equal(answer.answer.action, 'answer');
+  assert.equal(ok(checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw: canonical(raw) })).kind, 'fact-candidates');
+  const native = clone(raw) as Record<string, any>; native.results[0].questionId = q.value;
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(saved), raw: canonical(native) }), 'answer_label_unknown');
+  native.results[0].questionId = q.label; native.results[0].citations[0].source = q.label;
+  rejected(readPacketAnswer(f.store, { project: f.project, packet: reference(saved), raw: canonical(native) }), 'answer_label_unknown');
+  new Evidence(f.store).document(f.project, 'unrelated-later', 'This new identity is not reselected', 'text/plain', 0);
+  assert.deepEqual(ok(prepareQuestionPacket(f.store, p.request)).record, saved);
+  assert.deepEqual(ok(writeQuestionPacket(f.store, p.request)).writes, []);
+  const next = new Evidence(f.store).document(f.project, 'encoding-reference', 'Changed source', 'text/plain', 1);
+  assert.equal(next.revision, 2);
+  rejected(prepareQuestionPacket(f.store, p.request), 'input_stale');
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
+test('MP1 node response schema is valid for both endpoint and outcome assignments', t => {
+  const p = expansionFixture(t), { f } = p;
+  const saved = ok(writeQuestionPacket(f.store, p.request)).record;
+  assert.equal(saved.value.state, 'ready', canonical(saved.value.refusal));
+  const payload = saved.value.packet as Record<string, any>;
+  const raw = { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'pause',
+    questionIds: payload.brief.labels.filter((label: { domain: string }) => label.domain === 'question').map((label: { label: string }) => label.label),
+    reason: 'fixture control branch' };
+  assert.equal(ok(readPacketAnswer(f.store, { project: f.project, packet: reference(saved), raw: canonical(raw) })).answer.action, 'pause');
+});
+
+test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3 packets, calls, parts and continuations', async t => {
+  for (const commit of ['b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c', 'dcd741d7da24cfb37e858a1d6b2ff15c1823865b']) await t.test(commit, t => {
+    for (const history of lp1OldProducer(t, commit)) {
+      let store = new Store(history.database);
+      try {
+        const before = snapshot(store);
+        for (const packet of history.packets) {
+          assert.equal(packet.value.answerProtocol, commit.startsWith('b595') ? 'omg-answer/v2' : 'omg-answer/v3');
+          assert.ok(!packet.value.packetContract?.includes('brief'));
+          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+          assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
+          assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+          assert.deepEqual(packet.value.fingerprint, { hash: hashJson(packet.value.packet), chars: canonical(packet.value.packet).length,
+            utf8Bytes: Buffer.byteLength(canonical(packet.value.packet)) });
+        }
+        for (const part of history.parts) assert.deepEqual(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), part);
+        assert.deepEqual(snapshot(store), before);
+        store.close(); store = new Store(history.database);
+        for (const packet of history.packets) assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+        if (history.next) {
+          const next = ok(writeQuestionPacket(store, history.next)).record;
+          assert.equal(next.value.answerProtocol, history.packets[0]!.value.answerProtocol);
+          assert.equal(next.value.packetContract, history.packets[0]!.value.packetContract);
+        }
+      } finally { store.close(); }
+    }
+  });
+});
+
+test('MP1 L3 examples use actual slots, declared CodeRefs and concrete D7 bindings through E3 and F4.3', async t => {
+  const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  const payload = packet.value.packet as Record<string, any>;
+  const scope = JSON.parse(payload.brief.text.split('# Scope and exact context\n')[1].split('\n')[0]);
+  for (const slot of scope.expansion.obligations.filter((row: { flow?: string }) => row.flow)) {
+    const connection = scope.expansion.connections.find((row: { id: string }) => row.id === slot.connector);
+    assert.ok(connection.flows.some((row: { label: string }) => row.label === slot.flow));
+  }
+  const before = snapshot(f.store);
+  for (const example of payload.brief.examples) {
+    const request = { project: f.project, packet: reference(packet), raw: canonical(example) };
+    const checked = ok(checkAnswerForm(f.store, request));
+    if (example.action === 'answer') {
+      assert.equal(checked.kind, 'node-proposal');
+      assert.ok(ok(derivePartProposal(f.store, request)).works);
+    }
+  }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('MP1 №3052 real-work joins require designed condition and explicit required/optional; native assembly still owns actual inputs', async t => {
+  const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  const payload = packet.value.packet as Record<string, any>;
+  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
+  const connector = payload.expansion.connections[0].id;
+  const join = { id: 'example-join', consumer: example.proposal.nodes[0].id, connectors: [connector], condition: 'All inputs are current',
+    required: [connector], optional: [], failures: { missing: 'refuse', extra: 'refuse', foreign: 'refuse', stale: 'refuse', duplicate: 'refuse', returnsTo: example.proposal.nodes[0].id } };
+  example.proposal.joins = [join];
+  const check = (answer: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: canonical(answer) });
+  const admitted = check(example); assert.ok(admitted.ok, canonical(admitted));
+  for (const field of ['condition', 'required', 'optional']) {
+    const malformed = structuredClone(example); delete malformed.proposal.joins[0][field];
+    rejected(check(malformed), 'part_answer_invalid');
+  }
+  const blank = structuredClone(example); blank.proposal.joins[0].condition = '   ';
+  rejected(check(blank), 'part_answer_invalid');
+  assert.ok(payload.brief.text.includes('structural-representative exception does not apply to model work'));
+});
+
+test('MP1 the observed material guard closes a second Store race atomically while old brief history keeps its exact source', t => {
+  const p = packetFixture(t), { f } = p, saved = ok(writeQuestionPacket(f.store, p.request)).record;
+  const environment = p.environment(100_001);
+  const prepared = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(environment) }));
+  const source = f.store.get(`source:${f.project}:brief`)!;
+  const second = new Store(f.database);
+  try { second.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value }); }
+  finally { second.close(); }
+  const before = snapshot(f.store);
+  rejected(writeGuarded(f.store, { unit: 'MP1-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.deepEqual(snapshot(f.store), before);
+  assert.equal(f.store.get(prepared.record.id), null);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
 });

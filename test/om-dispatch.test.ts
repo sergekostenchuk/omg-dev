@@ -31,6 +31,7 @@ import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const adapterFixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const devinAdapter = fileURLToPath(new URL('../src/adapters/devin-stdio.js', import.meta.url));
 const originalPath = process.env['PATH'];
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
@@ -422,9 +423,9 @@ console.log(JSON.stringify(replace(step.research)));
   const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: dispatched.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   const questionId = batch.items[0]!.gap;
-  const originalStep = { research: { protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer',
+  const originalStep = { research: fixtureAnswer(packet.value.packet, { protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
-      selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
+      selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }), usage };
   writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
   return { root, project, configured, dispatched, packet, questionId, configure,
     get store() { return store; }, get engine() { return engine; },

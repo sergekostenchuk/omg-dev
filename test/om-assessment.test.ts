@@ -143,7 +143,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
   const dispatch = { adapter: reference(adapter), config: reference(config) };
-  writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
+  writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
   async function original(): Promise<AssessmentIntentRequest> {
     const model = ok(await runModelCall(store, { project, packet: reference(packet), dispatch, role: 'implementer' }));
     assert.equal(model.outcome?.kind, 'fact-candidates');
@@ -171,18 +171,18 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
       const nextPacket = ok(writeQuestionPacket(store, { project, routes: reference(successor),
         batch: nextBatch.id, environment: reference(config),
         attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, originalStep] }));
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, originalStep] }));
       const model = ok(await runModelCall(store, { project, packet: reference(nextPacket), dispatch, role: 'implementer' }));
       assert.equal(model.outcome?.kind, 'fact-candidates');
       return { project, modelCall: reference(model.record), questionId, dispatch };
     },
     assessor(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
       const choices = verdicts.length ? verdicts : ['supported' as const];
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, ...choices.map(verdict =>
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, ...choices.map(verdict =>
         ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
     },
     assessorsForTwoOriginals(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
-      writeFileSync(scenario, JSON.stringify({ steps: [originalStep, originalStep, ...verdicts.map(verdict =>
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, originalStep, ...verdicts.map(verdict =>
         ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
     },
     sent() { return readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean); },
@@ -473,7 +473,7 @@ test('E5 preserves conflicting and off-form outcomes as their own terminal state
   for (const variant of ['conflicting', 'off-form'] as const) await t.test(variant, async t => {
     const f = fixture(t), request = await f.original();
     if (variant === 'conflicting') f.assessor('conflicting');
-    else writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep,
+    else writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep,
       { research: { answer: 'untyped reviewer reply' }, usage }] }));
     const terminal = ok(await assessFact(f.store, request));
     assert.equal(terminal.value.verdict, variant);
@@ -504,7 +504,7 @@ test('real technical E5 terminals permit their own G7 close and exact restart re
     const assessorStep = variant === 'off-form'
       ? { research: { answer: 'untyped reviewer reply' }, usage }
       : { rawStdout: '{broken', exitCode: 7, stderr: 'intentional assessor failure' };
-    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, assessorStep] }));
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, assessorStep] }));
     const terminal = ok(await assessFact(f.store, request));
     assert.equal(terminal.value.verdict, variant);
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
@@ -528,7 +528,7 @@ test('real technical E5 terminals permit their own G7 close and exact restart re
 test('a technical terminal retains its own verdict when a semantic E5 fact closes the attempt', async t => {
   for (const semantic of ['supported', 'insufficient'] as const) await t.test(semantic, async child => {
     const f = fixture(child, true), request = await f.original();
-    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep,
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep,
       { research: { verdict: semantic, reasons: semantic === 'supported' ? [] : ['source not decisive'] }, usage },
       { research: { answer: 'untyped reviewer reply' }, usage }] }));
     const first = ok(await assessFact(f.store, request));
@@ -815,7 +815,7 @@ test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 co
       ? { rawStdout: '{broken', exitCode: 7, stderr: 'intentional assessor failure' }
       : { research: verdict === 'off-form' ? { answer: 'no typed verdict' }
         : { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage };
-    writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, ...choices.map(step)] }));
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, ...choices.map(step)] }));
     const requests = f.questionIds.map(questionId => ({ ...request, questionId }));
     const first = ok(await assessFact(f.store, requests[0]!));
     const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
@@ -911,7 +911,7 @@ test('24 H1.0a a complete MC1 root cannot hide an unpaid MC2 root in the initial
       outcome:{reason:'result',accepting:[first.value.accepted!],cancelling:[],refusals:[]}}),'completion_incomplete');
   });
   const other=f.otherRoot();
-  writeFileSync(f.scenario,JSON.stringify({steps:[f.originalStep,{research:{verdict:'supported',reasons:[]},usage},
+  writeFileSync(f.scenario,JSON.stringify({database: f.store.path, steps:[f.originalStep,{research:{verdict:'supported',reasons:[]},usage},
     {research:{wrong:true},usage}]}));
   const physical=ok(await runModelCycle(f.store,other.request));
   assert.equal(physical.record.value.terminal,'outcome');
@@ -1039,7 +1039,7 @@ test('24 H1.0a two genuine MC1 roots share a block through realizes and retain b
   // H1.0a names both root orders and E2 before/after the neighbouring S; the diagonal holds each of them once.
   for(const [deferredPackets,order] of [[false,[0,1]],[true,[1,0]]] as const)await t.test(`C38 root order ${order.join(',')}; E2 ${deferredPackets?'after':'before'} neighbouring S`,async child=>{
     const f=twoMc1Fixture(child,deferredPackets),results:ReturnType<typeof reference>[]=[];
-    writeFileSync(f.scenario,JSON.stringify({steps:order.flatMap(i=>[f.steps[i],{research:{verdict:'supported',reasons:[]},usage}])}));
+    writeFileSync(f.scenario,JSON.stringify({database: f.store.path, steps:order.flatMap(i=>[f.steps[i],{research:{verdict:'supported',reasons:[]},usage}])}));
     const intents:Ref[]=[],assessments:AssessmentIntentRequest[]=[];
     for(const [position,i] of order.entries()){
       const model=ok(await runModelCall(f.store,f.requestFor(i)));assert.equal(model.outcome?.kind,'fact-candidates');
@@ -1078,7 +1078,7 @@ test('24 H1.0a two genuine MC1 roots share a block through realizes and retain b
 
 test('C38 H1.0a neighbouring S during receipt preserves target admission while target and common changes remain guarded',async t=>{
   const f=twoMc1Fixture(t,true);
-  writeFileSync(f.scenario,JSON.stringify({steps:[f.steps[0],{research:{verdict:'supported',reasons:[]},usage},
+  writeFileSync(f.scenario,JSON.stringify({database: f.store.path, steps:[f.steps[0],{research:{verdict:'supported',reasons:[]},usage},
     f.steps[1],{research:{verdict:'supported',reasons:[]},usage}]}));
   const original=ok(await runModelCall(f.store,f.requestFor(0)));
   const intent=ok(writeAssessmentIntent(f.store,{project:f.project,modelCall:reference(original.record),
@@ -1224,7 +1224,7 @@ test('31 H1.0b a different already-applied B1 fact is a required file prerequisi
   const nextStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage };
-  writeFileSync(f.scenario, JSON.stringify({ steps: [f.originalStep, { research: { verdict: 'supported', reasons: [] }, usage },
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, { research: { verdict: 'supported', reasons: [] }, usage },
     { research: { verdict: 'insufficient', reasons: ['source not decisive'] }, usage }, nextStep] }));
   const model = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: 'implementer' }));
   const intent = ok(writeAssessmentIntent(f.store, { project: f.project, modelCall: reference(model.record),
@@ -1233,7 +1233,7 @@ test('31 H1.0b a different already-applied B1 fact is a required file prerequisi
   const input = { project: f.project, intent: reference(intent) };
   assert.equal(ok(prepareAssessmentFileTerminationCause(f.store, input)).cause, null);
   const priorSteps = JSON.parse(readFileSync(f.scenario, 'utf8')) as { steps: unknown[] };
-  writeFileSync(f.scenario, JSON.stringify({ steps: [...priorSteps.steps, { research: { verdict: 'supported', reasons: [] }, usage }] }));
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [...priorSteps.steps, { research: { verdict: 'supported', reasons: [] }, usage }] }));
   const paid = await paidAssessment(f, { project: f.project, modelCall: reference(model.record),
     questionId: batch.items[0]!.gap, dispatch: f.dispatch }, 'supported', true);
   writeFileSync(f.sourcePath, '{changed');
@@ -1621,7 +1621,7 @@ test('22 H1.0b a physical terminal resolves its own MC1 root but retains the oth
   const f = fixture(t, false, false, true, true);
   const packet = f.store.list('question-packet')[0]!;
   const first = { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: 'implementer' as const };
-  writeFileSync(f.scenario, JSON.stringify({ steps: [
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [
     { research: { wrong: true }, usage }, { research: { wrong: true }, usage },
   ] }));
   const firstCycle = ok(await runModelCycle(f.store, first));

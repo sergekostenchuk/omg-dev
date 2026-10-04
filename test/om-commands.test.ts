@@ -95,7 +95,7 @@ function commandFixture(t: TestContext, cold: boolean) {
   return { database, configured,
     get store() { return store; },
     get engine() { return engine; },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
+    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     sent(): { requestId: string }[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; },
     pause(name: string) { return join(root, `${name}.pause.json`); },
     restart(make: (path: string) => Store = path => new Store(path)) { store.close(); store = make(database); engine = new ProductEngine(store); } };
@@ -373,7 +373,7 @@ test("H2 row 6 of №1821-2: a continue through execute drives the pass to its s
       ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
+  writeFileSync(scenario, JSON.stringify({ database: f.store.path, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage }] }));
   const sent = () => existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).length : 0;
   const done = ok<PassOutcome>(await engine.execute({ type: "om-continue", project }));
   assert.deepEqual([done.end, done.refusal, done.run!.value.state.phase], ["complete", null, "complete"]);

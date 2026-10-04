@@ -1,3 +1,4 @@
+import { packetPrompt } from './packet-brief.js';
 import type { AnswerGround } from './accepted-answer.js';
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance as readLayerAcceptanceOf, readLayerEnvelope as readLayerEnvelopeOf, readUnacceptedLayer as readUnacceptedLayerOf } from './layer-basis.js';
 import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
@@ -197,7 +198,7 @@ export function adapterRequest(request: AdapterRequestInput): ModelCallResult<Se
     || (Object.hasOwn(request, 'speed') && !['fast', 'inherited'].includes(request.speed as string))
     || Object.keys(request).some(key => !['requestId', 'packet', 'model', 'effort', 'speed'].includes(key))) invalid('request');
   let prompt: string;
-  try { prompt = canonical(request.packet); }
+  try { prompt = packetPrompt(request.packet, request.requestId); }
   catch (error) { if (error instanceof EngineError) invalid('packet'); throw error; }
   return delivered({ protocol: 'omg-agent/v1', requestId: request.requestId, mode: 'research',
     model: request.model, effort: request.effort, ...(request.speed === undefined ? {} : { speed: request.speed }), prompt });
@@ -1736,10 +1737,18 @@ function requireTransport(store: Store, request: unknown): asserts request is Mo
     || !exactKeys(request, ['project', 'call', 'packet', 'role'])) invalid('transport');
   try { canonical(request.packet); } catch (error) { if (error instanceof EngineError) invalid('packet'); throw error; }
 }
+function callPacketText(packet: unknown, call: string) {
+  try { return packetPrompt(packet, call); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'packet_brief_invalid')
+      fail('packet_invalid', call, 'packet', error.message);
+    throw error;
+  }
+}
 function transportAssignment(store: Store, request: ModelTransportRequest, history?: CallHistory) {
   const call = take(readCall(store, request.project, request.call, history));
   if (call.revision !== 1) fail('model_call_request_invalid', request.call.id, 'call', 'A transport names the original E1 admission');
-  const packet = canonical(request.packet);
+  const packet = callPacketText(request.packet, call.value.call);
   if (!same(call.value.packet, { hash: hashJson(request.packet), chars: packet.length, bytes: Buffer.byteLength(packet) }))
     fail('packet_invalid', request.call.id, 'packet', 'The actual sent body must reproduce the admitted fingerprint and both sizes');
   const environment = take(readRecord<Environment>(store, call.value.dispatch.config,
@@ -2765,7 +2774,7 @@ function completionCallPacket(store: Store, project: string, request: AnyRecordC
     && object(record.value.packet) && record.value.packet.requestId === request.call);
   if (candidates.length !== 1) fail('completion_foreign', request.call, 'packet', 'A call must name one exact E2, not just a batch');
   const packet = take(readQuestionPacket(store, { project, record: reference(candidates[0]!) }));
-  const payload = packet.value.packet!, bytes = canonical(payload);
+  const payload = packet.value.packet!, bytes = callPacketText(payload, request.call);
   if (!same(request.packet, payload) && !same(request.packet, { hash: hashJson(payload), chars: bytes.length, bytes: Buffer.byteLength(bytes) }))
     fail('completion_foreign', request.call, 'packet', 'The E1 body or fingerprint must reproduce its exact E2');
   return reference(packet);
@@ -3371,7 +3380,7 @@ function checkedAssignmentCall(store: Store, binding: Revision<CompletionOwner> 
     call: row.call, purpose: row.purpose, basis: row.basis, gaps: [...row.gaps].sort(compareJson), series: row.series,
     attempt: row.attempt, goal: { ...row.goal, questions: [...row.goal.questions].sort() }, dispatch: row.dispatch, packet: row.packet,
   });
-  const body = canonical(expected.packet);
+  const body = callPacketText(expected.packet, expected.call);
   if (actual.series.id !== binding.value.series.id || actual.attempt !== binding.value.attempt || !same(actual.goal, binding.value.goal)
     || !same(normalized(actual), normalized({ ...expected,
       packet: { hash: hashJson(expected.packet), chars: body.length, bytes: Buffer.byteLength(body) } } as AnyCallRecord))
