@@ -499,3 +499,111 @@ test('MP3 rows 14–15 (brief): carried items are whole, in their given order, b
     assert.equal(included === 0 ? 0 : JSON.parse(section(packetPrompt(bounded), text).split('\n')[3]!).length, included, 'Included means shown');
   }
 });
+
+// MP1.1 rows 14–18: exercise the real selector through the public derivation, never a copied ranking predicate.
+function mp11Materials(t: test.TestContext, files: Record<string, string>, anchors: string[]) {
+  const f = sample(t), evidence = new Evidence(f.store), graph = structuredClone(f.basis.graph);
+  graph.nodes.find(node => node.id === f.basis.node)!.code = anchors.map(path => ({ path, access: 'read', status: 'existing' }));
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(join(f.root, path, '..'), { recursive: true }); writeFileSync(join(f.root, path), content);
+    evidence.file('garden', path.replaceAll('/', ':'), f.root, path, 'text/plain', 0);
+  }
+  const basis: BriefBasis = { ...f.basis, graph, briefContract: 'om-brief/v2', material: briefMaterial(f.store, 'garden', f.root, false) };
+  const selected = (b = basis): string[] => deriveBrief(f.input, b).brief.manifest.filter((row: { completeness: string }) => row.completeness === 'whole')
+    .map((row: { path: string }) => row.path).sort();
+  return { ...f, evidence, basis, selected };
+}
+
+test('MP1.1 rows 14–16,18: direct imports rank by distinct file paths, then size/path/Ref; duplicates and documents cannot inflate popularity; budgets and old selection stay exact', t => {
+  const files = {
+    'src/root.ts': 'import "./small.js"; import "./large.js"; import "./missing.js";',
+    'src/small.ts': 'x', 'src/large.ts': '0123456789',
+    'src/one.ts': 'import "./small.js"; require("./small.ts"); import "./small.js";',
+    'src/two.ts': 'import "./large.js";', 'src/three.ts': 'import "./large.ts";',
+    'test/root.test.ts': 'import "../src/root.js";',
+  };
+  const f = mp11Materials(t, files, ['src/root.ts']);
+  // A second Ref at the same importer path and a code-looking owner document are not new importing paths.
+  f.evidence.file('garden', 'duplicate-importer', f.root, 'src/one.ts', 'text/plain', 0);
+  f.evidence.document('garden', 'non-file-importer', 'import "./src/small.js"; import "./src/small.js";', 'text/plain', 0);
+  const basis = { ...f.basis, material: briefMaterial(f.store, 'garden', f.root, false), materialBudget: files['src/root.ts'].length + 10 };
+  assert.deepEqual(f.selected(basis), ['src/large.ts', 'src/root.ts'], 'Popularity wins over shorter size; no room is reserved for tests');
+  const packet = deriveBrief(f.input, basis);
+  const reverse = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].reverse(), references: [...basis.material.references].reverse() } };
+  assert.deepEqual(deriveBrief(f.input, reverse), packet);
+  assert.deepEqual(f.selected({ ...basis, materialBudget: 0 }), []);
+  assert.deepEqual(f.selected({ ...basis, materialBudget: files['src/root.ts'].length + 1 }), ['src/root.ts', 'src/small.ts'], 'An oversized import does not block a fitting one');
+  const { briefContract: _version, ...legacy } = basis;
+  assert.deepEqual(f.selected(legacy), ['src/root.ts', 'src/small.ts'], 'The literal v1 selector keeps its size order');
+  assert.equal(deriveBrief(f.input, legacy).brief.contract, 'om-brief/v1');
+  assert.equal(packet.brief.contract, 'om-brief/v2');
+  assert.equal(packet.responseForm.requestId, deriveBrief(f.input, legacy).responseForm.requestId);
+});
+
+test('MP1.1 rows 15–18: tied imports have a total order; additional tests require both directory and name, shown modules, and spare budget; explicit fixture/test anchors survive', t => {
+  const files: Record<string, string> = {
+    'src/root.ts': 'import "./b.js"; import "./a.js";', 'src/a.ts': 'a', 'src/b.ts': 'b', 'src/hidden.ts': 'h',
+    'test/product-fixture.ts': 'import "../src/root.js";',
+    'test/a.test.ts': 'import "../src/a.js";', 'tests/b.spec.mjs': 'import "../src/a.js";',
+    '__tests__/c.test.cts': 'import "../src/a.js"; // third, longer', 'test/hidden.test.ts': 'import "../src/hidden.js";',
+    'src/wrong.test.ts': 'import "./a.js";', 'test/no-name.ts': 'import "../src/a.js";',
+    'test/fake.test.json': 'import "../src/a.js";',
+  };
+  const f = mp11Materials(t, files, ['src/root.ts']);
+  // The unchanged document rule precedes the imports.
+  f.evidence.document('garden', 'audit-garden-consume-block', 'historic document', 'text/plain', 0);
+  const material = briefMaterial(f.store, 'garden', f.root, false);
+  const basis = { ...f.basis, material };
+  const whole = f.selected(basis);
+  assert.ok(whole.includes('test/a.test.ts') && whole.includes('tests/b.spec.mjs'));
+  for (const path of ['test/product-fixture.ts', '__tests__/c.test.cts', 'test/hidden.test.ts', 'src/wrong.test.ts', 'test/no-name.ts', 'test/fake.test.json'])
+    assert.ok(!whole.includes(path), path);
+  assert.ok(whole.includes('audit-garden-consume-block'), 'Documents keep their old priority and provenance');
+  const anchored = structuredClone(basis.graph);
+  anchored.nodes.find(node => node.id === basis.node)!.code.push({ path: 'test/product-fixture.ts', access: 'read', status: 'existing' },
+    { path: '__tests__/c.test.cts', access: 'read', status: 'existing' });
+  const withAnchors = f.selected({ ...basis, graph: anchored });
+  assert.ok(withAnchors.includes('test/product-fixture.ts') && withAnchors.includes('__tests__/c.test.cts'));
+  assert.equal(withAnchors.filter(path => /\.(test|spec)\./.test(path)).length, 3, 'Explicit test anchor does not consume the two additional places');
+  const minimal = mp11Materials(t, { 'src/root.ts': files['src/root.ts']!, 'src/a.ts': 'a', 'src/b.ts': 'b' }, ['src/root.ts']);
+  assert.deepEqual(minimal.selected({ ...minimal.basis, materialBudget: files['src/root.ts']!.length + 1 }), ['src/a.ts', 'src/root.ts']);
+  const none = mp11Materials(t, { 'src/orphan.ts': 'x', 'test/orphan.test.ts': 'import "../src/orphan.js";' }, []);
+  assert.deepEqual(none.selected(), []);
+  // Multiple exact sources at one dependency path tie by Ref, independent of catalogue insertion order.
+  minimal.evidence.file('garden', 'a-copy', minimal.root, 'src/a.ts', 'text/plain', 0);
+  const tie = { ...minimal.basis, material: briefMaterial(minimal.store, 'garden', minimal.root, false), materialBudget: files['src/root.ts']!.length + 1 };
+  const first = deriveBrief(minimal.input, tie);
+  assert.deepEqual(deriveBrief(minimal.input, { ...tie, material: { ...tie.material, sources: [...tie.material.sources].reverse() } }), first);
+  const expected = tie.material.sources.filter(row => row.path === 'src/a.ts').sort((a,b) => canonical(a.reference) < canonical(b.reference) ? -1 : 1)[0]!;
+  assert.deepEqual(first.brief.manifest.find((row: any) => row.path === 'src/a.ts' && row.completeness === 'whole').source, expected.reference);
+});
+
+test('MP1.1 rows 1,11–13,20: v2 teaches literal case-insensitive search in rules, schema and examples; v1 bytes remain unchanged', t => {
+  const f = sample(t), packet = deriveBrief(f.input, { ...f.basis, briefContract: 'om-brief/v2' });
+  assert.deepEqual(deriveBrief(f.input, f.basis), f.payload);
+  assert.ok(!f.payload.brief.text.includes('Search finds one literal substring'));
+  assert.ok(packet.brief.text.includes('Search finds one literal substring'));
+  assert.ok(packet.brief.text.includes('A successful search may return []; an inaccessible scope instead refuses.'));
+  const branch = packet.responseForm.schema.oneOf.find((row: any) => row.properties.action.const === 'need_source');
+  const search = branch.properties.reads.items.oneOf.find((row: any) => row.properties.action.const === 'search');
+  assert.match(search.properties.query.description, /without case sensitivity/);
+  const validate = new Ajv({ strict: true, allowUnionTypes: true }).compile(packet.responseForm.schema);
+  for (const query of ['A|B', '.', '*', 'Two words']) {
+    const example = packet.brief.examples.find((row: any) => row.action === 'need_source' && row.reads.some((read: any) => read.action === 'search'));
+    assert.ok(example);
+    const answer = structuredClone(example); answer.reads = [{ ...answer.reads.find((read: any) => read.action === 'search'), query }];
+    assert.equal(validate(answer), true, canonical(validate.errors));
+  }
+  for (const example of packet.brief.examples) assert.equal(validate(example), true, canonical(validate.errors));
+  assert.deepEqual(packetFingerprint(packet), { hash: hashJson(packet), chars: packet.brief.text.length, utf8Bytes: Buffer.byteLength(packet.brief.text, 'utf8') });
+  assert.equal(packetPrompt(packet), packet.brief.text);
+  assert.throws(() => packetPrompt({ ...packet, brief: { ...packet.brief, contract: 'unknown' } }), (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid');
+});
+
+test('MP1.1 row 17: each approved test extension is selected by its actual saved path', t => {
+  for (const extension of ['ts', 'tsx', 'js', 'jsx', 'mts', 'cts', 'mjs', 'cjs']) {
+    const path = `test/unit.spec.${extension}`;
+    const f = mp11Materials(t, { 'src/unit.ts': 'unit', [path]: 'import "../src/unit.js";' }, ['src/unit.ts']);
+    assert.ok(f.selected().includes(path), path);
+  }
+});

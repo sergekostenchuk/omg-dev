@@ -20,6 +20,7 @@ export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
 export const BRIEF_VERSION = 'om-question-packet/brief-v1' as const;
 export const WORKS_BRIEF_VERSION = 'om-question-packet/works-brief-v1' as const;
+export const BRIEF_CONTENT_CONTRACT = 'om-brief/v2' as const;
 export const BRIEF_CODES = Object.freeze(['answer_label_unknown', 'packet_brief_invalid'] as const);
 export const briefContract = (value: unknown): boolean => value === BRIEF_PACKET_CONTRACT || value === WORKS_BRIEF_PACKET_CONTRACT;
 const object = (value: unknown): value is Record<string, any> => isPlainObject(value);
@@ -37,7 +38,7 @@ export interface BriefManifest {
   completeness: 'whole' | 'omitted'; reason: string;
 }
 export interface PacketBrief {
-  contract: 'om-brief/v1'; requestId: string; text: string; labels: BriefLabel[];
+  contract: 'om-brief/v1' | typeof BRIEF_CONTENT_CONTRACT; requestId: string; text: string; labels: BriefLabel[];
   manifest: BriefManifest[]; references: Ref[]; examples: Json[];
 }
 export interface BriefMaterial {
@@ -86,7 +87,7 @@ export function packetPrompt(packet: unknown, requestId?: string): string {
   if (typeof packet.requestId !== 'string' || !packet.requestId || requestId !== undefined && requestId !== packet.requestId
     || !object(packet.responseForm) || packet.responseForm.protocol !== 'omg-answer/v3'
     || packet.responseForm.requestId !== packet.requestId || !object(packet.responseForm.schema)
-    || !object(packet.brief) || packet.brief.contract !== 'om-brief/v1' || packet.brief.requestId !== packet.requestId
+    || !object(packet.brief) || !['om-brief/v1', BRIEF_CONTENT_CONTRACT].includes(packet.brief.contract) || packet.brief.requestId !== packet.requestId
     || typeof packet.brief.text !== 'string' || !packet.brief.text.trim() || !Array.isArray(packet.brief.labels)
     || !Array.isArray(packet.brief.manifest) || !Array.isArray(packet.brief.references) || !Array.isArray(packet.brief.examples)
     || !packet.brief.references.every(isRef)
@@ -122,6 +123,7 @@ function neighbourSection(basis: BriefBasis): string[] {
     canonical(basis.neighbors)] : [];
 }
 export interface BriefBasis {
+  briefContract?: typeof BRIEF_CONTENT_CONTRACT;
   project: string; graph: Graph; node: string | null; gaps: { question: string; target: string; field: string; ref: Ref; evidence: Json }[];
   /** MP2 (№2968 §2): the proved finished work of neighbouring roots — only in the form a packet issued after MP2 saves. */
   neighbors?: { contract: typeof NEIGHBOR_CONTRACT; works: Json[] };
@@ -180,7 +182,8 @@ function selectMaterial(basis: BriefBasis, payload: Record<string, any>) {
   addPath('package.json', 'project commands and dependencies');
   const byLength = (a: typeof sources[number], b: typeof sources[number]) => a.value.content.length - b.value.content.length
     || compare(a.path, b.path) || compare(canonical(a.reference), canonical(b.reference));
-  const dependencies = new Set(anchors.flatMap(path => (byPath.get(path) ?? []).flatMap(imports)));
+  const dependencies = new Set(anchors.flatMap(path => (byPath.get(path) ?? [])
+    .filter(source => basis.briefContract !== BRIEF_CONTENT_CONTRACT || source.value.origin.kind === 'file').flatMap(imports)));
   const linked = canonical([basis.input, basis.gaps.map(gap => gap.evidence)]);
   const words = basis.graph.nodes.filter(row => nodeIds.has(row.id)).flatMap(row => row.title.toLowerCase().split(/[^\p{L}\p{N}]+/u)).filter(word => word.length > 3);
   for (const source of sources.filter(source => source.value.origin.kind === 'owner-document').sort(byLength)) {
@@ -188,6 +191,29 @@ function selectMaterial(basis: BriefBasis, payload: Record<string, any>) {
     else if (words.some(word => source.path.toLowerCase().includes(word))
       || [...nodeIds].some(id => source.path.split(/[^\p{L}\p{N}-]+/u).some(part => part === id || part.endsWith(`-${id}`))))
       add(source, 'node-name document heuristic; material is not authority or an accepted decision');
+  }
+  if (basis.briefContract === BRIEF_CONTENT_CONTRACT) {
+    const importers = new Map<string, Set<string>>();
+    for (const source of sources.filter(source => source.value.origin.kind === 'file')) for (const path of imports(source)) {
+      if (!importers.has(path)) importers.set(path, new Set());
+      importers.get(path)!.add(source.path);
+    }
+    for (const source of sources.filter(source => source.value.origin.kind === 'file' && dependencies.has(source.path)).sort((a, b) =>
+      (importers.get(b.path)?.size ?? 0) - (importers.get(a.path)?.size ?? 0) || byLength(a, b)))
+      add(source, 'one-hop relative import of an anchor ranked by distinct importer paths, size, path and reference');
+    const testDirectory = (path: string) => /(?:^|\/)(?:tests?|__tests__)\//.test(path);
+    const modules = new Set(sources.filter(source => source.value.origin.kind === 'file'
+      && !testDirectory(source.path) && picks.has(canonical(source.reference))).map(source => source.path));
+    const tests = sources.filter(source => source.value.origin.kind === 'file' && testDirectory(source.path)
+      && /\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(source.path)
+      && !picks.has(canonical(source.reference)) && imports(source).some(path => modules.has(path))).sort(byLength);
+    let added = 0;
+    for (const source of tests) {
+      if (added === 2) break;
+      add(source, 'one of at most two additional tests importing an included module');
+      if (picks.has(canonical(source.reference))) added++;
+    }
+    return picks;
   }
   for (const source of sources.filter(source => /(?:^|\/)(?:tests?|__tests__)\//.test(source.path)
     && imports(source).some(path => anchors.includes(path))).sort(byLength).slice(0, 2)) add(source, 'one of at most two tests importing an anchor');
@@ -312,6 +338,7 @@ function fieldValueShape(gap: BriefBasis['gaps'][number], basis: BriefBasis): Re
   invalid(`gaps.${gap.field}`, 'The brief needs the native value contract of every assigned field');
 }
 
+const SEARCH_RULE = 'Search finds one literal substring within each line, without case sensitivity (JavaScript toLowerCase). A phrase with spaces is one substring, not AND/OR. Regular expressions are not supported: |, . and * are ordinary characters. Use separate search entries for different terms. Results are matching lines with their source and line number. [] means no matches in the successfully read exact scope, not absence of functionality throughout the project. An unavailable scope is a refusal, not an empty success. String within is a literal relative path, not a glob; {label:S1} selects a source of this packet, and saved context is read with read_context.';
 function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis: BriefBasis) {
   const schema = JSON.parse(canonical(payload.responseForm.schema));
   const enumOf = (domain: BriefLabel['domain']) => {
@@ -323,6 +350,7 @@ function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis:
     const p = branch.properties;
     if (p.questionIds) p.questionIds.items = enumOf('question');
     for (const read of p.reads?.items.oneOf ?? []) {
+      if (read.properties.query && basis.briefContract === BRIEF_CONTENT_CONTRACT) read.properties.query.description = SEARCH_RULE;
       if (read.properties.source) read.properties.source = enumOf('source');
       if (read.properties.record) read.properties.record = enumOf('context');
       if (read.properties.path) read.properties.path.description = 'Literal safe relative project path. Labels are not expanded in this field.';
@@ -712,6 +740,8 @@ function compactSchema(schema: any): any {
 
 /** Content is embedded as JSON strings/data, never interpolated inside a closable code fence. */
 export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Record<string, any> {
+  if (Object.hasOwn(basis, 'briefContract') && basis.briefContract !== BRIEF_CONTENT_CONTRACT)
+    invalid('briefContract', 'The selected brief content contract must be supported');
   basis = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].sort((a, b) => compare(a.path, b.path) || compare(canonical(a.reference), canonical(b.reference))) } };
   const labels = labelMap(payload, basis);
   const picks = selectMaterial(basis, payload);
@@ -758,7 +788,10 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
       refusals: display.view(payload.refusals), sourceDeliveries: display.view(payload.sourceDeliveries ?? []) }),
     '# Reference labels',
     'These engine-issued labels are aliases for exact references. They are resolved before source/context domain checks. Use labels only in questionId/questionIds, basis, fills/replaces.obligation, replaces.base.graph, citations.source, read_source.source, read_context.record and search.within={label}. Node/port/connector IDs and code/value strings remain literal. read.path and string search.within are literal relative paths, even "S1". Source selectors use UTF-16 offsets. Documents are not authority. A planned implementation may have no existing source.',
-    'Material selection is a bounded heuristic: saved files at code bindings and accepted test entrypoints of the node and its consumers/ancestors, package.json, up to two importing tests, related documents and one-hop imports. Quoting an existing file does not make a planned symbol or test implemented. Documents retain their historical scope and dates; their claims are not current database facts or authority. Omitted material remains available by its label.',
+    ...(basis.briefContract === BRIEF_CONTENT_CONTRACT ? [SEARCH_RULE] : []),
+    basis.briefContract === BRIEF_CONTENT_CONTRACT
+      ? 'Material selection is a bounded heuristic: saved files at code bindings and accepted test entrypoints of the node and its consumers/ancestors, package.json, related documents, direct imports ranked by distinct importer paths and size, then at most two additional tests importing included modules. Quoting an existing file does not make a planned symbol or test implemented. Documents retain their historical scope and dates; their claims are not current database facts or authority. Omitted material remains available by its label.'
+      : 'Material selection is a bounded heuristic: saved files at code bindings and accepted test entrypoints of the node and its consumers/ancestors, package.json, up to two importing tests, related documents and one-hop imports. Quoting an existing file does not make a planned symbol or test implemented. Documents retain their historical scope and dates; their claims are not current database facts or authority. Omitted material remains available by its label.',
     '# Material catalogue (an observed set, not proof of absence outside it)', canonical(manifest.map(({ label, origin, path, length, completeness, reason }) => ({ label, origin: { kind: origin.kind }, path, length, unit: 'UTF-16', completeness,
       selection: completeness === 'omitted' ? 'outside-selection-or-budget' : reason.startsWith('saved file') ? 'anchor' : reason.startsWith('project') ? 'project'
         : reason.startsWith('one of') ? 'test' : reason.startsWith('one-hop') ? 'import' : reason.startsWith('exact') ? 'linked-document' : 'document-heuristic' }))),
@@ -773,11 +806,12 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
     canonical({ contract: 'om-brief-response/v1', responseForm: { ...responseForm, schema: compactSchema(schema) }, labels: display.meanings }),
     '# Examples of structure — replace example design, value, paths and commands with your substantiated answer',
     'Examples illustrate the declared forms; they are not an accepted design or proof of the claimed fact. The exact constraints and native checks above still apply.',
+    ...(basis.briefContract === BRIEF_CONTENT_CONTRACT ? ['The search examples use the single literal term "example", matched without case sensitivity. Use separate searches for different terms; | is not an alternative operator. A successful search may return []; an inaccessible scope instead refuses. Keep that delivery result outside the JSON request you return.'] : []),
     ...(examples.some(example => object(example) && !Array.isArray(example) && example.action === 'answer') ? [] : [
       'No substantive answer example is available within the bounded generator, full result schema and available evidence. Follow the exact declared schema; the control examples below remain available.',
     ]), canonical(examples),
   ].join('\n');
-  const brief: PacketBrief = { contract: 'om-brief/v1', requestId: payload.requestId, text, labels, manifest, examples,
+  const brief: PacketBrief = { contract: basis.briefContract ?? 'om-brief/v1', requestId: payload.requestId, text, labels, manifest, examples,
     references: [...new Map([...basis.material.references, ...basis.contexts].map(ref => [canonical(ref), ref])).values()].sort((a, b) => compare(canonical(a), canonical(b))) };
   return { ...payload, responseForm, brief };
 }

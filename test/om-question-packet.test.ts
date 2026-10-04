@@ -43,7 +43,7 @@ import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORI
 import { prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
+import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -721,6 +721,7 @@ test('E2 splits MC2 by indivisible connectors, assigns the outcome to the last p
   assert.equal(complete.record.value.state, 'empty'); assert.equal(complete.record.value.packet, null);
   assert.deepEqual(f.store.list('question').map(reference), nativeBefore);
   const history = [first.record, second.record, complete.record];
+  for (const packet of history) mp11Version(packet, 'om-brief/v2');
   for (const result of [firstResult, secondResult]) {
     ok(settleCall(f.store, reference(result.call), { inputTokens: 10, outputTokens: 3, cachedInputTokens: null, reasoningOutputTokens: null }, 'succeeded'));
     f.store.write({ id: result.proposal.id, kind: result.proposal.kind, expected: result.proposal.revision,
@@ -1431,7 +1432,7 @@ test('S1.1 a repeated entry into the same active journal proof is journal_invali
   });
 });
 
-test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', t => {
+function emptyPacketFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-packet-accepted-')), database = join(root, 'state.sqlite');
   const store = new Store(database), engine = new ProductEngine(store), project = 'garden';
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1470,6 +1471,11 @@ test('E2 does not reassign accepted refinements and writes an empty packet when 
     catalog: { paths: [], records: [] }, previous: null }));
   assert.deepEqual(routes.value.batches, []);
   const request: QuestionPacketRequest = { project, routes: reference(routes), batch: null, environment: reference(environment), attempt: null, previous: [] };
+  return { root, database, store, project, request };
+}
+
+test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', t => {
+  const { store, project, request } = emptyPacketFixture(t);
   const nativeBefore = store.list('question').map(reference), prepared = ok(prepareQuestionPacket(store, request));
   assert.equal(prepared.record.value.state, 'empty'); assert.equal(prepared.record.value.packet, null);
   assert.equal(prepared.record.value.fingerprint, null); assert.equal(prepared.record.value.plan, null);
@@ -2475,6 +2481,7 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
   assert.deepEqual(snapshot(f.store), before);
   const legacy = clone(ready.value) as QuestionPacketRecord;
   delete legacy.packetContract;
+  delete legacy.briefContract; // This negative pre-brief construction must reach the unsupported-owner check.
   legacy.answerProtocol = 'omg-answer/v2';
   const legacyRequestId = hashJson({ protocol: legacy.answerProtocol, request });
   const legacyPayload = legacy.packet as Record<string, Json>;
@@ -2539,7 +2546,7 @@ for (const conflict of ['response', 'environment'] as const) test(`E2 pending at
   else rejected(preparePartResult(f.store, pending.source), 'part_result_invalid');
 });
 
-type ContextRead = { action: 'read_context'; record: Ref; pointer: string } | { action: 'read_source'; source: Ref; selector: { kind: 'text-range'; start: number; end: number } };
+type ContextRead = { action: 'search'; within: string | Ref; query: string } | { action: 'read_context'; record: Ref; pointer: string } | { action: 'read_source'; source: Ref; selector: { kind: 'text-range'; start: number; end: number } };
 function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<Revision<QuestionPacketRecord>>,
   read?: ContextRead | ContextRead[]) {
   const { f } = p, payload = packet.value.packet as Record<string, any>;
@@ -3056,6 +3063,7 @@ test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3
 
 test('MP1 L3 examples use actual slots, declared CodeRefs and concrete D7 bindings through E3 and F4.3', async t => {
   const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  mp11Version(packet, 'om-brief/v2');
   const payload = packet.value.packet as Record<string, any>;
   const scope = JSON.parse(payload.brief.text.split('# Scope and exact context\n')[1].split('\n')[0]);
   for (const slot of scope.expansion.obligations.filter((row: { flow?: string }) => row.flow)) {
@@ -3151,4 +3159,229 @@ test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the 
       } finally { store.close(); }
     }
   });
+});
+
+const MP11_BASE = 'e88b4ed40d94dd61e242d613d96a87e0bb5e6206';
+// Reuse the actual managed-cycle fixtures; no tests from the neighbouring suite are registered.
+async function mp11CycleFixtures(t: TestContext): Promise<any> {
+  const module = new URL(`./.mp11-cycles-${process.pid}.mjs`, import.meta.url);
+  const source = readFileSync(new URL('./om-model-call.test.js', import.meta.url), 'utf8')
+    .replace(/import test from ["']node:test["'];/, 'const test = () => {};');
+  writeFileSync(module, `${source}\nexport { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit };\n`);
+  t.after(() => rmSync(module, { force: true }));
+  return import(module.href);
+}
+function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-brief/v1' | 'om-brief/v2') {
+  assert.equal(packet.value.briefContract, era === 'om-brief/v2' ? era : undefined);
+  if (packet.value.packet) {
+    const payload = packet.value.packet as Record<string, any>;
+    assert.equal(payload.brief.contract, era);
+    assert.deepEqual(packet.value.fingerprint, packetFingerprint(payload));
+    assert.equal(payload.requestId, packet.id.slice(packet.id.lastIndexOf(':') + 1));
+  }
+}
+
+test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, delivered continuation and no-progress records byte for byte; new descendants inherit v1', t => {
+  const histories = lp1OldProducer(t, MP11_BASE);
+  for (const history of histories) {
+    let store = new Store(history.database);
+    try {
+      const before = snapshot(store);
+      for (const packet of history.packets) {
+        mp11Version(packet, 'om-brief/v1');
+        assert.ok(briefReadings(packet.value.packet), 'The actual MP3 producer keeps readings');
+        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+        assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
+        const repeated = ok(writeQuestionPacket(store, packet.value.request));
+        assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
+      }
+      for (const part of history.parts) assert.deepEqual(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), part);
+      assert.deepEqual(snapshot(store), before);
+      if (history.next) {
+        const next = ok(writeQuestionPacket(store, history.next)).record;
+        mp11Version(next, 'om-brief/v1');
+        if (history.next.continuation) assert.equal(next.value.refusal?.code, 'research_no_progress');
+        else assert.equal(next.value.plan?.position, 1);
+        store.close(); store = new Store(history.database);
+        const saved = snapshot(store);
+        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(next) })), next);
+        assert.deepEqual(ok(writeQuestionPacket(store, history.next)).record, next);
+        assert.deepEqual(snapshot(store), saved);
+      }
+    } finally { store.close(); }
+  }
+});
+
+test('MP1.1 rows 2–4: independent blocked packets record their version before the null payload; true legacy blocked stays unmarked on repeat', t => {
+  const p = packetFixture(t, 1), packet = ok(writeQuestionPacket(p.f.store, p.request)).record;
+  assert.equal(packet.value.state, 'blocked'); assert.equal(packet.value.packet, null); mp11Version(packet, 'om-brief/v2');
+  p.f.restart(); const before = snapshot(p.f.store);
+  assert.deepEqual(ok(writeQuestionPacket(p.f.store, p.request)).record, packet); assert.deepEqual(snapshot(p.f.store), before);
+  const [old] = lp1OldProducer(t, MP11_BASE, { node: false, capacity: 1 }); assert.ok(old);
+  const store = new Store(old.database);
+  try {
+    const packet = old.packets[0]!; assert.equal(packet.value.state, 'blocked'); mp11Version(packet, 'om-brief/v1');
+    const before = snapshot(store);
+    assert.deepEqual(ok(readQuestionPacket(store, { project: old.project, record: reference(packet) })), packet);
+    assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+    assert.deepEqual(snapshot(store), before);
+  } finally { store.close(); }
+});
+
+test('MP1.1 rows 9,10,19: direct reader and current producer reject unsupported, absent and mismatched versions; exact-address race stays atomic', t => {
+  const p = packetFixture(t), f = p.f, prepared = ok(prepareQuestionPacket(f.store, p.request));
+  const record = prepared.record, original = clone(record.value), { briefContract: _era, ...absent } = original;
+  for (const value of [absent, { ...original, briefContract: null }, { ...original, briefContract: 'om-brief/unknown' },
+    { ...original, packetContract: PACKET_CONTRACT },
+    { ...original, packet: { ...(original.packet as Record<string, any>), brief: { ...(original.packet as any).brief, contract: 'om-brief/v1' } } }]) {
+    const view = pendingCallStore(f.store, [...prepared.writes.filter(write => write.id !== record.id),
+      { id: record.id, kind: 'question-packet', expected: 0, value }]);
+    const ref = { id: record.id, revision: 1, hash: hashJson(value) };
+    rejected(readQuestionPacket(view, { project: f.project, record: ref }), 'packet_record_invalid');
+    for (const action of [prepareQuestionPacket, writeQuestionPacket]) rejected(action(view, p.request), 'packet_record_invalid');
+  }
+  const rival = new Store(f.database);
+  try { ok(writeQuestionPacket(rival, p.request)); } finally { rival.close(); }
+  const before = snapshot(f.store), raced = writeGuarded(f.store, { unit: 'MP1.1', target: record.id, writes: prepared.writes, guards: prepared.guards });
+  assert.equal(raced.ok, false); assert.deepEqual(snapshot(f.store), before);
+  const root = ok(writeQuestionPacket(f.store, p.request)).record;
+  const delivered = sourceContinuation(p, root), child = ok(prepareQuestionPacket(f.store, { ...p.request, continuation: delivered.continuation }));
+  const { briefContract: _childEra, ...oldChild } = clone(child.record.value);
+  const value = { ...oldChild, packet: { ...(oldChild.packet as any), brief: { ...(oldChild.packet as any).brief, contract: 'om-brief/v1' } } };
+  const view = pendingCallStore(f.store, [...child.writes.filter(write => write.id !== child.record.id),
+    { id: child.record.id, kind: 'question-packet', expected: 0, value }]);
+  rejected(readQuestionPacket(view, { project: f.project, record: { id: child.record.id, revision: 1, hash: hashJson(value) } }), 'packet_chain_invalid');
+  for (const action of [prepareQuestionPacket, writeQuestionPacket]) rejected(action(view, clone(child.record.value.request) as QuestionPacketRequest), 'packet_chain_invalid');
+});
+
+test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive literal substrings, including phrases and | . *; empty succeeds and inaccessible refuses', async t => {
+  const { e4Fixture, e4NeedSource } = await mp11CycleFixtures(t);
+  for (const scope of ['path', 'source'] as const) await t.test(scope, async t => {
+    const text = 'Alpha TWO Words\nA\nB\nA|B\nA.B\nA*B\nTwo separate words\n';
+    let source!: Revision<any>;
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, false, undefined,
+      (store: Store, project: string, root: string) => {
+        writeFileSync(join(root, 'literal.txt'), text);
+        source = new Evidence(store).file(project, 'literal', root, 'literal.txt', 'text/plain', 0);
+      });
+    const queries = ['alpha', 'TWO WORDS', 'A|B', '.', '*', 'not present'];
+    const reads = queries.map(query => ({ action: 'search', query, within: scope === 'path' ? 'literal.txt' : reference(source) }));
+    f.steps([{ research: e4NeedSource(f, reads) }, { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'cannot_answer',
+      questionIds: f.packet.value.packet.questions.map((q: any) => q.id), reason: 'End this local search probe' } }]);
+    const cycle = ok(await runModelCycle(f.store, f.request));
+    const continuation = f.store.list('question-packet').find((row: any) => row.value.request.continuation);
+    assert.ok(continuation, canonical(cycle.record.value)); mp11Version(continuation, 'om-brief/v2');
+    const delivered = (continuation.value.packet as any).sourceDeliveries[0].data;
+    const byQuery = new Map<string, any>(delivered.map((entry: any) => [entry.read.query, entry.data]));
+    assert.deepEqual(queries.map(query => byQuery.get(query).map((row: any) => row.line)), [[1], [1], [4], [5], [6], []]);
+    assert.equal(byQuery.get('alpha')[0].text, 'Alpha TWO Words');
+    assert.ok(isRef(byQuery.get('alpha')[0].source));
+    if (scope === 'source') assert.deepEqual(byQuery.get('alpha')[0].source, reference(source));
+    // Unknown exact source is rejected by E3; unavailable path is a delivery refusal, never a successful [].
+    const missing = scope === 'path' ? 'absent.txt' : { id: 'source:garden:absent', revision: 1, hash: '0'.repeat(64) };
+    const p = packetFixture(t), root = ok(writeQuestionPacket(p.f.store, p.request)).record;
+    const raw = JSON.stringify(fixtureAnswer(root.value.packet, { protocol: 'omg-answer/v3', requestId: (root.value.packet as any).requestId,
+      action: 'need_source', questionIds: (root.value.packet as any).questions.map((q: any) => q.id), missing: 'Read exact scope',
+      reads: [{ action: 'search', within: missing, query: 'anything' }] }));
+    const checked = checkAnswerForm(p.f.store, { project: p.f.project, packet: reference(root), raw });
+    if (scope === 'source') assert.equal(checked.ok, false);
+    else {
+      assert.equal(checked.ok, true);
+      assert.throws(() => sourceContinuation(p, root, { action: 'search', within: missing as string, query: 'anything' }), /source|path|ENOENT|file|search/i);
+      assert.equal(p.f.store.list('om-read-delivery').length, 0);
+    }
+  });
+});
+
+test('MP1.1 rows 5–8,20: actual managed correction → continuation → next part inherits v1/v2 and reopens without another send', async t => {
+  const { e4Fixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } = await mp11CycleFixtures(t);
+  for (const historical of [false, true]) await t.test(historical ? 'e88 root' : 'new root', async t => {
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
+    const whole = historical ? h15AtCommit(f, MP11_BASE, 'mp11-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
+      out(take(prepareQuestionPacket(store, args)).record);`, f.packetRequest) : f.packet;
+    const config = f.environment(whole.value.fullChars - 1);
+    const packetRequest = { ...f.packetRequest, environment: reference(config) };
+    const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-root', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+      out(take(writeQuestionPacket(store, args)).record);`, packetRequest) : ok(writeQuestionPacket(f.store, packetRequest)).record;
+    mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
+    assert.equal(packet.value.plan.mode, 'parts'); const total = packet.value.plan.assignments.length;
+    const at = (position: number) => ({ ...packet, value: { ...packet.value, plan: { ...packet.value.plan, position } } });
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    f.steps([{ research: mp2Refused(f, at(0)) }, { research: { ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
+        questionIds: packet.value.packet.questions.map((q: any) => q.id) } },
+      ...Array.from({ length: total }, (_, index) => ({ research: e4Node(f, at(index)) }))]);
+    const cycle = ok(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, 'assembled', canonical(cycle.record.value)); assert.equal(f.sent().length, total + 2);
+    const packets = cycle.record.value.steps.map(step => ok(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
+    assert.ok(packets[1]!.value.request.correction && packets[2]!.value.request.continuation && packets[3]!.value.request.previous.length);
+    for (const step of packets) {
+      mp11Version(step, historical ? 'om-brief/v1' : 'om-brief/v2');
+      assert.ok(briefReadings(step.value.packet)); assert.ok(step.value.briefNeighbors);
+      assert.ok(packetPrompt(step.value.packet).includes('# Accepted work of neighbouring roots'));
+    }
+    const before = snapshot(f.store); f.restart();
+    assert.equal(ok(await runModelCycle(f.store, request)).repeated, true);
+    assert.equal(f.sent().length, total + 2); assert.deepEqual(snapshot(f.store), before);
+    for (const packet of packets) assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  });
+});
+
+test('MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty preserve their chosen version and repeat after reopen', async t => {
+  const { h15AtCommit } = await mp11CycleFixtures(t);
+  for (const historical of [false, true]) {
+    const f = emptyPacketFixture(t);
+    const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-empty', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+      out(take(writeQuestionPacket(store, args)).record);`, f.request) : ok(writeQuestionPacket(f.store, f.request)).record;
+    assert.equal(packet.value.state, 'empty'); assert.equal(packet.value.packet, null);
+    mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
+    const reopened = new Store(f.database);
+    try {
+      const before = snapshot(reopened);
+      assert.deepEqual(ok(readQuestionPacket(reopened, { project: f.project, record: reference(packet) })), packet);
+      assert.deepEqual(ok(prepareQuestionPacket(reopened, f.request)).record, packet);
+      assert.deepEqual(ok(writeQuestionPacket(reopened, f.request)).record, packet);
+      assert.deepEqual(snapshot(reopened), before);
+    } finally { reopened.close(); }
+  }
+});
+
+test('MP1.1 rows 1,6,8,19: a selected chain through compatible historical environment chooses the same version in temporary proof and current admission', async t => {
+  const { e4Fixture, e4NeedSource, mp2IssuedBy } = await mp11CycleFixtures(t);
+  for (const historical of [false, true]) {
+    const fixture = historical ? mp2IssuedBy(t, MP11_BASE) : null;
+    const f = fixture?.f ?? e4Fixture(t, 'node', 100_000, 0, 5000, true), request = fixture?.request ?? f.request;
+    f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
+    const first = ok(await runModelCall(f.store, request));
+    const deliveries = ok(deliverModelSources(f.store, { project: f.project, packet: request.packet, call: first.call, response: first.response! }));
+    const next = { ...f.packetRequest, continuation: { packet: request.packet, call: first.call, response: first.response!, deliveries: [...deliveries.deliveries] } };
+    f.environment(); // Same execution facts: only the already selected plan grants this compatibility.
+    const prepared = ok(prepareQuestionPacket(f.store, next)), packet = ok(writeQuestionPacket(f.store, next)).record;
+    assert.deepEqual(packet, prepared.record); mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+    assert.equal(f.sent().length, 1);
+  }
+});
+
+test('MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain', async t => {
+  const { h15AtCommit } = await mp11CycleFixtures(t), p = expansionFixture(t), { f } = p;
+  const oldWhole = h15AtCommit(f, MP11_BASE, 'mp11-old-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
+    out(take(prepareQuestionPacket(store, args)).record);`, p.request);
+  const oldEnvironment = p.environment(oldWhole.value.fullChars - 1), oldRequest = { ...p.request, environment: reference(oldEnvironment) };
+  const oldRecord = h15AtCommit(f, MP11_BASE, 'mp11-old-part', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+    out(take(writeQuestionPacket(store, args)).record);`, oldRequest) as Revision<QuestionPacketRecord>;
+  const old = ok(writeQuestionPacket(f.store, oldRequest)), oldPart = partResult(p, old); mp11Version(oldRecord, 'om-brief/v1');
+  const largeEnvironment = p.environment(100_000), newWhole = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(largeEnvironment) })).record;
+  const newEnvironment = p.environment(newWhole.value.fullChars! - 1), newRequest = { ...p.request, environment: reference(newEnvironment) };
+  const next = ok(writeQuestionPacket(f.store, newRequest)), nextPart = partResult(p, next); mp11Version(next.record, 'om-brief/v2');
+  const request: QuestionPacketRequest = { ...newRequest, previous: [
+    { packet: reference(oldRecord), proposal: reference(oldPart.proposal), result: reference(oldPart.record) },
+    { packet: reference(next.record), proposal: reference(nextPart.proposal), result: reference(nextPart.record) },
+  ] };
+  const before = snapshot(f.store);
+  for (const action of [prepareQuestionPacket, writeQuestionPacket]) rejected(action(f.store, request), 'packet_chain_invalid');
+  const id = `om-question-packet:${f.project}:${hashJson({ contract: BRIEF_PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request })}`;
+  const value = { ...clone(next.record.value), request };
+  const view = pendingCallStore(f.store, [{ id, kind: 'question-packet', expected: 0, value }]);
+  rejected(readQuestionPacket(view, { project: f.project, record: { id, revision: 1, hash: hashJson(value) } }), 'packet_chain_invalid');
+  assert.deepEqual(snapshot(f.store), before);
 });
