@@ -2015,10 +2015,11 @@
 - Отдаёт: —
 - Читает записи: om-input (ревизии); маршруты и run-bases; итоговая проверка блока, оценка; предложения слоя
 - Пишет записи: прекращение/перевод старой работы; новые основания
-- Разрешённые пути: `src/om/run.ts`, `src/om/routes.ts`, `src/om/run-bases.ts`, `src/om/model-call.ts`, `src/om/answers-gate.ts`, `test/om-run.test.ts`, `test/om-routes.test.ts`, `test/om-run-bases.test.ts`
+- Разрешённые пути: `src/om/run.ts`, `src/om/routes.ts`, `src/om/run-bases.ts`, `src/om/model-call.ts`, `src/om/answers-gate.ts`, `test/om-run.test.ts`, `test/om-routes.test.ts`, `test/om-run-bases.test.ts`, `test/om-model-call.test.ts`, `test/om-answers-gate.test.ts`
 - Из движка как есть: ~/REPORTS/review/omg-live-wait-input-stale_041026.md (разбор Codex-omg №3270); снимок после прохода ~/REPORTS/review/omg-live-resume/omg-live-after-041026.sqlite (ro, sha a621f863) — воспроизведение тупика; LP4 (cycle-step-ceased, completion cause), MP2 (owedCorrection, required-record-replaced); живой проход: RUNBOOK OM-LIVE, ограничитель ~/REPORTS/review/omg-live-resume/branch/
 - После: MP1.1
 - Тесты сверх обязательных:
+  - ПУТИ +2 (опись Opus-1 №3274/№3275, решение оркестратора): test/om-model-call.test.ts, test/om-answers-gate.test.ts (итого 10). Тупик двойной: после законного конца проверки n-research попытка n-state (проверка завершена, не прошла) не имеет основания G7 (reason null) — нужно правило конца приёмки, иначе frame_gate + bases_after_work; обе оплаченные сборки n-state текущим допуском применимы к новому основанию (открыто 24 против 30). В договоре Codex-omg: поправка H1.0c, выбор переноса (Т0/Т1/Т2)
   - ДО КОДА — опись исполнителя (Opus-1, WORKER-CLAUDE-OMG-1; только чтение) и договор Codex-omg: состояния после смены B1 — что прекращается, что переводится, что остаётся; судьба оплаченных результатов (предложения n-state, оценка, расход); таблица исходов (урок 46); пути (уточняются описью, вопрос до кода)
   - регрессии: воспроизведение выхода из нынешнего ожидания на копии снимка после прохода (бесплатно, заглушка): проход доходит до новых оснований и следующего задания без input_stale; оплаченные результаты сохранены; повтор после reopen без новых отправок; прежние терминалы своей эры не меняются
 
