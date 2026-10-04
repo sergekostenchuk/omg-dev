@@ -1,11 +1,13 @@
-import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel } from './packet-brief.js';
+import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel,
+  briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot } from './packet-brief.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
-import { ANSWER_FORM_CODES } from './answer-form.js';
+import { ANSWER_FORM_CODES, readTextResult, readPointerResult, type ReadResult } from './answer-form.js';
 import { Ajv } from 'ajv';
-import type { Selector } from '../evidence/evidence.js';
+import { sourceIsCurrent, type Selector, type Source } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall, type AnyCallRecord } from './call-record.js';
-import { readContinuationEvidence, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic, readCorrectionGround, readNeighbourResults, type NeighbourSource } from './model-call.js';
+import { readContinuationEvidence, currentSearchScope, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic, readCorrectionGround, readNeighbourResults, type NeighbourSource,
+  readModelCallState, readCompletionWorkAt, readDeliverySet, deliverySetAddress } from './model-call.js';
 import { readAssessmentRefusalAt } from './assessment.js';
 import { readDefinitions } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -26,7 +28,7 @@ import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
 import { PROPOSAL_REFUSAL_CODES, prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { FRAME_REFUSAL_CODES, flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
-import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
+import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, completionWorkId, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
@@ -598,8 +600,238 @@ function workAssignments(frame: FrameProposals, node: string, basis: OmObligatio
     obligations: basis.handoff.obligations, nodeAssignments: assigned, assigned };
 }
 
+/**
+ * MP3 (№2981 п.1): whether this request continues the readings era. A new independent brief root opens it; an existing exact
+ * packet keeps its own form (MP1 priority); parts and continuations inherit the era of their root.
+ */
+function chainReadings(store: Store, request: QuestionPacketRequest, saved: QuestionPacketRecord | undefined): boolean {
+  const ancestor = request.continuation?.packet ?? request.previous[0]?.packet;
+  if (ancestor) return briefReadings(loadPacket(store, request.project, ancestor).value.packet) !== null;
+  return saved ? briefReadings(saved.packet) !== null : true;
+}
+type CarriedRow = Omit<ReadingEntry, 'decision'>;
+interface DeliveryRow { delivery: Ref; questionIds: string[]; read: PacketRead; sources: Ref[]; data: Json }
+const originRank = (origin: ReadingOrigin) => origin.kind === 'part' ? [0, -origin.position] : [1, -origin.ordinal];
+const compareOrigins = (a: ReadingOrigin, b: ReadingOrigin) => {
+  const [x, y] = [originRank(a), originRank(b)];
+  return x[0]! - y[0]! || x[1]! - y[1]! || order(canonical(a.delivery), canonical(b.delivery));
+};
+/** Equal read, sources and data are one shown item with every origin; later parts and attempts first, then exact references. */
+function groupCarried(rows: readonly CarriedRow[]): CarriedRow[] {
+  const groups = new Map<string, CarriedRow>();
+  for (const row of rows) {
+    const key = canonical({ read: row.read, sources: row.sources, data: row.data }), group = groups.get(key);
+    if (!group) groups.set(key, { origins: [...row.origins], read: row.read, sources: row.sources, data: row.data });
+    else for (const origin of row.origins) if (!group.origins.some(item => same(item, origin))) group.origins.push(origin);
+  }
+  const grouped = [...groups.values()].map(row => ({ ...row, origins: [...row.origins].sort(compareOrigins) }));
+  return grouped.sort((a, b) => compareOrigins(a.origins[0]!, b.origins[0]!) || order(canonical(a), canonical(b)));
+}
+/** A delivery of an earlier era is shown in the addressed form, re-derived from its exact proved source; the record is unchanged. */
+function representedData(store: Store, row: DeliveryRow, addressed: boolean): Json {
+  if (addressed || (row.read.action !== 'read_source' && row.read.action !== 'read_context')) return row.data;
+  const record = row.read.action === 'read_source' ? store.get(row.read.source.id, row.read.source.revision)
+    : store.get(row.read.record.id, row.read.record.revision);
+  let result: ReadResult | null = null;
+  if (record && row.read.action === 'read_source') {
+    const content = (record.value as unknown as Source).content;
+    result = row.read.selector.kind === 'text-range' ? readTextResult(content, row.read.selector) : readPointerResult(JSON.parse(content), row.read.selector.pointer);
+  }
+  else if (record && row.read.action === 'read_context') result = readPointerResult(record.value, row.read.pointer);
+  if (!result || result.outcome !== 'complete' || !same('text' in result ? result.text : 'value' in result ? result.value : null, row.data))
+    fail('packet_record_invalid', row.delivery.id, 'readings', 'A carried earlier delivery must be its exact complete read', row.delivery);
+  return json(result);
+}
+/** The node, level or question set a batch assigns: equal assignments of different attempts may have different batch ids. */
+function assignmentKey(batch: RoutedBatch): string {
+  return canonical(batch.task === 'node-expansion' ? { model: batch.model, task: batch.task, kind: batch.kind, level: batch.level, node: batch.node }
+    : { model: batch.model, task: batch.task, kind: batch.kind, questions: sorted(batch.items.map(item => [item.target, item.field])) });
+}
+function packetAssignment(store: Store, project: string, packet: Revision<QuestionPacketRecord>): string | null {
+  const routes = take(readRoutes(store, { project, record: packet.value.request.routes })) as unknown as { record: Revision<RoutesRecord> };
+  const batch = routes.record.value.batches.find(item => item.id === packet.value.request.batch);
+  return batch ? assignmentKey(batch) : null;
+}
+/** Deliveries of the chain that ends at a prior part packet: its need_source links back to the first packet of that part. */
+function partRows(store: Store, project: string, last: Revision<QuestionPacketRecord>): CarriedRow[] {
+  const rows: CarriedRow[] = [], position = last.value.plan?.position;
+  if (position === undefined) fail('packet_chain_invalid', last.id, 'readings', 'A carried part has its exact plan position');
+  // The part's chain back to its first packet: continuations bring their deliveries; an MP2 correction is a step of the same
+  // chain without deliveries of its own, so the walk passes through it to the rejected step and its reads.
+  for (let cursor = last; ;) {
+    const link = cursor.value.request.continuation;
+    if (link) {
+      const evidence = take(readContinuationEvidence(store, { project, ...link }));
+      for (const row of evidence.data as unknown as DeliveryRow[]) rows.push({ origins: [{ kind: 'part', position, packet: link.packet, call: link.call,
+        response: link.response, delivery: row.delivery, questionIds: [...row.questionIds] }], read: row.read as unknown as Json, sources: [...row.sources], data: row.data });
+      cursor = loadPacket(store, project, link.packet);
+    } else if (cursor.value.request.correction) cursor = loadPacket(store, project, cursor.value.request.correction.packet);
+    else break;
+  }
+  return rows;
+}
+/**
+ * Deliveries of earlier completed attempts of the same proved line (own and inherited attempts only) and full goal, for the
+ * same assignment, from the exact registry snapshot of each managed attempt and its deterministic step sets. A legacy
+ * attempt without a registry has no exact snapshot and gives nothing.
+ */
+function attemptRows(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, saved: readonly ReadingSnapshot[] | null) {
+  const project = request.project, attemptRef = request.attempt!;
+  const series = take(readAnySeriesAt(store, project, attemptRef.series));
+  const attempt = series.value.attempts.find(item => item.ordinal === attemptRef.ordinal);
+  if (!attempt) fail('packet_attempt_invalid', batch.id, 'attempt', 'Carried reads need the declared running attempt');
+  const key = assignmentKey(batch), snapshots: ReadingSnapshot[] = [], rows: CarriedRow[] = [];
+  const earlier = [...series.value.inherited, ...series.value.attempts]
+    .filter(item => item.ordinal < attempt.ordinal && item.outcome !== null && same(item.goal, attempt.goal)).sort((a, b) => b.ordinal - a.ordinal);
+  for (const item of earlier) {
+    const binding = take(readCompletionBinding(store, project, attemptRef.series, item.ordinal));
+    if (!binding) continue;
+    const kept = saved?.find(row => row.kind === 'attempt' && row.ordinal === item.ordinal) as Extract<ReadingSnapshot, { kind: 'attempt' }> | undefined;
+    const head = kept ? null : store.get(completionWorkId(project, binding.id));
+    if (saved && !kept || !kept && !head) fail('packet_record_invalid', binding.id, 'readings', 'An earlier managed attempt keeps its exact registry snapshot');
+    const workRef = kept ? kept.work : reference(head!);
+    const work = take(readCompletionWorkAt(store, project, workRef));
+    if (!same(reference(work.binding), reference(binding)))
+      fail('packet_record_invalid', workRef.id, 'readings', 'The registry snapshot belongs to the binding of this earlier attempt');
+    const steps = new Map<string, { record: Ref; basis: { project: string; packet: Ref; call: Ref; response: Ref } }>();
+    const continued: { project: string; packet: Ref; call: Ref; response: Ref; deliveries: Ref[] }[] = [];
+    for (const ref of work.products) {
+      const kind = store.get(ref.id, ref.revision)?.kind;
+      if (kind === 'model-call') {
+        const state = take(readModelCallState(store, { project, record: ref }));
+        if (state.state !== 'applied' || state.outcome.outcome?.kind !== 'need-source' || !state.outcome.response) continue;
+        if (packetAssignment(store, project, loadPacket(store, project, state.outcome.packet)) !== key) continue;
+        const old = steps.get(ref.id);
+        if (!old || old.record.revision < ref.revision) steps.set(ref.id, { record: ref,
+          basis: { project, packet: state.outcome.packet, call: state.outcome.call, response: state.outcome.response } });
+      } else if (kind === QUESTION_PACKET_KIND) {
+        const packet = loadPacket(store, project, ref), link = packet.value.request.continuation;
+        if (link && packetAssignment(store, project, packet) === key) continued.push({ project, ...link });
+      }
+    }
+    const found = kept ? kept.sets : [...steps.values()].flatMap(step => {
+      const set = store.get(deliverySetAddress(step.basis)); return set ? [reference(set)] : [];
+    }).sort((a, b) => order(canonical(a), canonical(b)));
+    for (const link of continued) {
+      const set = found.find(ref => ref.id === deliverySetAddress(link));
+      if (!set) fail('packet_record_invalid', link.response.id, 'readings', 'A delivery set referenced by a saved continuation is missing');
+    }
+    for (const ref of found) {
+      const set = take(readDeliverySet(store, project, ref));
+      const step = [...steps.values()].find(row => same(row.basis, set.basis));
+      if (!step) fail('packet_record_invalid', ref.id, 'readings', 'A carried set belongs to a step of this exact earlier assignment', ref);
+      const continuation = continued.find(link => same({ project, packet: link.packet, call: link.call, response: link.response }, set.basis));
+      if (continuation && !same(continuation.deliveries, set.deliveries))
+        fail('packet_record_invalid', ref.id, 'readings', 'A saved continuation names exactly the deliveries of its step', ref);
+      const addressed = briefReadings(loadPacket(store, project, set.basis.packet).value.packet) !== null;
+      for (const row of set.data as unknown as DeliveryRow[]) rows.push({ origins: [{ kind: 'attempt', ordinal: item.ordinal, binding: reference(binding),
+        work: workRef, packet: set.basis.packet, call: set.basis.call, response: set.basis.response, delivery: row.delivery,
+        questionIds: [...row.questionIds] }], read: row.read as unknown as Json, sources: [...row.sources], data: representedData(store, row, addressed) });
+    }
+    snapshots.push({ kind: 'attempt', ordinal: item.ordinal, binding: reference(binding), work: workRef, sets: found });
+  }
+  if (saved && !same(snapshots, saved)) fail('packet_record_invalid', batch.id, 'readings', 'The saved readings snapshots must follow from the exact attempt line');
+  return { snapshots, rows };
+}
+/**
+ * Currency of a carried delivery at its first selection: an exact head for every source, a prior file check for files and, for
+ * a search over a workspace path, its whole scope today — the producer's own walk must find exactly the delivered files, also
+ * when there were none (Codex-omg №3190); otherwise the delivery is omitted as unconfirmed. Nothing is captured or delivered.
+ */
+function carriedCurrency(store: Store, row: CarriedRow, workspace: () => string): CarriedEntry['decision'] {
+  for (const source of row.sources) {
+    const head = store.get(source.id);
+    if (!head) fail('packet_record_invalid', source.id, 'readings', 'A carried source keeps its record');
+    if (!same(reference(head), source)) return { state: 'omitted', reason: 'head-changed', source, observed: reference(head) };
+    const value = head.value as unknown as Source;
+    if (head.kind === 'source' && object(value) && object(value.origin) && value.origin.kind === 'file' && !sourceIsCurrent(value))
+      return { state: 'omitted', reason: 'currency-unconfirmed', source };
+  }
+  const read = row.read as unknown as PacketRead;
+  if (read.action === 'search' && typeof read.within === 'string') {
+    const today = currentSearchScope(workspace(), read.within);
+    const delivered = row.sources.map(ref => store.get<Source>(ref.id, ref.revision)!.value.origin.location);
+    if (!today || !same([...today].sort(), [...delivered].sort())) return { state: 'omitted', reason: 'scope-unconfirmed' };
+  }
+  return { state: 'eligible' };
+}
+/** History keeps the saved decision and checks its evidence; current admission requires every included source to be current. */
+function replayedCurrency(store: Store, entry: ReadingEntry, current: boolean, workspace: () => string): CarriedEntry['decision'] {
+  const decision = entry.decision;
+  if (decision.state === 'included') {
+    if (current) {
+      const now = carriedCurrency(store, entry, workspace);
+      // A moved search scope changes no single source: the refusal names the carried delivery itself.
+      if (now.state !== 'eligible') {
+        const at = 'source' in now ? now.source : entry.origins[0]!.delivery;
+        fail('input_stale', at.id, 'readings', 'source' in now ? 'A carried source changed after its selection'
+          : 'The scope of a carried search changed after its selection', at);
+      }
+    }
+    return { state: 'eligible' };
+  }
+  if (decision.reason === 'capacity' || decision.reason === 'unaddressed') return { state: 'eligible' };
+  // History keeps an unconfirmed scope as it was decided: today's disk is not walked again (Codex-omg №3190).
+  if (decision.reason === 'scope-unconfirmed') return decision;
+  if (!entry.sources.some(source => same(source, decision.source))) fail('packet_record_invalid', decision.source.id, 'readings', 'An omission names a source of its delivery');
+  if (decision.reason === 'head-changed') {
+    const observed = store.get(decision.observed.id, decision.observed.revision);
+    if (!observed || !same(reference(observed), decision.observed) || decision.observed.id !== decision.source.id
+      || decision.observed.revision <= decision.source.revision)
+      fail('packet_record_invalid', decision.source.id, 'readings', 'A changed head is proved by the saved later revision');
+    return decision;
+  }
+  const record = store.get<Source>(decision.source.id, decision.source.revision);
+  if (record?.kind !== 'source' || record.value.origin?.kind !== 'file')
+    fail('packet_record_invalid', decision.source.id, 'readings', 'Only a file source can have an unconfirmed currency');
+  return decision;
+}
+/**
+ * MP3 (№2981 п.4–5): the carried set of a new packet. A continuation keeps the set of its packet; a part adds the chain of the
+ * preceding part to that part's set; a new attempt root selects from earlier attempts. The set is fixed at first issuance;
+ * saved readings are replayed from the same snapshots.
+ */
+function carriedReadings(store: Store, request: QuestionPacketRequest, batch: RoutedBatch, current: boolean, saved: BriefReadings | null): CarriedBasis {
+  const project = request.project;
+  let snapshots: ReadingSnapshot[], rows: CarriedRow[];
+  const link = request.continuation ?? request.correction;
+  if (link) {
+    const prior = briefReadings(loadPacket(store, project, link.packet).value.packet)!;
+    snapshots = prior.snapshots; rows = prior.entries.map(({ decision: _decision, ...row }) => row);
+  } else if (request.previous.length) {
+    const last = loadPacket(store, project, request.previous.at(-1)!.packet), prior = briefReadings(last.value.packet);
+    if (!prior) fail('packet_chain_invalid', last.id, 'readings', 'A part continues the readings of its preceding part');
+    snapshots = [{ kind: 'packet', packet: reference(last) }];
+    rows = groupCarried([...prior.entries.map(({ decision: _decision, ...row }) => row), ...partRows(store, project, last)]);
+  } else ({ snapshots, rows } = (() => {
+    const selected = attemptRows(store, request, batch, saved ? saved.snapshots : null);
+    return { snapshots: selected.snapshots, rows: groupCarried(selected.rows) };
+  })());
+  if (saved && (!same(saved.snapshots, snapshots) || !same(saved.entries.map(({ decision: _decision, ...row }) => row), rows)))
+    fail('packet_record_invalid', batch.id, 'readings', 'The saved carried set must follow from its exact snapshots');
+  const workspace = () => take(readRecord<{ workspace: string }>(store, request.environment,
+    { unit: 'E2', target: batch.id, id: `environment:${project}`, kind: 'environment' })).value.workspace;
+  return { snapshots, entries: rows.map((row, index) => ({ ...row,
+    decision: saved ? replayedCurrency(store, saved.entries[index]!, current, workspace) : carriedCurrency(store, row, workspace) })) };
+}
+const includedSources = (packet: Json): Ref[] => (briefReadings(packet)?.entries ?? [])
+  .flatMap(entry => entry.decision.state === 'included' ? entry.sources : []);
+/**
+ * MP3: a chain step of the readings era — a continuation or an MP2 correction — shows the set fixed for the step it follows
+ * (the same snapshots and entries), in the capacity left after its mandatory content; a saved step replays its decisions.
+ * The era is the root's: the caller asks only when the step it follows carries readings.
+ */
+function chainStepReadings(store: Store, request: QuestionPacketRequest, prior: Revision<QuestionPacketRecord>, saved: QuestionPacketRecord | undefined,
+  current: boolean, packet: Json, limit: number): { packet: Json; guards: Ref[] } {
+  const savedReadings = saved ? briefReadings(saved.packet) : null;
+  if (saved && !savedReadings) fail('packet_record_invalid', prior.id, 'readings', 'A chain step of the readings era keeps its readings');
+  const routed = take(readRoutes(store, { project: request.project, record: request.routes })) as unknown as { record: Revision<RoutesRecord> };
+  const batch = routed.record.value.batches.find(item => item.id === request.batch)!;
+  const next = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings), limit));
+  return { packet: next, guards: current ? includedSources(next) : [] };
+}
 function deriveContinuation(store: Store, request: QuestionPacketRequest, current: boolean,
-  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol']) {
+  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol'], saved?: QuestionPacketRecord) {
   const continuation = request.continuation!;
   const prior = loadPacket(store, request.project, continuation.packet);
   const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
@@ -638,11 +870,16 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
       schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } }, basis, capacity.maxRequestChars));
     guards.push(...material.guards);
   }
-  const fingerprint = bounded(packet, capacity.maxRequestChars);
+  let fingerprint = bounded(packet, capacity.maxRequestChars);
+  const fullChars = packetPrompt(packet).length;
+  if (basis && evidence.novel && fingerprint && briefReadings(payload) !== null) {
+    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
+    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
+  }
   const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: contract,
     ...(basis ? { briefCatalogue: basis.material.references } : {}),
     state: evidence.novel && fingerprint ? 'ready' : 'blocked', packet: evidence.novel && fingerprint ? packet : null,
-    fingerprint: evidence.novel ? fingerprint : null, fullChars: packetPrompt(packet).length,
+    fingerprint: evidence.novel ? fingerprint : null, fullChars,
     refusal: !evidence.novel ? { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt',
       at: { unit: 'E2', target: request.batch!, field: 'continuation', ref: continuation.response }, route: 'producer' }
       : fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
@@ -655,7 +892,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
  * response form. The ground is proved again by the common derivation; a caller cannot hand one in.
  */
 function deriveCorrection(store: Store, request: QuestionPacketRequest, current: boolean,
-  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol']) {
+  contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol'], saved?: QuestionPacketRecord) {
   const correction = request.correction!;
   const prior = loadPacket(store, request.project, correction.packet);
   const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
@@ -681,15 +918,20 @@ function deriveCorrection(store: Store, request: QuestionPacketRequest, current:
   const payload = prior.value.packet as Record<string, Json>;
   const refusal = ground.refusal;
   const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
-  const packet = json(boundedBrief({ ...payload, requestId,
+  let packet = json(boundedBrief({ ...payload, requestId,
     correction: { refusals: [{ code: refusal.code, field: refusal.at.field ?? null, message: refusal.message, rule: briefRepairRule(refusal.code) }],
       answer: ground.raw },
     responseForm: { protocol, requestId, schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } },
   { ...basis, priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars));
-  const fingerprint = bounded(packet, capacity.maxRequestChars);
+  let fingerprint = bounded(packet, capacity.maxRequestChars);
+  const fullChars = packetPrompt(packet).length;
+  if (fingerprint && briefReadings(payload) !== null) {
+    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
+    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
+  }
   const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: contract,
     briefCatalogue: basis.material.references, state: fingerprint ? 'ready' : 'blocked', packet: fingerprint ? packet : null,
-    fingerprint, fullChars: packetPrompt(packet).length,
+    fingerprint, fullChars,
     refusal: fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
   return { value, guards: unique(guards), references: unique([...priorDerived.references, correction.packet, correction.call, correction.response,
     correction.diagnostic, ...capacity.references, ...ground.references]), writes: priorDerived.writes, briefBasis: basis };
@@ -711,12 +953,12 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   if (request.continuation) {
     if (!currentContract(contract))
       fail('packet_record_invalid', request.continuation.packet.id, 'packetContract', 'A historical packet cannot acquire continuation semantics');
-    return deriveContinuation(store, request, current, contract!, protocol);
+    return deriveContinuation(store, request, current, contract!, protocol, saved);
   }
   if (request.correction) {
     if (!briefContract(contract))
       fail('packet_record_invalid', request.correction.packet.id, 'packetContract', 'Only a brief chain can acquire a correction');
-    return inChainStep(() => deriveCorrection(store, request, current, contract!, protocol));
+    return inChainStep(() => deriveCorrection(store, request, current, contract!, protocol, saved));
   }
   const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as { record: Revision<RoutesRecord>; references: Ref[] };
   const batch = request.batch === null ? null : routes.record.value.batches.find(item => item.id === request.batch);
@@ -887,10 +1129,18 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     if (request.previous.length) fail('packet_chain_invalid', batch.id, 'previous', 'Only a node expansion can have preceding parts');
     base.fullChars = packetPrompt(packet).length;
   }
-  const fingerprint = bounded(packet, capacity.maxRequestChars);
+  let fingerprint = bounded(packet, capacity.maxRequestChars);
   if (!fingerprint) {
     base.state = 'blocked'; base.refusal = blocked(batch.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', batch.node ?? batch.id);
     return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
+  }
+  // MP3: optional carried reads in the capacity left by the fitting packet; they never block or split it.
+  if (briefBasis && chainReadings(store, request, saved)) {
+    const savedReadings = saved ? briefReadings(saved.packet) : null;
+    if (saved && !savedReadings) fail('packet_record_invalid', requestId, 'readings', 'A packet of the readings era keeps its readings');
+    packet = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings), capacity.maxRequestChars));
+    fingerprint = bounded(packet, capacity.maxRequestChars)!;
+    if (current) guards.push(...includedSources(packet));
   }
   base.state = 'ready'; base.packet = packet; base.fingerprint = fingerprint;
   const writes: Write[] = [...routeWrites];

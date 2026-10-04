@@ -362,3 +362,140 @@ test('MP1 №3045 planned accepted entrypoints select saved anchor code and impo
     }
   }
 });
+// MP3 (№2981, decision №3058): the readings marker beside the MP1 manifest and the carried section of a brief.
+import { briefReadings, withReadings, READINGS_CONTRACT, type CarriedBasis, type CarriedEntry } from '../src/om/packet-brief.js';
+import { readTextResult, readPointerResult } from '../src/om/answer-form.js';
+function carriedSample(t: test.TestContext) {
+  const s = sample(t), ref = (n: number) => ({ id: `om-read-delivery:garden:${String(n).repeat(64).slice(0, 64)}`, revision: 1, hash: String(n).repeat(64).slice(0, 64) });
+  const step = (n: number) => ({ packet: { id: `om-question-packet:garden:p${n}`, revision: 1, hash: 'a'.repeat(64) },
+    call: { id: `call:garden:c${n}`, revision: 1, hash: 'b'.repeat(64) }, response: { id: `om-part-response:garden:r${n}`, revision: 1, hash: 'c'.repeat(64) } });
+  const content = s.source.value.content;
+  const entry = (_n: number, read: Record<string, unknown>, sources: unknown[], data: unknown, origins: unknown[], decision: CarriedEntry['decision'] = { state: 'eligible' }) =>
+    ({ origins, read, sources, data, decision }) as unknown as CarriedEntry;
+  const partOrigin = (n: number, position: number) => ({ kind: 'part', position, ...step(n), delivery: ref(n), questionIds: ['q-native'] });
+  const attemptOrigin = (n: number, ordinal: number) => ({ kind: 'attempt', ordinal, binding: { id: 'om-completion-owner:garden:x', revision: 1, hash: 'd'.repeat(64) },
+    work: { id: 'om-completion-work:garden:x', revision: 2, hash: 'e'.repeat(64) }, ...step(n), delivery: ref(n), questionIds: ['q-old'] });
+  const foreign = { id: 'source:garden:not-in-catalogue', revision: 1, hash: 'f'.repeat(64) };
+  const entries = [
+    entry(1, { action: 'read_source', source: reference(s.source), selector: { kind: 'text-range', start: 0, end: 4 } }, [reference(s.source)],
+      readTextResult(content, { start: 0, end: 4 }), [partOrigin(1, 0)]),
+    entry(2, { action: 'read_context', record: reference(s.context), pointer: '/absent' }, [reference(s.context)],
+      readPointerResult(s.context.value, '/absent'), [partOrigin(2, 1), attemptOrigin(3, 2)]),
+    entry(4, { action: 'read_source', source: reference(s.source), selector: { kind: 'text-range', start: 4, end: 900000 } }, [reference(s.source)],
+      { ...readTextResult(content, { start: 4, end: 900000 }), text: 'x'.repeat(20_000) }, [attemptOrigin(4, 1)]),
+    entry(5, { action: 'read_source', source: foreign, selector: { kind: 'text-range', start: 0, end: 1 } }, [foreign],
+      readTextResult('z', { start: 0, end: 1 }), [attemptOrigin(5, 1)]),
+    entry(6, { action: 'read_source', source: reference(s.source), selector: { kind: 'text-range', start: 1, end: 2 } }, [reference(s.source)],
+      readTextResult(content, { start: 1, end: 2 }), [attemptOrigin(6, 1)],
+      { state: 'omitted', reason: 'head-changed', source: reference(s.source), observed: { ...reference(s.source), revision: 2, hash: '9'.repeat(64) } }),
+  ];
+  const carried: CarriedBasis = { snapshots: [{ kind: 'packet', packet: step(9).packet }], entries };
+  return { ...s, carried, base: packetPrompt(s.payload).length };
+}
+const section = (text: string, base: string) => text.slice(base.length);
+
+test('MP3 row 19 (wire): readings are optional; a declared null, unknown or damaged marker is refused before any text is sent', t => {
+  const { payload, carried } = carriedSample(t);
+  assert.equal(briefReadings(payload), null, 'An MP1 brief without readings stays its own era');
+  const marked = withReadings(payload, { snapshots: [], entries: [] }, 100_000);
+  assert.equal(packetPrompt(marked), packetPrompt(payload), 'An empty carried set changes no text');
+  assert.deepEqual(briefReadings(marked), { contract: READINGS_CONTRACT, snapshots: [], entries: [] });
+  const full = withReadings(payload, carried, 1_000_000);
+  assert.ok(briefReadings(full));
+  const readings = full.brief.readings;
+  for (const broken of [null, { ...readings, contract: 'om-brief-readings/v2' }, { contract: READINGS_CONTRACT, snapshots: [] },
+    { ...readings, extra: true }, { ...readings, snapshots: [{ kind: 'attempt', ordinal: 1, binding: readings.entries[1].origins[1].binding, work: readings.entries[1].origins[1].work }] },
+    { ...readings, entries: [{ ...readings.entries[0], decision: { state: 'included', why: 'free text' } }] },
+    { ...readings, entries: [{ ...readings.entries[0], decision: { state: 'omitted', reason: 'head-changed', source: readings.entries[0].sources[0] } }] },
+    { ...readings, entries: [{ ...readings.entries[0], origins: [] }] },
+    { ...readings, entries: [{ ...readings.entries[0], origins: [{ ...readings.entries[0].origins[0], delivery: 'r1' }] }] },
+    { ...readings, entries: [{ ...readings.entries[0], sources: [] }] }]) {
+    const packet = { ...full, brief: { ...full.brief, readings: broken } };
+    for (const check of [() => packetPrompt(packet), () => briefReadings(packet)])
+      assert.throws(check, (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid', canonical(broken));
+  }
+});
+
+test('MP3 №3171 (brief): the readings marker takes every source list a lawful delivery has — none for a search over an empty directory — and still refuses a missing or extra source of read_source, read_context, read and a search inside a named source', t => {
+  const s = carriedSample(t), origin = s.carried.entries[0]!.origins[0]!, source = reference(s.source);
+  const entry = (read: Record<string, unknown>, sources: unknown[], data: unknown) => ({ origins: [origin], read, sources, data, decision: { state: 'eligible' } }) as unknown as CarriedEntry;
+  const full = withReadings(s.payload, { snapshots: s.carried.snapshots, entries: [
+    entry({ action: 'search', within: 'empty-dir', query: 'absent' }, [], []), entry({ action: 'search', within: source, query: 'absent' }, [source], [])] }, 1_000_000);
+  const readings = briefReadings(full)!;
+  assert.deepEqual(readings.entries.map(row => row.decision.state), ['included', 'included']);
+  const shown = packetPrompt(full).slice(packetPrompt(s.payload).length);
+  assert.ok(shown.includes('"within":"empty-dir"') && shown.includes('"data":[]'), 'The empty search is shown by its path with no rows');
+  const selector = { kind: 'text-range', start: 0, end: 1 };
+  for (const [read, sources] of [
+    [{ action: 'read_source', source, selector }, []], [{ action: 'read_source', source, selector }, [source, source]],
+    [{ action: 'read_context', record: reference(s.context), pointer: '/a' }, []], [{ action: 'read', path: 'x.txt', media: 'text/plain' }, []],
+    [{ action: 'read', path: 'x.txt', media: 'text/plain' }, [source, source]], [{ action: 'search', within: source, query: 'absent' }, []],
+    [{ action: 'list', within: 'empty-dir' }, [source]]] as [Record<string, unknown>, unknown[]][]) {
+    const packet = { ...full, brief: { ...full.brief, readings: { ...readings, entries: [{ ...readings.entries[1]!, read, sources }] } } };
+    for (const check of [() => packetPrompt(packet), () => briefReadings(packet)])
+      assert.throws(check, (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid', canonical([read, sources]));
+  }
+});
+
+test('MP3 №3171 (view): a literal path stays as asked — a read of a file without a label here and a search over a path with such a file in its scope are shown; a found line of a file without a label is not', t => {
+  const s = carriedSample(t), origin = s.carried.entries[0]!.origins[0]!, source = reference(s.source);
+  const unlabelled = { id: 'source:garden:not-in-catalogue', revision: 1, hash: 'f'.repeat(64) };
+  const entry = (read: Record<string, unknown>, sources: unknown[], data: unknown) => ({ origins: [origin], read, sources, data, decision: { state: 'eligible' } }) as unknown as CarriedEntry;
+  const line = s.source.value.content.split('\n')[0]!;
+  const full = withReadings(s.payload, { snapshots: s.carried.snapshots, entries: [
+    entry({ action: 'read', path: 'other.txt', media: 'text/plain' }, [unlabelled], 'other text'),
+    entry({ action: 'search', within: 'docs', query: 'absent' }, [unlabelled], []),
+    entry({ action: 'search', within: 'docs', query: 'other' }, [unlabelled], [{ source: unlabelled, line: 1, text: 'other text' }]),
+    entry({ action: 'search', within: '.', query: line }, [unlabelled, source], [{ source, line: 1, text: line }])] }, 1_000_000);
+  assert.deepEqual(briefReadings(full)!.entries.map(row => 'reason' in row.decision ? row.decision.reason : row.decision.state),
+    ['included', 'included', 'unaddressed', 'included']);
+  const shown = packetPrompt(full).slice(packetPrompt(s.payload).length);
+  assert.ok(shown.includes('"path":"other.txt"') && shown.includes('"within":"docs"'), 'Literal paths are shown as asked');
+  assert.equal(shown.includes(unlabelled.id), false, 'A file without a label is never shown by its reference');
+});
+
+test('MP3 №3190 (brief): an unconfirmed scope is an omission of a search over a workspace path only, counted in the summary', t => {
+  const s = carriedSample(t), origin = s.carried.entries[0]!.origins[0]!, source = reference(s.source);
+  const omitted = { state: 'omitted', reason: 'scope-unconfirmed' };
+  const full = withReadings(s.payload, { snapshots: s.carried.snapshots, entries: [
+    { origins: [origin], read: { action: 'search', within: 'empty-dir', query: 'absent' }, sources: [], data: [], decision: omitted } as unknown as CarriedEntry] }, 1_000_000);
+  const readings = briefReadings(full)!;
+  assert.deepEqual(readings.entries.map(row => row.decision), [omitted]);
+  assert.ok(packetPrompt(full).includes('{"omitted":{"scope-unconfirmed":1}}'));
+  for (const [read, sources] of [[{ action: 'read_source', source, selector: { kind: 'text-range', start: 0, end: 1 } }, [source]],
+    [{ action: 'search', within: source, query: 'absent' }, [source]]] as [Record<string, unknown>, unknown[]][]) {
+    const packet = { ...full, brief: { ...full.brief, readings: { ...readings, entries: [{ ...readings.entries[0]!, read, sources }] } } };
+    for (const check of [() => packetPrompt(packet), () => briefReadings(packet)])
+      assert.throws(check, (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid', canonical(read));
+  }
+});
+
+test('MP3 rows 14–15 (brief): carried items are whole, in their given order, by the labels of this packet, after the fitting text; capacity omits them first with a counted summary', t => {
+  const { payload, carried, base } = carriedSample(t), text = packetPrompt(payload);
+  const decisions = (packet: Record<string, any>) => packet.brief.readings.entries.map((entry: { decision: { state: string; reason?: string } }) => entry.decision.reason ?? entry.decision.state);
+  const roomy = withReadings(payload, carried, 1_000_000);
+  assert.deepEqual(decisions(roomy), ['included', 'included', 'included', 'unaddressed', 'head-changed']);
+  const shown = section(packetPrompt(roomy), text);
+  assert.ok(packetPrompt(roomy).startsWith(text), 'The fitting MP1 text is kept as it is');
+  assert.ok(shown.startsWith('\n# Carried reads'));
+  assert.equal(/[0-9a-f]{64}/.test(shown), false, 'The model sees labels, never references or hashes');
+  const items = JSON.parse(shown.split('\n')[3]!) as { origins: unknown[]; read: Record<string, unknown> }[];
+  const sourceLabel = payload.brief.labels.find((label: { domain: string; value: unknown }) => label.domain === 'source' && canonical(label.value) === canonical(carried.entries[0]!.sources[0]))!.label;
+  assert.equal(items[0]!.read.source, sourceLabel);
+  assert.deepEqual(items[1]!.origins, [{ kind: 'part', part: 2 }, { kind: 'attempt', attempt: 2 }], 'One shown item lists both origins');
+  assert.deepEqual(JSON.parse(shown.split('\n')[4]!), { omitted: { 'head-changed': 1, unaddressed: 1 } });
+  const tight = withReadings(payload, carried, base + section(packetPrompt(withReadings(payload, { ...carried,
+    entries: carried.entries.filter((_, index) => index !== 2) }, 1_000_000)), text).length + 20);
+  assert.deepEqual(decisions(tight), ['included', 'included', 'capacity', 'unaddressed', 'head-changed']);
+  assert.ok(packetPrompt(tight).length <= base + section(packetPrompt(tight), text).length);
+  assert.deepEqual(JSON.parse(section(packetPrompt(tight), text).split('\n')[4]!), { omitted: { capacity: 1, 'head-changed': 1, unaddressed: 1 } });
+  const none = withReadings(payload, carried, base);
+  assert.equal(packetPrompt(none), text, 'Without remaining capacity nothing is shown and the packet is not blocked');
+  assert.deepEqual(decisions(none), ['capacity', 'capacity', 'capacity', 'unaddressed', 'head-changed']);
+  for (const limit of [base + 100, base + 2_000, base + 30_000]) {
+    const bounded = withReadings(payload, carried, limit);
+    assert.ok(packetPrompt(bounded).length <= limit, String(limit));
+    const included = decisions(bounded).filter((value: string) => value === 'included').length;
+    assert.equal(included === 0 ? 0 : JSON.parse(section(packetPrompt(bounded), text).split('\n')[3]!).length, included, 'Included means shown');
+  }
+});

@@ -4362,3 +4362,688 @@ test('MP2 return №3147 (§4; №2968 ¶25): once admitted the correction is th
     assert.equal(f.sent().length, sent, 'Nothing is sent again');
   });
 });
+// MP3 (№2981, decision №3058): addressed read results, novelty by served facts and carried reads of parts and attempts.
+import { briefReadings, type BriefReadings } from '../src/om/packet-brief.js';
+import type { Source } from '../src/evidence/evidence.js';
+const MP3_NOTES = 'Line one: UTF-8 is the encoding.\nLine two: Кириллица 😀 stays.\nLine three: end.';
+const MP3_CONFIG = '{"format":"json","list":[1,2],"nested":{"a":1}}';
+const MP3_LARGE = 'Large carried line.\n'.repeat(3000);
+function mp3Cycle(t: TestContext, kind: 'fact' | 'node' = 'fact', capacity = 100_000, managed = false) {
+  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, undefined, (store, project, root) => {
+    writeFileSync(join(root, 'mp3-notes.txt'), MP3_NOTES);
+    new Evidence(store).file(project, 'mp3-notes', root, 'mp3-notes.txt', 'text/plain', 0);
+    new Evidence(store).document(project, 'mp3-config', MP3_CONFIG, 'application/json', 0);
+    writeFileSync(join(root, 'mp3-large.txt'), MP3_LARGE);
+    new Evidence(store).file(project, 'mp3-large', root, 'mp3-large.txt', 'text/plain', 0);
+    new Evidence(store).document(project, 'mp3-empty', '', 'text/plain', 0);
+  });
+  const notes = f.store.get<Source>(`source:${f.project}:mp3-notes`)!, config = f.store.get<Source>(`source:${f.project}:mp3-config`)!;
+  const large = f.store.get<Source>(`source:${f.project}:mp3-large`)!, empty = f.store.get<Source>(`source:${f.project}:mp3-empty`)!;
+  const range = (start: number, end: number, source: Revision<Source> = notes) => ({ action: 'read_source', source: reference(source), selector: { kind: 'text-range', start, end } });
+  const pointer = (value: string) => ({ action: 'read_source', source: reference(config), selector: { kind: 'json-pointer', pointer: value } });
+  const packets = () => f.store.list<QuestionPacketRecord>('question-packet');
+  const payload = (requestId: string) => packets().find(row => (row.value.packet as { requestId?: string } | null)?.requestId === requestId)!.value.packet as Record<string, any>;
+  const need = (reads: unknown[], packet: { value: { packet: unknown } } = f.packet) => ({ ...e4NeedSource(f, reads),
+    questionIds: (packet.value.packet as { questions: { id: string }[] }).questions.map(row => row.id) });
+  return { f, notes, config, large, empty, range, pointer, packets, payload, need, length: MP3_NOTES.length };
+}
+const mp3Readings = (packet: unknown): BriefReadings => { const value = briefReadings(packet); assert.ok(value, 'The packet is of the readings era'); return value; };
+const mp3Decisions = (packet: unknown) => mp3Readings(packet).entries.map(entry => 'reason' in entry.decision ? entry.decision.reason : entry.decision.state);
+
+test('MP3 main scenario, rows 1, 2, 3, 5: one need_source of several reads delivers complete, clipped, outside and missing results with search rows; the next prompt names requested and served; the answer follows', async t => {
+  const m = mp3Cycle(t), { f, length } = m;
+  const root = f.packet.value.packet as Record<string, any>;
+  assert.deepEqual(mp3Readings(root), { contract: 'om-brief-readings/v1', snapshots: [], entries: [] });
+  const catalogued = (root.brief.manifest as { source: Ref; length: number; completeness: string }[]).find(row => canonical(row.source) === canonical(reference(m.notes)))!;
+  assert.deepEqual([catalogued.length, catalogued.completeness], [length, 'omitted'], 'The catalogue knows the length, not the text');
+  const reads = [m.range(0, 9), m.range(length - 5, length + 100), m.range(length + 10, length + 20), m.pointer('/list/9'),
+    { action: 'read_context', record: reference(f.input), pointer: '/input/absent' }, { action: 'search', within: 'mp3-notes.txt', query: 'line two' },
+    m.range(0, 1, m.empty)];
+  f.steps([{ research: m.need(reads), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'outcome'); assert.equal(cycle.last.outcome?.kind, 'fact-candidates');
+  const sent = f.sent(); assert.equal(sent.length, 2);
+  const next = m.payload(sent[1].requestId); assert.equal(sent[1].prompt, packetPrompt(next, sent[1].requestId));
+  const data = new Map((next.sourceDeliveries[0].data as { read: Record<string, any>; data: unknown }[]).map(row => [canonical(row.read), row.data]));
+  const at = (read: object) => data.get(canonical(read)) as Record<string, unknown>;
+  assert.deepEqual(at(reads[0]!), { contract: 'om-read-result/v1', outcome: 'complete', requested: { start: 0, end: 9 }, length, unit: 'utf16',
+    served: { start: 0, end: 9 }, text: MP3_NOTES.slice(0, 9) });
+  assert.deepEqual(at(reads[1]!), { contract: 'om-read-result/v1', outcome: 'clipped', requested: { start: length - 5, end: length + 100 }, length,
+    unit: 'utf16', served: { start: length - 5, end: length }, text: MP3_NOTES.slice(length - 5) });
+  assert.deepEqual(at(reads[2]!), { contract: 'om-read-result/v1', outcome: 'outside', requested: { start: length + 10, end: length + 20 }, length,
+    unit: 'utf16', served: null, text: null });
+  assert.deepEqual(at(reads[3]!), { contract: 'om-read-result/v1', outcome: 'missing', requested: { pointer: '/list/9' }, missing: '9',
+    parent: { pointer: '/list', type: 'array', keys: ['0', '1'], length: 2 } });
+  assert.deepEqual(at(reads[4]!), { contract: 'om-read-result/v1', outcome: 'missing', requested: { pointer: '/input/absent' }, missing: 'absent',
+    parent: { pointer: '/input', type: 'object', keys: Object.keys((f.input.value as Record<string, any>).input).sort() } });
+  assert.deepEqual((at(reads[5]!) as unknown as { line: number; text: string }[]).map(row => [row.line, row.text]), [[2, 'Line two: Кириллица 😀 stays.']]);
+  assert.deepEqual(at(reads[6]!), { contract: 'om-read-result/v1', outcome: 'outside', requested: { start: 0, end: 1 }, length: 0, unit: 'utf16',
+    served: null, text: null }, 'An empty source is a lawful read with its real length');
+  for (const piece of ['"outcome":"clipped"', '"requested":{"end":', '"served":{"end":', '"served":null', '"outcome":"missing"'])
+    assert.ok(sent[1].prompt.includes(piece), piece);
+  assert.equal(f.store.list('call-record').length, 2);
+});
+
+test('MP3 rows 3, 20, 24: known metadata gives no progress even at the first request; another end past EOF or another missing name is no new fact; a new served slice or omitted catalogue text is progress', async t => {
+  await t.test('row 24: a length the catalogue shows ends the attempt at the first request', async child => {
+    const m = mp3Cycle(child), { f, length } = m;
+    f.steps([{ research: m.need([m.range(length + 10, length + 20)]), usage }]);
+    const cycle = valueOf(await runModelCycle(f.store, f.request));
+    assert.equal(cycle.record.value.terminal, 'research-no-progress'); assert.equal(f.sent().length, 1);
+    assert.equal(f.store.list('om-read-delivery').length, 1, 'The addressed result stays a saved delivery');
+  });
+  await t.test('row 20: repeated EOF with another end, another missing key of the same parent and a known subslice', async child => {
+    const m = mp3Cycle(child), { f, length } = m;
+    f.steps([{ research: m.need([m.range(0, 9), m.pointer('/list/9')]), usage },
+      { research: m.need([m.range(length + 50, length + 60), m.pointer('/list/10'), m.range(2, 8)]), usage }]);
+    const cycle = valueOf(await runModelCycle(f.store, f.request));
+    assert.equal(cycle.record.value.terminal, 'research-no-progress'); assert.equal(f.sent().length, 2, 'No third paid call');
+    const diagnostic = f.store.get<{ refusals: { code: string }[] }>(cycle.diagnostic!.id)!;
+    assert.equal(diagnostic.value.refusals[0]!.code, 'research_no_progress');
+  });
+  await t.test('row 24: known with new metadata, then an omitted catalogue text, are progress', async child => {
+    const m = mp3Cycle(child), { f, length } = m;
+    f.steps([{ research: m.need([m.range(length + 10, length + 20), m.range(10, 20)]), usage }, { research: e4Fact(f), usage }]);
+    const cycle = valueOf(await runModelCycle(f.store, f.request));
+    assert.equal(cycle.record.value.terminal, 'outcome'); assert.equal(f.sent().length, 2);
+  });
+});
+
+test('MP3 row 8: after reopen with the working file changed or removed, a delivery is the same data and Ref from saved sources; current applicability is checked separately', async t => {
+  const m = mp3Cycle(t), { f } = m;
+  f.steps([{ research: m.need([m.range(0, 9), { action: 'read', path: 'mp3-notes.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  const link = valueOf(readQuestionPacket(f.store, { project: f.project, record: cycle.record.value.steps[1]!.packet })).value.request.continuation!;
+  const evidence = { project: f.project, ...link, deliveries: [...link.deliveries] };
+  const saved = valueOf(readContinuationEvidence(f.store, evidence));
+  for (const change of ['changed', 'removed'] as const) {
+    if (change === 'changed') writeFileSync(join(f.root, 'mp3-notes.txt'), 'replaced working file');
+    else rmSync(join(f.root, 'mp3-notes.txt'));
+    f.restart();
+    const before = f.store.list().map(reference);
+    assert.deepEqual(valueOf(readContinuationEvidence(f.store, evidence)), saved, change);
+    assert.deepEqual(valueOf(deliverModelSources(f.store, { project: f.project, packet: link.packet, call: link.call, response: link.response })).deliveries, link.deliveries);
+    const current = readContinuationEvidence(f.store, evidence, true);
+    assert.equal(current.ok, false); if (!current.ok) assert.equal(current.refusal.code, 'input_stale', change);
+    assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) })).record, cycle.record);
+    assert.deepEqual(f.store.list().map(reference), before);
+  }
+});
+
+/** G7 closes a managed attempt of the MP3 fixture on the refusals of its complete registry; the next one keeps the full goal. */
+function mp3Close(f: ReturnType<typeof e4Fixture>, ordinal: number, reason: 'refused' | 'off-form' | 'interrupted' = 'refused') {
+  const series = f.store.get<RepairSeries>(f.series.id)!;
+  const binding = valueOf(readCompletionBinding(f.store, f.project, reference(series), ordinal))!;
+  const work = valueOf(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+  assert.equal(work.complete, true);
+  return valueOf(closeAttempt(f.store, { ...seriesRequestOf(series.value), attempt: ordinal, outcome: { reason, accepting: [], cancelling: [], refusals: work.refusals } }));
+}
+function mp3Open(f: ReturnType<typeof e4Fixture>, ordinal: number, environment: Ref = reference(f.configured)) {
+  const current = f.store.get<RepairSeries>(f.series.id)!, goal = current.value.attempts[0]!.goal;
+  const series = valueOf(managedOpenAttempt(f.store, { ...seriesRequestOf(current.value), attempt: ordinal, goal,
+    completion: { routes: reference(f.routes), batches: [f.batch.id] } } as never));
+  const request: QuestionPacketRequest = { ...f.packetRequest, environment, attempt: { series: reference(series), ordinal } };
+  return { series, request, root: () => valueOf(writeQuestionPacket(f.store, request)).record };
+}
+const mp3Carried = (packet: { value: { packet: unknown } }) => {
+  const text = packetPrompt(packet.value.packet), at = text.indexOf('\n# Carried reads');
+  return at < 0 ? [] : JSON.parse(text.slice(at).split('\n')[3]!) as { origins: unknown[]; read: Record<string, unknown>; data: Record<string, unknown> }[];
+};
+const mp3Origins = (packet: { value: { packet: unknown } }) => mp3Readings(packet.value.packet).entries.map(entry => entry.origins.map(origin =>
+  origin.kind === 'attempt' ? `attempt ${origin.ordinal}` : `part ${origin.position}`));
+
+test('MP3 rows 10, 22: a new attempt of the same line and full goal carries the deliveries of earlier managed attempts, after their refusal and after a cycle whose cursor was never saved', async t => {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m, script: Record<string, unknown>[] = [];
+  const run = (steps: Record<string, unknown>[]) => { script.push(...steps); f.steps(script); };
+  run([{ research: m.need([m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, f.request)); mp3Close(f, 1);
+  const second = mp3Open(f, 2), root2 = second.root();
+  const readings2 = mp3Readings(root2.value.packet);
+  assert.deepEqual(readings2.snapshots.map(row => row.kind === 'attempt' ? [row.ordinal, row.sets.length] : null), [[1, 1]]);
+  assert.deepEqual(mp3Decisions(root2.value.packet), ['included']); assert.deepEqual(mp3Origins(root2), [['attempt 1']]);
+  assert.deepEqual(mp3Carried(root2).map(item => item.data.text), [MP3_NOTES.slice(0, 9)], 'Row 10: the refusal of attempt 1 did not erase its material');
+  // Row 22: attempt 2 delivers another slice, but its cycle cursor is never saved.
+  run([{ research: m.need([m.range(20, 30)], root2), usage }, { research: e4CannotAnswer(f), usage }]);
+  const write = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes, guards) => {
+    if (writes.some(row => row.kind === 'om-model-cycle')) throw Error('stop before cycle cursor');
+    return write(writes, guards);
+  }) as Store['writeMany'];
+  try { await assert.rejects(runModelCycle(f.store, { ...f.request, packet: reference(root2) }), /stop before cycle cursor/); }
+  finally { f.store.writeMany = write; }
+  assert.equal(f.store.list('om-model-cycle').length, 1, 'Only attempt 1 has a cycle record');
+  mp3Close(f, 2);
+  const third = mp3Open(f, 3), root3 = third.root();
+  assert.deepEqual(mp3Origins(root3), [['attempt 2'], ['attempt 1']], 'The later attempt first');
+  assert.deepEqual(mp3Carried(root3).map(item => item.data.text), [MP3_NOTES.slice(20, 30), MP3_NOTES.slice(0, 9)]);
+  const sends = f.sent().length, before = f.store.list().map(reference);
+  f.restart();
+  assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root3) })), root3);
+  assert.deepEqual(valueOf(writeQuestionPacket(f.store, third.request)).record, root3);
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, sends);
+});
+
+/** An attempt 1 of the managed MP3 fixture that delivered the given reads and was refused, then closed by G7. */
+async function mp3Delivered(t: TestContext, reads: (m: ReturnType<typeof mp3Cycle>) => unknown[], capacity = 100_000) {
+  const m = mp3Cycle(t, 'fact', capacity, true), { f } = m;
+  const script: Record<string, unknown>[] = [{ research: m.need(reads(m)), usage }, { research: e4CannotAnswer(f), usage }];
+  f.steps(script);
+  valueOf(await runModelCycle(f.store, f.request)); mp3Close(f, 1);
+  return { ...m, script, run: (steps: Record<string, unknown>[]) => { script.push(...steps); f.steps(script); } };
+}
+
+test('MP3 rows 11, 12: a source changed before the first selection is omitted with its proved reason and its old text is not shown; an included source changed after issuance refuses current admission with no write or call, while history reproduces the packet', async t => {
+  await t.test('row 11: a recaptured head is a proved head change', async child => {
+    const m = await mp3Delivered(child, m => [m.range(0, 9), m.pointer('/format')]), { f } = m;
+    writeFileSync(join(f.root, 'mp3-notes.txt'), 'Changed notes text.');
+    const recaptured = new Evidence(f.store).file(f.project, 'mp3-notes', f.root, 'mp3-notes.txt', 'text/plain', 1);
+    const root = mp3Open(f, 2).root(), readings = mp3Readings(root.value.packet);
+    const notes = readings.entries.find(entry => canonical(entry.sources) === canonical([reference(m.notes)]))!;
+    assert.deepEqual(notes.decision, { state: 'omitted', reason: 'head-changed', source: reference(m.notes), observed: reference(recaptured) });
+    assert.deepEqual(mp3Carried(root).map(item => item.data.value ?? item.data.text), ['json'], 'Only the current config read is shown');
+    assert.equal(packetPrompt(root.value.packet).includes(MP3_NOTES.slice(0, 9)), false, 'The changed text is never shown as current');
+    f.restart(); assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root) })), root);
+  });
+  await t.test('row 11: an unrecaptured changed file has an unconfirmed currency', async child => {
+    const m = await mp3Delivered(child, m => [m.range(0, 9)]), { f } = m;
+    writeFileSync(join(f.root, 'mp3-notes.txt'), 'Changed without a capture.');
+    const root = mp3Open(f, 2).root();
+    assert.deepEqual(mp3Readings(root.value.packet).entries[0]!.decision, { state: 'omitted', reason: 'currency-unconfirmed', source: reference(m.notes) });
+    assert.deepEqual(mp3Carried(root), []);
+    assert.deepEqual(JSON.parse(packetPrompt(root.value.packet).split('\n').at(-1)!), { omitted: { 'currency-unconfirmed': 1 } });
+    f.restart(); assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root) })), root);
+  });
+  await t.test('row 12: an included source changed after issuance', async child => {
+    const m = await mp3Delivered(child, m => [m.pointer('/format')]), { f } = m;
+    const next = mp3Open(f, 2), root = next.root();
+    assert.deepEqual(mp3Decisions(root.value.packet), ['included']);
+    new Evidence(f.store).document(f.project, 'mp3-config', '{"format":"xml"}', 'application/json', 1);
+    const sends = f.sent().length, before = f.store.list().map(reference), calls = f.store.list('call-record').length;
+    const refused = await runModelCall(f.store, { ...f.request, packet: reference(root) });
+    assert.equal(refused.ok, false); if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.ref], ['input_stale', reference(m.config)]);
+    const prepared = prepareQuestionPacket(f.store, next.request);
+    assert.equal(prepared.ok, false); if (!prepared.ok) assert.equal(prepared.refusal.code, 'input_stale');
+    assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, sends); assert.equal(f.store.list('call-record').length, calls);
+    f.restart(); assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root) })), root);
+  });
+});
+
+test('MP3 row 13: deliveries of another block\'s series reading the same file, or of another goal on the same line, are never selected', async t => {
+  const m = await mp3Delivered(t, m => [m.range(0, 9)]), { f } = m;
+  const series = f.store.get<RepairSeries>(f.series.id)!, goal = series.value.attempts[0]!.goal;
+  const nodeBatch = f.routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === 'garden-produce-block')!;
+  const other = { project: f.project, block: nodeBatch.node!, line: 1 };
+  valueOf(openSeries(f.store, { ...other, slice: 'mp3-other-block', predecessor: null, basis: null }));
+  const nodeGoal = { key: 'mp3:other-block', questions: nodeBatch.items.map(item => gapLineKey(f.project, item.target, item.field)),
+    result: gapLineExpectedResult(f.project, nodeBatch.items[0]!.target, nodeBatch.items[0]!.field) };
+  const foreign = valueOf(managedOpenAttempt(f.store, { ...other, attempt: 1, goal: nodeGoal, completion: { routes: reference(f.routes), batches: [nodeBatch.id] } } as never));
+  const foreignRoot = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, batch: nodeBatch.id, attempt: { series: reference(foreign), ordinal: 1 } })).record;
+  const nodeQuestions = (foreignRoot.value.packet as { questions: { id: string }[] }).questions.map(row => row.id);
+  m.run([{ research: m.need([m.range(40, 50)], foreignRoot), usage }, { research: { protocol: '$answerProtocol', requestId: '$requestId',
+    action: 'cannot_answer', questionIds: nodeQuestions, reason: 'Not in the named source' }, usage }]);
+  valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(foreignRoot) }));
+  const changedGoal = valueOf(managedOpenAttempt(f.store, { ...seriesRequestOf(series.value), attempt: 2, goal: { ...goal, key: `${goal.key}:other` },
+    completion: { routes: reference(f.routes), batches: [f.batch.id] } } as never));
+  const changedRoot = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, attempt: { series: reference(changedGoal), ordinal: 2 } })).record;
+  assert.deepEqual(mp3Readings(changedRoot.value.packet).entries, [], 'Another goal of the same line selects nothing');
+  m.run([{ research: m.need([m.range(60, 70)], changedRoot), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(changedRoot) })); mp3Close(f, 2);
+  const root = mp3Open(f, 3).root();
+  assert.deepEqual(mp3Origins(root), [['attempt 1']], 'Only attempt 1 of this exact line and full goal');
+  assert.deepEqual(mp3Carried(root).map(item => item.data.text), [MP3_NOTES.slice(0, 9)]);
+  assert.equal(f.store.list('om-read-delivery').length, 3, 'The excluded deliveries stay saved');
+});
+
+test('MP3 row 14: an identical delivery of two admissible attempts is one shown item listing both origins; a different slice stays its own item', async t => {
+  const m = await mp3Delivered(t, m => [m.range(0, 9)]), { f } = m;
+  const root2 = mp3Open(f, 2).root();
+  m.run([{ research: m.need([m.range(0, 9), m.range(5, 15)], root2), usage }, { research: e4CannotAnswer(f), usage }]);
+  const second = valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(root2) }));
+  assert.equal(second.record.value.steps.length, 2, 'The partly new slice is progress');
+  mp3Close(f, 2);
+  const root3 = mp3Open(f, 3).root(), readings = mp3Readings(root3.value.packet);
+  const byText = new Map(readings.entries.map(entry => [(entry.data as { text: string }).text, entry.origins.map(origin => origin.kind === 'attempt' && origin.ordinal)]));
+  assert.deepEqual(byText.get(MP3_NOTES.slice(0, 9)), [2, 1]); assert.deepEqual(byText.get(MP3_NOTES.slice(5, 15)), [2]);
+  assert.equal(readings.entries.length, 2);
+  assert.equal(f.store.list('om-read-delivery').length, 3, 'Repeated deliveries keep their own records');
+  const shown = mp3Carried(root3).find(item => item.data.text === MP3_NOTES.slice(0, 9))!;
+  assert.deepEqual(shown.origins, [{ kind: 'attempt', attempt: 2 }, { kind: 'attempt', attempt: 1 }]);
+});
+
+test('MP3 row 15: a carried read that does not fit is omitted first with its reason, the packet stays ready, and reading it again is progress', async t => {
+  const m = await mp3Delivered(t, m => [m.range(0, 40_000, m.large)]), { f } = m;
+  const next = mp3Open(f, 2), probe = valueOf(prepareQuestionPacket(f.store, next.request)).record;
+  assert.deepEqual(mp3Decisions(probe.value.packet), ['included']);
+  const text = packetPrompt(probe.value.packet), core = text.indexOf('\n# Carried reads');
+  const tight = f.environment(core + 2_000);
+  const root = valueOf(writeQuestionPacket(f.store, { ...next.request, environment: reference(tight) })).record;
+  assert.equal(root.value.state, 'ready'); assert.deepEqual(mp3Decisions(root.value.packet), ['capacity']);
+  assert.ok(packetPrompt(root.value.packet).length <= core + 2_000); assert.deepEqual(mp3Carried(root), []);
+  m.run([{ research: m.need([m.range(0, 100, m.large)], root), usage }, { research: e4CannotAnswer(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(root), dispatch: { ...f.request.dispatch, config: reference(tight) } }));
+  assert.equal(cycle.record.value.steps.length, 2, 'Omitted carried text is not known: reading it again is progress');
+});
+
+test('MP3 row 16: the saved set is not selected again — continuations keep it, the running attempt\'s own deliveries never join it, repeated preparation and reopen reproduce it', async t => {
+  const m = await mp3Delivered(t, m => [m.range(0, 9)]), { f } = m;
+  const next = mp3Open(f, 2), root = next.root();
+  const issued = f.store.list().map(reference);
+  assert.deepEqual(valueOf(prepareQuestionPacket(f.store, next.request)).writes, [], 'A repeated preparation selects nothing again');
+  assert.deepEqual(valueOf(writeQuestionPacket(f.store, next.request)).record, root);
+  assert.deepEqual(f.store.list().map(reference), issued);
+  m.run([{ research: m.need([m.range(20, 30)], root), usage }, { research: e4CannotAnswer(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(root) }));
+  const continuation = valueOf(readQuestionPacket(f.store, { project: f.project, record: cycle.record.value.steps[1]!.packet }));
+  const strip = (packet: unknown) => mp3Readings(packet).entries.map(({ decision: _decision, ...entry }) => entry);
+  assert.deepEqual(mp3Readings(continuation.value.packet).snapshots, mp3Readings(root.value.packet).snapshots);
+  assert.deepEqual(strip(continuation.value.packet), strip(root.value.packet));
+  assert.equal((continuation.value.packet as Record<string, any>).sourceDeliveries[0].data[0].data.text, MP3_NOTES.slice(20, 30));
+  const before = f.store.list().map(reference);
+  assert.deepEqual(valueOf(writeQuestionPacket(f.store, next.request)).record, root, 'The saved root is replayed, its set unchanged by later deliveries');
+  f.restart();
+  for (const packet of [root, continuation]) assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+test('MP3 window (Т7): a second Store moving an included carried source between preparation and write refuses the whole packet write', async t => {
+  const m = await mp3Delivered(t, m => [m.pointer('/format')]), { f } = m;
+  const next = mp3Open(f, 2), prepared = valueOf(prepareQuestionPacket(f.store, next.request));
+  assert.deepEqual(mp3Decisions(prepared.record.value.packet), ['included']);
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(m.config))), 'The included source is a condition of the write');
+  const second = new Store(f.database);
+  try { new Evidence(second).document(f.project, 'mp3-config', '{"format":"xml"}', 'application/json', 1); } finally { second.close(); }
+  const before = f.store.list().map(reference);
+  const written = writeGuarded(f.store, { unit: 'E2', target: prepared.record.id, writes: prepared.writes as Write[], guards: prepared.guards as Parameters<typeof writeGuarded>[1]['guards'] });
+  assert.equal(written.ok, false); if (!written.ok) assert.equal(written.refusal.code, 'input_stale');
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.store.get(prepared.record.id), null);
+});
+
+test('MP3 rows 9, 18: a new part carries the proven deliveries of the preceding part chain as a fixed set; every packet keeps the root era and no carried read becomes another edge', async t => {
+  const m = mp3Cycle(t, 'node'), { f } = m, config = f.environment(f.packet.value.fullChars! - 1);
+  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+  assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length; assert.ok(total >= 2);
+  const answers = Array.from({ length: total }, (_, position) => e4Node(f, { ...packet,
+    value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>));
+  f.steps([{ research: m.need([m.range(0, 9)], packet), usage }, ...answers.map(research => ({ research, usage }))]);
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  const cycle = valueOf(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, total + 1, 'No call is added for carried reads');
+  const steps = cycle.record.value.steps.map(step => valueOf(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
+  for (const step of steps) assert.ok(briefReadings(step.value.packet), 'Row 18: every packet of the chain keeps the root era');
+  const [root, continuation, ...parts] = steps;
+  assert.ok(continuation!.value.request.continuation); assert.deepEqual(mp3Readings(continuation!.value.packet).entries, []);
+  for (const [index, part] of parts.entries()) {
+    assert.equal(part.value.request.continuation, undefined, 'A carried read is no continuation edge');
+    assert.equal(part.value.request.previous.length, index + 1);
+    assert.deepEqual(mp3Readings(part.value.packet).snapshots, [{ kind: 'packet', packet: reference(index ? parts[index - 1]! : continuation!) }]);
+    assert.deepEqual(mp3Origins(part), [['part 0']]); assert.deepEqual(mp3Decisions(part.value.packet), ['included']);
+    assert.deepEqual(mp3Carried(part).map(item => item.data.text), [MP3_NOTES.slice(0, 9)]);
+  }
+  assert.ok(root);
+  f.restart();
+  for (const step of steps) assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(step) })), step);
+});
+
+// MP3 row 18 with the MP2 correction: a correction is a step of its root's chain — the root era and the carried set of the step it
+// corrects; the walk back over a part chain passes through a correction to the reads before it.
+function mp3Parts(t: TestContext) {
+  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m, config = f.environment(f.packet.value.fullChars! - 1);
+  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record as Revision<QuestionPacketRecord>;
+  assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length; assert.ok(total >= 2);
+  const at = (position: number) => ({ ...packet, value: { ...packet.value, plan: { ...packet.value.plan!, position } } }) as Revision<QuestionPacketRecord>;
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  const steps = (cycle: { record: { value: { steps: readonly { packet: Ref }[] } } }) => cycle.record.value.steps.map(step => valueOf(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
+  return { m, f, packet, total, at, request, steps };
+}
+test('MP3 row 18 (MP2 correction after reads): the next part carries the reads of a part chain that went through a correction', async t => {
+  const { m, f, packet, total, at, request, steps } = mp3Parts(t);
+  f.steps([{ research: m.need([m.range(0, 9)], packet), usage }, { research: mp2Refused(f, at(0)), usage }, { research: e4Node(f, at(0)), usage },
+    ...Array.from({ length: total - 1 }, (_, index) => ({ research: e4Node(f, at(index + 1)), usage }))]);
+  const cycle = valueOf(await mp2Cycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, total + 2, 'No call is added for carried reads');
+  const [root, continuation, correction, ...parts] = steps(cycle);
+  assert.ok(continuation!.value.request.continuation && correction!.value.request.correction);
+  for (const step of [root!, continuation!, correction!, ...parts]) assert.ok(briefReadings(step.value.packet), 'Every packet keeps the root era');
+  assert.deepEqual(mp3Readings(correction!.value.packet), mp3Readings(continuation!.value.packet), 'The correction shows the set of the step it corrects');
+  const next = parts[0]!;
+  assert.equal(next.value.request.previous.length, 1); assert.equal(next.value.request.continuation, undefined, 'A carried read is no continuation edge');
+  assert.deepEqual(mp3Readings(next.value.packet).snapshots, [{ kind: 'packet', packet: reference(correction!) }]);
+  assert.deepEqual(mp3Origins(next), [['part 0']]); assert.deepEqual(mp3Decisions(next.value.packet), ['included']);
+  assert.deepEqual(mp3Carried(next).map(item => item.data.text), [MP3_NOTES.slice(0, 9)], 'The read before the correction reaches the next part');
+  f.restart();
+  for (const step of [root!, continuation!, correction!, ...parts]) assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(step) })), step);
+});
+test('MP3 row 18 (MP2 correction of a later part): the correction keeps the carried set of the part it corrects and decides it by its own capacity — the larger correction omits it and stays ready', async t => {
+  const { m, f, packet, total, at, request, steps } = mp3Parts(t);
+  f.steps([{ research: m.need([m.range(0, 9)], packet), usage }, { research: e4Node(f, at(0)), usage }, { research: mp2Refused(f, at(1)), usage },
+    { research: e4Node(f, at(1)), usage }, ...Array.from({ length: total - 2 }, (_, index) => ({ research: e4Node(f, at(index + 2)), usage }))]);
+  const cycle = valueOf(await mp2Cycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, total + 2);
+  const [, , part1, correction] = steps(cycle);
+  assert.ok(correction!.value.request.correction); assert.equal(correction!.value.plan!.position, 1); assert.equal(correction!.value.state, 'ready');
+  const rows = (packet: { value: { packet: unknown } }) => mp3Readings(packet.value.packet).entries.map(({ decision: _decision, ...row }) => row);
+  assert.deepEqual(mp3Readings(correction!.value.packet).snapshots, mp3Readings(part1!.value.packet).snapshots, 'The snapshots of the part it corrects');
+  assert.deepEqual(rows(correction!), rows(part1!), 'The entries of the part it corrects');
+  assert.deepEqual(mp3Decisions(part1!.value.packet), ['included']);
+  assert.deepEqual(mp3Decisions(correction!.value.packet), ['capacity'], 'Its own capacity: the refusal and the previous answer leave no room for the optional read');
+  assert.deepEqual(mp3Carried(correction!), []);
+});
+test('MP3 row 18 (MP2 correction of an attempt root): the correction shows the carried set after its own sections; fullChars keeps the MP1 meaning; the model sees the read', async t => {
+  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m;
+  f.steps([{ research: m.need([m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, f.request)); mp3Close(f, 1);
+  const second = mp3Open(f, 2), root2 = second.root() as Revision<QuestionPacketRecord>;
+  assert.deepEqual(mp3Decisions(root2.value.packet), ['included']);
+  f.steps([{ research: m.need([m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }, { research: mp2Refused(f, root2), usage }, { research: e4Node(f, root2), usage }]);
+  const cycle = valueOf(await mp2Cycle(f.store, { ...f.request, packet: reference(root2) }));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, 4, 'One correction call');
+  const [, correction] = cycle.record.value.steps.map(step => valueOf(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
+  assert.ok(correction!.value.request.correction);
+  assert.deepEqual(mp3Readings(correction!.value.packet), mp3Readings(root2.value.packet), 'The same snapshots, entries and decisions as the root it corrects');
+  assert.deepEqual(mp3Carried(correction!).map(item => item.data.text), [MP3_NOTES.slice(0, 9)]);
+  const text = packetPrompt(correction!.value.packet), own = text.indexOf('# Correction of your previous answer'), carried = text.indexOf('\n# Carried reads');
+  assert.ok(own >= 0 && carried > own, 'The carried section follows the correction and the rest of the bounded brief');
+  assert.equal(correction!.value.fullChars, carried, 'fullChars counts the bounded brief without the carried section');
+  const sent = f.sent()[3] as { prompt: string };
+  assert.ok(sent.prompt.includes('# Carried reads') && sent.prompt.includes(JSON.stringify(MP3_NOTES.slice(0, 9))), 'The model sees the carried read with the correction');
+  f.restart();
+  assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(correction!) })), correction);
+});
+
+// MP3 return 1 (Codex-omg №3171): every lawful delivery form is carried — a search over an existing empty directory has no
+// sources and no rows; its producer (deliverModelSources), the readings marker, the carried view and novelty agree on it.
+import { mkdirSync } from 'node:fs';
+const MP3_EMPTY_SEARCH = { action: 'search', within: 'empty-search', query: 'absent' };
+const mp3SearchDelivery = (f: ReturnType<typeof e4Fixture>) => f.store.list<{ read: { action: string }; sources: unknown[]; data: unknown }>('om-read-delivery')
+  .find(row => row.value.read.action === 'search')!;
+test('MP3 №3171: a search over an existing empty directory is a lawful delivery without sources or rows; the next attempt root carries it beside the text read, stays ready and reopens unchanged', async t => {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
+  mkdirSync(join(f.root, 'empty-search'));
+  f.steps([{ research: m.need([MP3_EMPTY_SEARCH, m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.steps.length, 2);
+  const empty = mp3SearchDelivery(f);
+  assert.deepEqual([empty.value.sources, empty.value.data], [[], []], 'The producer writes no source and no row');
+  mp3Close(f, 1);
+  const second = mp3Open(f, 2), root2 = second.root();
+  assert.equal(root2.value.state, 'ready');
+  const carried = mp3Readings(root2.value.packet).entries.find(entry => entry.origins.some(origin => origin.delivery.id === empty.id))!;
+  assert.deepEqual(carried.sources, []); assert.equal(carried.decision.state, 'included');
+  assert.deepEqual(mp3Decisions(root2.value.packet), ['included', 'included']);
+  const shown = mp3Carried(root2);
+  assert.deepEqual(shown.find(item => item.read.action === 'search'), { origins: [{ kind: 'attempt', attempt: 1 }], read: MP3_EMPTY_SEARCH, data: [] });
+  assert.ok(shown.some(item => item.data.text === MP3_NOTES.slice(0, 9)), 'The text read is carried beside it');
+  const sends = f.sent().length, before = f.store.list().map(reference);
+  f.restart();
+  assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root2) })), root2);
+  assert.deepEqual(valueOf(writeQuestionPacket(f.store, second.request)).record, root2);
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, sends);
+});
+test('MP3 №3171: the same reads in the first part — the next part carries the empty search with the text read and the node assembles; reopen reads every step back unchanged', async t => {
+  const { m, f, packet, total, at, request, steps } = mp3Parts(t);
+  mkdirSync(join(f.root, 'empty-search'));
+  f.steps([{ research: m.need([MP3_EMPTY_SEARCH, m.range(0, 9)], packet), usage }, ...Array.from({ length: total }, (_, index) => ({ research: e4Node(f, at(index)), usage }))]);
+  const cycle = valueOf(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.equal(f.sent().length, total + 1);
+  const all = steps(cycle), next = all[2]!, empty = mp3SearchDelivery(f);
+  assert.equal(next.value.request.previous.length, 1);
+  const carried = mp3Readings(next.value.packet).entries.find(entry => entry.origins.some(origin => origin.delivery.id === empty.id))!;
+  assert.deepEqual(carried.sources, []); assert.deepEqual(carried.origins.map(origin => origin.kind), ['part']);
+  f.restart();
+  for (const step of all) assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(step) })), step);
+});
+test('MP3 №3171 (control): a search without a match inside a file path has its one source and no rows and is carried', async t => {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
+  f.steps([{ research: m.need([{ action: 'search', within: 'mp3-notes.txt', query: 'absent' }, m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, f.request));
+  const search = mp3SearchDelivery(f);
+  assert.equal(search.value.sources.length, 1); assert.deepEqual(search.value.data, []);
+  mp3Close(f, 1);
+  const root2 = mp3Open(f, 2).root();
+  assert.equal(root2.value.state, 'ready');
+  assert.equal(mp3Readings(root2.value.packet).entries.find(entry => entry.origins.some(origin => origin.delivery.id === search.id))!.decision.state, 'included');
+});
+// MP3 round 3 (Codex-omg №3190): a carried search over a workspace path is current only while the producer's own walk finds
+// exactly its delivered files — an empty directory included; before the selection a moved scope omits the whole delivery,
+// after it the current admission refuses; history keeps the saved choice without walking the disk.
+async function mp3ScopeAttempt(t: TestContext, files: Record<string, string>) {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
+  mkdirSync(join(f.root, 'scope'));
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(f.root, 'scope', name), content);
+  f.steps([{ research: m.need([{ action: 'search', within: 'scope', query: 'newneedle' }, m.range(0, 9)]), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, f.request));
+  const search = mp3SearchDelivery(f);
+  assert.equal(search.value.sources.length, Object.keys(files).length); assert.deepEqual(search.value.data, []);
+  mp3Close(f, 1);
+  return { f, search, second: mp3Open(f, 2) };
+}
+const mp3DecisionOf = (packet: { value: { packet: unknown } }, delivery: { id: string }) => {
+  const entry = mp3Readings(packet.value.packet).entries.find(row => row.origins.some(origin => origin.delivery.id === delivery.id))!;
+  return 'reason' in entry.decision ? entry.decision.reason : entry.decision.state;
+};
+const MP3_SCOPES = [['empty directory', {}], ['non-empty directory', { 'a.txt': 'alpha' }]] as const;
+test('MP3 №3190: a file added to the scope before the first selection — of an empty or a non-empty directory — omits the whole search delivery as unconfirmed; the text read is carried; nothing is captured, delivered or sent', async t => {
+  for (const [name, files] of MP3_SCOPES) await t.test(name, async t => {
+    const { f, search, second } = await mp3ScopeAttempt(t, files);
+    writeFileSync(join(f.root, 'scope', 'new.txt'), 'the newneedle is here');
+    const counts = () => [f.store.list('om-read-delivery').length, f.store.list('source').length, f.sent().length];
+    const before = counts(), root2 = second.root();
+    assert.equal(root2.value.state, 'ready');
+    assert.equal(mp3DecisionOf(root2, search), 'scope-unconfirmed');
+    assert.deepEqual(mp3Decisions(root2.value.packet).sort(), ['included', 'scope-unconfirmed']);
+    assert.equal(mp3Carried(root2).some(item => item.read.action === 'search'), false, 'The stale result is not shown as current');
+    assert.ok(packetPrompt(root2.value.packet).includes('{"omitted":{"scope-unconfirmed":1}}'), 'The omission is counted');
+    assert.deepEqual(counts(), before, 'Nothing is captured, delivered or sent for the carry-over');
+    f.restart();
+    assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root2) })), root2);
+  });
+});
+test('MP3 №3190: an unchanged scope is carried; a file added after the selection refuses the current admission of the issued packet by the delivery itself, while its history replays the saved choice without walking the disk', async t => {
+  for (const [name, files] of MP3_SCOPES) await t.test(name, async t => {
+    const { f, search, second } = await mp3ScopeAttempt(t, files);
+    const root2 = second.root();
+    assert.equal(mp3DecisionOf(root2, search), 'included', 'Positive control: the unchanged scope is current');
+    assert.deepEqual(valueOf(prepareQuestionPacket(f.store, second.request)).record, root2, 'Unchanged: current admission prepares the same packet');
+    writeFileSync(join(f.root, 'scope', 'new.txt'), 'the newneedle is here');
+    const refused = prepareQuestionPacket(f.store, second.request);
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.target, refused.refusal.at.field], ['input_stale', search.id, 'readings']);
+    assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root2) })), root2, 'History keeps the saved choice');
+    f.restart();
+    assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root2) })), root2);
+  });
+});
+test('MP3 №3171: a literal read of a captured file is carried into the next attempt root and shown by the path it asked for', async t => {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
+  writeFileSync(join(f.root, 'mp3-extra.txt'), 'Extra file read by its path.');
+  f.steps([{ research: m.need([{ action: 'read', path: 'mp3-extra.txt', media: 'text/plain' }]), usage }, { research: e4CannotAnswer(f), usage }]);
+  valueOf(await runModelCycle(f.store, f.request));
+  const delivery = f.store.list<{ read: { action: string }; sources: Ref[] }>('om-read-delivery').find(row => row.value.read.action === 'read')!;
+  assert.equal(delivery.value.sources.length, 1, 'The producer captures the one requested file');
+  mp3Close(f, 1);
+  const root2 = mp3Open(f, 2).root();
+  const carried = mp3Readings(root2.value.packet).entries.find(entry => entry.origins.some(origin => origin.delivery.id === delivery.id))!;
+  assert.equal(carried.decision.state, 'included');
+  assert.deepEqual(mp3Carried(root2).find(item => item.read.action === 'read'),
+    { origins: [{ kind: 'attempt', attempt: 1 }], read: { action: 'read', path: 'mp3-extra.txt', media: 'text/plain' }, data: 'Extra file read by its path.' });
+});
+test('MP3 on merged MP2 (№3147 junction): an attempt ceased with its correction owed after reads carries its delivery into the next attempt — by the series outcome and the physical steps, the cessation code untouched', async t => {
+  const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
+  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m;
+  f.steps([{ research: m.need([m.range(0, 9)]), usage }, { research: mp2Refused(f), usage }, { research: e4Node(f), usage }]);
+  // The cycle stops where it would write the correction: the refusal after the reads stays owed.
+  const writeMany = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes, guards) => {
+    if (writes.some(write => write.kind === 'question-packet' && (write.value as { request?: { correction?: unknown } }).request?.correction))
+      throw new Error('MP3 stop before the correction');
+    return writeMany(writes, guards);
+  }) as Store['writeMany'];
+  try { await assert.rejects(runModelCycle(f.store, f.request), /MP3 stop before the correction/); }
+  finally { f.store.writeMany = writeMany; }
+  assert.equal(f.sent().length, 2, 'The read request and the refused answer were sent; the correction was not');
+  const delivery = f.store.list('om-read-delivery')[0]!;
+  const rejected = f.store.list<OmModelCall>('model-call').find(row => row.value.om.failure)!, owner = rejected.value.om.completionOwner!;
+  const changed = f.environment(90_000);
+  assert.ok(valueOf(prepareCompletionCause(f.store, f.project, owner.assignment)).cause, 'The changed environment ends the owed step');
+  const ceased = valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: owner.assignment }));
+  assert.deepEqual([ceased.value.disposition, ceased.value.remainder], ['branch-ceased', 'continuation'], 'The owed correction is ceased by the common outcome');
+  valueOf(writeCompletionCessation(f.store, { project: f.project, binding: owner.binding, assignment: reference(lp4Root(f)) }));
+  assert.equal(completionSnapshot(f).complete, true, 'The attempt can close');
+  mp3Close(f, 1, 'interrupted');
+  const second = mp3Open(f, 2, reference(changed)), root2 = second.root();
+  assert.equal(root2.value.state, 'ready');
+  assert.deepEqual(mp3Readings(root2.value.packet).entries.map(entry => entry.origins.map(origin => origin.delivery.id)), [[delivery.id]]);
+  assert.deepEqual(mp3Origins(root2), [['attempt 1']]); assert.deepEqual(mp3Decisions(root2.value.packet), ['included']);
+  assert.deepEqual(mp3Carried(root2).map(item => item.data.text), [MP3_NOTES.slice(0, 9)], 'The read before the owed correction is carried');
+  const sends = f.sent().length, before = f.store.list().map(reference);
+  f.restart();
+  assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(root2) })), root2);
+  assert.deepEqual(valueOf(writeQuestionPacket(f.store, second.request)).record, root2);
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, sends);
+});
+test('MP3 №3171 (novelty): an existing empty directory is new knowledge the first time it is searched; searching it again with any query adds nothing', async t => {
+  const m = mp3Cycle(t), { f } = m;
+  mkdirSync(join(f.root, 'empty-search'));
+  f.steps([{ research: m.need([MP3_EMPTY_SEARCH]), usage }, { research: m.need([{ ...MP3_EMPTY_SEARCH, query: 'another' }]), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(f.sent().length, 2, 'The first search of the empty directory is progress: its continuation is sent');
+  assert.equal(cycle.record.value.terminal, 'research-no-progress', 'The same directory again holds nothing new');
+});
+
+test('MP3 row 21 (delivery): an addressed read whose source changed after E3 keeps the prior freshness refusal of delivery and writes nothing', async t => {
+  const m = mp3Cycle(t), { f } = m;
+  f.steps([{ research: m.need([m.range(0, 9)]), usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request));
+  assert.equal(first.outcome?.kind, 'need-source');
+  writeFileSync(join(f.root, 'mp3-notes.txt'), 'Changed after E3.');
+  const before = f.store.list().map(reference);
+  const refused = deliverModelSources(f.store, { project: f.project, packet: first.packet, call: first.call, response: first.response! });
+  assert.equal(refused.ok, false); if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.ref], ['input_stale', reference(m.notes)]);
+  assert.deepEqual(f.store.list().map(reference), before);
+});
+
+/**
+ * MP3 era (№2981 §7): the accepted MP1 producer from Git — its engine and its own fixtures, in a process of its own — runs a
+ * managed attempt that delivers an addressed read and is refused, and G7 closes it. Nothing of it is imitated here.
+ */
+function mp3PriorAttempt(t: TestContext, commit: string) {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-mp3-prior-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(directory, 'prior-loader.mjs');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/', root).href;
+  if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
+  const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
+  let source = execFileSync('git', ['show', ${JSON.stringify(commit + ':')} + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 20000000 });
+  if (relative === 'test/om-model-call.test.ts') {
+    source = source.replace('import test from "node:test";', 'const test = Object.assign(() => {}, { skip() {}, only() {} });');
+    source += '\\nexport { e4Fixture, e4NeedSource, e4CannotAnswer, completionSnapshot };';
+  }
+  return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+}
+`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const script = `
+const root = ${JSON.stringify(repositoryUrl)}, src = name => new URL('dist/src/' + name, root).href;
+const fixtures = await import(new URL('dist/test/om-model-call.test.js', root).href);
+const { reference } = await import(src('pipeline/contracts.js'));
+const { runModelCycle } = await import(src('om/model-call.js'));
+const { closeAttempt } = await import(src('om/repeat-gate.js'));
+const { seriesRequestOf } = await import(src('om/series.js'));
+const { Evidence } = await import(src('evidence/evidence.js'));
+const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const f = fixtures.e4Fixture({ after() {} }, 'fact', 100000, 0, 5000, true, true, false, undefined, (store, project, folder) => {
+  writeFileSync(join(folder, 'mp3-notes.txt'), ${JSON.stringify(MP3_NOTES)});
+  new Evidence(store).file(project, 'mp3-notes', folder, 'mp3-notes.txt', 'text/plain', 0);
+});
+const notes = f.store.get('source:' + f.project + ':mp3-notes');
+const need = { ...fixtures.e4NeedSource(f, [{ action: 'read_source', source: reference(notes), selector: { kind: 'text-range', start: 0, end: 9 } }]),
+  questionIds: f.packet.value.packet.questions.map(question => question.id) };
+f.steps([{ research: need }, { research: fixtures.e4CannotAnswer(f) }]);
+const cycle = take(await runModelCycle(f.store, f.request));
+const work = fixtures.completionSnapshot(f);
+take(closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1, outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: work.refusals } }));
+process.stdout.write(JSON.stringify({ root: f.root, database: f.database, project: f.project, packetRequest: f.packetRequest, routes: reference(f.routes),
+  batch: f.batch.id, series: f.series.id, notes: reference(notes), cycle: reference(cycle.record), packet: reference(f.packet), scenario: f.scenario }));
+f.store.close();
+`;
+  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
+    '--input-type=module', '--eval', script], { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 })) as {
+    root: string; database: string; project: string; packetRequest: QuestionPacketRequest; routes: Ref; batch: string; series: string;
+    notes: Ref; cycle: Ref; packet: Ref; scenario: string };
+  t.after(() => rmSync(output.root, { recursive: true, force: true }));
+  return output;
+}
+// The code before MP3 — merged MP1 and MP2 (om/module 08be75a7).
+const MP3_PRIOR_COMMIT = '08be75a785bac8d2cc88efe930dc05be9ffd4cc6';
+
+test('MP3 era: a new MP3 root carries a lawful delivery of the producer before MP3 (MP1+MP2) in the addressed form, while the earlier records keep their bytes and read back unchanged', async t => {
+  const prior = mp3PriorAttempt(t, MP3_PRIOR_COMMIT);
+  const store = new Store(prior.database);
+  t.after(() => store.close());
+  const old = valueOf(readModelCycle(store, { project: prior.project, record: prior.cycle }));
+  const oldPacket = valueOf(readQuestionPacket(store, { project: prior.project, record: prior.packet }));
+  assert.equal(briefReadings(oldPacket.value.packet), null, 'The MP1 root has no readings');
+  const delivery = store.list<{ data: unknown }>('om-read-delivery');
+  assert.deepEqual(delivery.map(row => row.value.data), [MP3_NOTES.slice(0, 9)], 'The MP1 delivery keeps its own form');
+  const before = store.list().map(reference);
+  const series = store.get<RepairSeries>(prior.series)!;
+  const opened = valueOf(managedOpenAttempt(store, { ...seriesRequestOf(series.value), attempt: 2, goal: series.value.attempts[0]!.goal,
+    completion: { routes: prior.routes, batches: [prior.batch] } } as never));
+  const root = valueOf(writeQuestionPacket(store, { ...prior.packetRequest, attempt: { series: reference(opened), ordinal: 2 } })).record;
+  const readings = mp3Readings(root.value.packet);
+  assert.equal(readings.entries.length, 1);
+  assert.deepEqual(readings.entries[0]!.data, { contract: 'om-read-result/v1', outcome: 'complete', requested: { start: 0, end: 9 },
+    length: MP3_NOTES.length, unit: 'utf16', served: { start: 0, end: 9 }, text: MP3_NOTES.slice(0, 9) }, 'Its representation changes, not its record');
+  assert.deepEqual(readings.entries[0]!.origins.map(origin => origin.delivery), delivery.map(reference));
+  assert.deepEqual(readings.entries[0]!.decision, { state: 'included' });
+  for (const row of delivery) assert.deepEqual(store.get(row.id, row.revision), row, 'The earlier delivery record is unchanged');
+  assert.deepEqual(valueOf(readModelCycle(store, { project: prior.project, record: prior.cycle })), old);
+  assert.ok(before.every(ref => canonical(store.get(ref.id, ref.revision) && reference(store.get(ref.id, ref.revision)!)) === canonical(ref)));
+});
+
+test('MP3 row 17: a stop after each saving transition of an addressed read cycle resumes exactly — one send per call, one settlement each, one delivery set', async t => {
+  const script = (m: ReturnType<typeof mp3Cycle>) => [{ research: m.need([m.range(0, 9), m.range(m.length + 1, m.length + 5), m.pointer('/list/9')]), usage },
+    { research: e4Fact(m.f), usage }];
+  const phases: CycleCommitPhase[] = [];
+  {
+    const m = mp3Cycle(t), { f } = m; f.steps(script(m));
+    const write = f.store.writeMany.bind(f.store);
+    f.store.writeMany = ((writes, guards) => { const committed = write(writes, guards); if (writes.length) phases.push(cycleCommitPhase(writes)); return committed; }) as Store['writeMany'];
+    try { valueOf(await runModelCycle(f.store, f.request)); } finally { f.store.writeMany = write; }
+  }
+  assert.ok(phases.includes('deliveries') && phases.includes('continuation') && phases.at(-1) === 'cycle');
+  for (const [index, phase] of phases.entries()) {
+    if (phase === 'running' || phase === 'authorized') continue;
+    await t.test(`stop after transaction ${index + 1}: ${phase}`, async nested => {
+      const m = mp3Cycle(nested), { f } = m; f.steps(script(m));
+      const write = f.store.writeMany.bind(f.store);
+      let count = 0;
+      f.store.writeMany = ((writes, guards) => {
+        const committed = write(writes, guards);
+        if (writes.length && count++ === index) throw new Error('MP3 simulated stop');
+        return committed;
+      }) as Store['writeMany'];
+      try { await assert.rejects(runModelCycle(f.store, f.request), /MP3 simulated stop/); } finally { f.store.writeMany = write; }
+      f.restart();
+      const resumed = valueOf(await runModelCycle(f.store, f.request));
+      assert.equal(resumed.record.value.terminal, 'outcome'); assert.equal(f.sent().length, 2, 'Each call is sent once');
+      const calls = f.store.list<{ status: string; usage: unknown }>('call-record');
+      assert.equal(calls.length, 2);
+      for (const call of calls) { assert.equal(call.value.status, 'succeeded'); assert.deepEqual(call.value.usage, usage); }
+      assert.equal(f.store.list('om-read-delivery-set').length, 1); assert.equal(f.store.list('om-read-delivery').length, 3);
+      const snapshot = f.store.list(); f.restart();
+      assert.equal(valueOf(await runModelCycle(f.store, f.request)).repeated, true);
+      assert.deepEqual(f.store.list(), snapshot); assert.equal(f.sent().length, 2);
+    });
+  }
+});

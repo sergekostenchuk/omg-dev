@@ -400,7 +400,6 @@ test('E3 refuses unaddressed, foreign, malformed and executable control requests
     { action: 'read_source', source: reference(source), selector: { kind: 'text-range', start: 5, end: 1 } },
     { action: 'read_source', source: reference(source), selector: { kind: 'json-pointer', pointer: '/bad~2escape' } },
     { action: 'read_source', source: reference(foreign), selector: { kind: 'json-pointer', pointer: '/format' } },
-    { action: 'read_context', record: reference(f.input), pointer: '/missing' },
     { action: 'read_context', record: { ...reference(f.input), hash: '0'.repeat(64) }, pointer: '/input' },
     { action: 'search', query: 'format' }, { action: 'search', within: '../', query: 'format' },
     { action: 'search', within: reference(foreign), query: 'format' },
@@ -417,6 +416,10 @@ test('E3 refuses unaddressed, foreign, malformed and executable control requests
     const rejected = action(f.store, { project: f.project, packet: reference(f.factPacket), raw: f.answerRaw(f.factPacket, branch) });
     assert.equal(rejected.ok, false, canonical(branch)); if (!rejected.ok) assert.ok(rejected.refusal.at.target);
   }
+  // MP3 (№2981 row 5): in the readings era an absent context segment is an addressed read result, no longer a refusal.
+  const absent = { ...base, reads: [{ action: 'read_context', record: reference(f.input), pointer: '/missing' }] };
+  for (const action of [checkAnswerForm, prepareAnswerForm])
+    assert.equal(ok(action(f.store, { project: f.project, packet: reference(f.factPacket), raw: f.answerRaw(f.factPacket, absent) })).kind, 'need-source');
   assert.deepEqual(snapshot(f.store), before);
 });
 
@@ -853,5 +856,136 @@ test('MP1 MC1 and L2 examples pass the same E3 admission as model content and co
       if (example.action === 'answer' && packet === f.factPacket) assert.equal(actual.kind, 'fact-candidates');
     }
     assert.deepEqual(snapshot(f.store), before);
+  }
+});
+
+// MP3 (№2981, readings decision №3058): addressed read results in the era of new independent brief roots.
+import { briefReadings, briefAnswerRepairable } from '../src/om/packet-brief.js';
+import { readTextResult, readPointerResult, pointerSegments, READ_RESULT_CONTRACT } from '../src/om/answer-form.js';
+import { contextValue } from '../src/discovery/working-context.js';
+const MP3_JSON = '{"format":"json","list":[1,2],"":"empty","a/b":1,"m~n":2,"nul":null,"__proto__":{"own":true},"deep":{"x":{"y":[]}}}';
+const MP3_TEXT = 'Кириллица 😀 text';
+function mp3Fixture(t: TestContext) {
+  const f = fixture(t, valueForm, false, (store, project) => {
+    new Evidence(store).document(project, 'mp3-json', MP3_JSON, 'application/json', 0);
+    new Evidence(store).document(project, 'mp3-text', MP3_TEXT, 'text/plain', 0);
+    new Evidence(store).document(project, 'mp3-empty', '', 'text/plain', 0);
+  });
+  const source = (id: string) => f.store.get(`source:${f.project}:${id}`)!;
+  assert.ok(briefReadings(f.factPacket.value.packet), 'A new independent brief root opens the readings era');
+  const need = (reads: object[]) => ({ project: f.project, packet: reference(f.factPacket), raw: f.answerRaw(f.factPacket,
+    { action: 'need_source', questionIds: f.questionIds(f.factPacket), missing: 'Need the addressed material', reads }) });
+  return { f, json: source('mp3-json'), text: source('mp3-text'), empty: source('mp3-empty'), need };
+}
+
+test('MP3 row 4: in the readings era E3 refuses an empty, reversed, unsafe, unescaped or media-incompatible selector at its address; the wire shape stays the MP2-classified form refusal', t => {
+  const { f, json, text, empty, need } = mp3Fixture(t), before = snapshot(f.store);
+  const addressed: object[] = [{ kind: 'text-range', start: 5, end: 5 }, { kind: 'text-range', start: 6, end: 2 },
+    { kind: 'text-range', start: 0, end: 2 ** 60 }, { kind: 'text-range', start: 2 ** 60, end: 2 ** 61 }]
+    .map(selector => ({ action: 'read_source', source: reference(text), selector }));
+  addressed.push({ action: 'read_source', source: reference(json), selector: { kind: 'json-pointer', pointer: '/bad~2escape' } },
+    { action: 'read_source', source: reference(json), selector: { kind: 'json-pointer', pointer: 'format' } },
+    { action: 'read_source', source: reference(text), selector: { kind: 'json-pointer', pointer: '' } },
+    { action: 'read_source', source: reference(empty), selector: { kind: 'json-pointer', pointer: '' } },
+    { action: 'read_context', record: reference(f.input), pointer: '/input~' });
+  for (const read of addressed) for (const check of [checkAnswerForm, prepareAnswerForm]) {
+    const refusal = rejected(check(f.store, need([read])), 'answer_form_address_invalid');
+    assert.ok(['selector', 'pointer'].includes(refusal.at.field!), canonical(read));
+    assert.equal(briefAnswerRepairable(refusal.code, refusal.at.field!), false, 'An E3 address refusal is no correctable answer form');
+  }
+  const wire = [{ kind: 'text-range', start: -1, end: 4 }, { kind: 'text-range', start: 0, end: 4, unit: 'bytes' }, { kind: 'text-range', start: 0.5, end: 4 }]
+    .map(selector => ({ action: 'read_source', source: reference(text), selector }));
+  for (const read of wire) for (const check of [checkAnswerForm, prepareAnswerForm]) {
+    const refusal = rejected(check(f.store, need([read])), 'part_answer_invalid');
+    assert.equal(briefAnswerRepairable(refusal.code, refusal.at.field!), true, 'Correction follows only the MP2 classification of the wire form');
+  }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('MP3 row 5: an absent pointer segment of a source or saved context and a range past the end are admitted for addressed results, with every other read of the answer kept', t => {
+  const { f, json, text, empty, need } = mp3Fixture(t), before = snapshot(f.store);
+  const reads = [
+    { action: 'read_source', source: reference(json), selector: { kind: 'json-pointer', pointer: '/missing' } },
+    { action: 'read_source', source: reference(json), selector: { kind: 'json-pointer', pointer: '/list/7/x' } },
+    { action: 'read_context', record: reference(f.input), pointer: '/input/absent' },
+    { action: 'read_source', source: reference(text), selector: { kind: 'text-range', start: 3, end: 9000 } },
+    { action: 'read_source', source: reference(text), selector: { kind: 'text-range', start: 9000, end: 9001 } },
+    { action: 'read_source', source: reference(empty), selector: { kind: 'text-range', start: 0, end: 1 } },
+    { action: 'read_source', source: reference(json), selector: { kind: 'json-pointer', pointer: '/format' } },
+  ];
+  for (const check of [checkAnswerForm, prepareAnswerForm]) {
+    const form = ok(check(f.store, need(reads)));
+    assert.equal(form.kind, 'need-source');
+    if (form.kind === 'need-source') assert.deepEqual([...form.reads].map(read => canonical(read)).sort(), reads.map(read => canonical(read)).sort());
+  }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('MP3 row 6: the selector admitted as a read stays a strict D5 refusal as the citation of a final answer', t => {
+  const { f, json, text, need } = mp3Fixture(t), before = snapshot(f.store);
+  for (const { source, selector } of [{ source: text, selector: { kind: 'text-range', start: 3, end: 9000 } },
+    { source: json, selector: { kind: 'json-pointer', pointer: '/missing' } }]) {
+    assert.equal(ok(checkAnswerForm(f.store, need([{ action: 'read_source', source: reference(source), selector }]))).kind, 'need-source');
+    const raw = f.answerRaw(f.factPacket, { action: 'answer', results: [{ questionId: f.questionIds(f.factPacket)[0],
+      value: { format: 'json', versions: [1] }, citations: [{ source: reference(source), selector }] }] });
+    for (const check of [checkAnswerForm, prepareAnswerForm]) rejected(check(f.store, { project: f.project, packet: reference(f.factPacket), raw }), 'answer_unconfirmed');
+    rejected(readAnswerCitations(f.store, { project: f.project, citations: [{ source: reference(source), selector: selector as never }] }), 'answer_unconfirmed');
+  }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+test('MP3 row 21 (E3): a rehashed, foreign or nonexistent source reference of the model keeps its prior addressed refusal and never becomes a missing result', t => {
+  const { f, text, need } = mp3Fixture(t), before = snapshot(f.store);
+  const foreign = new Evidence(f.store).document('foreign', 'mp3-text', MP3_TEXT, 'text/plain', 0), after = snapshot(f.store);
+  for (const source of [{ ...reference(text), hash: '0'.repeat(64) }, { ...reference(text), revision: 9 }, reference(foreign)])
+    for (const selector of [{ kind: 'text-range', start: 0, end: 4 }, { kind: 'text-range', start: 9000, end: 9001 }])
+      for (const check of [checkAnswerForm, prepareAnswerForm])
+        rejected(check(f.store, need([{ action: 'read_source', source, selector }])), 'answer_label_unknown');
+  assert.notDeepEqual(before, after); assert.deepEqual(snapshot(f.store), after);
+});
+
+test('MP3 row 23: read results keep UTF-16 units, pointer escapes, empty keys, arrays and null exactly as Evidence and context reads, never reading the prototype', t => {
+  const { f, json, text } = mp3Fixture(t), evidence = new Evidence(f.store), pair = MP3_TEXT.indexOf('😀');
+  const range = (start: number, end: number) => readTextResult(MP3_TEXT, { start, end });
+  assert.deepEqual(range(pair, pair + 1), { contract: READ_RESULT_CONTRACT, outcome: 'complete', requested: { start: pair, end: pair + 1 },
+    length: MP3_TEXT.length, unit: 'utf16', served: { start: pair, end: pair + 1 }, text: '\ud83d' }, 'No boundary moves around a surrogate pair');
+  assert.deepEqual(range(pair + 1, 9000), { contract: READ_RESULT_CONTRACT, outcome: 'clipped', requested: { start: pair + 1, end: 9000 },
+    length: MP3_TEXT.length, unit: 'utf16', served: { start: pair + 1, end: MP3_TEXT.length }, text: MP3_TEXT.slice(pair + 1) });
+  assert.deepEqual(range(MP3_TEXT.length, MP3_TEXT.length + 1), { contract: READ_RESULT_CONTRACT, outcome: 'outside',
+    requested: { start: MP3_TEXT.length, end: MP3_TEXT.length + 1 }, length: MP3_TEXT.length, unit: 'utf16', served: null, text: null });
+  assert.deepEqual(readTextResult('', { start: 0, end: 1 }), { contract: READ_RESULT_CONTRACT, outcome: 'outside', requested: { start: 0, end: 1 },
+    length: 0, unit: 'utf16', served: null, text: null });
+  for (const [start, end] of [[0, 9], [pair, pair + 2], [0, MP3_TEXT.length]] as const)
+    assert.equal((range(start, end) as { text: string }).text, evidence.observe(f.project, reference(text), { kind: 'text-range', start, end }).value);
+  const parsed = JSON.parse(MP3_JSON);
+  for (const pointer of ['', '/', '/a~1b', '/m~0n', '/list/1', '/list/2', '/list/length', '/nul', '/nul/x', '/format/x', '/__proto__',
+    '/__proto__/own', '/constructor', '/toString', '/deep/x/y', '/deep/x/y/0', '/a~1b~0/z']) {
+    const result = readPointerResult(parsed, pointer)!;
+    let observed: unknown, code: string | null = null;
+    try { observed = evidence.observe(f.project, reference(json), { kind: 'json-pointer', pointer }).value; }
+    catch (error) { code = (error as EngineError).code; }
+    if (result.outcome === 'complete') { assert.equal(code, null, pointer); assert.deepEqual((result as { value: unknown }).value, observed, pointer); }
+    else assert.equal(code, 'evidence_missing', pointer);
+  }
+  assert.deepEqual(readPointerResult(parsed, '/'), { contract: READ_RESULT_CONTRACT, outcome: 'complete', requested: { pointer: '/' }, value: 'empty' });
+  assert.deepEqual(readPointerResult(parsed, '/__proto__'), { contract: READ_RESULT_CONTRACT, outcome: 'complete', requested: { pointer: '/__proto__' }, value: { own: true } });
+  assert.deepEqual(readPointerResult(parsed, '/list/2'), { contract: READ_RESULT_CONTRACT, outcome: 'missing', requested: { pointer: '/list/2' },
+    missing: '2', parent: { pointer: '/list', type: 'array', keys: ['0', '1'], length: 2 } });
+  assert.deepEqual(readPointerResult(parsed, '/nul/x'), { contract: READ_RESULT_CONTRACT, outcome: 'missing', requested: { pointer: '/nul/x' },
+    missing: 'x', parent: { pointer: '/nul', type: 'null', keys: [] } });
+  assert.deepEqual(readPointerResult(parsed, '/deep/x/z~1w'), { contract: READ_RESULT_CONTRACT, outcome: 'missing', requested: { pointer: '/deep/x/z~1w' },
+    missing: 'z/w', parent: { pointer: '/deep/x', type: 'object', keys: ['y'] } });
+  assert.deepEqual(readPointerResult(parsed, '/constructor'), { contract: READ_RESULT_CONTRACT, outcome: 'missing', requested: { pointer: '/constructor' },
+    missing: 'constructor', parent: { pointer: '', type: 'object', keys: ['', '__proto__', 'a/b', 'deep', 'format', 'list', 'm~n', 'nul'] } });
+  assert.deepEqual(readPointerResult(parsed, '/format/x')!.outcome === 'missing' && (readPointerResult(parsed, '/format/x') as { parent: object }).parent,
+    { pointer: '/format', type: 'string', keys: [] });
+  for (const invalid of ['x', '/~2', '/a~', 5]) { assert.equal(pointerSegments(invalid), null); if (typeof invalid === 'string') assert.equal(readPointerResult(parsed, invalid), null); }
+  const record = f.input.value;
+  for (const pointer of ['', '/input', '/input/questions', '/absent', '/input/questions/0/question', '/input/questions/9']) {
+    const result = readPointerResult(record, pointer)!;
+    let value: unknown, missing = false;
+    try { value = contextValue(record, pointer); } catch (error) { missing = (error as EngineError).code === 'context_missing'; }
+    assert.equal(result.outcome === 'missing', missing, pointer);
+    if (result.outcome === 'complete') assert.deepEqual((result as { value: unknown }).value, JSON.parse(canonical(value)), pointer);
   }
 });

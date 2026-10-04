@@ -1,5 +1,5 @@
 import { Ajv } from 'ajv';
-import { canonical, hashJson, type Json } from '../canonical.js';
+import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
@@ -15,6 +15,8 @@ import { inputDecisionWrite, deriveInputDecisions, prepareAddressing, type Input
 import { readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
 import { readPacketAnswer, packetReadPath, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
   type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest, type WorksPartBindings } from './question-packet.js';
+import { briefReadings } from './packet-brief.js';
+import type { Source } from '../evidence/evidence.js';
 import type { LayerProposal } from './frame-proposals.js';
 import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import { delivered, isPlainObject, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -39,6 +41,7 @@ export type AnswerFormOutcome = NodeAnswerForm | FactValueForm;
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const references = (refs: readonly Ref[]) => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
 // H1.0d (№1715): transaction conditions of the current admission, including absences; provenance stays Ref[].
@@ -217,6 +220,90 @@ export function prepareInputFieldAnswer(store: Store, request: InputFieldAnswerR
   return result(() => fieldForm(store, request, true));
 }
 
+/**
+ * MP3 (№2981 п.2): the addressed result of one read, distinct from a citation. Offsets are UTF-16 units of the whole saved
+ * content and are never moved around a surrogate pair; a pointer walks own properties exactly as Evidence and context reads do.
+ */
+export const READ_RESULT_CONTRACT = 'om-read-result/v1' as const;
+export type JsonType = 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null';
+export interface JsonShape { type: JsonType; keys: string[]; length?: number }
+export type ReadRange = { start: number; end: number };
+export type ReadResult =
+  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'complete' | 'clipped'; requested: ReadRange; length: number; unit: 'utf16'; served: ReadRange; text: string }
+  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'outside'; requested: ReadRange; length: number; unit: 'utf16'; served: null; text: null }
+  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'complete'; requested: { pointer: string }; value: Json }
+  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'missing'; requested: { pointer: string }; missing: string; parent: { pointer: string } & JsonShape };
+/** The one pointer syntax of Evidence and saved context: '' or '/'-prefixed, ~ escaped only as ~0 and ~1. */
+export function pointerSegments(pointer: unknown): { encoded: string[]; decoded: string[] } | null {
+  if (typeof pointer !== 'string' || pointer !== '' && !pointer.startsWith('/')) return null;
+  const encoded = pointer === '' ? [] : pointer.slice(1).split('/');
+  if (encoded.some(part => /~(?![01])/.test(part))) return null;
+  return { encoded, decoded: encoded.map(part => part.replaceAll('~1', '/').replaceAll('~0', '~')) };
+}
+export function jsonShape(value: unknown): JsonShape {
+  if (value === null) return { type: 'null', keys: [] };
+  if (Array.isArray(value)) return { type: 'array', keys: Object.keys(value), length: value.length };
+  if (typeof value === 'object') return { type: 'object', keys: Object.keys(value).sort(order) };
+  return { type: typeof value as 'string' | 'number' | 'boolean', keys: [] };
+}
+/** Requires a checked range (safe integers, 0 <= start < end); the length is that of the whole saved content. */
+export function readTextResult(content: string, range: ReadRange): ReadResult {
+  const length = content.length, requested = { start: range.start, end: range.end };
+  if (range.start >= length) return { contract: READ_RESULT_CONTRACT, outcome: 'outside', requested, length, unit: 'utf16', served: null, text: null };
+  const end = Math.min(range.end, length);
+  return { contract: READ_RESULT_CONTRACT, outcome: end < range.end ? 'clipped' : 'complete', requested, length, unit: 'utf16',
+    served: { start: range.start, end }, text: content.slice(range.start, end) };
+}
+/** Null for a syntactically invalid pointer; an absent segment is a result, never a refusal. */
+export function readPointerResult(value: unknown, pointer: string): ReadResult | null {
+  const segments = pointerSegments(pointer);
+  if (!segments) return null;
+  let current = value;
+  for (let index = 0; index < segments.decoded.length; index++) {
+    const key = segments.decoded[index]!;
+    if (current === null || typeof current !== 'object' || !Object.hasOwn(current, key))
+      return { contract: READ_RESULT_CONTRACT, outcome: 'missing', requested: { pointer }, missing: key,
+        parent: { pointer: index ? `/${segments.encoded.slice(0, index).join('/')}` : '', ...jsonShape(current) } };
+    current = (current as Record<string, unknown>)[key];
+  }
+  return { contract: READ_RESULT_CONTRACT, outcome: 'complete', requested: { pointer }, value: JSON.parse(canonical(current)) as Json };
+}
+/** The form E3 admits for an addressed read in the MP3 era; existence and length are results of the read itself. */
+export function readSelectorProblem(selector: unknown, media: unknown): string | null {
+  if (!object(selector)) return 'A read selector is a text-range or json-pointer object';
+  const keys = Object.keys(selector);
+  if (selector.kind === 'text-range') {
+    if (keys.length !== 3 || !keys.every(key => ['kind', 'start', 'end'].includes(key)))
+      return 'A text range has exactly kind, start and end';
+    const { start, end } = selector;
+    return Number.isSafeInteger(start) && Number.isSafeInteger(end) && (start as number) >= 0 && (end as number) > (start as number) ? null
+      : 'A text range needs safe integers 0 <= start < end in UTF-16 units';
+  }
+  if (selector.kind === 'json-pointer') {
+    if (keys.length !== 2 || !keys.every(key => ['kind', 'pointer'].includes(key))) return 'A JSON pointer selector has exactly kind and pointer';
+    if (!pointerSegments(selector.pointer)) return 'Use a JSON pointer that is empty or starts with / and escapes ~ as ~0 and / as ~1';
+    return media === 'application/json' ? null : 'A JSON pointer selects only from a JSON source';
+  }
+  return 'A read selector is a text-range or json-pointer object';
+}
+/** MP3 E3 admission of read_source: exact source and selector form, never its length or the existence of a segment. */
+function sourceRead(store: Store, project: string, task: Ref, read: Extract<PacketRead, { action: 'read_source' }>): Ref[] {
+  const found = store.get<Source>(read.source.id, read.source.revision);
+  const row = found && same(reference(found), read.source) && object(found.value) ? found : null;
+  if (!row || row.value.content !== '') {
+    // D5's shared exact-source proof keeps its own refusal for a missing, foreign or damaged source; for an intact
+    // nonempty source it is the whole saved text, as at delivery.
+    const length = row && typeof row.value.content === 'string' ? row.value.content.length : 1;
+    take(readAnswerCitations(store, { project, citations: [{ source: read.source, selector: { kind: 'text-range', start: 0, end: length } }] }));
+  } else if (row.kind !== 'source' || !read.source.id.startsWith(`source:${project}:`) || row.value.projectId !== project
+    || digest('') !== row.value.sha256 || row.value.mediaType !== 'text/plain' || !object(row.value.origin)
+    || !['file', 'owner-document'].includes(row.value.origin.kind) || !text(row.value.origin.location))
+    // An empty source has no nonempty range for D5; an empty JSON source is malformed.
+    fail('answer_form_address_invalid', task, 'source', 'A read needs an exact intact source of this project');
+  const problem = readSelectorProblem(read.selector, found!.value.mediaType);
+  if (problem) fail('answer_form_address_invalid', task, 'selector', problem);
+  return [read.source];
+}
 function contextRecord(store: Store, project: string, task: Ref, ref: Ref) {
   const record = store.get(ref.id, ref.revision), namespace = ref.id.slice(0, ref.id.indexOf(':'));
   const address = `${namespace}:${project}`;
@@ -244,13 +331,20 @@ function checkReads(store: Store, request: PacketAnswerRequest, packet: Revision
       }
     }
   };
+  // MP3: the era of the exact packet selects the read protocol; a packet without readings keeps the D5 citation check (№57).
+  const addressed = briefReadings(packet.value.packet) !== null;
   for (const read of reads) {
     if (read.action === 'read') path(read.path);
     else if (read.action === 'read_source') {
+      if (addressed) { refs.push(...sourceRead(store, request.project, request.packet, read)); continue; }
       const cited = take(readAnswerCitations(store, { project: request.project, citations: [{ source: read.source, selector: read.selector }] }));
       refs.push(...cited.references);
     } else if (read.action === 'read_context') {
       const record = contextRecord(store, request.project, request.packet, read.record);
+      if (addressed) {
+        if (!pointerSegments(read.pointer)) fail('answer_form_address_invalid', request.packet, 'pointer', 'Use a JSON pointer');
+        refs.push(read.record); continue;
+      }
       try { contextValue(record.value, read.pointer); }
       catch (error) {
         if (error instanceof EngineError && ['selector_invalid', 'context_missing'].includes(error.code))

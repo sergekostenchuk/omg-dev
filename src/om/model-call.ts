@@ -1,10 +1,10 @@
-import { briefAnswerRepairable, briefContract, packetPrompt } from './packet-brief.js';
+import { briefAnswerRepairable, briefContract, packetPrompt, briefReadings, type BriefManifest, type BriefReadings } from './packet-brief.js';
 import type { AnswerGround } from './accepted-answer.js';
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance as readLayerAcceptanceOf, readLayerEnvelope as readLayerEnvelopeOf, readUnacceptedLayer as readUnacceptedLayerOf } from './layer-basis.js';
 import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, posix, relative } from 'node:path';
 import { EngineError } from '../errors.js';
 import { physicalClaim, authorizeModelDispatch, prepareModelCallRecovery, readModelCallRecovery,
   prepareLateModelReceipt, readLateModelReceipt, executionOf, paidModelReceipt } from '../discovery/model-call-recovery.js';
@@ -22,7 +22,8 @@ import type { ProcessResult } from '../runtime/process.js';
 import { delivered, refused, sealed, isPlainObject, localErrors, localRefusals, transfer, transferring, type Refusal, type OmResult, type Sealed, type SourceCode, type SourceCodes } from './refusal.js';
 import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
 import { readAnswerCitations as readAnswerCitationsOf, prepareAnswerCitations as prepareAnswerCitationsOf, readAcceptedAnswer as readAcceptedAnswerOf, readMc1Question as readMc1QuestionOf } from './accepted-answer.js';
-import { checkAnswerForm as checkAnswerFormOf, prepareAnswerForm as prepareAnswerFormOf } from './answer-form.js';
+import { checkAnswerForm as checkAnswerFormOf, prepareAnswerForm as prepareAnswerFormOf, readSelectorProblem, readTextResult, readPointerResult,
+  pointerSegments, jsonShape, READ_RESULT_CONTRACT, type ReadResult } from './answer-form.js';
 import { readPacketResponse as readPacketResponseOf, readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf, normalizePartAnswer as normalizePartAnswerOf, type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
 import { readRoutes as readRoutesOf } from './routes.js';
 import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as prepareFrameProposalsOf, type LayerProposal } from './frame-proposals.js';
@@ -285,9 +286,24 @@ function exactSource(store: Store, project: string, ref: Ref, current: boolean):
   }
   return record as Revision<Source>;
 }
-function deliveryData(store: Store, project: string, environment: Environment, read: PacketRead, sources: Ref[], current: boolean): Json {
+/** MP3: the delivery form follows the exact packet it answers; readings mark the addressed-result era. */
+const addressedEra = (packet: QuestionPacketRecord) => briefReadings(packet.packet) !== null;
+function deliveryData(store: Store, project: string, environment: Environment, read: PacketRead, sources: Ref[], current: boolean, addressed: boolean): Json {
   if (read.action === 'read_source') {
     if (!same(sources, [read.source])) fail('model_delivery_invalid', read.source.id, 'sources', 'The selected source must be the requested source');
+    if (addressed) {
+      const source = exactSource(store, project, read.source, current);
+      if (readSelectorProblem(read.selector, source.value.mediaType))
+        fail('model_delivery_invalid', read.source.id, 'selector', 'Only an E3-admitted selector is delivered', read.source);
+      if (read.selector.kind === 'text-range') return readTextResult(source.value.content, read.selector) as unknown as Json;
+      let parsed: unknown;
+      try { parsed = JSON.parse(source.value.content); }
+      catch (error) {
+        if (error instanceof SyntaxError) fail('model_delivery_invalid', read.source.id, 'source', 'The captured JSON source is malformed', read.source);
+        throw error;
+      }
+      return readPointerResult(parsed, read.selector.pointer) as unknown as Json;
+    }
     const request = { project, citations: [{ source: read.source, selector: read.selector }] };
     const checked = current ? take(prepareAnswerCitations(store, request)) : take(readAnswerCitations(store, request));
     return checked.grounds[0]!.observation.value as Json;
@@ -298,6 +314,11 @@ function deliveryData(store: Store, project: string, environment: Environment, r
     if (!found || !same(reference(found), read.record)) fail('model_delivery_invalid', read.record.id, 'record', 'The exact context record must exist');
     const head = current ? store.get(read.record.id) : null;
     if (current && (!head || !same(reference(head), read.record))) fail('input_stale', read.record.id, 'record', 'The selected context changed');
+    if (addressed) {
+      const result = readPointerResult(found.value, read.pointer);
+      if (!result) fail('model_delivery_invalid', read.record.id, 'pointer', 'Only an E3-admitted pointer is delivered', read.record);
+      return result as unknown as Json;
+    }
     return contextValue(found.value, read.pointer) as Json;
   }
   const records = sources.map(ref => exactSource(store, project, ref, current));
@@ -335,6 +356,7 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
     const envRef = response.packet.value.request.environment;
     const environment = take(readRecord<Environment>(store, envRef, { unit: 'E4', target: envRef.id, id: `environment:${request.project}`, kind: 'environment' }));
     const references: Ref[] = [...response.references, envRef], guards: TransactionGuard[] = prepared ? [...prepared.guards] : [];
+    const addressed = addressedEra(response.packet.value as QuestionPacketRecord);
     const data = request.deliveries.map((ref, index) => {
       const record = take(readRecord<ReadDeliveryRecord>(store, ref, { unit: 'E4', target: ref.id, idPrefix: `om-read-delivery:${request.project}:`, kind: READ_DELIVERY_KIND }));
       const value = record.value;
@@ -343,7 +365,7 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
         || value.project !== request.project || !same(value.packet, request.packet) || !same(value.call, request.call)
         || !same(value.response, request.response) || !same(value.questionIds, checked.questionIds) || !same(value.read, checked.reads[index]))
         fail('model_delivery_invalid', ref.id, 'delivery', 'A delivery belongs to this response, question set and requested read', ref);
-      const expected = deliveryData(store, request.project, environment.value as Environment, value.read as PacketRead, value.sources as Ref[], current);
+      const expected = deliveryData(store, request.project, environment.value as Environment, value.read as PacketRead, value.sources as Ref[], current, addressed);
       if (!same(expected, value.data)) fail('model_delivery_invalid', ref.id, 'data', 'The delivery must reproduce data from the exact saved sources', ref);
       references.push(ref, ...value.sources); if (current) guards.push(ref, ...value.sources);
       return { delivery: ref, questionIds: value.questionIds, read: value.read, sources: value.sources, data: value.data } as unknown as Json;
@@ -394,6 +416,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
     const envRef = response.packet.value.request.environment;
     const environment = take(readRecord<Environment>(store, envRef, { unit: 'E4', target: envRef.id, id: `environment:${request.project}`, kind: 'environment' }));
     const capture = new ResearchSources(store, request.project, environment.value.workspace);
+    const addressed = addressedEra(response.packet.value as QuestionPacketRecord);
     const writes: Write[] = [], deliveries: Ref[] = [], guards: TransactionGuard[] = [...checked.guards, request.response];
     for (const read of checked.reads) {
       let sources: Ref[];
@@ -402,18 +425,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
         else if (read.action === 'read_source') sources = [read.source];
         else if (read.action === 'read_context') sources = [read.record];
         else if (typeof read.within !== 'string') sources = [read.within];
-        else {
-          const paths: string[] = [];
-          const visit = (path: string) => {
-            const absolute = workspacePath(environment.value.workspace, path);
-            if (realpathSync(absolute) !== absolute) fail('model_read_unavailable', path, 'path', 'Search uses concrete paths without symbolic aliases');
-            if (statSync(absolute).isDirectory()) for (const entry of readdirSync(absolute).sort()) {
-              if (entry !== '.git') visit(`${path}/${entry}`);
-            } else paths.push(path);
-          };
-          visit(read.within);
-          sources = paths.map(path => reference(capture.read(path, 'text/plain')));
-        }
+        else sources = searchScopeFiles(environment.value.workspace, read.within).map(file => reference(capture.read(file.path, 'text/plain')));
       } catch (error) {
         if (error instanceof CallFailure) throw error;
         if (error instanceof EngineError || object(error) && ['ENOENT', 'ENOTDIR', 'EACCES', 'EISDIR'].includes(String(error.code)))
@@ -421,7 +433,7 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
         throw error;
       }
       const value: ReadDeliveryRecord = { ...request, questionIds: [...checked.questionIds], read: read as PacketRead, sources,
-        data: deliveryData(store, request.project, environment.value as Environment, read as PacketRead, sources, true) };
+        data: deliveryData(store, request.project, environment.value as Environment, read as PacketRead, sources, true, addressed) };
       const id = deliveryId(value), old = store.get(id);
       if (old && (old.kind !== READ_DELIVERY_KIND || old.revision !== 1 || !same(old.value, value)))
         fail('model_delivery_invalid', id, 'record', 'An immutable delivery cannot be replaced');
@@ -436,6 +448,54 @@ export function deliverModelSources(store: Store, request: ReadDeliveryRequest):
   });
 }
 
+/**
+ * The concrete files of a search over a workspace path — the one walk of the delivery producer and of the carried scope's
+ * currency (MP3, Codex-omg №3190): concrete paths only, no symbolic alias, directories in sorted order, never .git.
+ */
+function searchScopeFiles(workspace: string, within: string): { path: string; location: string }[] {
+  const files: { path: string; location: string }[] = [];
+  const visit = (path: string) => {
+    const absolute = workspacePath(workspace, path);
+    if (realpathSync(absolute) !== absolute) fail('model_read_unavailable', path, 'path', 'Search uses concrete paths without symbolic aliases');
+    if (statSync(absolute).isDirectory()) for (const entry of readdirSync(absolute).sort()) {
+      if (entry !== '.git') visit(`${path}/${entry}`);
+    } else files.push({ path, location: absolute });
+  };
+  visit(within);
+  return files;
+}
+/**
+ * Today's scope of a carried search over a workspace path by that same walk: the locations of its files, or null when the walk
+ * no longer holds there (a missing or aliased path, an escape). Reads the directory only: nothing is captured or delivered.
+ */
+export function currentSearchScope(workspace: string, within: string): string[] | null {
+  try { return searchScopeFiles(workspace, within).map(file => file.location); }
+  catch (error) {
+    if (error instanceof CallFailure || error instanceof EngineError
+      || object(error) && ['ENOENT', 'ENOTDIR', 'EACCES', 'EISDIR', 'ELOOP'].includes(String(error.code))) return null;
+    throw error;
+  }
+}
+/** MP3 carry-over: the deterministic set address of one physical step; the set itself is written only by delivery. */
+export function deliverySetAddress(basis: ReadDeliveryRequest): string {
+  if (!object(basis) || !text(basis.project) || ![basis.packet, basis.call, basis.response].every(isRef)) invalid('delivery');
+  return deliverySetId({ project: basis.project, packet: basis.packet, call: basis.call, response: basis.response });
+}
+/** The exact saved set of one step, with every delivery proved by the common historical continuation proof. */
+export function readDeliverySet(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<{ basis: ReadDeliveryRequest; deliveries: Ref[]; data: Json[] }>> {
+  if (!(store instanceof Store) || !text(project) || !isRef(ref)) invalid('delivery.set');
+  return result(() => {
+    const set = take(readRecord<ContinuationEvidenceRequest>(store, ref, { unit: 'E4', target: ref.id, idPrefix: `om-read-deliveries:${project}:`, kind: DELIVERY_SET_KIND }));
+    const value = set.value;
+    if (set.revision !== 1 || !object(value) || !exactKeys(value, ['project', 'packet', 'call', 'response', 'deliveries'])
+      || value.project !== project || ![value.packet, value.call, value.response].every(isRef)
+      || !Array.isArray(value.deliveries) || !value.deliveries.every(isRef)
+      || set.id !== deliverySetId({ project, packet: value.packet, call: value.call, response: value.response }))
+      fail('model_delivery_invalid', ref.id, 'record', 'A delivery set has one immutable exact step', ref);
+    const proof = take(readContinuationEvidence(store, { ...value, deliveries: [...value.deliveries] }));
+    return { basis: { project, packet: value.packet, call: value.call, response: value.response }, deliveries: [...value.deliveries], data: proof.data as Json[] };
+  });
+}
 
 export interface PartAssemblyRequest { project: string; results: Ref[] }
 export interface PartAssemblyRecord { project: string; results: Ref[]; proposal: Ref; works?: WorksPartBindings }
@@ -717,7 +777,117 @@ function owedCorrection(store: Store, project: string, products: readonly Ref[],
   for (const claim of claims) if (store.get(claim)) fail('completion_claim_exists', claim, 'claim', 'A dispatched correction resolves through its own physical outcome');
   return { claims: [...claims] };
 }
+/**
+ * MP3 (№2981 п.3): a fact the model could see. Sources keep the existing knowledge identity (origin and media), so an unchanged
+ * recapture adds nothing and a changed content does; text is known by UTF-16 coverage, JSON by value or parent shape.
+ */
+type Fact =
+  | { kind: 'text'; address: string; start: number; end: number; text: string }
+  | { kind: 'length'; address: string; length: number }
+  | { kind: 'value'; address: string; path: string[]; value: unknown; content: string | null }
+  | { kind: 'shape'; address: string; path: string[]; shape: Json; content: string | null }
+  | { kind: 'absent'; query: string; within: string | null; scope: { address: string; content: string }[] };
+interface DeliveredRow { read: PacketRead; sources: Ref[]; data: Json }
+function knownRecord(store: Store, ref: unknown): Revision<Source> {
+  const record = isRef(ref) ? store.get<Source>(ref.id, ref.revision) : undefined;
+  if (!record || !same(reference(record), ref)) fail('model_delivery_invalid', isRef(ref) ? ref.id : 'knowledge', 'source', 'Knowledge needs its exact captured source');
+  return record;
+}
+const knowledgeAddress = (record: Revision<Source>) => record.kind === 'source'
+  ? canonical({ origin: record.value.origin, media: record.value.mediaType }) : canonical({ record: record.id });
+function servedFacts(store: Store, row: DeliveredRow): Fact[] {
+  const read = row.read;
+  if (read.action === 'read_source' || read.action === 'read_context') {
+    const record = knownRecord(store, read.action === 'read_source' ? read.source : read.record), address = knowledgeAddress(record);
+    if (!object(row.data) || row.data.contract !== READ_RESULT_CONTRACT) invalid('knowledge.data');
+    const data = row.data as unknown as ReadResult;
+    if ('length' in data) return [{ kind: 'length', address, length: data.length },
+      ...(data.served ? [{ kind: 'text' as const, address, start: data.served.start, end: data.served.end, text: data.text! }] : [])];
+    const content = read.action === 'read_source' ? record.value.content : null;
+    if (data.outcome === 'complete') return [{ kind: 'value', address, path: pointerSegments(data.requested.pointer)!.decoded, value: data.value, content }];
+    const { pointer, ...shape } = data.parent;
+    return [{ kind: 'shape', address, path: pointerSegments(pointer)!.decoded, content, shape: shape as unknown as Json }];
+  }
+  if (read.action === 'read') {
+    const record = knownRecord(store, row.sources[0]), address = knowledgeAddress(record);
+    return [{ kind: 'length', address, length: record.value.content.length },
+      { kind: 'text', address, start: 0, end: record.value.content.length, text: record.value.content }];
+  }
+  return searchFacts(store, row as DeliveredRow & { read: Extract<PacketRead, { action: 'search' }> });
+}
+/**
+ * The facts of one search delivery: its found lines, or "no match" for its query over its exact scope. The query semantics
+ * (today the engine's literal search, №60) stay with the search delivery itself; a later semantics changes only this reading.
+ */
+function searchFacts(store: Store, row: DeliveredRow & { read: Extract<PacketRead, { action: 'search' }> }): Fact[] {
+  const read = row.read;
+  if (!Array.isArray(row.data)) invalid('search.data');
+  // A search over a workspace path keeps its path: an existing empty directory has no source to cover (Codex-omg №3171).
+  const within = typeof read.within === 'string' ? posix.normalize(read.within).replace(/\/+$/, '') : null;
+  if (!row.data.length) return [{ kind: 'absent', query: read.query.toLowerCase(), within, scope: row.sources.map(ref => {
+    const record = knownRecord(store, ref); return { address: knowledgeAddress(record), content: record.value.content };
+  }).sort((a, b) => compareJson(a, b)) }];
+  return row.data.map(item => {
+    if (!object(item) || !Number.isSafeInteger(item.line) || typeof item.text !== 'string') invalid('search.data');
+    const record = knownRecord(store, item.source), content = record.value.content;
+    let start = 0;
+    for (let line = 1; line < (item.line as number); line++) start = content.indexOf('\n', start) + 1;
+    return { kind: 'text' as const, address: knowledgeAddress(record), start, end: start + (item.text as string).length, text: item.text as string };
+  });
+}
+/** Everything the exact packet showed: catalogue lengths and quoted material, included carried reads, this chain's deliveries. */
+function visibleFacts(store: Store, payload: Record<string, any>, readings: BriefReadings): Fact[] {
+  const facts: Fact[] = [];
+  for (const row of payload.brief.manifest as BriefManifest[]) {
+    const record = knownRecord(store, row.source), address = knowledgeAddress(record);
+    facts.push({ kind: 'length', address, length: row.length });
+    if (row.completeness === 'whole') facts.push({ kind: 'text', address, start: 0, end: row.length, text: record.value.content });
+  }
+  for (const entry of readings.entries) if (entry.decision.state === 'included') facts.push(...servedFacts(store, entry as unknown as DeliveredRow));
+  for (const item of Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : [])
+    for (const row of Array.isArray(item?.data) ? item.data : []) facts.push(...servedFacts(store, row as DeliveredRow));
+  return facts;
+}
+function covered(known: readonly Fact[], address: string, start: number, end: number, text: string): boolean {
+  const pieces = known.flatMap(item => {
+    if (item.kind !== 'text' || item.address !== address) return [];
+    const from = Math.max(start, item.start), to = Math.min(end, item.end);
+    return from < to && item.text.slice(from - item.start, to - item.start) === text.slice(from - start, to - start) ? [[from, to] as const] : [];
+  }).sort((a, b) => a[0] - b[0]);
+  let reach = start;
+  for (const [from, to] of pieces) { if (from > reach) break; reach = Math.max(reach, to); }
+  return reach >= end;
+}
+function knownFact(known: readonly Fact[], fact: Fact): boolean {
+  if (fact.kind === 'length') return known.some(item => item.kind === 'length' && item.address === fact.address && item.length === fact.length);
+  if (fact.kind === 'text') return covered(known, fact.address, fact.start, fact.end, fact.text);
+  // No match over sources the model saw whole, or the same search seen before. An empty directory holds no text to have
+  // seen: its emptiness is known only from an earlier delivery of that same path, whatever its query.
+  if (fact.kind === 'absent') return !fact.scope.length
+    ? known.some(item => item.kind === 'absent' && !item.scope.length && item.within === fact.within)
+    : known.some(item => item.kind === 'absent' && item.query === fact.query && same(item.scope, fact.scope))
+      || fact.scope.every(row => covered(known, row.address, 0, row.content.length, row.content));
+  if (fact.content !== null && covered(known, fact.address, 0, fact.content.length, fact.content)) return true;
+  if (fact.kind === 'shape' && known.some(item => item.kind === 'shape' && item.address === fact.address && same(item.path, fact.path) && same(item.shape, fact.shape))) return true;
+  // A delivered value answers every pointer below it: its sub-value or the shape of a reached parent.
+  return known.some(item => {
+    if (item.kind !== 'value' || item.address !== fact.address || item.path.length > fact.path.length
+      || item.path.some((segment, index) => segment !== fact.path[index])) return false;
+    let current = item.value;
+    for (const key of fact.path.slice(item.path.length)) {
+      if (current === null || typeof current !== 'object' || !Object.hasOwn(current, key)) return false;
+      current = (current as Record<string, unknown>)[key];
+    }
+    return fact.kind === 'value' ? same(current, fact.value) : same(jsonShape(current), fact.shape);
+  });
+}
+function addsAddressedKnowledge(store: Store, payload: Record<string, any>, readings: BriefReadings, data: readonly Json[]): boolean {
+  const known = visibleFacts(store, payload, readings);
+  return data.some(row => servedFacts(store, row as unknown as DeliveredRow).some(fact => !knownFact(known, fact)));
+}
 function addsKnowledge(store: Store, packet: QuestionPacketRecord, data: readonly Json[]): boolean {
+  const readings = briefReadings(packet.packet);
+  if (readings) return addsAddressedKnowledge(store, packet.packet as Record<string, any>, readings, data);
   const payload = packet.packet as Record<string, Json>;
   const delivered = Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries.flatMap(item =>
     object(item) && Array.isArray(item.data) ? item.data as Json[] : []) : [];

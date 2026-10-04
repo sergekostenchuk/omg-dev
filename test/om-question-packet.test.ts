@@ -2575,7 +2575,9 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
   const original = first.value.packet as Record<string, any>, payload = second.value.packet as Record<string, any>;
   assert.deepEqual(payload.questions, original.questions);
   if (model === 'MC2') assert.deepEqual(payload.expansion, original.expansion);
-  assert.equal(payload.sourceDeliveries[0].data[0].data, f.input.value.input.questions[0]!.question);
+  // MP3 (№2981 п.2): the readings era delivers the addressed result of the read, carrying the exact value.
+  assert.deepEqual(payload.sourceDeliveries[0].data[0].data, { contract: 'om-read-result/v1', outcome: 'complete',
+    requested: { pointer: '/input/questions/0/question' }, value: f.input.value.input.questions[0]!.question });
   assert.deepEqual(payload.sourceDeliveries[0].deliveries, delivery.continuation.deliveries);
   assert.notEqual(payload.requestId, original.requestId); assert.equal(payload.responseForm.requestId, payload.requestId);
   assert.deepEqual(second.value.fingerprint, packetFingerprint(payload));
@@ -2737,6 +2739,7 @@ const { reference } = await import(src('pipeline/contracts.js'));
 const { writeQuestionPacket, prepareQuestionPacket, preparePartResult, readPartResult, partResponseId } = await import(src('om/question-packet.js'));
 const { recordCall } = await import(src('om/call-record.js'));
 const { writeGuarded } = await import(src('om/refs.js'));
+const { fixtureAnswer } = await import(new URL('test/om-adapter-fixture.mjs', root).href);
 const ok = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
 const t = { after() {} };
 const output = [];
@@ -2766,7 +2769,8 @@ const output = [];
 {
   const f = await fixtures.worksPacketFixture(t), request = f.request();
   const packet = ok(writeQuestionPacket(f.store, request)).record;
-  const payload = packet.value.packet, raw = JSON.stringify(f.answer(packet));
+  // A brief-era producer answers with its own labels; earlier packets are returned unchanged (MP3 era check of the MP1 and MP2 producers).
+  const payload = packet.value.packet, raw = JSON.stringify(fixtureAnswer(payload, f.answer(packet)));
   const adapter = f.store.write({ id: 'adapter:garden:lp1', kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
   const config = f.store.write({ id: 'config:garden:lp1', kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
   const series = f.store.get(request.attempt.series.id, request.attempt.series.revision);
@@ -3103,4 +3107,48 @@ test('MP1 the observed material guard closes a second Store race atomically whil
   assert.equal(f.store.get(prepared.record.id), null);
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
+// MP3 (№2981 rows 7, 19): the real producers of the earlier eras from Git; their records are never imitated by removing readings.
+import { briefReadings } from '../src/om/packet-brief.js';
+// The code before MP3: merged MP1, merged MP2 (08be75a7) and FJ1 before briefs.
+const MP3_PRIOR_PRODUCERS = { 'MP1 5ccc463': '5ccc463e8c8520019a10e2ab52761650b4817cfd', 'MP2 08be75a': '08be75a785bac8d2cc88efe930dc05be9ffd4cc6',
+  'FJ1 bed6664': 'bed666410838b0730656e08beef31be208f02719' };
+test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the MP1 and pre-MP1 producers keep their form and outcomes under the new code, including №57; their descendants never acquire readings', async t => {
+  for (const [era, commit] of Object.entries(MP3_PRIOR_PRODUCERS)) await t.test(era, t => {
+    for (const history of lp1OldProducer(t, commit)) {
+      let store = new Store(history.database);
+      try {
+        const before = snapshot(store);
+        for (const packet of history.packets) {
+          assert.equal(briefReadings(packet.value.packet), null, 'An earlier producer wrote no readings');
+          assert.equal(Boolean(packet.value.packetContract?.includes('brief')), !era.startsWith('FJ1'));
+          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+          assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
+          const repeated = ok(writeQuestionPacket(store, packet.value.request));
+          assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
+        }
+        for (const part of history.parts) assert.deepEqual(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), part);
+        const root = history.packets[0]!, payload = root.value.packet as Record<string, any>;
+        const listed = (payload?.brief?.manifest as { source: Ref; length: number }[] | undefined)?.find(row => row.length > 0);
+        if (listed) {
+          // №57 stays the behavior of its era: a range past the end of a catalogued source is the D5 refusal of the whole answer.
+          const raw = JSON.stringify(fixtureAnswer(payload, { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'need_source',
+            questionIds: payload.questions.map((item: { id: string }) => item.id), missing: 'Read past the end',
+            reads: [{ action: 'read_source', source: listed.source, selector: { kind: 'text-range', start: 0, end: listed.length + 100 } }] }));
+          for (const check of [checkAnswerForm, prepareAnswerForm]) rejected(check(store, { project: history.project, packet: reference(root), raw }), 'answer_unconfirmed');
+        }
+        assert.deepEqual(snapshot(store), before);
+        if (history.next) {
+          const next = ok(writeQuestionPacket(store, history.next)).record;
+          assert.equal(next.value.packetContract, root.value.packetContract);
+          if (next.value.packet) assert.equal(briefReadings(next.value.packet), null, 'A descendant of an earlier root stays in its era');
+          if (history.next.continuation) assert.equal(next.value.refusal?.code, 'research_no_progress', 'The earlier novelty rule decides its chain');
+          else assert.equal(next.value.plan?.position, 1);
+          store.close(); store = new Store(history.database);
+          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(next) })), next);
+        }
+      } finally { store.close(); }
+    }
+  });
 });
