@@ -14,6 +14,7 @@ import {
 } from "./refusal-journal.js";
 import {
   prepareManagedBeginAttempt, prepareCompleteAttempt, readAnySeries, readAnySeriesAt, seriesAddress, seriesRequestOf, REPAIR_SERIES_KIND,
+  decidedFieldsBefore,
   type Attempt, type AttemptGoal, type AttemptVerdict, type BeginAttemptRequest, type ClaimedRefusal,
   type CompletionReason, type Continuation, type GroundRecord, type RepairSeries,
   type SeriesLadder, type SeriesRequest, type SeriesStop, type SeriesTransition,
@@ -21,7 +22,7 @@ import {
   type MechanismRepairSeries, type AnyRepairSeries, type AnySeriesRequest, type AnySeriesTransition,
 } from "./series.js";
 import { withHistoricalReads, historicalRead } from "./input.js";
-import { confirmResults, type ConfirmedResults } from "./achievements.js";
+import { confirmResults, readInputFieldResult, type ConfirmedResults, type FilledField, type InputFieldResult } from "./achievements.js";
 import { projectGraph } from "../graph/project.js";
 import type { Graph } from "../graph/model.js";
 import { readFrame, type FrameRequest } from "./frame-obligations.js";
@@ -1714,11 +1715,13 @@ function requestOf(address: Address): AnySeriesRequest {
   return { project: address.project, line: address.line, ...ownerFields(address.owner) };
 }
 
-import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_WORK_KIND,
-  readCompletionBinding, prepareManagedCompleteAttempt,
-  type CompletionWork, type ManagedClosure, type ClaimedOutcome } from './series.js';
+import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_WORK_KIND, ATTEMPT_PROGRESS_CONTRACT,
+  readCompletionBinding, readCompletionOwnerAt, prepareManagedCompleteAttempt,
+  type CompletionWork, type ManagedClosure, type ClaimedOutcome, type AdministrativeEnd, type AttemptProgress } from './series.js';
 import { readCompletionEffectiveAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
-  completionClosedWork, prepareCompletionProducts, readModelCallState, modelCallRecordId, type CompletionSnapshot } from './model-call.js';
+  completionClosedWork, prepareCompletionProducts, readModelCallState, modelCallRecordId, readCompletionAreaInput,
+  COMPLETION_CESSATION_KIND, COMPLETION_FINALIZATION_KIND, AREA_INPUT_VARIANT,
+  type CompletionCessation, type CompletionFinalization, type CompletionSnapshot } from './model-call.js';
 import type { MechanismOwner } from './series.js';
 import { prepareJournalBatch, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalWrite } from './refusal-journal.js';
 import type { Write } from '../storage/store.js';
@@ -1729,7 +1732,8 @@ import { answersProduct, readAnswersGateRefusalAt } from './answers-gate.js';
  * pre-close sources, and the derived outcome. One derivation reads every close; there is no second version.
  */
 export interface CompletionCloseRecord {
-  contract: 'om-completion-close/v1'; project: string; binding: Ref; work: Ref; additions: readonly Ref[]; series: Ref;
+  // LP6 (№3325 §4): a block close of the new era is v2 and carries its derived outcome.progress; v1 is read literally.
+  contract: 'om-completion-close/v1' | 'om-completion-close/v2'; project: string; binding: Ref; work: Ref; additions: readonly Ref[]; series: Ref;
   ledger: Ref | null; journal: Ref | null; claim: GateOutcome; outcome: ClaimedOutcome; waiting: Ref[];
 }
 class ManagedCloseFailure extends Error {
@@ -1824,11 +1828,15 @@ export function mechanismAttemptResults(store: Store, request: { project: string
   });
 }
 const CLOSURE_SHAPE = 'additions,binding,journal,work';
+// LP6: the closure of a block close of the new era names its progress contract; the rest of the shape is the same.
+const PROGRESS_CLOSURE_SHAPE = 'additions,binding,journal,progress,work';
+const closureShaped = (context: Record<string, unknown>): boolean => Object.keys(context).sort().join(',') === CLOSURE_SHAPE
+  || Object.keys(context).sort().join(',') === PROGRESS_CLOSURE_SHAPE && context['progress'] === ATTEMPT_PROGRESS_CONTRACT;
 /** Exact registry context for the D5 supplier. It is evidence to rederive, never a completeness flag. */
 export function checkManagedCompletionClaims(store: Store, project: string, context: ManagedClosure,
   accepting: readonly Ref[], refusals: readonly ClaimedRefusal[]): OmResult<Sealed<CompletionSnapshot>> {
   requireStore(store); requireProject(project);
-  requireCondition(isPlainObject(context) && Object.keys(context).sort().join(',') === CLOSURE_SHAPE
+  requireCondition(isPlainObject(context) && closureShaped(context as unknown as Record<string, unknown>)
     && isRef(context.binding) && isRef(context.work) && Array.isArray(context.additions) && context.additions.every(isRef)
     && (context.journal === null || isRef(context.journal)),
   "repeat_request_invalid", "A managed closure names its exact binding, work, additions (explicitly none) and final journal");
@@ -1846,7 +1854,9 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
     if (canonical(ordered(accepting.filter(required.e5Of))) !== canonical(ordered(required.e5)))
       managedFail(context.work.id, 'accepting', 'The close must retain every exact supported E5 basis');
     if (canonical(ordered(accepting.filter(required.e4Of))) !== canonical(ordered(required.e4)))
-      managedFail(context.work.id, 'accepting', 'The close must retain every applied M5 addressing of its registry, at its effective revision');
+      managedFail(context.work.id, 'accepting', required.block
+        ? 'The close must retain every own applied E4 of its registry that filled an input field anew, at its effective revision, and no other'
+        : 'The close must retain every applied M5 addressing of its registry, at its effective revision');
     const requiredRows = new Set(snapshot.refusals.map(row => row.row));
     // Rows beyond the required set are looked up in the final journal the closure presents.
     const extra = refusals.filter(item => !requiredRows.has(item.row));
@@ -1868,32 +1878,227 @@ export function checkManagedCompletionClaims(store: Store, project: string, cont
  * The accepting bases the effective registry itself requires: every supported E5 basis and, for M5, every applied
  * addressing at its effective revision (H1.0d №1688-3). One function for the claim check and the claim preparer (H1).
  */
+/** LP6: one own applied input decision of a registry — its reading, with or without keys. */
+interface RequiredField { ref: Ref; read: Extract<InputFieldResult, { relevant: true }> }
 function requiredManagedAccepting(store: Store, project: string, context: ManagedClosure, snapshot: CompletionSnapshot) {
   const e5Of = (ref: Ref) => ref.id.startsWith(`${acceptedAnswerNamespace(project)}e5:`);
   const e4Of = (ref: Ref) => ref.id.startsWith(`model-call:${project}:om:`);
-  const binding = snapshot.binding.value, e4: Ref[] = [];
+  const binding = snapshot.binding.value, e4: Ref[] = [], noop: Ref[] = [], fields: RequiredField[] = [];
+  const latest = new Map<string, Ref>();
+  for (const ref of snapshot.products) if (e4Of(ref) && (latest.get(ref.id)?.revision ?? 0) < ref.revision) latest.set(ref.id, ref);
   if (binding.owner.kind === 'mechanism') {
     // H1.0d (№1688-3, C13, C14, C46): every applied M5 addressing of the effective registry — each runtime id at its
     // latest revision — is required before reduction by key; an empty claim does not skip it, and a call outside
     // the registry cannot hide behind an equal key.
-    const latest = new Map<string, Ref>();
-    for (const ref of snapshot.products) if (e4Of(ref) && (latest.get(ref.id)?.revision ?? 0) < ref.revision) latest.set(ref.id, ref);
     for (const ref of latest.values()) {
       if (!managedTake(appliedAddressing(store, project, ref))) continue;
       const own = confirmResults(store, { project, owner: binding.owner, target: binding.series.id, goal: binding.goal,
         attempt: { series: binding.series, ordinal: binding.attempt }, accepting: [ref], cancelling: [], managedClosure: context });
       if (own.ok) e4.push(ref);
     }
+  } else if (context.progress === ATTEMPT_PROGRESS_CONTRACT) {
+    // LP6 (№3325 §2 п.5): in the new era every own applied E4 of the effective registry that filled an input field anew
+    // is required, each at its latest revision; one that filled nothing anew is the attempt's own no-op answer. A broken
+    // or foreign proof of an applied input decision is its addressed refusal, never filtered out; other E4 are no part.
+    for (const ref of latest.values()) {
+      const read = managedTake(readInputFieldResult(store, ref, { project, block: binding.owner.block, goal: binding.goal,
+        attempt: { series: binding.series, ordinal: binding.attempt }, accepting: [ref], managedClosure: context }));
+      if (!read.relevant) continue;
+      fields.push({ ref, read: read as RequiredField['read'] });
+      (read.keys.length ? e4 : noop).push(ref);
+    }
   }
-  return { e5: [...snapshot.accepting], e4, e5Of, e4Of };
+  return { e5: [...snapshot.accepting], e4, noop, fields, block: binding.owner.kind === 'block', e5Of, e4Of };
+}
+/** LP6: one technical end of a composition as the administrative rule reads it, and as the reviewer of a stop is shown it. */
+export interface TechnicalEnd { readonly source: Ref; readonly kind: string; readonly detail: string; readonly replacement: Ref | null }
+const exactOf = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
+const refsSorted = (refs: readonly Ref[]): Ref[] => [...new Map(refs.map(ref => [canonical(ref as unknown as Json), exactOf(ref)])).entries()]
+  .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, ref]) => ref);
+/**
+ * The technical ends of one composition, each with whether it is a clean end by the replaced B1 of the attempt's own
+ * area: an LP4 cessation by that input (never the end of an application), the area-input check cessation, or the LP5
+ * end of the remaining acceptance (never of a confirmation). One reading for the administrative rule and for A6.
+ */
+function technicalEnds(store: Store, project: string, snapshot: CompletionSnapshot): { area: Ref; ends: (TechnicalEnd & { clean: boolean })[] } {
+  const area = managedTake(readCompletionAreaInput(store, project, reference(snapshot.binding)));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fields = (value: unknown): Record<string, any> | null => isPlainObject(value) ? value as Record<string, any> : null;
+  const replaced = (value: unknown): Ref | null => { const cause = fields(value);
+    return cause && cause['kind'] === 'required-record-replaced' && canonical(cause['prerequisite'] as Json) === canonical(area as unknown as Json)
+      && isRef(cause['replacement']) ? exactOf(cause['replacement'] as Ref) : null; };
+  const named = (value: unknown): string => { const cause = fields(value);
+    return !cause ? 'an unnamed cause' : cause['kind'] !== 'required-record-replaced' ? String(cause['kind'])
+      : replaced(cause) ? `the replaced B1 of the area (${area.source.id}@${area.source.revision})`
+      : `a replaced ${fields(cause['prerequisite'])?.['kind'] ?? 'record'} outside the area's B1`; };
+  const ends = snapshot.technical.map(row => {
+    const record = store.get<Json>(row.source.id, row.source.revision);
+    if (!record || record.hash !== row.source.hash)
+      managedFail(row.source.id, 'technical', 'A technical end stands at its exact reference', 'completion_invalid', row.source);
+    if (record.kind === COMPLETION_CESSATION_KIND) {
+      const value = record.value as unknown as CompletionCessation, replacement = replaced(value.cause);
+      return { source: exactOf(row.source), kind: value.disposition === 'check-ceased' ? 'check-cessation' : 'cessation',
+        detail: `${value.disposition}${value.remainder === null ? '' : `/${value.remainder}`} by ${named(value.cause)}`, replacement,
+        clean: replacement !== null && value.remainder !== 'application' && (value.disposition !== 'check-ceased' || value.variant === AREA_INPUT_VARIANT) };
+    }
+    if (record.kind === COMPLETION_FINALIZATION_KIND) {
+      const value = record.value as unknown as CompletionFinalization, replacement = replaced(value.cause);
+      return { source: exactOf(row.source), kind: 'finalization', detail: `end of the remaining ${value.phase} by ${named(value.cause)}`,
+        replacement, clean: replacement !== null && value.phase === 'acceptance' };
+    }
+    return { source: exactOf(row.source), kind: record.kind, detail: `${row.reason} of ${record.kind}`, replacement: null, clean: false };
+  });
+  return { area: exactOf(area.source), ends };
+}
+/**
+ * LP6 (№3325 §3): the administrative end of a block close, derived from its full proved composition and never claimed.
+ * It stands only where the formula gives interrupted, nothing waits for the owner, no own input-field answer of the
+ * attempt filled nothing anew, and every technical end is a clean end by the replaced B1 of the attempt's own area. The
+ * ends may have met different later revisions of that input.
+ */
+function administrativeEnd(store: Store, project: string, snapshot: CompletionSnapshot, noop: readonly Ref[]): AdministrativeEnd | null {
+  if (noop.length || snapshot.waiting.length || !snapshot.technical.length) return null;
+  const { area, ends } = technicalEnds(store, project, snapshot);
+  if (!ends.every(end => end.clean)) return null;
+  return { kind: 'area-input-replaced', input: area, replacements: refsSorted(ends.map(end => end.replacement!)),
+    sources: refsSorted(ends.map(end => end.source)) };
+}
+/** LP6 (№3325 §5): one counted attempt of a saved stop's window, as the rules of the new era read its exact close. */
+export interface WindowProgressRow {
+  ordinal: number; goal: AttemptGoal; close: Ref; result: 'input-field' | 'administrative'; achieved: string[]; sources: Ref[];
+}
+/** LP6 (№3325 §6): what one attempt of an explained window proves, shown to A6 as facts — never as refusal rows. */
+export interface CompletionEvidence {
+  readonly ordinal: number; readonly goal: string; readonly reason: CompletionReason; readonly close: Ref | null;
+  readonly decisions: readonly { readonly e4: Ref; readonly call: Ref; readonly previous: Ref; readonly input: Ref; readonly filled: readonly FilledField[] }[];
+  readonly ends: readonly TechnicalEnd[];
+  readonly effect: 'input-field' | 'administrative' | 'failure' | 'standalone';
+  readonly results: readonly string[];
+  readonly remaining: readonly string[];
+}
+interface AttemptReading { evidence: CompletionEvidence; goal: AttemptGoal; e4: Ref[]; administrative: AdministrativeEnd | null; unfit: string | null }
+/**
+ * LP6 (№3325 §5 п.3; return №3371): the real failures a closed attempt still holds beside whatever it achieved — a cancelled
+ * result; every effective refusal of its close (one whose chain a dispatched correction replaced, MP2, is owed no more and
+ * is no failure); the owner's wait; a technical end of another cause than the replaced B1 of its own area; an own
+ * input-field answer that filled nothing anew. One reading for the transition of a saved stop — its producer and its
+ * reader — and for the facts A6 is shown: a fresh result beside any of these is no reconciled row.
+ */
+function attemptFailures(store: Store, project: string, close: Sealed<CompletionCloseRecord>, snapshot: CompletionSnapshot,
+  ends: readonly (TechnicalEnd & { clean: boolean })[], noop: readonly Ref[]): string[] {
+  const corrected = new Set(snapshot.corrected.map(ref => canonical(exactOf(ref) as unknown as Json)));
+  const rows = new Map(close.journal === null ? [] : managedTake(readJournalAt(store, project, close.journal)).value.rows.map(row => [row.id, row]));
+  const effective = close.claim.refusals.filter(item => {
+    const row = rows.get(item.row);
+    return row === undefined || !corrected.has(canonical(exactOf(row.source) as unknown as Json));
+  });
+  return [
+    ...close.outcome.cancelled.map(key => `cancelled result ${key}`),
+    ...effective.map(row => `refusal ${row.name} of ${row.goal} (row ${row.row})`),
+    ...snapshot.waiting.map(ref => `waiting for the owner on ${ref.id}@${ref.revision}`),
+    ...ends.filter(end => !end.clean).map(end => `${end.detail} (${end.source.id}@${end.source.revision})`),
+    ...noop.map(ref => `own input-field answer ${ref.id}@${ref.revision} filled no field anew`),
+  ];
+}
+/**
+ * LP6: one closed attempt of a window as the new era reads its exact close and composition — never today's heads. The
+ * one analysis behind a reconciled stop and behind the facts A6 is shown. `known` is the line's decided fields before
+ * the attempt and grows by its keys, so novelty is sequential. `unfit` says why it is no row of a reconciliation.
+ */
+function readAttempt(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, ref: Ref, ordinal: number, known: Set<string>): AttemptReading {
+  const attempt = [...series.value.inherited, ...series.value.attempts].find(item => item.ordinal === ordinal);
+  if (!attempt?.outcome) return managedFail(series.id, `attempts.${ordinal}`, 'An attempt of a window is a closed attempt of its series');
+  const goal: AttemptGoal = { key: attempt.goal.key, questions: [...attempt.goal.questions], result: attempt.goal.result };
+  const reason = attempt.outcome.reason, block = 'block' in series.value;
+  const base = { ordinal, goal: goal.key, reason };
+  const binding = managedTake(readCompletionBinding(store, project, ref, ordinal));
+  if (!binding) return { goal, e4: [], administrative: null, unfit: 'A standalone attempt has no managed close to prove a result of LP6',
+    evidence: { ...base, close: null, decisions: [], ends: [], effect: 'standalone', results: [],
+      remaining: [`closed without a managed close as ${reason}`] } };
+  const id = completionCloseId(project, binding.id), head = store.get(id);
+  if (!head) return managedFail(id, 'close', 'A closed managed attempt keeps its exact close proof');
+  const close = managedTake(readCompletionCloseAt(store, project, reference(head)));
+  const composition = { work: close.work, additions: [...close.additions], journal: close.journal };
+  const snapshot = managedTake(readCompletionEffectiveAt(store, project, composition)) as CompletionSnapshot;
+  const required = block ? requiredManagedAccepting(store, project, { binding: close.binding, ...composition, progress: ATTEMPT_PROGRESS_CONTRACT }, snapshot)
+    : { e4: [] as Ref[], noop: [] as Ref[], fields: [] as RequiredField[] };
+  const keys = [...new Set(required.fields.flatMap(row => row.read.keys))].sort();
+  const fresh = keys.filter(key => !known.has(key));
+  for (const key of keys) known.add(key);
+  const ends = snapshot.technical.length ? technicalEnds(store, project, snapshot).ends : [];
+  const administrative = block && !keys.length && reason === 'interrupted' ? administrativeEnd(store, project, snapshot, required.noop) : null;
+  // Return №3371: what else ended the attempt is weighed BEFORE any fresh result admits it — a fresh field beside a real
+  // failure is no reconciled row, whatever the new era would make of the same attempt (G7 of new closes is unchanged).
+  const failures = attemptFailures(store, project, close, snapshot, ends, required.noop);
+  const remaining = [...failures, ...(keys.length && !fresh.length ? ['a repeat of input-field results the line already holds'] : [])];
+  const effect = failures.length ? 'failure' : fresh.length ? 'input-field' : administrative ? 'administrative' : 'failure';
+  const unfit = !block ? 'Only a block series has the input-field results and administrative ends of LP6'
+    : close.contract !== 'om-completion-close/v1' ? 'A close of the new era was counted by the rules of its own era'
+    : close.outcome.cancelled.length ? 'A cancelled result is a conflict of results, not a reconciled attempt'
+    : failures.length ? `The attempt still holds real failures beside its results: ${failures.join('; ')}`
+    : fresh.length ? null
+    : keys.length ? 'A repeat of a known input-field result is no progress'
+    : reason !== 'interrupted' ? `An attempt closed as ${reason} is a real failure of its window`
+    : administrative ? null : "The interruption is not only the proved replacement of the B1 of the attempt's own area";
+  return { goal, e4: refsSorted(required.e4), administrative, unfit, evidence: { ...base, close: exactOf(reference(head)),
+    decisions: required.fields.map(row => ({ e4: exactOf(row.ref), call: exactOf(row.read.call), previous: exactOf(row.read.previous),
+      input: exactOf(row.read.input), filled: row.read.filled.map(item => ({ ...item })) })),
+    ends: ends.map(end => ({ source: end.source, kind: end.kind, detail: end.detail, replacement: end.replacement })),
+    effect, results: fresh, remaining } };
+}
+function windowSeries(store: Store, project: string, request: { series: Ref; ordinals: readonly number[] }) {
+  requireStore(store); requireProject(project);
+  requireCondition(isPlainObject(request) && isRef(request.series) && Array.isArray(request.ordinals) && request.ordinals.length > 0
+    && request.ordinals.every(item => Number.isSafeInteger(item) && item > 0),
+  "repeat_request_invalid", "A window is read at its exact series revision and its attempts");
+}
+/**
+ * LP6 (№3325 §5): the one subject derivation of a reconciled stop, for its producer and for every reader. Each counted
+ * attempt of the window is read by readAttempt: a fresh input-field result (new against the line's decided fields and
+ * the rows before it) or a clean administrative end. Anything else — a real failure, a conflict, a repeat of a known
+ * result, a standalone attempt, a close of the new era or another cause — is `progress_unproved`, and the old rules
+ * stand. A missing or broken proof is its own addressed refusal, never "unfit".
+ */
+export function deriveWindowProgress(store: Store, project: string, request: { series: Ref; ordinals: readonly number[] }): OmResult<Sealed<WindowProgressRow[]>> {
+  windowSeries(store, project, request);
+  return managedResult(() => {
+    const series = managedTake(readAnySeriesAt(store, project, request.series));
+    const known = new Set(decidedFieldsBefore(series.value, Math.min(...request.ordinals))), rows: WindowProgressRow[] = [];
+    for (const ordinal of request.ordinals) {
+      const read = readAttempt(store, project, series, request.series, ordinal, known);
+      if (read.unfit !== null) managedFail(series.id, `attempts.${ordinal}`, read.unfit, 'progress_unproved');
+      rows.push(read.evidence.effect === 'input-field'
+        ? { ordinal, goal: read.goal, close: read.evidence.close!, result: 'input-field', achieved: [...read.evidence.results], sources: read.e4 }
+        : { ordinal, goal: read.goal, close: read.evidence.close!, result: 'administrative', achieved: [], sources: [...read.administrative!.sources] });
+    }
+    return rows;
+  });
+}
+/** LP6 (№3325 §6): the facts A6 of the new era is shown about every attempt of the window it explains — the same reading. */
+export function deriveCompletionEvidence(store: Store, project: string, request: { series: Ref; ordinals: readonly number[] }): OmResult<Sealed<CompletionEvidence[]>> {
+  windowSeries(store, project, request);
+  return managedResult(() => {
+    const series = managedTake(readAnySeriesAt(store, project, request.series));
+    const ordinals = [...new Set(request.ordinals)].sort((a, b) => a - b);
+    const known = new Set(decidedFieldsBefore(series.value, ordinals[0]!));
+    return ordinals.map(ordinal => readAttempt(store, project, series, request.series, ordinal, known).evidence);
+  });
 }
 /**
  * The single managed outcome table: prove the entire work with its additions, collect source classes, then derive the
  * reason. A saved close (`final`) also shows that its final journal holds exactly the classes derived here; the producer
  * derives them first over the rows alone, before that journal exists.
  */
-type ManagedOutcomeInput = Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting' | 'claim'> & { claim: Omit<GateOutcome, 'reason'> };
-function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'>, final = true) {
+type EraMarker = { progress?: typeof ATTEMPT_PROGRESS_CONTRACT };
+type ManagedOutcomeInput = Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting' | 'claim'> & { claim: Omit<GateOutcome, 'reason'> } & EraMarker;
+type ManagedCloseInput = Omit<CompletionCloseRecord, 'contract' | 'outcome' | 'waiting'> & EraMarker;
+/** A saved close as the input of its own derivation: its era is the one its record names (LP6, №3325 §4). */
+function closeInput(close: Sealed<CompletionCloseRecord> | CompletionCloseRecord): ManagedCloseInput {
+  return { project: close.project, binding: close.binding, work: close.work, additions: [...close.additions], series: close.series,
+    ledger: close.ledger, journal: close.journal, claim: close.claim as GateOutcome,
+    ...(close.contract === 'om-completion-close/v2' ? { progress: ATTEMPT_PROGRESS_CONTRACT } : {}) };
+}
+function deriveManagedClose(store: Store, input: ManagedCloseInput, final = true) {
   const derived = deriveManagedOutcome(store, input), { reason, confirmed, classifications, journal, series, owner, snapshot } = derived;
   if (reason === null || input.claim.reason !== reason)
     managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
@@ -1902,17 +2107,23 @@ function deriveManagedClose(store: Store, input: Omit<CompletionCloseRecord, 'co
     if (!saved || canonical(saved) !== canonical(row))
       managedFail(input.journal?.id ?? series.id, 'journal', 'The final journal of the close holds exactly the classes the close derives', 'completion_invalid', input.journal ?? undefined);
   }
-  const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals };
-  const value: CompletionCloseRecord = { contract: 'om-completion-close/v1', project: input.project, binding: input.binding,
+  const outcome: ClaimedOutcome = { reason, achieved: confirmed.achieved, cancelled: confirmed.cancelled, refusals: input.claim.refusals,
+    ...(derived.progress === undefined ? {} : { progress: derived.progress }) };
+  const value: CompletionCloseRecord = { contract: derived.progress === undefined ? 'om-completion-close/v1' : 'om-completion-close/v2',
+    project: input.project, binding: input.binding,
     work: input.work, additions: [...input.additions], series: input.series, ledger: input.ledger, journal: input.journal,
     claim: completionClaim(input.claim), outcome, waiting: [...snapshot.waiting] };
   return { value, snapshot, routed: derived.routed, classifications, rows: derived.rows, address: derived.address, guards: confirmed.guards ?? [] };
 }
 /** Everything a managed close derives before its reason is compared: the one formula for the close and the claim preparer (H1). */
 function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
-  const closure = { binding: input.binding, work: input.work, additions: input.additions, journal: input.journal };
+  const closure: ManagedClosure = { binding: input.binding, work: input.work, additions: input.additions, journal: input.journal,
+    ...(input.progress === undefined ? {} : { progress: input.progress }) };
   const snapshot = managedTake(checkManagedCompletionClaims(store, input.project, closure, input.claim.accepting, input.claim.refusals));
   const owner = snapshot.binding.value, series = managedTake(readAnySeriesAt(store, input.project, input.series));
+  // LP6: only a block gets the new rules of result and neutrality; a mechanism close stays in its own era.
+  if (closure.progress !== undefined && owner.owner.kind !== 'block')
+    managedFail(series.id, 'progress', 'A mechanism close keeps the rules of its own era; only a block close carries progress');
   const address = seriesAddress(seriesRequestOf(series.value));
   const attempt = series.value.attempts.find(row => row.ordinal === owner.attempt);
   if (series.id !== owner.series.id || !attempt || attempt.outcome !== null || canonical(attempt.goal) !== canonical(owner.goal))
@@ -1972,14 +2183,18 @@ function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
   const reason: CompletionReason | null = confirmed.achieved.length || confirmed.cancelled.length ? 'result'
     : subject ? 'refused' : snapshot.technical.some(row => row.reason === 'interrupted') ? 'interrupted'
     : snapshot.technical.some(row => row.reason === 'off-form') ? 'off-form' : snapshot.waiting.length ? 'awaiting-owner' : null;
-  return { reason, confirmed, snapshot, routed, classifications, rows, address, journal, series, owner };
+  // LP6 (№3325 §3–4): a block close of the new era derives its progress from this same composition, never from a flag.
+  const progress: AttemptProgress | undefined = closure.progress === undefined ? undefined : { contract: ATTEMPT_PROGRESS_CONTRACT,
+    administrative: reason === 'interrupted' ? administrativeEnd(store, input.project, snapshot as CompletionSnapshot,
+      requiredManagedAccepting(store, input.project, closure, snapshot as CompletionSnapshot).noop) : null };
+  return { reason, confirmed, snapshot, routed, classifications, rows, address, journal, series, owner, progress };
 }
 export function readCompletionCloseAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionCloseRecord>> {
   return managedResult(() => historicalRead(store, { reader: 'G7.completion-close', project, ref }, () => {
     const record = managedTake(readRecord<CompletionCloseRecord>(store, ref, { unit: UNIT, target: ref.id,
       kind: COMPLETION_CLOSE_KIND, idPrefix: `${COMPLETION_CLOSE_KIND}:${project}:` }));
     const value = record.value;
-    if (!isPlainObject(value) || value.contract !== 'om-completion-close/v1' || value.project !== project
+    if (!isPlainObject(value) || value.contract !== 'om-completion-close/v1' && value.contract !== 'om-completion-close/v2' || value.project !== project
       || !isRef(value.binding) || !isRef(value.work) || !Array.isArray(value.additions) || !value.additions.every(isRef)
       || !isRef(value.series) || !isPlainObject(value.claim)
       || !Array.isArray(value.claim.accepting) || !value.claim.accepting.every(isRef)
@@ -1989,8 +2204,7 @@ export function readCompletionCloseAt(store: Store, project: string, ref: Ref): 
       || !['result', 'refused', 'off-form', 'interrupted', 'awaiting-owner'].includes(value.claim.reason)
       || ![value.ledger, value.journal].every(item => item === null || isRef(item)))
       managedFail(ref.id, 'record', 'The immutable close proof retains all exact pre-close sources');
-    const derived = deriveManagedClose(store, { project, binding: value.binding, work: value.work, additions: value.additions,
-      series: value.series, ledger: value.ledger, journal: value.journal, claim: value.claim });
+    const derived = deriveManagedClose(store, closeInput(value));
     if (record.revision !== 1 || record.id !== completionCloseId(project, value.binding.id) || canonical(value) !== canonical(derived.value))
       managedFail(ref.id, 'record', 'The close proof must equal the single full managed outcome derivation');
     return derived.value;
@@ -2011,7 +2225,7 @@ function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest):
       const series = managedTake(readAnySeriesAt(store, request.project, reference(seriesHead)));
       const attempt = series.value.attempts.find(row => row.ordinal === request.attempt);
       if (!attempt?.outcome) managedFail(id, 'series', 'A saved close proof requires its atomic A3 outcome');
-      const derived = deriveManagedClose(store, close);
+      const derived = deriveManagedClose(store, closeInput(close));
       const journal = close.journal ? managedTake(readJournalAt(store, request.project, close.journal)) : null;
       const decided = [...(journal?.value.classifications ?? []).filter(row => !derived.classifications.some(next => next.row === row.row)),
         ...derived.classifications];
@@ -2101,7 +2315,9 @@ export function prepareManagedClaim(store: Store, request: AnyCloseAttemptReques
     return managedResult(() => {
       if (!seriesHead || !selected?.value) managedFail(seriesAddress(request).id, 'completion', 'A derived claim belongs to a managed attempt', 'completion_required');
       const heads = closeHeads(store, request, selected.value, seriesHead);
-      const closure: ManagedClosure = { binding: heads.binding, work: reference(heads.work), additions: [], journal: heads.journal };
+      // LP6: a block close is of the new era; its claim names every own input-field result the registry requires.
+      const era = selected.value.value.owner.kind === 'block' ? { progress: ATTEMPT_PROGRESS_CONTRACT } : {};
+      const closure: ManagedClosure = { binding: heads.binding, work: reference(heads.work), additions: [], journal: heads.journal, ...era };
       const snapshot = managedTake(readCompletionEffectiveAt(store, request.project, { work: closure.work, additions: [], journal: closure.journal }));
       if (!snapshot.complete || snapshot.work.value.closed)
         managedFail(closure.work.id, 'work', 'The close must use one complete exact pre-close registry', 'completion_incomplete');
@@ -2111,7 +2327,7 @@ export function prepareManagedClaim(store: Store, request: AnyCloseAttemptReques
       const refusals = unique([...snapshot.refusals, ...request.outcome.refusals], row => row.row);
       const claim = { accepting, cancelling: [...request.outcome.cancelling], refusals };
       const derived = deriveManagedOutcome(store, { project: request.project, binding: heads.binding, work: closure.work, additions: [],
-        series: reference(heads.series), ledger: heads.ledger, journal: heads.journal, claim });
+        series: reference(heads.series), ledger: heads.ledger, journal: heads.journal, claim, ...era });
       if (derived.reason === null) managedFail(heads.series.id, 'reason',
         'The composition is complete but no proved ground closes it yet: the pause stands with its producer or control', 'completion_reason_invalid');
       return { outcome: completionClaim({ reason: derived.reason, ...claim }),
@@ -2161,8 +2377,11 @@ function managedCloseBundle(store: Store, request: AnyCloseAttemptRequest, heads
     extra.push(...admitted.writes.filter(write => write.id !== workHead.id));
     extraGuards.push(...linked.guards, ...admitted.guards);
   }
+  // LP6 (№3325 §4): every new managed close of a block is of the new era; a mechanism close keeps its own.
+  const era = managedTake(readCompletionOwnerAt(base, project, heads.binding)).value.owner.kind === 'block'
+    ? { progress: ATTEMPT_PROGRESS_CONTRACT } : {};
   const input = { project, binding: heads.binding, work: reference(workHead), additions, series: reference(heads.series),
-    ledger: heads.ledger, claim: completionClaim(request.outcome) };
+    ledger: heads.ledger, claim: completionClaim(request.outcome), ...era };
   const first = deriveManagedClose(rowsView, { ...input, journal: rows ? rows.result : heads.journal }, false);
   // One final A2 write: the rows of the additions and the classes of this close; no intermediate journal revision.
   const batch = sources.length || first.classifications.length ? managedTake(prepareJournalBatch(base,

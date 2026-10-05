@@ -3,7 +3,7 @@ import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { delivered, isPlainObject, isText, refused, sealed, type OmResult, type Sealed } from "./refusal.js";
-import { readAnySeriesAt, readCompletionOwnerAt, readMechanismAdmission, readSeriesAt, type Achievement, type AnyRepairSeries,
+import { INPUT_FIELD_KEY_PREFIX, readAnySeriesAt, readCompletionOwnerAt, readMechanismAdmission, readSeriesAt, type Achievement, type AnyRepairSeries,
   type AttemptGoal, type ClaimedRefusal, type ManagedClosure, type MechanismOwner, type MechanismRepairSeries, type RepairSeries } from "./series.js";
 import { confirmGapLineResult, gapLinesNamespace } from "./gap-lines.js";
 import { acceptedAnswerNamespace, confirmAcceptedAnswerResult } from "./accepted-answer.js";
@@ -101,12 +101,13 @@ function providers(entries: Record<string, AcceptanceProvider>): Readonly<Record
 /**
  * Kind of an ACCEPTING record → the provider written by its producing unit.
  * Historical grounds and semantic result identity are interpreted by that provider, never by this table.
- * The applied E4 (model-call) confirms only M5 addressing, and only for its mechanism owner (H1.0d).
+ * The applied E4 (model-call) confirms M5 addressing for its mechanism owner (H1.0d) and, for a block owner, the fields
+ * of the block's own input it decided (LP6, №3325 §2).
  */
 export const ACCEPTANCE_PROVIDERS = providers({ "gap-line": { namespace: gapLinesNamespace, confirm: confirmGapLineResult },
   "accepted-answer": { namespace: acceptedAnswerNamespace, confirm: confirmAcceptedAnswerResult },
   "connection-frame": { namespace: project => `om-frame:${project}:`, confirm: confirmAcceptedFrameResult },
-  "model-call": { namespace: project => `model-call:${project}:om:`, confirmMechanism: confirmModelCallAddressing } });
+  "model-call": { namespace: project => `model-call:${project}:om:`, confirm: confirmModelCallInputFields, confirmMechanism: confirmModelCallAddressing } });
 
 /**
  * Kind of a TRANSITION that cancelled an earlier result → its provider, which derives the keys of the results it
@@ -346,6 +347,140 @@ export function confirmModelCallAddressing(record: Sealed<Revision<Json>>, conte
       }
       hold(keys.length > 0, "An applied E4 that addressed nothing accepts no result");
       return { keys };
+    } catch (error) {
+      if (error instanceof Unconfirmed) return { unconfirmed: error.message };
+      throw error;
+    }
+  });
+}
+
+// ---- LP6 (№3325 §2): the fields of a block's own input decided by its own applied E4 ----
+const BLOCK_INPUT_FIELDS: readonly string[] = Object.freeze(["nodes", "state", "checkKind"]);
+const STATE_COMPONENTS: readonly string[] = Object.freeze(["writer", "authority", "rollback"]);
+/**
+ * What one E4 established for a block attempt: nothing of this kind (no applied input decision, or a call of the M5
+ * mechanism), or the semantic keys of the fields its own D3 application newly filled — none for an answer that filled
+ * nothing anew. A broken or foreign proof of an applied input decision throws: it is not "nothing of this kind".
+ */
+export interface FilledField { readonly target: string; readonly field: string; readonly component: string | null; readonly accepted: Sealed<Json> }
+export type InputFieldResult = { readonly relevant: false } | {
+  readonly relevant: true; readonly keys: readonly string[];
+  /** The exact E1 of the call, the B1 its decisions stood on and the B1 their D3 application produced. */
+  readonly call: Ref; readonly previous: Ref; readonly input: Ref;
+  /** The fields this application filled anew, one per key, as the reviewer of a stop is shown them (LP6 §6). */
+  readonly filled: readonly FilledField[];
+};
+function inputFieldKeys(store: Store, record: Sealed<Revision<Json>>, context: AcceptanceContext): InputFieldResult {
+  const project = context.project;
+  const state = need(readModelCallState(store, { project, record: reference(record) }));
+  if (state.state !== "applied" || state.outcome.outcome?.kind !== "input-decisions") return { relevant: false };
+  const applied = state.outcome, form = applied.outcome as Extract<NonNullable<typeof applied.outcome>, { kind: "input-decisions" }>;
+  const e4 = applied.record.value as OmModelCall;
+  const call = need(readCall(store, project, e4.om.call)).value;
+  if ("owner" in call) return { relevant: false };
+  hold(applied.diagnostic === null, "An input-field result is an applied decision without a diagnostic");
+  hold(call.purpose === "model-design" && call.block === context.block, "The call was admitted for another block or purpose");
+  hold(validAttempt(context.attempt), "An input-field result needs the exact attempt it closes");
+  const at = context.attempt!;
+  // The exact own attempt and its FULL goal: a later revision of the same series may close it, another line may not.
+  hold(call.series.id === at.series.id && call.attempt === at.ordinal && same(goalOf(call.goal), goalOf(context.goal)),
+    "The result belongs to another series, attempt or full goal");
+  if (!same(call.series, at.series)) {
+    const lineage = (series: Sealed<Revision<RepairSeries>>) => ({ project: series.value.projectId, block: series.value.block,
+      line: series.value.line, slice: series.value.slice, predecessor: series.value.predecessor, basis: series.value.basis,
+      inherited: series.value.inherited, earlier: series.value.attempts.filter(item => item.ordinal < call.attempt),
+      goal: series.value.attempts.find(item => item.ordinal === call.attempt)?.goal ?? null });
+    hold(same(lineage(need(readSeriesAt(store, project, call.series))), lineage(need(readSeriesAt(store, project, at.series)))),
+      "The named series revision must preserve the original line, prior history and attempt");
+  }
+  const binding = e4.om.completionOwner;
+  if (context.managedClosure !== undefined)
+    hold(binding !== undefined && same(binding.binding, context.managedClosure.binding), "The result belongs to another completion binding");
+  if (binding !== undefined) {
+    const owner = need(readCompletionOwnerAt(store, project, binding.binding)).value;
+    hold(owner.owner.kind === "block" && owner.owner.block === context.block && owner.series.id === call.series.id
+      && owner.attempt === call.attempt && same(goalOf(owner.goal), goalOf(call.goal)), "The managed call belongs to the binding of this exact attempt");
+  }
+  // The accepted B1 is exactly this E4's own D3 transition; the values are read from it and from its predecessor.
+  hold(e4.om.input !== null, "Input decisions need their applied D3 result");
+  const accepted = need(readOmInput(store, project, e4.om.input)).value as Sealed<OmInputRecord>;
+  const ordered = (refs: readonly Ref[]) => [...refs].map(ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash }))
+    .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+  const derivation: unknown = accepted.derivation;
+  hold(object(derivation) && !Object.hasOwn(derivation, "kind") && Object.keys(derivation).length === 3
+    && same(derivation['previous'], form.input) && same(derivation['graph'], form.graph)
+    && Array.isArray(derivation['decisions']) && same(ordered(derivation['decisions'] as Ref[]), ordered(form.decisions)),
+  "The accepted input must derive from the previous input, graph and complete decisions of this E4");
+  const previous = need(readOmInput(store, project, form.input)).value as Sealed<OmInputRecord>;
+  const assigned = new Set(call.gaps.map(gap => `${gap.goal}\u0000${gap.field}`));
+  const keys: string[] = [], filled: FilledField[] = [];
+  const key = (target: string, field: string, component: string | null, value: Json) => {
+    const made = `${INPUT_FIELD_KEY_PREFIX}${hashJson({ kind: "input-field", project, target, field, component, accepted: value } as Json)}`;
+    if (!keys.includes(made)) { keys.push(made); filled.push({ target, field, component, accepted: value }); }
+  };
+  for (const ref of form.decisions) {
+    const found = store.get<InputDecisionProposal>(ref.id, ref.revision);
+    hold(found && found.kind === INPUT_DECISION_KIND && same(reference(found), ref), "Every decision stands at its exact reference");
+    const decision = found.value.decision;
+    hold(BLOCK_INPUT_FIELDS.includes(decision.field) && assigned.has(`${decision.target}\u0000${decision.field}`),
+      "Every decision belongs to the input fields assigned to this call");
+    if (decision.field === "checkKind") {
+      const row = accepted.input.criteria.find(item => item.id === decision.target);
+      const before = previous.input.criteria.find(item => item.id === decision.target);
+      hold(row && row.checkKind !== null && row.checkKind === decision.value && before, "The accepted criterion holds this exact decision");
+      if (before.checkKind !== row.checkKind) key(decision.target, "checkKind", null, row.checkKind);
+      continue;
+    }
+    const row = accepted.input.contracts.find(item => item.id === decision.target);
+    const before = previous.input.contracts.find(item => item.id === decision.target);
+    hold(row && before, "The accepted contract holds this exact decision");
+    if (decision.field === "nodes") {
+      const nodes = Array.isArray(row.nodes) ? [...row.nodes].sort() : null;
+      hold(nodes !== null && Array.isArray(decision.value) && same([...decision.value as string[]].sort(), nodes),
+        "The accepted contract binds exactly the decided nodes");
+      if (!same(before.nodes === null ? null : [...before.nodes].sort(), nodes)) key(decision.target, "nodes", null, nodes as unknown as Json);
+      continue;
+    }
+    const value: unknown = decision.value;
+    hold(object(value) && Object.keys(value).length > 0, "A state decision names its components");
+    for (const [component, id] of Object.entries(value)) {
+      hold(STATE_COMPONENTS.includes(component) && isText(id) && row.state[component] === id,
+        "The accepted contract holds this exact state component");
+      // Only a component this application filled anew: a known neighbour or the same participant again is no result.
+      if (before.state[component] !== id) key(decision.target, "state", component, id as string);
+    }
+  }
+  return { relevant: true, keys, call: e4.om.call, previous: form.input, input: e4.om.input, filled };
+}
+/** The input-field result of one E4 for a block attempt, or the addressed refusal of a broken or foreign proof. */
+export function readInputFieldResult(store: Store, record: Ref, context: AcceptanceContext): OmResult<Sealed<InputFieldResult>> {
+  requireCondition(store instanceof Store && isRef(record) && isPlainObject(context) && isText(context.project) && isText(context.block)
+    && isGoal(context.goal), "acceptance_request_invalid", "An input-field result is read at its exact record for a block attempt");
+  return withHistoricalReads(() => {
+    const found = store.get<Json>(record.id, record.revision);
+    if (!found || !same(reference(found), record) || found.kind !== "model-call" || !record.id.startsWith(`model-call:${context.project}:om:`))
+      return problem("achievement_unconfirmed", "No E4 of this project stands at the exact reference", context.block, "record", record);
+    try { return delivered(inputFieldKeys(store, sealed(found), context)); }
+    catch (error) {
+      if (error instanceof Unconfirmed) return problem("achievement_unconfirmed", error.message, context.block, "record", record);
+      throw error;
+    }
+  });
+}
+/**
+ * The block provider of the applied E4 (LP6): only its own applied input decision with the proved E1, full goal,
+ * assigned fields and D3 derivation; the keys of the fields it newly filled, independent of packaging and revisions.
+ */
+export function confirmModelCallInputFields(record: Sealed<Revision<Json>>, context: AcceptanceContext, store: Store): Confirmation {
+  requireCondition(store instanceof Store && isPlainObject(record) && isRef(record) && isPlainObject(context)
+    && isText(context.project) && isText(context.block) && isGoal(context.goal),
+  "acceptance_request_invalid", "An input-field confirmation needs its exact record, the block and the full goal");
+  return withHistoricalReads(() => {
+    try {
+      const result = inputFieldKeys(store, record, context);
+      if (!result.relevant) return { unconfirmed: "Only an applied E4 of this block's own input fields accepts an input-field result" };
+      if (!result.keys.length) return { unconfirmed: "An applied input-field answer that filled no field anew accepts no result" };
+      return { keys: result.keys };
     } catch (error) {
       if (error instanceof Unconfirmed) return { unconfirmed: error.message };
       throw error;

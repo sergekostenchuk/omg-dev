@@ -9,7 +9,7 @@ import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal,
 import { readAnySeriesAt, seriesRequestOf, prepareSeriesLineAdmission, prepareEscalateSeries,
   readSeriesWorkAdmission, seriesRequiresAdmissionProof,
   STOP_REVIEW_KIND, stopReviewNamespace, type AnyRepairSeries, type AttemptGoal } from './series.js';
-import { stopReport, stopReportSources, readStopReport, type AnyStopReport, type StopReportSources } from './stop-report.js';
+import { stopReportOfNewEra, stopReportSources, readStopReport, STOP_REPORT_CONTRACT_V2, type AnyStopReport, type StopReportSources } from './stop-report.js';
 import { prepareLiftOriginHold, readOriginHoldAt, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace,
   REFUSAL_CLASSES, type RefusalClass } from './repeat-gate.js';
 import { normalizeOriginSource, type OriginSource } from './refusal-journal.js';
@@ -19,6 +19,10 @@ import { withHistoricalReads } from './input.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 
 export const STOP_ANALYSIS_CONTRACT = 'om-stop-analysis/v1';
+/** LP6 (№3325 §4): a new intent stands on the report of the new era; its results and failures inherit its contract. */
+export const STOP_ANALYSIS_CONTRACT_V2 = 'om-stop-analysis/v2';
+type AnalysisContract = typeof STOP_ANALYSIS_CONTRACT | typeof STOP_ANALYSIS_CONTRACT_V2;
+const CONTRACTS: readonly string[] = [STOP_ANALYSIS_CONTRACT, STOP_ANALYSIS_CONTRACT_V2];
 export const STOP_ANALYSIS_FAILURE_KIND = 'om-stop-analysis-failure';
 export const STOP_ANALYSIS_CODES = Object.freeze(['analysis_request_invalid', 'analysis_invalid', 'analysis_conflict',
   'analysis_response_invalid', 'assessor_not_independent', 'context_too_large'] as const);
@@ -30,7 +34,7 @@ export interface AnalysisAnswer {
   origin: { class: RefusalClass; basis: OriginSource[] } | null;
 }
 export interface AnalysisIntent {
-  contract: typeof STOP_ANALYSIS_CONTRACT; request: StopAnalysisRequest;
+  contract: AnalysisContract; request: StopAnalysisRequest;
   sources: StopReportSources; report: AnyStopReport; packet: Json; call: AnyRecordCallRequest;
 }
 export interface PreparedStopAnalysis { intent: AnalysisIntent; writes: Write[]; guards: TransactionGuard[] }
@@ -39,7 +43,7 @@ interface AnalysisAdmission {
   owner: { kind: 'block'; block: string };
 }
 export interface AnalysisRecord {
-  contract: typeof STOP_ANALYSIS_CONTRACT; projectId: string; intent: Ref; transport: Ref;
+  contract: AnalysisContract; projectId: string; intent: Ref; transport: Ref;
   state: 'decided' | 'undecided' | 'origin-established' | 'origin-unestablished' | 'failed';
   cause: AnalysisCause | null; change: AnalysisChange | null; error: Refusal | null;
   block?: string; owner?: { kind: 'mechanism'; mechanism: 'M5:addressing' };
@@ -101,12 +105,36 @@ function groundId(request: StopAnalysisRequest, key: string): string {
 function declaredSources(report: AnyStopReport, request: StopAnalysisRequest): Ref[] {
   return uniqueRefs([...report.guards, request.dispatch.adapter, request.dispatch.config,
     ...report.obstacles.flatMap(row => [row.source, ...row.origin.sources.map(source => source.ref)]),
-    ...report.remedies.flatMap(remedy => [...remedy.records])]);
+    ...report.remedies.flatMap(remedy => [...remedy.records]),
+    // LP6 (№3325 §6): the exact witnesses of the completions are sources of the task, not guards of its write.
+    ...(report.completionEvidence ?? []).flatMap(item => [...(item.close === null ? [] : [item.close]),
+      ...item.decisions.flatMap(decision => [decision.e4, decision.call, decision.previous, decision.input]),
+      ...item.ends.flatMap(end => [end.source, ...(end.replacement === null ? [] : [end.replacement])])])]);
 }
 const form = sealed({ protocol: 'omg-stop-analysis/v1', cause: 'null or {kind:evidence|hypothesis,text,sources:Ref[]}; evidence needs sources',
   change: 'null or {text,addresses:[{ref,field}]}', origin: 'null or {class,basis:OriginSource[]}; only origin analysis',
   rule: 'Diagnose this saved stop. State uncertainty explicitly. A proposal changes no graph, input or readiness.' });
+/**
+ * LP6 (№3325 §6): the form of an intent of the new era says the whole shape the acceptance below checks — the exact
+ * Ref object, the non-empty field, origin null for a stop — with an example built from a Ref this task really declares.
+ * The protocol of the answer is the same `omg-stop-analysis/v1`; only the description of its form is clearer.
+ */
+function formOf(contract: AnalysisContract, purpose: 'stop-analysis' | 'origin-analysis', example: Ref): Json {
+  if (contract === STOP_ANALYSIS_CONTRACT) return form as unknown as Json;
+  return json({
+    protocol: 'omg-stop-analysis/v1',
+    ref: 'A Ref is one whole exact object {"id":<string>,"revision":<integer>,"hash":<string>} copied unchanged from "sources" of this task. A string id, a partial object or a record outside "sources" is refused, never corrected.',
+    cause: 'null, or {"kind":"evidence"|"hypothesis","text":<non-empty string>,"sources":[<Ref>, ...]}. Evidence needs at least one source; a hypothesis stays a hypothesis.',
+    change: 'null, or {"text":<non-empty string>,"addresses":[{"ref":<Ref>,"field":<non-empty string>}, ...]} with at least one address. "field" names the field or aspect of that record to change: any non-empty string, not necessarily a JSON Pointer and not a closed vocabulary.',
+    origin: purpose === 'stop-analysis' ? 'null: this is the analysis of a stop, not of an origin' : 'null or {class,basis:OriginSource[]}; only origin analysis',
+    example: { protocol: 'omg-stop-analysis/v1', cause: { kind: 'hypothesis', text: '<the cause you see, with its uncertainty>', sources: [] },
+      change: { text: '<the change you propose>', addresses: [{ ref: example, field: '<the field or aspect to change>' }] }, origin: null },
+    rule: 'Diagnose this saved stop from the report, its lines and its completionEvidence. State uncertainty explicitly. A proposal changes no graph, input or readiness.',
+  });
+}
 function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnyStopReport): AnalysisIntent {
+  // The era of an intent is the era of the report it stands on: a saved v1 report gives back its v1 intent literally.
+  const contract: AnalysisContract = report.contract === STOP_REPORT_CONTRACT_V2 ? STOP_ANALYSIS_CONTRACT_V2 : STOP_ANALYSIS_CONTRACT;
   const series = seriesOf(store, request), key = identity(store, request, series.value), id = intentId(request.project, key);
   if (report.project !== request.project || report.series !== request.series.id
     || !report.guards.some(ref => same(ref, request.series))) fail('analysis_invalid', id, 'report', 'The report must name the exact saved series');
@@ -130,7 +158,7 @@ function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnySto
   if (env.implementer.actor === env.reviewer.actor)
     fail('assessor_not_independent', request.dispatch.config.id, 'reviewer.actor', 'The reviewer must be a different actor from the implementer');
   take(readRecord(store, request.dispatch.adapter, { unit: 'A6', target: id, id: request.dispatch.adapter.id, kind: 'dispatch-adapter' }));
-  const packet = json({ contract: STOP_ANALYSIS_CONTRACT, purpose, basis, goal, report, sources, form });
+  const packet = json({ contract, purpose, basis, goal, report, sources, form: formOf(contract, purpose, request.series) });
   const callKey = `A6:${key}`;
   const wire = take(adapterRequest({ requestId: callKey, packet, model: env.reviewer.model, effort: env.reviewer.effort,
     ...(env.reviewer.speed === undefined ? {} : { speed: env.reviewer.speed }) }));
@@ -145,14 +173,14 @@ function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnySto
     if (!admitted) fail('analysis_invalid', id, 'admission', 'The mechanism attempt must retain its exact admission');
     call = { ...common, owner: series.value.owner, admission: admitted.basis, gaps: [{ ...gap, consumer: series.value.owner }] };
   } else call = { ...common, block: series.value.block, gaps: [{ ...gap, consumer: 'A6:stop-analysis' }] };
-  return copy({ contract: STOP_ANALYSIS_CONTRACT, request, sources: stopReportSources(report), report, packet, call });
+  return copy({ contract, request, sources: stopReportSources(report), report, packet, call });
 }
 function readIntent(store: Store, project: string, ref: Ref): Revision<AnalysisIntent> {
   const record = take(readRecord<AnalysisIntent>(store, ref, { unit: 'A6', target: ref.id,
     idPrefix: `om-analysis-intent:${project}:`, kind: 'om-analysis-intent' }));
   const saved = record.value;
   if (!object(saved) || !keys(saved, ['contract', 'request', 'sources', 'report', 'packet', 'call'])
-    || saved.contract !== STOP_ANALYSIS_CONTRACT || !object(saved.sources))
+    || !CONTRACTS.includes(saved.contract as string) || !object(saved.sources))
     fail('analysis_invalid', ref.id, 'intent', 'An analysis intent must retain its producer and complete exact sources');
   requireRequest(store, saved.request as StopAnalysisRequest);
   if (saved.request.project !== project) fail('analysis_invalid', ref.id, 'project', 'An intent belongs to its project');
@@ -192,7 +220,7 @@ export function prepareStopAnalysis(store: Store, request: StopAnalysisRequest):
       return { intent: saved.value, writes: [], guards: originalGuards(store, reference(saved), saved.value) };
     }
     const admission = take(prepareSeriesLineAdmission(store, request.project, request.series));
-    const report = take(stopReport(store, seriesRequestOf(source.value))) as AnyStopReport;
+    const report = take(stopReportOfNewEra(store, seriesRequestOf(source.value))) as AnyStopReport;
     const intent = deriveIntent(store, request, report);
     const writes: Write[] = [{ id, kind: 'om-analysis-intent', expected: 0, value: json(intent) }];
     if (seriesRequiresAdmissionProof(source.value)) {
@@ -252,7 +280,7 @@ function deriveRecord(intent: Revision<AnalysisIntent>, physical: Sealed<ModelTr
   const state = answer === null ? 'failed' : holding !== null
     ? answer.origin === null || answer.origin.class === 'unknown' ? 'origin-unestablished' : 'origin-established'
     : answer.cause === null || answer.change === null ? 'undecided' : 'decided';
-  return copy({ contract: STOP_ANALYSIS_CONTRACT, projectId: request.project, intent: reference(intent), transport: reference(physical.record),
+  return copy({ contract: value.contract, projectId: request.project, intent: reference(intent), transport: reference(physical.record),
     state, cause: answer?.cause ?? null, change: answer?.change ?? null, error: parsed.ok ? null : parsed.refusal,
     ...('owner' in report ? { owner: report.owner } : { block: report.block }),
     stop: report.context.stop?.attempt ?? holding!.attempt, goals: [...(report.context.stop?.goals ?? report.context.goals.map(goal => goal.key))].sort(),
@@ -272,7 +300,7 @@ export function readStopAnalysis(store: Store, request: { project: string; recor
     if (!kind) fail('analysis_invalid', ref.id, 'id', 'This is not an analysis result address of the named project');
     const saved = take(readRecord<AnalysisRecord>(store, ref, { unit: 'A6', target: ref.id, id: ref.id, kind }));
     const body = saved.value;
-    if (!object(body) || body.contract !== STOP_ANALYSIS_CONTRACT || !isRef(body.intent) || !isRef(body.transport))
+    if (!object(body) || !CONTRACTS.includes(body.contract as string) || !isRef(body.intent) || !isRef(body.transport))
       fail('analysis_invalid', ref.id, 'contract', 'An A6 result must name its intent and physical response');
     const intent = readIntent(store, project, body.intent);
     const history = intent.value.sources.journal === null ? undefined : { journal: intent.value.sources.journal };

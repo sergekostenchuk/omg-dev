@@ -352,7 +352,13 @@ test('A6 the saved A5 source set requires its exact journal and every held origi
     refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [] } }), 'hold_invalid');
     refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, holds: [...sources.holds, ...sources.holds] } }), 'hold_invalid');
     const { journal: _journal, ...missing } = sources;
-    assert.throws(() => readStopReport(f.store, { project: f.project, sources: missing as typeof sources }), EngineError);
+    // LP6 (№3325 §4): the sources of a new intent carry the era of their report; a part of that form missing, or an era this
+    // unit does not write, is an addressed refusal. The exact old form without the marker stays a defect of its caller.
+    assert.equal((sources as { contract?: string }).contract, 'om-stop-report/v2');
+    refusedWith(readStopReport(f.store, { project: f.project, sources: missing as typeof sources }), 'report_forged');
+    refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, contract: 'om-stop-report/v3' } as unknown as typeof sources }), 'report_forged');
+    const { contract: _contract, ...old } = missing as typeof sources & { contract?: string };
+    assert.throws(() => readStopReport(f.store, { project: f.project, sources: old as typeof sources }), EngineError);
   } finally { restore(); }
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
@@ -581,4 +587,28 @@ test('A6 two Stores resume one saved intent without a second physical request or
   assert.equal(f.sent().length, 1); assert.equal(f.store.list('model-call').length, 1);
   assert.deepEqual(f.store.list<{ calls: Array<{ usage: unknown }> }>('om-call-ledger')
     .flatMap(record => record.value.calls.map(call => call.usage)), [usage]);
+});
+
+test('LP6 rows 30, 31: a new intent is v2 — its packet shows the facts of every completion and a form that says the whole Ref with an example from its own sources; a declared Ref is accepted, its id as a string or a Ref outside the sources is refused, and cause and origin keep their rules', async t => {
+  const f = fixture(t);
+  const prepared = ok(prepareStopAnalysis(f.store, f.request));
+  assert.equal(prepared.intent.contract, 'om-stop-analysis/v2');
+  assert.equal(prepared.intent.report.contract, 'om-stop-report/v2');
+  assert.ok(Array.isArray(prepared.intent.report.completionEvidence), 'The report of the new era carries its completion facts');
+  const packet = prepared.intent.packet as unknown as { sources: Ref[]; form: { ref: string; example: { change: { addresses: { ref: Ref }[] } } } };
+  assert.match(packet.form.ref, /whole exact object/);
+  const example = packet.form.example.change.addresses[0]!.ref;
+  assert.ok(packet.sources.some(ref => canonical(ref) === canonical(example)), 'The example names a Ref this very task declares');
+  const changes: [string, (g: Fixture) => unknown, string][] = [
+    ['a declared Ref', g => ({ text: 'Change the series.', addresses: [{ ref: g.request.series, field: 'attempts' }] }), 'decided'],
+    ['its id as a string', g => ({ text: 'Change the series.', addresses: [{ ref: g.request.series.id, field: 'attempts' }] }), 'failed'],
+    ['a Ref outside the sources', g => ({ text: 'Change another revision.', addresses: [{ ref: { ...g.request.series, revision: g.request.series.revision + 7 }, field: 'attempts' }] }), 'failed'],
+  ];
+  for (const [name, change, state] of changes) {
+    const g = fixture(t); g.steps([{ research: { ...answer(g), change: change(g) }, usage }]);
+    const result = ok(await runStopAnalysis(g.store, g.request));
+    assert.equal(result.value.state, state, name);
+    assert.equal(result.value.contract, 'om-stop-analysis/v2', `${name}: the result inherits the contract of its intent`);
+    if (state === 'failed') assert.equal(result.value.error?.at.field, 'change', name);
+  }
 });

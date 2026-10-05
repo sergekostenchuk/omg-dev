@@ -2178,7 +2178,7 @@ test('C11 H1.0c closed work accepts no registration; saved work@1 and the v1 clo
   assert.equal(final.answers, null);
   assert.equal(final.complete, true);
   assert.equal(final.work.value.assignments.some(ref => ref.id === answersGateAssignment(m.binding).id), false);
-  assert.equal(f.store.get<{ contract: string }>(completionCloseId(f.project, m.binding.id))!.value.contract, 'om-completion-close/v1');
+  assert.deepEqual((({ contract, outcome }) => [contract, outcome.progress])(f.store.get<{ contract: string; outcome: { progress?: unknown } }>(completionCloseId(f.project, m.binding.id))!.value), ['om-completion-close/v2', { contract: 'om-attempt-progress/v1', administrative: null }]);
   assert.deepEqual(ok(closeAttempt(f.store, closing(f, terminal.value.accepted!))), closed);
   assert.deepEqual(snapshot(f.store), stored);
   // A planted registration standing on the closed work is refused by the reader itself.
@@ -4214,7 +4214,25 @@ test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prep
   const g = fixture(t, 'repository-fact'), s = await linkedN(g, 'pf1', PF1_BASE);
   const linked = prepareAnswersEvaluation(g.store, s.linked);
   assert.ok(ok(linked).closed !== undefined && ok(linked).groups.length > 0);
-  assert.equal(preparedHere(linked), preparedAtBase(g, 'pf1-linked', 'prepareAnswersEvaluation', s.linked), 'Linked with the close: the same bytes as the base');
+  // LP6 (№3325 §4, №3350): the close of a block is of the new era, the base writes the old one. Every write and guard is
+  // the base's, byte for byte and in the base's order, except the three the era changes — each checked as exactly that
+  // change: the close (contract v2 and its progress), the series (the outcome's progress and the boundary activated by
+  // this close on the revision before it) and the closed work (citing the new close).
+  type Prepared = { writes: { id: string; kind: string; value: Record<string, any> }[] };
+  const here = JSON.parse(preparedHere(linked)) as Prepared;
+  const base = JSON.parse(preparedAtBase(g, 'pf1-linked', 'prepareAnswersEvaluation', s.linked)) as Prepared;
+  const progress = { contract: 'om-attempt-progress/v1', administrative: null };
+  const close = here.writes.find(write => write.kind === 'om-completion-close')!;
+  assert.deepEqual([close.value.contract, close.value.outcome.progress], ['om-completion-close/v2', progress]);
+  const era = (write: Prepared['writes'][number]): Prepared['writes'][number] => write.kind === 'om-completion-close'
+    ? { ...write, value: { ...write.value, contract: 'om-completion-close/v2', outcome: { ...write.value.outcome, progress } } }
+    : write.kind === 'repair-series' ? { ...write, value: { ...write.value,
+      attempts: write.value.attempts.map((row: Record<string, any>) => row.ordinal === s.linked.close.attempt ? { ...row, outcome: { ...row.outcome, progress } } : row),
+      progressPolicy: { contract: 'om-series-progress/v1', previous: reference(g.store.get(write.id)!), from: s.linked.close.attempt } } }
+    : write.kind === 'om-completion-work' && write.value.closed
+      ? { ...write, value: { ...write.value, closed: { id: close.id, revision: 1, hash: hashJson(close.value as Json) } } } : write;
+  assert.equal(canonical({ ...base, writes: base.writes.map(era) } as unknown as Json), preparedHere(linked),
+    'Linked with the close: the same bytes as the base, but for the era of LP6');
   ok(writeAnswersEvaluation(g.store, s.linked));
   const closed = snapshot(g.store), again = ok(writeAnswersEvaluation(g.store, s.linked));
   assert.ok(again.repeated); assert.deepEqual(snapshot(g.store), closed, 'The repeated linked evaluation writes nothing');

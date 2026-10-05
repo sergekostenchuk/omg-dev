@@ -35,7 +35,7 @@ import {
 } from "../src/om/repeat-gate.js";
 import {
   checkStanding, stopReport,
-  CLAIM_SUBJECTS, REMEDY_KINDS, REPORT_AUDIENCES, STOP_REPORT_CODES, STOP_SUBJECTS, STOP_SUBJECT_DECISIONS, REMEDY_OUTCOMES,
+  CLAIM_SUBJECTS, REMEDY_KINDS, REPORT_AUDIENCES, STOP_REPORT_CODES, STOP_SUBJECTS, STOP_SUBJECT_DECISIONS, STOP_SUBJECT_DECISIONS_V2, REMEDY_OUTCOMES,
   type StopFacts, type StopReport,
 } from "../src/om/stop-report.js";
 
@@ -794,7 +794,8 @@ test("the table of decision admits one subject for a tally at most, and every ro
       }
     }
   }
-  assert.deepEqual([...seen].sort(), [...STOP_SUBJECTS].sort());
+  // LP6: the old table never says input-transition; that subject belongs to a report of the new era (below).
+  assert.deepEqual([...seen].sort(), STOP_SUBJECTS.filter(subject => subject !== "input-transition").sort());
 
   // The rows that matter, pinned: one responsible says a subject, two of them say nothing.
   const oneObstacle = facts({ classes: counts(REFUSAL_CLASSES, { input: 2 }), obstacles: 2, addressees: 1 });
@@ -1247,4 +1248,28 @@ test("the complete modern source context survives A2, an origin hold and analysi
   assert.deepEqual(deliveredOf(checkStanding(store, report)), report);
   store.close(); const reopened = new Store(path); t.after(() => reopened.close());
   assert.deepEqual(reportOf(reopened), report);
+});
+
+test("LP6 row 30: the table of the new era keeps one subject per tally — input-transition only when every cycle of the window ended by its own input moving and nothing else stands — and an interruption by a moved input is never an environment", () => {
+  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.map(row => row.subject), ["obstacle", "environment", "origin", "input-transition"]);
+  assert.ok(Object.isFrozen(STOP_SUBJECT_DECISIONS_V2));
+  const seen = new Set<string>();
+  for (const transitions of [0, 1, 2, 3]) for (const proposal of [0, 1]) for (const conditions of [0, 1]) for (const unknown of [0, 1])
+    for (const holds of [0, 1]) for (const addressees of [0, 1, 2]) for (const interrupted of [0, 1]) for (const refused of [0, 1]) {
+      const classes: Record<RefusalClass, number> = { proposal, input: 0, derivation: 0, readiness: 0, conditions, unknown };
+      const obstacles = REFUSAL_CLASSES.reduce((sum, item) => sum + classes[item], 0);
+      const tally = facts({ classes, holds, addressees, obstacles, repeating: obstacles, transitions,
+        attempts: transitions + interrupted + refused, endings: counts(COMPLETION_REASONS, { interrupted, refused }) });
+      const admitted = STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(tally));
+      assert.ok(admitted.length <= 1, JSON.stringify(tally));
+      seen.add(admitted[0]?.subject ?? "unknown");
+    }
+  assert.deepEqual([...seen].sort(), [...STOP_SUBJECTS].sort());
+  // Three proved input transitions and nothing else: an input transition, never an environment of three broken cycles.
+  const moved = facts({ attempts: 3, transitions: 3 });
+  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(moved)).map(row => row.subject), ["input-transition"]);
+  // A mixed window keeps its real obstacle as the subject when one responsible stands behind it; two say nothing.
+  const mixed = facts({ attempts: 3, transitions: 2, classes: counts(REFUSAL_CLASSES, { input: 1 }), obstacles: 1, addressees: 1 });
+  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(mixed)).map(row => row.subject), ["obstacle"]);
+  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient({ ...mixed, addressees: 2 })), []);
 });

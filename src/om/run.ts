@@ -13,7 +13,7 @@ import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
 import { writeApplyAnswer as writeApplyAnswerOf } from "./addressing.js";
 import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
-  resumeSeries as resumeSeriesOf, seriesAddress, seriesRequestOf,
+  resumeSeries as resumeSeriesOf, reconcileSeries as reconcileSeriesOf, prepareReconcileSeries as prepareReconcileSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
 import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
@@ -100,6 +100,8 @@ const readAnySeriesAt = transferring("series", readAnySeriesAtOf);
 const readCompletionBinding = transferring("series", readCompletionBindingOf);
 const prepareSeriesLineAdmission = transferring("series", prepareSeriesLineAdmissionOf);
 const resumeSeries = transferring("series", resumeSeriesOf);
+const reconcileSeries = transferring("series", reconcileSeriesOf);
+const prepareReconcileSeries = transferring("series", prepareReconcileSeriesOf);
 const closeAttempt = transferring("repeat-gate", closeAttemptOf);
 const openAttempt = transferring("repeat-gate", openAttemptOf);
 const prepareManagedClaim = transferring("repeat-gate", prepareManagedClaimOf);
@@ -172,7 +174,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply", "finalize", "reuse"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -471,6 +473,9 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       case "finalize": return mapped(writeCompletionFinalization(store, body as never), record => [refOf(record)]);
       case "reuse": return mapped(writeCompletionReuse(store, body as never), record => [refOf(record)]);
       case "resume": return mapped(resumeSeries(store, body as never), record => [refOf(record)]);
+      // LP6: the series revision and the exact transition record of the reconciled stop.
+      case "reconcile": return mapped(reconcileSeries(store, body as never), record => [refOf(record),
+        ...("block" in record.value ? (record.value.reconciliations ?? []).filter(item => item.after === body['stop']).map(item => refOf(item.transition)) : [])]);
       case "bases": {
         const build = body as unknown as BasesStep;
         return mapped(writeRunBases(store, { project }, { guards: build.guards, open: build.open, completion: build.completion }),
@@ -865,6 +870,15 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   }
   const stop = context.stop;
   if (!stop) return null;
+  // LP6 (№3325 §5): a block stop whose whole counted window the new era proves false is lifted by its own transition
+  // first — before the second rung and before A6 is asked or paid for. A window with a real failure keeps the old rules
+  // below; a missing or broken proof is a typed refusal of the pass, never a ground to pay for A6.
+  if ("block" in series.value) {
+    const reconcile = { ...seriesRequestOf(series.value), stop: stop.attempt };
+    const fit = prepareReconcileSeries(store, reconcile as never);
+    if (fit.ok) { if (fit.value.writes.length) return step("reconcile", reconcile, series.id, null); }
+    else if (fit.refusal.code !== "progress_unproved") throw new RunFailure(fit.refusal);
+  }
   if (context.ladder.rung >= 2) {
     const escalation = series.value.escalations.find(item => item.after === stop.attempt);
     return { final: [reasonOf("stop-second-rung", "owner_decision", series.id, "stop",

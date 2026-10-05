@@ -3893,7 +3893,9 @@ test("C01 O6 C8 C13 O13 H1.0d owners select their providers: no block provider r
   assert.deepEqual([foreignKind.code, foreignKind.at.field], ["achievement_unconfirmed", "outcome.accepting.0.kind"]);
   const asBlock = refusalOf(confirmResults(f.store, { project: f.project, block: "garden-consume-block", target: f.series.id,
     goal: f.goal, attempt: { series: reference(f.series), ordinal: 1 }, accepting: [e4], cancelling: [] }));
-  assert.deepEqual([asBlock.code, asBlock.at.field], ["achievement_unconfirmed", "outcome.accepting.0.kind"]);
+  // LP6 (№3325 §2): a block has its own provider of the applied E4 now — the input fields — and it refuses an M5 call.
+  assert.deepEqual([asBlock.code, asBlock.at.field], ["achievement_unconfirmed", "outcome.accepting.0"]);
+  assert.match(asBlock.message, /input fields/);
   for (const other of [{ ...m5Context(f), goal: { ...f.goal, key: "another-goal" } },
     { ...m5Context(f), attempt: { series: reference(f.series), ordinal: 2 } }]) {
     const refused = refusalOf(confirmResults(f.store, { ...other, accepting: [e4] }));
@@ -4315,4 +4317,279 @@ test("C15 C43 H1.0d the public finish entry carries the absence of another admit
     assert.deepEqual(deliveredOf(prepareModelAttemptFinish(f.store, finish)).writes, []);
     assert.deepEqual(mechanismSnapshot(f.store), closed);
   });
+});
+
+// ---- LP6 (№3325 §2–§4): the new era of a block close — input-field results and the administrative end ----
+import { existsSync } from "node:fs";
+import { readCompletionBinding, completionCloseId, completionWorkId, readSeries, type AttemptProgress } from "../src/om/series.js";
+import { writeCompletionCessation, readCompletionWorkAt } from "../src/om/model-call.js";
+import { prepareManagedClaim, deriveCompletionEvidence } from "../src/om/repeat-gate.js";
+import { runModelCycle } from "../src/om/model-call.js";
+
+const LP6_ADAPTER = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
+type Lp6Field = "nodes" | "state" | "checkKind";
+type Lp6Answer = { field: Lp6Field | "expansion"; value?: Json; cannot?: string; owner?: string; unsent?: true; need?: true; corrected?: true };
+const lp6Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+/**
+ * The garden block garden-consume-block on a B1 that leaves its contract's nodes and state and its criterion's checkKind
+ * open: M6 gives it an MC2 input-field batch per field and an MC2 node-expansion batch of its own. A round opens a managed
+ * attempt on today's routes with the named batches, every packet first, and sends only the answered ones; the owner's own
+ * decision replaces B1 from outside; a remaining root is ended by LP4; the claim of a close is derived by its producer.
+ */
+function lp6Gate(t: test.TestContext) {
+  const seeded = seedCopy("lp6:gate-fields", store => {
+    const engine = new ProductEngine(store), project = "garden", { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
+    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field));
+    const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+    deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
+    return null;
+  }, "omg-lp6-gate-");
+  const { root, database } = seeded, project = "garden", block = "garden-consume-block";
+  let store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [LP6_ADAPTER, "--scenario", scenario, "--trace", trace] };
+  const configured = new ProductEngine(store).environments.configure(project, { workspace: root,
+    implementer: { actor: "lp6-implementer", model: "fixture", effort: "high", speed: "fast", command },
+    reviewer: { actor: "lp6-reviewer", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 100_000 }, 0);
+  const adapter = store.write({ id: `adapter:${project}:lp6`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
+  const address = { project, block, line: 1 };
+  deliveredOf(openSeries(store, { ...address, slice: "lp6", predecessor: null, basis: null } as never));
+  const steps: unknown[] = [];
+  const routesNow = () => {
+    const input = store.get(`om-input:${project}`)!, graph = store.get(`graph:${project}`)!;
+    const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+      choice: { choiceVersion: `lp6-${input.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
+    const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+      operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+      works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+    const gaps = deliveredOf(writeGaps(store, sources));
+    return deliveredOf(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
+      tasks: [], catalog: { paths: ["lp6-source.txt"], records: [] }, previous: null })) as Revision<RoutesRecord>;
+  };
+  writeFileSync(join(root, "lp6-source.txt"), "The garden contract is written by the producer.\n");
+  const f = {
+    root, project, block, address, adapter,
+    get store() { return store; },
+    restart() { store.close(); store = new Store(database); },
+    sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
+    head: () => store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!,
+    async round(ordinal: number, answers: readonly Lp6Answer[]) {
+      const routes = routesNow();
+      const batches = answers.map(answer => routes.value.batches.find(batch => answer.field === "expansion"
+        ? batch.task === "node-expansion" && batch.items.every(item => item.consumers.includes(block))
+        : batch.task === "input-field" && batch.items.some(item => item.field === answer.field && item.consumers.includes(block)))!);
+      assert.ok(batches.every(Boolean), "M6 gives the block every named batch");
+      const items = batches.flatMap(batch => batch.items);
+      const goal: AttemptGoal = { key: `lp6:${ordinal}:${answers.map(answer => answer.field).join("+")}`,
+        questions: items.map(item => gapLineKey(project, item.target, item.field)).sort(), result: gapLineExpectedResult(project, items[0]!.target, items[0]!.field) };
+      const series = deliveredOf(openAttempt(store, { ...address, attempt: ordinal, goal,
+        completion: { routes: reference(routes), batches: batches.map(batch => batch.id).sort() } } as never));
+      const packets = batches.map(batch => deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+        environment: reference(configured), attempt: { series: reference(series), ordinal }, previous: [] })).record);
+      const e4: Ref[] = [];
+      for (const [index, batch] of batches.entries()) {
+        const answer = answers[index]!;
+        if (answer.unsent) continue;
+        if (answer.corrected) {
+          // MP2: an answer naming a label the packet never issued is refused and corrected once by its own cycle.
+          const results = (basis: (item: typeof batch.items[number]) => unknown) => batch.items.map(item => ({ target: item.target, field: item.field, basis: basis(item), value: answer.value }));
+          steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: results(() => "G999") }, usage: lp6Usage },
+            { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: results(item => (item as unknown as { record: Ref }).record) }, usage: lp6Usage });
+          writeFileSync(scenario, JSON.stringify({ database, steps }));
+          const cycle = await runModelCycle(store, { project, packet: reference(packets[index]!), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" });
+          if (!cycle.ok) assert.fail(`${cycle.refusal.code}: ${cycle.refusal.message}`);
+          e4.push(cycle.value.record.value.steps.at(-1)!.record);
+          continue;
+        }
+        steps.push({ research: answer.need ? { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+            action: "need_source", missing: "Who writes the contract", reads: [{ action: "read", path: "lp6-source.txt", media: "text/plain" }] }
+          : answer.cannot !== undefined || answer.owner !== undefined
+          ? { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
+            ...(answer.owner !== undefined ? { action: "need_owner", reason: answer.owner, decision: "Decide it" } : { action: "cannot_answer", reason: answer.cannot }) }
+          : { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+            results: batch.items.map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: answer.value })) }, usage: lp6Usage });
+        writeFileSync(scenario, JSON.stringify({ database, steps }));
+        const sent = await runModelCall(store, { project, packet: reference(packets[index]!), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" });
+        if (!sent.ok) assert.fail(`${sent.refusal.code} at ${JSON.stringify(sent.refusal.at)}: ${sent.refusal.message}`);
+        e4.push(reference(sent.value.record));
+      }
+      return { goal, e4, routes: reference(routes) };
+    },
+    /** The owner's own decision of a field on today's B1: B1 is replaced from outside the attempt. */
+    replace(target: string, field: Lp6Field, value: Json) {
+      const input = store.get(`om-input:${project}`)!, graph = store.get(`graph:${project}`)!;
+      return deliveredOf(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
+        decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph: reference(graph), layers: [],
+          decision: { target, field, value } })) as Write }] }));
+    },
+    /** Every unresolved assignment of the attempt ended by its LP4 producer (its cause is derived, never named here). */
+    cease(ordinal: number) {
+      const binding = deliveredOf(readCompletionBinding(store, project, reference(f.head()), ordinal))!;
+      // Roots first: a part under a ceased root owes nothing more. An assignment its producer does not end (a field root
+      // whose own part answered) is left to the next one, as the pass would leave it.
+      const ended = [];
+      for (let moved = true; moved;) {
+        moved = false;
+        const snapshot = deliveredOf(readCompletionWorkAt(store, project, reference(store.get(completionWorkId(project, binding.id))!)));
+        const resolved = new Set(snapshot.resolved.map(ref => ref.id));
+        for (const row of snapshot.assignments.filter(item => !resolved.has(item.id)).sort((a, b) => Number(a.value.kind !== "root") - Number(b.value.kind !== "root"))) {
+          const written = writeCompletionCessation(store, { project, binding: reference(binding), assignment: reference(row) });
+          if (written.ok) { ended.push(written.value); moved = true; break; }
+        }
+      }
+      return ended;
+    },
+    claim(ordinal: number) {
+      return prepareManagedClaim(store, { ...address, attempt: ordinal, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never);
+    },
+    close(ordinal: number, outcome?: GateOutcome) {
+      return closeAttempt(store, { ...address, attempt: ordinal, outcome: outcome ?? deliveredOf(f.claim(ordinal)).outcome } as never);
+    },
+    saved(ordinal: number) {
+      const binding = deliveredOf(readCompletionBinding(store, project, reference(f.head()), ordinal))!;
+      const head = store.get(completionCloseId(project, binding.id))!;
+      return deliveredOf(readCompletionCloseAt(store, project, reference(head)));
+    },
+  };
+  return f;
+}
+
+test("LP6 rows 2, 4, 11: a new block close is v2 with its derived progress and every own input-field result; its claim may hide none of them nor add a foreign one, and the first one activates the boundary of the series", async t => {
+  const f = lp6Gate(t);
+  const before = reference(f.head());
+  const nodes = await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }]);
+  const derived = deliveredOf(f.claim(1)).outcome;
+  assert.deepEqual(derived.accepting, nodes.e4, "The producer of the claim names the own applied E4 the registry requires");
+  // Row 11: a claim that hides it, or that adds a record no provider confirms, is refused whole.
+  const hidden = refusalOf(f.close(1, { ...derived, accepting: [] }));
+  assert.deepEqual([hidden.code, hidden.at.field], ["completion_invalid", "accepting"]);
+  assert.match(hidden.message, /input field anew/);
+  const foreign = refusalOf(f.close(1, { ...derived, accepting: [...derived.accepting, reference(f.adapter)] }));
+  assert.equal(foreign.code, "achievement_unconfirmed");
+  // Rows 2, 4: the close is v2, its outcome a result with the input-field key and its progress explicitly non-administrative.
+  const closed = deliveredOf(f.close(1));
+  assert.equal(closed.verdict, "progress");
+  const saved = f.saved(1);
+  assert.equal(saved.contract, "om-completion-close/v2");
+  assert.deepEqual(saved.outcome.progress, { contract: "om-attempt-progress/v1", administrative: null } satisfies AttemptProgress);
+  assert.equal(saved.outcome.reason, "result");
+  assert.ok(saved.outcome.achieved.every(item => item.key.startsWith("om-result:input-field:")) && saved.outcome.achieved.length === 1);
+  const series = deliveredOf(readSeries(f.store, f.address as never)).value as RepairSeries;
+  assert.deepEqual(series.progressPolicy, { contract: "om-series-progress/v1", previous: before.revision === f.head().revision ? before : series.progressPolicy!.previous, from: 1 });
+  assert.equal(series.progressPolicy!.previous!.id, before.id);
+  // The repeat of the saved claim is the saved close (no claim is derived for a closed attempt), and a new Store reads the
+  // same v2 record and series.
+  assert.equal(refusalOf(f.claim(1)).code, "completion_incomplete");
+  assert.deepEqual(deliveredOf(f.close(1, saved.claim)).verdict, "progress");
+  f.restart();
+  assert.deepEqual(f.saved(1), saved);
+  assert.deepEqual((deliveredOf(readSeries(f.store, f.address as never)).value as RepairSeries).progressPolicy, series.progressPolicy);
+});
+
+test("LP6 rows 12, 14, 16, 17, 18: a close ended only by the replaced B1 of its own area is administrative and neutral; a real refusal beside it, an unfinished composition or the owner's wait keep the old rules — and three real failures still stop between administrative ends", async t => {
+  const f = lp6Gate(t);
+  const administrative = (ordinal: number) => f.saved(ordinal).outcome.progress!.administrative;
+  // 1: a real refusal of the model (none). 2: B1 replaced by the owner under an unsent root, ended by LP4 (neutral).
+  await f.round(1, [{ field: "checkKind", cannot: "Not decidable" }]);
+  assert.equal(deliveredOf(f.close(1)).verdict, "none");
+  assert.equal(administrative(1), null);
+  await f.round(2, [{ field: "expansion", unsent: true }]);
+  // Row 17: while the root is unfinished nothing closes the attempt — no reason is made up for it.
+  assert.equal(refusalOf(f.claim(2)).code, "completion_incomplete");
+  const replaced = f.replace("garden-B1", "state", { writer: "garden-produce-block" });
+  const ended = f.cease(2);
+  assert.ok(ended.length >= 1 && ended.every(row => row.value.cause.kind === "required-record-replaced"));
+  const neutral = deliveredOf(f.close(2));
+  assert.equal(neutral.verdict, "neutral");
+  const end = administrative(2)!;
+  assert.deepEqual([end.kind, end.input.revision, end.replacements.map(ref => ref.revision)], ["area-input-replaced", replaced.revision - 1, [replaced.revision]]);
+  assert.deepEqual(end.sources.map(ref => ref.id).sort(), ended.map(row => row.id).sort());
+  assert.equal(f.saved(2).outcome.reason, "interrupted", "The reason stays interrupted; only its progress marks it");
+  assert.equal(f.head().value.withoutProgress, 1, "Row 12: a neutral end neither counts nor resets the window");
+  // Row 16: a real refusal beside a later replacement of B1 is no administrative end: refused keeps its count.
+  await f.round(3, [{ field: "checkKind", cannot: "Still not decidable" }, { field: "expansion", unsent: true }]);
+  f.replace("garden-B1", "nodes", ["garden-produce-block", "garden-consume-block"]);
+  f.cease(3);
+  assert.equal(deliveredOf(f.close(3)).verdict, "none");
+  assert.deepEqual([f.saved(3).outcome.reason, administrative(3)], ["refused", null]);
+  assert.equal(f.head().value.withoutProgress, 2);
+  // Row 12 again, then the owner's wait (row 18) and the third real failure: the neutral ends never reset the count (row 14).
+  await f.round(4, [{ field: "expansion", unsent: true }]);
+  f.replace("garden-B1", "state", { authority: "garden-consume-block" });
+  f.cease(4);
+  assert.equal(deliveredOf(f.close(4)).verdict, "neutral");
+  await f.round(5, [{ field: "checkKind", owner: "The owner must name the criterion's check" }]);
+  assert.equal(deliveredOf(f.close(5)).verdict, "neutral");
+  assert.deepEqual([f.saved(5).outcome.reason, administrative(5)], ["awaiting-owner", null], "The owner's wait keeps its own rule");
+  await f.round(6, [{ field: "checkKind", cannot: "Never decidable" }]);
+  assert.equal(deliveredOf(f.close(6)).verdict, "none");
+  const series = f.head().value;
+  assert.deepEqual([series.withoutProgress, series.stop?.attempt, series.stop?.attempts], [3, 6, [1, 3, 6]], "The third real failure stops, counted with the first two only");
+  assert.deepEqual(series.attempts.map(row => row.verdict), ["none", "neutral", "none", "neutral", "neutral", "none"]);
+  f.restart();
+  assert.deepEqual(f.saved(2).outcome.progress, { contract: "om-attempt-progress/v1", administrative: end });
+});
+
+test("LP6 row 13: a paid need_source accepted for a field, then the replaced B1 of the area ending its continuation, is an administrative end — the paid answer, its read and its spend stay in the composition, and no achievement is made of them", async t => {
+  const f = lp6Gate(t);
+  const asked = await f.round(1, [{ field: "state", need: true }]);
+  f.replace("garden-B1", "nodes", ["garden-produce-block", "garden-consume-block"]);
+  const ended = f.cease(1);
+  assert.ok(ended.some(row => row.value.disposition === "branch-ceased" && row.value.remainder === "continuation"), JSON.stringify(ended.map(row => [row.value.disposition, row.value.remainder])));
+  assert.equal(deliveredOf(f.close(1)).verdict, "neutral");
+  const saved = f.saved(1);
+  assert.deepEqual([saved.outcome.reason, saved.outcome.achieved, saved.outcome.progress!.administrative!.kind], ["interrupted", [], "area-input-replaced"]);
+  // The paid call is no technical end and no result: it stays in the work the close names.
+  const work = deliveredOf(readCompletionWorkAt(f.store, f.project, saved.work));
+  assert.ok(work.products.some(ref => ref.id === asked.e4[0]!.id), "The paid answer is a product of the closed work");
+  assert.ok(!saved.outcome.progress!.administrative!.sources.some(ref => ref.id === asked.e4[0]!.id));
+  assert.equal(f.sent().length, 1, "Nothing was sent again");
+});
+
+test("LP6 rows 3, 29: an unknown era of a close, a missing progress after the boundary, an unknown boundary contract or a lost close proof is an addressed refusal of the reader — never read as the old era", async t => {
+  const f = lp6Gate(t);
+  await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }]);
+  deliveredOf(f.close(1));
+  const close = f.saved(1), binding = deliveredOf(readCompletionBinding(f.store, f.project, reference(f.head()), 1))!;
+  const closeHead = f.store.get(completionCloseId(f.project, binding.id))!, seriesHead = f.head();
+  // One record of the store seen otherwise, through a view; the database itself is never touched.
+  const seen = (id: string, value: Json | null) => {
+    const planted = value === null ? null : { ...(id === closeHead.id ? closeHead : seriesHead), value, hash: hashJson(value) };
+    return new Proxy(f.store, { get(target, property) {
+      if (property === "get") return (key: string, revision?: number) => key === id && (revision === undefined || revision === (planted ?? seriesHead).revision)
+        ? planted : target.get(key, revision);
+      const member: unknown = Reflect.get(target, property, target); return typeof member === "function" ? member.bind(target) : member;
+    } });
+  };
+  const withClose = (value: Record<string, unknown>) => seen(closeHead.id, value as unknown as Json);
+  const v3 = withClose({ ...close, contract: "om-completion-close/v3" });
+  assert.deepEqual([refusalOf(readCompletionCloseAt(v3, f.project, { ...reference(closeHead), hash: hashJson({ ...close, contract: "om-completion-close/v3" } as unknown as Json) })).code], ["completion_invalid"]);
+  const bare = { ...close, outcome: { ...close.outcome } } as Record<string, unknown> & { outcome: Record<string, unknown> };
+  delete bare.outcome["progress"];
+  for (const value of [{ ...bare }, { ...bare, contract: "om-completion-close/v1" }])
+    assert.equal(refusalOf(readCompletionCloseAt(withClose(value), f.project, { ...reference(closeHead), hash: hashJson(value as unknown as Json) })).code, "completion_invalid",
+      "A close of a block without its progress is not read as the old era");
+  // The series stands on its boundary: an unknown contract of it, or the boundary dropped under a v2 close, is refused.
+  const series = seriesHead.value as unknown as Record<string, unknown>;
+  for (const value of [{ ...series, progressPolicy: { ...(series["progressPolicy"] as object), contract: "om-series-progress/v0" } },
+    Object.fromEntries(Object.entries(series).filter(([key]) => key !== "progressPolicy"))]) {
+    const read = readSeries(seen(seriesHead.id, value as Json) as Store, f.address as never);
+    assert.equal(read.ok, false, JSON.stringify(Object.keys(value)));
+  }
+  // Row 29: the close proof of a closed managed attempt lost from the store is an addressed refusal, not a ground to go on.
+  const lost = refusalOf(readSeries(seen(closeHead.id, null) as Store, f.address as never));
+  assert.deepEqual([lost.code, lost.at.field], ["completion_invalid", "completion"]);
+});
+
+test("LP6 return №3371: a refusal its chain lawfully corrected (MP2) is no failure of the attempt — beside the field that chain applied it leaves a clean input-field row in the facts of the completion, its refusal kept in the history", async t => {
+  const f = lp6Gate(t);
+  const nodes = await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"], corrected: true }]);
+  assert.equal(f.sent().length, 2, "One refused answer and its one correction");
+  assert.equal(deliveredOf(f.close(1)).verdict, "progress");
+  const close = f.saved(1);
+  assert.ok(close.claim.refusals.length > 0, "The corrected refusal stays in the claim and in its history");
+  const evidence = deliveredOf(deriveCompletionEvidence(f.store, f.project, { series: reference(f.head()), ordinals: [1] }));
+  assert.deepEqual([evidence[0]!.effect, evidence[0]!.remaining, evidence[0]!.decisions.map(row => row.e4.id)], ["input-field", [], [nodes.e4[0]!.id]]);
 });

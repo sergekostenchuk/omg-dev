@@ -10,8 +10,8 @@ import {
   type CompletionReason, type Continuation, type SeriesRequest, type StopHistory, type StopHistoryEntry,
   type AnySeriesRequest, type SeriesAddress, type MechanismOwner,
 } from "./series.js";
-import { readStopContext, readStopContextAt, originHoldNamespace, ADDRESSEE_KINDS, REFUSAL_CLASSES,
-  type RefusalClass, type StopContext, type StopContextSources } from "./repeat-gate.js";
+import { readStopContext, readStopContextAt, originHoldNamespace, deriveCompletionEvidence, ADDRESSEE_KINDS, REFUSAL_CLASSES,
+  type CompletionEvidence, type RefusalClass, type StopContext, type StopContextSources } from "./repeat-gate.js";
 
 /**
  * THE EXPLANATION OF A STOP, ASSEMBLED BY CODE.
@@ -75,9 +75,11 @@ const AUDIENCE_OF: Readonly<Record<number, ReportAudience>> = Object.freeze({ 1:
  *   environment — the cycles were broken off by the repository, the workspace or the executor: a failure of the
  *                 ENVIRONMENT, which the explanation and its addressee speak of instead of a failed construction;
  *   origin      — the origin of the refusal is not established and is held for analysis at its own address;
- *   unknown     — the records do not single out any of these, and that is what is written down.
+ *   unknown     — the records do not single out any of these, and that is what is written down;
+ *   input-transition — (a report of the new era only, LP6) every cycle of the window ended by its own input moving,
+ *                 proved at its exact close: fields it decided anew, or a clean end by the replaced B1 of its area.
  */
-export const STOP_SUBJECTS = Object.freeze(["obstacle", "environment", "origin", "unknown"] as const);
+export const STOP_SUBJECTS = Object.freeze(["obstacle", "environment", "origin", "unknown", "input-transition"] as const);
 export type StopSubject = typeof STOP_SUBJECTS[number];
 
 /** What was done after an earlier stop of this lineage, and what kind of record it stood on. */
@@ -176,6 +178,8 @@ export interface StopFacts {
   readonly addressees: number;
   readonly holds: number;
   readonly accepted: number;
+  /** LP6, a report of the new era only: the cycles proved to have ended by their own input moving (not in `endings`). */
+  readonly transitions?: number;
 }
 
 /** What this unit establishes: the subject of the stop, its address and its responsible — or that it is not established. */
@@ -211,11 +215,17 @@ export interface StopReport {
   readonly guards: readonly Ref[];
   /** The explanation itself, assembled by code from the facts above. No model writes a line of it. */
   readonly lines: readonly string[];
+  /** LP6 (№3325 §4): the era of a report of the new era; a report without it is read by the old derivation. */
+  readonly contract?: typeof STOP_REPORT_CONTRACT_V2;
+  /** LP6 (№3325 §6): what every attempt of the window proves at its exact close — facts, never refusal rows. */
+  readonly completionEvidence?: readonly CompletionEvidence[];
 }
 
 export interface MechanismStopReport extends Omit<StopReport, "block"> { readonly owner: MechanismOwner }
 export type AnyStopReport = StopReport | MechanismStopReport;
-export type StopReportSources = StopContextSources;
+/** The sources of a report: A4's own, and — for a report of the new era only — its era beside them, never inside. */
+export type StopReportSources = StopContextSources & { readonly contract?: typeof STOP_REPORT_CONTRACT_V2 };
+export const STOP_REPORT_CONTRACT_V2 = "om-stop-report/v2" as const;
 
 const BLAMING_CLASSES: readonly RefusalClass[] = Object.freeze(["proposal", "input", "derivation", "readiness"] as const);
 const blamed = (facts: StopFacts): number => BLAMING_CLASSES.reduce((sum, item) => sum + facts.classes[item], 0);
@@ -255,11 +265,26 @@ export const STOP_SUBJECT_DECISIONS: readonly Readonly<{ subject: StopSubject; s
   }),
 ]);
 
+/**
+ * LP6 (№3325 §6): the table of a report of the new era. The cycles proved to have ended by their own input moving are
+ * counted apart from `endings`, so an interruption by a replaced B1 is never read as a failure of the environment; the
+ * rows above decide on the rest of the window. A window of such cycles alone, with nothing else in it, is an input
+ * transition; a mixed one keeps its real obstacles, and a cause they do not single out is not established.
+ */
+export const STOP_SUBJECT_DECISIONS_V2: readonly Readonly<{ subject: StopSubject; sufficient: (facts: StopFacts) => boolean }>[] = Object.freeze([
+  ...STOP_SUBJECT_DECISIONS,
+  Object.freeze({
+    subject: "input-transition" as const,
+    sufficient: (f: StopFacts) => (f.transitions ?? 0) >= 1 && f.transitions === f.attempts && f.holds === 0 && f.obstacles === 0,
+  }),
+]);
+
 const REPORT_KEYS = Object.freeze([
   "project", "block", "line", "series", "rung", "audience", "context", "obstacles", "finding", "remedies", "proposed",
   "guards", "lines",
 ] as const);
 const MECHANISM_REPORT_KEYS = Object.freeze([...REPORT_KEYS.filter(key => key !== "block"), "owner"]);
+const ERA_KEYS = Object.freeze(["contract", "completionEvidence"] as const);
 const REVIEW_PARTS = Object.freeze(["cause", "change"] as const);
 
 interface Assembled { readonly report: AnyStopReport; readonly guards: readonly Ref[] }
@@ -283,6 +308,17 @@ export function stopReport(store: Store, request: AnySeriesRequest): OmResult<Se
   return assembled.ok ? delivered(assembled.value.report) : assembled;
 }
 
+/**
+ * LP6 (№3325 §4, §6): the explanation of the new era — the same report, with its era and the facts every attempt of the
+ * window proves at its exact close. New A6 intents stand on it; a report already saved is read in its own era.
+ */
+export function stopReportOfNewEra(store: Store, request: AnySeriesRequest): OmResult<Sealed<AnyStopReport>> {
+  requireStore(store);
+  requireCondition(isPlainObject(request), "stop_report_invalid", "The explanation of a stop is asked for through a request object");
+  const assembled = assemble(store, request, undefined, STOP_REPORT_CONTRACT_V2);
+  return assembled.ok ? delivered(assembled.value.report) : assembled;
+}
+
 /** Capture only the mutable inputs of the checked report; all deeper witnesses remain in their saved records. */
 export function stopReportSources(report: Sealed<AnyStopReport>): Sealed<StopReportSources> {
   requireReport(report);
@@ -291,21 +327,32 @@ export function stopReportSources(report: Sealed<AnyStopReport>): Sealed<StopRep
   const series = byId.get(address.id)!, journal = byId.get(journalId(address.project)) ?? null;
   const holds = report.guards.filter(ref => ref.id.startsWith(originHoldNamespace(address.project)));
   if (1 + Number(journal !== null) + holds.length !== report.guards.length) reportInvalid("guards");
-  return sealed({ series: exactRef(series), journal: journal === null ? null : exactRef(journal), holds: holds.map(exactRef) });
+  return sealed({ ...(report.contract === STOP_REPORT_CONTRACT_V2 ? { contract: STOP_REPORT_CONTRACT_V2 } : {}),
+    series: exactRef(series), journal: journal === null ? null : exactRef(journal), holds: holds.map(exactRef) });
 }
 
 /** Reassemble through A3/A4 and the same report formula from exact saved sources, without current admission. */
 export function readStopReport(store: Store, request: { project: string; sources: StopReportSources }): OmResult<Sealed<AnyStopReport>> {
   if (!(store instanceof Store)) reportInvalid("store");
+  // LP6: the era stands beside A4's sources. Without it the exact old form is read by the old derivation; a marker this
+  // unit does not write, or a v2 form missing a part, is refused at its address — never read as the old era.
+  const era = isPlainObject(request) && isPlainObject(request.sources) && Object.hasOwn(request.sources, "contract")
+    ? (request.sources as { contract?: unknown }).contract : undefined;
+  if (Object.hasOwn(isPlainObject(request) && isPlainObject(request.sources) ? request.sources : {}, "contract")) {
+    const target = isPlainObject(request.sources.series) && isText((request.sources.series as Ref).id) ? (request.sources.series as Ref).id : "stop-report";
+    if (era !== STOP_REPORT_CONTRACT_V2 || !exactKeys(request.sources, ["contract", "series", "journal", "holds"]))
+      return refused("report_forged", "A report names only the era this unit writes, with every source of that era",
+        { unit: UNIT, target, field: "sources.contract" }, "producer");
+  }
   if (!(isPlainObject(request) && isText(request.project) && isPlainObject(request.sources)
-    && exactKeys(request.sources, ["series", "journal", "holds"]) && isRef(request.sources.series)
+    && exactKeys(request.sources, era === undefined ? ["series", "journal", "holds"] : ["contract", "series", "journal", "holds"]) && isRef(request.sources.series)
     && (request.sources.journal === null || isRef(request.sources.journal))
     && Array.isArray(request.sources.holds) && request.sources.holds.every(isRef))) reportInvalid("sources");
   const fixed = sealed({ project: request.project, sources: { series: exactRef(request.sources.series),
     journal: request.sources.journal === null ? null : exactRef(request.sources.journal), holds: request.sources.holds.map(exactRef) } });
   const series = readAnySeriesAt(store, fixed.project, fixed.sources.series);
   if (!series.ok) return series;
-  const assembled = assemble(store, seriesRequestOf(series.value.value), fixed.sources);
+  const assembled = assemble(store, seriesRequestOf(series.value.value), fixed.sources, era === undefined ? undefined : STOP_REPORT_CONTRACT_V2);
   return assembled.ok ? delivered(assembled.value.report) : assembled;
 }
 
@@ -330,7 +377,7 @@ export function checkStanding(store: Store, report: Sealed<AnyStopReport>): OmRe
     return refused("report_stale", "A head this explanation was read from has moved since, so the explanation no longer stands for what the records hold",
       { unit: UNIT, target, field: "guards", ref: moved }, "producer");
   }
-  const again = assemble(store, request);
+  const again = assemble(store, request, undefined, report.contract);
   if (!again.ok) return again;
   // Every head the report was read from is among its guards, so unchanged guards give the same explanation again:
   // a difference here is a difference in the report, not in the records (T3).
@@ -343,10 +390,12 @@ export function checkStanding(store: Store, report: Sealed<AnyStopReport>): OmRe
 
 // ---------------------------------------------------------------------------
 
-function assemble(store: Store, request: AnySeriesRequest, sources?: StopReportSources): OmResult<Assembled> {
+function assemble(store: Store, request: AnySeriesRequest, sources?: StopContextSources, era?: typeof STOP_REPORT_CONTRACT_V2): OmResult<Assembled> {
   // The context is assembled by the ONE function that assembles it, and it hands over the heads it read: the series,
   // the journal and every hold of the lineage, lifted or standing. Nothing is guessed about what the gate touched.
-  const read = sources ? readStopContextAt(store, { project: request.project, sources }) : readStopContext(store, request);
+  // A4 is handed its own sources only: the era of a report is this unit's envelope, never a field of the context.
+  const read = sources ? readStopContextAt(store, { project: request.project,
+    sources: { series: sources.series, journal: sources.journal, holds: sources.holds } }) : readStopContext(store, request);
   if (!read.ok) return read;
   const held = read.value.context as StopContext;
   const guards: Ref[] = [...read.value.reads];
@@ -374,16 +423,28 @@ function assemble(store: Store, request: AnySeriesRequest, sources?: StopReportS
   requireCondition(audience !== "owner" || remedies.length > 0,
     "stop_report_broken", "The owner's rung is reached by spending the first one, and what was spent is on record");
 
-  const facts = factsOf(held);
-  const finding = findingOf(held, facts, obstacles);
+  // LP6 (№3325 §6): a report of the new era is shown what every attempt of its window proves at its exact close, by the
+  // one reading of repeat-gate that also stands behind a reconciled stop; the old era is assembled as it always was.
+  let evidence: readonly CompletionEvidence[] = [];
+  if (era === STOP_REPORT_CONTRACT_V2 && held.endings.length > 0) {
+    const series = sources ? sources.series : guards.find(ref => ref.id === at.id);
+    requireCondition(series !== undefined, "stop_report_broken", "A context names the head of the series it was read from");
+    const derived = deriveCompletionEvidence(store, at.project, { series, ordinals: held.endings.map(item => item.attempt) });
+    if (!derived.ok) return derived;
+    evidence = derived.value as readonly CompletionEvidence[];
+  }
+  const facts = era === STOP_REPORT_CONTRACT_V2 ? factsOfNewEra(held, evidence) : factsOf(held);
+  const finding = findingOf(held, facts, obstacles, era === STOP_REPORT_CONTRACT_V2 ? STOP_SUBJECT_DECISIONS_V2 : STOP_SUBJECT_DECISIONS, evidence);
   // A change nobody named is no proposal: an analysis that found none says so, and none is invented in its place.
   const proposed = remedies.flatMap(item => item.claims.filter(claim => claim.what === "change" && claim.stated !== null));
+  const lines = linesOf(held, obstacles, finding, remedies, proposed, audience as ReportAudience);
   const report: AnyStopReport = {
     project: at.project, ...(at.owner.kind === "block" ? { block: at.owner.block } : { owner: at.owner }), line: at.line,
     series: at.id, rung, audience: audience as ReportAudience,
     context: held, obstacles, finding, remedies, proposed,
     guards: uniqueGuards(guards),
-    lines: linesOf(held, obstacles, finding, remedies, proposed, audience as ReportAudience),
+    lines: era === STOP_REPORT_CONTRACT_V2 ? [...lines.slice(0, -1), ...evidence.map(evidenceLine), lines.at(-1)!] : lines,
+    ...(era === STOP_REPORT_CONTRACT_V2 ? { contract: STOP_REPORT_CONTRACT_V2, completionEvidence: evidence } : {}),
   };
   return { ok: true, value: { report, guards } };
 }
@@ -593,6 +654,13 @@ function factsOf(context: StopContext): StopFacts {
   };
 }
 
+/** LP6: the facts of a report of the new era — the cycles proved to have ended by their own input moving stand apart. */
+function factsOfNewEra(context: StopContext, evidence: readonly CompletionEvidence[]): StopFacts {
+  const moved = new Set(evidence.filter(item => item.effect === "input-field" || item.effect === "administrative").map(item => item.ordinal));
+  const rest = factsOf({ ...context, endings: context.endings.filter(item => !moved.has(item.attempt)) });
+  return { ...rest, attempts: context.endings.length, transitions: moved.size };
+}
+
 function counted<Key extends string>(keys: readonly Key[], seen: readonly Key[]): Readonly<Record<Key, number>> {
   const table = {} as Record<Key, number>;
   for (const key of keys) table[key] = 0;
@@ -600,8 +668,9 @@ function counted<Key extends string>(keys: readonly Key[], seen: readonly Key[])
   return Object.freeze(table);
 }
 
-function findingOf(context: StopContext, facts: StopFacts, obstacles: readonly StopObstacleRow[]): StopFinding {
-  const admitted = STOP_SUBJECT_DECISIONS.filter(decision => decision.sufficient(facts));
+function findingOf(context: StopContext, facts: StopFacts, obstacles: readonly StopObstacleRow[],
+  table: typeof STOP_SUBJECT_DECISIONS, evidence: readonly CompletionEvidence[]): StopFinding {
+  const admitted = table.filter(decision => decision.sufficient(facts));
   requireCondition(admitted.length <= 1, "stop_report_broken", "The table of decision admits one subject for a tally at most");
   const decided = admitted[0];
   const subject: StopSubject = decided === undefined ? "unknown" : decided.subject;
@@ -621,6 +690,12 @@ function findingOf(context: StopContext, facts: StopFacts, obstacles: readonly S
     return {
       subject, addressee, rows: conditions.map(item => item.row).sort(compare), facts,
       text: `The work of this window was stopped by the ENVIRONMENT, not by the construction of the product: ${environmentFacts(facts, conditions)}. It goes to ${addressee}.`,
+    };
+  }
+  if (subject === "input-transition") {
+    return {
+      subject, addressee: null, rows: [], facts,
+      text: `Every cycle of this window ended by its own input moving, as its exact close proves: ${evidence.map(item => `attempt ${item.ordinal} — ${effectText(item)}`).join("; ")}. This is no failure of the environment and no obstacle of the product.`,
     };
   }
   if (subject === "origin") {
@@ -648,6 +723,7 @@ const environmentFacts = (facts: StopFacts, conditions: readonly StopObstacleRow
 
 const knownFacts = (facts: StopFacts): string => [
   `${facts.attempts} cycle(s) ended in the window`,
+  ...(facts.transitions === undefined ? [] : [`${facts.transitions} of them proved to have ended by their own input moving`]),
   `${facts.obstacles} obstacle(s), ${facts.repeating} of them met by more than one cycle`,
   `${facts.unclassified} of them classified by nobody`,
   `${facts.addressees} responsible(s) named`,
@@ -701,6 +777,23 @@ const repeatedLine = (obstacles: readonly StopObstacleRow[]): string => {
   return `Refusals repeating: ${repeating.map(item => `"${item.code}" over "${item.origin.subject}" (row ${item.row}) met by ${item.times} cycles, answered for by ${String(item.addressee)}`).join("; ")}.`;
 };
 
+/** LP6 (№3325 §6): one attempt of the window as its exact close proves it, in words a reviewer can check against sources. */
+const effectText = (item: CompletionEvidence): string => item.effect === "input-field"
+  ? `new accepted input-field result(s) of its own applied E4 (${item.results.length})`
+  : item.effect === "administrative" ? "a clean administrative end: the B1 of its own area was replaced, nothing else ended it"
+  : item.effect === "standalone" ? "no managed close proves what it did"
+  // Return №3371: a fresh field beside a real failure is a mixed end, never shown as a clean input transition.
+  : `${item.results.length > 0 ? `new accepted input-field result(s) of its own applied E4 (${item.results.length}) beside ` : ""}real failure(s) that remain: ${item.remaining.join("; ")}`;
+const at = (ref: Ref): string => `${ref.id}@${ref.revision}`;
+const evidenceLine = (item: CompletionEvidence): string => [
+  `Completion of attempt ${item.ordinal} (${item.goal}): closed ${item.reason}${item.close === null ? " without a managed close" : ` by ${at(item.close)}`}`,
+  item.decisions.length === 0 ? "no own applied input decision" : `own applied input decisions: ${item.decisions.map(decision =>
+    `E4 ${at(decision.e4)} of E1 ${at(decision.call)} on B1 ${at(decision.previous)} applied as B1 ${at(decision.input)}${decision.filled.length === 0
+      ? ", filling no field anew" : `, filling anew ${decision.filled.map(field => `${field.field}${field.component === null ? "" : `.${field.component}`} of ${field.target} = ${JSON.stringify(field.accepted)}`).join(", ")}`}`).join("; ")}`,
+  item.ends.length === 0 ? "no technical end" : `technical ends: ${item.ends.map(end => `${end.detail} (${at(end.source)})`).join("; ")}`,
+  `effect: ${effectText(item)}.`,
+].join("; ");
+
 const endingsLine = (context: StopContext): string =>
   `Why the cycles ended: ${context.endings.map(item => `attempt ${item.attempt} — ${item.reason}`).join("; ")}.`;
 
@@ -741,7 +834,10 @@ function requireStore(store: unknown): asserts store is Store {
 }
 
 function requireReport(report: unknown): asserts report is Sealed<AnyStopReport> {
-  if (!(isPlainObject(report) && exactKeys(report, Object.hasOwn(report as object, "owner") ? MECHANISM_REPORT_KEYS : REPORT_KEYS))) reportInvalid("report");
+  const era = isPlainObject(report) && Object.hasOwn(report as object, "contract");
+  if (!(isPlainObject(report) && exactKeys(report, [...(Object.hasOwn(report as object, "owner") ? MECHANISM_REPORT_KEYS : REPORT_KEYS),
+    ...(era ? ERA_KEYS : [])]))) reportInvalid("report");
+  if (era && (report as { contract?: unknown }).contract !== STOP_REPORT_CONTRACT_V2) reportInvalid("contract");
   const value = report as unknown as AnyStopReport;
   if (!(isText(value.project) && Number.isSafeInteger(value.line) && isText(value.series)
     && ("owner" in value ? isPlainObject(value.owner) && exactKeys(value.owner, ["kind", "mechanism"])

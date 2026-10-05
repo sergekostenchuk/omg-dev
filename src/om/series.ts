@@ -1,4 +1,5 @@
-import { readCompletionCloseAt as readCompletionCloseAtOf } from './repeat-gate.js';
+import { readCompletionCloseAt as readCompletionCloseAtOf, deriveWindowProgress as deriveWindowProgressOf,
+  type WindowProgressRow } from './repeat-gate.js';
 import { canonical, compareKeys, compositeKey, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -139,6 +140,7 @@ export type SeriesResultCode = SeriesLocalCode | SourceCodes<SeriesSource>;
 export type SeriesResult<T> = OmResult<T, SeriesResultCode>;
 
 const readCompletionCloseAt = transferring("repeat-gate", readCompletionCloseAtOf);
+const deriveWindowProgress = transferring("repeat-gate", deriveWindowProgressOf);
 const readPreparedSeriesTransition = transferring("series-transition", readPreparedSeriesTransitionOf);
 const prepareSeriesTransition = transferring("series-transition", prepareSeriesTransitionOf);
 const comparePreparedSeriesSlices = transferring("series-transition", comparePreparedSeriesSlicesOf);
@@ -199,11 +201,40 @@ export interface ClaimedRefusal extends SeriesRefusal {
   readonly goal: string;
 }
 
+/**
+ * LP6 (№3325 §2–§5). A clean administrative end of an attempt — every technical end of its work a proved end by the
+ * replaced B1 of its own area — is neutral for the count of attempts without progress: it neither raises the count nor
+ * clears it. The family of decided input fields is new or known against the history of the whole LINE, so a changed set
+ * of questions (a new composite goal) does not make the same accepted field new. Both rules hold only from the series'
+ * explicit boundary on; the history before it is walked by the rules of its own era.
+ */
+export const ATTEMPT_PROGRESS_CONTRACT = "om-attempt-progress/v1" as const;
+export const SERIES_PROGRESS_CONTRACT = "om-series-progress/v1" as const;
+/** The key family of a decided block input field; such keys reach a series only from their confirming provider. */
+export const INPUT_FIELD_KEY_PREFIX = "om-result:input-field:";
+export interface AdministrativeEnd {
+  readonly kind: "area-input-replaced";
+  readonly input: Ref;
+  readonly replacements: readonly Ref[];
+  readonly sources: readonly Ref[];
+}
+export interface AttemptProgress { readonly contract: typeof ATTEMPT_PROGRESS_CONTRACT; readonly administrative: AdministrativeEnd | null }
+/** The boundary from which a block series is walked by LP6: the exact revision before it, and the first attempt it covers. */
+export interface ProgressPolicy { readonly contract: typeof SERIES_PROGRESS_CONTRACT; readonly previous: Ref | null; readonly from: number }
+/** A saved stop reconciled under LP6: the exact transition record and the result keys it brought into the history. */
+export interface Reconciliation {
+  readonly after: number;
+  readonly transition: Ref;
+  readonly achieved: readonly { readonly goal: string; readonly key: string }[];
+}
+
 export interface AttemptOutcome {
   readonly reason: CompletionReason;
   readonly achieved: readonly Achievement[];
   readonly cancelled: readonly string[];
   readonly refusals: readonly SeriesRefusal[];
+  /** What a block's managed close of the LP6 era proved besides its results; absent before the series' boundary. */
+  readonly progress?: AttemptProgress;
 }
 
 export interface ClaimedOutcome extends Omit<AttemptOutcome, "refusals"> {
@@ -314,6 +345,8 @@ export interface StopHistoryEntry {
   readonly continuation: Continuation | null;
   /** What became of the window the continuation opened — null when no continuation opened one. */
   readonly window: StopWindow | null;
+  /** LP6: the transition that reconciled this stop — present only when one did. */
+  readonly reconciliation?: Ref;
 }
 
 export interface StopHistory {
@@ -347,6 +380,9 @@ export interface RepairSeries {
   readonly withoutProgress: number;
   readonly ladder: SeriesLadder;
   readonly stop: SeriesStop | null;
+  /** LP6: present from the series' first activation of the new progress rules on, and inherited by a successor. */
+  readonly progressPolicy?: ProgressPolicy;
+  readonly reconciliations?: readonly Reconciliation[];
 }
 
 export interface SeriesRequest {
@@ -577,6 +613,21 @@ export function escalateSeries(store: Store, request: EscalateSeriesRequest): Se
 export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>>;
 export function escalateSeries(store: Store, request: AnyEscalateSeriesRequest): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   return withHistoricalReads(() => applied(store, prepareEscalate(store, request)));
+}
+
+/**
+ * LP6 (№3325 §5): lifts the saved stop the request names by `progress-reconciled` — the transition of the new era for a
+ * stop whose whole counted window proves fresh input-field results or clean administrative ends of the replaced B1. It
+ * opens a new window with a count of zero, neither climbs nor resets the rung, adds no window to the ladder and puts the
+ * proved results into the history; the old outcomes, verdicts and the stop itself stay as they were written. The record
+ * of the transition and the new revision of the series are one guarded transaction; a repeat finds its own transition.
+ * A window with a real failure is `progress_unproved` (from repeat-gate), and the old rules of the ladder stand.
+ */
+export function reconcileSeries(store: Store, request: ReconcileSeriesRequest): SeriesResult<Sealed<Revision<RepairSeries>>> {
+  return withHistoricalReads(() => applied(store, prepareReconcile(store, request))) as SeriesResult<Sealed<Revision<RepairSeries>>>;
+}
+export function prepareReconcileSeries(store: Store, request: ReconcileSeriesRequest): SeriesResult<Sealed<SeriesTransition>> {
+  return withHistoricalReads(() => handed(prepareReconcile(store, request))) as SeriesResult<Sealed<SeriesTransition>>;
 }
 
 /**
@@ -841,6 +892,8 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): SeriesRe
     achievedOrder: ACHIEVED_ORDER, projectId: address.project, ...ownerFields(address.owner), line: address.line, slice,
     ...(mechanism ? { scope: normalizedScope(request.scope), admissions: earlier && "owner" in earlier.value ? earlier.value.admissions : [] } : {}),
     predecessor, basis, inherited, attempts: [], continuations: carried, escalations: escalated,
+    ...(earlier && "block" in earlier.value && earlier.value.progressPolicy !== undefined ? { progressPolicy: earlier.value.progressPolicy } : {}),
+    ...(earlier && "block" in earlier.value && earlier.value.reconciliations !== undefined ? { reconciliations: earlier.value.reconciliations } : {}),
   } as SeriesDraft);
   // Claim the old line in the same CAS transaction. Its unchanged body remains historical, while its new revision
   // invalidates previously prepared work on that old line in either transaction ordering.
@@ -1008,6 +1061,15 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, manag
     completionGuards = admission.value.guards;
   }
 
+  // LP6 (№3325 §4): progress is derived by a block's managed close of the new era, never claimed by a caller; the first
+  // such close activates the boundary of the series at its own attempt, and from it on every managed close carries one.
+  const progressed = outcome.progress !== undefined;
+  const policy = "block" in held ? held.progressPolicy : undefined;
+  if (progressed && (binding.value === null || !("block" in held)))
+    return problem("outcome_invalid", "Only a managed close of a block carries its progress", context, "outcome.progress");
+  if (binding.value !== null && "block" in held && policy !== undefined && (attempt.ordinal >= policy.from) !== progressed)
+    return refuse('completion_invalid', 'A managed close keeps the progress rules of its side of the series boundary',
+      { unit: UNIT, target: head.id, field: 'completion' }, 'producer');
   const contradiction = outcomeContradiction(outcome);
   if (contradiction) return problem("outcome_invalid", contradiction, context, "outcome");
   for (let item = 0; item < outcome.achieved.length; item += 1) {
@@ -1031,8 +1093,9 @@ function prepareComplete(store: Store, request: AnyCompleteAttemptRequest, manag
     ...(terminal === undefined ? {} : { terminal: exactRef(terminal) }) };
   const value = settled({
     ...plainSeries(held),
+    ...(progressed && policy === undefined ? { progressPolicy: { contract: SERIES_PROGRESS_CONTRACT, previous: reference(head), from: attempt.ordinal } } : {}),
     attempts: held.attempts.map(item => (item.ordinal === request.attempt ? closed : copyAttempt(item, held.achievedOrder))),
-  });
+  } as SeriesDraft);
   return change(address, value, head.revision, completionGuards, head);
 }
 
@@ -1134,6 +1197,106 @@ function prepareEscalate(store: Store, request: AnyEscalateSeriesRequest): Serie
 
   const value = settled({ ...plainSeries(held), escalations: [...held.escalations.map(plainEscalation), escalation] });
   return change(address, value, head.revision, lineAdmission.value.guards, head, grounded.write === null ? [] : [grounded.write]);
+}
+
+// ---------------------------------------------------------------------------
+// LP6 (№3325 §5): progress-reconciled. A saved stop the rules of the new era prove false is lifted by a transition record
+// of its own — never by a string of explanation, a model's decision or a pretended owner's decision.
+
+export const SERIES_PROGRESS_TRANSITION_KIND = "om-series-progress-transition";
+export const SERIES_PROGRESS_TRANSITION_CONTRACT = "om-series-progress-transition/v1" as const;
+export type ReconcileSeriesRequest = SeriesRequest & { readonly stop: number };
+/** The proved transition of one saved stop: its exact source revision, the stop and every counted row of its window. */
+export interface SeriesProgressTransition {
+  readonly contract: typeof SERIES_PROGRESS_TRANSITION_CONTRACT; readonly project: string; readonly series: Ref; readonly stop: number;
+  readonly rows: readonly WindowProgressRow[];
+}
+/** Deterministic in the exact source state and its stop: a repeat addresses that state, never "whatever stop stands now". */
+export function seriesProgressTransitionId(project: string, series: Ref, stop: number): string {
+  return `${SERIES_PROGRESS_TRANSITION_KIND}:${project}:${hashJson({ series: exactRef(series), stop } as unknown as Json)}`;
+}
+/** The results a transition puts into the history, in the one order a reconciliation holds them. */
+const reconciledOf = (record: SeriesProgressTransition): { goal: string; key: string }[] =>
+  ordered(record.rows.flatMap(row => row.achieved.map(key => ({ goal: row.goal.key, key }))), row => compositeKey([row.goal, row.key]));
+const rowOf = (row: WindowProgressRow): WindowProgressRow => ({ ordinal: row.ordinal, goal: goalOf(row.goal), close: exactRef(row.close),
+  result: row.result, achieved: [...row.achieved], sources: row.sources.map(exactRef) });
+/**
+ * The one derivation of a transition, for its producer and its reader: the stop standing at the end of the exact source
+ * revision of a block series, its counted window read by the common subject derivation of repeat-gate over the decided
+ * fields the line held then. Historical proof only: the saved refs in their own eras, never today's B1 head.
+ */
+function progressTransitionValue(store: Store, project: string, source: Ref, held: Sealed<AnyRepairSeries>, context: Context):
+  SeriesResult<SeriesProgressTransition> {
+  if (!("block" in held)) return problem("series_invalid", "Only a block series is reconciled by the rules of LP6", context, "owner");
+  const derived = walk(plainSeries(held as unknown as AnyRepairSeries));
+  if (derived.stop === null) return problem("stop_absent", "No saved stop stands at the end of this revision of the series", context, "stop");
+  const rows = deriveWindowProgress(store, project, { series: source, ordinals: derived.stop.attempts });
+  if (!rows.ok) return rows;
+  return delivered({ contract: SERIES_PROGRESS_TRANSITION_CONTRACT, project, series: exactRef(source), stop: derived.stop.attempt,
+    rows: rows.value.map(row => rowOf(row as WindowProgressRow)) }) as SeriesResult<SeriesProgressTransition>;
+}
+/** Reads a transition at its exact reference: its own address, and equal to the one derivation of its saved source. */
+export function readSeriesProgressTransitionAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<SeriesProgressTransition>>> {
+  requireStore(store); requireProject(project);
+  check(isRef(ref), "series_request_invalid", "A progress transition is read at its exact reference");
+  return withHistoricalReads(() => historicalRead(store, { reader: 'A3.progress-transition', project, ref, parameters: null }, () => {
+    const read = readRecord<SeriesProgressTransition>(store, ref, { unit: UNIT, target: ref.id, kind: SERIES_PROGRESS_TRANSITION_KIND,
+      idPrefix: `${SERIES_PROGRESS_TRANSITION_KIND}:${project}:` });
+    if (!read.ok) return read;
+    const record = read.value, value = record.value as unknown as Record<string, unknown>, context: Context = { target: ref.id, ref };
+    if (!isPlainObject(value) || !exactKeys(value, ["contract", "project", "series", "stop", "rows"])
+      || value['contract'] !== SERIES_PROGRESS_TRANSITION_CONTRACT || value['project'] !== project || !isRef(value['series'])
+      || !Number.isSafeInteger(value['stop']) || record.revision !== 1
+      || record.id !== seriesProgressTransitionId(project, value['series'] as Ref, value['stop'] as number))
+      return problem("series_invalid", "A progress transition names its contract, project, exact source series and stop at its own address", context, "record");
+    const source = readAnySeriesAt(store, project, value['series'] as Ref);
+    if (!source.ok) return source;
+    const derived = progressTransitionValue(store, project, value['series'] as Ref, source.value.value, context);
+    if (!derived.ok) return derived;
+    if (canonical(derived.value as unknown as Json) !== canonical(value as Json) || derived.value.stop !== value['stop'])
+      return problem("series_invalid", "A progress transition is the one derivation of its stop and window", context, "record");
+    return delivered(record as Revision<SeriesProgressTransition>);
+  }, () => problem("series_invalid", "A progress transition cannot prove itself", { target: ref.id, ref }, "history")));
+}
+function prepareReconcile(store: Store, request: ReconcileSeriesRequest): SeriesResult<Prepared> {
+  requireStore(store);
+  check(isPlainObject(request), "series_request_invalid", "A stopped series is reconciled through a request object");
+  const address = requireAddress(request);
+  check(address.owner.kind === "block", "series_request_invalid", "Only a block series is reconciled by the rules of LP6");
+  check(Number.isSafeInteger(request.stop) && request.stop >= 1, "series_request_invalid", "A reconciliation names the attempt whose stop it answers");
+  const current = currentSeries(store, address);
+  if (!current) return missing(address);
+  if (!current.ok) return current;
+  const head = current.value, held = head.value as RepairSeries;
+  const context: Context = { target: address.id, ref: reference(head) };
+  // T5: the stop this transition answers is reconciled already — a repeat, a reopen or a repeat after later actions finds
+  // that very transition and writes nothing; it never lands on a stop saved since then.
+  const already = (held.reconciliations ?? []).find(item => item.after === request.stop);
+  if (already) {
+    const saved = readSeriesProgressTransitionAt(store, address.project, already.transition);
+    return saved.ok ? unchanged(head) : saved;
+  }
+  const obsolete = currentLineProblem(store, address, reference(head));
+  if (obsolete) return obsolete;
+  const lineAdmission = mutationAdmission(store, head);
+  if (!lineAdmission.ok) return lineAdmission;
+  if (held.stop === null || held.stop.attempt !== request.stop)
+    return problem("stop_absent", `No saved stop stands after attempt ${request.stop} in this series`, context, "stop");
+  const derived = progressTransitionValue(store, address.project, reference(head), held, context);
+  if (!derived.ok) return derived;
+  const record = derived.value;
+  const id = seriesProgressTransitionId(address.project, reference(head), request.stop);
+  const transition: Ref = { id, revision: 1, hash: hashJson(record as unknown as Json) };
+  // The boundary is activated here, at the attempt after the stop, when no close of the new era activated it before.
+  const value = settled({
+    ...plainSeries(held),
+    progressPolicy: held.progressPolicy ?? { contract: SERIES_PROGRESS_CONTRACT, previous: reference(head),
+      from: held.inherited.length + held.attempts.length + 1 },
+    reconciliations: [...(held.reconciliations ?? []).map(reconciliationOf),
+      reconciliationOf({ after: request.stop, transition, achieved: reconciledOf(record) })],
+  } as SeriesDraft);
+  return change(address, value, head.revision, lineAdmission.value.guards, head,
+    [{ id, kind: SERIES_PROGRESS_TRANSITION_KIND, expected: 0, value: record as unknown as Json }]);
 }
 
 /** Where a record of a ground comes from, what it holds, and — when it is written with this change — its write. */
@@ -1422,6 +1585,8 @@ interface Walk {
   readonly stop: SeriesStop | null;
   readonly stops: readonly StopHistoryEntry[];
   readonly flaw: { readonly field: string; readonly message: string } | null;
+  /** LP6: the keys of decided input fields the whole line holds — its outcomes and its reconciliations. */
+  readonly fields: ReadonlySet<string>;
 }
 
 // The history as the walk fills it in: one draft per saved stop, completed as the walk reaches what answered it and
@@ -1433,6 +1598,7 @@ interface StopDraft {
   escalation: Escalation | null;
   continuation: Continuation | null;
   window: StopWindow | null;
+  reconciliation?: Ref;
 }
 
 type SeriesDraft = Omit<RepairSeries, "withoutProgress" | "ladder" | "stop"> | Omit<MechanismRepairSeries, "withoutProgress" | "ladder" | "stop">;
@@ -1473,6 +1639,12 @@ function walk(value: SeriesDraft): Walk {
   let ladder = ladderStart();
   let flaw: { readonly field: string; readonly message: string } | null = null;
   let run: { ordinals: number[]; goals: string[] } = { ordinals: [], goals: [] };
+  // LP6: the boundary of the new rules, the line history of decided input fields, and the reconciled stops.
+  const policy = "block" in value ? value.progressPolicy : undefined;
+  const newEra = (attempt: Attempt): boolean => policy !== undefined && attempt.ordinal >= policy.from;
+  const fields = new Set<string>();
+  const settles = new Map((("block" in value ? value.reconciliations : undefined) ?? []).map((item, index) => [item.after, { item, index }]));
+  const settled = new Set<number>();
   // The history of the stops, and the two drafts the walk is in the middle of: the stop standing at this point, and
   // the one whose continuation opened the window the walk is inside.
   const stops: StopDraft[] = [];
@@ -1513,12 +1685,20 @@ function walk(value: SeriesDraft): Walk {
     }
     if (attempt.outcome === null) return;
     const history = achieved.get(attempt.goal.key) ?? new Set<string>();
-    const fresh = attempt.outcome.achieved.filter(item => !history.has(item.key)).map(item => item.key);
-    const verdict: AttemptVerdict = attempt.outcome.reason === "awaiting-owner" ? "neutral"
+    // LP6: a decided input field is new or known against the whole line, whatever composite goal asked for it. No record
+    // before LP6 holds such a key, so the old history is walked exactly as before.
+    const known = (key: string): boolean => key.startsWith(INPUT_FIELD_KEY_PREFIX) ? fields.has(key) : history.has(key);
+    const fresh = attempt.outcome.achieved.filter(item => !known(item.key)).map(item => item.key);
+    // LP6: a clean administrative end by the replaced B1 of the attempt's own area is neutral — no count, no reset.
+    const administrative = newEra(attempt) && (attempt.outcome.progress?.administrative ?? null) !== null;
+    const verdict: AttemptVerdict = attempt.outcome.reason === "awaiting-owner" || administrative ? "neutral"
       : attempt.outcome.cancelled.length > 0 ? "conflict"
         : fresh.length > 0 ? "progress" : "none";
     verdicts.set(attempt.ordinal, verdict);
-    for (const item of attempt.outcome.achieved) history.add(item.key);
+    for (const item of attempt.outcome.achieved) {
+      history.add(item.key);
+      if (item.key.startsWith(INPUT_FIELD_KEY_PREFIX)) fields.add(item.key);
+    }
     achieved.set(attempt.goal.key, history);
 
     if (verdict === "progress") {
@@ -1580,16 +1760,55 @@ function walk(value: SeriesDraft): Walk {
         opened();
       }
     }
+    // LP6 (№3325 §5): a reconciled stop is lifted without a ground of the ladder. It opens a new window with a count of
+    // zero, neither climbs nor resets the rung and adds no window to the ladder; the results it proved enter the
+    // history of their original goals and of the line. The old outcomes and verdicts stay as they were written.
+    const settle = settles.get(attempt.ordinal)?.item;
+    if (settle) {
+      settled.add(attempt.ordinal);
+      if (stop === null || stop.attempt !== attempt.ordinal || lift !== undefined) {
+        flaw ??= { field: "reconciliations", message: `A reconciliation after attempt ${attempt.ordinal} answers no stop that stands there alone` };
+      } else {
+        for (const row of settle.achieved) {
+          const goal = achieved.get(row.goal) ?? new Set<string>();
+          goal.add(row.key);
+          achieved.set(row.goal, goal);
+          if (row.key.startsWith(INPUT_FIELD_KEY_PREFIX)) fields.add(row.key);
+        }
+        if (saved !== null) {
+          saved.reconciliation = exactRef(settle.transition);
+          inside = saved;
+          saved = null;
+        }
+        stop = null;
+        opened();
+      }
+    }
   };
 
   for (const attempt of value.inherited) step(attempt);
   for (const attempt of value.attempts) step(attempt);
+  if (settled.size !== settles.size) flaw ??= { field: "reconciliations", message: "A reconciliation follows an attempt this series does not hold" };
   if (used.size !== lifts.size) flaw ??= { field: "continuations", message: "A continuation follows an attempt this series does not hold" };
   if (raised.size !== raises.size) flaw ??= { field: "escalations", message: "An escalation follows an attempt this series does not hold" };
   // A window still open is said to be open: what will end it is not yet in the history. Only the window of the LAST
   // continuation can be in that state, because every later continuation follows a stop, and a stop closes it.
-  for (const draft of stops) if (draft.continuation !== null && draft.window === null) draft.window = { ended: "open" };
-  return { verdicts, achieved, withoutProgress, ladder, stop, stops, flaw };
+  for (const draft of stops) if ((draft.continuation !== null || draft.reconciliation !== undefined) && draft.window === null) draft.window = { ended: "open" };
+  return { verdicts, achieved, withoutProgress, ladder, stop, stops, flaw, fields };
+}
+
+/**
+ * LP6: the decided input fields a line holds before one of its attempts, as the one walk of its rules derives them —
+ * its outcomes and its reconciliations up to there. Whoever weighs a later attempt reads the line's history here.
+ */
+export function decidedFieldsBefore(value: Sealed<AnyRepairSeries>, ordinal: number): string[] {
+  const plain = plainSeries(value as unknown as AnyRepairSeries);
+  const before = <T extends { readonly after: number }>(items: readonly T[]): T[] => items.filter(item => item.after < ordinal);
+  const draft = { ...plain, inherited: plain.inherited.filter(item => item.ordinal < ordinal),
+    attempts: plain.attempts.filter(item => item.ordinal < ordinal),
+    continuations: before(plain.continuations), escalations: before(plain.escalations),
+    ...("reconciliations" in plain && plain.reconciliations !== undefined ? { reconciliations: before(plain.reconciliations) } : {}) } as SeriesDraft;
+  return [...walk(draft).fields].sort();
 }
 
 function stopOf(attempt: Attempt, ordinals: readonly number[], goals: readonly string[], ladder: SeriesLadder): SeriesStop {
@@ -1626,6 +1845,8 @@ function settled(draft: SeriesDraft): AnyRepairSeries {
     withoutProgress: derived.withoutProgress,
     ladder: derived.ladder,
     stop: derived.stop,
+    ...("progressPolicy" in draft && draft.progressPolicy !== undefined ? { progressPolicy: policyOf(draft.progressPolicy) } : {}),
+    ...("reconciliations" in draft && draft.reconciliations !== undefined ? { reconciliations: draft.reconciliations.map(reconciliationOf) } : {}),
   } as AnyRepairSeries;
 }
 
@@ -1675,7 +1896,16 @@ const outcomeOf = (outcome: AttemptOutcome | ClaimedOutcome, order: AchievedOrde
   cancelled: ordered(outcome.cancelled, key => key),
   // Multiplicity is kept: two refusals are two, and only their order is decided here.
   refusals: ordered(outcome.refusals, item => item.row).map(item => ({ row: item.row })),
+  ...(outcome.progress === undefined ? {} : { progress: progressOf(outcome.progress) }),
 });
+const refsInOrder = (refs: readonly Ref[]): Ref[] => ordered(refs.map(exactRef), item => canonical(item));
+const progressOf = (progress: AttemptProgress): AttemptProgress => ({ contract: progress.contract,
+  administrative: progress.administrative === null ? null : { kind: progress.administrative.kind, input: exactRef(progress.administrative.input),
+    replacements: refsInOrder(progress.administrative.replacements), sources: refsInOrder(progress.administrative.sources) } });
+const policyOf = (policy: ProgressPolicy): ProgressPolicy =>
+  ({ contract: policy.contract, previous: policy.previous === null ? null : exactRef(policy.previous), from: policy.from });
+const reconciliationOf = (item: Reconciliation): Reconciliation => ({ after: item.after, transition: exactRef(item.transition),
+  achieved: ordered(item.achieved.map(row => ({ goal: row.goal, key: row.key })), row => compositeKey([row.goal, row.key])) });
 
 const copyAttempt = (attempt: Attempt, order: AchievedOrder | undefined): Attempt => ({
   ordinal: attempt.ordinal, goal: goalOf(attempt.goal),
@@ -1695,6 +1925,8 @@ const plainSeries = (value: AnyRepairSeries): SeriesDraft => ({
   attempts: value.attempts.map(attempt => copyAttempt(attempt, value.achievedOrder)),
   continuations: value.continuations.map(plainContinuation),
   escalations: value.escalations.map(plainEscalation),
+  ...(!("block" in value) || value.progressPolicy === undefined ? {} : { progressPolicy: policyOf(value.progressPolicy) }),
+  ...(!("block" in value) || value.reconciliations === undefined ? {} : { reconciliations: value.reconciliations.map(reconciliationOf) }),
 } as SeriesDraft);
 
 // ---------------------------------------------------------------------------
@@ -1713,8 +1945,12 @@ function goalProblem(value: unknown): string | null {
 }
 
 function outcomeProblem(value: unknown, refusalKeys: readonly string[]): string | null {
-  if (!isPlainObject(value) || !exactKeys(value, OUTCOME_KEYS)) return "outcome";
+  if (!isPlainObject(value) || !exactKeys(value, Object.hasOwn(value as object, "progress") ? [...OUTCOME_KEYS, "progress"] : OUTCOME_KEYS)) return "outcome";
   const outcome = value as Record<string, unknown>;
+  if (Object.hasOwn(outcome, "progress")) {
+    const flawed = progressProblem(outcome['progress']);
+    if (flawed !== null) return flawed;
+  }
   if (!COMPLETION_REASONS.includes(outcome['reason'] as CompletionReason)) return "reason";
   const achieved = outcome['achieved'];
   if (!Array.isArray(achieved)) return "achieved";
@@ -1736,6 +1972,23 @@ function outcomeProblem(value: unknown, refusalKeys: readonly string[]): string 
     for (const field of refusalKeys) {
       if (!isText(entry[field])) return `refusals.${index}.${field}`;
     }
+  }
+  return null;
+}
+
+/** The LP6 progress of an outcome: its contract and either no administrative end or a complete, non-empty one. */
+function progressProblem(value: unknown): string | null {
+  if (!isPlainObject(value) || !exactKeys(value, ["contract", "administrative"]) || (value as Record<string, unknown>)['contract'] !== ATTEMPT_PROGRESS_CONTRACT)
+    return "progress";
+  const end = (value as Record<string, unknown>)['administrative'];
+  if (end === null) return null;
+  if (!isPlainObject(end) || !exactKeys(end, ["kind", "input", "replacements", "sources"])
+    || (end as Record<string, unknown>)['kind'] !== "area-input-replaced" || !isRef((end as Record<string, unknown>)['input']))
+    return "progress.administrative";
+  for (const field of ["replacements", "sources"]) {
+    const list = (end as Record<string, unknown>)[field];
+    if (!Array.isArray(list) || list.length === 0 || !list.every(isRef) || new Set(list.map(item => canonical(item))).size !== list.length)
+      return `progress.administrative.${field}`;
   }
   return null;
 }
@@ -1842,8 +2095,9 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   const mechanism = address.owner.kind === "mechanism";
   const managed = isPlainObject(value) && (Object.hasOwn(value as object, "contract") || Object.hasOwn(value as object, "activation"));
   const marked = isPlainObject(value) && Object.hasOwn(value as object, "achievedOrder");
+  const lp6Keys = !mechanism && isPlainObject(value) ? ["progressPolicy", "reconciliations"].filter(key => Object.hasOwn(value as object, key)) : [];
   const keys = [...(mechanism ? [...SERIES_KEYS.filter(key => key !== "block"), "owner", "scope", "admissions"]
-    : [...SERIES_KEYS, ...(managed ? ["contract", "activation"] : [])]), ...(marked ? ["achievedOrder"] : [])];
+    : [...SERIES_KEYS, ...(managed ? ["contract", "activation"] : []), ...lp6Keys]), ...(marked ? ["achievedOrder"] : [])];
   if (!isPlainObject(value) || !exactKeys(value, keys)) {
     return problem("series_invalid", "A series carries its address, its history of attempts and what follows from them, and nothing else", context, "value");
   }
@@ -1931,6 +2185,8 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
     }
     raised = Number(after);
   }
+  const progressFlaw = progressPolicyProblem(series, all.length);
+  if (progressFlaw !== null) return problem("series_invalid", progressFlaw.message, context, progressFlaw.field);
 
   if (mechanism) {
     if (!isPlainObject(series['scope']) || !Array.isArray(series['admissions']))
@@ -1994,7 +2250,18 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
       return problem("series_invalid", "The escalations a successor inherits are not the ones its predecessor holds", context, "escalations");
     }
     samePredecessorSlice = read.value.value.slice === draft.slice;
+    // LP6: the boundary and the reconciliations a line holds travel to its successor whole and unchanged.
+    const before = read.value.value as AnyRepairSeries;
+    if ("block" in before && before.progressPolicy !== undefined
+      && hashJson(series['progressPolicy'] ?? null) !== hashJson(before.progressPolicy as unknown as Json))
+      return problem("series_invalid", "A successor keeps the progress boundary its predecessor holds", context, "progressPolicy");
+    const settledBefore = "block" in before ? (before.reconciliations ?? []).map(reconciliationOf) : [];
+    const settledHere = (series['reconciliations'] as Reconciliation[] | undefined ?? []).map(reconciliationOf);
+    if (hashJson(settledHere.slice(0, settledBefore.length) as unknown as Json) !== hashJson(settledBefore as unknown as Json))
+      return problem("series_invalid", "The reconciliations a successor inherits are not the ones its predecessor holds", context, "reconciliations");
   }
+  const boundary = checkProgressBoundary(store, series as unknown as AnyRepairSeries, address, context);
+  if (boundary) return boundary;
 
   const activation = checkSeriesActivation(store, series as unknown as AnyRepairSeries, address, context);
   if (!activation.ok) return activation;
@@ -2016,6 +2283,11 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
       // H1.0c: one closed-work formula for every close, over its exact additions and final journal.
       const closedWork = priorWork ? completionClosedWork(store, address.project, priorWork, proof.value, reference(close)) : null;
       if (closedWork && !closedWork.ok) return closedWork;
+      // LP6: the era of a managed close follows the boundary of the series — v2 with its progress from it on, v1 before.
+      const policy = "block" in draft ? draft.progressPolicy : undefined;
+      if ((policy !== undefined && attempt.ordinal >= policy.from) !== (attempt.outcome.progress !== undefined))
+        return refuse('completion_invalid', 'A managed close keeps the progress rules of its side of the series boundary',
+          { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
       if (!sameRef(proof.value.binding, reference(binding.value)) || canonical(outcomeOf(proof.value.outcome, order)) !== canonical(attempt.outcome)
         || !work || work.kind !== COMPLETION_WORK_KIND || !work.value.closed || !sameRef(work.value.closed, reference(close))
         || !work.value.previous || !sameRef(work.value.previous, proof.value.work) || !priorWork
@@ -2027,6 +2299,13 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   for (const attempt of draft.attempts) if (attempt.terminal !== undefined) {
     const witness = checkTerminalCompletion(store, address.project, address.id, attempt);
     if (!witness.ok) return witness;
+  }
+  // LP6: a standalone attempt never carries progress — only a managed close of a block derives it.
+  if (context.ref) for (const attempt of draft.attempts) {
+    if (attempt.outcome?.progress === undefined) continue;
+    const binding = readCompletionBinding(store, address.project, context.ref, attempt.ordinal);
+    if (!binding.ok) return binding;
+    if (binding.value === null) return problem("series_invalid", "Only a managed close of a block carries progress", context, `attempts.${attempt.ordinal}.outcome.progress`);
   }
   const derived = walk(draft);
   if (derived.flaw !== null) {
@@ -2048,6 +2327,86 @@ function checkSeries(store: Store, value: unknown, address: Address, context: Co
   }
   return null;
 }
+
+/** LP6: the shape of the boundary and of the reconciliations a block series may hold. */
+function progressPolicyProblem(series: Record<string, unknown>, attempts: number): { field: string; message: string } | null {
+  const policy = series['progressPolicy'], settles = series['reconciliations'];
+  if (policy === undefined && settles === undefined) return null;
+  if (policy === undefined) return { field: "reconciliations", message: "A reconciliation belongs to a series whose progress boundary was activated" };
+  if (!isPlainObject(policy) || !exactKeys(policy, ["contract", "previous", "from"]) || (policy as Record<string, unknown>)['contract'] !== SERIES_PROGRESS_CONTRACT)
+    return { field: "progressPolicy", message: "A progress boundary names its contract, the revision before it and the first attempt it covers" };
+  const { previous, from } = policy as Record<string, unknown>;
+  if (!Number.isSafeInteger(from) || (from as number) < 1 || (from as number) > attempts + 1)
+    return { field: "progressPolicy.from", message: "The boundary is an attempt of this series or the next one" };
+  // The producer always activates on a stored revision (a close of an open attempt, or a reconciled stop), so the
+  // reader takes nothing else: a boundary without the revision before it would be believed, not proved.
+  if (!isRef(previous))
+    return { field: "progressPolicy.previous", message: "A progress boundary names the exact revision of the series it was activated on" };
+  if (settles === undefined) return null;
+  if (!Array.isArray(settles)) return { field: "reconciliations", message: "Reconciliations are a list" };
+  let last = 0;
+  for (let index = 0; index < settles.length; index += 1) {
+    const item = settles[index];
+    if (!isPlainObject(item) || !exactKeys(item, ["after", "transition", "achieved"]) || !isRef((item as Record<string, unknown>)['transition'])
+      || !Array.isArray((item as Record<string, unknown>)['achieved'])
+      || !((item as Record<string, unknown>)['achieved'] as unknown[]).every(row => isPlainObject(row) && exactKeys(row, ["goal", "key"])
+        && isText((row as Record<string, unknown>)['goal']) && isText((row as Record<string, unknown>)['key'])))
+      return { field: `reconciliations.${index}`, message: "A reconciliation names its stop, its exact transition and the results it proved" };
+    const after = (item as Record<string, unknown>)['after'];
+    if (!Number.isSafeInteger(after) || (after as number) <= last || (after as number) >= (from as number))
+      return { field: `reconciliations.${index}.after`, message: "A reconciliation answers one saved stop before the boundary, once" };
+    last = after as number;
+  }
+  return null;
+}
+/**
+ * LP6 (№3325 §4): the boundary is derived from the proved state before it, never taken on a caller's word. Activated in
+ * this line, it names the exact earlier revision of this very series that held no boundary, and starts at that
+ * revision's open attempt — or at the next one when every attempt there was closed. Inherited, it is exactly the
+ * boundary of the predecessor this line names. Each reconciliation is the exact transition record its common reader derives.
+ */
+function checkProgressBoundary(store: Store, value: AnyRepairSeries, address: Address, context: Context): SeriesResult<never> | null {
+  if (!("block" in value) || value.progressPolicy === undefined) return null;
+  const policy = value.progressPolicy;
+  if (policy.previous === null) return problem("series_invalid", "A progress boundary names the revision it was activated on", context, "progressPolicy.previous");
+  if (policy.previous.id === address.id) {
+    const read = readRecord<AnyRepairSeries>(store, policy.previous, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: address.id });
+    if (!read.ok) return problem("series_invalid", `The revision before the progress boundary does not stand: ${read.refusal.code}`, context, "progressPolicy.previous");
+    const before = read.value.value;
+    if (!("block" in before) || before.progressPolicy !== undefined || (context.ref && read.value.revision >= context.ref.revision))
+      return problem("series_invalid", "The progress boundary stands on an earlier revision of this series without one", context, "progressPolicy.previous");
+    const prior = [...before.inherited, ...before.attempts];
+    const open = prior.find(item => item.outcome === null);
+    if (policy.from !== (open?.ordinal ?? prior.length + 1))
+      return problem("series_invalid", "The boundary starts at the attempt open before it, or at the next one", context, "progressPolicy.from");
+    const ours = [...value.inherited, ...value.attempts];
+    for (const attempt of prior) if (attempt.outcome !== null && hashJson(copyAttempt(attempt, before.achievedOrder) as unknown as Json)
+      !== hashJson(copyAttempt(ours[attempt.ordinal - 1]!, value.achievedOrder) as unknown as Json))
+      return problem("series_invalid", "The history before the progress boundary is the history it was activated on", context, "progressPolicy.previous");
+  } else {
+    if (value.predecessor === null)
+      return problem("series_invalid", "An inherited progress boundary needs the line it came from", context, "progressPolicy.previous");
+    const read = readRecord<AnyRepairSeries>(store, value.predecessor, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND,
+      id: ownerSeriesId(address.project, address.owner, address.line - 1) });
+    if (!read.ok) return problem("series_invalid", `The line a progress boundary came from does not stand: ${read.refusal.code}`, context, "progressPolicy");
+    const before = read.value.value;
+    if (!("block" in before) || before.progressPolicy === undefined
+      || hashJson(policyOf(before.progressPolicy) as unknown as Json) !== hashJson(policyOf(policy) as unknown as Json))
+      return problem("series_invalid", "An inherited progress boundary is exactly the boundary of the predecessor", context, "progressPolicy");
+  }
+  for (let index = 0; index < (value.reconciliations ?? []).length; index += 1) {
+    const item = value.reconciliations![index]!;
+    const read = readSeriesProgressTransitionAt(store, address.project, item.transition);
+    if (!read.ok) return read;
+    const record = read.value.value;
+    if (record.stop !== item.after || hashJson(reconciliationOf(item).achieved as unknown as Json) !== hashJson(reconciledOf(record as unknown as SeriesProgressTransition) as unknown as Json)
+      || !lineageIds(address).includes(record.series.id))
+      return problem("series_invalid", "A reconciliation is the exact transition of a stop of this line", context, `reconciliations.${index}`);
+  }
+  return null;
+}
+const lineageIds = (address: Address): string[] => Array.from({ length: address.line }, (_, index) =>
+  ownerSeriesId(address.project, address.owner, index + 1));
 
 function checkAttempt(value: unknown, ordinal: number, context: Context, path: string, order: AchievedOrder | undefined): SeriesResult<never> | null {
   if (!isPlainObject(value) || !exactKeys(value, [...ATTEMPT_KEYS, ...(Object.hasOwn(value as object, "terminal") ? ["terminal"] : [])])) {
@@ -3090,7 +3449,7 @@ export interface CompletionWork {
   assignments: Ref[]; products: Ref[]; journal: Ref | null; closed: Ref | null;
 }
 /** H1.0c: the exact pre-close work, the additions of the close (explicitly none) and its final journal, to rederive. */
-export interface ManagedClosure { binding: Ref; work: Ref; additions: readonly Ref[]; journal: Ref | null }
+export interface ManagedClosure { binding: Ref; work: Ref; additions: readonly Ref[]; journal: Ref | null; progress?: typeof ATTEMPT_PROGRESS_CONTRACT }
 export const completionOwnerId = (project: string, seriesId: string, attempt: number): string =>
   `${COMPLETION_OWNER_KIND}:${project}:${hashJson({ seriesId, attempt })}`;
 export const completionEraId = (project: string, seriesId: string): string =>

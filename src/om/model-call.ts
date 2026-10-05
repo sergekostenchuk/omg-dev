@@ -2598,6 +2598,8 @@ export interface CompletionSnapshot {
   products: Ref[]; resolved: Ref[]; cessations: Revision<CompletionCessation>[]; complete: boolean; accepting: Ref[]; negative: Ref[]; refusals: { row: string; name: string; goal: string }[];
   technical: { source: Ref; reason: 'off-form' | 'interrupted' }[]; waiting: Ref[]; guards: TransactionGuard[];
   answers: AnswersCheckState | null;
+  /** LP6 (return №3371): the diagnostics a dispatched correction replaced (MP2) — refusals their chain no longer owes. */
+  corrected: Ref[];
 }
 function completionRecord(value: CompletionAssignment): Revision<CompletionAssignment> {
   return { id: completionAssignmentId(value.project, value.binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
@@ -3043,7 +3045,7 @@ export function prepareCompletionPacket(store: Store, packet: Ref): ModelCallRes
 function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwner>, work: Revision<CompletionWork>, graph: ReturnType<typeof completionGraph>): CompletionSnapshot {
   const project = binding.value.project, completed = new Set<string>();
   const accepting: Ref[] = [], negative: Ref[] = [], technical: CompletionSnapshot['technical'] = [], waiting: Ref[] = [];
-  const diagnostics: Ref[] = [], products = work.value.products;
+  const diagnostics: Ref[] = [], replacedDiagnostics: Ref[] = [], products = work.value.products;
   // MP2 (№2968 §3): the refusals a dispatched correction replaced (a call of its packet is registered — never a packet only
   // written or blocked), and the calls a saved cycle already ended.
   const corrected = new Set(products.filter(ref => store.get(ref.id, ref.revision)?.kind === 'model-call').flatMap(ref => {
@@ -3069,6 +3071,7 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
     completed.add(step.id);
     if (call.diagnostic) {
       diagnostics.push(call.diagnostic);
+      if (replaced) replacedDiagnostics.push(call.diagnostic);
       const checked = take(readManagedModelDiagnostic(store, binding, call.diagnostic));
       // The replaced refusal stays in the history; the corrected chain decides the outcome.
       if (!replaced && (checked.reason === 'off-form' || checked.reason === 'interrupted')) technical.push({ source: reference(call.record), reason: checked.reason });
@@ -3153,7 +3156,7 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
     resolved: graph.assignments.filter(row => completed.has(row.id)).map(reference), cessations: graph.cessations,
     complete: completionRootAssignments(binding).every(root => completed.has(root.id)) && (answers?.complete ?? true),
     accepting: refs(accepting), negative: refs(negative), refusals: [...new Map(refusals.map(row => [row.row, row])).values()].sort((a,b) => a.row.localeCompare(b.row)),
-    technical, waiting: refs(waiting), guards: [reference(work), reference(binding)], answers };
+    technical, waiting: refs(waiting), guards: [reference(work), reference(binding)], answers, corrected: refs(replacedDiagnostics) };
 }
 /** E1 is a cross-check of the registered plan, never the plan itself. */
 export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionSnapshot>, ledger: Ref, journal: Ref | null = null): ModelCallResult<Sealed<true>> {
@@ -3671,6 +3674,13 @@ function areaReplacement(store: Store, binding: Revision<CompletionOwner>): { ca
   const cause: CompletionCause = { kind: 'required-record-replaced', prerequisite, replacement: reference(head), proof: null };
   readReplacement(store, binding.value.project, prerequisite, cause.replacement, null);
   return { cause, guards: [reference(head)] };
+}
+/** LP6 (№3325 §3): the exact B1 prerequisite of an attempt's own area — what an administrative end must have replaced. */
+export function readCompletionAreaInput(store: Store, project: string, bindingRef: Ref): ModelCallResult<Sealed<{
+  kind: 'input'; source: Ref; graph: null; level: null;
+}>> {
+  return result(() => areaInput(store, take(readCompletionOwnerAt(store, project, bindingRef)) as Revision<CompletionOwner>) as {
+    kind: 'input'; source: Ref; graph: null; level: null });
 }
 /** LP5: whether the B1 of this attempt's own area was replaced — the proved cause and its guarded head, or none. */
 export function readAreaReplacement(store: Store, project: string, bindingRef: Ref): ModelCallResult<Sealed<{ cause: CompletionCause; guards: Ref[] } | null>> {

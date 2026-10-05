@@ -4121,6 +4121,8 @@ test('MP2 (№2968 rows 14, 18) stopped after the first applied refusal the root
   assert.ok(journal, 'The first refusal stays in the history');
   const correction = done.assignments.find(row => row.value.kind === 'continuation' && row.value.key.includes(':correct:'));
   assert.ok(correction, 'The correction is its own physical step under the rejected one');
+  // LP6 (return №3371): the replaced refusal is a corrected diagnostic of the registry — owed no more, kept in its history.
+  assert.deepEqual(done.corrected, [call.diagnostic]);
 });
 
 /** The accepted MP1 producer (its merged commit) and the base before it. */
