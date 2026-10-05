@@ -26,7 +26,7 @@ import type { ProposalRequest } from './frame-proposals.js';
 import { prepareGapLines as prepareGapLinesOf, readGapLines as readGapLinesOf } from './gap-lines.js';
 import { prepareCurrentGaps as prepareCurrentGapsOf, prepareGaps as prepareGapsOf, readGaps as readGapsOf, type GapCollection, type GapReadRequest, type GapRequest } from './gaps.js';
 import { withHistoricalReads, historicalRead } from './input.js';
-import { readPartAssembly as readPartAssemblyOf } from './model-call.js';
+import { readPartAssembly as readPartAssemblyOf, readReuseResult as readReuseResultOf } from './model-call.js';
 import { prepareNeighbors as prepareNeighborsOf, readNeighbors as readNeighborsOf, type NeighborCollection } from './neighbors.js';
 import { prepareObligationTransfer as prepareObligationTransferOf, prepareOmObligations as prepareOmObligationsOf, readObligationTransfer as readObligationTransferOf, readOmObligations as readOmObligationsOf,
   type ObligationRequest, type OmObligationHandoff, type OmObligations } from './obligations.js';
@@ -62,6 +62,7 @@ const prepareCurrentGaps = transferring('gaps', prepareCurrentGapsOf);
 const prepareGaps = transferring('gaps', prepareGapsOf);
 const readGaps = transferring('gaps', readGapsOf);
 const readPartAssembly = transferring('model-call', readPartAssemblyOf);
+const readReuseResult = transferring('model-call', readReuseResultOf);
 const prepareNeighbors = transferring('neighbors', prepareNeighborsOf);
 const readNeighbors = transferring('neighbors', readNeighborsOf);
 const prepareObligationTransfer = transferring('obligations', prepareObligationTransferOf);
@@ -75,7 +76,8 @@ const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordR
 const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 
 export const ATOMIC_GATE_CONTRACT = 'om-atomic-gate/v1' as const;
-export interface WorkProposalSource { kind: 'part' | 'assembly'; record: Ref }
+// LP5 (№3278 §3): a reuse — a paid complete L3 assembly admitted again into a later attempt, with today's D7 bindings.
+export interface WorkProposalSource { kind: 'part' | 'assembly' | 'reuse'; record: Ref }
 export interface AtomicGateRequest {
   project: string; candidate: Ref; neighbors: Ref; environment: Ref; gaps: GapReadRequest; results: WorkProposalSource[]; sources: Ref[];
 }
@@ -112,7 +114,7 @@ function invalid(field: string): never {
   return raise('atomic_gate_request_invalid', 'G5 needs explicit exact sources', { unit: 'G5', target: 'works', field });
 }
 function sourcesShape(sources: unknown): sources is WorkProposalSource[] {
-  return Array.isArray(sources) && sources.every(source => object(source) && ['part', 'assembly'].includes(source.kind as string)
+  return Array.isArray(sources) && sources.every(source => object(source) && ['part', 'assembly', 'reuse'].includes(source.kind as string)
     && isRef(source.record) && Object.keys(source).every(key => ['kind', 'record'].includes(key)))
     && new Set(sources.map(canonical)).size === sources.length;
 }
@@ -212,6 +214,7 @@ export const transactionForTests = (store: Store): { view: Store; writes: Map<st
 function modelSources(store: Store, project: string, results: readonly WorkProposalSource[]) {
   const outputs = results.map(source => historicalRead(store, { reader: `G5.model-source.${source.kind}`, project, ref: source.record },
     () => source.kind === 'part' ? take(readPartResult(store, { project, record: source.record }))
+      : source.kind === 'reuse' ? take(readReuseResult(store, { project, record: source.record }))
       : take(readPartAssembly(store, { project, record: source.record })),
     () => fail('atomic_gate_bindings_unproven', source.record.id, 'cycle', 'Model-result sources contain a cyclic derivation')));
   const works: WorksPartBindings[] = [];
@@ -638,7 +641,7 @@ export function prepareWorksSources(store: Store, raw: WorksSourcesRequest): Ato
   return run(() => {
     if (!(store instanceof Store) || !object(raw) || !same(Object.keys(raw).sort(), ['project', 'results']) || !text(raw.project)
       || !Array.isArray(raw.results) || !raw.results.length || !raw.results.every(item => object(item)
-        && (item.kind === 'part' || item.kind === 'assembly') && isRef(item.record) && same(Object.keys(item).sort(), ['kind', 'record']))
+        && (item.kind === 'part' || item.kind === 'assembly' || item.kind === 'reuse') && isRef(item.record) && same(Object.keys(item).sort(), ['kind', 'record']))
       || new Set(raw.results.map(item => canonical(item.record))).size !== raw.results.length) invalid('sources');
     const project = raw.project, results = sorted(copy(raw.results));
     const built = worksCandidate(store, project, results, `works-sources:${project}`);

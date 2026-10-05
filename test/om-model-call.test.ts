@@ -415,7 +415,7 @@ function e4Node(f: ReturnType<typeof e4Fixture>, packet: Revision<QuestionPacket
 }
 
 /** A first works pass through C2/C4/C5, with a genuine owner assignment and no accepted L3. */
-function e4WorksFixture(t: TestContext) {
+function e4WorksFixture(t: TestContext, managed = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-works-')), database = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -471,9 +471,11 @@ function e4WorksFixture(t: TestContext) {
   const batch = routes.value.batches.find(batch => batch.level === 3 && batch.node === 'garden-produce-operation')!; assert.ok(batch);
   const address = { project, block: 'garden-produce-block', line: 1 };
   valueOf(openSeries(store, { ...address, slice: 'e4-work', predecessor: null, basis: null }));
-  const series = valueOf(beginAttempt(store, { ...address, attempt: 1, goal: { key: 'e4-work',
-    questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
-    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) } }));
+  const goal = { key: 'e4-work', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  // LP5: a managed attempt plans exactly this works batch of the routes (its completion owner and work registry).
+  const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, { ...address, attempt: 1, goal,
+    ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) } as never));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
   function environment(requestCapacityChars = 100_000) {
@@ -506,7 +508,8 @@ function e4WorksFixture(t: TestContext) {
     return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal,
       bindings: position === plan.assignments.length - 1 ? bindings : [] };
   }
-  return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured,
+  return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured, address, goal,
+    graph, layer2, upperFrame, frame2, lines, gapRead, routes, batch, desired, root,
     get store() { return store; }, restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
     steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database, steps })); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []; } };
@@ -5046,4 +5049,76 @@ test('MP3 row 17: a stop after each saving transition of an addressed read cycle
       assert.deepEqual(f.store.list(), snapshot); assert.equal(f.sent().length, 2);
     });
   }
+});
+
+// ---- LP5 (№3278 §3, rows 17, 19): a reuse carries a non-empty D7 losslessly to today's handoff ----
+import { writeAnswersRegistration, writeAnswersCheckCessation } from '../src/om/answers-gate.js';
+import { completionRootAssignments } from '../src/om/series.js';
+import { prepareWorksSources } from '../src/om/atomic-gate.js';
+import { prepareCompletionReuse, writeCompletionReuse, readCompletionReuseAt, AREA_INPUT_VARIANT as LP5_AREA_INPUT } from '../src/om/model-call.js';
+
+test('LP5 (№3278 rows 17, 19) a reuse carries a non-empty D7 to today\'s handoff: the same assignments by their common key, today\'s binding ids and scopes, every consumer and its tests kept; an old D7 is refused; G5 reads the reuse as a checked source of today\'s handoff', async t => {
+  const f = e4WorksFixture(t, true), project = f.project;
+  const series = () => reference(f.store.get(f.series.id)!);
+  const first = valueOf(readCompletionBinding(f.store, project, series(), 1))!;
+  valueOf(writeAnswersRegistration(f.store, { project, binding: reference(first) }));
+  f.steps([{ research: f.answer(), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'assembled');
+  // The B1 of the area is replaced (G1): the check ends by it and the attempt closes interrupted, its paid assembly kept.
+  const before = f.store.get(`om-input:${project}`)!;
+  const inventory = f.store.write({ id: `repo-inventory:${project}`, kind: 'repo-inventory', expected: 0, value: { projectId: project, paths: [] } });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const input = valueOf(writeOmInput(f.store, { project, stages, inventory: reference(inventory), expected: before.revision }));
+  assert.equal(valueOf(writeAnswersCheckCessation(f.store, { project, binding: reference(first) })).value.variant, LP5_AREA_INPUT);
+  valueOf(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
+  // The plan of the next attempt over the new B1: its own horizon, D1, D2, D7 with the owner's assignment in its context, M6.
+  const horizon = valueOf(writeHorizon(f.store, { project, input: reference(input), graph: f.graph, refinement: f.layer2, available: {},
+    choice: { choiceVersion: 'e4-work-pass-lp5', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project, input: reference(input), graph: f.graph, horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { ...f.frame2, graph: f.graph, horizon: reference(horizon.gate), layer: f.layer2, frame: f.upperFrame } },
+    works: { proposals: [], frame: { project, level: 3, graph: f.graph, horizon: reference(horizon.gate), layer: null, frame: null,
+      upper: { horizon: reference(horizon.gate), frame: f.upperFrame } } } };
+  const gaps = valueOf(writeGaps(f.store, sources)), gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = valueOf(writeGapLines(f.store, { project, previous: reference(f.store.get(f.lines.id)!), pass: 2, gaps: gapRead, closures: [] }));
+  const late = gaps.records.find(row => row.value.gap.target === 'discovery:late-proof')!;
+  const assignment = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project, context: { gaps: gapRead, lines: reference(lines) },
+    gap: reference(late), assignments: late.value.gap.consumers.map(consumer => ({ responsibleNode: 'garden-produce-operation',
+      responsibleConsumer: consumer, reason: 'Retain the concrete result test', returnCondition: `Prove result for ${consumer}`, wake: null })) });
+  const ledger = valueOf(writeOmObligations(f.store, { project, gaps: gapRead, lines: reference(lines), assignments: [{ pending: {
+    id: `om-owner-gap-assignment:${project}:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } }] }));
+  const routes = valueOf(writeRoutes(f.store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(row => row.level === 3 && row.node === 'garden-produce-operation')!;
+  valueOf(managedOpenAttempt(f.store, { ...f.address, attempt: 2, goal: f.goal, completion: { routes: reference(routes), batches: [batch.id] } } as never));
+  const second = valueOf(readCompletionBinding(f.store, project, series(), 2))!;
+  const root = completionRootAssignments(second).find(row => row.value.batch === batch.id)!;
+  const works = { producer: reference(ledger.producer), ledger: reference(ledger.record) };
+  // Row 19: the D7 of the old area is never taken for today's.
+  assert.equal(prepareCompletionReuse(f.store, { project, binding: reference(second), root: reference(root),
+    works: { producer: reference(f.ledger.producer), ledger: reference(f.ledger.record) } }).ok, false);
+  const reuse = valueOf(writeCompletionReuse(f.store, { project, binding: reference(second), root: reference(root), works }));
+  const sorted = <T>(rows: readonly T[]) => [...rows].sort((a, b) => canonical(a).localeCompare(canonical(b)));
+  const expected = ledger.handoff.obligations.map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
+    consumers: [{ node: f.work.id, tests: [...f.work.tests] }] }));
+  assert.ok(expected.length > 0, 'Today\'s handoff is not empty');
+  assert.deepEqual(sorted(reuse.value.works.bindings), sorted(expected), 'Every binding carried by its common key to today\'s ids and scopes');
+  assert.ok(reuse.value.works.bindings.every(row => !f.bindings.some(old => old.id === row.id)), 'No binding keeps the old authority');
+  assert.deepEqual([reuse.value.works.producer, reuse.value.works.ledger], [works.producer, works.ledger]);
+  f.restart();
+  assert.deepEqual(valueOf(readCompletionReuseAt(f.store, project, reference(reuse))), reuse, 'Read back by its common derivation');
+  // A saved reuse that lost a proof reference, or carries one more field, is a typed refusal of its reader — never a crash.
+  for (const value of [{ ...reuse.value, source: { ...reuse.value.source, close: undefined } }, { ...reuse.value, works: { ...reuse.value.works, ledger: null } },
+    { ...reuse.value, origin: { assembly: reuse.value.origin.assembly } }, { ...reuse.value, extra: true }]) {
+    const body = JSON.parse(JSON.stringify(value)) as Json, forged = { ...reuse, value: body, hash: hashJson(body) };
+    const view = new Proxy(f.store, { get(target, property) {
+      if (property === 'get') return (key: string, revision?: number) => key === forged.id ? forged : target.get(key, revision);
+      const member: unknown = Reflect.get(target, property, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    const read = readCompletionReuseAt(view, project, reference(forged as never));
+    assert.deepEqual(read.ok ? 'accepted' : read.refusal.code, 'completion_invalid', JSON.stringify(Object.keys(value)));
+  }
+  // G5 takes the reuse as a checked source of today's handoff: its non-empty bindings pass the transfer to the final D7;
+  // only the works of the other operation, never asked here, keep the candidate open (the whole C4/G5 is the pass's test).
+  const gate = prepareWorksSources(f.store, { project, results: [{ kind: 'reuse', record: reference(reuse) }] });
+  assert.deepEqual(gate.ok ? 'accepted' : [gate.refusal.code, gate.refusal.at.field], ['work_blocking_gap_open', 'candidate']);
 });

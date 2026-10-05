@@ -14,11 +14,15 @@ import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js
 import { writeApplyAnswer as writeApplyAnswerOf } from "./addressing.js";
 import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
   resumeSeries as resumeSeriesOf, seriesAddress, seriesRequestOf,
-  type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionWork, type SeriesOwner } from "./series.js";
+  type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
 import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
 import { ceasedCycleGround as ceasedCycleGroundOf, modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
-  writeCompletionCessation as writeCompletionCessationOf, type CompletionSnapshot } from "./model-call.js";
+  writeCompletionCessation as writeCompletionCessationOf, readAreaReplacement as readAreaReplacementOf,
+  prepareCompletionFinalization as prepareCompletionFinalizationOf, writeCompletionFinalization as writeCompletionFinalizationOf,
+  prepareCompletionReuse as prepareCompletionReuseOf, writeCompletionReuse as writeCompletionReuseOf, readReuseResult as readReuseResultOf,
+  readCompletionAcceptance as readCompletionAcceptanceOf, readConfirmationGround as readConfirmationGroundOf,
+  COMPLETION_FINALIZATION_KIND, COMPLETION_REUSE_KIND, type CompletionSnapshot, type FinalizationPhase } from "./model-call.js";
 import { readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf } from "./question-packet.js";
 import { assessFact as assessFactOf, readAssessmentIntentAt as readAssessmentIntentAtOf, ASSESSMENT_RESULT_KIND, type AssessmentResultRecord } from "./assessment.js";
 import { NO_PRODUCER_EMISSIONS, prepareAnswersGate as prepareAnswersGateOf, prepareAnswersGateTrace as prepareAnswersGateTraceOf, readAnswersEvaluationAt as readAnswersEvaluationAtOf, readAnswersGate as readAnswersGateOf, readAnswersGateTrace as readAnswersGateTraceOf, readRouteProducers as readRouteProducersOf,
@@ -110,6 +114,14 @@ const readManagedModelDiagnostic = transferring("model-call", readManagedModelDi
 const readModelCycle = transferring("model-call", readModelCycleOf);
 const readPartAssembly = transferring("model-call", readPartAssemblyOf);
 const writeCompletionCessation = transferring("model-call", writeCompletionCessationOf);
+const readAreaReplacement = transferring("model-call", readAreaReplacementOf);
+const prepareCompletionFinalization = transferring("model-call", prepareCompletionFinalizationOf);
+const writeCompletionFinalization = transferring("model-call", writeCompletionFinalizationOf);
+const prepareCompletionReuse = transferring("model-call", prepareCompletionReuseOf);
+const writeCompletionReuse = transferring("model-call", writeCompletionReuseOf);
+const readReuseResult = transferring("model-call", readReuseResultOf);
+const readConfirmationGround = transferring("model-call", readConfirmationGroundOf);
+const readCompletionAcceptance = transferring("model-call", readCompletionAcceptanceOf);
 const writeQuestionPacket = transferring("question-packet", writeQuestionPacketOf);
 const readQuestionPacket = transferring("question-packet", readQuestionPacketOf);
 const readAssessmentIntentAt = transferring("assessment", readAssessmentIntentAtOf);
@@ -160,7 +172,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -456,6 +468,8 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       case "analyze": return mapped(await recovering(raw, project, () => runStopAnalysis(raw, body as never, undefined, hold)), record => [refOf(record)]);
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
       case "cease-check": return mapped(writeAnswersCheckCessation(store, body as never), record => [refOf(record)]);
+      case "finalize": return mapped(writeCompletionFinalization(store, body as never), record => [refOf(record)]);
+      case "reuse": return mapped(writeCompletionReuse(store, body as never), record => [refOf(record)]);
       case "resume": return mapped(resumeSeries(store, body as never), record => [refOf(record)]);
       case "bases": {
         const build = body as unknown as BasesStep;
@@ -1096,6 +1110,14 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
           if (ledger.final) { trail.finals.push(ledger.final); explained.add(assignment.id); continue; }
           return ledger;
         }
+        // LP5 (№3278 §3, T1): a paid complete assembly of an earlier attempt of this line, ended by the replaced B1 of its
+        // area, answers this unstarted root again when it fits it today — no new E1, call or expense.
+        if (ledger) {
+          const reuse = { project, binding: reference(binding), root: reference(assignment), works: ledger.works };
+          const found = prepareCompletionReuse(store, reuse);
+          if (!found.ok) return { wait: waitOf(found.refusal, project) };
+          if (found.value.record) return step("reuse", reuse, series.id, ordinal);
+        }
         return step("packet", { project, routes: binding.value.plan.routes, batch: value.batch, environment: request.dispatch.config,
           attempt: { series: binding.value.series, ordinal }, previous: [], ...(ledger ? { works: ledger.works } : {}) }, series.id, ordinal);
       }
@@ -1132,14 +1154,27 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   // complete assemblies are enough, without a premature G5.
   let candidate: { ref: Ref; graphHash: string } | null = null;
   // An acceptance already made for this attempt's own results is found first: after C5 the old frame request is history.
-  const mine = level ? assembliesOf(store, project, work).filter(row => row.level === level) : [];
-  const made = level ? acceptedWith(store, project, level, mine.map(row => level === 2 ? row.proposal : row.record)) : null;
+  // LP5 (return №3294 п.2): one derivation with the end of a remaining acceptance — the own assemblies and reuses.
+  const made = level ? take(readCompletionAcceptance(store, project, work, level)) : null;
   // №1770 п.2: an own root of this level that ended without assembly makes the attempt negative. It needs no candidate,
   // passed G4b or C5: its check is evaluated on the full G4b and the attempt closes through the common G7, whatever the
   // neighbours of the frame still do; its other own assignments must still be complete (above).
   const levelBatches = new Set(batches.filter(row => row.task === "node-expansion" && row.level === level).map(row => row.id));
   const negative = !!level && !made && negativesOf(store, project, work).some(row => levelBatches.has(row.batch));
-  if (level === 2 && !made && !negative) {
+  // LP5 (№3278 §2): once the B1 of this attempt's own area is replaced, its remaining non-physical work ends by its own
+  // product — the registered check by check-ceased, a complete check's common acceptance by a finalization — and the
+  // attempt goes to its common close, never back into a check, a candidate or a frame wait of the ended phase. On the
+  // same B1 a moved D1/M6 keeps every earlier rule (row 1).
+  const replaced = block ? take(readAreaReplacement(store, project, reference(binding))) : null;
+  const ended = !!work.answers?.ceased || work.products.some(ref => store.get(ref.id, ref.revision)?.kind === COMPLETION_FINALIZATION_KIND);
+  if (replaced && work.answers && !ended) {
+    if (!work.answers.complete) {
+      const ceased = prepareCompletionCause(store, project, work.answers.assignment);
+      if (!ceased.ok) return { wait: waitOf(ceased.refusal, project) };
+      if (ceased.value.cause) return step("cease-check", { project, binding: reference(binding) }, series.id, ordinal);
+    } else if (level && !negative && !made) return finalizeStep(store, project, binding, "acceptance", series.id, ordinal);
+  }
+  if (!ended && level === 2 && !made && !negative) {
     const operations = scope.sources.operations as unknown as { frame: CandidateRequest["frame"]; proposals: Ref[] };
     const proposals = uniqueRefs([...operations.proposals, ...group.flatMap(row => row.assemblies.filter(item => item.level === 2).map(item => item.proposal))]);
     const candidateRequest: CandidateRequest = { frame: operations.frame, proposals };
@@ -1153,7 +1188,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     if (!gate.ok) return { wait: waitOf(gate.refusal, project) };
     candidate = { ref: reference(prepared.value.existing), graphHash: gate.value.graphHash };
   }
-  if (block && work.answers && !work.answers.complete) {
+  if (!ended && block && work.answers && !work.answers.complete) {
     // The registered check ends by its own H1.0b door when its block line admission lawfully changed (№1616 п.1).
     const ceased = prepareCompletionCause(store, project, work.answers.assignment);
     if (!ceased.ok) return { wait: waitOf(ceased.refusal, project) };
@@ -1182,7 +1217,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     return step("evaluate", evaluation, series.id, ordinal);
   }
   const accepting: Ref[] = [];
-  if (level && !negative) {
+  if (!ended && level && !negative) {
     // D2 lines are named by the D1 gap ids of the attempt's own node obligations at this level.
     const goalLines = [...new Set(batches.filter(row => row.task === "node-expansion" && row.level === level)
       .flatMap(row => row.items.map(item => item.gap)))].sort();
@@ -1202,7 +1237,7 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       const bound: FrameAttemptBinding = { series: reference(series), ordinal, obligations: obligationsOf(batches, level) };
       if (level === 2) return step("accept", { gate: checked.request, settle: { project, level: 2, candidate: candidate!.ref,
         outcome: { gate: "G3", candidate: candidate!.ref, graphHash: candidate!.graphHash, passed: true, codes: [] }, binding: bound } }, series.id, ordinal);
-      const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: "assembly" as const, record: item.record })));
+      const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: item.kind, record: item.record })));
       const sources = prepareWorksSources(store, { project, results });
       if (!sources.ok) return { wait: waitOf(sources.refusal, project) };
       return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...sources.value.sources],
@@ -1216,6 +1251,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       // common C5 its new horizon and D1 serve the D2 events of this group, though its attempts are still open; any
       // other attempt still working on the old heads finishes first. The old scope stays the history of the goal.
       // Bases that complete this accepted group: its B3 of the new slices comes only after its own D2 and G7 (№1860 п.8).
+      // LP5 (№3278 §2, rows 9–10; return №3294 п.1): with the B1 of its area replaced, the accepted goal whose accepted frame
+      // or graph is superseded can no longer be confirmed by D2 — only the remainder of its confirmation ends, proved by
+      // the derivation of its producer and reader. While both stand, D2 stays the one way, on whatever B1.
+      if (replaced && take(readConfirmationGround(store, project, accepted.acceptance, level)).ground)
+        return finalizeStep(store, project, binding, "confirmation", series.id, ordinal);
       const checkedBases = prepareRunBases(store, { project }, { completion: true });
       if (!checkedBases.ok) return { wait: waitOf(checkedBases.refusal, project) };
       if (checkedBases.value.state === "missing") {
@@ -1238,6 +1278,14 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   const claim = prepareManagedClaim(store, { ...address, outcome: { reason: "result", accepting, cancelling: [], refusals: [] } } as never);
   if (!claim.ok) return { wait: waitOf(claim.refusal, project) };
   return step("close", { ...address, outcome: claim.value.outcome }, series.id, ordinal);
+}
+/** LP5: the end of a remaining acceptance or confirmation by its common producer; an addressed refusal stays the wait. */
+function finalizeStep(store: Store, project: string, binding: Sealed<Revision<CompletionOwner>>, phase: FinalizationPhase, series: string,
+  ordinal: number): Choice {
+  const request = { project, binding: reference(binding), phase };
+  const prepared = prepareCompletionFinalization(store, request);
+  if (!prepared.ok) return { wait: waitOf(prepared.refusal, project) };
+  return step("finalize", request, series, ordinal);
 }
 /**
  * LP3 (№2817-4): the packet a root's cycle starts with — by its links, never by the order of the products: the one
@@ -1398,14 +1446,19 @@ function answersRequest(store: Store, project: string, routes: Ref, members: rea
   return { project, gaps, routes, results };
 }
 
-/** The assemblies of the attempt's MC2 roots, with the level of their node proposal. */
-function assembliesOf(store: Store, project: string, work: CompletionSnapshot): { record: Ref; proposal: Ref; level: 2 | 3; fills: string[] }[] {
-  const rows: { record: Ref; proposal: Ref; level: 2 | 3; fills: string[] }[] = [];
+/**
+ * The assemblies of the attempt's MC2 roots, with the level of their node proposal — and the LP5 reuses that answer a root
+ * of this attempt by an earlier paid assembly: the reuse itself is the result, never the old assembly (№3278 §3).
+ */
+function assembliesOf(store: Store, project: string, work: CompletionSnapshot): { kind: "assembly" | "reuse"; record: Ref; proposal: Ref; level: 2 | 3; fills: string[] }[] {
+  const rows: { kind: "assembly" | "reuse"; record: Ref; proposal: Ref; level: 2 | 3; fills: string[] }[] = [];
   for (const product of work.products) {
-    if (store.get(product.id, product.revision)?.kind !== "om-part-assembly") continue;
-    const read = take(readPartAssembly(store, { project, record: product }));
+    const kind = store.get(product.id, product.revision)?.kind;
+    if (kind !== "om-part-assembly" && kind !== COMPLETION_REUSE_KIND) continue;
+    const read = kind === "om-part-assembly" ? take(readPartAssembly(store, { project, record: product })) : take(readReuseResult(store, { project, record: product }));
     const proposal = read.proposal as unknown as Revision<{ level: 2 | 3; fills: { obligation: string }[] }>;
-    rows.push({ record: product, proposal: reference(proposal), level: proposal.value.level, fills: proposal.value.fills.map(fill => fill.obligation) });
+    rows.push({ kind: kind === "om-part-assembly" ? "assembly" : "reuse", record: product, proposal: reference(proposal), level: proposal.value.level,
+      fills: proposal.value.fills.map(fill => fill.obligation) });
   }
   return rows;
 }
@@ -1544,26 +1597,6 @@ function acceptedFrame(store: Store, project: string, level: 2 | 3, candidate: R
         graph: reference(read.graph), layer: reference(read.layer), frame: reference(read.frame) } };
     }
   }
-  return null;
-}
-/**
- * The one common acceptance that took this attempt's own results — its proposals into the accepted N2 candidate, or its
- * assemblies into the accepted works — whichever attempt of the group coordinated it.
- */
-function acceptedWith(store: Store, project: string, level: 2 | 3, own: readonly Ref[]): Accepted | null {
-  if (!own.length) return null;
-  const covers = (refs: readonly Ref[]) => own.every(ref => refs.some(other => same(other, ref)));
-  if (level === 2) {
-    for (const row of store.history(`om-frame:${project}:2`)) {
-      const acceptance = (row.value as { acceptance?: { candidate?: Ref } }).acceptance;
-      const candidate = acceptance?.candidate ? store.get<{ request: CandidateRequest }>(acceptance.candidate.id, acceptance.candidate.revision) : null;
-      if (candidate && covers(candidate.value.request.proposals)) return acceptedFrame(store, project, 2, acceptance!.candidate!, null);
-    }
-    return null;
-  }
-  for (const row of store.list<{ request: WorksAcceptanceRequest; acceptance: AcceptedFrameRequest | null }>("om-works-acceptance"))
-    if (row.id.startsWith(`om-works-acceptance:${project}:`) && row.value.acceptance && covers(row.value.request.results.map(item => item.record)))
-      return { frame: row.value.acceptance.frame, acceptance: row.value.acceptance, binding: row.value.request.binding ?? null };
   return null;
 }
 /** The D2 snapshot over exactly this D1 scope, wherever it stands in the D2 history. */

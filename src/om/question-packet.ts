@@ -583,7 +583,7 @@ function worksTaskBasis(store: Store, request: QuestionPacketRequest, gaps: Seal
     fail('packet_task_set_invalid', basis.producer.id, 'works', 'The complete current handoff must already be saved at the declared references');
   return { ...saved, guards: prepared ? [...prepared.guards] : [] };
 }
-interface WorksPacketContext {
+export interface WorksPacketContext {
   contract: typeof WORKS_FRAME_CONTRACT; producer: Ref; ledger: Ref;
   obligations: CarriedObligation[]; nodeAssignments: string[]; assigned: string[];
 }
@@ -592,7 +592,8 @@ function assignmentGraph(frame: FrameProposals): Graph {
   return { ...initial, nodes: [...new Map([...initial.nodes, ...frame.proposals.flatMap(item => item.value.nodes)]
     .map(node => [node.id, node] as const)).values()], edges: [...(initial.edges ?? []), ...frame.proposals.flatMap(item => item.value.edges)] } as Graph;
 }
-function workAssignments(frame: FrameProposals, node: string, basis: OmObligations): WorksPacketContext {
+/** The D7 tasks a work packet assigns to one node — one derivation for the packet and for an LP5 reuse of its answer. */
+export function workAssignments(frame: FrameProposals, node: string, basis: OmObligations): WorksPacketContext {
   const graph = assignmentGraph(frame);
   const relations = new RefinementRelations(graph);
   const refinements = graph.nodes.filter(item => relations.refines(item.id, node));
@@ -944,7 +945,8 @@ function neighbourForm(value: unknown, target: string): { contract: typeof NEIGH
   if (!object(value) || value.contract !== NEIGHBOR_CONTRACT || !Array.isArray(value.sources)
     || Object.keys(value).some(key => !['contract', 'sources'].includes(key))
     || value.sources.some(row => !object(row) || !isRef(row.root) || !text(row.batch) || !text(row.node) || !isRef(row.assembly)
-      || !isRef(row.proposal) || Object.keys(row).some(key => !['root', 'batch', 'node', 'assembly', 'proposal'].includes(key)))
+      || !isRef(row.proposal) || Object.hasOwn(row, 'reuse') && !isRef(row.reuse)
+      || Object.keys(row).some(key => !['root', 'batch', 'node', 'assembly', 'proposal', 'reuse'].includes(key)))
     || new Set(value.sources.map(row => canonical(row))).size !== value.sources.length)
     fail('packet_record_invalid', target, 'briefNeighbors', 'The neighbour form names its known contract and exact finished sources');
   return value as unknown as { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };

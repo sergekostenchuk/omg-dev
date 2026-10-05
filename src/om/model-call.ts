@@ -1,6 +1,8 @@
 import { briefAnswerRepairable, briefContract, packetPrompt, briefReadings, type BriefManifest, type BriefReadings } from './packet-brief.js';
 import type { AnswerGround } from './accepted-answer.js';
+import { gapLinesId } from './gap-lines.js';
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance as readLayerAcceptanceOf, readLayerEnvelope as readLayerEnvelopeOf, readUnacceptedLayer as readUnacceptedLayerOf } from './layer-basis.js';
+import type { FrameAttemptBinding } from './layer-basis.js';
 import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
@@ -26,7 +28,12 @@ import { checkAnswerForm as checkAnswerFormOf, prepareAnswerForm as prepareAnswe
   pointerSegments, jsonShape, READ_RESULT_CONTRACT, type ReadResult } from './answer-form.js';
 import { readPacketResponse as readPacketResponseOf, readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf, normalizePartAnswer as normalizePartAnswerOf, type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
 import { readRoutes as readRoutesOf } from './routes.js';
-import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as prepareFrameProposalsOf, type LayerProposal } from './frame-proposals.js';
+import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as prepareFrameProposalsOf, type FrameProposals, type LayerProposal } from './frame-proposals.js';
+import { readGaps as readGapsOf } from './gaps.js';
+import { prepareOmObligations as prepareOmObligationsOf, readOmObligations as readOmObligationsOf, type OmObligations } from './obligations.js';
+import { taskBindingId, taskObligations } from '../graph/task-obligations.js';
+import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
+import type { CarriedObligation } from '../graph/obligation-policy.js';
 import { WORKS_FRAME_CONTRACT, readFrameBasis as readFrameBasisOf, prepareFrame as prepareFrameOf, type FrameRequest } from './frame-obligations.js';
 import { withHistoricalReads, historicalRead, historicalTrace } from './input.js';
 import { prepareAssessmentAdmission as prepareAssessmentAdmissionOf, readAssessmentIntentAt as readAssessmentIntentAtOf } from './assessment.js';
@@ -66,8 +73,8 @@ export type TransportErrorCode = typeof TRANSPORT_ERROR_CODES[number];
  * 'transport' is the verified exchange of an adapter, passed on by transportFailure.
  */
 export type ModelCallSource = 'refs' | 'input' | 'addressing' | 'accepted-answer' | 'answer-form' | 'answers-gate' | 'assessment'
-  | 'call-record' | 'frame-obligations' | 'frame-proposals' | 'layer-basis' | 'question-packet' | 'refusal-journal' | 'repeat-gate'
-  | 'routes' | 'series' | 'run-control' | 'transport';
+  | 'call-record' | 'frame-obligations' | 'frame-proposals' | 'gaps' | 'layer-basis' | 'obligations' | 'question-packet' | 'refusal-journal'
+  | 'repeat-gate' | 'routes' | 'series' | 'run-control' | 'transport';
 export type ModelCallCode = ModelCallLocalCode | SourceCodes<ModelCallSource>;
 export type ModelCallResult<T> = OmResult<T, ModelCallCode>;
 
@@ -125,6 +132,9 @@ const readPartResult = transferring('question-packet', readPartResultOf);
 const readQuestionPacket = transferring('question-packet', readQuestionPacketOf);
 const readRouteProducers = transferring('answers-gate', readRouteProducersOf);
 const readRoutes = transferring('routes', readRoutesOf);
+const readGaps = transferring('gaps', readGapsOf);
+const readOmObligations = transferring('obligations', readOmObligationsOf);
+const prepareOmObligations = transferring('obligations', prepareOmObligationsOf);
 const readSeriesAdmissionChange = transferring('series', readSeriesAdmissionChangeOf);
 const readSeriesWorkAdmission = transferring('series', readSeriesWorkAdmissionOf);
 const readUnacceptedLayer = transferring('layer-basis', readUnacceptedLayerOf);
@@ -1180,8 +1190,8 @@ import { readFileSync as readRejectedFile } from 'node:fs';
 import { runProcess } from '../runtime/process.js';
 import { isProcessStopRefusal, writeProcessStopWitness } from '../runtime/process-identity.js';
 import { recordCall as recordCallOf, readCall as readCallOf, readCallLedgerAt as readCallLedgerAtOf, readCallLedger as readCallLedgerOf, callRecordId, callLedgerId, settleCall as settleCallOf, prepareCallDispatch as prepareCallDispatchOf, type AnyCallRecord, type AnyRecordCallRequest, type DispatchContract, type CallHistory, type CallLedger } from './call-record.js';
-import { prepareQuestionPacket as prepareQuestionPacketOf, preparePartResult as preparePartResultOf, partResponseId, PART_RESPONSE_KIND, PART_RESULT_KIND, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
-import { readAnySeriesAt as readAnySeriesAtOf, seriesRequestOf, prepareCompleteAttempt as prepareCompleteAttemptOf, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readSeriesWorkAdmission as readSeriesWorkAdmissionOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
+import { prepareQuestionPacket as prepareQuestionPacketOf, preparePartResult as preparePartResultOf, partResponseId, PART_RESPONSE_KIND, PART_RESULT_KIND, workAssignments, type QuestionPacketRequest, type PartResponseRecord } from './question-packet.js';
+import { readAnySeriesAt as readAnySeriesAtOf, completionCloseId, type AnyRepairSeries, seriesRequestOf, prepareCompleteAttempt as prepareCompleteAttemptOf, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readSeriesWorkAdmission as readSeriesWorkAdmissionOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf, type AttemptGoal, type CompletionReason, type SeriesAdmissionChange } from './series.js';
 import { prepareJournalBatch as prepareJournalBatchOf, prepareRecordRefusal as prepareRecordRefusalOf, unitRefusalNamespace, UNIT_REFUSAL_KIND, type UnitRefusalRecord } from './refusal-journal.js';
 import { prepareAddressing as prepareAddressingOf, deriveInputDecisions as deriveInputDecisionsOf } from './addressing.js';
 import { readOmInput as readOmInputOf, type OmInputRecord } from './input.js';
@@ -2599,7 +2609,8 @@ function completionRoot(binding: Revision<CompletionOwner>, batch: string): Revi
   return root;
 }
 /** MP2 (№2968 §2): one neighbour of a brief root — the finished node expansion of another root of its managed attempt. */
-export interface NeighbourSource { root: Ref; batch: string; node: string; assembly: Ref; proposal: Ref }
+// LP5 (№3278 §3): a root of this attempt answered by a reuse names that exact reuse; its assembly is the origin.
+export interface NeighbourSource { root: Ref; batch: string; node: string; assembly: Ref; proposal: Ref; reuse?: Ref }
 export interface NeighbourWork {
   node: string; root: Ref; assembly: Ref; proposal: Ref; writes: string[];
   nodes: { id: string; kind: string; title: string; parent: string | null; ports: Json; code: Json }[];
@@ -2654,7 +2665,16 @@ export function readNeighbourResults(store: Store, request: NeighbourRequest): M
       const resolved = new Set(snapshot.resolved.map(ref => ref.id));
       const found = new Map<string, NeighbourSource>();
       for (const ref of snapshot.products) {
-        if (store.get(ref.id, ref.revision)?.kind !== PART_ASSEMBLY_KIND) continue;
+        const kind = store.get(ref.id, ref.revision)?.kind;
+        if (kind === COMPLETION_REUSE_KIND) {
+          const reuse = take(readCompletionReuseAt(store, project, ref)).value;
+          const root = completionRoot(binding, reuse.batch), node = nodeOf(root.value.batch);
+          if (root.id === own.id || !node || ceased.has(root.id) || !resolved.has(root.id)) continue;
+          const source = { root: reference(root), batch: root.value.batch, node, assembly: reuse.origin.assembly, proposal: reuse.origin.proposal, reuse: ref };
+          found.set(canonical(source), source);
+          continue;
+        }
+        if (kind !== PART_ASSEMBLY_KIND) continue;
         const assembly = take(readPartAssembly(store, { project, record: ref }));
         const root = rootOf(assembly), node = nodeOf(root.value.batch);
         if (root.id === own.id || !node || ceased.has(root.id) || !resolved.has(root.id)) continue;
@@ -2672,11 +2692,14 @@ export function readNeighbourResults(store: Store, request: NeighbourRequest): M
     }
     const works = sources.map((source): NeighbourWork => {
       const assembly = take(readPartAssembly(store, { project, record: source.assembly }));
-      const root = rootOf(assembly);
+      // A reused root is proved by its reuse — never by putting this attempt's root to the old assembly by its name.
+      const reuse = source.reuse ? take(readCompletionReuseAt(store, project, source.reuse)).value : null;
+      const root = reuse ? completionRoot(binding, reuse.batch) : rootOf(assembly);
       if (!same(reference(assembly.proposal), source.proposal) || !same(reference(root), source.root) || root.value.batch !== source.batch
-        || root.id === own.id || nodeOf(source.batch) !== source.node)
+        || root.id === own.id || nodeOf(source.batch) !== source.node || reuse && (!same(reuse.binding, reference(binding))
+          || !same(reuse.root, source.root) || !same(reuse.origin, { assembly: source.assembly, proposal: source.proposal })))
         fail('completion_foreign', source.assembly.id, 'neighbors', 'A neighbour is the exact finished expansion of another root of this attempt', source.assembly);
-      references.push(source.root, source.assembly, source.proposal, ...assembly.references);
+      references.push(source.root, source.assembly, source.proposal, ...(source.reuse ? [source.reuse] : []), ...assembly.references);
       const nodes = assembly.proposal.value.nodes.map(node => ({ id: node.id, kind: node.kind, title: node.title, parent: node.parent ?? null,
         ports: JSON.parse(canonical(node.ports)) as Json, code: JSON.parse(canonical(node.code ?? [])) as Json }));
       const writes = [...new Set(assembly.proposal.value.nodes.flatMap(node => (node.code ?? [])
@@ -2769,6 +2792,8 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
   const packets = new Map<string, Revision<QuestionPacketRecord>>(), calls = new Map<string, ModelCallOutcome>();
   const terminals: ReturnType<typeof readAssessmentTerminalAt>[] = [];
   const cessations: Revision<CompletionCessation>[] = [];
+  const finalizations: Revision<CompletionFinalization>[] = [];
+  const reuses: Revision<CompletionReuse>[] = [];
   const answers: Ref[] = [];
   const add = (rows: Revision<CompletionAssignment>[]) => {
     for (const row of rows) {
@@ -2809,6 +2834,14 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
       // H1.0c: the ceased check is a participant of its own; physical readers never see a non-physical assignment.
       if (cessation.value.disposition === 'check-ceased') answers.push(ref);
       else cessations.push(cessation as Revision<CompletionCessation>);
+    } else if (record.kind === COMPLETION_FINALIZATION_KIND) {
+      const finalization = take(readCompletionFinalizationAt(store, binding.value.project, ref));
+      if (!same(finalization.value.binding, reference(binding))) fail('completion_foreign', ref.id, 'binding', 'A finalization belongs to this owner');
+      finalizations.push(finalization as Revision<CompletionFinalization>);
+    } else if (record.kind === COMPLETION_REUSE_KIND) {
+      const reuse = take(readCompletionReuseAt(store, binding.value.project, ref));
+      if (!same(reuse.value.binding, reference(binding))) fail('completion_foreign', ref.id, 'binding', 'A reuse belongs to this owner');
+      reuses.push(reuse as Revision<CompletionReuse>);
     } else if (record.kind === MODEL_CYCLE_KIND) {
       const cycle = take(readModelCycle(store, { project: binding.value.project, record: ref }));
       packetCompletionAssignments(store, binding, cycle.record.value.request.packet);
@@ -2829,7 +2862,7 @@ function completionGraph(store: Store, binding: Revision<CompletionOwner>, produ
     } else fail('completion_invalid', ref.id, 'product', 'This record has no registered completion producer');
   }
   return { assignments: [...assignments.values()].sort((a, b) => a.id.localeCompare(b.id)), packets, calls,
-    terminals: terminals.map(item => take(item)), cessations, answers: take(readAnswersParticipant(store, binding, answers)) };
+    terminals: terminals.map(item => take(item)), cessations, finalizations, reuses, answers: take(readAnswersParticipant(store, binding, answers)) };
 }
 /** The registered answers-gate check is one more logical assignment of the same work (H1.0c). */
 const completionAssignmentRefs = (graph: ReturnType<typeof completionGraph>): Ref[] =>
@@ -3062,6 +3095,10 @@ function deriveCompletionSnapshot(store: Store, binding: Revision<CompletionOwne
     while (id) { if (id === parent) return true; id = parentOf.get(id); }
     return false;
   };
+  // LP5: the ended remainder of a common acceptance or confirmation is a cause of ending, not a verdict (№3278 §2).
+  for (const row of graph.finalizations) technical.push({ source: reference(row), reason: 'interrupted' });
+  // LP5 (№3278 §3): a reuse resolves exactly its own new root; the paid source keeps its own result.
+  for (const row of graph.reuses) completed.add(row.value.root.id);
   for (const row of graph.cessations) {
     technical.push({ source: reference(row), reason: 'interrupted' });
     if (row.value.remainder !== 'assembly') completed.add(row.value.assignment.id);
@@ -3506,8 +3543,9 @@ export function readCompletionCause(store: Store, project: string, assignmentRef
     const { assignment, check } = readAnyCompletionAssignmentAt(store, project, assignmentRef);
     const binding = take(readCompletionOwnerAt(store, project, assignment.value.binding)) as Revision<CompletionOwner>;
     if (!object(cause)) fail('completion_cause_invalid', assignment.id, 'cause', 'A disposition requires a closed proof of a necessary condition');
-    if (check && cause.kind !== 'series-admission-change')
-      fail('completion_cause_invalid', assignment.id, 'cause', 'The answers-gate check ends only by its proved admission change');
+    if (check && cause.kind !== 'series-admission-change' && !(cause.kind === 'required-record-replaced' && object(cause.prerequisite)
+      && cause.prerequisite.kind === 'input'))
+      fail('completion_cause_invalid', assignment.id, 'cause', 'The answers-gate check ends only by its proved admission change or the replaced B1 of its area');
     if (cause.kind === 'file-observation') {
       if (!exactKeys(cause, ['kind', 'source', 'observation']) || !isRef(cause.source) || !object(cause.observation)
         || !exactKeys(cause.observation, cause.observation.kind === 'read' ? ['kind', 'bytes'] : ['kind', 'code']))
@@ -3523,7 +3561,7 @@ export function readCompletionCause(store: Store, project: string, assignmentRef
         || ((cause.prerequisite.kind === 'environment' || cause.prerequisite.kind === 'adapter') && !isRef(cause.prerequisite.context))
         || (cause.prerequisite.kind === 'adapter' && !(cause.prerequisite.packet === null || isRef(cause.prerequisite.packet)))
         || !(cause.proof === null || isRef(cause.proof))) fail('completion_cause_invalid', assignment.id, 'cause', 'Replacement proof has an exact declared prerequisite');
-      const prerequisites = completionPrerequisites(store, binding, assignment,
+      const prerequisites = check ? { records: [areaInput(store, binding)] } : completionPrerequisites(store, binding, assignment,
         cause.prerequisite.kind === 'environment' || cause.prerequisite.kind === 'adapter' && cause.prerequisite.packet === null ? cause.prerequisite.context : null,
         cause.prerequisite.kind === 'adapter' ? cause.prerequisite : null,
         cause.prerequisite.kind === 'environment' ? cause.prerequisite.physical : null);
@@ -3617,6 +3655,27 @@ export function ceasedCycleGround(store: Store, project: string, rootRef: Ref): 
     return ceased ? reference(ceased) : null;
   });
 }
+/**
+ * LP5 (№3278 §1): the mandatory B1 of an attempt's own area — the exact om-input the D1 of its plan stands on. Only its
+ * proved replacement by a later revision of that same record ends the area's remaining non-physical work (the registered
+ * check, the common acceptance or confirmation); a moved D1/M6 on the same B1 does not (H1.0c, №1616 п.1).
+ */
+function areaInput(store: Store, binding: Revision<CompletionOwner>): CompletionPrerequisite {
+  const routes = take(readRoutes(store, { project: binding.value.project, record: binding.value.plan.routes }));
+  return { kind: 'input', source: routes.record.value.request.gaps.sources.input, graph: null, level: null };
+}
+function areaReplacement(store: Store, binding: Revision<CompletionOwner>): { cause: CompletionCause; guards: Ref[] } | null {
+  const prerequisite = areaInput(store, binding), head = store.get(prerequisite.source.id);
+  if (!head) fail('completion_cause_invalid', prerequisite.source.id, 'source', 'Loss of original Store evidence is not lawful replacement');
+  if (same(reference(head), prerequisite.source)) return null;
+  const cause: CompletionCause = { kind: 'required-record-replaced', prerequisite, replacement: reference(head), proof: null };
+  readReplacement(store, binding.value.project, prerequisite, cause.replacement, null);
+  return { cause, guards: [reference(head)] };
+}
+/** LP5: whether the B1 of this attempt's own area was replaced — the proved cause and its guarded head, or none. */
+export function readAreaReplacement(store: Store, project: string, bindingRef: Ref): ModelCallResult<Sealed<{ cause: CompletionCause; guards: Ref[] } | null>> {
+  return result(() => areaReplacement(store, take(readCompletionOwnerAt(store, project, bindingRef)) as Revision<CompletionOwner>));
+}
 export function prepareCompletionCause(store: Store, project: string, assignmentRef: Ref): ModelCallResult<Sealed<{
   cause: CompletionCause | null; guards: Ref[];
 }>> {
@@ -3641,8 +3700,13 @@ export function prepareCompletionCause(store: Store, project: string, assignment
         }
       }
     }
-    // H1.0c: movement of D1/M6 or of physical inputs does not prove that the check ended.
-    if (check) return { cause: null, guards: [] };
+    // H1.0c: movement of D1/M6 or of physical inputs does not prove that the check ended; LP5 (№3278 §1): the proved
+    // replacement of its area's mandatory B1 does.
+    if (check) {
+      const replaced = areaReplacement(store, binding);
+      if (replaced) take(readCompletionCause(store, project, assignmentRef, replaced.cause));
+      return replaced ?? { cause: null, guards: [] };
+    }
     let context: Ref | null = null;
     if (assignment.value.kind === 'fact') {
       const physical = take(readModelCallState(store, { project, record: assignment.value.source }));
@@ -3750,7 +3814,10 @@ export interface CompletionCessation {
   remainder: 'expansion' | 'continuation' | 'assembly' | 'application' | 'answers-gate' | null;
   packet: Ref | null; callId: string | null; physicalId: string | null; call: Ref | null; ledger: Ref | null;
   physical: Ref | null; exchange: Ref | null; rejection: Ref | null;
+  // LP5 (№3278 §4): a check ceased by the replaced B1 of its area is a variant of its own era; no earlier record has it.
+  variant?: typeof AREA_INPUT_VARIANT;
 }
+export const AREA_INPUT_VARIANT = 'area-input/v1' as const;
 export const completionCessationId = (project: string, binding: string, assignment: string): string =>
   `${COMPLETION_CESSATION_KIND}:${project}:${hashJson({ binding, assignment })}`;
 function assignmentCallAddress(store: Store, context: Sealed<CompletionDispositionContext>, packet: Ref | null): {
@@ -3955,6 +4022,536 @@ export function writeCompletionCessation(store: Store, request: { project: strin
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'G7', target: prepared.record.id,
       writes: prepared.writes, guards: prepared.guards }));
     return prepared.record as Revision<CompletionCessation>;
+  });
+}
+
+// ---- LP5 (№3278 §2): the end of an attempt's remaining common acceptance or confirmation after its area's B1 was replaced ----
+export const COMPLETION_FINALIZATION_KIND = 'om-completion-finalization';
+export type FinalizationPhase = 'acceptance' | 'confirmation';
+/**
+ * The product that ends the non-physical remainder of a complete attempt whose area lost its B1: the common acceptance
+ * (C5) its complete check was waiting for, or the D2 confirmation of a goal already accepted. It is no evaluation and no
+ * cessation of the complete check; every resolved root, the evaluation and the paid products keep their meaning.
+ */
+export interface CompletionFinalization {
+  contract: 'om-completion-finalization/v1'; project: string; binding: Ref; work: Ref; phase: FinalizationPhase;
+  outcome: 'ceased'; cause: CompletionCause; level: 2 | 3; evaluation: Ref; accepted: Ref | null; basis: ConfirmationGround | null;
+}
+export const completionFinalizationId = (project: string, binding: string, phase: FinalizationPhase): string =>
+  `${COMPLETION_FINALIZATION_KIND}:${project}:${hashJson({ binding, phase })}`;
+/** The level of the attempt's own common acceptance — its node expansions, L2 before L3 — or none. */
+function acceptanceLevel(store: Store, binding: Revision<CompletionOwner>): 2 | 3 | null {
+  const routes = take(readRoutes(store, { project: binding.value.project, record: binding.value.plan.routes })).record.value;
+  const own = routes.batches.filter(row => binding.value.plan.batches.includes(row.id) && row.task === 'node-expansion');
+  return own.some(row => row.level === 2) ? 2 : own.some(row => row.level === 3) ? 3 : null;
+}
+/**
+ * LP5 (return №3294 п.2): the own results a common acceptance of this level takes from a work — at L2 the proposals of
+ * its assemblies, at L3 its assemblies and the reuses that answer its roots (the reuse itself, never the old assembly).
+ * The one derivation of the pass and of the end of a remaining acceptance or confirmation.
+ */
+export function completionAcceptanceResults(store: Store, project: string, work: { readonly products: readonly Ref[] }, level: 2 | 3): Ref[] {
+  const rows: Ref[] = [];
+  for (const product of work.products) {
+    const kind = store.get(product.id, product.revision)?.kind;
+    if (kind !== PART_ASSEMBLY_KIND && kind !== COMPLETION_REUSE_KIND) continue;
+    const proposal = kind === PART_ASSEMBLY_KIND ? take(readPartAssembly(store, { project, record: product })).proposal
+      : take(readReuseResult(store, { project, record: product })).proposal;
+    if (proposal.value.level === level) rows.push(level === 2 ? reference(proposal) : product);
+  }
+  return rows;
+}
+/** An accepted frame request (frame-accept `AcceptedFrameRequest`), named here by its shape: frame-accept reaches this module through atomic-gate. */
+export interface AcceptedFrameRequest { project: string; level: 2 | 3; graph: Ref; layer: Ref; frame: Ref }
+/** The one common acceptance that took exactly these own results: its accepted frame, frame request and attempt binding. */
+export interface CompletionAcceptance { frame: Ref; acceptance: AcceptedFrameRequest; binding: FrameAttemptBinding | null }
+/**
+ * The common acceptance that took exactly these own results, read from the standard sources of the pass: the accepted N2
+ * whose candidate carries the proposals, or the works acceptance whose results are the assemblies and reuses — whichever
+ * attempt of the group coordinated it. The one derivation of the pass and of the end of a remaining acceptance.
+ */
+export function completionAcceptance(store: Store, project: string, level: 2 | 3, own: readonly Ref[]): CompletionAcceptance | null {
+  if (!own.length) return null;
+  const covers = (refs: readonly unknown[]) => own.every(ref => refs.some(other => same(other, ref)));
+  if (level === 2) {
+    for (const row of store.history<{ acceptance?: { candidate?: Ref; binding?: FrameAttemptBinding | null } }>(`om-frame:${project}:2`)) {
+      const candidate = row.value.acceptance?.candidate;
+      const proposals = candidate ? store.get<{ request: { proposals: Ref[] } }>(candidate.id, candidate.revision)?.value.request.proposals : null;
+      if (!proposals || !covers(proposals)) continue;
+      const read = take(readAcceptedFrameLayer(store, { project, level: 2, frame: reference(row) }));
+      return { frame: reference(row), binding: row.value.acceptance!.binding ?? null,
+        acceptance: { project, level: 2, graph: reference(read.graph), layer: reference(read.layer), frame: reference(read.frame) } };
+    }
+    return null;
+  }
+  for (const row of store.list<{ request: { results: { record: Ref }[]; binding?: FrameAttemptBinding | null }; acceptance: AcceptedFrameRequest | null }>('om-works-acceptance'))
+    if (row.id.startsWith(`om-works-acceptance:${project}:`) && row.value.acceptance && covers(row.value.request.results.map(item => item.record)))
+      return { frame: row.value.acceptance.frame, acceptance: row.value.acceptance, binding: row.value.request.binding ?? null };
+  return null;
+}
+/** The acceptance that took the own results of this work at its level, or none — the pass's reading of the same derivation. */
+export function readCompletionAcceptance(store: Store, project: string, work: { readonly products: readonly Ref[] }, level: 2 | 3): ModelCallResult<Sealed<CompletionAcceptance | null>> {
+  return result(() => completionAcceptance(store, project, level, completionAcceptanceResults(store, project, work, level)));
+}
+/**
+ * LP5 (return №3294 п.1): the heads that prove the D2 confirmation of an accepted goal impossible on its area. The machine
+ * D1 of the project stands on the accepted frame of each level and on the graph head (run-bases `upperBasis`); once the
+ * accepted frame of the goal's level or the graph it was accepted on is replaced, no D2 of this acceptance is admitted
+ * (run `ownersScope`). While both heads are still the acceptance's own, D2 is the one way to the goal's result.
+ */
+export interface ConfirmationGround { frame: Ref; graph: Ref }
+export function readConfirmationGround(store: Store, project: string, acceptance: AcceptedFrameRequest, level: 2 | 3): ModelCallResult<Sealed<{
+  ground: ConfirmationGround | null; guards: Ref[];
+}>> {
+  return result(() => {
+    const frame = store.get(`om-frame:${project}:${level}`), graph = store.get(`graph:${project}`);
+    if (!frame || !graph) fail('completion_invalid', acceptance.frame.id, 'accepted', 'An accepted goal keeps its accepted frame and graph');
+    const ground = { frame: reference(frame), graph: reference(graph) };
+    readSupersession(store, project, acceptance, level, ground, false);
+    return { ground: same(ground.frame, acceptance.frame) && same(ground.graph, acceptance.graph) ? null : ground, guards: [ground.frame, ground.graph] };
+  });
+}
+/** The historical proof of a saved ground: exact later revisions of the very accepted frame and graph, one of them moved. */
+function readSupersession(store: Store, project: string, acceptance: AcceptedFrameRequest, level: 2 | 3, ground: ConfirmationGround, moved: boolean): void {
+  if (!object(ground) || !exactKeys(ground, ['frame', 'graph']) || !isRef(ground.frame) || !isRef(ground.graph))
+    fail('completion_invalid', acceptance.frame.id, 'basis', 'A confirmation remainder names the exact frame and graph heads it ended on');
+  const pairs = [[ground.frame, acceptance.frame, `om-frame:${project}:${level}`, 'connection-frame'], [ground.graph, acceptance.graph, `graph:${project}`, 'graph']] as const;
+  for (const [later, accepted, id, kind] of pairs) {
+    if (later.id !== id || accepted.id !== id || later.revision < accepted.revision)
+      fail('completion_invalid', id, 'basis', 'The ground is a revision of the accepted frame or graph itself, never an earlier one');
+    take(readRecord(store, later, { unit: 'G7', target: id, id, kind }));
+  }
+  if (moved && same(ground.frame, acceptance.frame) && same(ground.graph, acceptance.graph))
+    fail('completion_invalid', acceptance.frame.id, 'basis', 'While the accepted frame and graph stand, D2 is the one way to the result');
+}
+/** The D2 event that confirmed the goal of this exact attempt (№1749 п.4–6), wherever it stands in the history. */
+function confirmationOfAttempt(store: Store, project: string, binding: Revision<CompletionOwner>): Ref | null {
+  for (const row of store.history<{ request: { closures: { attempt?: { series: Ref; attempt: number } }[] } }>(gapLinesId(project)))
+    if (row.value.request.closures.some(item => item.attempt?.series.id === binding.value.series.id && item.attempt.attempt === binding.value.attempt))
+      return reference(row);
+  return null;
+}
+/** The saved replacement of the area's B1, read at its exact references — never today's head. */
+function readAreaCause(store: Store, binding: Revision<CompletionOwner>, cause: CompletionCause): Ref[] {
+  if (!object(cause) || cause.kind !== 'required-record-replaced' || !exactKeys(cause, ['kind', 'prerequisite', 'replacement', 'proof'])
+    || !same(cause.prerequisite, areaInput(store, binding)) || cause.proof !== null)
+    fail('completion_cause_invalid', binding.id, 'cause', 'The remaining acceptance ends only by the replaced B1 of its own area');
+  return readReplacement(store, binding.value.project, cause.prerequisite, cause.replacement, null);
+}
+/** The one derivation of the end of a remaining acceptance or confirmation, for its producer and for every reader. */
+function finalizationValue(store: Store, project: string, request: {
+  binding: Ref; work: Ref; phase: FinalizationPhase; cause: CompletionCause; accepted: Ref | null; basis: ConfirmationGround | null;
+}): CompletionFinalization {
+  const binding = take(readCompletionOwnerAt(store, project, request.binding)) as Revision<CompletionOwner>;
+  if (!same(reference(binding), request.binding) || binding.value.owner.kind !== 'block')
+    fail('completion_invalid', request.binding.id, 'binding', 'Only a block attempt has a common acceptance to end');
+  const before = take(readCompletionWorkAt(store, project, request.work));
+  if (before.work.value.closed || !same(reference(before.binding), reference(binding)))
+    fail('completion_invalid', request.work.id, 'work', 'The end stands on the open work of its binding');
+  const resolved = new Set(before.resolved.map(ref => canonical(ref)));
+  if (before.assignments.some(row => !resolved.has(canonical(reference(row)))))
+    fail('completion_invalid', request.work.id, 'assignments', 'Every physical root and remainder is resolved before its acceptance ends');
+  const answers = before.answers;
+  if (!answers || !answers.complete || answers.ceased || !answers.evaluation)
+    fail('completion_invalid', request.work.id, 'answers', 'The remaining acceptance follows a complete, evaluated check');
+  const level = acceptanceLevel(store, binding);
+  if (!level) fail('completion_invalid', binding.id, 'level', 'Only an attempt with a common acceptance has its remainder');
+  readAreaCause(store, binding, request.cause);
+  if (request.phase === 'confirmation') {
+    const accepted = completionAcceptance(store, project, level, completionAcceptanceResults(store, project, before, level));
+    if (!accepted || !request.accepted || !same(accepted.frame, request.accepted))
+      fail('completion_invalid', binding.id, 'accepted', 'A confirmation remainder names the exact acceptance of its own results');
+    take(readAcceptedFrameLayer(store, { project, level, frame: request.accepted }));
+    // Its era's ground, at its saved references: the accepted frame or graph superseded — never today's heads.
+    readSupersession(store, project, accepted.acceptance, level, request.basis as ConfirmationGround, true);
+  } else if (request.accepted !== null || request.basis !== null || request.phase !== 'acceptance')
+    fail('completion_invalid', binding.id, 'phase', 'The end of an acceptance names no accepted frame and no ground of a confirmation');
+  return { contract: 'om-completion-finalization/v1', project, binding: reference(binding), work: reference(before.work),
+    phase: request.phase, outcome: 'ceased', cause: request.cause, level, evaluation: answers.evaluation, accepted: request.accepted,
+    basis: request.basis };
+}
+export function readCompletionFinalizationAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionFinalization>>> {
+  return result(() => historicalRead(store, { reader: 'G7.completion-finalization', project, ref }, () => {
+    const record = take(readRecord<CompletionFinalization>(store, ref, { unit: 'G7', target: ref.id,
+      kind: COMPLETION_FINALIZATION_KIND, idPrefix: `${COMPLETION_FINALIZATION_KIND}:${project}:` }));
+    const value = record.value;
+    if (!object(value) || record.revision !== 1 || value.contract !== 'om-completion-finalization/v1' || value.project !== project
+      || !isRef(value.binding) || !isRef(value.work) || !['acceptance', 'confirmation'].includes(value.phase)
+      || !(value.accepted === null || isRef(value.accepted)) || !Object.hasOwn(value, 'basis')
+      || record.id !== completionFinalizationId(project, value.binding.id, value.phase) || !same(value, finalizationValue(store, project, value)))
+      fail('completion_invalid', ref.id, 'finalization', 'The end of a remaining acceptance must equal the common exact derivation');
+    return record as Revision<CompletionFinalization>;
+  }, () => fail('completion_invalid', ref.id, 'history', 'A finalization cannot prove itself')));
+}
+/**
+ * LP5 (№3278 §2; return №3294 п.1–2): the producer of that end. The cause is today's replacement of the area's B1, guarded.
+ * The acceptance is the one common derivation over the attempt's own assemblies and reuses: while it stands the
+ * acceptance is kept, never ceased; its frame head or absence is guarded. A confirmation remainder ends only when D2 is
+ * proved impossible — the accepted frame or graph superseded, both heads guarded — and only while no D2 confirmed this
+ * attempt (the D2 history guarded). The record and its registration are one transaction.
+ */
+export function prepareCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase }): ModelCallResult<Sealed<{
+  record: Revision<CompletionFinalization>; writes: Write[]; guards: TransactionGuard[];
+}>> {
+  return result(() => {
+    const { project, phase } = request;
+    if (phase !== 'acceptance' && phase !== 'confirmation') fail('completion_invalid', project, 'phase', 'A finalization names its phase');
+    const binding = take(readCompletionOwnerAt(store, project, request.binding)) as Revision<CompletionOwner>;
+    const id = completionFinalizationId(project, binding.id, phase), prior = store.get(id);
+    if (prior) return { record: take(readCompletionFinalizationAt(store, project, reference(prior))), writes: [], guards: [] };
+    const head = store.get<CompletionWork>(completionWorkId(project, binding.id));
+    if (!head) fail('completion_invalid', binding.id, 'work', 'A managed binding keeps its work registry');
+    if (head.value.closed) fail('completion_closed', head.id, 'work', 'Closed work accepts only exact historical repeats');
+    const replaced = areaReplacement(store, binding);
+    if (!replaced) fail('completion_cause_unproved', binding.id, 'cause', 'The remaining acceptance keeps its area: only a replaced B1 ends it');
+    const snapshot = take(readCompletionWorkAt(store, project, reference(head)));
+    const level = acceptanceLevel(store, binding);
+    if (!level) fail('completion_invalid', binding.id, 'level', 'Only an attempt with a common acceptance has its remainder');
+    const frameId = `om-frame:${project}:${level}`, frameHead = store.get(frameId);
+    const guards: TransactionGuard[] = [...replaced.guards, frameHead ? reference(frameHead) : { id: frameId, absent: true }];
+    const accepted = completionAcceptance(store, project, level, completionAcceptanceResults(store, project, snapshot, level));
+    if (phase === 'acceptance' && accepted)
+      fail('completion_resolved', binding.id, 'accepted', 'A real acceptance of these results stands; it is kept, never ceased', accepted.frame);
+    let basis: ConfirmationGround | null = null;
+    if (phase === 'confirmation') {
+      if (!accepted) fail('completion_invalid', binding.id, 'accepted', 'Only an accepted goal has a confirmation remainder');
+      const linesHead = store.get(gapLinesId(project));
+      guards.push(linesHead ? reference(linesHead) : { id: gapLinesId(project), absent: true });
+      const confirmed = confirmationOfAttempt(store, project, binding);
+      if (confirmed) fail('completion_resolved', binding.id, 'confirmation', 'The goal of this attempt is already confirmed by D2', confirmed);
+      const read = take(readConfirmationGround(store, project, accepted.acceptance, level));
+      if (!read.ground) fail('completion_cause_unproved', binding.id, 'confirmation',
+        'D2 of the accepted goal is still admissible on its accepted frame and graph; only their replacement ends its confirmation', accepted.frame);
+      guards.push(...read.guards);
+      basis = read.ground as ConfirmationGround;
+    }
+    const value = finalizationValue(store, project, { binding: reference(binding), work: reference(head), phase, cause: replaced.cause,
+      accepted: phase === 'confirmation' ? accepted!.frame : null, basis });
+    const write: Write = { id, kind: COMPLETION_FINALIZATION_KIND, expected: 0, value: value as unknown as Json };
+    const record: Revision<CompletionFinalization> = { id, kind: COMPLETION_FINALIZATION_KIND, revision: 1, hash: hashJson(value), value };
+    const completion = take(prepareCompletionProducts(pendingCallStore(store, [write]), reference(binding), [reference(record)]));
+    const writes = [write, ...completion.writes];
+    return { record, writes, guards: uniqueTransactionGuards([...guards, ...completion.guards].filter(guard => !isRef(guard)
+      || !writes.some(row => same(writeRef(row), guard)))) };
+  });
+}
+export function writeCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase }): ModelCallResult<Sealed<Revision<CompletionFinalization>>> {
+  return result(() => {
+    const prepared = take(prepareCompletionFinalization(store, request));
+    if (prepared.writes.length) take(writeGuarded(store, { unit: 'G7', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+    return prepared.record as Revision<CompletionFinalization>;
+  });
+}
+
+// ---- LP5 (№3278 §3): T1 — a paid complete L3 assembly admitted again into an unstarted root of a later attempt ----
+export const COMPLETION_REUSE_KIND = 'om-completion-reuse';
+/** The immediate source of a reuse: the closed earlier attempt, its exact pre-close work and close, its root and result. */
+export interface CompletionReuseSource { binding: Ref; close: Ref; work: Ref; root: Ref; result: Ref }
+/**
+ * The proof that one unstarted L3 node-expansion root of a later attempt is answered by a paid complete assembly of an
+ * earlier attempt of the same line, closed because the B1 of its area was replaced: the same complete subject, today's
+ * admission of its proposal to the new works frame, and its D7 bindings carried to today's handoff by the common
+ * assignment key. Nothing physical is created; the source keeps its result, expense and outcome. Through several
+ * replacements the origin stays the first complete assembly; each admission is its own.
+ */
+export interface CompletionReuse {
+  contract: 'om-completion-reuse/v1'; project: string; binding: Ref; root: Ref; work: Ref; routes: Ref; batch: string;
+  source: CompletionReuseSource; origin: { assembly: Ref; proposal: Ref }; works: WorksPartBindings;
+}
+export const completionReuseId = (project: string, binding: string, root: string): string =>
+  `${COMPLETION_REUSE_KIND}:${project}:${hashJson({ binding, root })}`;
+interface ExpansionArea { node: string; source: { frame: FrameRequest; proposals: Ref[] }; frame: FrameProposals; open: string[]; subject: Json }
+/**
+ * The complete subject of an L3 node expansion of a binding's plan — what its answer had to fill: the batch and its routed
+ * items with the whole content of their D1 gaps, and the open obligations of the node in the works frame. The addresses
+ * of the area (D1 records, horizon and frame references) are no part of it. Null for any other batch.
+ */
+function expansionArea(store: Store, project: string, binding: Revision<CompletionOwner>, batchId: string): ExpansionArea | null {
+  const routes = take(readRoutes(store, { project, record: binding.value.plan.routes })).record.value;
+  const batch = routes.batches.find(row => row.id === batchId);
+  const works = routes.request.gaps.sources.works as unknown as { frame: FrameRequest; proposals: Ref[] } | { state: string };
+  if (!batch || batch.task !== 'node-expansion' || batch.level !== 3 || !text(batch.node) || 'state' in works) return null;
+  const node = batch.node, frame = take(readFrameProposals(store, works as never)) as unknown as FrameProposals;
+  const records = take(readGaps(store, routes.request.gaps as never)).records;
+  const items = batch.items.map(item => {
+    const row = records.find(record => same(reference(record), item.record));
+    if (!row) fail('completion_invalid', item.record.id, 'gap', 'A routed item keeps its exact D1 gap');
+    const { record: _record, ...rest } = item;
+    return { ...rest, content: row.value.gap };
+  }).sort((a, b) => canonical(a).localeCompare(canonical(b)));
+  const open = frame.result.open.filter(item => item.upper.node === node).sort((a, b) => a.id.localeCompare(b.id));
+  const { id: _id, items: _items, ...head } = batch;
+  return { node, source: works, frame, open: open.map(item => item.id),
+    subject: JSON.parse(canonical({ ...head, items, open })) as Json };
+}
+/** The common assignment key of a D7 task: every responsibility and policy field, the scope and origin aside. */
+function reuseAssignmentKey(value: CarriedObligation): string {
+  const { scope: _scope, original: _original, ...policy } = value as CarriedObligation & { original?: unknown };
+  return canonical(policy);
+}
+/** The D7 tasks the works packet of this node assigns (the packet's own derivation), by their common assignment key. */
+function assignedTasks(area: ExpansionArea, basis: OmObligations): Map<string, CarriedObligation> {
+  const assigned = new Set(workAssignments(area.frame, area.node, basis).nodeAssignments), rows = new Map<string, CarriedObligation>();
+  for (const item of taskObligations(basis.handoff)) {
+    if (!assigned.has(taskBindingId(item))) continue;
+    const key = reuseAssignmentKey(item);
+    if (rows.has(key)) fail('completion_invalid', item.obligation, 'assignments', 'An assignment cannot map to two destinations');
+    rows.set(key, item);
+  }
+  return rows;
+}
+/** The D7 basis a work answer names, at its exact producer and complete ledger. */
+function worksBasisAt(store: Store, project: string, works: { producer: Ref; ledger: Ref }): OmObligations {
+  const basis = take(readOmObligations(store, { project, producer: works.producer })) as OmObligations;
+  if (!same(reference(basis.record), works.ledger)) fail('completion_invalid', works.ledger.id, 'works', 'A D7 basis names its exact complete ledger');
+  return basis;
+}
+/** Whether any physical or result step of this root already exists in the work: a packet, its parts, a call, a cycle or a result. */
+function rootStarted(store: Store, binding: Revision<CompletionOwner>, before: Sealed<CompletionSnapshot>, root: Revision<CompletionAssignment>): boolean {
+  const project = binding.value.project;
+  const parents = new Map(before.assignments.map(row => [row.id, row.value.parent?.id ?? null]));
+  const under = (id: string) => { for (let at: string | null | undefined = id; at; at = parents.get(at)) if (at === root.id) return true; return false; };
+  if (before.resolved.some(ref => ref.id === root.id) || before.cessations.some(row => row.value.assignment.id === root.id)) return true;
+  if (before.assignments.some(row => row.id !== root.id && under(row.id))) return true;
+  for (const ref of before.products) {
+    const record = store.get(ref.id, ref.revision);
+    let packet: Ref | null = null;
+    if (record?.kind === 'question-packet') packet = ref;
+    else if (record?.kind === 'model-call') {
+      const state = take(readModelCallState(store, { project, record: ref }));
+      packet = (state.state === 'running' || state.state === 'received' ? state.record : state.outcome.record).value.om.request.packet;
+    } else if (record?.kind === MODEL_CYCLE_KIND) packet = take(readModelCycle(store, { project, record: ref })).record.value.request.packet;
+    else if (record?.kind === COMPLETION_REUSE_KIND && (record.value as unknown as CompletionReuse).root.id === root.id) return true;
+    if (packet && under(packetCompletionAssignments(store, binding, packet).selected.id)) return true;
+  }
+  return false;
+}
+/** Whether a closed attempt was ended by the replaced B1 of its area (LP5): only such an attempt hands its results on. */
+function endedByArea(store: Store, snapshot: Sealed<CompletionSnapshot>): boolean {
+  if (snapshot.products.some(ref => store.get(ref.id, ref.revision)?.kind === COMPLETION_FINALIZATION_KIND)) return true;
+  return snapshot.products.some(ref => {
+    const record = store.get<CompletionCessation>(ref.id, ref.revision);
+    return record?.kind === COMPLETION_CESSATION_KIND && record.value.disposition === 'check-ceased' && record.value.variant === AREA_INPUT_VARIANT;
+  });
+}
+/** The root of a binding a result of its work answers: an assembly by its parts' packet, a reuse by its own root. */
+function resultRoot(store: Store, project: string, binding: Revision<CompletionOwner>, result: Ref): { root: Revision<CompletionAssignment>;
+  origin: { assembly: Ref; proposal: Ref }; works: WorksPartBindings } | null {
+  const record = store.get(result.id, result.revision);
+  if (record?.kind === PART_ASSEMBLY_KIND) {
+    const assembly = take(readPartAssembly(store, { project, record: result }));
+    const part = take(readPartResult(store, { project, record: assembly.record.value.results[0]! }));
+    const packet = packetCompletionAssignments(store, binding, part.record.value.request.packet).packet;
+    const works = (assembly.record.value as unknown as { works?: WorksPartBindings }).works;
+    if (!works) return null;
+    return { root: completionRoot(binding, packet.value.request.batch!), origin: { assembly: result, proposal: reference(assembly.proposal) }, works };
+  }
+  if (record?.kind === COMPLETION_REUSE_KIND) {
+    const reuse = take(readCompletionReuseAt(store, project, result));
+    if (!same(reuse.value.binding, reference(binding))) fail('completion_foreign', result.id, 'binding', 'A reuse belongs to its exact binding');
+    return { root: completionRoot(binding, reuse.value.batch), origin: reuse.value.origin, works: reuse.value.works as unknown as WorksPartBindings };
+  }
+  return null;
+}
+/**
+ * The one derivation of a reuse for its producer (`current`) and its historical reader. It throws on a broken or foreign
+ * proof and returns null when the found result simply does not fit the new root: another subject, a partial fill, an
+ * inadmissible proposal or a changed D7 task — then the root is new work.
+ */
+function reuseValue(store: Store, project: string, request: { binding: Ref; root: Ref; work: Ref; works: { producer: Ref; ledger: Ref };
+  source: CompletionReuseSource }, current: boolean): { value: CompletionReuse; guards: TransactionGuard[] } | null {
+  const binding = take(readCompletionOwnerAt(store, project, request.binding)) as Revision<CompletionOwner>;
+  if (!same(reference(binding), request.binding) || binding.value.owner.kind !== 'block')
+    fail('completion_invalid', request.binding.id, 'binding', 'Only a block attempt reuses a node expansion');
+  const before = take(readCompletionWorkAt(store, project, request.work));
+  if (before.work.value.closed || !same(reference(before.binding), reference(binding)))
+    fail('completion_invalid', request.work.id, 'work', 'A reuse stands on the open work of its binding');
+  const root = completionRootAssignments(binding).find(row => same(reference(row), request.root));
+  if (!root) fail('completion_foreign', request.root.id, 'root', 'A reuse answers a root of its own whole assignment');
+  if (rootStarted(store, binding, before, root)) fail('completion_resolved', root.id, 'root', 'A started root keeps its own work; no earlier answer replaces it');
+  const area = expansionArea(store, project, binding, root.value.batch);
+  if (!area) fail('completion_invalid', root.id, 'batch', 'Only an L3 node expansion is reused');
+  const guards: TransactionGuard[] = [];
+  // Today's D7 of the exact D1 of this plan: the authority the reused bindings receive (the packet's own basis check).
+  const basis = worksBasisAt(store, project, request.works);
+  const plan = take(readRoutes(store, { project, record: binding.value.plan.routes })).record.value.request.gaps;
+  if (!same(basis.producer.value.request.gaps.sources, plan.sources) || !same(sortedRefs(basis.producer.value.request.gaps.records), sortedRefs(plan.records)))
+    fail('completion_invalid', request.works.producer.id, 'works', 'The handoff belongs to the exact D1 of this plan');
+  if (current) {
+    const prepared = take(prepareOmObligations(store, basis.producer.value.request as never));
+    if (prepared.writes.length || !same(reference(prepared.producer), request.works.producer) || !same(reference(prepared.record), request.works.ledger))
+      fail('input_stale', request.works.producer.id, 'works', 'The complete current handoff must already be saved at the declared references');
+    guards.push(...prepared.guards);
+  }
+  // The source: a closed earlier attempt of the same block line (or of a line it continues), ended by its replaced B1.
+  const source = request.source;
+  const owner = take(readCompletionOwnerAt(store, project, source.binding)) as Revision<CompletionOwner>;
+  if (!same(reference(owner), source.binding) || owner.value.owner.kind !== 'block'
+    || (owner.value.owner as { block: string }).block !== (binding.value.owner as { block: string }).block
+    || !lineContinues(store, project, binding, owner))
+    fail('completion_foreign', source.binding.id, 'source', 'A reuse comes from an earlier attempt of the same block line');
+  const close = take(readCompletionCloseAt(store, project, source.close));
+  if (source.close.id !== completionCloseId(project, owner.id) || !same(close.binding, reference(owner)) || !same(close.work, source.work)
+    || close.claim.reason !== 'interrupted')
+    fail('completion_foreign', source.close.id, 'close', 'The source attempt is closed on its exact work and interrupted');
+  const earlier = take(readCompletionWorkAt(store, project, source.work));
+  if (!endedByArea(store, earlier))
+    fail('completion_foreign', source.work.id, 'work', 'Only an attempt ended by the replaced B1 of its area hands its results on');
+  if (!earlier.products.some(ref => same(ref, source.result)) || !earlier.resolved.some(ref => same(ref, source.root)))
+    fail('completion_foreign', source.result.id, 'result', 'The result and its resolved root belong to the exact source work');
+  const answered = resultRoot(store, project, owner, source.result);
+  if (!answered || !same(reference(answered.root), source.root))
+    fail('completion_foreign', source.result.id, 'root', 'The result is the complete assembly of exactly the named root');
+  const before3 = expansionArea(store, project, owner, answered.root.value.batch);
+  if (!before3 || !same(before3.subject, area.subject)) return null;
+  const origin = take(readPartAssembly(store, { project, record: answered.origin.assembly }));
+  if (!same(reference(origin.proposal), answered.origin.proposal)) fail('completion_foreign', answered.origin.assembly.id, 'origin', 'The origin names its exact proposal');
+  const proposal = origin.proposal.value as unknown as { level: number; worksContract?: string; fills: { obligation: string }[] };
+  if (proposal.level !== 3 || proposal.worksContract !== WORKS_FRAME_CONTRACT
+    || canonical([...new Set(proposal.fills.map(fill => fill.obligation))].sort()) !== canonical(area.open)) return null;
+  // Today's admission of the proposal to the new works frame — the historical reading never stands in for it.
+  const proof = { frame: area.source.frame, proposals: refs([...area.source.proposals, answered.origin.proposal]) };
+  const admitted = current ? prepareFrameProposals(store, proof as never) : readFrameProposals(store, proof as never);
+  if (!admitted.ok) {
+    if (admitted.refusal.code === 'input_stale') take(admitted);
+    return null;
+  }
+  const result = admitted.value.result;
+  if (result.open.some(item => area.open.includes(item.id)) || !area.open.every(id => result.fills.some(fill => fill.obligation === id
+    && fill.source === 'proposed' && same(fill.basis, answered.origin.proposal)))) return null;
+  if (current) guards.push(...(admitted.value as unknown as { guards: TransactionGuard[] }).guards);
+  // The same D7 tasks of the node, and every binding of the answer carried losslessly to today's handoff.
+  const formerBasis = worksBasisAt(store, project, answered.works);
+  const before7 = assignedTasks(before3, formerBasis), after7 = assignedTasks(area, basis);
+  if (canonical([...before7.keys()].sort()) !== canonical([...after7.keys()].sort())) return null;
+  const former = new Map(taskObligations(formerBasis.handoff).map(item => [taskBindingId(item), item]));
+  const bindings: TaskObligationBinding[] = [];
+  for (const row of answered.works.bindings) {
+    const task = former.get(row.id);
+    if (!task || row.obligation !== task.obligation || !same(row.scope, task.scope))
+      fail('completion_foreign', row.id, 'bindings', 'Every binding refers to its checked original handoff');
+    const next = after7.get(reuseAssignmentKey(task));
+    if (!next) return null;
+    bindings.push({ id: taskBindingId(next), scope: next.scope, obligation: next.obligation, consumers: row.consumers.map(item => ({ node: item.node, tests: [...item.tests] })) });
+  }
+  const value: CompletionReuse = { contract: 'om-completion-reuse/v1', project, binding: reference(binding), root: reference(root),
+    work: reference(before.work), routes: binding.value.plan.routes, batch: root.value.batch, source: { ...source }, origin: answered.origin,
+    works: { contract: WORKS_FRAME_CONTRACT, producer: request.works.producer, ledger: request.works.ledger,
+      bindings: [...bindings].sort((a, b) => canonical(a).localeCompare(canonical(b))) } };
+  return { value: JSON.parse(canonical(value)) as unknown as CompletionReuse, guards };
+}
+const sortedRefs = (rows: readonly Ref[]): Ref[] => [...rows].sort((a, b) => canonical(a).localeCompare(canonical(b)));
+/** Whether the source attempt is an earlier one of this binding's line, or of a line this line continues by its predecessors. */
+function lineContinues(store: Store, project: string, binding: Revision<CompletionOwner>, source: Revision<CompletionOwner>): boolean {
+  if (source.value.series.id === binding.value.series.id) return source.value.attempt < binding.value.attempt;
+  for (let at = take(readAnySeriesAt(store, project, binding.value.series)) as Sealed<Revision<AnyRepairSeries>>; at.value.predecessor;) {
+    at = take(readAnySeriesAt(store, project, at.value.predecessor)) as Sealed<Revision<AnyRepairSeries>>;
+    if (at.id === source.value.series.id) return true;
+  }
+  return false;
+}
+/**
+ * The candidate results for a root, in the one deterministic order: the latest closed earlier attempt of the line first,
+ * then the lines it continues; inside one attempt, its one result for this node. Contradictory results are a refusal.
+ */
+function reuseCandidates(store: Store, project: string, binding: Revision<CompletionOwner>, root: Revision<CompletionAssignment>): CompletionReuseSource[] {
+  const area = expansionArea(store, project, binding, root.value.batch);
+  if (!area) return [];
+  const lines: Sealed<Revision<AnyRepairSeries>>[] = [];
+  for (let at: Sealed<Revision<AnyRepairSeries>> | null = take(readAnySeriesAt(store, project, binding.value.series)) as Sealed<Revision<AnyRepairSeries>>; at;
+    at = at.value.predecessor ? take(readAnySeriesAt(store, project, at.value.predecessor)) as Sealed<Revision<AnyRepairSeries>> : null) lines.push(at);
+  const found: CompletionReuseSource[] = [];
+  for (const line of lines) {
+    const ordinals = line.value.attempts.map(row => row.ordinal).filter(ordinal => line.id !== binding.value.series.id || ordinal < binding.value.attempt)
+      .sort((a, b) => b - a);
+    for (const ordinal of ordinals) {
+      const owner = take(readCompletionBinding(store, project, reference(line), ordinal)) as Revision<CompletionOwner> | null;
+      const closeHead = owner ? store.get(completionCloseId(project, owner.id)) : null;
+      if (!owner || !closeHead) continue;
+      const close = take(readCompletionCloseAt(store, project, reference(closeHead)));
+      if (close.claim.reason !== 'interrupted') continue;
+      const earlier = take(readCompletionWorkAt(store, project, close.work));
+      if (!endedByArea(store, earlier)) continue;
+      const rows: CompletionReuseSource[] = [];
+      for (const ref of earlier.products) {
+        const kind = store.get(ref.id, ref.revision)?.kind;
+        if (kind !== PART_ASSEMBLY_KIND && kind !== COMPLETION_REUSE_KIND) continue;
+        const answered = resultRoot(store, project, owner, ref);
+        if (!answered || !earlier.resolved.some(item => same(item, reference(answered.root)))) continue;
+        if (expansionArea(store, project, owner, answered.root.value.batch)?.node !== area.node) continue;
+        rows.push({ binding: reference(owner), close: reference(closeHead), work: close.work, root: reference(answered.root), result: ref });
+      }
+      if (rows.length > 1) fail('completion_conflict', owner.id, 'results', 'One original assignment holds contradictory results for this node');
+      found.push(...rows);
+    }
+  }
+  return found;
+}
+export function readCompletionReuseAt(store: Store, project: string, ref: Ref): ModelCallResult<Sealed<Revision<CompletionReuse>>> {
+  return result(() => historicalRead(store, { reader: 'G7.completion-reuse', project, ref }, () => {
+    const record = take(readRecord<CompletionReuse>(store, ref, { unit: 'G7', target: ref.id,
+      kind: COMPLETION_REUSE_KIND, idPrefix: `${COMPLETION_REUSE_KIND}:${project}:` }));
+    const value = record.value;
+    if (!object(value) || record.revision !== 1 || value.contract !== 'om-completion-reuse/v1' || value.project !== project
+      || !isRef(value.binding) || !isRef(value.root) || !isRef(value.work) || !object(value.source) || !object(value.works)
+      || !(['binding', 'close', 'work', 'root', 'result'] as const).every(key => isRef(value.source[key]))
+      || !isRef(value.works.producer) || !isRef(value.works.ledger)
+      || record.id !== completionReuseId(project, value.binding.id, value.root.id))
+      fail('completion_invalid', ref.id, 'reuse', 'A reuse keeps its exact contract, identity and proof references');
+    const derived = reuseValue(store, project, { binding: value.binding, root: value.root, work: value.work,
+      works: { producer: value.works.producer, ledger: value.works.ledger }, source: value.source }, false);
+    if (!derived || !same(value, derived.value)) fail('completion_invalid', ref.id, 'reuse', 'The reuse must equal the common exact derivation');
+    return record as Revision<CompletionReuse>;
+  }, () => fail('completion_invalid', ref.id, 'history', 'A reuse cannot prove itself')));
+}
+/**
+ * The reuse producer for one unstarted L3 root: the first fitting result of the deterministic candidates, admitted today,
+ * written with its registration in one guarded transaction; no fitting result is `null` — the root is new work.
+ */
+export function prepareCompletionReuse(store: Store, request: { project: string; binding: Ref; root: Ref; works: { producer: Ref; ledger: Ref } }): ModelCallResult<Sealed<{
+  record: Revision<CompletionReuse> | null; writes: Write[]; guards: TransactionGuard[];
+}>> {
+  return result(() => {
+    const project = request.project;
+    const binding = take(readCompletionOwnerAt(store, project, request.binding)) as Revision<CompletionOwner>;
+    const id = completionReuseId(project, binding.id, request.root.id), prior = store.get(id);
+    if (prior) return { record: take(readCompletionReuseAt(store, project, reference(prior))), writes: [], guards: [] };
+    const head = store.get<CompletionWork>(completionWorkId(project, binding.id));
+    if (!head) fail('completion_invalid', binding.id, 'work', 'A managed binding keeps its work registry');
+    if (head.value.closed) fail('completion_closed', head.id, 'work', 'Closed work accepts only exact historical repeats');
+    const root = completionRootAssignments(binding).find(row => same(reference(row), request.root));
+    if (!root) fail('completion_foreign', request.root.id, 'root', 'A reuse answers a root of its own whole assignment');
+    for (const source of reuseCandidates(store, project, binding, root)) {
+      const derived = reuseValue(store, project, { binding: reference(binding), root: request.root, work: reference(head), works: request.works, source }, true);
+      if (!derived) continue;
+      const value = derived.value;
+      const write: Write = { id, kind: COMPLETION_REUSE_KIND, expected: 0, value: value as unknown as Json };
+      const record: Revision<CompletionReuse> = { id, kind: COMPLETION_REUSE_KIND, revision: 1, hash: hashJson(value), value };
+      const completion = take(prepareCompletionProducts(pendingCallStore(store, [write]), reference(binding), [reference(record)]));
+      const writes = [write, ...completion.writes];
+      return { record, writes, guards: uniqueTransactionGuards([...derived.guards, ...completion.guards].filter(guard => !isRef(guard)
+        || !writes.some(row => same(writeRef(row), guard)))) };
+    }
+    return { record: null, writes: [], guards: [] };
+  });
+}
+export function writeCompletionReuse(store: Store, request: { project: string; binding: Ref; root: Ref; works: { producer: Ref; ledger: Ref } }): ModelCallResult<Sealed<Revision<CompletionReuse>>> {
+  return result(() => {
+    const prepared = take(prepareCompletionReuse(store, request));
+    if (!prepared.record) fail('completion_invalid', request.root.id, 'reuse', 'No earlier complete result fits this root; it is new work');
+    if (prepared.writes.length) take(writeGuarded(store, { unit: 'G7', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+    return prepared.record as Revision<CompletionReuse>;
+  });
+}
+/** The reused result as a checked L3 model source: the origin proposal with the bindings carried to today's handoff. */
+export function readReuseResult(store: Store, request: { project: string; record: Ref }): ModelCallResult<Sealed<{
+  record: Revision<CompletionReuse>; proposal: Revision<LayerProposal>; references: Ref[];
+}>> {
+  return result(() => {
+    const reuse = take(readCompletionReuseAt(store, request.project, request.record));
+    const origin = take(readPartAssembly(store, { project: request.project, record: reuse.value.origin.assembly }));
+    return { record: reuse as Revision<CompletionReuse>, proposal: origin.proposal as Revision<LayerProposal>,
+      references: refs([request.record, reuse.value.origin.assembly, reuse.value.origin.proposal, ...origin.references]) };
   });
 }
 
@@ -4212,6 +4809,15 @@ function checkCompletionTransition(store: Store, before: Sealed<CompletionSnapsh
       const ceased = take(readCompletionCessationAt(store, project, ref));
       if (!same(ceased.value.work, reference(before.work)))
         fail('completion_invalid', ref.id, 'work', 'A cessation is atomic with its immediately succeeding registry');
+    } else if (record.kind === COMPLETION_FINALIZATION_KIND) {
+      const finalized = take(readCompletionFinalizationAt(store, project, ref));
+      if (!same(finalized.value.work, reference(before.work)))
+        fail('completion_invalid', ref.id, 'work', 'A finalization is atomic with its immediately succeeding registry');
+    } else if (record.kind === COMPLETION_REUSE_KIND) {
+      const reuse = take(readCompletionReuseAt(store, project, ref));
+      if (!same(reuse.value.work, reference(before.work)))
+        fail('completion_invalid', ref.id, 'work', 'A reuse is atomic with its immediately succeeding registry');
+      take(checkCompletionDisposition(store, before, { batch: reuse.value.batch, assignment: reuse.value.root, action: 'materialize' }));
     } else if (record.kind === 'om-assessment-result') {
       const result = take(readAssessmentTerminalAt(store, project, ref));
       const intent = take(readAssessmentIntentAt(store, project, result.value.intent));

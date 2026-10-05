@@ -1459,10 +1459,13 @@ test("6 C54 H1 a lawfully changed required condition of an unfinished assignment
   const refused = await drive(f, request, 5);
   assert.deepEqual(refused.performed, ["packet"]);
   assert.equal(refused.wait.code, "input_stale");
-  const driven = await drive(f, request, 20);
-  assert.ok(driven.performed.includes("cease"), `${driven.performed.join(",")} ${JSON.stringify(driven.wait)}`);
+  // LP5 (№3278 rows 2, 6, 13): the replaced B1 of the area also ends the registered check, so the attempt closes by the
+  // common G7 instead of waiting on its stale check; the bases of the new B1 come next.
+  const driven = await driveTo(f, request, "close", 20);
+  assert.deepEqual(driven.performed, ["cease", "cease-check", "close"], JSON.stringify(driven.wait));
   assert.equal(f.sent().length, sends, "The ended assignment is never sent");
   assert.ok(f.store.list().some(row => row.kind === "om-completion-cessation"), "The proved cessation is its own record");
+  assert.equal(blockSeries(f).value.attempts[0]!.outcome!.reason, "interrupted");
 });
 
 test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothing: the line's work on today's question goes on", async t => {
@@ -3142,4 +3145,314 @@ test("MP2 №3153: through the pass in a second attempt, standing on the non-emp
   assert.notDeepEqual(reference(f.store.get(correction.value.journal!.id)!), correction.value.journal, "The refusal moved the head");
   assert.equal(lp4Sent(f, reference(correction)), 1, "The correction is sent once");
   assert.equal(f.sent().length, steps.length, "Every scripted answer was asked for exactly once, nothing twice");
+});
+
+// ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
+import { AREA_INPUT_VARIANT, COMPLETION_FINALIZATION_KIND, COMPLETION_REUSE_KIND, prepareCompletionFinalization, prepareCompletionReuse, readCompletionCessationAt, readCompletionFinalizationAt, writeCompletionFinalization, writeCompletionReuse, type CompletionCessation, type CompletionFinalization, type CompletionReuse } from "../src/om/model-call.js";
+import type { WorksAcceptanceRecord } from "../src/om/atomic-gate.js";
+/** A lawful new B1 by G1 (the writeOmInput writer): the repository inventory D1 asked for is recorded (or its paths change) and the input refreshed. */
+function lp5ReplaceB1(f: WorksRun, paths: string[] = []): Ref {
+  const before = f.store.get(`om-input:${project}`)!, id = `repo-inventory:${project}`, old = f.store.get<{ paths: string[] }>(id);
+  const inventory = old && JSON.stringify(old.value.paths) === JSON.stringify(paths) ? old
+    : f.store.write({ id, kind: "repo-inventory", expected: old?.revision ?? 0, value: { projectId: project, paths } });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  return reference(ok(writeOmInput(f.store, { project, stages, inventory: reference(inventory), expected: before.revision })));
+}
+const lp5Kind = <T = Json>(f: WorksRun, kind: string): Revision<T>[] => f.store.list<T>(kind);
+
+test("LP5 (№3278 rows 2, 6, 7, 9, 13, 14, 18, 20, 23) through the pass on a new Store after every transaction: a B1 replaced by G1 while a works attempt is open ends its remaining work by its own products, the attempt closes by the common G7, the bases of the new B1 are built and the paid complete assemblies answer their roots again — never a wait, never a second send of a paid answer, one common C4/G5 of reused and new results", async t => {
+  for (const moment of ["after the first root", "after the check", "after the acceptance"] as const) await t.test(moment, async t => {
+    const f = worksFixture(t);
+    const scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>(), trail: string[] = [];
+    let replaced: Ref | null = null;
+    const line = () => blockSeries(f as unknown as Fixture, "garden-produce-block")?.value ?? null;
+    const done = () => moment === "after the acceptance" ? !!line()?.attempts[0]?.outcome && (line()!.attempts[0]!.outcome!.reason === "result" || !!line()?.attempts[1]?.outcome)
+      : !!line()?.attempts[1]?.outcome;
+    ok(startRun(f.store, { project }));
+    for (let index = 0; index < 300 && !done(); index++) {
+      f.restart();
+      const advanced = ok(await advanceRun(f.store, f.request));
+      const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref }; attempt: number | null } };
+      const performed = advanced.performed?.action ?? "";
+      trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${performed}${state.phase === "step" ? `>${state.step!.action}#${state.step!.attempt}` : ""}`);
+      assert.ok(state.phase === "step" || state.phase === "ready", trail.join(","));
+      if (!replaced && (moment === "after the first root" && performed === "cycle" || moment === "after the check" && performed === "evaluate"
+        || moment === "after the acceptance" && performed === "works")) replaced = lp5ReplaceB1(f);
+      if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
+      answered.add(state.step!.request.packet.id);
+      steps.push({ research: mp2WorkAnswer(f, state.step!.request.packet).research, usage });
+      writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+    }
+    assert.ok(replaced && done(), trail.join(","));
+    t.diagnostic(trail.join(","));
+    const [first, second] = line()!.attempts;
+    const packets = f.store.list<QuestionPacketRecord>("question-packet");
+    // The produce block's own packets of the new attempt: the reused roots get none, every other root one, sent once.
+    const produced = (ordinal: number) => packets.filter(row => row.value.request.attempt?.series.id === blockSeries(f as unknown as Fixture, "garden-produce-block").id
+      && row.value.request.attempt.ordinal === ordinal && row.value.state === "ready");
+    for (const packet of packets.filter(row => row.value.state === "ready")) assert.ok(lp4Sent(f, reference(packet)) <= 1, "A paid answer is never sent again");
+    assert.equal(f.sent().length, steps.length, "Every scripted answer was asked for exactly once");
+    const reuses = lp5Kind<CompletionReuse>(f, COMPLETION_REUSE_KIND);
+    if (moment === "after the acceptance") {
+      // Rows 9, 10: the acceptance stays; either the confirmation is completed by D2 and the attempt keeps its result, or the
+      // remainder of the confirmation alone is ended — the accepted frame is never ceased and no closure is made up.
+      const finalized = lp5Kind(f, COMPLETION_FINALIZATION_KIND);
+      if (finalized.length) assert.deepEqual([first!.outcome!.reason, (finalized[0]!.value as { phase: string }).phase], ["interrupted", "confirmation"]);
+      else assert.equal(first!.outcome!.reason, "result", "Row 9: the accepted goal is confirmed on the new bases");
+      assert.equal(reuses.length, finalized.length ? reuses.length : 0);
+      return;
+    }
+    assert.equal(first!.outcome!.reason, "interrupted", "The old attempt ends without a verdict");
+    assert.equal(second!.outcome!.reason, "result", "The next attempt reaches its result");
+    const cessations = lp5Kind<CompletionCessation>(f, "om-completion-cessation");
+    if (moment === "after the first root") {
+      // Rows 2, 6: the unsent second root by LP4, the registered check by its area's replaced B1 (a variant of its own era).
+      assert.ok(cessations.some(row => row.value.disposition !== "check-ceased" && row.value.cause.kind === "required-record-replaced"), "Row 2");
+      const check = cessations.find(row => row.value.disposition === "check-ceased")!;
+      assert.deepEqual([check.value.cause.kind, check.value.variant, (check.value.cause as { replacement: Ref }).replacement], ["required-record-replaced", AREA_INPUT_VARIANT, replaced], "Row 6");
+      assert.equal(reuses.length, 1, "Row 14: the paid first root answers again");
+      assert.deepEqual(produced(2).map(row => lp4Sent(f, reference(row))), [1], "Row 18: only the unsent second root is asked, once, in the new attempt");
+      // Row 20: the second root of the new attempt sees its reused neighbour by the exact reuse.
+      const later = packets.filter(row => row.value.request.attempt?.ordinal === 2 && row.value.state === "ready");
+      assert.ok(later.some(row => (row.value as unknown as { briefNeighbors?: { sources: { reuse?: Ref }[] } }).briefNeighbors?.sources
+        .some(source => source.reuse?.id === reuses[0]!.id)), "Row 20: the neighbour form names the reuse");
+    } else {
+      // Row 7: the complete check keeps its evaluation; only the remaining acceptance ends.
+      const finalized = lp5Kind(f, COMPLETION_FINALIZATION_KIND);
+      assert.deepEqual(finalized.map(row => (row.value as { phase: string }).phase), ["acceptance"]);
+      // Row 7: the check is complete without a pass (the full G4b still waits for the group's works) and no C5 exists.
+      const evaluation = (finalized[0]!.value as unknown as { evaluation: Ref }).evaluation;
+      const gate = f.store.get<{ gate: Ref }>(evaluation.id, evaluation.revision)!.value.gate;
+      assert.equal(f.store.get<{ result: { passed: boolean } }>(gate.id, gate.revision)!.value.result.passed, false, "Row 7");
+      assert.ok(!cessations.some(row => row.value.disposition === "check-ceased"), "A complete check is never ceased");
+      assert.equal(reuses.length, 2, "Row 14: both paid roots answer again");
+      assert.deepEqual(produced(2), [], "No root of the new attempt is asked: 0 new E1, calls or expense");
+    }
+    for (const reuse of reuses) assert.equal(reuse.value.binding.id === reuse.value.source.binding.id, false, "A reuse answers a later attempt");
+    // Row 18: the one common C4/G5 of the new attempt takes the reuses themselves, beside the new assemblies.
+    const acceptance = lp5Kind<WorksAcceptanceRecord>(f, "om-works-acceptance").find(row => row.value.acceptance);
+    assert.ok(acceptance, "G5 accepts the works of the new attempt");
+    assert.deepEqual(acceptance!.value.request.results.filter(row => row.kind === "reuse").map(row => row.record).sort((a, b) => a.id.localeCompare(b.id)),
+      reuses.map(row => reference(row)).sort((a, b) => a.id.localeCompare(b.id)));
+  });
+});
+
+import { completionRootAssignments } from "../src/om/series.js";
+import { writeGuarded } from "../src/om/refs.js";
+type Lp5State = { phase: string; wait?: { code: string }; step?: { action: string; request: Record<string, unknown> & { packet?: Ref }; series?: string | null; attempt: number | null } };
+/** The pass on a new Store after every transaction, every new cycle answered with the work of its operation; `hook` sees each state. */
+async function lp5Pass(f: WorksRun, hook: (state: Lp5State, performed: string) => Promise<"stop" | void> | "stop" | void, bound = 300) {
+  const scenario = join(f.root, "scenario.json"), steps: unknown[] = existsSync(scenario) ? (JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps : [];
+  const answered = new Set(f.store.list<{ om?: { request: { packet: Ref } } }>("model-call").map(row => row.value.om?.request.packet.id ?? "")), trail: string[] = [];
+  for (let index = 0; index < bound; index++) {
+    f.restart();
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as Lp5State, performed = advanced.performed?.action ?? "";
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${performed}${state.phase === "step" ? `>${state.step!.action}#${state.step!.attempt}` : ""}`);
+    assert.ok(state.phase === "step" || state.phase === "ready", trail.join(","));
+    if (await hook(state, performed) === "stop") return trail;
+    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
+    answered.add(state.step!.request.packet.id);
+    steps.push({ research: mp2WorkAnswer(f, state.step!.request.packet).research, usage });
+    writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+  }
+  return assert.fail(`The pass did not reach the awaited state: ${trail.join(",")}`);
+}
+
+test("LP5 (№3278 rows 8, 9, 10, 11, 15, 19, 22, 23, 24; §3; return №3294 п.1–2) the producers of the transition on the pass's own states: an accepted goal whose D2 is still admissible keeps its acceptance and its confirmation, its own reuses included, and only a superseded graph or frame ends its confirmation; a passed check whose C5 is not made ends its remaining acceptance all the same; through a second replacement a reuse is admitted again from the earlier reuse, its origin the first assembly; a reuse refuses a foreign D7 and finds nothing for another operation; a work moved between preparation and writing refuses the prepared reuse without a partial write; a loss after the reuse is written repeats it exactly; an accepted goal keeps its acceptance — only its confirmation remainder ends, and nothing ends once D2 confirmed it", async t => {
+  await t.test("the reuse", async t => {
+    const f = worksFixture(t);
+    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+    let replaced = false, reuse: Record<string, unknown> | null = null;
+    ok(startRun(f.store, { project }));
+    await lp5Pass(f, (state, performed) => {
+      if (!replaced && performed === "cycle") { lp5ReplaceB1(f); replaced = true; }
+      if (state.phase === "step" && state.step!.action === "reuse") { reuse = state.step!.request; return "stop"; }
+    });
+    const request = reuse! as { project: string; binding: Ref; root: Ref; works: { producer: Ref; ledger: Ref } };
+    const binding = ok(readCompletionBinding(f.store, project, reference(produce()), 2))!;
+    const first = f.store.list<QuestionPacketRecord>("question-packet").find(row => row.value.request.attempt?.ordinal === 1 && row.value.state === "ready")!;
+    // Row 19: the D7 of the old area is never taken for today's.
+    const foreign = prepareCompletionReuse(f.store, { ...request, works: first.value.request.works! });
+    assert.equal(foreign.ok, false, "An old D7 is no basis of a reuse");
+    // Row 15: another operation of the attempt finds no paid result of its own.
+    const other = completionRootAssignments(binding).find(row => row.id !== request.root.id)!;
+    assert.equal(ok(prepareCompletionReuse(f.store, { ...request, root: reference(other) })).record, null);
+    // Rows 22, 24: the work moves between the preparation and the write — the prepared reuse refuses as a whole.
+    const prepared = ok(prepareCompletionReuse(f.store, request));
+    assert.ok(prepared.record && prepared.writes.length);
+    ok(writeQuestionPacket(f.store, { project, routes: binding.value.plan.routes, batch: other.value.batch, environment: f.request.dispatch.config,
+      attempt: { series: reference(produce()), ordinal: 2 }, previous: [], works: request.works }));
+    const stored = f.store.list().map(reference);
+    assert.equal(writeGuarded(f.store, { unit: "G7", target: prepared.record!.id, writes: [...prepared.writes], guards: [...prepared.guards] }).ok, false);
+    assert.deepEqual(f.store.list().map(reference), stored, "Nothing of it is written");
+    // Row 23: the reuse written by its producer and the pass lost before its cursor moved — the same saved step repeats it.
+    const saved = ok(writeCompletionReuse(f.store, request));
+    f.restart();
+    const repeated = ok(await advanceRun(f.store, f.request));
+    assert.deepEqual([repeated.performed?.action, f.store.list<CompletionReuse>(COMPLETION_REUSE_KIND).map(reference)], ["reuse", [reference(saved)]]);
+    await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
+    assert.equal(produce().value.attempts[1]!.outcome!.reason, "result");
+    for (const packet of f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.state === "ready"))
+      assert.ok(lp4Sent(f, reference(packet)) <= 1, "Nothing paid is sent again");
+  });
+  await t.test("the confirmation", async t => {
+    const f = worksFixture(t);
+    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+    ok(startRun(f.store, { project }));
+    await lp5Pass(f, (_state, performed) => performed === "works" ? "stop" : undefined);
+    lp5ReplaceB1(f);
+    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 1))!);
+    // Row 9 (return №3294 п.1): the real acceptance stays, and with its accepted frame and graph still the heads D2 is
+    // admissible on the new B1 — neither the acceptance nor its confirmation may end.
+    const acceptance = prepareCompletionFinalization(f.store, { project, binding, phase: "acceptance" });
+    assert.deepEqual(acceptance.ok ? "ended" : acceptance.refusal.code, "completion_resolved");
+    const confirmation = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
+    assert.deepEqual(confirmation.ok ? "ended" : [confirmation.refusal.code, confirmation.refusal.at.field], ["completion_cause_unproved", "confirmation"]);
+    // The same pass confirms the goal on its new bases (the reviewer's probe №3294 п.1); row 11: once D2 confirmed it,
+    // nothing of it ends any more.
+    await lp5Pass(f, () => produce()?.value.attempts[0]?.outcome ? "stop" : undefined);
+    assert.equal(produce().value.attempts[0]!.outcome!.reason, "result");
+    assert.equal(lp5Kind(f, COMPLETION_FINALIZATION_KIND).length, 0, "Nothing of the accepted goal was ended");
+    const late = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
+    assert.ok(!late.ok && ["completion_resolved", "completion_closed"].includes(late.refusal.code), late.ok ? "ended" : late.refusal.code);
+  });
+  await t.test("a superseded graph", async t => {
+    const f = worksFixture(t);
+    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+    ok(startRun(f.store, { project }));
+    await lp5Pass(f, (_state, performed) => performed === "works" ? "stop" : undefined);
+    lp5ReplaceB1(f);
+    // Row 10 (return №3294 п.1): the owner saves the map again (save-graph), so the graph the works were accepted on is no
+    // longer the head: the machine D1 can never stand on this acceptance again and its D2 is proved impossible.
+    const head = f.store.get<Graph>(`graph:${project}`)!;
+    f.engine.graphs.save(project, head.value, head.revision, "lp5-owner");
+    const moved = reference(f.store.get(`graph:${project}`)!), frame = reference(f.store.get(`om-frame:${project}:3`)!);
+    assert.equal(moved.revision, head.revision + 1);
+    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 1))!);
+    const accepted = f.store.list<WorksAcceptanceRecord>("om-works-acceptance").find(row => row.value.acceptance)!;
+    const prepared = ok(prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" }));
+    assert.deepEqual([prepared.record.value.accepted, prepared.record.value.basis], [accepted.value.acceptance!.frame, { frame, graph: moved }]);
+    assert.ok(prepared.guards.some(guard => JSON.stringify(guard) === JSON.stringify(moved)), "The superseding graph head is guarded");
+    // A ground that moves between the preparation and the write refuses the whole write: nothing is written.
+    f.engine.graphs.save(project, f.store.get<Graph>(`graph:${project}`)!.value, moved.revision, "lp5-owner-race");
+    const raced = writeGuarded(f.store, { unit: "G7", target: prepared.record.id, writes: [...prepared.writes], guards: [...prepared.guards] });
+    assert.equal(raced.ok, false);
+    assert.ok(!f.store.get(prepared.record.id), "Nothing is written");
+    const latest = reference(f.store.get(`graph:${project}`)!);
+    // The pass ends exactly that remainder by the same derivation, on today's ground: the acceptance stays, interrupted.
+    await lp5Pass(f, () => produce()?.value.attempts[0]?.outcome ? "stop" : undefined);
+    assert.equal(produce().value.attempts[0]!.outcome!.reason, "interrupted");
+    const ended = lp5Kind<CompletionFinalization>(f, COMPLETION_FINALIZATION_KIND).find(row => row.value.binding.id === binding.id)!;
+    assert.deepEqual([ended.value.phase, ended.value.accepted, ended.value.basis], ["confirmation", accepted.value.acceptance!.frame, { frame, graph: latest }]);
+    assert.ok(f.store.get(accepted.id), "The real acceptance is kept");
+    // Its reader proves the saved ground at its exact references after a restart and a later graph.
+    const later = f.store.get<Graph>(`graph:${project}`)!;
+    f.engine.graphs.save(project, later.value, later.revision, "lp5-owner-2");
+    f.restart();
+    assert.deepEqual(ok(readCompletionFinalizationAt(f.store, project, reference(ended))), ended);
+  });
+  await t.test("accepted reuses", async t => {
+    const f = worksFixture(t);
+    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+    ok(startRun(f.store, { project }));
+    // The first B1 after the check of attempt 1; attempt 2 answers both its roots by reuse and reaches the real C5.
+    let replaced = false;
+    await lp5Pass(f, (_state, performed) => {
+      if (!replaced && performed === "evaluate") { lp5ReplaceB1(f); replaced = true; }
+      else if (replaced && performed === "works") return "stop";
+    });
+    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 2))!);
+    const accepted = f.store.list<WorksAcceptanceRecord>("om-works-acceptance").find(row => row.value.acceptance)!;
+    assert.equal(accepted.value.request.results.filter(row => row.kind === "reuse").length, 2, "The real C5 took both reuses");
+    lp5ReplaceB1(f, ["src"]);
+    // Return №3294 п.2 (the reviewer's probe): the acceptance of the reuses is the attempt's own — never declared absent,
+    // and its confirmation is no remainder while D2 is admissible.
+    const acceptance = prepareCompletionFinalization(f.store, { project, binding, phase: "acceptance" });
+    assert.deepEqual(acceptance.ok ? "ended" : [acceptance.refusal.code, acceptance.refusal.at.ref], ["completion_resolved", accepted.value.acceptance!.frame]);
+    const confirmation = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
+    assert.deepEqual(confirmation.ok ? "ended" : confirmation.refusal.code, "completion_cause_unproved");
+    await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
+    assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "result"]);
+  });
+  await t.test("a passed check", async t => {
+    const f = worksFixture(t);
+    ok(startRun(f.store, { project }));
+    // The full G4b of the group passed: C5 is chosen, not yet made, by the attempt whose current check passed (№1749 п.3),
+    // when the B1 of the area is replaced.
+    const chosen: { series?: string; attempt?: number } = {};
+    await lp5Pass(f, state => {
+      if (state.phase !== "step" || state.step!.action !== "works") return;
+      chosen.series = state.step!.series!; chosen.attempt = state.step!.attempt!;
+      return "stop";
+    });
+    lp5ReplaceB1(f);
+    const line = () => f.store.get<RepairSeries>(chosen.series!)!.value.attempts.find(row => row.ordinal === chosen.attempt)!;
+    const binding = reference(ok(readCompletionBinding(f.store, project, reference(f.store.get(chosen.series!)!), chosen.attempt!))!);
+    // Row 8: the old pass gives no current C5; the remaining acceptance ends exactly as after a check that did not pass.
+    const ended = ok(writeCompletionFinalization(f.store, { project, binding, phase: "acceptance" }));
+    const gate = f.store.get<{ gate: Ref }>(ended.value.evaluation.id, ended.value.evaluation.revision)!.value.gate;
+    assert.equal(f.store.get<{ result: { passed: boolean } }>(gate.id, gate.revision)!.value.result.passed, true);
+    // The chosen C5 stands on the replaced B1 and is refused by its own producer; the attempt closes by the common G7.
+    const trail: string[] = [];
+    for (let index = 0; index < 20 && !line().outcome; index++) {
+      f.restart();
+      const advanced = ok(await advanceRun(f.store, f.request)), state = advanced.record.value.state as unknown as Lp5State;
+      trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    }
+    assert.equal(line().outcome?.reason, "interrupted", trail.join(","));
+    assert.equal(f.store.list<WorksAcceptanceRecord>("om-works-acceptance").some(row => row.value.acceptance), false, "No C5 is made on the replaced B1");
+  });
+  await t.test("a second replacement", async t => {
+    const f = worksFixture(t);
+    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+    const reuses = () => lp5Kind<CompletionReuse>(f, COMPLETION_REUSE_KIND);
+    ok(startRun(f.store, { project }));
+    // The first B1 after the check of attempt 1; the second once attempt 2 holds the reuses of both its roots.
+    let replaced = 0;
+    await lp5Pass(f, (_state, performed) => {
+      if (replaced === 0 && performed === "evaluate") { lp5ReplaceB1(f); replaced = 1; }
+      else if (replaced === 1 && performed === "reuse" && reuses().length === 2) { lp5ReplaceB1(f, ["src"]); replaced = 2; }
+      return produce()?.value.attempts[2]?.outcome ? "stop" : undefined;
+    });
+    assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "interrupted", "result"]);
+    // §3: through several replacements the origin stays the first complete assembly; each admission is its own.
+    const bindingOf = (ordinal: number) => ok(readCompletionBinding(f.store, project, reference(produce()), ordinal))!.id;
+    const second = reuses().filter(row => row.value.binding.id === bindingOf(2)), third = reuses().filter(row => row.value.binding.id === bindingOf(3));
+    assert.deepEqual([second.length, third.length], [2, 2], "Both roots answered again after each replacement");
+    for (const row of third) {
+      const source = second.find(item => item.id === row.value.source.result.id && item.revision === row.value.source.result.revision);
+      assert.ok(source, "The third admission stands on the second attempt's own reuse");
+      assert.deepEqual(row.value.origin, source!.value.origin, "The origin stays the first complete assembly");
+      assert.notDeepEqual(row.value.works, source!.value.works, "Its bindings are carried to today's handoff again");
+    }
+    for (const packet of f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.state === "ready"))
+      assert.ok(lp4Sent(f, reference(packet)) <= 1, "A paid answer is never sent again");
+  });
+});
+
+const LP5_BASE_COMMIT = "febbee2cf8187e1c230eec325e183fc8203e06ae";
+test("LP5 (№3278 §4, rows 13, 21) era: febbee2c, run from Git in its own process on the B1 replaced under its open works attempt, ends the unsent root by LP4 and stands on input_stale; the new code reads its records as they are and continues that very open work — the check ceased, the attempt closed, the new bases built, the paid root answered by its reuse", async t => {
+  const f = worksFixture(t);
+  const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
+  ok(startRun(f.store, { project }));
+  await lp5Pass(f, (_state, performed) => performed === "cycle" ? "stop" : undefined);
+  lp5ReplaceB1(f);
+  const stood = atCommit(f, LP5_BASE_COMMIT, "lp5-base", `const { advanceRun } = await import(src('om/run.js'));
+const trail = [];
+for (let index = 0; index < 20; index++) {
+  const advanced = take(await advanceRun(store, args.request)), state = advanced.record.value.state;
+  trail.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code + ':' + state.wait.target : state.phase + ':' + (advanced.performed?.action ?? ''));
+  if (state.phase === 'waiting') break;
+}
+out(trail);`, { request: f.request }) as string[];
+  assert.equal(stood.at(-1), `waiting:input_stale:om-input:${project}`, `The base stands on the replaced B1: ${stood.join(",")}`);
+  f.restart();
+  const ceased = f.store.list<CompletionCessation>("om-completion-cessation");
+  assert.deepEqual(ceased.map(row => [row.value.disposition, row.value.cause.kind]), [["branch-ceased", "required-record-replaced"]], "The base ended the unsent root by LP4");
+  assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(ceased[0]!))), ceased[0], "Its record reads as it is");
+  const trail = await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
+  assert.ok(trail.some(row => row.endsWith(">cease-check#1")) && trail.some(row => row.endsWith(">reuse#2")), trail.join(","));
+  assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "result"]);
+  assert.equal(f.store.list(COMPLETION_REUSE_KIND).length, 1);
 });

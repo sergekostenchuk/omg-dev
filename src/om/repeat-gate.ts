@@ -1921,9 +1921,10 @@ function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
   else {
     // Null is historical evidence only for a complete never-dispatched composition.
     // Every product is already proved by the work reader; no present-day enumeration is used here.
-    // The registered check and its G4b records are non-physical products (№1616 п.3): they need no E1 row.
+    // The registered check and its G4b records are non-physical products (№1616 п.3): they need no E1 row. So is the
+    // LP5 end of a remaining acceptance or confirmation (return №3294 п.3); a reuse is not: it answers by paid work.
     if (snapshot.products.some(ref => { const record = store.get(ref.id, ref.revision)!;
-      return !['question-packet', 'om-completion-packet', 'om-completion-cessation'].includes(record.kind)
+      return !['question-packet', 'om-completion-packet', 'om-completion-cessation', 'om-completion-finalization'].includes(record.kind)
         && !answersProduct(input.project, ref, record); })
       || !snapshot.cessations.length || snapshot.cessations.some(row => row.value.call !== null
         || row.value.ledger !== null || row.value.physical !== null))

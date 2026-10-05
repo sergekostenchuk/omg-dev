@@ -15,7 +15,7 @@ import { historicalRead, readOmInput, withHistoricalReads, type OmInputRecord } 
 import { readPartAssembly, readModelCallState, readModelTransport, readCompletionWorkAt, prepareCompletionProducts, readModelCycle,
   readManagedModelDiagnostic,
   pendingCallStore, readCompletionCause, prepareCompletionCause, readCompletionCessationAt, completionCessationId,
-  COMPLETION_CESSATION_KIND, type CompletionCause, type CompletionCessation, type CompletionSnapshot } from './model-call.js';
+  COMPLETION_CESSATION_KIND, AREA_INPUT_VARIANT, COMPLETION_REUSE_KIND, readReuseResult, type CompletionCause, type CompletionCessation, type CompletionSnapshot } from './model-call.js';
 import { answersGateAssignment, completionWorkId, readCompletionBinding, readCompletionOwnerAt, readAnswersGateAssignmentAt, type AnswersGateAssignment,
   type AttemptGoal, type CompletionOwner, type CompletionWork } from './series.js';
 import { UNIT_REFUSAL_KIND, answersSourceMarks, journalId, prepareJournalBatch, readJournalAt, registerAnswersSourceReader,
@@ -76,7 +76,7 @@ export const ANSWERS_GATE_SOURCE_ROLES = sealed([
   'model-call', 'call', 'packet-routes', 'response', 'diagnostic', 'transport', 'terminal', 'intent', 'question',
   'accepted', 'binding', 'assignment', 'work', 'receipt', 'observed-source', 'prerequisite', 'replacement',
   'replacement-proof', 'appeared', 'appeared-graph', 'admission-series', 'admission-pointer', 'admission-applied',
-  'admission-current', 'cycle', 'ceased-step', 'ceased-work',
+  'admission-current', 'cycle', 'ceased-step', 'ceased-work', 'reuse',
 ] as const);
 export type AnswersGateSourceRole = typeof ANSWERS_GATE_SOURCE_ROLES[number];
 // Every violated condition of a composite emission point, so one emitted finding keeps all of its checked causes.
@@ -504,6 +504,8 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
   }
   if (row.result.id.startsWith(`om-model-cycle:${request.project}:`))
     return mc2Terminal(store, request, row, gap, current, guards, references, traced);
+  if (row.result.id.startsWith(`${COMPLETION_REUSE_KIND}:${request.project}:`))
+    return reusedResult(store, request, row, gap, current, guards, references, traced);
   if (!row.result.id.startsWith(`om-part-assembly:${request.project}:`)) {
     const known = proveOfferedRecord(store, request.project, row.result);
     return traced(known ? 'design-known-foreign' : 'design-unrecognized', finding(known ? 'record_foreign' : 'route_result_unsupported',
@@ -586,6 +588,45 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
     }
   } else return traced('batch-level-foreign', finding('answer_route_foreign', target, 'batch',
     'A node proposal needs a level-two or level-three MC2 batch'), assembled, { level: batch.level });
+  return null;
+}
+/**
+ * LP5 (№3278 §3): a reuse answers an L3 obligation of a later attempt. The reuse, read by its common reader, names this
+ * exact current batch and routed gap, and its origin proposal fills the obligation in the current works frame — admitted
+ * today for a current check. The old assembly is never a result of the new attempt by itself.
+ */
+function reusedResult(store: Store, request: AnswersGateRequest, row: AnswerRouteResult, gap: Gap, current: boolean,
+  guards: TransactionGuard[], references: Ref[], traced: Traced): AnswersGateTraceEntry | null {
+  const target = gap.target, ref = row.result!;
+  const read = take(readReuseResult(store, { project: request.project, record: ref })), reuse = read.record.value;
+  const cited = [cite('reuse', ref), cite('assembly', reuse.origin.assembly), cite('proposal', reuse.origin.proposal)];
+  const batch = take(readRoutes(store, { project: request.project, record: request.routes })).record.value.batches.find(item => item.id === reuse.batch);
+  const own = take(readRoutes(store, { project: request.project, record: reuse.routes })).record.value.batches.find(item => item.id === reuse.batch);
+  if (!batch || !own || !same(own, batch) || batch.task !== 'node-expansion' || batch.level !== 3
+    || !batch.items.some(item => item.gap === gap.id && same(item.record, row.gap)))
+    return traced('assembly-assignment-foreign', finding('answer_route_foreign', target, 'reuse',
+      'The reuse must answer this exact routed gap of the current batch', ref), [...cited, cite('packet-routes', reuse.routes)], { mismatch: violated([
+      ['current-batch-absent', !batch], ['source-batch-absent', !own], ['batch-changed', !!batch && !!own && !same(own, batch)],
+      ['batch-task', !!batch && (batch.task !== 'node-expansion' || batch.level !== 3)],
+      ['item-absent', !!batch && !batch.items.some(item => item.gap === gap.id && same(item.record, row.gap))]]) });
+  if (row.candidate !== null) return traced('works-candidate', finding('answer_route_foreign', target, 'candidate',
+    'Works are admitted to assembly before G5 acceptance'), [...cited, cite('candidate', row.candidate)], { level: 3 });
+  const works = request.gaps.sources.works;
+  if (!('frame' in works)) return traced('works-frame-unavailable', finding('route_result_missing', target, 'works',
+    'The exact works frame is unavailable', ref), cited, { level: 3 });
+  const proof = { frame: works.frame, proposals: unique([...works.proposals, reuse.origin.proposal]) };
+  const derived = take(readFrameProposals(store, proof));
+  const open = derived.result.open.some(item => item.id === target);
+  if (open || !derived.result.fills.some(fill => fill.obligation === target && fill.source === 'proposed' && same(fill.basis, reuse.origin.proposal)))
+    return traced(open ? 'works-obligation-open' : 'works-obligation-filled-elsewhere', finding('route_result_missing', target, 'proposal',
+      'The reused complete proposal does not fill the exact works obligation', ref), cited, { level: 3 });
+  references.push(ref, ...read.references, ...derived.references);
+  if (current) {
+    const prepared = take(prepareFrameProposals(store, proof));
+    if (!same(prepared.result, derived.result)) fail('input_stale', target, 'works', 'The works proposal changed before current admission', ref);
+    guards.push(ref, ...prepared.guards);
+    references.push(...prepared.references);
+  }
   return null;
 }
 /**
@@ -1643,7 +1684,8 @@ function checkCessationValue(store: Store, project: string, request: { binding: 
   take(readCompletionCause(store, project, reference(assignment), request.cause));
   return { contract: 'om-completion-cessation/v1', project, binding: reference(binding), assignment: reference(assignment),
     work: reference(before.work), cause: copy(request.cause), disposition: 'check-ceased', remainder: 'answers-gate',
-    packet: null, callId: null, physicalId: null, call: null, ledger: null, physical: null, exchange: null, rejection: null };
+    packet: null, callId: null, physicalId: null, call: null, ledger: null, physical: null, exchange: null, rejection: null,
+    ...(request.cause.kind === 'required-record-replaced' ? { variant: AREA_INPUT_VARIANT } : {}) };
 }
 export function answersCheckCessationValue(store: Store, project: string,
   request: { binding: Ref; assignment: Ref; work: Ref; cause: CompletionCause }): OmResult<Sealed<CompletionCessation>> {

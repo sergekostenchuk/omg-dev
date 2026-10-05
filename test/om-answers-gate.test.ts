@@ -2700,10 +2700,10 @@ test('14 H1.0c E5 T, E4 T and an H1.0b root cessation stay their own grounds, ne
   });
 });
 
-/** One D3 decision applied to the current B1 and the whole D1/M6 derived again from that input. */
-function redrive(f: ReturnType<typeof fixture>, decision: { target: string; field: string; value: Json }, choice: string) {
+/** One D3 decision applied to the current B1 (none: B1 stands) and the whole D1/M6 derived again from that input. */
+function redrive(f: ReturnType<typeof fixture>, decision: { target: string; field: string; value: Json } | null, choice: string) {
   const head = f.store.get(f.input.id)!;
-  const input = ok(writeAddressing(f.store, { project: f.project, input: reference(head), graph: reference(f.graph),
+  const input = !decision ? head : ok(writeAddressing(f.store, { project: f.project, input: reference(head), graph: reference(f.graph),
     decisions: [{ pending: clone(inputDecisionWrite({ project: f.project, input: reference(head), graph: reference(f.graph), layers: [],
       decision: decision as never })) as Write }] }));
   const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(input), graph: reference(f.graph), refinement: null,
@@ -3780,17 +3780,24 @@ test('X9 H1.0c one transition cannot both cease the check and add its next evalu
       'Each of them alone is a lawful transition of this work');
 });
 
-test('X9 H1.0c a replaced B1, a new D1 or a later M6 ends a physical root but never the check', t => {
+test('X9 H1.0c a new D1 or a later M6 on the same B1 never ends the check; a replaced B1 ends a physical root and, since LP5 (№3278 §1), the check of its area by that B1 alone', t => {
   const { f, m } = excludable(t, 'x9-moved'), check = checkOf(m);
-  // One D3 decision replaces B1; the whole D1 and M6 are derived again from it.
-  redrive(f, { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] }, 'x9-moved');
-  const root = ok(prepareCompletionCause(f.store, f.project, reference(rootOf(m))));
-  assert.equal(root.cause?.kind, 'required-record-replaced', 'The physical root has its proved cause');
+  // A new D1 and M6 over another horizon of the same B1: the check reads its own current slice instead.
+  const stood = redrive(f, null, 'x9-same-b1');
+  assert.deepEqual(stood.input, f.store.get(f.input.id), 'B1 stands');
+  assert.notDeepEqual(stood.gaps.sources.horizon, f.request.gaps.sources.horizon, 'D1 and M6 are derived over a new horizon');
   const own = prepareCompletionCause(f.store, f.project, check);
-  assert.deepEqual(own.ok ? own.value : own.refusal.code, { cause: null, guards: [] }, 'The check reads its own current slice instead');
+  assert.deepEqual(own.ok ? own.value : own.refusal.code, { cause: null, guards: [] }, 'No cause while B1 stands');
   const stored = snapshot(f.store);
   assert.deepEqual(refusedAt(ceaseCheck(f, m)), ['completion_cause_unproved', 'cause', check]);
   assert.deepEqual(snapshot(f.store), stored);
+  // One D3 decision replaces B1; the whole D1 and M6 are derived again from it.
+  const next = redrive(f, { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] }, 'x9-moved');
+  const root = ok(prepareCompletionCause(f.store, f.project, reference(rootOf(m))));
+  assert.equal(root.cause?.kind, 'required-record-replaced', 'The physical root has its proved cause');
+  // LP5: the cause of the check is the replaced B1 of its area itself — never the new D1 or M6 derived from it.
+  assert.deepEqual(ok(prepareCompletionCause(f.store, f.project, check)).cause, { kind: 'required-record-replaced',
+    prerequisite: { kind: 'input', source: f.request.gaps.sources.input, graph: null, level: null }, replacement: reference(next.input), proof: null });
 });
 
 // ---- H1.0c final self-check: form of every argument, windows of the unlinked bundles, the era of the managed work ----
@@ -4235,4 +4242,176 @@ test('LP4 (№2887 rows 6, 7, 8) facts of an answered step keep their own ground
   assert.equal(ok(prepareCompletionCause(f.store, f.project, check)).cause, null);
   const refused = readCompletionCause(f.store, f.project, check, { kind: 'cycle-step-ceased', cessation: anyCessation, work: head() });
   assert.ok(!refused.ok && refused.refusal.code === 'completion_cause_invalid');
+});
+
+// ---- LP5 (№3278 §1, rows 1, 6, 12, 22): the check ends by the proved replacement of its area's B1 — and by nothing less ----
+import { AREA_INPUT_VARIANT } from '../src/om/model-call.js';
+/** A new B1 by G1 (the writeOmInput writer): the repository inventory D1 asked for is recorded, or its paths change. */
+function replaceInput(f: ReturnType<typeof fixture>, paths: string[] = []): Ref {
+  const before = f.store.get(f.input.id)!, id = `repo-inventory:${f.project}`, old = f.store.get(id);
+  const inventory = old && JSON.stringify((old.value as { paths: string[] }).paths) === JSON.stringify(paths) ? old
+    : f.store.write({ id, kind: 'repo-inventory', expected: old?.revision ?? 0, value: { projectId: f.project, paths } });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${f.project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  return reference(ok(writeOmInput(f.store, { project: f.project, stages, inventory: reference(inventory), expected: before.revision })));
+}
+
+test('LP5 (№3278 rows 1, 6, 22) a registered check ends only by the proved replacement of its area\'s B1: a moved M6 on the same B1 is still no cause; the cessation is a variant of its own era, made by no evaluation and no E1, read back at its exact references after a later B1, and a B1 moved between preparation and writing refuses the write', async t => {
+  const { f, m } = excludable(t, 'lp5-b1'), check = checkOf(m);
+  // Row 1: a moved M6 on the same B1 keeps the earlier rule.
+  laterRoute(f);
+  assert.equal(ok(prepareCompletionCause(f.store, f.project, check)).cause, null);
+  assert.deepEqual(refusedAt(ceaseCheck(f, m)), ['completion_cause_unproved', 'cause', check]);
+  // Row 22: the cause read with its head; a B1 replaced again before the write makes the prepared write refuse.
+  const first = replaceInput(f);
+  const area = { kind: 'input', source: f.request.gaps.sources.input, graph: null, level: null };
+  assert.deepEqual(ok(prepareCompletionCause(f.store, f.project, check)).cause, { kind: 'required-record-replaced', prerequisite: area, replacement: first, proof: null });
+  const prepared = ok(prepareAnswersCheckCessation(f.store, { project: f.project, binding: reference(m.binding) }));
+  const second = replaceInput(f, ['src']), stored = snapshot(f.store);
+  const raced = writeGuarded(f.store, { unit: 'G7', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards });
+  assert.equal(raced.ok, false, 'A B1 moved after the preparation refuses the write');
+  assert.deepEqual(snapshot(f.store), stored, 'Nothing is written');
+  // Row 6: the check ends by check-ceased(input), a variant of its own era, without a made-up evaluation, packet or E1.
+  const before = m.head(), ceased = ok(ceaseCheck(f, m));
+  assert.deepEqual(ceased.value, { contract: 'om-completion-cessation/v1', project: f.project, binding: reference(m.binding), assignment: check,
+    work: reference(before), cause: { kind: 'required-record-replaced', prerequisite: area, replacement: second, proof: null },
+    disposition: 'check-ceased', remainder: 'answers-gate', packet: null, callId: null, physicalId: null, call: null, ledger: null,
+    physical: null, exchange: null, rejection: null, variant: AREA_INPUT_VARIANT });
+  const work = m.work();
+  assert.deepEqual([work.answers?.ceased, work.answers?.evaluation, work.answers?.complete], [reference(ceased), null, true]);
+  assert.ok(work.technical.some(row => same(row, { source: reference(ceased), reason: 'interrupted' })));
+  // A later B1 changes nothing of it: the reader proves the saved replacement at its exact references.
+  replaceInput(f, ['src', 'test']);
+  f.restart();
+  assert.deepEqual(ok(readCompletionCessationAt(f.store, f.project, reference(ceased))), ceased);
+  assert.deepEqual(ok(writeAnswersCheckCessation(f.store, { project: f.project, binding: reference(m.binding) })), ceased, 'Its historical repeat');
+  // The unsent root ends by LP4 on the same replacement; the attempt closes by the common G7 as interrupted.
+  ceaseRoot(f, m);
+  ok(closeWith(f, 'interrupted', []));
+  assert.equal(outcomeOf(f, m).reason, 'interrupted');
+});
+
+test('LP5 (№3278 row 12) a proved subject refusal stays the outcome beside the B1 cessation: the common G7 keeps refused, never a forced interrupted', async t => {
+  const { f, m } = excludable(t, 'lp5-refused');
+  await managedFact(f, m, 'insufficient');
+  replaceInput(f);
+  ok(ceaseCheck(f, m));
+  const work = m.work();
+  assert.ok(work.complete && work.refusals.length > 0, 'The paid negative assessment keeps its row');
+  ok(closeWith(f, 'refused', work.refusals));
+  assert.equal(outcomeOf(f, m).reason, 'refused');
+});
+
+// ---- LP5 (№3278 row 25): whoever writes the new B1 — E4, D3, F5.3 or G1 — its consumer makes the one same transition ----
+import { writeApplyAnswer, writeReopenAnswers } from '../src/om/addressing.js';
+import type { OmInputRecord } from '../src/om/input.js';
+import type { CompletionCause } from '../src/om/model-call.js';
+/** Row 25 (E4): a managed attempt on the garden-B1 nodes batch whose own E4 answer applies its D3 decision — the live n-research case. */
+async function lp5OwnDecision(t: TestContext, slice: string) {
+  const f = fixture(t, 'repository-fact', true, false, { block: 'garden-consume-block', later: true }), batch = fieldBatch(f, 'garden-B1', 'nodes');
+  const goal: AttemptGoal = { key: `answers:${slice}:nodes`, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
+    result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+  ok(openSeries(f.store, { project: f.project, block: f.block, line: 1, slice: `answers:${slice}`, predecessor: null, basis: null }));
+  activateLines(f, f.horizon);
+  const series = ok(managedOpenAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal,
+    completion: { routes: reference(f.route), batches: [batch.id] } }));
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(series), 1));
+  if (!binding) assert.fail('The managed opening writes its binding');
+  ok(writeAnswersRegistration(f.store, { project: f.project, binding: reference(binding) }));
+  const scenario = join(f.root, `${slice}-scenario.json`);
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', join(f.root, `${slice}-trace.jsonl`)] };
+  const config = f.engine.environments.configure(f.project, { workspace: f.root,
+    implementer: { actor: 'answers-original', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'answers-independent', model: 'fixture', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
+  const adapter = f.store.write({ id: `adapter:${f.project}:answers:${slice}`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: batch.id,
+    environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  writeFileSync(scenario, JSON.stringify({ database: f.path, steps: [{ research: { protocol: '$answerProtocol', requestId: '$requestId',
+    action: 'answer', results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
+      value: ['garden-produce-block', 'garden-consume-block'] })) }, usage: traceUsage }] }));
+  const sent = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet),
+    dispatch: { adapter: reference(adapter), config: reference(config) }, role: 'implementer' }));
+  assert.equal(sent.outcome?.kind, 'input-decisions');
+  assert.deepEqual(sent.record.value.om.input, reference(f.store.get(f.input.id)!), 'E4 itself wrote the new B1');
+  return { f, m: { binding } };
+}
+/** How the head of B1 was derived: the D3 decisions (E4 applies them through D3), a G1 refresh, an F5.3 fact or its reopening. */
+const derivedBy = (f: ReturnType<typeof fixture>) => {
+  const derivation = f.store.get<OmInputRecord>(f.input.id)!.value.derivation;
+  return !derivation ? 'root' : 'kind' in derivation ? derivation.kind : 'decisions';
+};
+/** The consumer's transition: the cause read with its guarded head, then check-ceased(input) of its era; exact references set aside. */
+function lp5Transition(f: ReturnType<typeof fixture>, binding: Revision<CompletionOwner>) {
+  const check = reference(answersGateAssignment(binding)), head = reference(f.store.get(f.input.id)!);
+  const prepared = ok(prepareCompletionCause(f.store, f.project, check));
+  assert.deepEqual(prepared, { cause: { kind: 'required-record-replaced', prerequisite: { kind: 'input', source: f.request.gaps.sources.input,
+    graph: null, level: null }, replacement: head, proof: null }, guards: [head] });
+  const ceased = ok(writeAnswersCheckCessation(f.store, { project: f.project, binding: reference(binding) }));
+  const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get<CompletionWork>(completionWorkId(f.project, binding.id))!)));
+  assert.deepEqual([work.answers?.ceased, work.answers?.evaluation, work.answers?.complete], [reference(ceased), null, true]);
+  assert.ok(work.technical.some(row => same(row, { source: reference(ceased), reason: 'interrupted' })));
+  const { binding: _binding, assignment: _assignment, work: _work, cause, ...rest } = ceased.value;
+  return { ...rest, cause: { ...cause, replacement: replacementOf(cause) && 'the head' } };
+}
+const replacementOf = (cause: CompletionCause | null) => cause?.kind === 'required-record-replaced' ? cause.replacement : null;
+
+test('LP5 (№3278 row 25) a B1 replaced through E4, writeAddressing, writeApplyAnswer and writeReopenAnswers, or writeOmInput: the consumer\'s check makes one and the same transition, with no condition on who wrote it', async t => {
+  const transitions: Record<string, ReturnType<typeof lp5Transition>> = {};
+  await t.test('E4', async t => {
+    const { f, m } = await lp5OwnDecision(t, 'lp5-e4');
+    assert.equal(derivedBy(f), 'decisions');
+    transitions.E4 = lp5Transition(f, m.binding);
+  });
+  await t.test('D3 writeAddressing', t => {
+    const { f, m } = excludable(t, 'lp5-d3'), head = f.store.get(f.input.id)!;
+    ok(writeAddressing(f.store, { project: f.project, input: reference(head), graph: reference(f.graph), decisions: [{ pending: clone(inputDecisionWrite({
+      project: f.project, input: reference(head), graph: reference(f.graph), layers: [],
+      decision: { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] } })) as Write }] }));
+    assert.equal(derivedBy(f), 'decisions');
+    transitions.D3 = lp5Transition(f, m.binding);
+  });
+  await t.test('F5.3 writeApplyAnswer, then writeReopenAnswers', async t => {
+    const { f, m } = excludable(t, 'lp5-f53');
+    writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [{ research: { verdict: 'supported', reasons: [] }, usage: traceUsage }] }));
+    const prior = await acceptedFact(f);
+    const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(f.store.get(f.input.id)!),
+      answer: reference(prior.accepted), question: prior.accepted.value.request.question }));
+    assert.equal(derivedBy(f), 'fact');
+    assert.deepEqual(replacementOf(ok(prepareCompletionCause(f.store, f.project, checkOf(m))).cause), reference(applied));
+    // The evidence of the applied fact changes, so F5.3 returns the fact to the unresolved set by the next B1.
+    writeFileSync(join(f.root, 'answer.json'), JSON.stringify({ answer: 'XML' }));
+    f.engine.discovery.evidence.file(f.project, 'answer-source', f.root, 'answer.json', 'application/json',
+      f.store.get(`source:${f.project}:answer-source`)!.revision);
+    ok(writeReopenAnswers(f.store, { project: f.project, input: reference(applied) }));
+    assert.equal(derivedBy(f), 'reopen-facts');
+    transitions['F5.3'] = lp5Transition(f, m.binding);
+  });
+  await t.test('G1 writeOmInput', t => {
+    const { f, m } = excludable(t, 'lp5-g1');
+    replaceInput(f);
+    assert.equal(derivedBy(f), 'refresh');
+    transitions.G1 = lp5Transition(f, m.binding);
+  });
+  assert.deepEqual(Object.keys(transitions), ['E4', 'D3', 'F5.3', 'G1']);
+  for (const [writer, transition] of Object.entries(transitions)) assert.deepEqual(transition, transitions.G1, writer);
+  assert.equal(transitions.G1!.variant, AREA_INPUT_VARIANT);
+});
+
+// ---- LP5 return №3294 п.3: the end of a remaining acceptance is a non-physical product of a work without E1 ----
+import { writeCompletionFinalization } from '../src/om/model-call.js';
+test('LP5 (return №3294 п.3) a never-dispatched work whose remaining acceptance ended closes by the common G7 without E1: the finalization is no physical product', async t => {
+  const f = fixture(t), block = 'garden-consume-block';
+  const m = managedOn(f, block, [nodeBatch(f, block).id], 1, 'lp5-zero');
+  // The B1 of the area is replaced; the unsent roots end by LP4 and the check is evaluated complete on the current M6.
+  const next = redrive(f, { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] }, 'lp5-zero');
+  for (const root of completionRootAssignments(m.binding))
+    ok(writeCompletionCessation(f.store, { project: f.project, binding: reference(m.binding), assignment: reference(root) }));
+  ok(evaluate(f, m, [], { request: next.request }));
+  assert.deepEqual([m.work().answers?.complete, f.store.get(`om-call-ledger:${f.project}`)], [true, null], 'No E1 in the whole project');
+  const ended = ok(writeCompletionFinalization(f.store, { project: f.project, binding: reference(m.binding), phase: 'acceptance' }));
+  assert.ok(m.work().products.some(ref => same(ref, reference(ended))));
+  // The common G7 closes it with its ledger absent: technical interrupted, the formula unchanged.
+  ok(closeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
+  assert.equal(outcomeOf(f, m).reason, 'interrupted');
 });
