@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -954,4 +957,74 @@ store.close();process.stdout.write(JSON.stringify(result));`);
       for (const row of rows) assert.equal(hashJson(row.value), row.hash);
     } finally { store.close(); }
   }
+});
+
+// ---- PF3.1 (№3459 row 39): the history of the base code reads the same with the new one ----
+const PF31_BASE = "259d7a8c3534a30211b7c29e0ac10823b46c9989";
+/** The engine of the base commit, loaded from Git whole in its own process, works on the test's database. */
+function atBase(root: string, database: string, body: string): unknown {
+  const repository = fileURLToPath(new URL("../../", import.meta.url));
+  const loader = join(root, "pf31-base-loader.mjs"), producer = join(root, "pf31-base-producer.mjs"), served = join(root, "pf31-base-served.log");
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+  writeFileSync(served, "");
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(PF31_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const store = new Store(database);
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
+    { cwd: repository, encoding: "utf8", timeout: 300_000, maxBuffer: 50_000_000 }));
+  const loaded = readFileSync(served, "utf8").split("\n");
+  assert.ok(loaded.includes("src/om/gaps.ts") && loaded.includes("src/history/proofs.ts"), "The producer ran on the modules of the base commit");
+  return output;
+}
+
+test("PF3.1 rows 35, 39: a D1 set the base code 259d7a8c wrote, read and prepared reads and prepares the same with the new code — cold, warm and after reopen", async t => {
+  const f = await createOmFixture(t), request = nativeRequest(f);
+  const root = mkdtempSync(join(tmpdir(), "omg-pf31-era-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const old = atBase(root, f.database, `const { writeGaps, readGaps, prepareCurrentGaps } = await import(src('om/gaps.js'));
+const written = take(writeGaps(store, ${JSON.stringify(request)}));
+const read = { sources: written.sources, records: written.records.map(row => ({ id: row.id, revision: row.revision, hash: row.hash })) };
+out({ read, historical: take(readGaps(store, read)), current: take(prepareCurrentGaps(store, read)) });`) as { read: GapReadRequest; historical: Json; current: Json };
+  const check = (store: Store, label: string) => {
+    for (const round of ["cold", "warm"]) withHistoricalReads(() => {
+      assert.equal(canonical(delivered(readGaps(store, old.read))), canonical(old.historical), `${label} ${round}: historical`);
+      assert.equal(canonical(delivered(prepareCurrentGaps(store, old.read))), canonical(old.current), `${label} ${round}: current admission`);
+    });
+  };
+  check(f.store, "open");
+  const reopened = new Store(f.database);
+  t.after(() => reopened.close());
+  check(reopened, "reopened");
 });

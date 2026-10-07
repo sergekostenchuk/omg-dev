@@ -296,8 +296,13 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
 export function gateGaps(result: GapCollection, sources: GapSources): Sealed<GapGate> {
   if (!object(result) || !Array.isArray(result.gaps) || !Array.isArray(result.refusals) || result.gaps.some(gap => !object(gap)))
     return sealed({ passed: false, codes: ['gap_set_missing'], findings: [failure('gap_set_missing', 'gaps', 'set', 'An explicit gap set and refusals are required')] });
+  return gateAgainst(result, collectGaps(sources), sources);
+}
+/** The one comparison of a claimed set with the set its sources derive (PF3.1 №3459 §6): the public gate derives that set
+ * itself; G4's own derivation hands over the collection it has just derived, so it is not collected a second time. */
+function gateAgainst(result: GapCollection, fresh: Sealed<GapCollection>, sources: GapSources): Sealed<GapGate> {
   result = copy(result);
-  const fresh = collectGaps(sources), findings: Refusal[] = [...fresh.refusals] as Refusal[];
+  const findings: Refusal[] = [...fresh.refusals] as Refusal[];
   const expected = new Map(fresh.gaps.map(gap => [gap.id, gap])), seen = new Set<string>();
   for (const gap of result.gaps) {
     const id = text(gap.id) ? gap.id : 'gap';
@@ -383,7 +388,7 @@ function deriveMaterialized(store: Store, request: GapRequest, current: boolean)
   const sources: GapSources = { inputResult: { input: input.value.input as OmInput, hash: input.value.hash, gaps: input.value.gaps as InputGap[], refusals: [] },
     graph: graph.value as Graph, horizon: { nodes: [...horizon.horizon.value.result.horizon.nodes] },
     frameGaps: { operations: operations.gaps as FrameGap[], works: works.gaps as FrameGap[] } };
-  const collection = collectGaps(sources) as GapCollection, gate = gateGaps(collection, sources) as GapGate;
+  const derived = collectGaps(sources), collection = derived as GapCollection, gate = gateAgainst(collection, derived, sources) as GapGate;
   if (!gate.passed) throw new GapFailure(gate.findings[0]!);
   const guards = new Map<string, Ref>();
   if (current) for (const source of [operations, works]) for (const ref of (source as Sealed<PreparedFrameProposals>).guards) {

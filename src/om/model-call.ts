@@ -36,6 +36,7 @@ import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import type { CarriedObligation } from '../graph/obligation-policy.js';
 import { WORKS_FRAME_CONTRACT, readFrameBasis as readFrameBasisOf, prepareFrame as prepareFrameOf, type FrameRequest } from './frame-obligations.js';
 import { withHistoricalReads, historicalRead, historicalTrace } from './input.js';
+import { historicalRefusalRead } from '../history/proofs.js';
 import { prepareAssessmentAdmission as prepareAssessmentAdmissionOf, readAssessmentIntentAt as readAssessmentIntentAtOf } from './assessment.js';
 
 export const MODEL_CALL_CODES = Object.freeze([
@@ -383,7 +384,9 @@ export function readContinuationEvidence(store: Store, request: ContinuationEvid
     return { data, novel: addsKnowledge(store, response.packet.value as QuestionPacketRecord, data),
       references: refs(references), guards: externalGuards(guards, []) };
   });
-  return current ? derive() : historicalRead(store, { reader: 'E4.continuation', project: request.project, ref: request.response,
+  // PF3.1 (№3459 §4): the historical replay of a saved delivery keeps its refusal too — the same refusal of the same exact
+  // inputs at every repeat; the current branch above always checks sources and admission afresh.
+  return current ? derive() : historicalRefusalRead(store, { reader: 'E4.continuation', project: request.project, ref: request.response,
     parameters: request as unknown as Json }, derive,
   () => refuse('model_delivery_invalid', 'Delivery provenance contains a cycle', { unit: 'E4', target: request.response.id, field: 'continuation' }, 'producer'));
 }
@@ -2915,7 +2918,10 @@ export function readCompletionEffectiveAt(store: Store, project: string, closure
   if (!(store instanceof Store) || !text(project)) invalid('store');
   if (!object(closure) || !exactKeys(closure, ['work', 'additions', 'journal']) || !isRef(closure.work) || !Array.isArray(closure.additions)
     || !closure.additions.every(isRef) || !(closure.journal === null || isRef(closure.journal))) invalid('closure');
-  return result(() => {
+  // PF3.1 (№3459 §5): one derivation per exact closure — the work and the additions in the order presented, and the
+  // journal, an explicit null included — so a malformed order is refused again rather than normalized by the key.
+  return result(() => historicalRead(store, { reader: 'G7.completion-effective', project, ref: closure.work,
+    parameters: { additions: [...closure.additions], journal: closure.journal } as unknown as Json }, () => {
     const prior = take(readCompletionWorkAt(store, project, closure.work)), cut = prior.work.value.journal;
     // The final journal of a close is the work's own cut or a later revision of it, never an older or another one.
     if (cut && !(closure.journal && closure.journal.id === cut.id && closure.journal.revision >= cut.revision))
@@ -2932,7 +2938,7 @@ export function readCompletionEffectiveAt(store: Store, project: string, closure
       revision: prior.work.revision + 1, hash: hashJson(value as unknown as Json), value }, graph);
     // The view is of the next revision; the snapshot names only the real work it stands on (no Ref of a revision to be).
     return { ...effective, work: prior.work, guards: prior.guards };
-  });
+  }, () => fail('completion_invalid', closure.work.id, 'history', 'An effective registry cannot derive through its own closure')));
 }
 /** H1.0c: the one formula of every next work revision: the exact predecessor, the full products, their journal cut. */
 function completionNext(store: Store, binding: Revision<CompletionOwner>, prior: Sealed<Revision<CompletionWork>>, products: Ref[],

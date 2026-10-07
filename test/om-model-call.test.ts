@@ -5152,3 +5152,80 @@ out(reference(take(writeQuestionPacket(store, args)).record));`, f.packetRequest
     assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(sent.record) })).record, sent.record);
   });
 });
+
+// ---- PF3.1 (№3459): completion-effective under the proof mechanism; a kept historical E4 refusal ----
+import { readCompletionEffectiveAt } from '../src/om/model-call.js';
+import { storeReads } from '../src/storage/store.js';
+
+const readsOf = (action: () => unknown): number => { const before = storeReads(); action(); return storeReads() - before; };
+
+test('PF3.1 rows 1, 33, 34: completion-effective is one derivation per exact closure — empty and non-empty additions, a repeat in this and the next operation, the real work and guards; a malformed closure is refused again, never normalized by its key', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+  const id = completionWorkId(f.project, binding.id);
+  f.steps([{ research: e4Fact(f), usage }]);
+  valueOf(await runModelCall(f.store, f.request));
+  const revisions = f.store.history(id);
+  const pair = revisions.findIndex((row, index) => index > 0 && (row.value as unknown as { products: Ref[] }).products.length
+    > (revisions[index - 1]!.value as unknown as { products: Ref[] }).products.length);
+  assert.ok(pair > 0, 'The fixture adds products to the work');
+  const prior = revisions[pair - 1]!, next = revisions[pair]!;
+  const added = (next.value as unknown as { products: Ref[] }).products.filter(ref => !(prior.value as unknown as { products: Ref[] }).products.some(old => canonical(old) === canonical(ref)));
+  const closure = { work: reference(prior), additions: added, journal: (next.value as unknown as { journal: Ref | null }).journal };
+  const empty = { work: reference(next), additions: [] as Ref[], journal: (next.value as unknown as { journal: Ref | null }).journal };
+  for (const request of [closure, empty]) {
+    // Row 1: the first derivation is the common one; rows 33: the same snapshot again in this and the next operation.
+    let first!: unknown;
+    const cold = readsOf(() => withHistoricalReads(() => { first = valueOf(readCompletionEffectiveAt(f.store, f.project, request));
+      assert.equal(readsOf(() => assert.deepEqual(valueOf(readCompletionEffectiveAt(f.store, f.project, request)), first)), 0, 'A repeat in the operation reads nothing'); }));
+    assert.ok(cold > 0);
+    // Across operations only a complete trail is kept (om-input rows 2, 17); this fixture's history reads through
+    // non-proved views, so the next operation derives the same snapshot again.
+    assert.deepEqual(withHistoricalReads(() => valueOf(readCompletionEffectiveAt(f.store, f.project, request))), first);
+    const snapshot = first as { work: Revision<unknown>; guards: Ref[] };
+    assert.deepEqual(reference(snapshot.work), request.work, 'The snapshot names the real work it stands on, never a revision to be');
+    assert.deepEqual(snapshot.guards, valueOf(readCompletionWorkAt(f.store, f.project, request.work)).guards);
+  }
+  assert.deepEqual(valueOf(readCompletionEffectiveAt(f.store, f.project, empty)), valueOf(readCompletionWorkAt(f.store, f.project, empty.work)),
+    'Empty additions return the exact prior snapshot');
+  // Row 34: a malformed closure is refused before any proof, and again at every repeat — the key never normalizes it.
+  const refusedWith = (request: unknown, code: string) => {
+    for (let round = 0; round < 2; round++) {
+      let outcome: OmResult<unknown> | undefined;
+      try { outcome = readCompletionEffectiveAt(f.store, f.project, request as never); }
+      catch (error) { assert.ok(error instanceof EngineError && error.code === code, `${code}: ${String(error)}`); continue; }
+      assert.equal(outcome.ok, false); if (!outcome.ok) assert.equal(outcome.refusal.code, code);
+    }
+  };
+  refusedWith({ work: closure.work, additions: closure.additions }, 'model_call_request_invalid');
+  if (added.length) refusedWith({ ...closure, additions: [...added, added[0]!] }, 'completion_invalid');
+  if (added.length > 1) refusedWith({ ...closure, additions: [...added].reverse() }, 'completion_invalid');
+  const cut = (prior.value as unknown as { journal: Ref | null }).journal;
+  if (cut) refusedWith({ ...closure, journal: { ...cut, revision: cut.revision - 1 } }, 'completion_invalid');
+});
+
+test('PF3.1 rows 4, 25, 27, 31, 32: the historical E4 continuation keeps its refusal of exact saved inputs — the same code and address at every repeat, in this and the next operation; a different request is another key; current applicability is never taken from it', async t => {
+  const m = mp3Cycle(t), { f } = m;
+  f.steps([{ research: m.need([m.range(0, 9), { action: 'read', path: 'mp3-notes.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  const link = valueOf(readQuestionPacket(f.store, { project: f.project, record: cycle.record.value.steps[1]!.packet })).value.request.continuation!;
+  const evidence = { project: f.project, ...link, deliveries: [...link.deliveries] };
+  assert.ok(evidence.deliveries.length > 1);
+  const short = { ...evidence, deliveries: evidence.deliveries.slice(1) };
+  const refusal = () => { const read = readContinuationEvidence(f.store, short); assert.equal(read.ok, false); return read.ok ? null : read.refusal; };
+  let first: unknown, repeat = 0;
+  const cold = readsOf(() => withHistoricalReads(() => { first = refusal(); repeat = readsOf(() => assert.deepEqual(refusal(), first)); }));
+  assert.ok(repeat < cold / 2, `Row 25: the kept refusal answers a repeat in the operation without deriving it again (${repeat} of ${cold} reads: its footprint)`);
+  assert.equal((first as { code: string }).code, 'model_delivery_invalid');
+  assert.deepEqual(withHistoricalReads(refusal), first, 'Row 25: the same refusal in the next operation');
+  assert.throws(() => { (first as { code: string }).code = 'changed by a caller'; }, TypeError);
+  assert.equal(refusal()!.code, 'model_delivery_invalid', 'Row 32: a returned refusal is sealed, never a shared mutable object');
+  // Row 4: another request is another key; the full one is a success of its own.
+  assert.ok(valueOf(readContinuationEvidence(f.store, evidence)).data.length > 0);
+  // Row 31: the current branch checks sources and admission afresh — a changed working file refuses it, history stays.
+  writeFileSync(join(f.root, 'mp3-notes.txt'), 'replaced working file');
+  const current = readContinuationEvidence(f.store, evidence, true);
+  assert.equal(current.ok, false); if (!current.ok) assert.equal(current.refusal.code, 'input_stale');
+  assert.ok(readsOf(() => readContinuationEvidence(f.store, evidence, true)) > 0, 'The current branch derives at every call');
+  assert.deepEqual(refusal(), first);
+});

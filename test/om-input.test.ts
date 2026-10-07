@@ -2804,3 +2804,177 @@ test("PF2 (№2932-3, rows 1, 13) the base itself takes what a layer proved of i
     });
   }
 });
+
+// ---- PF3.1 (№3459): observed historical readers, nested reads inside a traced read, a kept historical refusal ----
+// Each test names the rows of outcome table §7 it pins down.
+test("PF3.1 rows 2, 5, 6, 9: a reader newly listed as observed keeps its proof across operations until a dependency moves — through an own write or a second Store; a disjoint write keeps it", t => {
+  const { first } = historicalStores(t);
+  const second = new Store(first.path); t.after(() => second.close());
+  const dep = first.write({ id: 'pf31:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  let runs = 0;
+  const read = () => historicalRead(first, { reader: 'G7.completion-effective', project: 'garden', ref: reference(dep) },
+    () => { runs++; return first.get<Json>(dep.id)!.value; }, noCycle);
+  assert.deepEqual(withHistoricalReads(read), { d: 1 });
+  assert.deepEqual(withHistoricalReads(read), { d: 1 });
+  assert.equal(runs, 1, 'Row 2: the complete proof of a listed reader serves the next operation');
+  first.write({ id: 'pf31:other', kind: 'k', expected: 0, value: {} });
+  assert.deepEqual(withHistoricalReads(read), { d: 1 }); assert.equal(runs, 1, 'Row 9: a disjoint write keeps the proof');
+  first.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
+  assert.deepEqual(withHistoricalReads(read), { d: 2 }); assert.equal(runs, 2, 'Row 5: an own write of the read head derives again');
+  second.write({ id: dep.id, kind: 'k', expected: 2, value: { d: 3 } });
+  assert.deepEqual(withHistoricalReads(read), { d: 3 }); assert.equal(runs, 3, 'Row 6: a second Store moving it derives again');
+  const unlisted = () => historicalRead(first, { reader: 'PF3.1.unlisted', project: 'garden', ref: reference(dep) },
+    () => { runs++; return first.get<Json>(dep.id)!.value; }, noCycle);
+  withHistoricalReads(unlisted); withHistoricalReads(unlisted);
+  assert.equal(runs, 5, 'Row 10: an unlisted reader of a closure-captured Store gains no completeness from the new list');
+});
+
+test("PF3.1 rows 16-19, 23: a proof started inside a traced read accounts for its own reads and the read for the rest, once; the parent is complete only with complete children, also from a cache; the read context is released after an exception", t => {
+  const { first } = historicalStores(t);
+  const x = first.write({ id: 'pf31:x', kind: 'k', expected: 0, value: { x: 1 } });
+  const y = first.write({ id: 'pf31:y', kind: 'k', expected: 0, value: { y: 1 } });
+  const z = first.write({ id: 'pf31:z', kind: 'k', expected: 0, value: { z: 1 } });
+  const counts = { outer: 0, inner: 0, after: 0 };
+  let hidden = false, failing = false;
+  const child = (reader: string, ref: Ref, tick: () => void) => historicalRead(first, { reader, project: 'garden', ref }, () => {
+    tick();
+    if (failing) throw new EngineError('record_corrupt', 'injected child failure');
+    if (hidden) transactionForTests(first).view.get(ref.id);
+    return first.get<Json>(ref.id)!.value;
+  }, noCycle);
+  // The genuine Store's own read of x starts two children inside the traced read that asked for it: one before its own
+  // read and one after it (a prototype member, so the instance stays a genuine Store).
+  const original = Store.prototype.get;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) {
+    if (args[0] !== x.id) return original.apply(this, args);
+    try { child('G7.completion-effective', reference(y), () => counts.inner++); } catch (error) { if (!(error instanceof EngineError)) throw error; }
+    const own = original.apply(this, args);
+    child('G7.completion-reuse', reference(z), () => counts.after++);
+    return own;
+  } as typeof original;
+  try {
+    const outer = () => historicalProof(first, { reader: 'PF3.1.outer', project: 'garden', ref: reference(x) },
+      source => { counts.outer++; return [source.get(y.id)?.value ?? null, source.get(x.id)?.value ?? null, source.get(y.id)?.value ?? null]; }, noCycle);
+    for (let operation = 0; operation < 3; operation++) withHistoricalReads(() => { outer(); outer(); });
+    assert.deepEqual(counts, { outer: 1, inner: 1, after: 1 },
+      'Rows 16-18: the reads before, between and after the children and the children\'s own are covered once — the parent is complete and kept');
+    first.write({ id: y.id, kind: 'k', expected: 1, value: { y: 2 } });
+    withHistoricalReads(() => { assert.deepEqual(outer()[0], { y: 2 }); outer(); });
+    withHistoricalReads(() => outer());
+    assert.deepEqual(counts, { outer: 2, inner: 2, after: 1 }, 'Row 17: a moved dependency of one child derives the parent and that child again; the other child is taken from the cache');
+    hidden = true;
+    first.write({ id: y.id, kind: 'k', expected: 2, value: { y: 3 } });
+    withHistoricalReads(() => outer()); withHistoricalReads(() => outer());
+    assert.deepEqual(counts, { outer: 4, inner: 4, after: 1 }, 'Row 19: a child reading through a mutable preview is incomplete, and so is its parent in every operation');
+    hidden = false; failing = true;
+    first.write({ id: y.id, kind: 'k', expected: 3, value: { y: 4 } });
+    withHistoricalReads(() => outer()); withHistoricalReads(() => outer());
+    assert.deepEqual([counts.outer, counts.inner], [6, 6], 'A child that threw and was caught leaves its parent incomplete');
+  } finally { Store.prototype.get = original; }
+  // Row 23: after the exceptions nothing of the nested context lingers — a listed proof over the Store is complete and kept.
+  failing = false;
+  let clean = 0;
+  const after = () => historicalRead(first, { reader: 'G7.completion-effective', project: 'garden', ref: reference(x) },
+    () => { clean++; return first.get<Json>(x.id)!.value; }, noCycle);
+  withHistoricalReads(after); withHistoricalReads(after);
+  assert.equal(clean, 1);
+});
+
+test("PF3.1 rows 25-28, 30, 32: only the explicit historical refusal read of a listed reader keeps a refusal — complete, untainted and acyclic; an absence it rests on derives again once written; a returned refusal is no shared object", t => {
+  const { first } = historicalStores(t);
+  const second = new Store(first.path); t.after(() => second.close());
+  const anchor = first.write({ id: 'pf31:anchor', kind: 'k', expected: 0, value: {} });
+  type Outcome = { ok: true; value: Json } | { ok: false; refusal: { code: string; at: { field: string } } };
+  let runs = 0;
+  const missing = (): Outcome => ({ ok: false, refusal: { code: 'model_delivery_invalid', at: { field: 'deliveries' } } });
+  const derive = (): Outcome => { runs++; first.get(anchor.id); const row = first.get<Json>('pf31:late'); return row ? { ok: true, value: row.value } : missing(); };
+  const key = { reader: 'E4.continuation', project: 'garden', ref: reference(anchor) };
+  const kept = () => proofs.historicalRefusalRead(first, key, derive, missing);
+  // Rows 25, 32: the same refusal at every repeat, in this and the next operation, each an object of its own.
+  const refused = withHistoricalReads(() => { const one = kept(); assert.deepEqual(kept(), one); return one; });
+  assert.deepEqual(refused, missing()); assert.equal(runs, 1);
+  (refused as { refusal: { code: string } }).refusal.code = 'changed by a caller';
+  assert.deepEqual(withHistoricalReads(kept), missing()); assert.equal(runs, 1, 'A kept refusal serves the next operation');
+  // Row 28: the absence is a dependency — a second Store writing the record derives again, and the refusal becomes a success.
+  second.write({ id: 'pf31:late', kind: 'k', expected: 0, value: { late: true } });
+  assert.deepEqual(withHistoricalReads(kept), { ok: true, value: { late: true } }); assert.equal(runs, 2);
+  // Row 26: an unlisted reader, or a listed one through the ordinary read even with cacheable () => true, keeps no refusal.
+  const plainKey = { ...key, parameters: 'plain' };
+  const plainRuns = () => { const before = runs; withHistoricalReads(() => { historicalRead(first, plainKey, () => { runs++; first.get(anchor.id); return missing(); }, missing, () => true);
+    historicalRead(first, plainKey, () => { runs++; first.get(anchor.id); return missing(); }, missing, () => true); }); return runs - before; };
+  assert.equal(plainRuns(), 2);
+  const unlisted = () => proofs.historicalRefusalRead(first, { ...key, reader: 'PF3.1.unlisted' }, () => { runs++; return missing(); }, missing);
+  const before = runs; withHistoricalReads(() => { unlisted(); unlisted(); }); assert.equal(runs - before, 2);
+  // Row 27: tainted by a write attempt, read through a Transaction preview, or with an empty trail across operations.
+  const tainted = () => { runs++; first.get(anchor.id); try { first.write({ id: 'pf31:taint', kind: 'k', expected: 9, value: {} }); } catch { /* refused write */ } return missing(); };
+  const taintKey = { ...key, ref: reference(anchor), parameters: 'taint' };
+  const taintRuns = runs; withHistoricalReads(() => { proofs.historicalRefusalRead(first, taintKey, tainted, missing); proofs.historicalRefusalRead(first, taintKey, tainted, missing); });
+  assert.equal(runs - taintRuns, 2, 'A write attempt taints the trail: no refusal is kept even inside the operation');
+  const preview = transactionForTests(first).view, previewKey = { ...key, parameters: 'preview' };
+  const viaPreview = () => { runs++; preview.get(anchor.id); return missing(); };
+  const previewRuns = runs; withHistoricalReads(() => { proofs.historicalRefusalRead(first, previewKey, viaPreview, missing); proofs.historicalRefusalRead(first, previewKey, viaPreview, missing); });
+  assert.equal(runs - previewRuns, 2, 'A closure read through a mutable preview keeps the refusal unproved');
+  const emptyKey = { ...key, parameters: 'empty' }, empty = () => { runs++; return missing(); };
+  const emptyRuns = runs;
+  withHistoricalReads(() => { proofs.historicalRefusalRead(first, emptyKey, empty, missing); proofs.historicalRefusalRead(first, emptyKey, empty, missing); });
+  withHistoricalReads(() => proofs.historicalRefusalRead(first, emptyKey, empty, missing));
+  assert.equal(runs - emptyRuns, 2, 'An empty trail is reused inside its operation, never kept beyond it');
+  // Row 30: a cycle answered by onCycle and returned as an ordinary refusal of the same code is never kept.
+  const cycleKey = { ...key, parameters: 'cycle' };
+  const cyclic = (): Outcome => { runs++; first.get(anchor.id); return proofs.historicalRefusalRead(first, cycleKey, cyclic, missing); };
+  const cycleRuns = runs;
+  withHistoricalReads(() => { assert.deepEqual(proofs.historicalRefusalRead(first, cycleKey, cyclic, missing), missing());
+    proofs.historicalRefusalRead(first, cycleKey, cyclic, missing); });
+  assert.equal(runs - cycleRuns, 2, 'The cyclic derivation is derived again, not kept');
+  // An exception is no refusal to keep.
+  const thrownKey = { ...key, parameters: 'thrown' };
+  let throws = 0;
+  const failing = (): Outcome => { throws++; first.get(anchor.id); throw new EngineError('record_corrupt', 'injected'); };
+  withHistoricalReads(() => { assert.throws(() => proofs.historicalRefusalRead(first, thrownKey, failing, missing));
+    assert.throws(() => proofs.historicalRefusalRead(first, thrownKey, failing, missing)); });
+  assert.equal(throws, 2);
+});
+
+test("PF3.1 return №3473 (rows 16-18, 24): every direct read inside a traced read is a dependency of its own at its place — before, between and after a child — cold and kept, with no child, a cold child or a kept one; ordered observers get the cold stream, distinct ones its set; a moved direct read derives the parent again", t => {
+  for (const childMode of ['none', 'cold', 'kept'] as const) for (const mode of ['ordered', 'distinct'] as const) for (const moved of ['y', 'w'] as const) {
+    const { first } = historicalStores(t);
+    const rows = Object.fromEntries(['x', 'y', 'z', 'w'].map(id => [id, first.write({ id: `ret:${id}`, kind: 'k', expected: 0, value: { id } })])) as Record<string, Revision<Json>>;
+    const counts = { outer: 0, inner: 0 };
+    let source: Store | undefined;
+    const child = (store: Store) => historicalRead(store, { reader: 'G7.completion-effective', project: 'garden', ref: reference(rows['z']!) },
+      () => { counts.inner++; return store.get<Json>(rows['z']!.id)!.value; }, noCycle);
+    // A child a traced caller may take must have been derived for a traced caller too (S1.4): warm it through a trace.
+    if (childMode === 'kept') withHistoricalReads(() => child(historicalTrace(first)));
+    const original = Store.prototype.get;
+    Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) {
+      if (args[0] === rows['x']!.id && source) {
+        source.get(rows['y']!.id);
+        if (childMode === 'none') source.get(rows['z']!.id); else child(source);
+        source.get(rows['w']!.id);
+      }
+      return original.apply(this, args);
+    } as typeof original;
+    const streams: string[][] = [];
+    try {
+      for (let operation = 0; operation < 4; operation++) {
+        const seen: string[] = [];
+        const traced = historicalTrace(first, ref => seen.push(`${ref.id}@${ref.revision}`), mode);
+        withHistoricalReads(() => historicalProof(traced, { reader: 'PF3.1.return', project: 'garden', ref: reference(rows['x']!) },
+          s => { counts.outer++; source = s; return s.get<Json>(rows['x']!.id)!.value; }, noCycle));
+        streams.push(seen);
+        if (operation === 1) { const row = first.get(rows[moved]!.id)!; first.write({ id: row.id, kind: 'k', expected: row.revision, value: { id: moved, moved: true } }); }
+      }
+    } finally { Store.prototype.get = original; source = undefined; }
+    const label = `${childMode}/${mode}/${moved}`;
+    const at = (revision: (id: string) => number) => ['y', 'z', 'w', 'x'].map(id => `ret:${id}@${revision(id)}`);
+    const cold = at(() => 1), after = at(id => id === moved ? 2 : 1);
+    const same = (stream: string[], expected: string[]) => mode === 'ordered' ? assert.deepEqual(stream, expected, label)
+      : assert.deepEqual([...stream].sort(), [...new Set(expected)].sort(), label);
+    same(streams[0]!, cold);
+    same(streams[1]!, cold);
+    same(streams[2]!, after);
+    same(streams[3]!, after);
+    assert.equal(counts.outer, 2, `${label}: kept until a direct read moves, then derived once again`);
+    assert.equal(counts.inner, childMode === 'none' ? 0 : 1, `${label}: the unchanged child — cold here or kept from before — is derived once in all`);
+  }
+});

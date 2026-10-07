@@ -49,6 +49,9 @@ interface ReadJournal {
   methods: Map<object, Map<string, unknown>>; conflict: boolean;
   /** A listed reader over the proven family of a genuine Store: its closure reads are observed (S1.4, №2410). */
   observing: boolean;
+  /** PF3.1 (№3459 §4): a cycle answered by onCycle while this proof or a nested one ran — whatever an action made of that
+   * answer, a refusal of such a derivation is never kept. */
+  cyclic: boolean;
   /** PF2 (№2905): the proved pending layer this proof observes its closure reads through. */
   layer: Store | null;
   /** PF2 (№2932-1): the pending layer this proof is derived at, whose own answers — and those of every layer beneath it —
@@ -72,8 +75,14 @@ let sharedProofs: WeakMap<Store, Map<string, HistoricalProof & { frozen: boolean
 const sharedRetained = new WeakMap<Store, Map<string, HistoricalProof & { frozen: boolean }>>();
 let proofCaptures: ReadJournal[] = [];
 let readStack: ReadObservation[][] = [];
+/** PF3.1 (№3459 §3): beside each frame of readStack, the physical Store reads that proofs started inside that traced read
+ * made and accounted for themselves; the read counts only the rest as its own (never twice, №2201). */
+let readCredits: number[] = [];
+/** PF3.1 (№3473): the read each frame of readStack performs. A nested read of another record — another method, id or
+ * revision — is a dependency of its own, recorded as its own event where it happened; only the same read seen through
+ * one more trace folds into the frame that encloses it. */
+let readFrames: { method: ReadEvent['method']; id: string | undefined; revision: number | undefined }[] = [];
 let checkingFootprint = 0;
-let proofStarts = 0;
 function synchronous<T>(action: () => T): T {
   if (typeof action !== "function") invalid("history.action");
   const result = action();
@@ -169,6 +178,13 @@ const OBSERVED_READERS: ReadonlySet<string> = new Set([
   'G7.completion-assignment', 'G7.completion-work', 'G7.completion-cessation', 'G7.completion-owner', 'G7.completion-close',
   'G7.answers-assignment', 'A3.series-history', 'A3.3.full-gaps', 'A3.3.mechanism-slice', 'A3.3.mechanism-admission',
   'E2.question-packet', 'E4.model-call-state', 'M6.route-result',
+  // PF3.1 (№3459 §2): audited the same way — each reads its root Store through the common historical readers and values
+  // derived from its key; a file, a workspace scope or a current admission is reached only on a current branch outside
+  // the cached action (D5 citations project the saved source as an owner document; E4 replays saved deliveries; a saved
+  // packet replays its carried readings; a research assessment replays its captured file snapshots).
+  'D5.citation', 'E4.continuation', 'E4.part-assembly', 'G7.completion-reuse', 'G7.completion-finalization',
+  'G7.completion-effective', 'G4b.answers', 'G4b.registration', 'G4b.evaluation', 'G4b.finding', 'G4b.refusal',
+  'E2.works-basis', 'E2.works-proposal-content', 'E2.part-result', 'D7.obligations', 'A3.progress-transition',
 ]);
 /**
  * S1.4 (№2302): the Store's own implementation reports every completed read and every write attempt, so a proof whose
@@ -214,7 +230,9 @@ observePendingReads((layer, id, revision, row) => {
 });
 function observedRead<T>(store: Store, method: ReadEvent['method'], id: string | undefined, revision: number | undefined, action: () => T): T {
   // Taken before the read: a commit between the stamp and the read can only make the stamp older, never mask a change.
-  const recorded = !readStack.length && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
+  const enclosing = readFrames.at(-1);
+  const distinct = !enclosing || enclosing.method !== method || enclosing.id !== id || enclosing.revision !== revision;
+  const recorded = distinct && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
   // PF1 (№2797-3): a row a pending layer answers from its own frozen rows is constant for that overlay; any other read is
   // witnessed by the genuine Store that serves it through proved layers, or by none.
   const served = recorded ? readServer(sourceView(store), method, id, revision) : null;
@@ -224,14 +242,17 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
   // beneath a trusted layer, or the source a trusted recovery snapshot delegates to.
   const delegate = !recorded ? null : pendingLayer(sourceView(store)) && witness ? witness : snapshotDelegate(sourceView(store));
   const invoked = delegate ? Reflect.get(delegate, method, delegate) : undefined;
-  const outermost = !readStack.length, reads = storeReads(), starts = proofStarts;
-  const observations: ReadObservation[] = []; readStack.push(observations);
+  const outermost = !readStack.length, reads = storeReads();
+  const observations: ReadObservation[] = []; readStack.push(observations); readCredits.push(0); readFrames.push({ method, id, revision });
   let value: T;
   try { value = action(); } finally {
-    readStack.pop();
-    // A proof run inside this read accounts for itself; then this read's own count is left unaccounted (never twice).
-    const capture = outermost && !checkingFootprint && proofStarts === starts ? proofCaptures.at(-1) : undefined;
-    if (capture) capture.accounted += storeReads() - reads;
+    readStack.pop(); readFrames.pop();
+    // PF3.1 (№3459 §3): a proof run inside this read has accounted for its own reads in its own journal, which its parent
+    // inherits; this read accounts for the rest — its own reads — once. The credit travels to an enclosing read.
+    const credit = readCredits.pop()!;
+    if (readCredits.length) readCredits[readCredits.length - 1]! += credit;
+    const capture = outermost && !checkingFootprint ? proofCaptures.at(-1) : undefined;
+    if (capture) capture.accounted += storeReads() - reads - credit;
   }
   const records = (method === 'get' ? value === null ? [] : [value] : value) as Revision<unknown>[];
   const refs = records.map(reference), source = sourceIdentity(store);
@@ -241,7 +262,7 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
   const child = observations.at(-1);
   if (!child || child.source !== source || child.method !== method || child.id !== id || child.revision !== revision)
     observations.push({ source, method, id, revision, references: refs });
-  if (readStack.length) readStack.at(-1)!.push(...observations);
+  if (!distinct) readStack.at(-1)!.push(...observations);
   else if (!checkingFootprint && historicalViews && proofCaptures.length) {
     // A read a layer delegated without a proved chain is an unknown projection: whole rows, always checked (№2827).
     const layer = pendingLayer(sourceView(store)), bodies = layer && served === null;
@@ -287,6 +308,7 @@ function completeJournal(journal: ReadJournal): void {
       for (const store of entry.stores) journal.stores.add(store);
       for (const [layer, witness] of entry.chains) journal.chains.set(layer, witness);
       if (entry.conflict) journal.conflict = true;
+      if (entry.cyclic) journal.cyclic = true;
       for (const [holder, names] of entry.methods) for (const [name, invoked] of names) noteMethod(journal, holder, name, invoked);
       for (const event of entry.footprint) remember(event);
     } else {
@@ -373,7 +395,7 @@ function adoptedJournal(events: ReadJournal, receiver: Store): ReadJournal {
     link = { entries: [events], sources: new Set([...events.sources].map(source => source === events.home ? receiver : source)),
       footprint: events.footprint, accounted: 0, complete: events.complete, tainted: events.tainted, stamps: events.stamps,
       stores: events.stores, chains: events.chains, methods: events.methods, conflict: events.conflict, observing: events.observing,
-      layer: null, root: null, home: receiver, alias: events.home };
+      cyclic: events.cyclic, layer: null, root: null, home: receiver, alias: events.home };
     links.set(receiver, link);
   }
   return link;
@@ -466,7 +488,7 @@ export function withHistoricalReads<T>(action: () => T): T {
   finally { historicalViews = null; sharedProofs = null; proofCaptures = []; }
 }
 function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (source: Store) => T,
-  onCycle: () => T, cacheable: (value: T) => boolean, traced: boolean): T {
+  onCycle: () => T, cacheable: (value: T) => boolean, traced: boolean, refusals = false): T {
   if (!(store instanceof Store) || !object(key) || !text(key.reader) || !text(key.project) || !isRef(key.ref)
     || typeof action !== 'function' || typeof onCycle !== 'function' || typeof cacheable !== 'function') invalid('history');
   const exact = canonical(key);
@@ -474,7 +496,7 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     const views = historicalViews!, source = sourceIdentity(store), base = layerBase(source);
     let view = views.get(source);
     if (!view) { view = { active: new Set(), proven: new Map() }; views.set(source, view); }
-    if (view.active.has(exact)) return synchronous(onCycle);
+    if (view.active.has(exact)) { for (const open of proofCaptures) open.cyclic = true; return synchronous(onCycle); }
     /**
      * PF2 (№2905, №2932-2/3): a proof of the base — proved there or through a layer of it, in this operation or kept —
      * serves this view when no own row of its chain answers what the proof read and the proof is current. The receiver
@@ -533,12 +555,16 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       else view.proven.clear();
     }
     view.active.add(exact);
-    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing,
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, stamps: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing, cyclic: false,
       layer: observing && base ? source : null, root: base ? source : null, home: source };
     // PF2: closure reads through a layer reach its base only while the layer still reads through the members it bound.
     if (events.layer) events.chains.set(source, base);
     proofCaptures.push(events);
-    const reads = storeReads(), gits = gitCalls(); proofStarts++;
+    // PF3.1 (№3459 §3): a derivation started inside a traced read observes its own reads — the read in progress outside it
+    // keeps its own observations and result; what this derivation reads is credited to that read when it ends.
+    const outerReads = readStack, outerCredits = readCredits, outerFrames = readFrames;
+    readStack = []; readCredits = []; readFrames = [];
+    const reads = storeReads(), gits = gitCalls();
     let completed = false;
     try {
       const result = synchronous(() => action(traced ? historicalTrace(store) : store));
@@ -549,7 +575,13 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       events.complete = observable && !events.tainted && storeReads() - reads === events.accounted && gitCalls() === gits
         && events.entries.every(entry => !('entries' in entry) || entry.complete);
       const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);
-      if (replayable && !(object(result) && result.ok === false) && cacheable(result)) {
+      // PF3.1 (№3459 §4): a refusal is a result like any other, but it is kept — here and across operations — only for a
+      // historical consumer that asked for it explicitly and is listed below, from a complete, acyclic derivation of plain
+      // data; every other refusal keeps the old rule, whatever its cacheable predicate says.
+      const refused = object(result) && result.ok === false;
+      const keptRefusal = refused && refusals && REFUSAL_READERS.has(key.reader) && events.complete && !events.cyclic
+        && plainValue(result, { all: true });
+      if (replayable && (refused ? keptRefusal : cacheable(result))) {
         const proof = { value: result, events, footprint: events.footprint, complete };
         view.proven.set(exact, proof);
         // Kept beyond this operation only with its full dependency area: a complete journal of this Store alone — never on
@@ -576,6 +608,8 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       }
       return result;
     } finally {
+      readStack = outerReads; readCredits = outerCredits; readFrames = outerFrames;
+      if (outerCredits.length) outerCredits[outerCredits.length - 1]! += storeReads() - reads;
       if (!completed) completeJournal(events);
       proofCaptures.pop(); recordRead(events); view.active.delete(exact);
       // The parent's own count includes these reads; what this proof traced is traced for the parent as well.
@@ -588,6 +622,15 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
 export function historicalRead<T>(store: Store, key: HistoricalReadKey, action: () => T,
   onCycle: () => T, cacheable: (value: T) => boolean = value => !(object(value) && value.ok === false)): T {
   return useHistoricalProof(store, key, action, onCycle, cacheable, false);
+}
+/**
+ * PF3.1 (№3459 §4): the historical readers whose own refusal, derived from exact saved inputs with a complete acyclic trail,
+ * is the same result at every repeat and may be kept like a success; it never stands for a current check.
+ */
+const REFUSAL_READERS: ReadonlySet<string> = new Set(['E4.continuation']);
+/** A historical read whose refusal may be kept as well — effective only for a reader listed in REFUSAL_READERS. */
+export function historicalRefusalRead<T>(store: Store, key: HistoricalReadKey, action: () => T, onCycle: () => T): T {
+  return useHistoricalProof(store, key, action, onCycle, value => !(object(value) && value.ok === false), false, true);
 }
 /** The callback uses this source for every read, so even a cold proof records its full transitive dependencies. */
 export function historicalProof<T>(store: Store, key: HistoricalReadKey, action: (source: Store) => T,
