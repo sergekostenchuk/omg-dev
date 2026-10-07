@@ -4,7 +4,10 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Store } from '../src/storage/store.js';
+import { Store, storeBodyCache } from '../src/storage/store.js';
+import { provenStore, storeView } from '../src/storage/store-view.js';
+import { transactionForTests } from '../src/om/atomic-gate.js';
+import { canonical, type Json } from '../src/canonical.js';
 import { reference } from '../src/pipeline/contracts.js';
 import {
   runProcess, stopOwnedGroup, classifyStopErrno, probeProcessIdentity,
@@ -736,4 +739,51 @@ test('D8.5 r3: resolution is CAS-guarded against a competing witness write', t =
   assert.equal(evaluateProcessStopWitnesses(store, ref.id, () => absent)[0]!.resolution, 'absent');
   const resolved = store.get<ProcessStopWitness>(wid)!;
   assert.equal(resolved.value.outcome, 'unconfirmed'); assert.equal(resolved.value.end?.proof, 'absent');
+});
+
+// PF3 (№3424): the witnesses of a subject are enumerated over a proven Store by the literal prefix of its head
+// identities; every other source keeps its own list. Rows 29-32 of outcome table §5.
+test('PF3 rows 29-32: one full witness set over a Store, a write-only view, a list-only source, a Proxy and a pending preview; foreign bodies stay unread; a later witness appears', t => {
+  const store = storeFixture(t);
+  const attempt = (id: string, revision: number) => ({ id, revision, hash: 'c'.repeat(64) });
+  const unconfirmed = (pid: number) => new EngineError('process_stop_unconfirmed', 'still unproven',
+    { outcome: 'unconfirmed', stage: 'post-check', target: 'child', pid, errno: null, cause: null });
+  writeProcessStopWitness(store, attempt('task-run:p', 1), { child: null, pid: 101 }, unconfirmed(101));
+  writeProcessStopWitness(store, attempt('task-run:p', 2), { child: null, pid: 102 }, unconfirmed(102));
+  writeProcessStopWitness(store, attempt('task-run:p2', 1), { child: null, pid: 201 }, unconfirmed(201));
+  store.writeMany([{ id: 'process-stop:task-run:p:junk', kind: 'other-kind', expected: 0, value: { not: 'a witness' } },
+    { id: 'pf3:research-context', kind: 'research-context', expected: 0, value: { text: 'x'.repeat(1_000_000) } }]);
+  const same = (left: unknown, right: unknown, message?: string) => assert.equal(canonical(left as Json), canonical(right as Json), message);
+  // Rows 29, 31: the literal prefix of the subject, in entity order, the record of another kind included, another subject not.
+  const before = storeBodyCache(), fast = processStopWitnesses(store, 'task-run:p');
+  assert.ok(storeBodyCache().loadedChars - before.loadedChars < 1_000_000, 'Foreign bodies are not loaded');
+  assert.deepEqual(fast.map(row => row.id), ['process-stop:task-run:p:1', 'process-stop:task-run:p:2', 'process-stop:task-run:p:junk']);
+  const writeOnly = storeView(store, { write: (inputs, guards) => store.writeMany(inputs, guards) });
+  assert.equal(provenStore(writeOnly), store);
+  same(processStopWitnesses(writeOnly, 'task-run:p'), fast);
+  same(processStopWitnesses({ list: <T,>(kind?: string) => store.list<T>(kind) }, 'task-run:p'), fast);
+  // Row 30: any other source is enumerated by its own list, errors included; no new method is required of it.
+  const failure = new Error('list failed');
+  assert.throws(() => processStopWitnesses({ list: () => { throw failure; } }, 'task-run:p'), (error: unknown) => error === failure);
+  let listed = 0;
+  const proxy = new Proxy(store, { get(target, prop) {
+    if (prop === 'list') return (kind?: string) => { listed++; return target.list(kind); };
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  same(processStopWitnesses(proxy, 'task-run:p'), fast);
+  assert.equal(listed, 1);
+  const tx = transactionForTests(store), pending = fast[0]!;
+  tx.add({ writes: [{ id: 'process-stop:task-run:p:3', kind: pending.kind, expected: 0, value: structuredClone(pending.value) }], guards: [] });
+  assert.deepEqual(processStopWitnesses(tx.view, 'task-run:p').map(row => row.id),
+    ['process-stop:task-run:p:1', 'process-stop:task-run:p:2', 'process-stop:task-run:p:3', 'process-stop:task-run:p:junk'], 'A preview lists its pending witness');
+  assert.equal(store.get('process-stop:task-run:p:3'), null);
+  // Row 32: a witness another Store writes after the first enumeration appears; a reopened Store reads the same set.
+  const second = new Store(store.path);
+  t.after(() => second.close());
+  writeProcessStopWitness(second, attempt('task-run:p', 4), { child: null, pid: 104 }, unconfirmed(104));
+  const after = processStopWitnesses(store, 'task-run:p');
+  assert.deepEqual(after.map(row => row.id).slice(-2), ['process-stop:task-run:p:4', 'process-stop:task-run:p:junk']);
+  const reopened = new Store(store.path);
+  t.after(() => reopened.close());
+  same(processStopWitnesses(reopened, 'task-run:p'), after);
 });

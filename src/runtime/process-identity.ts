@@ -3,6 +3,7 @@ import { EngineError, requireCondition } from "../errors.js";
 import { canonical } from "../canonical.js";
 import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Revision } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 
 export function processStart(pid: number): string {
   const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 5000 });
@@ -200,7 +201,15 @@ export function processStopWitnesses(
   store: { list<T>(kind?: string): Revision<T>[] }, subjectId: string): Revision<unknown>[] {
   requireCondition(typeof subjectId === "string" && subjectId.length > 0,
     "process_stop_witness_invalid", "A witness listing needs the exact subject record");
-  return store.list().filter(record => record.id.startsWith(`process-stop:${subjectId}:`));
+  // PF3 (№3424 §3): a proven genuine Store enumerates the literal prefix of head identities and reads exactly those
+  // versions, without decoding foreign bodies; any other source keeps its own list, errors included.
+  const prefix = `process-stop:${subjectId}:`, genuine = provenStore(store);
+  if (!genuine) return store.list().filter(record => record.id.startsWith(prefix));
+  return genuine.identities('prefix', prefix).map(row => {
+    const record = genuine.get(row.id, row.revision);
+    requireCondition(record !== null, "record_corrupt", "A selected witness revision disappeared before it was read");
+    return record;
+  });
 }
 
 const isWitnessIdentity = (value: unknown): value is { pid: number; started: string } =>

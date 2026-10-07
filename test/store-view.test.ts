@@ -1,15 +1,17 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { StatementSync } from 'node:sqlite';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { types } from 'node:util';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
-import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { observeStore, Store, storeBodyCache, storeReads, type Revision, type StoreBodyCache, type StoreObserver, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { captureView, genuineStore, observePendingReads, pendingOverlay, pendingSelections, provenReads, provenStore, readServer, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import type { OmResult } from '../src/om/refusal.js';
@@ -1221,4 +1223,283 @@ test('PF2 (№2905) the selections a chain of pending layers answers itself are 
   Store.prototype.list = function (this: Store, ...args: Parameters<typeof list>) { return list.apply(this, args); } as typeof list;
   try { assert.equal(pendingSelections(outer), null, 'A base read replaced after the layers were built ends the proved chain'); }
   finally { Store.prototype.list = list; }
+});
+
+// PF3 (№3424): the body cache of a Store. Each test names the rows of outcome table §5 it pins down.
+function bodyDelta(before: StoreBodyCache): Omit<StoreBodyCache, 'limit'> {
+  const now = storeBodyCache();
+  return { hits: now.hits - before.hits, misses: now.misses - before.misses, loads: now.loads - before.loads,
+    loadedChars: now.loadedChars - before.loadedChars, digests: now.digests - before.digests, parses: now.parses - before.parses,
+    kept: now.kept - before.kept, evictions: now.evictions - before.evictions, oversized: now.oversized - before.oversized,
+    resets: now.resets - before.resets, bytes: now.bytes - before.bytes, entries: now.entries - before.entries };
+}
+function recordingObserver(store: Store, events: unknown[]): StoreObserver {
+  return { begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token, source, method, mode, id, revision, rows) => { events.push(canonical([source === store, method, mode, id ?? null, revision ?? null, rows as unknown as Json])); } };
+}
+
+test('PF3 rows 1-4, 14, 15: cold and warm reads give the same new Revisions; a warm exact body is neither loaded nor hashed again; identities read no body; every public read is one observed read', t => {
+  const { store } = fixture(t);
+  store.writeMany([{ id: 'pf3:a', kind: 'pf3-k', expected: 0, value: { n: 1, nested: { list: [1, 2] } } },
+    { id: 'pf3:b', kind: 'pf3-other', expected: 0, value: { text: 'тело' } }]);
+  store.write({ id: 'pf3:a', kind: 'pf3-k', expected: 1, value: { n: 2, nested: { list: [3] } } });
+  const reads = () => [store.get('pf3:a'), store.get('pf3:a', 1), store.get('pf3:missing'), store.get('pf3:a', 9),
+    store.list(), store.list('pf3-k'), store.list('pf3-none'), store.history('pf3:a'), store.history('pf3:missing')];
+  const events: unknown[] = [], previous = observeStore(recordingObserver(store, events));
+  let cold: unknown[], warm: unknown[], coldEvents: unknown[], warmEvents: unknown[];
+  try {
+    const before = storeBodyCache(), counted = storeReads();
+    cold = reads(); coldEvents = events.splice(0);
+    const first = bodyDelta(before);
+    assert.equal(storeReads() - counted, 9, 'Every public read is counted once');
+    assert.deepEqual([first.loads, first.digests], [3, 3], 'Three distinct exact bodies are loaded and checked once each');
+    const again = storeBodyCache(), recounted = storeReads();
+    warm = reads(); warmEvents = events.splice(0);
+    const second = bodyDelta(again);
+    assert.equal(storeReads() - recounted, 9);
+    assert.deepEqual([second.loads, second.digests, second.loadedChars, second.hits, second.parses], [0, 0, 0, 7, 7],
+      'A warm exact body is neither loaded nor hashed again, but every result is parsed anew');
+    assert.equal(canonical(warm as Json), canonical(cold as Json));
+    assert.deepEqual(warmEvents, coldEvents, 'A hit is the same logical read for the observer: method, request and rows');
+    assert.equal(coldEvents.length, 9, 'No inner SQL is reported as a read');
+    const plain = storeBodyCache();
+    assert.deepEqual(store.identities('get', 'pf3:a').map(row => [row.id, row.revision, row.kind]), [['pf3:a', 2, 'pf3-k']]);
+    assert.deepEqual(store.identities('list').map(row => row.id), ['pf3:a', 'pf3:b']);
+    assert.deepEqual(store.identities('list', 'pf3-other').map(row => row.id), ['pf3:b']);
+    assert.deepEqual(store.identities('history', 'pf3:a').map(row => row.revision), [1, 2]);
+    assert.deepEqual(store.identities('prefix', 'pf3:').map(row => row.id), ['pf3:a', 'pf3:b']);
+    const identities = bodyDelta(plain);
+    assert.deepEqual([identities.loads, identities.hits, identities.parses], [0, 0, 0], 'identities neither read nor touch a body');
+    assert.equal(events.length, 5);
+  } finally { observeStore(previous); }
+  // Row 4: a caller's change at any depth of a returned value reaches neither a later read nor a sibling result.
+  const got = store.get<{ n: number; nested: { list: number[] } }>('pf3:a')!;
+  got.value.nested.list.push(99); got.value.n = -1; (got as { hash: string }).hash = 'changed';
+  const listed = store.list<{ nested: { list: number[] } }>('pf3-k'), twice = store.list<{ nested: { list: number[] } }>('pf3-k');
+  listed[0]!.value.nested.list.length = 0;
+  assert.deepEqual(twice[0]!.value.nested.list, [3]);
+  store.history<{ nested: unknown }>('pf3:a')[0]!.value.nested = null;
+  assert.equal(canonical(store.get('pf3:a') as unknown as Json), canonical(cold[0] as Json));
+  assert.equal(canonical(store.history('pf3:a') as unknown as Json), canonical(cold[7] as Json));
+  // Row 14: a read that throws reports no successful end. Row 15: the cache adds no own member of the instance.
+  const { root } = fixture(t), closed = new Store(join(root, 'closed.sqlite'));
+  closed.write({ id: 'pf3:c', kind: 'pf3-k', expected: 0, value: 1 }); closed.get('pf3:c'); closed.close();
+  const failed: unknown[] = [], prior = observeStore(recordingObserver(closed, failed));
+  try { assert.throws(() => closed.get('pf3:c')); assert.throws(() => closed.list()); assert.throws(() => closed.history('pf3:c')); }
+  finally { observeStore(prior); }
+  assert.deepEqual(failed, [], 'A closed connection answers nothing from memory and reports no read');
+  assert.ok(genuineStore(store) && provenStore(store) === store, 'The private cache keeps the instance a genuine Store');
+  assert.deepEqual(Object.getOwnPropertyNames(store), ['path']);
+});
+
+test('PF3 rows 5-7, 11, 12: a second Store\'s writes are seen — absence is never kept, a new head appears, a head moved during a read never mixes into the selected version; close and a new database start a fresh area; two databases never share', t => {
+  const { root, store } = fixture(t);
+  const second = new Store(join(root, 'live.sqlite'));
+  t.after(() => second.close());
+  // Row 5.
+  assert.equal(store.get('pf3:late'), null);
+  assert.deepEqual(store.list('pf3-late'), []);
+  second.write({ id: 'pf3:late', kind: 'pf3-late', expected: 0, value: { v: 1 } });
+  assert.deepEqual(store.get('pf3:late')?.value, { v: 1 });
+  assert.equal(store.list('pf3-late').length, 1);
+  // Row 6: the external stamp drops the area; the earlier exact version still reads on its own.
+  const warmed = store.get('pf3:late')!, before = storeBodyCache();
+  second.write({ id: 'pf3:late', kind: 'pf3-late', expected: 1, value: { v: 2 } });
+  assert.deepEqual([store.get('pf3:late')?.revision, store.get('pf3:late')?.value], [2, { v: 2 }]);
+  assert.equal(bodyDelta(before).resets, 1, 'Another connection\'s commit drops the area before it answers');
+  assert.equal(canonical(store.get('pf3:late', 1) as unknown as Json), canonical(warmed as unknown as Json));
+  // Row 7: the head moves between the selection of a version and the load of its body.
+  second.writeMany([{ id: 'pf3:race:1', kind: 'pf3-race', expected: 0, value: { v: 'first' } },
+    { id: 'pf3:race:2', kind: 'pf3-race', expected: 0, value: { v: 'first' } }]);
+  const original = StatementSync.prototype.get, bodySql = 'SELECT body FROM revisions WHERE entity_id=? AND revision=?';
+  const raced = (id: string, read: () => unknown, move: string) => {
+    let armed = true;
+    StatementSync.prototype.get = function (this: StatementSync, ...args: Parameters<typeof original>) {
+      if (armed && this.sourceSQL === bodySql && (args as unknown[])[0] === id) {
+        armed = false;
+        const head = second.get(move)!;
+        second.write({ id: move, kind: 'pf3-race', expected: head.revision, value: { v: `moved ${head.revision}` } });
+      }
+      return original.apply(this, args);
+    } as typeof original;
+    try { return read(); } finally { StatementSync.prototype.get = original; assert.equal(armed, false, 'The second writer moved the head inside the read'); }
+  };
+  const single = raced('pf3:race:1', () => store.get('pf3:race:1'), 'pf3:race:1') as Revision;
+  assert.deepEqual([single.revision, single.value, single.hash], [1, { v: 'first' }, hashJson({ v: 'first' })]);
+  assert.deepEqual([store.get('pf3:race:1')?.revision, store.get('pf3:race:1')?.value], [2, { v: 'moved 1' }]);
+  const listed = raced('pf3:race:2', () => store.list('pf3-race'), 'pf3:race:1') as Revision[];
+  assert.deepEqual(listed.map(row => [row.id, row.revision, row.value, row.hash === hashJson(row.value)]),
+    [['pf3:race:1', 2, { v: 'moved 1' }, true], ['pf3:race:2', 1, { v: 'first' }, true]], 'One list is the selection it made, not re-read heads');
+  assert.deepEqual(store.list('pf3-race').map(row => row.revision), [3, 1]);
+  // Row 11: close frees the share; a closed connection answers nothing; a new database at the same path starts cold.
+  const path = join(root, 'scratch.sqlite'), scratch = new Store(path);
+  scratch.write({ id: 'pf3:s', kind: 'pf3-s', expected: 0, value: { v: 'old' } });
+  scratch.get('pf3:s');
+  const held = storeBodyCache();
+  scratch.close();
+  assert.ok(storeBodyCache().bytes < held.bytes && storeBodyCache().entries < held.entries, 'close releases its own entries');
+  assert.throws(() => scratch.get('pf3:s'));
+  for (const suffix of ['', '-wal', '-shm']) rmSync(path + suffix, { force: true });
+  const replaced = new Store(path);
+  replaced.write({ id: 'pf3:s', kind: 'pf3-s', expected: 0, value: { v: 'new' } });
+  const cold = storeBodyCache();
+  assert.deepEqual(replaced.get('pf3:s')?.value, { v: 'new' });
+  assert.equal(bodyDelta(cold).loads, 1);
+  replaced.close();
+  const reopened = new Store(path), opened = storeBodyCache();
+  assert.deepEqual(reopened.get('pf3:s')?.value, { v: 'new' });
+  assert.equal(bodyDelta(opened).loads, 1, 'A reopened Store reads with the first check again');
+  reopened.close();
+  // Row 12: equal ids, numbers and bodies in two databases, and equal bodies under two ids, never mix.
+  const left = new Store(join(root, 'left.sqlite')), right = new Store(join(root, 'right.sqlite'));
+  t.after(() => { left.close(); right.close(); });
+  left.writeMany([{ id: 'pf3:same', kind: 'pf3-left', expected: 0, value: { v: 1 } }, { id: 'pf3:twin', kind: 'pf3-twin', expected: 0, value: { v: 1 } }]);
+  right.write({ id: 'pf3:same', kind: 'pf3-right', expected: 0, value: { v: 1 } });
+  for (let round = 0; round < 2; round++) {
+    assert.deepEqual([left.get('pf3:same')?.kind, right.get('pf3:same')?.kind, left.get('pf3:twin')?.id, left.get('pf3:twin')?.kind],
+      ['pf3-left', 'pf3-right', 'pf3:twin', 'pf3-twin']);
+  }
+  const mine = left.get<{ v: number }>('pf3:same')!;
+  mine.value.v = 9;
+  assert.deepEqual(right.get('pf3:same')?.value, { v: 1 });
+});
+
+test('PF3 rows 8-10: own writes show new heads beside kept versions; a refused writeMany rolls back whole and keeps nothing; guards inside the transaction keep their own checked read', t => {
+  const { root, store } = fixture(t);
+  const second = new Store(join(root, 'live.sqlite'));
+  t.after(() => second.close());
+  const first = store.write({ id: 'pf3:w', kind: 'pf3-w', expected: 0, value: { v: 1 } });
+  store.get('pf3:w');
+  const next = store.write({ id: 'pf3:w', kind: 'pf3-w', expected: 1, value: { v: 2 } });
+  assert.equal(canonical(store.get('pf3:w') as unknown as Json), canonical(next as unknown as Json));
+  assert.equal(canonical(store.get('pf3:w', 1) as unknown as Json), canonical(first as unknown as Json));
+  // Row 9: the first element is written inside the transaction, the second conflicts.
+  const refused = storeBodyCache();
+  assert.throws(() => store.writeMany([{ id: 'pf3:new', kind: 'pf3-w', expected: 0, value: { v: 'n' } },
+    { id: 'pf3:w', kind: 'pf3-w', expected: 1, value: { v: 3 } }]), code('revision_conflict'));
+  assert.deepEqual([bodyDelta(refused).kept, bodyDelta(refused).hits], [0, 0], 'Nothing read inside the transaction is kept or answered from memory');
+  assert.equal(store.get('pf3:new'), null);
+  assert.deepEqual(store.history('pf3:new'), []);
+  assert.equal(store.get('pf3:w')?.revision, 2);
+  // A successful guarded writeMany over warm records reads them inside the transaction without the cache.
+  const warm = store.get('pf3:w')!, guarded = storeBodyCache();
+  store.writeMany([{ id: 'pf3:w', kind: 'pf3-w', expected: 2, value: { v: 3 } }], [reference(warm)]);
+  assert.deepEqual([bodyDelta(guarded).hits, bodyDelta(guarded).kept, bodyDelta(guarded).loads], [0, 0, 0]);
+  // Row 10: a positive guard moved by a second Store after warming, and an absence that appeared.
+  const held = store.get('pf3:w')!;
+  second.write({ id: 'pf3:w', kind: 'pf3-w', expected: 3, value: { v: 'second' } });
+  assert.throws(() => store.writeMany([{ id: 'pf3:other', kind: 'pf3-w', expected: 0, value: 1 }], [reference(held)]), code('input_stale'));
+  assert.equal(store.get('pf3:gone'), null);
+  second.write({ id: 'pf3:gone', kind: 'pf3-w', expected: 0, value: 1 });
+  assert.throws(() => store.writeMany([{ id: 'pf3:other', kind: 'pf3-w', expected: 0, value: 1 }], [{ id: 'pf3:gone', absent: true }]), code('input_stale'));
+  assert.equal(store.get('pf3:other'), null);
+});
+
+/** Rows 12-13 need a small budget: a copy of the compiled Store module with only its limit changed, loaded beside the
+ * real one — no setting of the engine and no hundreds of megabytes in a test. */
+async function limitedStoreModule(t: TestContext, limit: number) {
+  const dist = fileURLToPath(new URL('../src/storage/', import.meta.url)), anchor = 'const BODY_CACHE_LIMIT = 256 * 1024 * 1024;';
+  const source = readFileSync(join(dist, 'store.js'), 'utf8');
+  assert.equal(source.split(anchor).length, 2, 'The budget of the body cache was not identified');
+  const patched = source.replace(anchor, `const BODY_CACHE_LIMIT = ${limit};`)
+    .replace(/from "(\.\.?\/[^"]+)"/g, (_whole, path: string) => `from ${JSON.stringify(pathToFileURL(join(dist, path)).href)}`);
+  const root = mkdtempSync(join(tmpdir(), 'omg-store-limit-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'store-limited.mjs'), patched);
+  return { root, module: await import(pathToFileURL(join(root, 'store-limited.mjs')).href) as typeof import('../src/storage/store.js') };
+}
+
+test('PF3 rows 12, 13: one bounded budget for every Store of the process — eviction and an entry above the limit are ordinary reads; close frees its share', async t => {
+  const limit = 4096, { root, module } = await limitedStoreModule(t, limit), cache = module.storeBodyCache;
+  const one = new module.Store(join(root, 'one.sqlite')), two = new module.Store(join(root, 'two.sqlite'));
+  t.after(() => { one.close(); two.close(); });
+  const body = (size: number) => ({ text: 'x'.repeat(size) });
+  one.writeMany(['pf3:1', 'pf3:2', 'pf3:3'].map(id => ({ id, kind: 'pf3-limit', expected: 0, value: body(600) }))
+    .concat([{ id: 'pf3:big', kind: 'pf3-limit', expected: 0, value: body(3000) }]));
+  two.write({ id: 'pf3:1', kind: 'pf3-limit', expected: 0, value: body(600) });
+  for (const id of ['pf3:1', 'pf3:2', 'pf3:3']) assert.deepEqual(one.get(id)?.value, body(600));
+  let state = cache();
+  assert.deepEqual([state.kept, state.evictions, state.entries], [3, 1, 2], 'The third body evicts the least recently used one');
+  assert.ok(state.bytes <= limit, `Held ${state.bytes} of ${limit}`);
+  assert.deepEqual(one.get('pf3:big')?.value, body(3000));
+  state = cache();
+  assert.deepEqual([state.oversized, state.kept, state.entries], [1, 3, 2], 'A body above the budget is read the ordinary way and not kept');
+  const loads = state.loads;
+  assert.deepEqual(one.get('pf3:1')?.value, body(600), 'An evicted body is an ordinary read, not a refusal');
+  assert.equal(cache().loads - loads, 1);
+  assert.deepEqual(two.get('pf3:1')?.value, body(600));
+  state = cache();
+  assert.ok(state.bytes <= limit && state.entries === 2, 'Two Stores share one budget');
+  const held = state.bytes;
+  one.close();
+  assert.ok(cache().bytes < held, 'close frees the entries of its own area');
+  two.close();
+  assert.deepEqual([cache().bytes, cache().entries], [0, 0]);
+});
+
+const PF3_BASE = '5929ea25cb7d54d2d5c5a87859b64481e2d1f038';
+/** Row 16: the Store of the base commit, loaded from Git whole in its own process, writes and reads its database. */
+function atBase(root: string, database: string, body: string): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(root, 'pf3-base-loader.mjs'), producer = join(root, 'pf3-base-producer.mjs'), served = join(root, 'pf3-base-served.log');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(PF3_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const store = new Store(database);
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
+    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 50_000_000 }));
+  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/storage/store.ts'), 'The producer ran on the Store of the base commit');
+  return output;
+}
+
+test('PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them', t => {
+  const { root } = fixture(t), database = join(root, 'era.sqlite');
+  const reads = `({ get: store.get('pf3:e:a'), exact: store.get('pf3:e:a', 1), absent: store.get('pf3:e:none'), list: store.list(),
+    kind: store.list('pf3-era'), history: store.history('pf3:e:a'), identities: store.identities('prefix', 'pf3:e:') })`;
+  const old = atBase(root, database, `store.writeMany([{ id: 'pf3:e:a', kind: 'pf3-era', expected: 0, value: { text: 'тело ✓', nested: [1, { k: null }] } },
+  { id: 'pf3:e:b', kind: 'pf3-other', expected: 0, value: [] }]);
+store.write({ id: 'pf3:e:a', kind: 'pf3-era', expected: 1, value: { text: 'вторая', 'üñí': '\\u2028' } });
+out(${reads});`) as Json;
+  const read = (store: Store) => ({ get: store.get('pf3:e:a'), exact: store.get('pf3:e:a', 1), absent: store.get('pf3:e:none'), list: store.list(),
+    kind: store.list('pf3-era'), history: store.history('pf3:e:a'), identities: store.identities('prefix', 'pf3:e:') });
+  const current = new Store(database), before = storeBodyCache();
+  const cold = read(current), warm = read(current);
+  current.close();
+  assert.ok(bodyDelta(before).hits > 0, 'The second read was answered warm');
+  const reopened = new Store(database), after = read(reopened);
+  reopened.close();
+  for (const result of [cold, warm, after]) assert.equal(canonical(result as unknown as Json), canonical(old));
+  assert.equal(canonical(atBase(root, database, `out(${reads});`) as Json), canonical(old), 'The base code still reads the database the new code opened');
 });

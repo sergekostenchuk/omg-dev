@@ -1,6 +1,9 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import type { ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { tmpdir } from 'node:os';
@@ -16,7 +19,9 @@ import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Que
   readAnswerCitations, prepareAnswerCitations, ANSWER_GROUNDS_ERA,
   confirmAcceptedAnswerResult, ANSWER_REFUSAL_CODES, type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
 import { Evidence, type Selector, type Source } from '../src/evidence/evidence.js';
-import { Store, type Write } from '../src/storage/store.js';
+import { observeStore, Store, storeBodyCache, type Write } from '../src/storage/store.js';
+import { provenStore } from '../src/storage/store-view.js';
+import { transactionForTests } from '../src/om/atomic-gate.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -1216,4 +1221,174 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   } finally { raw.close(); }
   f.restart();
   rejected(writeAcceptedAnswer(f.store, { ...request, draft: reference(f.store.get(q.draft.id)!) }), 'research_acceptance_binding_invalid');
+});
+
+// PF3 (№3424): the answer index enumerates a proven Store by the literal prefix of its head identities; any other view
+// keeps its own list. Each test names the rows of outcome table §5 it pins down.
+const forwarding = (store: Store): Store => new Proxy(store, { get(target, prop) {
+  const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+} });
+const searchOf = (store: Store, project: string, target: string) => prepareAnswerSearch(store, { project, target, field: 'answer' });
+const sameJson = (left: unknown, right: unknown, message?: string) => assert.equal(canonical(left as Json), canonical(right as Json), message);
+
+test('PF3 rows 17-19, 25: the prefix branch over a proven Store and the list branch of any other view prepare the same searches; foreign bodies stay unread', async t => {
+  const f = factFixture(t), other = 'discovery:another-fact';
+  f.store.writeMany([{ id: 'om-answer:other:junk', kind: 'other-kind', expected: 0, value: {} },
+    { id: `om-answer:${f.project}-2:junk`, kind: 'other-kind', expected: 0, value: {} },
+    { id: 'pf3:research-context', kind: 'research-context', expected: 0, value: { text: 'x'.repeat(1_000_000) } }]);
+  assert.equal(provenStore(forwarding(f.store)), null);
+  // Row 25: the fast branch reads its prefix and exact records, never the whole base.
+  const events: string[] = [], recorder = { begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token: object, _store: Store, method: string, mode: string, id: string | undefined) => { events.push(`${method}:${mode}:${id ?? ''}`); } };
+  let previous = observeStore(recorder), before = storeBodyCache();
+  try { ok(searchOf(f.store, f.project, f.target)); } finally { observeStore(previous); }
+  assert.ok(events.includes(`identities:prefix:om-answer:${f.project}:`) && !events.some(event => event.startsWith('list:')), events.join(' '));
+  assert.ok(!events.some(event => event.endsWith(':pf3:research-context')));
+  assert.ok(storeBodyCache().loadedChars - before.loadedChars < 1_000_000, 'The large foreign body is not loaded');
+  events.length = 0; previous = observeStore(recorder); before = storeBodyCache();
+  try { ok(searchOf(forwarding(f.store), f.project, f.target)); } finally { observeStore(previous); }
+  assert.ok(events.includes('list:list:'), 'Any other view keeps its own list');
+  assert.ok(storeBodyCache().loadedChars - before.loadedChars >= 1_000_000);
+  // Row 17: the same result, writes, guards, references and order, empty and with several answers, beside another obligation.
+  const compare = (label: string) => {
+    for (const target of [f.target, other]) sameJson(searchOf(f.store, f.project, target), searchOf(forwarding(f.store), f.project, target), `${label}: ${target}`);
+  };
+  compare('empty');
+  const a = await f.answer(), b = await f.answer(), batch = ok(prepareAcceptedAnswers(f.store, [a.request, b.request]));
+  ok(writeGuarded(f.store, { unit: 'D5-test', target: f.target, writes: batch.writes, guards: batch.guards }));
+  compare('two answers');
+  assert.equal(ok(searchOf(f.store, f.project, f.target)).answers.length, 2);
+  // Row 19: a view's own list decides what it shows; the prefix of the Store beneath is no shortcut around it.
+  const hiddenId = batch.records[0]!.id;
+  const hiding = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'list') return (kind?: string) => target.list(kind).filter(row => row.id !== hiddenId);
+    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  rejected(searchOf(hiding, f.project, f.target), 'answer_record_invalid');
+  // Row 18: a record of the wrong kind inside the own namespace is the same addressed refusal on both branches.
+  f.store.write({ id: `om-answer:${f.project}:pf3-wrong-kind`, kind: 'other-kind', expected: 0, value: {} });
+  sameJson(rejected(searchOf(f.store, f.project, f.target), 'record_foreign'), rejected(searchOf(forwarding(f.store), f.project, f.target), 'record_foreign'));
+});
+
+test('PF3 rows 20, 21: a Transaction preview keeps its own list with pending answers; a warm search sees an answer a second writer adds, and an earlier preparation meets the same CAS', async t => {
+  const f = factFixture(t), a = await f.answer(), saved = ok(writeAcceptedAnswer(f.store, a.request));
+  const b = await f.answer(), prepared = ok(prepareAcceptedAnswer(f.store, b.request)), prefix = `om-answer:${f.project}:`;
+  const tx = transactionForTests(f.store);
+  tx.add({ writes: prepared.writes, guards: [] });
+  assert.ok(!tx.view.identities('prefix', prefix).some(row => row.id === prepared.record.id), 'The identities beneath do not show the pending answer');
+  const pending = ok(searchOf(tx.view, f.project, f.target));
+  assert.deepEqual(pending.answers.map(ref => ref.id).sort(), [saved.id, prepared.record.id].sort());
+  assert.deepEqual(pending.writes, [], 'The preview already holds the pending index of both answers');
+  assert.equal(f.store.get(prepared.record.id), null);
+  // Row 21.
+  const g = factFixture(t), first = ok(searchOf(g.store, g.project, g.target));
+  sameJson(ok(searchOf(g.store, g.project, g.target)), first, 'A warm empty search is the same search');
+  const c = await g.answer(), second = new Store(join(g.root, 'state.sqlite'));
+  t.after(() => second.close());
+  ok(writeAcceptedAnswer(second, c.request));
+  assert.equal(ok(searchOf(g.store, g.project, g.target)).answers.length, 1, 'The warm Store sees the answer another writer added');
+  rejected(writeGuarded(g.store, { unit: 'D5-test', target: g.target, writes: first.writes, guards: first.guards }), 'revision_conflict');
+  assert.equal(g.store.get<AnswerIndex>(first.record.id)!.value.answers.length, 1);
+});
+
+const PF3_BASE = '5929ea25cb7d54d2d5c5a87859b64481e2d1f038';
+/** Row 24: the code of the base commit, loaded from Git whole in its own process, works on the test's database. */
+function atBase(root: string, database: string, body: string): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(root, 'pf3-base-loader.mjs'), producer = join(root, 'pf3-base-producer.mjs'), served = join(root, 'pf3-base-served.log');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(PF3_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const store = new Store(database);
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
+    { cwd: repository, encoding: 'utf8', timeout: 300_000, maxBuffer: 50_000_000 }));
+  const loaded = readFileSync(served, 'utf8').split('\n');
+  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/om/accepted-answer.ts'), 'The producer ran on the modules of the base commit');
+  return output;
+}
+
+test('PF3 row 24: accepted answers and the index the base code 5929ea25 wrote prepare and read the same with the new code, warm and after reopen', async t => {
+  const f = factFixture(t), a = await f.answer(), b = await f.answer();
+  const args = JSON.stringify({ requests: [a.request, b.request], project: f.project, target: f.target });
+  const old = atBase(f.root, join(f.root, 'state.sqlite'), `const { writeAcceptedAnswer, prepareAnswerSearch, readAnswerSearch } = await import(src('om/accepted-answer.js'));
+const args = ${args};
+for (const request of args.requests) take(writeAcceptedAnswer(store, request));
+const search = take(prepareAnswerSearch(store, { project: args.project, target: args.target, field: 'answer' }));
+out({ search, read: take(readAnswerSearch(store, { project: args.project, record: { id: search.record.id, revision: search.record.revision, hash: search.record.hash } })) });`) as { search: { answers: unknown[] }; read: unknown };
+  assert.equal(old.search.answers.length, 2);
+  const check = (label: string) => {
+    const search = ok(searchOf(f.store, f.project, f.target));
+    sameJson(search, old.search, label);
+    sameJson(ok(readAnswerSearch(f.store, { project: f.project, record: reference(search.record) })), old.read, label);
+  };
+  check('cold'); check('warm');
+  f.restart();
+  check('reopened');
+});
+
+test('PF3 rows 26-28: basisView on the common pending layer keeps admission, visibility and closure references; layers of different rows or bases never share a result', async t => {
+  const f = factFixture(t), a = await f.answer(), accepted = ok(writeAcceptedAnswer(f.store, a.request));
+  const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: reference(f.input), answer: reference(accepted), question: a.request.question }));
+  const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(applied), graph: reference(f.graph), refinement: null, available: {},
+    choice: { choiceVersion: 'closed-fact', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project: f.project, input: reference(applied), graph: reference(f.graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project: f.project, level: 2, graph: reference(f.graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(f.store.get(`graph-layer:${f.project}:2`)!) } };
+  const current = ok(writeGaps(f.store, sources));
+  const request = (value: Json) => ({ project: f.project, basis: { pending: { id: accepted.id, kind: accepted.kind, expected: 0, value } },
+    target: f.target, field: 'answer', prior: { sources: f.gaps.sources, records: f.gaps.records },
+    current: { sources: structuredClone(current.sources) as GapRequest, records: current.records.map(reference) }, attempt: null, currentOnly: true });
+  const equal = request(clone(accepted.value) as unknown as Json), conflicting = request({ ...(accepted.value as object), field: 'other' } as unknown as Json);
+  // Row 26: an equal saved basis writes nothing new; a conflicting one is the same refusal over every base.
+  const genuine = ok(confirmAnswerGapClosure(f.store, equal));
+  assert.deepEqual(genuine.writes, []);
+  assert.ok(genuine.references.some(ref => canonical(ref) === canonical(reference(accepted))));
+  // Rows 27, 28: a registered layer over the Store, an opaque one over a Proxy and one over a Transaction preview see the
+  // same rows and give the same closure; one operation with layers of different rows keeps each result its own.
+  const tx = transactionForTests(f.store);
+  for (const base of [forwarding(f.store), tx.view]) {
+    sameJson(ok(confirmAnswerGapClosure(base, equal)), genuine);
+    sameJson(rejected(confirmAnswerGapClosure(base, conflicting), 'answer_record_invalid'), rejected(confirmAnswerGapClosure(f.store, conflicting), 'answer_record_invalid'));
+  }
+  withHistoricalReads(() => {
+    sameJson(ok(confirmAnswerGapClosure(f.store, equal)), genuine);
+    rejected(confirmAnswerGapClosure(f.store, conflicting), 'answer_record_invalid');
+    sameJson(ok(confirmAnswerGapClosure(f.store, equal)), genuine, 'A layer of other rows leaves no proof behind for this one');
+  });
+  const value = f.store.get<Record<string, unknown>>(accepted.id)!.value;
+  assert.deepEqual(value, accepted.value, 'The caller\'s and the saved objects are neither frozen nor changed by the layer');
+  assert.ok(!Object.isFrozen(equal.basis.pending.value) && !Object.isFrozen(value), 'A sealed caller value stays the caller\'s own');
 });

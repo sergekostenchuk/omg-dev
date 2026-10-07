@@ -1,6 +1,6 @@
 import { mkdirSync, lstatSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { canonical, digest, HASH_RE, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { migrate } from "./schema.js";
@@ -84,12 +84,53 @@ function decode<T>(row: Record<string, unknown>): Revision<T> {
     hash: String(row['sha256']), value: JSON.parse(body) as T };
 }
 
+/**
+ * PF3 (№3424 §2): the checked JSON text of exact saved revisions, kept so that a repeated read neither loads a body
+ * from SQLite again nor hashes it again. Only text that passed the first read's digest and JSON.parse is kept, in its
+ * own Store's area under the exact (id, revision, sha256); every read still parses a new value of its own, so callers
+ * share no mutable cell. Heads, absences, errors and any "checked" status are never kept. One least-recently-used
+ * budget bounds the areas of all Stores of the process together: an eviction, an entry above the budget or a released
+ * area is an ordinary read, never a refusal.
+ */
+const BODY_CACHE_LIMIT = 256 * 1024 * 1024;
+/** Accounting is conservative: the UTF-16 text of key and body, plus a fixed cost per entry. */
+const BODY_ENTRY_COST = 256;
+interface CachedBody { readonly area: Map<string, CachedBody>; readonly key: string; readonly body: string; readonly cost: number }
+const cachedBodies = new Set<CachedBody>();
+let cachedBytes = 0;
+const bodyCounters = { hits: 0, misses: 0, loads: 0, loadedChars: 0, digests: 0, parses: 0, kept: 0, evictions: 0, oversized: 0, resets: 0 };
+export interface StoreBodyCache {
+  hits: number; misses: number; loads: number; loadedChars: number; digests: number; parses: number; kept: number;
+  evictions: number; oversized: number; resets: number; bytes: number; entries: number; limit: number;
+}
+/** Diagnostics of the body cache (PF3): counters only; no proof, record, refusal or guard depends on them. */
+export function storeBodyCache(): Readonly<StoreBodyCache> {
+  return Object.freeze({ ...bodyCounters, bytes: cachedBytes, entries: cachedBodies.size, limit: BODY_CACHE_LIMIT });
+}
+const bodyKey = (id: string, revision: number, hash: string): string => `${hash}:${revision}:${id}`;
+function forgetBody(entry: CachedBody): void { cachedBodies.delete(entry); entry.area.delete(entry.key); cachedBytes -= entry.cost; }
+function keepBody(area: Map<string, CachedBody>, key: string, body: string): void {
+  const cost = 2 * (key.length + body.length) + BODY_ENTRY_COST;
+  if (cost > BODY_CACHE_LIMIT) { bodyCounters.oversized++; return; }
+  for (const oldest of cachedBodies) { if (cachedBytes + cost <= BODY_CACHE_LIMIT) break; forgetBody(oldest); bodyCounters.evictions++; }
+  const entry: CachedBody = { area, key, body, cost };
+  area.set(key, entry); cachedBodies.add(entry); cachedBytes += cost; bodyCounters.kept++;
+}
+function releaseArea(area: Map<string, CachedBody>): void { for (const entry of [...area.values()]) forgetBody(entry); }
+const IDENTITY_COLUMNS = "r.entity_id, r.revision, r.kind, r.sha256";
+
 export class Store {
   readonly path: string;
   #db: DatabaseSync;
   #busy = false;
   #closed = false;
   #commits = 0;
+  /** PF3: this connection's area of the body cache, its prepared statements, the data_version it last saw, and whether
+   * a writeMany transaction is open — inside it reads keep the previous uncached check. */
+  #bodies = new Map<string, CachedBody>();
+  #statements = new Map<string, StatementSync>();
+  #seen: unknown = undefined;
+  #writing = false;
   constructor(path: string) {
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -135,9 +176,45 @@ export class Store {
   get<T = Json>(id: string, revision?: number): Revision<T> | null {
     physicalReads++;
     const token = observer?.begin(this);
-    const found = this.#get<T>(id, revision);
+    const found = this.#writing ? this.#get<T>(id, revision) : this.#read<T>(id, revision);
     if (token) observer!.end(token, this, 'get', 'get', id, revision, found ? [found] : []);
     return found;
+  }
+  #statement(sql: string): StatementSync {
+    let statement = this.#statements.get(sql);
+    if (!statement) { statement = this.#db.prepare(sql); this.#statements.set(sql, statement); }
+    return statement;
+  }
+  /** Another connection's commit may have changed any row this area kept: the area is dropped before it answers. */
+  #current(): void {
+    const version = this.#statement("PRAGMA data_version").get()!['data_version'];
+    if (this.#seen !== undefined && version !== this.#seen && this.#bodies.size) { releaseArea(this.#bodies); bodyCounters.resets++; }
+    this.#seen = version;
+  }
+  #read<T>(id: string, revision?: number): Revision<T> | null {
+    this.#current();
+    const row = revision === undefined
+      ? this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id=?`).get(id)
+      : this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r WHERE entity_id=? AND revision=?`).get(id, revision);
+    return row ? this.#materialize<T>(row) : null;
+  }
+  /** The body of exactly the version a selection named — never re-read through a head that may have moved since. */
+  #materialize<T>(row: Record<string, unknown>): Revision<T> {
+    const id = String(row['entity_id']), revision = Number(row['revision']), kind = String(row['kind']), hash = String(row['sha256']);
+    const key = bodyKey(id, revision, hash), kept = this.#writing ? undefined : this.#bodies.get(key);
+    let body: string;
+    if (kept) { cachedBodies.delete(kept); cachedBodies.add(kept); bodyCounters.hits++; body = kept.body; }
+    else {
+      bodyCounters.misses++;
+      const loaded = this.#statement("SELECT body FROM revisions WHERE entity_id=? AND revision=?").get(id, revision);
+      requireCondition(loaded !== undefined, "record_corrupt", "A selected revision disappeared before its body was read");
+      body = String(loaded['body']); bodyCounters.loads++; bodyCounters.loadedChars += body.length; bodyCounters.digests++;
+      requireCondition(digest(body) === hash, "record_corrupt", "Stored revision checksum mismatch");
+    }
+    bodyCounters.parses++;
+    const value = JSON.parse(body) as T;
+    if (!kept && !this.#writing) keepBody(this.#bodies, key, body);
+    return { id, kind, revision, hash, value };
   }
   #get<T = Json>(id: string, revision?: number): Revision<T> | null {
     const row = revision === undefined
@@ -148,17 +225,20 @@ export class Store {
   list<T = Json>(kind?: string): Revision<T>[] {
     physicalReads++;
     const token = observer?.begin(this);
-    const sql = "SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision)";
-    const rows = kind === undefined ? this.#db.prepare(`${sql} ORDER BY entity_id`).all()
-      : this.#db.prepare(`${sql} WHERE kind=? ORDER BY entity_id`).all(kind);
-    const found = rows.map(row => decode<T>(row));
+    this.#current();
+    const sql = `SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN heads h USING(entity_id,revision)`;
+    const rows = kind === undefined ? this.#statement(`${sql} ORDER BY entity_id`).all()
+      : this.#statement(`${sql} WHERE kind=? ORDER BY entity_id`).all(kind);
+    const found = rows.map(row => this.#materialize<T>(row));
     if (token) observer!.end(token, this, 'list', 'list', kind, undefined, found);
     return found;
   }
   history<T = Json>(id: string): Revision<T>[] {
     physicalReads++;
     const token = observer?.begin(this);
-    const found = this.#db.prepare("SELECT * FROM revisions WHERE entity_id=? ORDER BY revision").all(id).map(row => decode<T>(row));
+    this.#current();
+    const found = this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r WHERE entity_id=? ORDER BY revision`).all(id)
+      .map(row => this.#materialize<T>(row));
     if (token) observer!.end(token, this, 'history', 'history', id, undefined, found);
     return found;
   }
@@ -179,6 +259,8 @@ export class Store {
       return { ...input, body, hash: digest(body) };
     });
     this.#db.exec("BEGIN IMMEDIATE");
+    // PF3 (№3424 §1 В4): inside the transaction every read keeps the uncached checked load and fills nothing.
+    this.#writing = true;
     try {
       for (const guard of checkedGuards) {
         if ('absent' in guard) {
@@ -202,9 +284,10 @@ export class Store {
         results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as T });
       }
       this.#db.exec("COMMIT");
+      this.#writing = false;
       this.#commits++;
       return results;
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    } catch (error) { this.#writing = false; this.#db.exec("ROLLBACK"); throw error; }
   }
   async snapshot(directory: string, options: SnapshotOptions = {}): Promise<Snapshot> {
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
@@ -214,6 +297,6 @@ export class Store {
   }
   close(): void {
     requireCondition(!this.#busy, "store_busy", "Wait for the snapshot before closing the store");
-    if (!this.#closed) { this.#db.close(); this.#closed = true; }
+    if (!this.#closed) { releaseArea(this.#bodies); this.#statements.clear(); this.#db.close(); this.#closed = true; }
   }
 }

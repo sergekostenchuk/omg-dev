@@ -11,7 +11,7 @@ import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-m
 import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { captureView } from '../storage/store-view.js';
+import { captureView, pendingOverlay, provenStore } from '../storage/store-view.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
@@ -788,8 +788,14 @@ function prepareAnswerIndex(store: Store, request: { project: string; target: st
     const id = answerIndexId(request.project, request.target, request.field), old = store.get<AnswerIndex>(id);
     const indexed = old ? loadAnswerSearch(store, { project: request.project, record: reference(old) }) : null;
     const existing: Ref[] = [], references: Ref[] = [...(indexed?.references ?? [])];
-    for (const row of store.list()) if (row.id.startsWith(acceptedAnswerNamespace(request.project))) {
-      const checked = loadAnswer(store, { project: request.project, record: reference(row) });
+    // PF3 (№3424 §3): over a proven genuine Store the project's answers are its literal prefix of head identities, read
+    // without decoding foreign bodies; every other view keeps its own list, whose pending rows its identities may not
+    // show. Either way each exact version, of any kind, goes through the common reader of the original view.
+    const namespace = acceptedAnswerNamespace(request.project), genuine = provenStore(store);
+    const rows: Ref[] = genuine ? genuine.identities('prefix', namespace).map(row => ({ id: row.id, revision: row.revision, hash: row.hash }))
+      : store.list().filter(row => row.id.startsWith(namespace)).map(reference);
+    for (const row of rows) {
+      const checked = loadAnswer(store, { project: request.project, record: row });
       if (checked.record.value.target === request.target && checked.record.value.field === request.field) {
         existing.push(reference(checked.record)); references.push(...checked.references);
       }
@@ -1209,11 +1215,9 @@ function basisView(store: Store, basis: AnswerBasis): { store: Store; ref: Ref; 
   const row = { id: write.id, kind: write.kind, value: copy(write.value), revision: 1, hash: hashJson(write.value) };
   const old = store.get(write.id);
   check(!old || same(old, row), 'answer_record_invalid', row.id, 'basis.pending', 'A pending basis conflicts with existing content');
-  const view = new Proxy(store, { get(target, prop) {
-    if (prop === 'get') return (id: string, revision?: number) => id === row.id && (revision === undefined || revision === 1) ? row : target.get(id, revision);
-    const member: unknown = Reflect.get(target, prop, target); return typeof member === 'function' ? member.bind(target) : member;
-  } });
-  return { store: view, ref: reference(row), writes: old ? [] : [write] };
+  // PF3 (№3424 §4): the common pending layer answers get of the row's head and own revision; everything else, list
+  // included, still reaches the base. It owns a detached frozen copy, and over an unknown base it stays opaque.
+  return { store: pendingOverlay(store, [row]), ref: reference(row), writes: old ? [] : [write] };
 }
 export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureRequest): OmResult<Sealed<{
   key: string; references: Ref[]; guards: Ref[]; writes: Write[]; attempt: AnswerAttempt | null;
