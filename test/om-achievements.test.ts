@@ -698,7 +698,62 @@ const LP6_BLOCK = "garden-consume-block";
 type Lp6Field = "nodes" | "state" | "checkKind";
 const lp6Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 /** The routes of today's B1 of the garden project: horizon, D1 and M6, no catalog. */
-function lp6Routes(store: Store, project: string): Revision<RoutesRecord> {
+import { dirname } from "node:path";
+const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
+/**
+ * The route the base code 7c7d3ccc writes, every engine module served from Git in its own process (LP7, №3393 §6 F1): the
+ * subject of these tests is several E4s of one block, which its genuine split routing keeps — today's routing joins them.
+ */
+function routesAtBase(store: Store, request: unknown): Revision<RoutesRecord> {
+  const root = dirname(store.path), repository = fileURLToPath(new URL("../../", import.meta.url));
+  const loader = join(root, "lp7-base-loader.mjs"), producer = join(root, "lp7-base-producer.mjs"), input = join(root, "lp7-base-input.json");
+  const served = join(root, "lp7-base-served.log"), typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+  writeFileSync(served, "");
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(LP7_BASE)} + ':' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { writeRoutes } = await import(src('om/routes.js'));
+const store = new Store(database);
+try {
+  const written = writeRoutes(store, JSON.parse(readFileSync(input, 'utf8')));
+  if (!written.ok) throw Error(JSON.stringify(written.refusal));
+  process.stdout.write(JSON.stringify(written.value));
+} finally { store.close(); }`);
+  writeFileSync(input, JSON.stringify(request));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output = JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, store.path, input],
+    { cwd: repository, encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 })) as Revision<RoutesRecord>;
+  assert.ok(readFileSync(served, "utf8").split("\n").includes("src/om/routes.ts"), "The route was written by the modules of the base code");
+  return output;
+}
+function lp6Routes(store: Store, project: string, joined = false): Revision<RoutesRecord> {
   const input = store.get(`om-input:${project}`)!, graph = store.get(`graph:${project}`)!;
   const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
     choice: { choiceVersion: `lp6-${input.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -706,12 +761,13 @@ function lp6Routes(store: Store, project: string): Revision<RoutesRecord> {
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
     works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
   const gaps = deliveredOf(writeGaps(store, sources));
-  return deliveredOf(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
-    tasks: [], catalog: { paths: [], records: [] }, previous: null })) as Revision<RoutesRecord>;
+  const request = { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
+    tasks: [], catalog: { paths: [], records: [] }, previous: null };
+  return joined ? deliveredOf(writeRoutes(store, request)) as Revision<RoutesRecord> : routesAtBase(store, request);
 }
 /**
- * A block whose B1 leaves its contract's nodes and state and its criterion's checkKind open, so M6 gives it one MC2
- * input-field batch per field. A round opens a managed attempt of its line on the routes of today's B1 with the batches
+ * A block whose B1 leaves its contract's nodes and state and its criterion's checkKind open, so the split routing of the
+ * base code gives it one MC2 input-field batch per field. A round opens a managed attempt of its line on the routes of today's B1 with the batches
  * of the named fields, and the scripted model answers each of them: the block's own E4 applies the decisions by D3.
  */
 function lp6Fields(t: test.TestContext, block = LP6_BLOCK) {
@@ -775,6 +831,24 @@ function lp6Fields(t: test.TestContext, block = LP6_BLOCK) {
         e4.push(reference(sent.value.record));
       }
       return { goal, e4, routes: reference(routes), series: reference(store.get(series.id)!) };
+    },
+    /** LP7: one managed attempt on today's routing, where the block's open input fields are one batch; the model answers the named ones. */
+    async joined(ordinal: number, values: Partial<Record<Lp6Field, Json>>) {
+      const routes = lp6Routes(store, project, true);
+      const batch = routes.value.batches.find(row => row.task === "input-field" && row.items.some(item => item.consumers.includes(block))
+        && new Set(row.items.map(item => item.field)).size > 1)!;
+      assert.ok(batch, `Today's routing joins the open input fields of ${block}`);
+      const goal: AttemptGoal = { key: `lp7:${ordinal}`, questions: batch.items.map(item => lp6LineKey(project, item.target, item.field)).sort(),
+        result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+      const series = deliveredOf(managedOpenAttempt(store, { ...address, attempt: ordinal, goal, completion: { routes: reference(routes), batches: [batch.id] } } as never));
+      const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+        environment: reference(configured), attempt: { series: reference(series), ordinal }, previous: [] })).record;
+      steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.filter(item => Object.hasOwn(values, item.field))
+        .map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: values[item.field as Lp6Field]! })) }, usage: lp6Usage });
+      writeFileSync(scenario, JSON.stringify({ database, steps }));
+      const sent = await runModelCall(store, { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" });
+      if (!sent.ok) assert.fail(`${sent.refusal.code} at ${JSON.stringify(sent.refusal.at)}: ${sent.refusal.message}`);
+      return { goal, e4: [reference(sent.value.record)], routes, batch, outcome: sent.value.outcome };
     },
     /** Closes the attempt by the claim its registry derives (H1 №1737 п.5) — the one producer of a full claim. */
     close(ordinal: number) {
@@ -882,4 +956,36 @@ test("LP6 row 10: a genuine applied E4 confirms nothing for another attempt, blo
   assert.equal(readInputFieldResult(f.store, nodes.e4[0]!, line2 as never).ok, false);
   // A record that is no E4 of this project is not even read as one.
   assert.equal(refusalOf(readInputFieldResult(f.store, f.adapter, own)).code, "achievement_unconfirmed");
+});
+
+test("LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1", async t => {
+  const values: Record<Lp6Field, Json> = { nodes: ["garden-produce-block", "garden-consume-block"], checkKind: "test",
+    state: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" } };
+  // The split packaging: the base code's routing, one E4 and one B1 revision per field.
+  const split = lp6Fields(t), splitKeys: string[] = [];
+  for (const [index, field] of (["nodes", "state", "checkKind"] as const).entries()) {
+    const round = await split.round(index + 1, [{ field, value: values[field] }]);
+    splitKeys.push(...lp6Keys(split.store, round.e4[0]!, split.context(round.goal, index + 1, round.e4)).keys);
+    split.close(index + 1);
+  }
+  assert.equal(split.store.get("om-input:garden")!.revision, 4);
+  // Row 23: today's routing joins them — one answer, one E4, one B1 revision, the very same set of keys.
+  const joined = lp6Fields(t), before = joined.store.get("om-input:garden")!.revision, once = await joined.joined(1, values);
+  assert.deepEqual([once.routes.value.grouping, [...new Set(once.batch.items.map(item => item.field))].sort()], ["block-input-v1", ["checkKind", "nodes", "state"]]);
+  assert.deepEqual([once.outcome?.kind, once.outcome?.unanswered], ["input-decisions", []]);
+  assert.equal(joined.store.get("om-input:garden")!.revision, before + 1, "One application, one B1 revision");
+  const onceRead = lp6Keys(joined.store, once.e4[0]!, joined.context(once.goal, 1, once.e4));
+  assert.deepEqual([...onceRead.keys].sort(), [...splitKeys].sort(), "Packaging does not change the subject keys");
+  assert.deepEqual(onceRead.filled.filter(item => item.field === "state").map(item => item.component).sort(), ["authority", "rollback", "writer"]);
+  // Row 24: nodes and a part of state are proved alone; checkKind and the rest of state stay open and join on the new B1.
+  const some = lp6Fields(t), part = await some.joined(1, { nodes: values.nodes, state: { writer: "garden-produce-block" } });
+  assert.deepEqual(part.outcome?.unanswered, part.batch.items.filter(item => item.field === "checkKind").map(item => item.gap));
+  const partRead = lp6Keys(some.store, part.e4[0]!, some.context(part.goal, 1, part.e4));
+  assert.deepEqual(partRead.filled.map(item => `${item.field}/${item.component}`).sort(), ["nodes/null", "state/writer"]);
+  some.close(1);
+  const rest = await some.joined(2, { state: values.state, checkKind: values.checkKind });
+  assert.deepEqual([...new Set(rest.batch.items.map(item => item.field))].sort(), ["checkKind", "state"], "The rest is one batch again");
+  const restRead = lp6Keys(some.store, rest.e4[0]!, some.context(rest.goal, 2, rest.e4));
+  assert.deepEqual(restRead.filled.filter(item => item.field === "state").map(item => item.component).sort(), ["authority", "rollback"], "A component decided before is no new key");
+  assert.deepEqual([...partRead.keys, ...restRead.keys].sort(), [...splitKeys].sort());
 });

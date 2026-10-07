@@ -252,7 +252,7 @@ import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { prepareQuestionTasks, prepareQuestionPacket, readQuestionPacket, readPartResult, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord,
   type PartProposalBody } from '../src/om/question-packet.js';
-import { writeRoutes } from '../src/om/routes.js';
+import { writeRoutes, type RoutesRecord } from '../src/om/routes.js';
 import { openSeries, beginAttempt, seriesRequestOf, readCompletionBinding, completionWorkId } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
@@ -306,11 +306,14 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
     questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
       .map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
   const source = store.get<{content: string}>(`source:${project}:brief`)!;
-  const routes = valueOf(writeRoutes(store, { project, gaps: gapRequest,
-    tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
-    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }));
+  // LP7 (№3393 §6 F2): every historical producer of these tests reads this route, so it is the base code's own record,
+  // written in its own process — the split route of its era, which today's code keeps current — never a joined one.
+  const routes = h15AtCommit({ root: dirname(store.path), database: store.path }, LP7_BASE, 'e4-routes', `const { writeRoutes } = await import(src('om/routes.js'));
+out(take(writeRoutes(store, args)));`, { project, gaps: gapRequest, tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
+    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }) as Revision<RoutesRecord>;
   return { graphData, graph, input, sources, gaps, gapRequest, source, routes };
 }
+const LP7_BASE = '7c7d3cccb88d0a6c17b21051069f0244d98248f9';
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
   seriesCommit?: string, material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
@@ -5123,4 +5126,29 @@ test('LP5 (№3278 rows 17, 19) a reuse carries a non-empty D7 to today\'s hando
   // only the works of the other operation, never asked here, keep the candidate open (the whole C4/G5 is the pass's test).
   const gate = prepareWorksSources(f.store, { project, results: [{ kind: 'reuse', record: reference(reuse) }] });
   assert.deepEqual(gate.ok ? 'accepted' : [gate.refusal.code, gate.refusal.at.field], ['work_blocking_gap_open', 'candidate']);
+});
+
+test('LP7 row 21: an input packet the base code 7c7d3ccc issued on its split route before the release is answered after it — managed and unmanaged, the exact route stays current and the paid answer applies, with no era refusal', async t => {
+  for (const managed of [true, false]) await t.test(managed ? 'managed' : 'unmanaged', async t => {
+    const f = e4Fixture(t, 'field', 100_000, 0, 5000, managed, false);
+    // The base code wrote this route split; on this very D1 today's birth rule joins the input fields of garden-consume-block.
+    assert.equal(f.routes.value.grouping, 'consumer-set-v1');
+    const split = f.routes.value.batches.filter(batch => batch.task === 'input-field'
+      && batch.items.every(item => ['nodes', 'state', 'checkKind'].includes(item.field) && item.consumers.includes('garden-consume-block')));
+    assert.ok(split.length > 1, 'The split era keeps one batch per field');
+    const issued = h15AtCommit(f, LP7_BASE, `lp7-issued-${managed}`, `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(reference(take(writeQuestionPacket(store, args)).record));`, f.packetRequest) as Ref;
+    // Today's admission keeps the exact route and finds the very packet the base code issued.
+    const admitted = valueOf(prepareQuestionPacket(f.store, f.packetRequest));
+    assert.deepEqual([admitted.existing, reference(admitted.record)], [true, issued]);
+    f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
+      results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
+        value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) }, usage }]);
+    const head = f.store.get(f.input.id)!, sent = valueOf(await runModelCall(f.store, { ...f.request, packet: issued }));
+    assert.equal(sent.outcome?.kind, 'input-decisions');
+    assert.equal(f.store.get(f.input.id)!.revision, head.revision + 1, 'The paid answer applies as one new B1 revision');
+    assert.equal(f.sent().length, 1);
+    f.restart();
+    assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(sent.record) })).record, sent.record);
+  });
 });

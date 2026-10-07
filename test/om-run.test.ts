@@ -3590,9 +3590,9 @@ function lp6Line(t: test.TestContext) {
     restart() { store.close(); store = new Store(database); },
     head: () => store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!,
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
-    old(name: string, ops: Lp6Op[]) {
+    old(name: string, ops: Lp6Op[], commit = LP6_BASE) {
       store.close();
-      const output = atCommit({ root, database }, LP6_BASE, name, LP6_OLD_BODY, { project, block, scenario, dispatch, steps, ops }) as
+      const output = atCommit({ root, database }, commit, name, LP6_OLD_BODY, { project, block, scenario, dispatch, steps, ops }) as
         { verdicts: string[]; analysis: Ref | null; steps: unknown[] };
       steps = output.steps;
       store = new Store(database);
@@ -3809,4 +3809,168 @@ test("LP6 return №3371: an accepted field beside a real failure of the same at
   ]);
   assert.deepEqual(mixed.verdicts, ["none", "none", "none"]);
   check(other, [/waiting for the owner/, /model_adapter_interrupted/, /model_adapter_interrupted/]);
+});
+
+import { readCompletionWorkAt } from "../src/om/model-call.js";
+import { completionWorkId } from "../src/om/series.js";
+import { writeGaps as lp7WriteGaps, type GapRequest as Lp7GapRequest } from "../src/om/gaps.js";
+import { writeRoutes as lp7WriteRoutes, prepareRoutes } from "../src/om/routes.js";
+import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
+const LP7_VALUES: Record<string, Json> = { nodes: ["garden-produce-block", "garden-consume-block"], checkKind: "test",
+  state: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" } };
+/** Today's routes of the LP6 line's current B1: the open input fields of its block are one batch (LP7). */
+function lp7Routes(f: ReturnType<typeof lp6Line>) {
+  const input = f.store.get(`om-input:${project}`)!, graph = f.store.get(`graph:${project}`)!;
+  const horizon = ok(writeHorizon(f.store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
+    choice: { choiceVersion: `lp7-${input.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const sources: Lp7GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(lp7WriteGaps(f.store, sources));
+  return ok(lp7WriteRoutes(f.store, { project, gaps: { sources: structuredClone(gaps.sources) as Lp7GapRequest, records: gaps.records.map(reference) },
+    tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+}
+
+test("LP7 row 30: one full answer to the joined input fields replaces B1 once; the rest of the attempt ends cleanly by that replacement, the v2 close takes every LP6 key, the line moves on without a false stop, and a reopen reads it all and pays nothing again", async t => {
+  const f = lp6Line(t), scenario = join(f.root, "scenario.json");
+  const routes = lp7Routes(f), byBlock = routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(f.block)));
+  const joined = byBlock.find(batch => batch.task === "input-field" && new Set(batch.items.map(item => item.field)).size > 1)!;
+  const expansion = byBlock.find(batch => batch.task === "node-expansion")!;
+  assert.deepEqual([routes.value.grouping, [...new Set(joined.items.map(item => item.field))].sort()], ["block-input-v1", ["checkKind", "nodes", "state"]]);
+  assert.ok(expansion);
+  const items = [...joined.items, ...expansion.items];
+  const goal = { key: "lp7:30", questions: items.map(item => lp7LineKey(project, item.target, item.field)).sort(), result: lp7Result(project, items[0]!.target, items[0]!.field) };
+  const series = ok(openAttempt(f.store, { ...f.address, attempt: 1, goal, completion: { routes: reference(routes), batches: [joined.id, expansion.id].sort() } } as never));
+  const packetOf = (batch: typeof joined) => ok(writeQuestionPacket(f.store, { project, routes: reference(routes), batch: batch.id,
+    environment: f.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const packet = packetOf(joined); packetOf(expansion);
+  writeFileSync(scenario, JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: joined.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: LP7_VALUES[item.field]! })) }, usage }] }));
+  const before = f.store.get(`om-input:${project}`)!.revision;
+  const sent = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+  assert.deepEqual([sent.outcome?.kind, f.store.get(`om-input:${project}`)!.revision], ["input-decisions", before + 1], "One application, one B1 revision");
+  // The unsent expansion of the same attempt ends by the replaced B1 of its own area — the LP4/LP5 door, never a failure.
+  const binding = ok(readCompletionBinding(f.store, project, reference(f.head()), 1))!;
+  for (let open = true; open;) {
+    const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+    const resolved = new Set(work.resolved.map(ref => ref.id));
+    const row = work.assignments.filter(item => !resolved.has(item.id)).sort((a, b) => Number(a.value.kind !== "root") - Number(b.value.kind !== "root"))[0];
+    open = row !== undefined;
+    if (row) ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(row) }));
+  }
+  const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: 1, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
+  assert.equal(ok(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: claim.outcome } as never)).verdict, "progress");
+  const close = lp6Close(f, 1);
+  assert.deepEqual([close.contract, close.outcome.reason], ["om-completion-close/v2", "result"]);
+  assert.deepEqual(close.outcome.achieved.map(item => item.key.startsWith("om-result:input-field:")), [true, true, true, true, true], "nodes, writer, authority, rollback, checkKind");
+  const line = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
+  assert.deepEqual([line.stop, line.withoutProgress, line.attempts.map(row => row.verdict)], [null, 0, ["progress"]], "No false stop");
+  assert.equal(f.store.get(`om-input:${project}`)!.revision, before + 1, "The cessation and the close replace no B1 again");
+  const sends = f.sent().length, saved = f.store.list().map(reference);
+  f.restart();
+  assert.deepEqual(lp6Close(f, 1), close);
+  assert.deepEqual(ok(readSeries(f.store, f.address as never)).value, line);
+  assert.deepEqual([f.sent().length, f.store.list().map(reference)], [sends, saved], "A reopen reads; it neither pays nor writes");
+});
+
+
+
+
+test("LP7 row 26: one question of a joined batch waiting for the owner holds that whole batch — none of its fields is asked again — while a free batch the wait does not hold is worked on", async t => {
+  const f = runFixture(t, ["encoding"], true, false, false, true);
+  const built = ok(writeRunBases(f.store, { project })), request = f.request();
+  assert.equal(f.store.get<RoutesRecord>(built.bases.routes.id, built.bases.routes.revision)!.value.grouping, "block-input-v1");
+  const source = () => f.store.get<{ content: string }>(`source:${project}:brief`)!;
+  const steps: Record<string, unknown>[] = [], sent: string[][] = [];
+  let state = ok(await advanceRun(f.store, request)).record.value.state;
+  for (let index = 0; index < 80 && !["waiting", "complete", "unable"].includes(state.phase); index++) {
+    if (state.phase === "step" && state.step.action === "assess") { steps.push(assessor("supported")); f.steps(steps); }
+    if (state.phase === "step" && state.step.action === "cycle") {
+      const packet = f.store.get<QuestionPacketRecord>((state.step.request as unknown as { packet: Ref }).packet.id)!;
+      const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
+      sent.push([...new Set(batch.items.map(item => item.field))].sort());
+      // M5 addresses the encoding; the block asks the owner one question of its joined batch and answers its fact.
+      steps.push(batch.items.every(item => item.field === "address") ? { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: { consumer: "garden-consume-block", kind: "repository-fact" } })) }, usage }
+        : batch.task === "input-field" ? { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_owner",
+          questionIds: batch.items.filter(item => item.field === "checkKind").map(item => item.gap), reason: "The owner decides the check kind", decision: "Name it" }, usage }
+        : { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" },
+          citations: [{ source: reference(source()), selector: { kind: "text-range", start: 0, end: source().value.content.length } }] })) }, usage });
+      f.steps(steps);
+    }
+    state = ok(await advanceRun(f.store, request)).record.value.state;
+  }
+  assert.deepEqual(sent[0], ["address"], "Row 6: M5 goes first, and the address keeps its own batch beside the joined one");
+  assert.deepEqual(sent.map(row => row.join("+")).sort(), ["address", "answer", "checkKind+nodes+state"],
+    `Each batch once: M5, the free fact and the joined batch whose one question waits: ${JSON.stringify(sent)}`);
+  assert.ok(actions(f.store).includes("assess"), "The free fact batch is worked on — its answer is assessed — beside the wait");
+  assert.equal(state.phase, "waiting");
+  // The wait holds the whole joined batch: further steps ask none of its fields again and pay nothing.
+  const calls = f.sent().length;
+  for (let index = 0; index < 3; index++) ok(await advanceRun(f.store, request));
+  assert.deepEqual([f.sent().length, blockSeries(f).value.attempts.length], [calls, 1]);
+});
+
+const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
+test("LP7 row 21 (run): a field packet the base code 7c7d3ccc issued on its split route before the release is answered by today's code — the exact route stays current and the paid answer applies once", async t => {
+  const f = lp6Line(t);
+  f.old("lp7-issued", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", unsent: true }] }], LP7_BASE);
+  const packet = f.store.list<QuestionPacketRecord>("question-packet")[0]!;
+  const routes = ok(readRoutes(f.store, { project, record: packet.value.request.routes })).record as unknown as Revision<RoutesRecord>;
+  assert.equal(routes.value.grouping, "consumer-set-v1", "The base code's own split route");
+  // Split by field: today's birth rule joins exactly these (row 30 on the same line); the saved route stays current by its own algorithm.
+  assert.equal(routes.value.batches.filter(row => row.task === "input-field" && row.items.every(item => item.consumers.includes(f.block))).length, 3);
+  const saved = routes.value.request, again = ok(prepareRoutes(f.store, { project, gaps: saved.gaps as never, tasks: saved.tasks.map(record => ({ record })),
+    catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, previous: saved.previous }));
+  assert.deepEqual([again.existing, again.writes.length, reference(again.record)], [true, 0, reference(routes)]);
+  const batch = routes.value.batches.find(row => row.id === packet.value.request.batch)!;
+  writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: LP7_VALUES[item.field]! })) }, usage }] }));
+  const before = f.store.get(`om-input:${project}`)!.revision;
+  const sent = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+  assert.deepEqual([sent.outcome?.kind, f.store.get(`om-input:${project}`)!.revision, f.sent().length], ["input-decisions", before + 1, 1]);
+});
+
+test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state included — applies only them; on the new B1 today's routing joins the rest, and its answer completes the subject keys of one full answer", async t => {
+  const f = lp6Line(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];
+  const round = async (ordinal: number, values: Record<string, Json>) => {
+    const routes = lp7Routes(f), joined = routes.value.batches.find(batch => batch.task === "input-field" && batch.items.every(item => item.consumers.includes(f.block))
+      && new Set(batch.items.map(item => item.field)).size > 1)!;
+    const goal = { key: `lp7:${ordinal}`, questions: joined.items.map(item => lp7LineKey(project, item.target, item.field)).sort(), result: lp7Result(project, joined.items[0]!.target, joined.items[0]!.field) };
+    const series = ok(openAttempt(f.store, { ...f.address, attempt: ordinal, goal, completion: { routes: reference(routes), batches: [joined.id] } } as never));
+    const packet = ok(writeQuestionPacket(f.store, { project, routes: reference(routes), batch: joined.id, environment: f.dispatch.config,
+      attempt: { series: reference(series), ordinal }, previous: [] })).record;
+    steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: joined.items.filter(item => Object.hasOwn(values, item.field))
+      .map(item => ({ target: item.target, field: item.field, basis: item.record, value: values[item.field]! })) }, usage });
+    writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+    const sent = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+    const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: ordinal, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
+    assert.equal(ok(closeAttempt(f.store, { ...f.address, attempt: ordinal, outcome: claim.outcome } as never)).verdict, "progress");
+    keys.push(...lp6Close(f, ordinal).outcome.achieved.map(item => item.key));
+    return { joined, sent };
+  };
+  const first = await round(1, { nodes: LP7_VALUES.nodes!, state: { writer: "garden-produce-block" } });
+  assert.deepEqual(first.sent.outcome?.unanswered, first.joined.items.filter(item => item.field === "checkKind").map(item => item.gap));
+  assert.equal(keys.length, 2, "nodes and the writer of state only");
+  const second = await round(2, { state: LP7_VALUES.state!, checkKind: "test" });
+  assert.deepEqual([...new Set(second.joined.items.map(item => item.field))].sort(), ["checkKind", "state"], "Row 14: the new B1's route joins the rest");
+  assert.deepEqual([keys.length, f.store.get(`om-input:${project}`)!.revision], [5, 3], "The rest adds authority, rollback and checkKind — never the writer again");
+  assert.deepEqual(ok(readSeries(f.store, f.address as never)).value.withoutProgress, 0);
+});
+
+test("LP7 row 22 (run): the routes, packets, paid applied answer and close the base code 7c7d3ccc wrote are read by today's code after a reopen exactly as written — nothing is executed again to read them", async t => {
+  const f = lp6Line(t);
+  f.old("lp7-history", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", value: LP7_VALUES.nodes! }, { field: "checkKind", unsent: true }] },
+    { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 }], LP7_BASE);
+  f.restart();
+  const before = f.store.list().map(reference), calls = f.sent().length;
+  const routes = f.store.list<RoutesRecord>("route-result");
+  assert.ok(routes.length > 0 && routes.every(row => row.value.grouping === "consumer-set-v1"), "The base code's own split routes");
+  for (const row of routes) assert.deepEqual(ok(readRoutes(f.store, { project, record: reference(row) })).record, row);
+  for (const row of f.store.list<QuestionPacketRecord>("question-packet")) assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(row) })), row);
+  const close = lp6Close(f, 1);
+  assert.deepEqual([close.contract, close.outcome.reason, close.outcome.achieved.length], ["om-completion-close/v2", "result", 1]);
+  assert.equal(ok(readSeries(f.store, f.address as never)).value.withoutProgress, 0);
+  assert.deepEqual([f.store.list().map(reference), f.sent().length, calls], [before, calls, 1], "Reading wrote nothing and paid nothing again");
 });

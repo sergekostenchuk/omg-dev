@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
@@ -32,7 +32,7 @@ import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
 import { checkAnswerForm, prepareAnswerForm, checkNodeAnswerForm } from '../src/om/answer-form.js';
 import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
-import { prepareRoutes, readRoutes, writeRoutes, type RoutesRequest } from '../src/om/routes.js';
+import { prepareRoutes, readRoutes, writeRoutes, type RoutesRecord, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   preparePartResult, readPartResult, readPacketResponse, partResponseId, type PartResponseRecord,
   normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
@@ -300,13 +300,66 @@ test('E2 does not disguise storage execution faults as a producer refusal', t =>
   assert.deepEqual(snapshot(f.store), before);
 });
 
+/** The route of a fixture as `commit` writes it, with every engine module of that commit, in its own process (LP7 F2). */
+function routeAtCommit(f: { root: string; path: string }, commit: string, request: unknown): Sealed<Revision<RoutesRecord>> {
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), served = join(f.root, 'route-commit-served.log');
+  const loader = join(f.root, 'route-commit-loader.mjs'), producer = join(f.root, 'route-commit-producer.mjs'), argsFile = join(f.root, 'route-commit-input.json');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { writeRoutes } = await import(src('om/routes.js'));
+const store = new Store(database);
+try {
+  const result = writeRoutes(store, JSON.parse(readFileSync(input, 'utf8')));
+  if (!result.ok) throw Error(JSON.stringify(result.refusal));
+  process.stdout.write(JSON.stringify(result.value));
+} finally { store.close(); }`);
+  writeFileSync(argsFile, JSON.stringify(request));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, argsFile],
+    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 })) as Sealed<Revision<RoutesRecord>>;
+  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/om/routes.ts'), `The route was written by the modules of ${commit}`);
+  return output;
+}
 function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
-  resultForm: Json = { type: 'string' }) {
+  resultForm: Json = { type: 'string' }, routeCommit?: string) {
   const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer);
   for (const question of f.request.questions) question.resultForm = resultForm;
   const tasks = ok(prepareQuestionTasks(f.store, f.request));
-  const routes = ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps,
-    tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: ['src/format.ts'], records: [] }, previous: null }));
+  const routesRequest = { project: f.project, gaps: f.request.gaps,
+    tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: ['src/format.ts'], records: [] }, previous: null };
+  // LP7 (№3393 §6 F2): a historical producer reads the route its own commit wrote, never a route joined by today's code.
+  const routes = routeCommit ? routeAtCommit({ root: dirname(f.store.path), path: f.store.path }, routeCommit, routesRequest)
+    : ok(writeRoutes(f.store, routesRequest));
   const batch = routes.value.batches.find(batch => batch.model === 'MC1'
     && batch.items.some(item => item.target === 'discovery:encoding'))!;
   assert.ok(batch);
@@ -572,8 +625,8 @@ function crossedPacketGraph(sideBindings = 1): Graph {
   return graph;
 }
 
-function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1) {
-  const p = packetFixture(t, capacity, crossedPacketGraph(sideBindings)), { f } = p;
+function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, routeCommit?: string) {
+  const p = packetFixture(t, capacity, crossedPacketGraph(sideBindings), true, false, { type: 'string' }, routeCommit), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === 'garden-produce-block')!;
   assert.ok(batch);
   const source = ok(prepareFrameProposals(f.store, f.request.gaps.sources.operations));
@@ -3363,7 +3416,7 @@ test('MP1.1 rows 1,6,8,19: a selected chain through compatible historical enviro
 });
 
 test('MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain', async t => {
-  const { h15AtCommit } = await mp11CycleFixtures(t), p = expansionFixture(t), { f } = p;
+  const { h15AtCommit } = await mp11CycleFixtures(t), p = expansionFixture(t, 100_000, 1, MP11_BASE), { f } = p;
   const oldWhole = h15AtCommit(f, MP11_BASE, 'mp11-old-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
     out(take(prepareQuestionPacket(store, args)).record);`, p.request);
   const oldEnvironment = p.environment(oldWhole.value.fullChars - 1), oldRequest = { ...p.request, environment: reference(oldEnvironment) };
@@ -3384,4 +3437,32 @@ test('MP1.1 row 10: two individually proved parts from different brief versions 
   const view = pendingCallStore(f.store, [{ id, kind: 'question-packet', expected: 0, value }]);
   rejected(readQuestionPacket(view, { project: f.project, record: { id, revision: 1, hash: hashJson(value) } }), 'packet_chain_invalid');
   assert.deepEqual(snapshot(f.store), before);
+});
+
+test('LP7 row 29: a joined input packet is whole — ready when the capacity holds it, otherwise the former blocked packet_too_large with every item kept; never split or cut', t => {
+  for (const fits of [true, false]) {
+    const p = packetFixture(t, 400_000, crossedPacketGraph(1)), { f } = p;
+    const joined = p.routes.value.batches.find(batch => batch.task === 'input-field' && new Set(batch.items.map(item => item.field)).size > 1)!;
+    assert.ok(joined, "Today's routing joins the open input fields of garden-consume-block");
+    assert.equal(p.routes.value.grouping, 'block-input-v1');
+    // The fixture's attempt of this line works on its facts; the next one declares the joined goal of the same block.
+    const address = { project: f.project, block: p.block, line: 1 };
+    ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
+    const goal: AttemptGoal = { key: 'lp7:joined', questions: joined.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
+      result: gapLineExpectedResult(f.project, joined.items[0]!.target, joined.items[0]!.field) };
+    const series = ok(beginAttempt(f.store, { ...address, attempt: 2, goal } as never));
+    const request: QuestionPacketRequest = { ...p.request, batch: joined.id, attempt: { series: reference(series), ordinal: 2 } };
+    const whole = ok(prepareQuestionPacket(f.store, request)).record;
+    assert.equal(whole.value.state, 'ready');
+    const asked = ((whole.value.packet as Record<string, Json>).questions as unknown as { id: string }[]).map(item => item.id).sort();
+    assert.deepEqual(asked, joined.items.map(item => item.gap).sort(), 'One packet asks every field of the joined batch');
+    if (fits) { assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record, whole); continue; }
+    const small = { ...request, environment: reference(p.environment(whole.value.fullChars! - 1)) };
+    const blocked = ok(writeQuestionPacket(f.store, small)).record;
+    assert.deepEqual([blocked.value.state, blocked.value.refusal?.code, blocked.value.packet, blocked.value.plan],
+      ['blocked', 'packet_too_large', null, null], 'Not split into parts, not cut down to what fits');
+    assert.equal(blocked.value.fullChars, whole.value.fullChars);
+    const saved = ok(readRoutes(f.store, { project: f.project, record: reference(p.routes) })).record;
+    assert.deepEqual(saved.value.batches.find(batch => batch.id === joined.id)!.items, joined.items, 'The joined batch keeps every item');
+  }
 });

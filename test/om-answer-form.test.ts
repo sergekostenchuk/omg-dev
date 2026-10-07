@@ -53,6 +53,8 @@ function rejected(result: OmResult<unknown>, code: string) {
 function frozen(value: unknown): boolean {
   return value === null || typeof value !== 'object' || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
+const JOINED_VALUES: Record<string, Json> = { nodes: ['garden-produce-block', 'garden-consume-block'], checkKind: 'test',
+  state: { writer: 'garden-produce-block', authority: 'garden-user', rollback: 'garden-produce-block' } };
 const valueForm: Json = { type: 'object', additionalProperties: false, required: ['format', 'versions'], properties: {
   format: { type: 'string', enum: ['json', 'xml'] }, versions: { type: 'array', minItems: 1, items: { type: 'integer', minimum: 1 } },
 } };
@@ -134,7 +136,11 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false, mat
   assert.ok(fieldBatch);
   const fieldRaw = () => JSON.stringify({ results: fieldBatch.items.map(item => ({ target: item.target, field: item.field,
     value: { consumer: 'garden-consume-block', kind: 'repository-fact' }, basis: item.record })) });
-  return { project, root, graph, input, sources, gaps, routes, fieldBatch, fieldRaw, nodePacket, factPacket, question, body, requestId, raw,
+  // LP7: the open input fields of garden-consume-block, one batch of one complete consumer set in block-input-v1.
+  const joinedBatch = routes.value.batches.find(batch => batch.task === 'input-field' && new Set(batch.items.map(item => item.field)).size > 1)!;
+  const joinedRow = (item: Sealed<RoutedBatch>['items'][number], value: Json = JOINED_VALUES[item.field]!) =>
+    ({ target: item.target, field: item.field, value, basis: item.record });
+  return { project, root, graph, input, sources, gaps, routes, fieldBatch, fieldRaw, joinedBatch, joinedRow, nodePacket, factPacket, question, body, requestId, raw,
     answerRaw, questionIds, get store() { return store; },
     restart() { store.close(); store = new Store(database); } };
 }
@@ -988,4 +994,56 @@ test('MP3 row 23: read results keep UTF-16 units, pointer escapes, empty keys, a
     assert.equal(result.outcome === 'missing', missing, pointer);
     if (result.outcome === 'complete') assert.deepEqual((result as { value: unknown }).value, JSON.parse(canonical(value)), pointer);
   }
+});
+
+const decisionOf = (write: Write) => (write.value as { decision: { target: string; field: string; value: Json } }).decision;
+test('LP7 rows 24, 25: a joined batch takes exactly the answered fields — part of state included — and keeps the rest open; one wrong row among right ones refuses the whole form and changes no B1', t => {
+  const f = fixture(t), batch = f.joinedBatch, field = (name: string) => batch.items.find(item => item.field === name)!;
+  assert.deepEqual(batch.items.map(item => item.field).sort(), ['checkKind', 'nodes', 'state']);
+  const request = { project: f.project, routes: reference(f.routes), batch: batch.id, raw: JSON.stringify({ results: batch.items.map(item => f.joinedRow(item)) }) };
+  const before = snapshot(f.store);
+  // One full mixed answer is one form: a decision per field, nothing left open.
+  for (const action of [checkInputFieldAnswer, prepareInputFieldAnswer]) {
+    const whole = ok(action(f.store, request));
+    assert.deepEqual([whole.writes.map(write => decisionOf(write as Write).field).sort(), whole.unanswered], [['checkKind', 'nodes', 'state'], []]);
+  }
+  // Row 24: nodes and a part of state are taken as answered; checkKind stays open at its exact gap.
+  const partial = { ...request, raw: JSON.stringify({ results: [f.joinedRow(field('nodes')), f.joinedRow(field('state'), { writer: 'garden-produce-block' })] }) };
+  for (const action of [checkInputFieldAnswer, prepareInputFieldAnswer]) {
+    const form = ok(action(f.store, partial));
+    assert.deepEqual(form.unanswered, [field('checkKind').gap]);
+    assert.deepEqual(form.writes.map(write => decisionOf(write as Write)).sort((a, b) => a.field.localeCompare(b.field)), [
+      { target: field('nodes').target, field: 'nodes', value: ['garden-consume-block', 'garden-produce-block'] },
+      { target: field('state').target, field: 'state', value: { writer: 'garden-produce-block' } }]);
+  }
+  // Row 25: a foreign target or field, a repeated field, a foreign basis or a wrong value among right rows refuses it all.
+  const right = batch.items.map(item => f.joinedRow(item));
+  const wrong = [
+    [...right, { ...f.joinedRow(field('checkKind')), target: 'garden-R1#9' }],
+    [...right.filter(row => row.field !== 'checkKind'), { ...f.joinedRow(field('nodes')), field: 'checkKind', value: 'test' }],
+    [...right, f.joinedRow(field('nodes'))],
+    [...right.filter(row => row.field !== 'state'), { ...f.joinedRow(field('state')), basis: field('nodes').record }],
+    [...right.filter(row => row.field !== 'nodes'), f.joinedRow(field('nodes'), ['nonexistent-block'])],
+  ];
+  for (const rows of wrong) for (const action of [checkInputFieldAnswer, prepareInputFieldAnswer]) {
+    const result = action(f.store, { ...request, raw: JSON.stringify({ results: rows }) });
+    assert.equal(result.ok, false, canonical(rows)); if (!result.ok) assert.ok(result.refusal.at.target);
+  }
+  assert.deepEqual(snapshot(f.store), before, 'A checked or refused form writes nothing to B1');
+});
+
+test('LP7 row 19: a joined batch keeps every guard — a B1 moved after the form was prepared refuses the write with no partial one', t => {
+  const f = fixture(t), batch = f.joinedBatch;
+  const request = { project: f.project, routes: reference(f.routes), batch: batch.id, raw: JSON.stringify({ results: batch.items.map(item => f.joinedRow(item)) }) };
+  const prepared = ok(prepareInputFieldAnswer(f.store, request)), head = f.store.get(f.input.id)!;
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(head))));
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.routes))));
+  // A concurrent writer applies another decision to the same B1 first.
+  ok(writeAddressing(f.store, { project: f.project, input: reference(head), graph: reference(f.graph), decisions: [{ pending: clone(inputDecisionWrite({
+    project: f.project, input: reference(head), graph: reference(f.graph), layers: [], decision: { target: 'discovery:unaddressed-format', field: 'address',
+      value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write }] }));
+  const before = snapshot(f.store);
+  rejected(writeGuarded(f.store, { unit: 'E3-test', target: batch.id, writes: prepared.writes as Write[], guards: prepared.guards as Ref[] }), 'input_stale');
+  assert.deepEqual(snapshot(f.store), before);
+  assert.equal(prepareInputFieldAnswer(f.store, request).ok, false, 'The new B1 is no ground for the old form');
 });

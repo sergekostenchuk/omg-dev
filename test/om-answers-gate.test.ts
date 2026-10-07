@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { type Json } from '../src/canonical.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -36,7 +37,7 @@ import { assembleModelParts, readModelCallState, readPartAssembly, runModelCall 
 import { writeOmObligations } from '../src/om/obligations.js';
 import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { readRoutes, writeRoutes } from '../src/om/routes.js';
+import { readRoutes, writeRoutes, type RoutesRecord } from '../src/om/routes.js';
 import { beginAttempt, completeAttempt, openSeries, type AttemptGoal } from '../src/om/series.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { createOmFixture, gardenGraph } from './om-fixture.js';
@@ -157,7 +158,10 @@ function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, 
     gap: reference(other), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) : null;
   const tasks = [task, otherTask].filter((entry): entry is NonNullable<typeof task> => entry !== null)
     .map(entry => entry.writes.length ? { pending: clone(entry.writes[0]!) as Write } : { record: reference(entry.record) });
-  const route = ok(writeRoutes(store, { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null }));
+  // LP7 (№3393 §6 F2): the legacy producers of this suite read this route, so it is the base code's own record, written in
+  // its own process — the split route of that era, which today's code keeps current — never a route joined by today's code.
+  const route = atCommit({ root: dirname(store.path), path: store.path }, LP7_BASE, 'gate-route', `const { writeRoutes } = await import(src('om/routes.js'));
+out(take(writeRoutes(store, args)));`, { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null }) as Revision<RoutesRecord>;
   const request: AnswersGateRequest = { project, gaps: gapRead, routes: reference(route), results: [] };
   return { project, target, block, input, graph, horizon, gaps, blocking, route, request, task };
 }
@@ -1127,7 +1131,10 @@ test('G4b retains a checked MC2 assignment when an unrelated M6 container advanc
   assert.equal(firstGate.value.result.findings.some(item => item.at.target === first.gap.value.gap.target), false);
   const successor = ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps, tasks: [],
     catalog: { paths: [], records: [] }, previous: reference(f.route) }));
-  assert.deepEqual(successor.value.batches, f.route.value.batches);
+  // LP7 (№3393 §6 F3): today's successor of the split base route joins the block's input fields; the MC2 assignments stay.
+  const expansions = (batches: readonly { task: string }[]) => batches.filter(batch => batch.task === 'node-expansion');
+  assert.equal(successor.value.grouping, 'block-input-v1');
+  assert.deepEqual(expansions(successor.value.batches), expansions(f.route.value.batches));
   const request: AnswersGateRequest = { ...f.request, routes: reference(successor), results };
   const saved = ok(writeAnswersGate(f.store, request));
   assert.equal(saved.value.result.findings.some(item => item.at.target === first.gap.value.gap.target), false);
@@ -1276,6 +1283,7 @@ const canonicalOrder = <T>(values: readonly T[]): T[] => [...values].sort((a, b)
  * each module it serves from Git and refuses an engine module outside the checkout, so a missed prefix cannot fall
  * back to the current build and let an era test pass vacuously.
  */
+const LP7_BASE = '7c7d3cccb88d0a6c17b21051069f0244d98248f9';
 function atCommit(f: { root: string; path: string }, commit: string, name: string, body: string, input: unknown): unknown {
   const repository = fileURLToPath(new URL('../../', import.meta.url));
   const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
@@ -4432,4 +4440,22 @@ test('LP5 (return №3294 п.3) a never-dispatched work whose remaining acceptan
   // The common G7 closes it with its ledger absent: technical interrupted, the formula unchanged.
   ok(closeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
   assert.equal(outcomeOf(f, m).reason, 'interrupted');
+});
+
+test('LP7 row 7: beside the joined input of its block, an answer without a producer stays its own unserved batch — the joined batch is served whole', t => {
+  const f = fixture(t, 'design-decision', true, false, { block: 'garden-consume-block' });
+  // The explicit successor of the base route over the same D1 is born by today's rule: the block's input fields join.
+  const saved = f.route.value.request, joinedRoute = ok(writeRoutes(f.store, { project: f.project, gaps: saved.gaps as GapReadRequest,
+    tasks: saved.tasks.map(record => ({ record })), catalog: clone(saved.catalog), previous: reference(f.route) }));
+  assert.equal(joinedRoute.value.grouping, 'block-input-v1');
+  const joined = joinedRoute.value.batches.find(batch => batch.task === 'input-field' && new Set(batch.items.map(item => item.field)).size > 1)!;
+  const answer = joinedRoute.value.batches.find(batch => batch.task === 'input-field' && batch.items.some(item => item.field === 'answer'))!;
+  assert.ok(joined && answer);
+  assert.deepEqual([...new Set(joined.items.map(item => item.field))].sort(), ['checkKind', 'nodes', 'state']);
+  assert.ok(answer.items.every(item => item.field === 'answer'));
+  assert.deepEqual(joined.items[0]!.consumers, answer.items[0]!.consumers, 'The same complete consumer set, yet never one batch');
+  const producers = ok(readRouteProducers(f.store, { project: f.project, routes: reference(joinedRoute) }));
+  assert.deepEqual(producers.batches.find(row => row.batch === joined.id)!.unserved, [], 'Every joined field has its producer');
+  assert.deepEqual(producers.batches.find(row => row.batch === answer.id)!.unserved.map(row => [row.field, row.producer.code]),
+    answer.items.map(() => ['answer', 'route_result_unsupported']));
 });

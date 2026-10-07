@@ -39,7 +39,7 @@ import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeRoutes } from "../src/om/routes.js";
+import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport } from "../src/om/model-call.js";
 import { readAssessmentIntentAt, writeAssessmentIntent } from "../src/om/assessment.js";
@@ -1416,7 +1416,7 @@ const E50_COMMIT = "3eb5dac3c790ca988082840693969b06b5d81966";
  * Every engine module comes from that commit, in its own process.
  */
 function fixtureWriteAt<T>(root: string, path: string, commit: string,
-  operation: 'openSeries' | 'writeQuestionPacket', request: unknown): T {
+  operation: 'openSeries' | 'writeQuestionPacket' | 'writeRoutes', request: unknown): T {
   const repository = fileURLToPath(new URL("../../", import.meta.url));
   const loader = join(root, `${operation}-loader.mjs`), producer = join(root, `${operation}-producer.mjs`);
   const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
@@ -1441,12 +1441,12 @@ const [repository, database, request] = process.argv.slice(2);
 const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
 const { Store } = await import(src('storage/store.js'));
 const { reference } = await import(src('pipeline/contracts.js'));
-const { ${operation} } = await import(src('${operation === 'openSeries' ? 'om/series.js' : 'om/question-packet.js'}'));
+const { ${operation} } = await import(src('${operation === 'openSeries' ? 'om/series.js' : operation === 'writeRoutes' ? 'om/routes.js' : 'om/question-packet.js'}'));
 const store = new Store(database);
 try {
   const written = ${operation}(store, JSON.parse(request));
   if (!written.ok) throw Error(JSON.stringify(written.refusal));
-  process.stdout.write(JSON.stringify(${operation === 'openSeries' ? 'reference(written.value)' : 'written.value.record'}));
+  process.stdout.write(JSON.stringify(${operation === 'openSeries' ? 'reference(written.value)' : operation === 'writeRoutes' ? 'written.value' : 'written.value.record'}));
 } finally { store.close(); }`);
   const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
     { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
@@ -1490,9 +1490,11 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     questions: gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing"
       && !row.value.gap.deferral).map(gap => ({ gap: reference(gap), requirements: [{ pointer: "/contracts/0" }],
         resultForm: { type: "string" } })) }));
-  const routes = deliveredOf(writeRoutes(store, { project, gaps: gapRequest,
-    tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
-    catalog: { paths: ["e50-source.txt"], records: [] }, previous: null }));
+  const routesRequest = { project, gaps: gapRequest, tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
+    catalog: { paths: ["e50-source.txt"], records: [] }, previous: null };
+  // LP7 (№3393 §6 F2): the historical producer reads the route its own commit wrote, never a route joined by today's code.
+  const routes = seriesCommit ? fixtureWriteAt<Revision<RoutesRecord>>(root, path, seriesCommit, 'writeRoutes', routesRequest)
+    : deliveredOf(writeRoutes(store, routesRequest));
   const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(question => question.target === "discovery:encoding"))!;
   assert.ok(batch);
   const block = "garden-consume-block", source = store.get<{ content: string }>(`source:${project}:brief`)!;

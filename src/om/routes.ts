@@ -37,7 +37,7 @@ export interface RoutedBatch extends Omit<RouteBatch, 'items'> { items: (RouteBa
 export interface RouteSearch {
   gap: string; index: Ref; checks: { answer: Ref; invalidation: AnswerInvalidation | null }[];
 }
-export interface RoutesRecord { grouping?: 'consumer-set-v1'; project: string; request: SavedRoutesRequest; searches: RouteSearch[];
+export interface RoutesRecord { grouping?: 'consumer-set-v1' | 'block-input-v1'; project: string; request: SavedRoutesRequest; searches: RouteSearch[];
   routes: RoutedGap[]; batches: RoutedBatch[]; refusals: Refusal[] }
 export interface PreparedRoutes { record: Revision<RoutesRecord>; existing: boolean; writes: Write[]; guards: Ref[]; references: Ref[] }
 export interface RoutesReadRequest { project: string; record: Ref }
@@ -182,8 +182,10 @@ function batchKind(gap: Gap): Pick<RouteBatch, 'model' | 'task' | 'kind' | 'node
   return { model: 'MC2', task: 'node-expansion', kind: gap.kind, node: first.node, level: first.level };
 }
 
-type RouteGrouping = 'task-v1' | 'consumer-set-v1';
-const CURRENT_GROUPING: RouteGrouping = 'consumer-set-v1';
+type RouteGrouping = 'task-v1' | 'consumer-set-v1' | 'block-input-v1';
+// The block's own input fields, each a D3 decision of B1. Address is the M5 mechanism's and an answer field has no
+// producer: both keep their field batches, so a block's input never waits on them (LP7, №3393 §2).
+const BLOCK_INPUT_FIELDS: readonly string[] = Object.freeze(['nodes', 'state', 'checkKind']);
 function planVerifiedGaps(gaps: readonly Gap[], catalog: RouteCatalog, grouping: RouteGrouping): RoutePlan {
   const routes: PlannedRoute[] = [], groups = new Map<string, Omit<RouteBatch, 'id'>>();
   for (const gap of gaps) {
@@ -193,9 +195,11 @@ function planVerifiedGaps(gaps: readonly Gap[], catalog: RouteCatalog, grouping:
     if (gap.deferral) continue;
     const kind = batchKind(gap);
     if (!kind) continue;
-    // Small questions share the complete consumer set; node expansion stays indivisible by consumers.
-    const key = canonical({ ...kind, field: kind.task === 'input-field' ? gap.field : null,
-      ...(grouping === 'consumer-set-v1' && kind.task !== 'node-expansion' ? { consumers: sorted(gap.consumers) } : {}) });
+    // Small questions share the complete consumer set; node expansion stays indivisible by consumers. In block-input-v1
+    // the block's input fields of one complete consumer set are one batch: one answer applies them as one B1 revision.
+    const joined = grouping === 'block-input-v1' && kind.task === 'input-field' && BLOCK_INPUT_FIELDS.includes(gap.field);
+    const key = canonical({ ...kind, field: kind.task === 'input-field' && !joined ? gap.field : null,
+      ...(grouping !== 'task-v1' && kind.task !== 'node-expansion' ? { consumers: sorted(gap.consumers) } : {}) });
     const batch = groups.get(key) ?? { ...kind, items: [] };
     batch.items.push({ gap: gap.id, target: gap.target, field: gap.field, consumers: sorted(gap.consumers), addresses: known });
     groups.set(key, batch);
@@ -205,6 +209,15 @@ function planVerifiedGaps(gaps: readonly Gap[], catalog: RouteCatalog, grouping:
     return { id: hashJson(value), ...value };
   });
   return { routes: sorted(routes), batches: sorted(batches) };
+}
+/**
+ * The birth rule of a new record (LP7, №3393 §3): over one verified D1 both pure plans are drawn, and block-input-v1 is
+ * written only when it changes the complete composition of the batches; otherwise the record keeps consumer-set-v1 and
+ * its old bytes. A saved record is never classified again by it: its own grouping names its algorithm.
+ */
+function bornPlan(gaps: readonly Gap[], catalog: RouteCatalog): { grouping: RouteGrouping; plan: RoutePlan } {
+  const older = planVerifiedGaps(gaps, catalog, 'consumer-set-v1'), joined = planVerifiedGaps(gaps, catalog, 'block-input-v1');
+  return same(older.batches, joined.batches) ? { grouping: 'consumer-set-v1', plan: older } : { grouping: 'block-input-v1', plan: joined };
 }
 
 /** Plan the fallback work for unanswered gaps. Catalog entries are addresses, never answers or admission to a model call. */
@@ -223,7 +236,7 @@ export function planGapRoutes(collection: GapCollection, sources: GapSources, ca
   }
   const checked = gateGaps(collection, sources);
   if (!checked.passed) return { ok: false, refusal: checked.findings[0]! };
-  return delivered(planVerifiedGaps(expected.gaps as Gap[], catalog, CURRENT_GROUPING));
+  return delivered(bornPlan(expected.gaps as Gap[], catalog).plan);
 }
 
 function mergedWrites(writes: readonly Write[]): Write[] {
@@ -278,7 +291,9 @@ function selectTaskAnswers(store: Store, request: RoutesRequest, tasks: ReturnTy
   }
   return { answers, searches, writes, guards, references };
 }
-function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, grouping: RouteGrouping, history?: RouteSearch[]) {
+/** `era` is the algorithm of a saved record, null the birth rule of a new one, or a choice made on the saved request. */
+type RouteEra = RouteGrouping | null | ((saved: SavedRoutesRequest) => RouteGrouping | null);
+function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, era: RouteEra, history?: RouteSearch[]) {
   const source = routeSources(store, request, current), writes = [...source.writes], guards = [...source.guards], references = [...source.references];
   if (request.previous) {
     const previous = loadRoutes(store, { project: request.project, record: request.previous });
@@ -286,7 +301,9 @@ function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, gr
   }
   const { answers, searches, ...selection } = selectTaskAnswers(store, request, source.tasks, current, history);
   writes.push(...selection.writes); guards.push(...selection.guards); references.push(...selection.references);
-  const fallback = planVerifiedGaps(source.gaps.collection.gaps as Gap[], request.catalog, grouping);
+  const chosen = typeof era === 'function' ? era(source.request) : era, gaps = source.gaps.collection.gaps as Gap[];
+  const { grouping, plan: fallback } = chosen === null ? bornPlan(gaps, request.catalog)
+    : { grouping: chosen, plan: planVerifiedGaps(gaps, request.catalog, chosen) };
   const recordFor = (gap: string): Ref => reference(source.gaps.records.find(record => record.value.gap.id === gap)!);
   const taskFor = (gap: string): Ref | null => source.tasks.has(gap) ? reference(source.tasks.get(gap)!.record) : null;
   const routes: RoutedGap[] = fallback.routes.map(route => ({ ...route, input: source.gaps.sources.input, record: recordFor(route.gap),
@@ -298,7 +315,7 @@ function deriveRoutes(store: Store, request: RoutesRequest, current: boolean, gr
     const { id: _id, ...body } = batch, normalized = { ...body, items: sorted(items) };
     return [{ id: hashJson(normalized), ...normalized }];
   });
-  const value: RoutesRecord = { ...(grouping === 'consumer-set-v1' ? { grouping } : {}), project: request.project, request: source.request, searches: sorted(searches),
+  const value: RoutesRecord = { ...(grouping !== 'task-v1' ? { grouping } : {}), project: request.project, request: source.request, searches: sorted(searches),
     routes: sorted(routes), batches: sorted(batches), refusals: sorted(source.refusals) };
   return { value, writes: mergedWrites(writes), guards: unique(guards), references: unique(references) };
 }
@@ -323,9 +340,10 @@ function loadRoutes(store: Store, request: RoutesReadRequest) {
     for (const search of value.searches) if (!object(search) || !text(search.gap) || !isRef(search.index) || !Array.isArray(search.checks)
       || !search.checks.every(check => object(check) && isRef(check.answer) && (check.invalidation === null || object(check.invalidation))))
       fail('route_record_invalid', record.id, 'searches', 'Every historical search needs an exact index and explicit checks');
-    if (Object.hasOwn(value, 'grouping') && value.grouping !== CURRENT_GROUPING)
+    // History is derived strictly by the saved algorithm: no property is task-v1, never a guess among the others.
+    if (Object.hasOwn(value, 'grouping') && value.grouping !== 'consumer-set-v1' && value.grouping !== 'block-input-v1')
       fail('route_record_invalid', record.id, 'grouping', 'The saved routing contract is unsupported');
-    const grouping: RouteGrouping = Object.hasOwn(value, 'grouping') ? 'consumer-set-v1' : 'task-v1';
+    const grouping: RouteGrouping = Object.hasOwn(value, 'grouping') ? value.grouping as RouteGrouping : 'task-v1';
     const derived = deriveRoutes(store, normalized(source), false, grouping, value.searches as RouteSearch[]);
     if (record.revision !== 1 || record.id !== idOf(derived.value.request) || !same(value, derived.value))
       fail('route_record_invalid', record.id, 'content', 'Routing must be rederived from its exact saved sources and complete answer searches');
@@ -375,7 +393,14 @@ export function prepareManagedRouteBatch(store: Store, request: {
 export function prepareRoutes(store: Store, request: RoutesRequest): OmResult<Sealed<PreparedRoutes>> {
   requireStore(store); requireRequest(request); request = normalized(request);
   return outcome(() => {
-    const derived = deriveRoutes(store, request, true, CURRENT_GROUPING), id = idOf(derived.value.request), old = store.get<RoutesRecord>(id);
+    // A supported saved record stays current by its own algorithm while its sources and searches are: a new code alone
+    // needs no successor, so an issued assignment keeps its exact route (LP7, №3393 §3). Task-v1 and a new address take
+    // the birth rule; the old task-v1 then differs and still needs its explicit successor.
+    const derived = deriveRoutes(store, request, true, saved => {
+      const existing = store.get<RoutesRecord>(idOf(saved));
+      const proved = existing ? loadRoutes(store, { project: request.project, record: reference(existing) }).record.value : null;
+      return proved && Object.hasOwn(proved, 'grouping') ? proved.grouping as RouteGrouping : null;
+    }), id = idOf(derived.value.request), old = store.get<RoutesRecord>(id);
     if (old) {
       const checked = loadRoutes(store, { project: request.project, record: reference(old) });
       if (!same(checked.record.value, derived.value)) fail('route_stale', id, 'searches', 'This historical route no longer selects the current answer; prepare its successor explicitly');
@@ -385,7 +410,7 @@ export function prepareRoutes(store: Store, request: RoutesRequest): OmResult<Se
     return { record, existing: old !== null, writes, guards: unique([...derived.guards, ...(old ? [reference(old)] : [])]), references: derived.references };
   });
 }
-/** A delivered request in the current era is idempotent after source changes; older eras require an explicit successor. */
+/** A delivered request of a supported era is idempotent after source changes; task-v1 requires an explicit successor. */
 export function writeRoutes(store: Store, request: RoutesRequest): OmResult<Sealed<Revision<RoutesRecord>>> {
   requireStore(store); requireRequest(request); request = normalized(request);
   return outcome(() => {
@@ -395,7 +420,7 @@ export function writeRoutes(store: Store, request: RoutesRequest): OmResult<Seal
       tasks: sorted(tasks) }, old = store.get<RoutesRecord>(idOf(source));
     if (old) {
       const checked = loadRoutes(store, { project: request.project, record: reference(old) }).record;
-      if (checked.value.grouping !== CURRENT_GROUPING)
+      if (!Object.hasOwn(checked.value, 'grouping'))
         fail('route_stale', old.id, 'grouping', 'The historical routing era needs an explicit successor before current use');
       return checked;
     }
