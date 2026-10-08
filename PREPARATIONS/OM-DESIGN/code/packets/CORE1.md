@@ -44,7 +44,7 @@
 - Читает записи: src, test, package.json, tsconfig.json, scripts
 - Пишет записи: пакет ядра
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- Уже сделано до тебя: NR «Доверенное чтение: записанное с хэшем читается как есть, проверяется только новое (класс «проверенное чтение», 58 мест)» (src/om/model-call.ts, src/om/repeat-gate.ts, src/om/question-packet.ts, src/om/series.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/frame-obligations.ts, src/om/layer-basis.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/routes.ts, src/om/obligations.ts, src/om/refusal-journal.ts, src/om/accepted-answer.ts, src/om/assessment.ts, src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/result-identity.ts, src/om/horizon.ts, src/graph/task-obligations.ts, src/storage/store.ts, src/evidence/evidence.ts, src/history/proofs.ts, src/storage/store-view.ts, src/om/refusal.ts)
+- Уже сделано до тебя: NR «Доверенное чтение: записанное с хэшем читается как есть, проверяется только новое (класс «проверенное чтение», 58 мест)» (src/om/model-call.ts, src/om/repeat-gate.ts, src/om/question-packet.ts, src/om/series.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/frame-obligations.ts, src/om/layer-basis.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/routes.ts, src/om/obligations.ts, src/om/refusal-journal.ts, src/om/accepted-answer.ts, src/om/assessment.ts, src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/result-identity.ts, src/om/horizon.ts, src/graph/task-obligations.ts, src/storage/store.ts, src/evidence/evidence.ts, src/history/proofs.ts, src/storage/store-view.ts, src/om/refusal.ts); LP8 «Восстановление полученного разбора стопа A6, отвергнутого старым адаптером (серия M5:addressing держит живой проход)» (src/om/stop-analysis.ts, src/om/run.ts, src/om/model-call.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -81,6 +81,8 @@
 - `src/history/proofs.ts`
 - `src/storage/store-view.ts`
 - `src/om/refusal.ts`
+- `src/om/stop-analysis.ts`
+- `src/om/run.ts`
 
 ### Границы незавершённой интеграции
 
