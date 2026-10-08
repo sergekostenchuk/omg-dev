@@ -9,7 +9,7 @@ import { assessmentRefusalId, readAssessmentIntentAt, readAssessmentTerminalAt, 
 import { readCall, readFactAssessmentOrigin } from './call-record.js';
 import { readCandidate, gateCandidate, prepareCandidate, type CandidateRequest } from './frame-candidate.js';
 import { prepareFrameProposals, readFrameProposals } from './frame-proposals.js';
-import { readGaps, prepareCurrentGaps, type GapReadRequest, type Gap, type GapKind, type GapMoment } from './gaps.js';
+import { bypassRouteOf, readGaps, prepareCurrentGaps, type GapReadRequest, type Gap, type GapKind, type GapMoment } from './gaps.js';
 import { gapLineKey } from './gap-lines.js';
 import { historicalRead, readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
 import { readPartAssembly, readModelCallState, readModelTransport, readCompletionWorkAt, prepareCompletionProducts, readModelCycle,
@@ -21,8 +21,8 @@ import { answersGateAssignment, completionWorkId, readCompletionBinding, readCom
 import { UNIT_REFUSAL_KIND, answersSourceMarks, journalId, prepareJournalBatch, readJournalAt, registerAnswersSourceReader,
   unitRefusalNamespace, type UnitRefusalRecord } from './refusal-journal.js';
 import { readPartResult, readQuestionPacket } from './question-packet.js';
-import { ownerResultNamespace, readOwnerResult, OWNER_RESULT_KIND,
-  type OwnerReaders, type OwnerResult } from './owner-result.js';
+import { ownerAnswersOf, ownerResultNamespace, readOwnerResult,
+  type OwnerReaders } from './owner-result.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from './refusal.js';
 import { readRoutes, prepareRoutes, type RoutesRequest, type RoutedGap, type SavedRoutesRequest } from './routes.js';
@@ -146,14 +146,22 @@ const OWNER_ABSENT: NoProducer = Object.freeze({ present: false, code: 'owner_re
   message: 'An owner gap needs the separately authenticated H2 owner-result producer' });
 const ANSWER_UNSUPPORTED: NoProducer = Object.freeze({ present: false, code: 'route_result_unsupported', field: 'answer',
   message: 'This question has no OM answer producer in the current contract' });
-export function answerProducerOf(gap: Pick<Gap, 'code' | 'field' | 'kind'>): AnswerProducer {
-  if (!object(gap) || !text(gap.code) || !text(gap.field) || !text(gap.kind)) invalid('gap');
-  if (gap.kind === 'owner-decision') return OWNER_ABSENT;
-  if (gap.code === 'predecessor_question' && gap.field === 'answer'
-    && (gap.kind === 'design-decision' || gap.kind === 'environment-confirmation' || gap.kind === 'post-implementation-proof'))
+export function answerProducerOf(gap: Pick<Gap, 'code' | 'field' | 'kind' | 'moment'>): AnswerProducer {
+  if (!object(gap) || !text(gap.code) || !text(gap.field) || !text(gap.kind) || !text(gap.moment)) invalid('gap');
+  // OWN1 (№3702, №3711): the owner's standing word is the bypass — the model decides a design or an owner question of the
+  // pass itself (MC2 input-field, applied by F5.3); an owner's own H2 result still covers its gap when one is offered. A
+  // mode with the owner's choice among prepared answers comes later with the UI. A question asked at a later moment
+  // (a decision or an environment confirmation at task start, a proof after the task) is no question of the pass: the
+  // pass has no producer of it, and D7 carries it to its consumer — an owner's still waits for the owner's H2.
+  if (gap.code !== 'predecessor_question' || gap.field !== 'answer') return PRODUCER_PRESENT;
+  if (gap.kind === 'owner-decision' && gap.moment !== 'om-pass') return OWNER_ABSENT;
+  if (gap.kind === 'environment-confirmation' || gap.kind === 'post-implementation-proof' || gap.moment !== 'om-pass')
     return ANSWER_UNSUPPORTED;
   return PRODUCER_PRESENT;
 }
+/** OWN1: the bypass route of an owner question is its M6 route as much as the routes D1 keeps for an offered result. */
+const routeAllowed = (gap: Pick<Gap, 'kind' | 'code' | 'field' | 'moment'> & { readonly routes: readonly string[] }, route: string): boolean =>
+  gap.routes.includes(route) || route === bypassRouteOf(gap);
 /** The emission points of derive that name a question without an answer producer (`answerProducerOf` says absent). */
 export const NO_PRODUCER_EMISSIONS: readonly AnswersGateEmission[] = Object.freeze(['owner-absent', 'owner-offered',
   'unsupported-absent', 'unsupported-offered'] as const);
@@ -406,7 +414,10 @@ function negativeFact(store: Store, request: AnswersGateRequest, row: AnswerRout
 function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRouteResult, route: RoutedGap,
   gap: Gap, current: boolean, guards: TransactionGuard[], references: Ref[], writes: Write[], traced: Traced): AnswersGateTraceEntry | null {
   const target = gap.target, producer = answerProducerOf(gap);
-  if (route.route === 'owner' || !producer.present && producer.code === 'owner_result_unavailable') {
+  // OWN1 (№3713): the bypass routes an owner question to the model, yet an owner's own H2 result offered for it is still
+  // proved and admitted on any route — it is never replaced by the model's decision.
+  if (route.route === 'owner' || !producer.present && producer.code === 'owner_result_unavailable'
+    || gap.kind === 'owner-decision' && row.result !== null && row.result.id.startsWith(ownerResultNamespace(request.project))) {
     const recognized = row.result ? proveOfferedRecord(store, request.project, row.result) : null;
     // H2.0: an offered om-owner-result is proved by the common reader, and admitted only when its om-owner-question/v1
     // binds this exact gap record, this exact M6 routes Ref and this exact B1 input — a valid result of another
@@ -438,7 +449,7 @@ function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRoute
   }
   if (row.result === null) return traced('blocking-null', finding('answer_missing_for_blocking_gap', target, 'result',
     'A blocking gap needs an exact result', row.gap));
-  if (!gap.routes.includes(route.route)) return traced('result-route-disallowed', finding('answer_route_foreign', target,
+  if (!routeAllowed(gap, route.route)) return traced('result-route-disallowed', finding('answer_route_foreign', target,
     'route', 'The D1 knowledge kind does not allow this route'), offered(row.result), { allowed: [...gap.routes] });
   if (gap.kind === 'repository-fact' && (route.route === 'code' || route.route === 'research')
     && (row.result.id.startsWith('om-assessment-result:') || row.result.id.startsWith('model-call:'))) {
@@ -686,18 +697,12 @@ function admitOwnerResults(store: Store, request: AnswersGateRequest): AnswersGa
   const offered = new Set(request.results.map(row => row.gap.id));
   const additions: AnswerRouteResult[] = [];
   // list() over the kind — never identities(): the gate runs under store views whose declared read surface is
-  // get/list/history (om-commands drives through them), and a scan is a body read anyway.
-  for (const head of store.list<OwnerResult>(OWNER_RESULT_KIND)) {
-    if (!head.id.startsWith(ownerResultNamespace(request.project))) continue;
-    const proved = readOwnerResult(store, { project: request.project,
-      record: { id: head.id, revision: head.revision, hash: head.hash } }, OWNER_READERS);
-    if (!proved.ok) continue;
-    const question = proved.value.question;
-    if (!same(question.routes, request.routes) || !same(question.input, request.gaps.sources.input)) continue;
-    const gap = question.gap;
+  // get/list/history (om-commands drives through them), and a scan is a body read anyway. OWN1: the one scan and proof
+  // the pass also reads the owner's answers by (ownerAnswersOf).
+  for (const answer of ownerAnswersOf(store, request.project, request.routes, request.gaps.sources.input, OWNER_READERS)) {
+    const gap = answer.gap;
     if (!declared.has(gap.id) || !same(declared.get(gap.id), gap) || offered.has(gap.id)) continue;
-    additions.push({ gap: exactRef(gap), result: { id: head.id, revision: head.revision, hash: head.hash },
-      candidate: null });
+    additions.push({ gap: exactRef(gap), result: answer.result, candidate: null });
   }
   if (additions.length === 0) return request;
   return normalized({ ...request, results: [...request.results, ...additions] });
@@ -781,7 +786,7 @@ function derive(store: Store, request: AnswersGateRequest, current: boolean): De
       continue;
     }
     if (!same(row.gap, exact)) continue;
-    if (!gap.routes.includes(route.route)) emit('route-disallowed', finding('answer_route_foreign', gap.target,
+    if (!routeAllowed(gap, route.route)) emit('route-disallowed', finding('answer_route_foreign', gap.target,
       'route', 'The D1 knowledge kind does not allow this route', row.gap), exact, [row], trail, [], { allowed: [...gap.routes] });
     const deferred = Object.hasOwn(row, 'deferral') || gap.blocking && gap.deferral !== undefined;
     if (row.result === null && row.candidate !== null) {

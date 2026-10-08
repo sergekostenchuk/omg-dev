@@ -799,66 +799,71 @@ function mixedAnswer(f: Fixture, step: { request: unknown }) {
     questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(brief), selector: { kind: "text-range", start: 0, end: brief.value.content.length } }] })) }, usage };
 }
 
-test("H1.2 R13 R8 №2045-2 H1.5 a fact and a design decision nobody answers in one block: the fact runs through E4, E5 and G7 and is applied, the design decision is never planned nor paid for, and the pass ends on that exact question", async t => {
-  const f = runFixture(t, ["encoding", "spare"]);
-  const input = f.store.get(`om-input:${project}`)!;
-  // One block gets a fact (MC1) and a design decision (MC2): the second has no answer producer (H1.5, №2166).
-  ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph, decisions: ["encoding", "spare"].map(id => ({
-    pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph: f.graph, layers: [], decision: { target: `discovery:${id}`,
-      field: "address", value: { consumer: "garden-consume-block", kind: id === "encoding" ? "repository-fact" : "design-decision" } } })) as Write })) }));
-  const request = f.request(), answers: Record<string, unknown>[] = [], answered = new Set<string>();
-  ok(startRun(f.store, { project }));
-  let state: RunRecord["state"] | null = null;
-  for (let index = 0; index < 90 && !state; index++) {
-    const advanced = ok(await advanceRun(f.store, request)), now = advanced.record.value.state as unknown as RunRecord["state"];
+// OWN1 (№3711, №3713) replaces R13 R8 №2045-2: a design question of the pass has its producer — the model decides it.
+const OWN1_DECISION = { decision: "Keep the minimal spare records", rationale: "The minimal records do not duplicate the stage states",
+  alternatives: [{ option: "Wait for the owner", consequences: "The pass stands at this question until the owner answers" },
+    { option: "Record every spare command", consequences: "More records and a risk of duplicating the stage states" }] };
+/** The model of the bypass: a fact gets its cited answer, a decision batch the decision with its alternatives. */
+function decisionAnswer(f: Fixture, step: { request: unknown }) {
+  const saved = (step.request as { packet: Ref }).packet;
+  const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+  const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
+  if (batch.model !== "MC2") return mixedAnswer(f, step);
+  return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: OWN1_DECISION })) }, usage };
+}
+/** The paid requests that ask the model for a decision: their response form assigns an answer field. */
+const decisionCalls = (f: Fixture) => f.sent().filter(line => (typeof line === "string" ? line : JSON.stringify(line))
+  .includes('\\"field\\":{\\"const\\":\\"answer\\"}')).length;
+async function restWithDecisions(f: Fixture, request: RunRequest, limit = 90) {
+  const answers: Record<string, unknown>[] = [], answered = new Set<string>();
+  for (let index = 0; index < limit; index++) {
+    const now = ok(await advanceRun(f.store, request)).record.value.state as unknown as RunRecord["state"];
     if (now.phase === "step" && (now.step.action === "cycle" || now.step.action === "assess") && !answered.has(JSON.stringify(now.step.request))) {
       answered.add(JSON.stringify(now.step.request));
-      answers.push(now.step.action === "assess" ? assessor("supported") : mixedAnswer(f, now.step));
+      answers.push(now.step.action === "assess" ? assessor("supported") : decisionAnswer(f, now.step));
       f.steps(answers);
     }
-    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") state = now;
+    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") return now;
   }
-  assert.ok(state, "The pass came to rest");
-  const reasons = reasonsOf(state);
-  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["unsupported-question", "route_result_unsupported", "discovery:spare", "answer"]]);
-  assert.ok(reasons[0]!.basis.length >= 1, "The exact gap of the question");
-  assert.equal(actions(f.store).filter(action => action === "evaluate").length, 1, "The saved evaluation is read, never repeated");
-  // H1.5 (№2166): the plan of the attempt holds the fact batch only, so its own check is complete after that fact and the
-  // attempt is closed by G7 with its result; the design decision is neither planned nor paid for and stays open at its address.
-  assert.deepEqual(actions(f.store), ["bases", "open-series", "open", "register", "packet", "cycle", "assess", "routes", "evaluate", "close", "apply", "bases"],
-    "The fact is asked, assessed, checked, closed, applied to B1; the bases are built again; nothing else is done");
-  const attempt = blockSeries(f).value.attempts[0]!;
-  assert.equal(attempt.outcome?.reason, "result", "The fact attempt is closed by G7 with its result");
-  assert.equal(attempt.outcome?.reason === "result" ? attempt.outcome.achieved.length : -1, 1, "Only the fact is achieved");
-  assert.equal(f.store.get(`om-frame:${project}:2`), null, "No C5");
-  assert.ok(!actions(f.store).some(action => ["accept", "confirm", "lines"].includes(action)), "No C5 or D2 without a passed G4b");
-  assert.equal(f.sent().length, 2, "The fact and the one assessment: nothing was paid for the design decision");
-  assert.ok(f.sent().every(line => !String(line).includes("Which spare is supported?")), "No paid request carries the design question");
-  const series = blockSeries(f), binding = ok(readCompletionBinding(f.store, project, reference(series), 1))!;
-  const routes = ok(readRoutes(f.store, { project, record: binding.value.plan.routes })).record.value;
-  assert.deepEqual(binding.value.plan.batches, routes.batches.filter(batch => batch.model === "MC1").map(batch => batch.id).sort(),
-    "The plan of the attempt holds the fact batch only");
-  assert.ok(routes.batches.some(batch => batch.model === "MC2" && batch.task === "input-field" && batch.items.some(item => item.target === "discovery:spare" && item.field === "answer")),
-    "M6 still describes the batch: its presence never was a right to pay");
-  const saved = ok(readRun(f.store, { project }))!;
+  assert.fail("The pass did not come to rest");
+}
+test("OWN1 H1.2 R13 R8 a fact and a design decision of one block are each asked once: the fact is applied, the model's decision with its alternatives stands decided in B1, and the pass ends on neither", async t => {
+  const f = runFixture(t, ["encoding", "spare"]);
+  addressQuestions(f, [["encoding", "repository-fact"], ["spare", "design-decision"]]);
+  const request = f.request();
+  ok(startRun(f.store, { project }));
+  const state = await restWithDecisions(f, request);
+  // At rest — idle on its bases or ending for another reason — never on these questions.
+  assert.ok(!(state.phase === "unable" ? reasonsOf(state) : []).some(row => row.target === "discovery:spare" || row.target === "discovery:encoding"), JSON.stringify(state));
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+  assert.deepEqual(input.decided?.map(row => [row.question.id, row.value]), [["discovery:spare", OWN1_DECISION]],
+    `${JSON.stringify(state).slice(0, 600)} ${actions(f.store).join(",")}`);
+  assert.ok(input.decided![0]!.decision.id.startsWith(`om-input-decision:${project}:`));
+  assert.ok(input.facts?.some(row => row.question.id === "discovery:encoding"), "The fact is applied");
+  assert.ok(!input.questions.some(row => row.id === "discovery:spare" || row.id === "discovery:encoding"));
+  assert.equal(decisionCalls(f), 1, "The decision is paid once");
+  const sent = f.sent().length;
   f.restart();
-  const again = ok(await advanceRun(f.store, request));
-  assert.deepEqual([again.performed, again.record.hash], [null, saved.hash], "A new store returns the same end");
-  assert.equal(f.sent().length, 2);
+  for (let index = 0; index < 3; index++) ok(await advanceRun(f.store, request));
+  assert.equal(f.sent().length, sent, "A restart pays for nothing again");
 });
 
+// OWN1 (№3711): an owner question of the pass is the model's since; a confirmation of the environment the pass itself
+// needs (moment om-pass) still has no producer in this product.
 test("H1.2 R13b a blocking question nobody can answer in this product ends the pass on that exact question, with no attempt open and nothing invented", async t => {
   const f = runFixture(t, ["encoding"]);
   const input = f.store.get(`om-input:${project}`)!;
   ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph, decisions: [{ pending: structuredClone(inputDecisionWrite({
     project, input: reference(input), graph: f.graph, layers: [], decision: { target: "discovery:encoding", field: "address",
-      value: { consumer: "garden-consume-block", kind: "owner-decision" } } })) as Write }] }));
+      value: { consumer: "garden-consume-block", kind: "environment-confirmation" } } })) as Write }] }));
   const request = f.request();
   ok(startRun(f.store, { project }));
   const end = await ends(f, request, 10);
   const reasons = reasonsOf(end.state);
-  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target]), [["unsupported-question", "owner_result_unavailable", "discovery:encoding"]]);
-  assert.equal(reasons[0]!.field, "owner-result");
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target]), [["unsupported-question", "route_result_unsupported", "discovery:encoding"]]);
+  assert.equal(reasons[0]!.field, "answer");
   assert.equal(f.store.list("repair-series").length, 0, "No line, no attempt: nobody was asked to answer it");
   assert.equal(f.store.list().filter(row => row.id.startsWith("om-owner-result:")).length, 0, "No owner result is invented");
   assert.equal(f.sent().length, 0);
@@ -1383,20 +1388,39 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
   void phase;
 });
 
-test("H1.2 R13 R13b a late question of the environment that D7 cannot assign ends the pass on that gap, after the works are otherwise ready; no assignment is invented", async t => {
+// OWN1 (№3711, №3716) replaces the end of R13/R13b: in the bypass a late question no H2 assigned no longer ends the pass —
+// the engine carries it to its own consumer with what the pass knows of its own database; the question stays open.
+test("OWN1 H1.2 R13 R13b a late question of the environment no H2 assigned is carried by the engine to its consumer with the facts of its own database; the works go on, the question stays open and no owner command is invented", async t => {
   const f = worksFixture(t, true);
   ok(startRun(f.store, { project }));
-  const end = await ends({ store: f.store } as unknown as Fixture, f.request, 60);
-  const reasons = reasonsOf(end.state);
-  assert.ok(reasons.length >= 1, JSON.stringify(end.state));
-  assert.ok(reasons.every(row => row.kind === "late-obligation" && row.code === "obligation_assignment_unresolved" && row.target === "discovery:later-env"), JSON.stringify(reasons));
-  assert.equal(new Set(reasons.map(row => JSON.stringify([row.target, row.field, row.basis]))).size, reasons.length, "One ground per meaning, however many roots meet it");
-  assert.equal(f.sent().length, 0, "Nothing is asked of a model for works that D7 cannot allow");
-  assert.equal(f.store.list("om-owner-gap-assignment").length, 0, "The pass invents no assignment");
-  const before = f.store.list().map(reference);
-  assert.equal(ok(await advanceRun(f.store, f.request)).performed, null);
-  assert.deepEqual(f.store.list().map(reference), before);
+  const performed: string[] = [], answered = new Set<string>();
+  let state: { phase: string; step?: { action: string; request: { packet: Ref } }; wait?: unknown } = { phase: "" };
+  for (let index = 0; index < 200; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    if (advanced.performed) performed.push(advanced.performed.action);
+    state = advanced.record.value.state as unknown as typeof state;
+    if (state.phase === "step" && state.step!.action === "cycle" && !answered.has(state.step!.request.packet.id)) {
+      answered.add(state.step!.request.packet.id); f.answer(state.step!.request.packet);
+    }
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+  }
+  // The works are asked of the model on the D7 ledger; binding the carried obligation to a work is the model's (this
+  // fixture's answers bind none, so the works are not accepted here).
+  assert.ok(performed.indexOf("obligations") >= 0 && performed.indexOf("cycle", performed.indexOf("obligations")) > 0,
+    `D7 and the works go on: ${performed.join(",")} ${JSON.stringify(state)}`);
+  assert.ok(f.sent().length > 0, "The works are asked of the model");
+  const carried = f.store.list<{ assignments: { kind: string; responsibleNode: string; responsibleConsumer: string; reason: string; returnCondition: string | null }[] }>("om-obligations")
+    .flatMap(row => row.value.assignments).filter(row => row.kind === "environment-confirmation");
+  assert.ok(carried.length >= 1, "The late gap is in the ledger");
+  for (const row of carried) {
+    assert.deepEqual([row.responsibleNode, row.responsibleConsumer], ["garden-consume-block", "garden-consume-block"]);
+    assert.match(row.reason, /^Assigned by the engine in the bypass: the consumer answers it at task-start\. Own database facts at this pass: stages discovery stage:garden:discovery@\d+/);
+    assert.equal(row.returnCondition, "Which runtime does the task start on?");
+  }
+  assert.equal(f.store.list("om-owner-gap-assignment").length, 0, "The pass invents no owner command");
+  assert.ok(f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.some(row => row.id === "discovery:later-env"), "The question stays open");
 });
+
 
 test("1 24 22 C57 R20 №1860-8 H1.1 a managed project works only on the activation of the pass's own issue: the machine runs B3, a new root works after it, a block outside the intent never", async t => {
   const f = runFixture(t, ["encoding"], false, true, true);
@@ -2052,49 +2076,24 @@ function addressQuestions(f: Fixture, rows: readonly (readonly [id: string, kind
 const answerBatch = (routes: RoutesRecord) => routes.batches.find(batch => batch.model === "MC2" && batch.task === "input-field"
   && batch.items.some(item => item.target === "discovery:spare" && item.field === "answer"))!;
 
-test("H1.5 №2164 a design-decision question nobody answers is never paid for: M6 keeps describing its batch, the pass opens no line and sends nothing, and it ends on that exact question", async t => {
+// OWN1 (№3711) replaces H1.5 №2164: an owner question of the pass is asked of the model once and decided by it.
+test("OWN1 H1.5 №2164 an owner question of the pass is asked of the model once: its decision stands decided in B1, om-decisions shows it with its alternatives, and the pass does not end on it", async t => {
   const f = runFixture(t, ["spare"]);
-  addressQuestions(f, [["spare", "design-decision"]]);
+  addressQuestions(f, [["spare", "owner-decision"]]);
   const bases = f.bases(), request = f.request();
-  assert.ok(answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value), "M6 describes the batch of the question");
+  assert.ok(answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value), "M6 routes the question to the model");
   ok(startRun(f.store, { project }));
-  const end = await ends(f, request, 12);
-  const reasons = reasonsOf(end.state);
-  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["unsupported-question", "route_result_unsupported", "discovery:spare", "answer"]]);
-  assert.ok(reasons[0]!.basis.length >= 1, "The exact D1 gap of the question");
-  assert.ok(!end.performed.some(action => ["open-series", "open", "register", "packet", "cycle", "assess"].includes(action)), end.performed.join(","));
-  assert.equal(f.store.list("repair-series").length, 0, "No line and no attempt: nobody was asked to answer it");
-  assert.equal(f.sent().length, 0);
-  const saved = ok(readRun(f.store, { project }))!;
-  f.restart();
-  const again = ok(await advanceRun(f.store, request));
-  assert.deepEqual([again.performed, again.record.hash], [null, saved.hash], "A new store returns the same end");
-  assert.equal(f.sent().length, 0);
+  const state = await restWithDecisions(f, request);
+  assert.ok(!(state.phase === "unable" ? reasonsOf(state) : []).some(row => row.target === "discovery:spare"), JSON.stringify(state));
+  const listed = ok(new ProductEngine(f.store).execute({ type: "om-decisions", project }) as unknown as OmResult<{ decisions: { id: string; kind: string; decision: string; alternatives: unknown[]; call: Ref | null; at: string | null }[] }>);
+  assert.deepEqual(listed.decisions.map(row => [row.id, row.kind, row.decision, row.alternatives.length]),
+    [["discovery:spare", "owner-decision", OWN1_DECISION.decision, 2]]);
+  assert.ok(listed.decisions[0]!.call?.id.startsWith(`model-call:${project}:om:`), "The model call that decided it");
+  assert.ok(!Number.isNaN(Date.parse(listed.decisions[0]!.at!)), "and when it started");
+  assert.equal(f.store.list().filter(row => row.id.startsWith("om-owner-result:")).length, 0, "No owner result is invented");
+  assert.equal(decisionCalls(f), 1, "The decision is paid once");
 });
 
-test("H1.5 №2166 п.2 independent work goes on: the fact of another block is asked and assessed, the design decision of this block is not, and the end names that question only", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, false, false, false, { encoding: { consumer: "garden-produce-block" } });
-  addressQuestions(f, [["encoding", "repository-fact", "garden-produce-block"], ["spare", "design-decision", "garden-consume-block"]]);
-  const request = f.request(), answers: Record<string, unknown>[] = [], answered = new Set<string>();
-  ok(startRun(f.store, { project }));
-  let state: RunRecord["state"] | null = null;
-  for (let index = 0; index < 90 && !state; index++) {
-    const now = ok(await advanceRun(f.store, request)).record.value.state as unknown as RunRecord["state"];
-    if (now.phase === "step" && (now.step.action === "cycle" || now.step.action === "assess") && !answered.has(JSON.stringify(now.step.request))) {
-      answered.add(JSON.stringify(now.step.request));
-      answers.push(now.step.action === "assess" ? assessor("supported") : mixedAnswer(f, now.step));
-      f.steps(answers);
-    }
-    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") state = now;
-  }
-  assert.ok(state, "The pass came to rest");
-  assert.deepEqual(reasonsOf(state).map(row => [row.kind, row.code, row.target, row.field]), [["unsupported-question", "route_result_unsupported", "discovery:spare", "answer"]]);
-  assert.equal(f.sent().length, 2, "The fact and its one assessment");
-  assert.ok(f.sent().every(line => !String(line).includes("Which spare is supported?")));
-  assert.equal(blockSeries(f, "garden-produce-block").value.attempts.length, 1, "The block of the fact worked");
-  assert.equal(f.store.list<RepairSeries>("repair-series").some(row => (row.value as { block?: string }).block === "garden-consume-block"), false,
-    "The block whose only batch is unserved has no line at all");
-});
 
 test("H1.5 №2166 п.4 the moment decides, not the kind: an environment confirmation or a post-implementation proof of the pass is a ground of its end, one of task-start or task-result is no barrier of the pass", async t => {
   for (const [kind, later] of [["environment-confirmation", "task-start"], ["post-implementation-proof", "task-result"]] as const) {
@@ -2189,7 +2188,6 @@ ${body}
   return output;
 }
 
-const H15_BASE_COMMIT = "479b307f8aa3d43745f5313c1f5c8a712bd7d55a";
 /** A managed attempt of `block` planned on exactly this batch — the plan an earlier pass saved (the reviewer's helper, №2221). */
 function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15", seriesCommit?: string) {
   const opening = { project, block, line: 1, slice, predecessor: null, basis: null };
@@ -2202,7 +2200,6 @@ out(reference(take(openSeries(store, args))));`, opening);
     result: gapLineExpectedResult(project, batches[0]!.items[0]!.target, batches[0]!.items[0]!.field) };
   return ok(openAttempt(f.store, { project, block, line: 1, attempt: 1, goal, completion: { routes: bases.routes, batches: batches.map(batch => batch.id).sort() } }));
 }
-const unsupportedSpare = [["unsupported-question", "route_result_unsupported", "discovery:spare", "answer"]];
 /** The saved end comes back from a new store: the same record, nothing performed, nothing sent. */
 async function sameEnd(f: Fixture, request: RunRequest, sends: number) {
   const saved = ok(readRun(f.store, { project }))!;
@@ -2212,100 +2209,77 @@ async function sameEnd(f: Fixture, request: RunRequest, sends: number) {
   assert.equal(f.sent().length, sends);
 }
 
-test("H1.5 №2221 reviewer-H15 current public producers: an open managed attempt planned on an unserved batch ends the pass unable on that exact question — no packet, no cycle, nothing sent, the attempt stays open and a new store repeats the end", async t => {
+// OWN1 (№3719, return of Codex-omg): the owner's answer is above the model's, and a decision packet asks no owner.
+import { issueOwnerInvitation, OwnerSessions } from "../src/product/owner-authority.js";
+import { writeOwnerResult } from "../src/om/owner-result.js";
+import { checkAnswerForm } from "../src/om/answer-form.js";
+test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the model is its decision: the model is never asked, B1 holds the owner's value, om-decisions names the owner", async t => {
+  const f = runFixture(t, ["spare"]);
+  addressQuestions(f, [["spare", "owner-decision"]]);
+  const bases = f.bases(), request = f.request();
+  const routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!;
+  const routed = routes.value.routes.find(row => row.kind === "owner-decision")! as unknown as { record: Ref; route: string };
+  assert.equal(routed.route, "design", "The bypass routes it to the model");
+  const sessions = new OwnerSessions(f.store), { invitation } = ok(issueOwnerInvitation(f.store, { project }));
+  const authority = sessions.authority(ok(sessions.exchange({ project, invitation })).bearer)!;
+  const owner = ok(writeOwnerResult(f.store, authority, { project, routes: reference(routes), gap: routed.record,
+    value: "Retain every record permanently", basis: "Explicit choice for this question" }, { routes: readRoutes, input: readOmInput }));
+  ok(startRun(f.store, { project }));
+  const state = await restWithDecisions(f, request);
+  assert.ok(!(state.phase === "unable" ? reasonsOf(state) : []).some(row => row.target === "discovery:spare"), JSON.stringify(state));
+  assert.equal(decisionCalls(f), 0, "The model is never asked the question the owner answered");
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+  assert.deepEqual(input.decided?.map(row => [row.question.id, row.value]),
+    [["discovery:spare", { owner: reference(owner.result), value: "Retain every record permanently" }]]);
+  assert.ok(!input.questions.some(row => row.id === "discovery:spare"));
+  const listed = ok(new ProductEngine(f.store).execute({ type: "om-decisions", project }) as unknown as OmResult<{ decisions: { id: string; by: string; decision: string; owner: Ref | null; alternatives: unknown[] }[] }>);
+  assert.deepEqual(listed.decisions.map(row => [row.id, row.by, row.decision, row.owner, row.alternatives.length]),
+    [["discovery:spare", "owner", "Retain every record permanently", reference(owner.result), 0]]);
+});
+test("OWN1 №3719 P2-2 a decision packet asks no owner: no need_owner in its form or examples, every example passes its own check, and a need_owner reply is a correctable refusal", async t => {
   const f = runFixture(t, ["spare"]);
   addressQuestions(f, [["spare", "design-decision"]]);
-  const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
-  openPlanned(f, bases, "garden-consume-block", [batch], "reviewer-current-h15");
+  const request = f.request();
   ok(startRun(f.store, { project }));
-  const end = await ends(f, f.request(), 15);
-  const reasons = reasonsOf(end.state);
-  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare, "A proved permanently unserved active question is a ground, not a wait");
-  assert.deepEqual(reasons[0]!.basis, [reference(f.store.get<Revision<unknown>>(reasons[0]!.basis[0]!.id, reasons[0]!.basis[0]!.revision)!)], "The exact D1 gap of the question");
-  assert.deepEqual(actions(f.store), ["register"], "The check is registered; the unserved root makes no packet and no cycle");
-  assert.equal(f.sent().length, 0);
-  assert.equal(blockSeries(f).value.attempts[0]!.outcome, null, "The attempt stays open: no G7 outcome is invented");
-  assert.equal(f.store.list("question-packet").length, 0, "No packet of the unserved batch was made");
-  await sameEnd(f, f.request(), 0);
-});
-
-test("H1.5 №2221 reviewer-H15 unserved open work does not starve independent admitted work: the neighbour's fact is asked, assessed and closed with its result (kept for the next pass: №1860 п.5 applies no new B1 while the unserved attempt stays open), and only then the pass ends on the unserved question", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, false, false, false, { encoding: { consumer: "garden-produce-block" } });
-  addressQuestions(f, [["encoding", "repository-fact", "garden-produce-block"], ["spare", "design-decision", "garden-consume-block"]]);
-  const bases = f.bases(), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value;
-  const bad = answerBatch(routes), good = routes.batches.find(row => row.model === "MC1" && row.items.some(item => item.target === "discovery:encoding"))!;
-  assert.ok(good);
-  openPlanned(f, bases, "garden-consume-block", [bad], "reviewer-current-h15");
-  openPlanned(f, bases, "garden-produce-block", [good], "reviewer-current-h15");
-  ok(startRun(f.store, { project }));
-  const request = f.request(), answers: Record<string, unknown>[] = [], answered = new Set<string>();
+  let saved: Ref | null = null;
+  for (let index = 0; index < 20 && !saved; index++) {
+    const now = ok(await advanceRun(f.store, request)).record.value.state as unknown as RunRecord["state"];
+    if (now.phase === "step" && now.step.action === "cycle") saved = (now.step.request as unknown as { packet: Ref }).packet;
+    else if (now.phase !== "step" && now.phase !== "ready") assert.fail(`The pass stood before its decision cycle: ${JSON.stringify(now)}`);
+  }
+  assert.ok(saved, "The decision packet is issued");
+  const payload = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!.value.packet as unknown as {
+    responseForm: { schema: { oneOf: { properties: { action?: { const?: string } } }[] } }; brief: { examples: Record<string, Json>[]; text: string } };
+  assert.ok(!payload.responseForm.schema.oneOf.some(branch => branch.properties.action?.const === "need_owner"));
+  assert.ok(!payload.brief.examples.some(example => example.action === "need_owner"));
+  assert.ok(payload.brief.text.includes("the owner is not asked in this pass"));
+  for (const example of payload.brief.examples) {
+    const checked = checkAnswerForm(f.store, { project, packet: saved, raw: canonical(example) });
+    assert.ok(checked.ok, `${canonical(example)}: ${checked.ok ? "" : `${checked.refusal.code} ${checked.refusal.message}`}`);
+    if (example.action === "answer") assert.equal(checked.value.kind, "input-decisions");
+  }
+  const control = payload.brief.examples.find(example => example.action === "cannot_answer")!;
+  const asked = checkAnswerForm(f.store, { project, packet: saved, raw: canonical({ ...control, action: "need_owner", reason: "Ask the owner", decision: "Choose the policy" }) });
+  assert.equal(asked.ok ? "accepted" : asked.refusal.code, "part_answer_invalid");
+  // The pass itself: a model that asks for the owner gets the correction of its answer, and decides on it.
+  const issued = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!.value.request;
+  const batch = f.store.get<RoutesRecord>(issued.routes.id, issued.routes.revision)!.value.batches.find(row => row.id === issued.batch)!;
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap), action: "need_owner",
+    reason: "The policy needs the owner", decision: "Choose the policy" }, usage },
+  { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: OWN1_DECISION })) }, usage }]);
   let state: RunRecord["state"] | null = null;
   for (let index = 0; index < 60 && !state; index++) {
-    const advanced = ok(await advanceRun(f.store, request)), now = advanced.record.value.state as unknown as RunRecord["state"];
-    if (now.phase === "step" && (now.step.action === "cycle" || now.step.action === "assess") && !answered.has(JSON.stringify(now.step.request))) {
-      answered.add(JSON.stringify(now.step.request));
-      answers.push(now.step.action === "assess" ? assessor("supported") : mixedAnswer(f, now.step));
-      f.steps(answers);
-    }
-    if (now.phase === "unable" || now.phase === "complete" || now.phase === "waiting" && advanced.performed === null) state = now;
+    const now = ok(await advanceRun(f.store, request)).record.value.state as unknown as RunRecord["state"];
+    if (now.phase === "waiting" || now.phase === "unable" || now.phase === "complete") state = now;
   }
-  assert.ok(state, "The pass came to rest");
-  assert.equal(f.sent().length, 2, "The independent admitted fact and its assessment were sent");
-  assert.deepEqual(reasonsOf(state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
-  assert.equal(blockSeries(f, "garden-produce-block").value.attempts[0]!.outcome?.reason, "result", "The neighbour's attempt closed by G7 with its result");
-  assert.equal(blockSeries(f, "garden-consume-block").value.attempts[0]!.outcome, null, "The unserved attempt stays open");
-  assert.ok(f.store.list().some(row => row.id.startsWith(`om-answer:${project}:`)), "The fact is accepted (D5) and kept for the next pass");
-  // №1860 п.5 stands: a new B1 is not applied while an attempt — here the unserved one — is still open on the current one.
-  assert.ok(!actions(f.store).includes("apply") && !actions(f.store).includes("bases"), actions(f.store).join(","));
-  assert.ok(f.sent().every(line => !String(line).includes("Which spare is supported?")));
-  await sameEnd(f, request, 2);
+  assert.deepEqual(f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.decided?.map(row => [row.question.id, row.value]),
+    [["discovery:spare", OWN1_DECISION]], JSON.stringify(state));
+  assert.equal(f.sent().length, 2, "The asked owner is one corrected answer, not a wait");
 });
 
-test("H1.5 №2221 the same attempt holds an admitted fact and an unserved batch: the fact is asked and assessed, the unserved root is never sent, and the pass ends on that question with the attempt open", async t => {
-  const f = runFixture(t, ["encoding", "spare"]);
-  addressQuestions(f, [["encoding", "repository-fact"], ["spare", "design-decision"]]);
-  const bases = f.bases(), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value;
-  const bad = answerBatch(routes), good = routes.batches.find(row => row.model === "MC1" && row.items.some(item => item.target === "discovery:encoding"))!;
-  openPlanned(f, bases, "garden-consume-block", [bad, good], "mixed-plan");
-  ok(startRun(f.store, { project }));
-  const request = f.request(), answers: Record<string, unknown>[] = [], answered = new Set<string>();
-  let state: RunRecord["state"] | null = null;
-  for (let index = 0; index < 60 && !state; index++) {
-    const advanced = ok(await advanceRun(f.store, request)), now = advanced.record.value.state as unknown as RunRecord["state"];
-    if (now.phase === "step" && (now.step.action === "cycle" || now.step.action === "assess") && !answered.has(JSON.stringify(now.step.request))) {
-      answered.add(JSON.stringify(now.step.request));
-      answers.push(now.step.action === "assess" ? assessor("supported") : mixedAnswer(f, now.step));
-      f.steps(answers);
-    }
-    if (now.phase === "unable" || now.phase === "complete" || now.phase === "waiting" && advanced.performed === null) state = now;
-  }
-  assert.ok(state, "The pass came to rest");
-  assert.equal(f.sent().length, 2, "The fact and its assessment; nothing for the design question");
-  assert.ok(f.sent().every(line => !String(line).includes("Which spare is supported?")));
-  assert.deepEqual(reasonsOf(state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
-  assert.ok(actions(f.store).includes("assess") && !actions(f.store).includes("close"), actions(f.store).join(","));
-  assert.equal(blockSeries(f).value.attempts[0]!.outcome, null, "The attempt cannot finish while its unserved root stays open; no outcome is invented");
-  await sameEnd(f, request, 2);
-});
-
-test("H1.5 №2221 a saved but unsent packet of an unserved batch is left as it is: the pass neither sends nor repeats it and ends on the question", async t => {
-  const f = runFixture(t, ["spare"]);
-  addressQuestions(f, [["spare", "design-decision"]]);
-  const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
-  const series = openPlanned(f, bases, "garden-consume-block", [batch]);
-  // The packet the earlier pass would have made (the current E2 producer): registered as the root's product, never sent.
-  const packet = ok(writeQuestionPacket(f.store, { project, routes: bases.routes, batch: batch.id, environment: reference(f.store.get(`environment:${project}`)!),
-    attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-  assert.equal(packet.value.state, "ready");
-  ok(startRun(f.store, { project }));
-  const end = await ends(f, f.request(), 15);
-  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
-  assert.equal(f.sent().length, 0, "The saved packet was not sent");
-  assert.ok(!actions(f.store).includes("cycle") && !actions(f.store).includes("packet"), actions(f.store).join(","));
-  assert.deepEqual(reference(f.store.get(packet.id)!), reference(packet), "The saved packet is untouched");
-  await sameEnd(f, f.request(), 0);
-});
-
+// OWN1 (№3711): the H1.5 tests of a blocking batch no producer serves are gone with it — a design or owner question of the
+// pass is the model's now (above); a question of a later moment keeps its unserved batch and is no ground (below).
 test("H1.5 №2221 a non-blocking unserved batch (a design question of task-start) in a saved plan is not sent and is no ground: the pass waits on the open work instead of ending", async t => {
   const f = runFixture(t, ["proof"], true, false, false, false, { proof: { moment: "task-start" } });
   addressQuestions(f, [["proof", "design-decision"]]);
@@ -2326,72 +2300,8 @@ test("H1.5 №2221 a non-blocking unserved batch (a design question of task-star
   assert.equal(f.sent().length, 0);
 });
 
-test("H1.5 №2166 п.3 →№2221 a plan saved before this rule that holds an unserved batch: the pass registers the check, sends nothing, and ends unable on that exact question (was: a standing wait on the E4 refusal)", async t => {
-  const f = runFixture(t, ["spare"]);
-  addressQuestions(f, [["spare", "design-decision"]]);
-  const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
-  openPlanned(f, bases, "garden-consume-block", [batch]);
-  const request = f.request();
-  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
-  const end = await ends(f, request, 12);
-  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
-  assert.deepEqual(actions(f.store), ["register"], "The check is registered; the unserved root is neither packed nor cycled");
-  assert.equal(f.sent().length, 0, "Nothing was sent");
-  await sameEnd(f, request, 0);
-});
 
-test("H1.5 ERA №2221 a pass written by the code of the base commit, which planned the unserved batch and made its packet, is continued by the new code without payment: the saved packet is not sent, the pass ends unable, and a new store changes nothing (was: a standing wait)", async t => {
-  const f = runFixture(t, ["spare"]);
-  addressQuestions(f, [["spare", "design-decision"]]);
-  f.bases();
-  const request = f.request();
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
-  // The base code chooses and performs the free steps up to the packet of the unserved batch; its next step would be the paid cycle.
-  const written = atCommit(f, H15_BASE_COMMIT, "h15-pass", `const { advanceRun } = await import(src('om/run.js'));
-const performed = [];
-for (let index = 0; index < 12; index++) {
-  const advanced = take(await advanceRun(store, args.request));
-  if (advanced.performed) performed.push(advanced.performed.action);
-  if (advanced.performed?.action === 'packet') break;
-}
-out(performed);`, { request }) as string[];
-  assert.deepEqual(written.slice(-4), ["open-series", "open", "register", "packet"], "The base code planned the unserved batch and made its packet");
-  assert.equal(f.sent().length, 0);
-  f.restart();
-  const end = await ends(f, request, 12);
-  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare);
-  assert.equal(f.sent().length, 0, "The saved packet was never sent");
-  assert.deepEqual(actions(f.store), written, "The history the base code wrote is read as it is; nothing was performed on top of it");
-  await sameEnd(f, request, 0);
-});
 
-test("H1.5 ERA №2221 physical work of an unserved batch paid by the base code is finished and accounted by the new code, never sent again: the paid cycle goes through the check, and the pass ends on the question the full G4b names", async t => {
-  const f = runFixture(t, ["spare"]);
-  addressQuestions(f, [["spare", "design-decision"]]);
-  const bases = f.bases(), batch = answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value);
-  openPlanned(f, bases, "garden-consume-block", [batch], "before-h15", H15_BASE_COMMIT);
-  const request = f.request();
-  f.steps([{ research: { protocol: "omg-answer/v2", requestId: "$requestId", action: "cannot_answer", code: "cannot_answer", message: "never needed" }, usage }]);
-  // The base code has no producer check: it sends the unserved packet and receives the paid answer.
-  const paid = atCommit(f, H15_BASE_COMMIT, "h15-paid", `const { advanceRun, startRun } = await import(src('om/run.js'));
-take(startRun(store, { project: args.project }));
-const performed = [];
-for (let index = 0; index < 12; index++) {
-  const advanced = take(await advanceRun(store, args.request));
-  if (advanced.performed) performed.push(advanced.performed.action);
-  if (advanced.performed?.action === 'cycle') break;
-}
-out(performed);`, { request, project }) as string[];
-  assert.deepEqual(paid.slice(-3), ["register", "packet", "cycle"]);
-  assert.equal(f.sent().length, 1, "The base code paid once");
-  f.restart();
-  const end = await ends(f, request, 20);
-  assert.equal(f.sent().length, 1, "The paid call is finished and accounted; nothing is sent again");
-  assert.deepEqual(reasonsOf(end.state).map(row => [row.kind, row.code, row.target, row.field]), unsupportedSpare, "The full G4b of the paid result names the question");
-  assert.ok(end.performed.includes("evaluate"), `The paid result went through the attempt's check: ${end.performed.join(",")}`);
-  assert.ok(!end.performed.includes("cycle") || f.sent().length === 1, "A repeated cycle step only replays the saved call");
-  await sameEnd(f, request, 1);
-});
 
 // ---- LP3 (№2817): a refusal caused by the content of a model answer or the size of its continuation ends the attempt ----
 const LP3_BASE_COMMIT = "d519a6036f8b2cc4aee823ce24d7160262a08fb9";

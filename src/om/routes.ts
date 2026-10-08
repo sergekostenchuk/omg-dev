@@ -6,7 +6,7 @@ import { readRecord, writeGuarded } from './refs.js';
 import { readCompletionWorkAt, checkCompletionDisposition } from './model-call.js';
 import { completionWorkId, prepareSeriesLineAdmission, readCompletionBinding } from './series.js';
 import { historicalRead, readOmInput, withHistoricalReads } from './input.js';
-import { collectGaps, gateGaps, readGaps, prepareCurrentGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
+import { bypassRouteOf, collectGaps, gateGaps, readGaps, prepareCurrentGaps, GAP_ROUTES as ROUTE_POLICY, type GapReadRequest, type Gap, type GapCollection, type GapKind,
   type GapMoment, type GapSources } from './gaps.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { applicableAnswerTask, prepareAnswerSearch, readAnswerSearch, readAnswerTaskBasis,
@@ -160,6 +160,8 @@ function addresses(gap: Gap, catalog: RouteCatalog): RouteCatalog {
 }
 function fallback(gap: Gap): GapRoute {
   if (gap.code === 'inventory_missing') return 'code';
+  const bypass = bypassRouteOf(gap);
+  if (bypass) return bypass;
   // The verified classification comes from D1; the record's claimed routes never select behavior.
   const routes = ROUTE_POLICY[gap.kind];
   return (gap.kind === 'repository-fact' ? routes[1] : routes[0]) as GapRoute;
@@ -167,6 +169,8 @@ function fallback(gap: Gap): GapRoute {
 function batchKind(gap: Gap): Pick<RouteBatch, 'model' | 'task' | 'kind' | 'node' | 'level'> | null {
   if (gap.kind === 'repository-fact' && gap.code !== 'inventory_missing')
     return { model: 'MC1', task: 'fact', kind: gap.kind, node: null, level: null };
+  // OWN1: an owner question the pass needs now is asked of the model, like a design decision.
+  if (bypassRouteOf(gap)) return { model: 'MC2', task: 'input-field', kind: gap.kind, node: null, level: null };
   if (gap.kind !== 'design-decision') return null;
   if (gap.code !== 'obligation_open')
     return { model: 'MC2', task: 'input-field', kind: gap.kind, node: null, level: null };
@@ -183,8 +187,8 @@ function batchKind(gap: Gap): Pick<RouteBatch, 'model' | 'task' | 'kind' | 'node
 }
 
 type RouteGrouping = 'task-v1' | 'consumer-set-v1' | 'block-input-v1';
-// The block's own input fields, each a D3 decision of B1. Address is the M5 mechanism's and an answer field has no
-// producer: both keep their field batches, so a block's input never waits on them (LP7, №3393 §2).
+// The block's own input fields, each a D3 decision of B1. Address is the M5 mechanism's and an answer is a decision of
+// its own question (OWN1): both keep their field batches, so a block's input never waits on them (LP7, №3393 §2).
 const BLOCK_INPUT_FIELDS: readonly string[] = Object.freeze(['nodes', 'state', 'checkKind']);
 function planVerifiedGaps(gaps: readonly Gap[], catalog: RouteCatalog, grouping: RouteGrouping): RoutePlan {
   const routes: PlannedRoute[] = [], groups = new Map<string, Omit<RouteBatch, 'id'>>();

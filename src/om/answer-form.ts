@@ -9,9 +9,10 @@ import { safeRelativePath } from '../graph/topology.js';
 import { LEVEL, type Graph } from '../graph/model.js';
 import { workspacePath, type Environment } from '../runtime/environment.js';
 import { readRecord } from './refs.js';
-import { readRoutes, prepareRoutes, type RoutesRequest } from './routes.js';
+import { readRoutes, prepareRoutes, prepareManagedRouteBatch, type RoutesRequest } from './routes.js';
 import { readGaps, type GapReadRequest } from './gaps.js';
-import { inputDecisionWrite, deriveInputDecisions, prepareAddressing, type InputFieldDecision } from './addressing.js';
+import { decidedAnswer, inputDecisionWrite, deriveInputDecisions, prepareAddressing, type InputFieldDecision } from './addressing.js';
+import { ownerAnswersOf } from './owner-result.js';
 import { readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
 import { readPacketAnswer, packetReadPath, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
   type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest, type WorksPartBindings } from './question-packet.js';
@@ -137,7 +138,8 @@ export type CheckedAnswerForm = PacketOutcomeBase & (
   | { kind: 'no-result'; action: 'cannot_answer' | 'pause'; questionIds: string[]; reason: string; questions: AssignedQuestion[] }
 );
 
-function fieldForm(store: Store, request: InputFieldAnswerRequest, current: boolean): InputDecisionsForm & { guards: TransactionGuard[] } {
+function fieldForm(store: Store, request: InputFieldAnswerRequest, current: boolean,
+  attempt: { series: Ref; ordinal: number } | null = null): InputDecisionsForm & { guards: TransactionGuard[] } {
   const routes = take(readRoutes(store, { project: request.project, record: request.routes }));
   const batch = routes.record.value.batches.find(item => item.id === request.batch);
   if (!batch || batch.model !== 'MC2' || batch.task !== 'input-field')
@@ -154,6 +156,9 @@ function fieldForm(store: Store, request: InputFieldAnswerRequest, current: bool
     if (!object(row) || !text(row.target) || !text(row.field) || !Object.hasOwn(row, 'value') || !isRef(row.basis)
       || Object.keys(row).some(key => !['target', 'field', 'value', 'basis'].includes(key)))
       fail('answer_form_invalid', request.routes, 'results', 'Each field result names its exact target, field, value and gap basis');
+    // OWN1 (№3711, №3719): a model decides a question only by a decision with its alternatives — never in the owner's form.
+    if (row.field === 'answer' && !decidedAnswer(row.value))
+      fail('answer_form_value_invalid', request.routes, 'results', 'A decision names what is decided and why and two or three other options with their consequences, in words of its own');
     const item = batch.items.find(item => item.target === row.target && item.field === row.field);
     const key = canonical([row.target, row.field]);
     if (!item || seen.has(key) || canonical(row.basis) !== canonical(item.record))
@@ -186,8 +191,21 @@ function fieldForm(store: Store, request: InputFieldAnswerRequest, current: bool
   const derived = take(deriveInputDecisions(view, { project: request.project, previous: base as Revision<OmInputRecord>, graph: source.graph, decisions }));
   const guards: TransactionGuard[] = [], refs = [request.routes, ...routes.references, ...derived.references];
   if (current) {
-    const preparedRoutes = take(prepareRoutes(store, { ...routes.record.value.request,
-      tasks: routes.record.value.request.tasks.map(record => ({ record })) } as RoutesRequest));
+    // OWN1 (№3719 P2-1): the owner's answer is above the model's — a question the owner has answered by H2 meanwhile
+    // takes no model decision; the owner's answer is applied by the pass itself.
+    const owned = new Set(ownerAnswersOf(store, request.project, request.routes, source.input, { routes: readRoutes, input: readOmInput })
+      .map(owner => canonical([owner.target, owner.field])));
+    if (parsed.results.some((row: { target: string; field: string }) => owned.has(canonical([row.target, row.field]))))
+      fail('answer_form_task_invalid', request.routes, 'results', 'The owner has answered this question by H2; the model decision is not applied');
+    // OWN1: an accepted answer of another batch of the same managed attempt (its fact) moves the route's searches, never
+    // this batch: the attempt still answers its own planned batch by the admission E2 issued it with, stale only when an
+    // answer now covers an item of this very batch.
+    const fresh = prepareRoutes(store, { ...routes.record.value.request,
+      tasks: routes.record.value.request.tasks.map(record => ({ record })) } as RoutesRequest);
+    const preparedRoutes = !fresh.ok && fresh.refusal.code === 'route_stale' && attempt
+      ? take(prepareManagedRouteBatch(store, { project: request.project, series: attempt.series, attempt: attempt.ordinal,
+        routes: request.routes, batch: request.batch }))
+      : take(fresh);
     if (canonical(reference(preparedRoutes.record)) !== canonical(request.routes))
       fail('answer_form_task_invalid', request.routes, 'routes', 'Historical routing cannot grant a new form admission');
     const prepared = take(prepareAddressing(store, { project: request.project, input: source.input, graph: source.graph,
@@ -380,6 +398,10 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
       refs.push(...checkReads(store, request, packet as Revision<QuestionPacketRecord>, answer.reads as PacketRead[], current));
       return { ...common, kind: 'need-source', missing: answer.missing, reads: answer.reads as PacketRead[], references: references(refs) };
     }
+    // OWN1 (№3719 P2-2): a question the bypass gives the model is decided by it; the owner is not asked in this pass.
+    if (answer.action === 'need_owner' && (payload.questions as unknown as AssignedQuestion[]).some(q => q.field === 'answer')
+      && payload.task === 'input-field')
+      fail('part_answer_invalid', request.packet, 'reply', 'Decide the question: a decision, why, and two or three other options with their consequences');
     if (answer.action === 'need_owner') return { ...common, kind: 'awaiting-owner', recipient: 'owner',
       reason: answer.reason, decision: answer.decision, references: references(refs) };
     return { ...common, kind: 'no-result', action: answer.action, reason: answer.reason, references: references(refs) };
@@ -414,7 +436,7 @@ function answerForm(store: Store, request: PacketAnswerRequest, current: boolean
     return { task, unanswered: questions.filter(q => !seen.has(q.id)).map(q => q.id).sort(order), kind: 'fact-candidates', facts, references: references(refs), guards: conditions(guards) };
   }
   const fields = fieldForm(store, { project: request.project, routes: packet.value.request.routes,
-    batch: packet.value.request.batch!, raw: canonical({ results: answer.results }) }, current);
+    batch: packet.value.request.batch!, raw: canonical({ results: answer.results }) }, current, packet.value.request.attempt);
   return { ...fields, task, references: references([...refs, ...fields.references]), guards: conditions([...guards, ...fields.guards]) };
 }
 /** Historical content checking. E4 must independently bind it to a saved adapter response and admitted call. */

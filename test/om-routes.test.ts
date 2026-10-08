@@ -188,16 +188,25 @@ function routesFixture(t: TestContext, withEncoding = false) {
     } };
 }
 
+// OWN1 (№3711, №3713): an owner question of the pass is routed to the model (design, MC2) in the bypass; a later owner
+// question keeps the owner route and no batch.
 test("D4 retains the source-derived knowledge routes and resolution moments", () => {
   const sources = source();
   const cases = [
     ["repository-fact", "research", "om-pass"], ["design-decision", "design", "om-pass"],
-    ["owner-decision", "owner", "om-pass"], ["environment-confirmation", "environment", "task-start"],
+    ["owner-decision", "design", "om-pass"], ["environment-confirmation", "environment", "task-start"],
     ["post-implementation-proof", "task-result", "task-result"],
   ] as const;
   sources.inputResult.input!.questions = cases.map(([kind]) => question(kind, kind));
   sources.inputResult.input!.questions.push({ ...question("before-feasibility", "environment-confirmation"), moment: "feasibility" });
+  sources.inputResult.input!.questions.push({ ...question("owner-later", "owner-decision"), moment: "feasibility" });
   const result = plan(sources);
+  const owner = result.routes.find(item => item.target === "owner-decision")!;
+  assert.deepEqual(result.batches.filter(batch => batch.items.some(entry => entry.gap === owner.gap)).map(batch => [batch.model, batch.task, batch.kind]),
+    [["MC2", "input-field", "owner-decision"]]);
+  const later = result.routes.find(item => item.target === "owner-later")!;
+  assert.deepEqual([later.route, later.moment], ["owner", "feasibility"]);
+  assert.equal(result.batches.some(batch => batch.items.some(entry => entry.gap === later.gap)), false);
   for (const [kind, route, moment] of cases) {
     const item = result.routes.find(item => item.target === kind)!;
     assert.ok(item);

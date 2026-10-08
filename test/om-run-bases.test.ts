@@ -386,8 +386,10 @@ test("№1852-5 R15 H1.1 M5 keeps the named subset; a question addressed to a la
   assert.notDeepEqual(second.bases.horizon, first.bases.horizon);
   const routes = routesOf(f.store, second).value;
   const owner = routes.routes.find(route => route.target === "discovery:spare")!;
-  assert.deepEqual([owner.route, owner.state], ["owner", "pending"], "The existing route of an owner decision, not a fact");
-  assert.ok(!routes.batches.some(batch => batch.items.some(item => item.target === "discovery:spare")), "No model batch is invented for it");
+  // OWN1 (№3711): in the bypass the model decides an owner question of the pass — its own MC2 batch, never a fact task.
+  assert.deepEqual([owner.route, owner.state], ["design", "pending"], "The bypass route of an owner decision, not a fact");
+  assert.deepEqual(routes.batches.filter(batch => batch.items.some(item => item.target === "discovery:spare"))
+    .map(batch => [batch.model, batch.task, batch.items.map(item => item.field)]), [["MC2", "input-field", ["answer"]]]);
   const tasks = f.store.list<{ request: { gap: Ref } }>("answer-task").map(task =>
     f.store.get<{ gap: { target: string } }>(task.value.request.gap.id, task.value.request.gap.revision)!.value.gap.target);
   assert.deepEqual(tasks, ["discovery:encoding"], "Only the repository fact gets a D5 task");

@@ -11,7 +11,8 @@ import { readHorizon as readHorizonOf } from "./horizon.js";
 import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunStandingGuardsOf, writeRunBases as writeRunBasesOf, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
 import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
-import { writeApplyAnswer as writeApplyAnswerOf } from "./addressing.js";
+import { writeApplyAnswer as writeApplyAnswerOf, writeOwnerDecision as writeOwnerDecisionOf } from "./addressing.js";
+import { ownerAnswersOf } from "./owner-result.js";
 import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
   resumeSeries as resumeSeriesOf, reconcileSeries as reconcileSeriesOf, prepareReconcileSeries as prepareReconcileSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
@@ -99,6 +100,7 @@ const writeRunBases = transferring("run-bases", writeRunBasesOf);
 const readOmInput = transferring("input", readOmInputOf);
 const readAcceptedAnswer = transferring("accepted-answer", readAcceptedAnswerOf);
 const writeApplyAnswer = transferring("addressing", writeApplyAnswerOf);
+const writeOwnerDecision = transferring("addressing", writeOwnerDecisionOf);
 const openSeries = transferring("series", openSeriesOf);
 const readAnySeriesAt = transferring("series", readAnySeriesAtOf);
 const readCompletionBinding = transferring("series", readCompletionBindingOf);
@@ -532,7 +534,9 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
         return mapped(writeRunBases(store, { project }, { guards: build.guards, open: build.open, completion: build.completion }),
           built => [built.input, built.bases.horizon, built.bases.routes, built.bases.queue]);
       }
-      case "apply": return mapped(writeApplyAnswer(store, body as never), record => [refOf(record)]);
+      // OWN1 (№3719 P2-1): an owner's proved answer of a question the bypass routes to the model is applied as its decision.
+      case "apply": return mapped(Object.hasOwn(body as object, "owner") ? writeOwnerDecision(store, body as never)
+        : writeApplyAnswer(store, body as never), record => [refOf(record)]);
       case "close": {
         const closed = closeAttempt(store, body as never);
         if (!closed.ok) return closed;
@@ -678,9 +682,12 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
   // A batch whose questions no answer producer serves is not paid for (H1.5, №2166): it is no part of any new plan, its
   // questions stay open at their exact address, and when nothing else is left the common G4b below names them. The one
   // reading of the route that says so is taken once per choice and only when a block has a batch to weigh.
-  let unserved: ReadonlySet<string> | null = null;
+  let unserved: ReadonlySet<string> | null = null, owned: ReadonlySet<string> | null = null;
+  // OWN1 (№3719 P2-1): a batch whose every question the owner has answered by H2 is never sent to the model; the
+  // answer is applied as the decision as soon as no attempt works on the current B1 (applyStep).
   const served = (batch: RouteBatch): boolean => !(unserved ??= new Set(take(readRouteProducers(store, { project, routes: bases.refs.routes }))
-    .batches.filter(row => row.unserved.length).map(row => row.batch))).has(batch.id);
+    .batches.filter(row => row.unserved.length).map(row => row.batch))).has(batch.id)
+    && !batch.items.every(item => (owned ??= new Set(ownerAnswersBypassed(store, project, bases).map(owner => owner.line))).has(item.gap));
   for (const block of bases.order) {
     const batches = bases.routes.value.batches.filter(batch => !isM5Batch(batch) && batch.items.every(item => item.consumers.includes(block))
       && !(batch.task === "node-expansion" && batch.level === 2 && batch.node !== block)).filter(served)
@@ -761,7 +768,22 @@ function applyStep(store: Store, project: string, bases: Bases): Choice | null {
     if (!answer.ok) return { wait: waitOf(answer.refusal, project) };
     return step("apply", { project, input: reference(input), answer: route.answer, question: reference(answer.value.question) });
   }
+  // OWN1 (№3719 P2-1): the owner's answer is above the model's — a question the bypass routes to the model that the owner
+  // has answered by H2 is decided by that answer, before any new work could send it to the model.
+  for (const owner of ownerAnswersBypassed(store, project, bases)) if (held.has(owner.target))
+    return step("apply", { project, input: reference(input), graph: bases.routes.value.request.gaps.sources.graph,
+      target: owner.target, owner: owner.result, value: owner.value });
   return null;
+}
+const OWNER_READERS = { routes: readRoutesOf, input: readOmInputOf };
+/** The owner's proved H2 answers of the questions the current M6 routes to the model in the bypass (design, owner-decision). */
+function ownerAnswersBypassed(store: Store, project: string, bases: Bases) {
+  const bypassed = bases.routes.value.routes.filter(route => route.route === "design" && route.kind === "owner-decision" && route.field === "answer");
+  return ownerAnswersOf(store, project, bases.refs.routes, bases.routes.value.request.gaps.sources.input, OWNER_READERS)
+    .flatMap(owner => {
+      const route = owner.field === "answer" ? bypassed.find(row => same(row.record, owner.gap)) : undefined;
+      return route ? [{ ...owner, line: route.gap }] : [];
+    });
 }
 
 /** Every current line of the project (or every line), blocks and the mechanism; each series is read through its common reader. */

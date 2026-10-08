@@ -2875,23 +2875,45 @@ process.stdout.write(JSON.stringify(output));
   return histories;
 }
 
+/**
+ * OWN1 (№3711, №3713): a route saved before the bypass that holds an owner question of the pass is history — the bypass
+ * routes that question to the model, so new work on it needs the explicit M6 successor. Its records are still read as
+ * written; its current admission is route_stale. True when the route of this packet request is still current.
+ */
+function routeCurrent(store: Store, request: { project: string; routes: Ref }): boolean {
+  const saved = ok(readRoutes(store, { project: request.project, record: request.routes })).record.value.request;
+  const prepared = prepareRoutes(store, { ...saved, tasks: saved.tasks.map(record => ({ record })) } as unknown as RoutesRequest);
+  if (!prepared.ok) assert.equal(prepared.refusal.code, 'route_stale');
+  return prepared.ok;
+}
+function admissionStale(store: Store, request: QuestionPacketRequest): void {
+  // A packet of the historical route is returned as it was written; nothing new is issued on that route.
+  for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
+    const result = action(store, request);
+    if (result.ok) assert.deepEqual(result.value.writes, [], 'No new packet on a historical route');
+    else assert.equal(result.refusal.code, 'route_stale');
+  }
+}
 test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and parts retain their era across reopen and current admission', t => {
   const histories = lp1OldProducer(t);
   for (const history of histories) {
     let store = new Store(history.database);
     try {
       const before = snapshot(store);
+      const current = routeCurrent(store, history.packets[0]!.value.request);
       for (const packet of history.packets) {
         assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
         assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+        if (!current) { admissionStale(store, packet.value.request); continue; }
         assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
         const repeated = ok(writeQuestionPacket(store, packet.value.request));
         assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
       }
       for (const part of history.parts) {
         sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
-        assert.deepEqual(ok(preparePartResult(store, part.record.value.request)).writes, []);
+        if (current) assert.deepEqual(ok(preparePartResult(store, part.record.value.request)).writes, []);
       }
+      if (!current) { if (history.next) admissionStale(store, history.next); assert.deepEqual(snapshot(store), before); continue; }
       const packet = history.packets[0]!;
       const answer = { project: history.project, packet: reference(packet), raw: history.raw };
       ok(prepareAnswerForm(store, answer));
@@ -3109,13 +3131,15 @@ test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3
     for (const history of lp1OldProducer(t, commit)) {
       let store = new Store(history.database);
       try {
-        const before = snapshot(store);
+        const before = snapshot(store), current = routeCurrent(store, history.packets[0]!.value.request);
         for (const packet of history.packets) {
           assert.equal(packet.value.answerProtocol, commit.startsWith('b595') ? 'omg-answer/v2' : 'omg-answer/v3');
           assert.ok(!packet.value.packetContract?.includes('brief'));
           assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-          assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
-          assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+          if (current) {
+            assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
+            assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+          } else admissionStale(store, packet.value.request);
           assert.deepEqual(packet.value.fingerprint, { hash: hashJson(packet.value.packet), chars: canonical(packet.value.packet).length,
             utf8Bytes: Buffer.byteLength(canonical(packet.value.packet)) });
         }
@@ -3123,7 +3147,8 @@ test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3
         assert.deepEqual(snapshot(store), before);
         store.close(); store = new Store(history.database);
         for (const packet of history.packets) assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-        if (history.next) {
+        if (history.next && !current) admissionStale(store, history.next);
+        else if (history.next) {
           const next = ok(writeQuestionPacket(store, history.next)).record;
           assert.equal(next.value.answerProtocol, history.packets[0]!.value.answerProtocol);
           assert.equal(next.value.packetContract, history.packets[0]!.value.packetContract);
@@ -3258,18 +3283,20 @@ test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, deli
   for (const history of histories) {
     let store = new Store(history.database);
     try {
-      const before = snapshot(store);
+      const before = snapshot(store), current = routeCurrent(store, history.packets[0]!.value.request);
       for (const packet of history.packets) {
         mp11Version(packet, 'om-brief/v1');
         assert.ok(briefReadings(packet.value.packet), 'The actual MP3 producer keeps readings');
         assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
+        if (!current) { admissionStale(store, packet.value.request); continue; }
         assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
         const repeated = ok(writeQuestionPacket(store, packet.value.request));
         assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
       }
       for (const part of history.parts) sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
       assert.deepEqual(snapshot(store), before);
-      if (history.next) {
+      if (history.next && !current) admissionStale(store, history.next);
+      else if (history.next) {
         const next = ok(writeQuestionPacket(store, history.next)).record;
         mp11Version(next, 'om-brief/v1');
         if (history.next.continuation) assert.equal(next.value.refusal?.code, 'research_no_progress');
@@ -3295,7 +3322,8 @@ test('MP1.1 rows 2–4: independent blocked packets record their version before 
     const packet = old.packets[0]!; assert.equal(packet.value.state, 'blocked'); mp11Version(packet, 'om-brief/v1');
     const before = snapshot(store);
     assert.deepEqual(ok(readQuestionPacket(store, { project: old.project, record: reference(packet) })), packet);
-    assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+    if (routeCurrent(store, packet.value.request)) assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
+    else admissionStale(store, packet.value.request);
     assert.deepEqual(snapshot(store), before);
   } finally { store.close(); }
 });

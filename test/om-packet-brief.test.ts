@@ -607,3 +607,28 @@ test('MP1.1 row 17: each approved test extension is selected by its actual saved
     assert.ok(f.selected().includes(path), path);
   }
 });
+
+// OWN1 (№3713, №3716): what the bypass decided reaches the packets of its consumers, and a consumer that answers a
+// question of the environment at its task start gets what the pass knows of its own database beside it.
+test('OWN1 a decided question reaches the packets of its own consumer only; the facts of the own database go with a late environment question', t => {
+  const f = sample(t), node = f.basis.node!;
+  const decision = (consumer: string, id: string) => ({ question: { id, question: `Which policy for ${id}?`, consumer, kind: 'owner-decision',
+    blocks: false, source: { id: 'stage:garden:discovery', revision: 1, hash: '2'.repeat(64) } },
+  value: { decision: `Keep the minimal ${id} policy`, rationale: 'It does not duplicate the stage states',
+    alternatives: [{ option: 'Wait for the owner', consequences: 'The pass stands at this question' },
+      { option: 'Keep everything forever', consequences: 'The database grows without a bound' }] },
+  decision: { id: `om-input-decision:garden:${id}`, revision: 1, hash: '3'.repeat(64) } });
+  const sources = [{ stage: 'discovery', id: 'stage:garden:discovery', revision: 2, hash: '4'.repeat(64), contractVersion: 3 }];
+  const environment = { id: 'discovery:live-state', question: 'Which stages are recorded?', consumer: node, kind: 'environment-confirmation',
+    blocks: false, source: sources[0] };
+  for (const late of [false, true]) {
+    const input = { ...(f.basis.input as Record<string, Json>), sources, questions: late ? [environment] : [],
+      decided: [decision(node, 'retention'), decision('garden-produce-block', 'elsewhere')] };
+    const packet = deriveBrief(f.input, { ...f.basis, input: input as unknown as Json });
+    assert.ok(packet.brief.text.includes('Keep the minimal retention policy'), 'The consumer sees the decision taken for it');
+    assert.ok(packet.brief.text.includes('Keep everything forever'), 'and the alternatives the model weighed');
+    assert.ok(!packet.brief.text.includes('Keep the minimal elsewhere policy'), 'A decision of another consumer stays out');
+    assert.equal(packet.brief.text.includes('ownDatabase'), late);
+    if (late) assert.ok(packet.brief.text.includes('stage:garden:discovery'));
+  }
+});

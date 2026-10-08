@@ -36,7 +36,7 @@ import { preparedField } from "./preparation-fixture.js";
 const project = "garden";
 const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
-const COMMANDS = ["om-start", "om-continue", "om-state", "om-spend", "om-stop"] as const;
+const COMMANDS = ["om-start", "om-continue", "om-state", "om-spend", "om-stop", "om-decisions"] as const;
 type State = { run: Revision<RunRecord> | null; control: RunControlStatus };
 
 function ok<T>(result: unknown): T {
@@ -191,6 +191,9 @@ test("H2 rows 1 3 9 of №1821-2: every malformed OM command is command_invalid 
   const spend = ok<SpendReport>(engine.execute({ type: "om-spend", project }));
   assert.deepEqual([spend.scope, spend.totals], ["om-e1", { calls: 0, measuredCalls: 0, unmeasuredCalls: 0, reportedTokens: null }]);
   assert.deepEqual(spend, ok(spendReport(store, { project })), "The report is the common one, unchanged");
+  // OWN1 (№3714): the decisions of the bypass are read only; a project without B1 has none.
+  assert.deepEqual(ok(engine.execute({ type: "om-decisions", project })), { input: null, decisions: [] });
+  rejects(() => engine.execute({ type: "om-decisions", project, decisions: [] }), "command_invalid");
   assert.equal(refusal(await engine.execute({ type: "om-continue", project })).code, "record_missing", "A continue never starts a pass");
   assert.deepEqual(refusal(await engine.execute({ type: "om-start", project })), refusal(await startPass(store, { project })),
     "An unconfigured dispatch is the driver's own refusal");

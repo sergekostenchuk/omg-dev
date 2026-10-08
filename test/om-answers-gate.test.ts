@@ -160,8 +160,12 @@ function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, 
     .map(entry => entry.writes.length ? { pending: clone(entry.writes[0]!) as Write } : { record: reference(entry.record) });
   // LP7 (№3393 §6 F2): the legacy producers of this suite read this route, so it is the base code's own record, written in
   // its own process — the split route of that era, which today's code keeps current — never a route joined by today's code.
-  const route = atCommit({ root: dirname(store.path), path: store.path }, LP7_BASE, 'gate-route', `const { writeRoutes } = await import(src('om/routes.js'));
-out(take(writeRoutes(store, args)));`, { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null }) as Revision<RoutesRecord>;
+  // OWN1 (№3713): an owner question of the pass is routed to the model since; that era's route of it is history, and
+  // its question is routed by today's code.
+  const routeRequest = { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null };
+  const route = kind === 'owner-decision' && addressQuestion ? ok(writeRoutes(store, clone(routeRequest) as never)) as Revision<RoutesRecord>
+    : atCommit({ root: dirname(store.path), path: store.path }, LP7_BASE, 'gate-route', `const { writeRoutes } = await import(src('om/routes.js'));
+out(take(writeRoutes(store, args)));`, routeRequest) as Revision<RoutesRecord>;
   const request: AnswersGateRequest = { project, gaps: gapRead, routes: reference(route), results: [] };
   return { project, target, block, input, graph, horizon, gaps, blocking, route, request, task };
 }
@@ -418,16 +422,20 @@ test('G4b preserves every real D1 blocker and the code-only inventory gap across
   assert.deepEqual(snapshot(f.store), after, 'Historical reading and repeat do not write');
 });
 
+// OWN1 (№3711, №3713): in the bypass M6 routes an owner question of the pass to the model; a missing result is a missing
+// answer of a blocking gap, never a final wait for the owner.
 test('G4b records an addressed missing owner-result and does not treat route state as proof', t => {
   const f = fixture(t, 'owner-decision');
   const owner = f.blocking.find(row => row.value.gap.target === f.target)!;
   assert.ok(owner);
   assert.equal(owner.value.gap.kind, 'owner-decision');
-  assert.equal(f.route.value.routes.find(row => row.gap === owner.value.gap.id)?.route, 'owner');
+  assert.deepEqual(owner.value.gap.routes, ['owner'], 'D1 keeps the routes of an offered result');
+  assert.equal(f.route.value.routes.find(row => row.gap === owner.value.gap.id)?.route, 'design');
   const request: AnswersGateRequest = { ...f.request, results: [{ gap: reference(owner), result: null, candidate: null }] };
   const saved = ok(writeAnswersGate(f.store, request));
   assert.equal(saved.value.result.passed, false);
-  assert.ok(saved.value.result.codes.includes('owner_result_unavailable'));
+  assert.ok(saved.value.result.codes.includes('answer_missing_for_blocking_gap'));
+  assert.ok(!saved.value.result.codes.includes('owner_result_unavailable'));
   assert.ok(saved.value.result.findings.some(finding => finding.at.target === owner.value.gap.target));
   f.restart();
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
@@ -446,9 +454,13 @@ test('G4b does not accept an actor owner field or an owner-result-shaped record 
   ];
   const saved = lookalikes.map(result => ok(writeAnswersGate(f.store, { ...f.request,
     results: [{ gap: reference(owner), result: reference(result), candidate: null }] })));
+  // OWN1: the owner-result-shaped record is still proved by the owner's reader and refused there; on the bypass route
+  // the actor-owner lookalike is no answer of any producer.
+  assert.ok(saved[1]!.value.result.findings.some(finding => finding.at.target === owner.value.gap.target
+    && finding.code === 'owner_result_unavailable' && finding.route === 'owner'));
   for (const record of saved) {
-    assert.ok(record.value.result.findings.some(finding => finding.at.target === owner.value.gap.target
-      && finding.code === 'owner_result_unavailable' && finding.route === 'owner'));
+    assert.ok(record.value.result.findings.some(finding => finding.at.target === owner.value.gap.target));
+    assert.ok(!traceOf(f, record).some(entry => entry.cause.emission === 'owner-answered'));
     assert.equal(record.value.result.passed, false);
   }
   f.restart();
@@ -510,7 +522,7 @@ test('G4b pins the result into the saved request: a later result yields a new ga
   const f = fixture(t, 'owner-decision');
   const before = ok(writeAnswersGate(f.store, f.request));
   assert.equal(before.value.request.results.length, 0);
-  assert.ok(before.value.result.codes.includes('owner_result_unavailable'));
+  assert.ok(before.value.result.codes.includes('answer_missing_for_blocking_gap'), 'OWN1: the model decides it, no owner wait');
   const { decided } = ownerResult(f);
   f.restart();
   // The historical read of the earlier gate is byte-identical — the scan is never part of derivation.
@@ -537,7 +549,7 @@ test('G4b refuses missing, duplicate and unknown declarations rather than select
   assert.ok(owner);
   const row = { gap: reference(owner), result: null, candidate: null };
   const cases: { name: string; results: AnswersGateRequest['results']; code: string }[] = [
-    { name: 'omitted', results: [], code: 'owner_result_unavailable' },
+    { name: 'omitted', results: [], code: 'answer_missing_for_blocking_gap' },
     { name: 'duplicate', results: [row, row], code: 'answer_duplicate' },
     { name: 'unknown', results: [{ ...row, gap: { ...row.gap, id: 'om-gap:garden:unknown' } }], code: 'answer_gap_unknown' },
   ];
@@ -628,8 +640,12 @@ test('G4b rejects malformed public result rows before touching storage', t => {
   assert.deepEqual(snapshot(f.store), before);
 });
 
+// OWN1 (№3711): a design question of the pass has its producer (the model, MC2) — missing, never unsupported.
 test('G4b returns the supported-producer boundary for current unsupported question kinds', t => {
-  for (const kind of ['design-decision', 'environment-confirmation', 'post-implementation-proof'] as const) {
+  const design = fixture(t, 'design-decision'), saved = ok(writeAnswersGate(design.store, design.request));
+  assert.ok(saved.value.result.findings.some(finding => finding.at.target === design.target && finding.code === 'answer_missing_for_blocking_gap'));
+  assert.ok(!saved.value.result.codes.includes('route_result_unsupported'));
+  for (const kind of ['environment-confirmation', 'post-implementation-proof'] as const) {
     const f = fixture(t, kind), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
     assert.ok(gap, kind);
     assert.equal(gap.value.gap.code, 'predecessor_question');
@@ -1829,11 +1845,12 @@ test('C05 H1.0c every reachable cause of one emission point keeps its own kind a
   await t.test('31 H1.0c an owner gap absent, offered a recognized or an unknown record, deferred, or named inexactly', async child => {
     const f = fixture(child, 'owner-decision'), owner = f.blocking.find(row => row.value.gap.target === f.target)!;
     assert.equal(owner.value.gap.kind, 'owner-decision');
-    assert.deepEqual(summary(at(f, owner, null)), [['owner_result_unavailable', 'owner-absent', {}, []]]);
-    assert.deepEqual(summary(at(f, owner, { result: reference(f.route), candidate: null })),
-      [['owner_result_unavailable', 'owner-offered', { recognized: true }, ['offered']]]);
-    assert.deepEqual(summary(at(f, owner, { result: unknownResult(f), candidate: null })),
-      [['owner_result_unavailable', 'owner-offered', { recognized: false }, ['offered']]]);
+    // OWN1 (№3711): on the bypass route the absent answer is the model's missing submission; an offered record that is
+    // no owner result is no owner finding either. An owner-result-shaped record still meets the owner's reader (G4b test
+    // of the lookalikes); the owner emissions stay for an owner question routed to the owner.
+    assert.deepEqual(summary(at(f, owner, null)), [['answer_missing_for_blocking_gap', 'blocking-absent', {}, []]]);
+    for (const result of [reference(f.route), unknownResult(f)])
+      assert.ok(!summary(at(f, owner, { result, candidate: null })).some(row => row[0] === 'owner_result_unavailable'));
     assert.deepEqual(summary(at(f, owner, { result: null, candidate: null,
       deferral: { reason: 'outside_horizon', until: 'horizon-entry' } })),
     [['deferral_not_permitted', 'deferral-declared', { declared: true, inherited: false }, []]]);
@@ -1852,8 +1869,9 @@ test('C05 H1.0c every reachable cause of one emission point keeps its own kind a
     assert.deepEqual(traceOf(f, unknown).filter(entry => entry.cause.gap === null).map(entry => entry.cause.emission), ['gap-unknown'],
       'A result outside the exact complete D1 set has no gap and is traced as unknown');
   });
+  // OWN1 (№3711): a design question of the pass has its producer since; the unsupported question is the environment's.
   await t.test('32 H1.0c an unsupported predecessor question absent and offered', async child => {
-    const f = fixture(child, 'design-decision'), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
+    const f = fixture(child, 'environment-confirmation'), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
     assert.equal(gap.value.gap.code, 'predecessor_question');
     assert.deepEqual(summary(at(f, gap, null)), [['route_result_unsupported', 'unsupported-absent', {}, []]]);
     assert.deepEqual(summary(at(f, gap, { result: reference(f.route), candidate: null })),
@@ -2866,13 +2884,17 @@ test('29 30 H1.0c a non-blocking gap outside the area creates nothing, and its b
     'The non-blocking gap is not made blocking and not attributed');
 });
 
+// OWN1 (№3711): an owner question of the pass is decided by the model in the bypass — its missing answer is no owner
+// finding at all; it is still never attributed to another batch and never makes an awaiting-owner.
 test('31 H1.0c owner_result_unavailable is never attributed and never awaiting-owner', t => {
   const f = fixture(t, 'owner-decision'), m = managedOn(f, f.block, [nodeBatch(f, f.block).id], 1, 'row31');
   const owner = f.blocking.find(row => row.value.gap.kind === 'owner-decision')!;
   assert.ok(owner.value.gap.consumers.includes(f.block), 'The owner gap shares the consumer block; that is not enough');
   const saved = ok(evaluate(f, m, []));
   const gate = ok(readAnswersGate(f.store, { project: f.project, record: saved.evaluation.value.gate }));
-  assert.ok(gate.value.result.codes.includes('owner_result_unavailable'), 'The full G4b keeps the owner finding and stays negative');
+  assert.ok(!gate.value.result.codes.includes('owner_result_unavailable'), 'The bypass makes no owner finding');
+  assert.ok(gate.value.result.findings.some(item => item.at.target === owner.value.gap.target && item.code === 'answer_missing_for_blocking_gap'),
+    'The full G4b keeps the missing answer and stays negative');
   assert.equal(contributions(f, reference(saved.evaluation)).some(item => item[1] === 'owner_result_unavailable'), false);
   const work = m.work();
   assert.deepEqual(work.waiting, [], 'No awaiting-owner is made');
@@ -2880,16 +2902,19 @@ test('31 H1.0c owner_result_unavailable is never attributed and never awaiting-o
   assert.equal(f.store.list().some(row => row.id.startsWith(`om-owner-result:${f.project}:`)), false);
 });
 
-test('32 H1.0c an unsupported predecessor question waits for its producer', t => {
+// OWN1 (№3711) replaces row 32: a design question of the pass has its producer — the model decides it through MC2 and
+// F5.3 — so its missing answer waits for that submission, never for a producer that does not exist.
+test('32 H1.0c a design question of the pass waits for its own submission, not for a producer', t => {
   const f = fixture(t, 'design-decision'), m = managedOn(f, f.block, [fieldBatch(f, f.target, 'answer').id], 1, 'row32');
   const absent = ok(evaluate(f, m, []));
-  assert.deepEqual(contributions(f, reference(absent.evaluation)), [['unsupported-absent', 'route_result_unsupported',
-    { kind: 'journal-only', wait: 'producer', barrier: true }]]);
+  assert.deepEqual(contributions(f, reference(absent.evaluation)), [['blocking-absent', 'answer_missing_for_blocking_gap',
+    { kind: 'journal-only', wait: 'submission', barrier: true }]]);
   const gap = f.blocking.find(row => row.value.gap.target === f.target)!;
   const offered = ok(evaluate(f, m, [{ gap: reference(gap), result: unknownResult(f), candidate: null }]));
-  assert.deepEqual(contributions(f, reference(offered.evaluation)), [['unsupported-offered', 'route_result_unsupported',
-    { kind: 'journal-only', wait: 'producer', barrier: true }]]);
-  assert.deepEqual(m.work().answers?.waiting.map(item => [item.reason, item.code]), [['producer', 'route_result_unsupported']]);
+  // An offered record of no producer is an unrecognized submission — the question still waits for its own answer.
+  assert.deepEqual(contributions(f, reference(offered.evaluation)), [['offered-unrecognized', 'route_result_unsupported',
+    { kind: 'journal-only', wait: 'submission', barrier: true }]]);
+  assert.ok(!(m.work().answers?.waiting ?? []).some(item => item.reason === 'producer'));
   assert.equal(offered.evaluation.value.scope.items[0]!.kind, 'design-decision', 'The kind is not changed to fit a producer');
 });
 
@@ -4053,23 +4078,28 @@ test('R9 R1 R3 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own 
 // ---- H1.5 (№2164, №2166): one verdict on whether an answer to a question has a producer ----
 const H15_BASE_COMMIT = '479b307f8aa3d43745f5313c1f5c8a712bd7d55a';
 
-test('H1.5 answerProducerOf: an owner question waits for H2, a predecessor question that is no repository fact has no producer, every other class keeps its own — one test per row of the table', () => {
-  type Row = readonly [row: string, code: string, field: string, kind: string, expected: 'present' | 'route_result_unsupported' | 'owner_result_unavailable'];
+// OWN1 (№3711) changes rows T1 and T5: in the bypass the model decides a design or an owner question of the pass; the same
+// question at a later moment has no producer in the pass (T1b, T5b), and the moment is part of the verdict.
+test('H1.5 answerProducerOf: a design or owner question of the pass is decided by the model, a later question has no producer, every other class keeps its own — one test per row of the table', () => {
+  type Row = readonly [row: string, code: string, field: string, kind: string, moment: string, expected: 'present' | 'route_result_unsupported' | 'owner_result_unavailable'];
   const table: readonly Row[] = [
-    ['T1', 'predecessor_question', 'answer', 'design-decision', 'route_result_unsupported'],
-    ['T2', 'predecessor_question', 'answer', 'environment-confirmation', 'route_result_unsupported'],
-    ['T3', 'predecessor_question', 'answer', 'post-implementation-proof', 'route_result_unsupported'],
-    ['T4', 'predecessor_question', 'answer', 'repository-fact', 'present'],
-    ['T5', 'predecessor_question', 'answer', 'owner-decision', 'owner_result_unavailable'],
-    ['T6', 'question_unaddressed', 'address', 'design-decision', 'present'],
-    ['T7', 'contract_node_unbound', 'nodes', 'design-decision', 'present'],
-    ['T8', 'contract_boundary_prose', 'state', 'design-decision', 'present'],
-    ['T9', 'acceptance_kind_missing', 'checkKind', 'design-decision', 'present'],
-    ['T10', 'obligation_open', 'fill', 'design-decision', 'present'],
-    ['T11', 'inventory_missing', 'inventory', 'repository-fact', 'present'],
+    ['T1', 'predecessor_question', 'answer', 'design-decision', 'om-pass', 'present'],
+    ['T1b', 'predecessor_question', 'answer', 'design-decision', 'task-start', 'route_result_unsupported'],
+    ['T2', 'predecessor_question', 'answer', 'environment-confirmation', 'task-start', 'route_result_unsupported'],
+    ['T2b', 'predecessor_question', 'answer', 'environment-confirmation', 'om-pass', 'route_result_unsupported'],
+    ['T3', 'predecessor_question', 'answer', 'post-implementation-proof', 'task-result', 'route_result_unsupported'],
+    ['T4', 'predecessor_question', 'answer', 'repository-fact', 'om-pass', 'present'],
+    ['T5', 'predecessor_question', 'answer', 'owner-decision', 'om-pass', 'present'],
+    ['T5b', 'predecessor_question', 'answer', 'owner-decision', 'feasibility', 'owner_result_unavailable'],
+    ['T6', 'question_unaddressed', 'address', 'design-decision', 'om-pass', 'present'],
+    ['T7', 'contract_node_unbound', 'nodes', 'design-decision', 'om-pass', 'present'],
+    ['T8', 'contract_boundary_prose', 'state', 'design-decision', 'om-pass', 'present'],
+    ['T9', 'acceptance_kind_missing', 'checkKind', 'design-decision', 'om-pass', 'present'],
+    ['T10', 'obligation_open', 'fill', 'design-decision', 'om-pass', 'present'],
+    ['T11', 'inventory_missing', 'inventory', 'repository-fact', 'om-pass', 'present'],
   ];
-  for (const [row, code, field, kind, expected] of table) {
-    const verdict = answerProducerOf({ code, field, kind } as never);
+  for (const [row, code, field, kind, moment, expected] of table) {
+    const verdict = answerProducerOf({ code, field, kind, moment } as never);
     assert.equal(verdict.present ? 'present' : verdict.code, expected, `${row}: ${code}/${field}/${kind}`);
     if (!verdict.present) {
       assert.equal(verdict.field, expected === 'owner_result_unavailable' ? 'owner-result' : 'answer', row);
@@ -4077,15 +4107,16 @@ test('H1.5 answerProducerOf: an owner question waits for H2, a predecessor quest
     }
   }
   // The verdict is a value of its gap alone: nothing but the class and the kind decides, and it cannot be changed by a caller.
-  assert.ok(Object.isFrozen(answerProducerOf({ code: 'predecessor_question', field: 'answer', kind: 'design-decision' } as never)));
+  assert.ok(Object.isFrozen(answerProducerOf({ code: 'predecessor_question', field: 'answer', kind: 'environment-confirmation', moment: 'task-start' } as never)));
   // A gap that lacks a field is an invalid request, never a guess (and never a TypeError).
   for (const bad of [null, undefined, 'gap', {}, { code: 'predecessor_question', field: 'answer' }, { code: 'predecessor_question', kind: 'design-decision' },
+    { code: 'predecessor_question', field: 'answer', kind: 'design-decision' },
     { field: 'answer', kind: 'design-decision' }, { code: '', field: 'answer', kind: 'design-decision' }, { code: 'predecessor_question', field: 'answer', kind: 7 }])
     assert.throws(() => answerProducerOf(bad as never), (error: unknown) => error instanceof EngineError && error.code === 'answers_gate_request_invalid', JSON.stringify(bad));
 });
 
 test('H1.5 G4b names an unserved question by answerProducerOf alone: code, field and message of the finding are the verdict, absent or offered, and the emission stands in the shared list', async t => {
-  for (const kind of ['design-decision', 'environment-confirmation', 'post-implementation-proof', 'owner-decision'] as const) {
+  for (const kind of ['environment-confirmation', 'post-implementation-proof'] as const) {
     await t.test(`${kind} has no producer`, child => {
       const f = fixture(child, kind), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
       assert.ok(gap);
@@ -4101,41 +4132,34 @@ test('H1.5 G4b names an unserved question by answerProducerOf alone: code, field
       }
     });
   }
-  await t.test('a repository fact has a producer: its absence is another emission, outside the list', child => {
-    const f = fixture(child, 'repository-fact'), gap = f.blocking.find(row => row.value.gap.target === f.target && row.value.gap.kind === 'repository-fact')!;
-    assert.equal(answerProducerOf(gap.value.gap).present, true);
-    const entries = ok(prepareAnswersGateTrace(f.store, { ...f.request, results: [] })).trace.filter(entry => entry.finding.at.target === f.target);
-    assert.deepEqual(entries.map(entry => entry.cause.emission), ['blocking-absent']);
-    assert.equal(NO_PRODUCER_EMISSIONS.includes('blocking-absent'), false);
-  });
+  for (const kind of ['repository-fact', 'design-decision', 'owner-decision'] as const)
+    await t.test(`${kind} has a producer: its absence is another emission, outside the list`, child => {
+      const f = fixture(child, kind), gap = f.blocking.find(row => row.value.gap.target === f.target && row.value.gap.kind === kind)!;
+      assert.equal(answerProducerOf(gap.value.gap).present, true);
+      const entries = ok(prepareAnswersGateTrace(f.store, { ...f.request, results: [] })).trace.filter(entry => entry.finding.at.target === f.target);
+      assert.deepEqual(entries.map(entry => entry.cause.emission), ['blocking-absent']);
+      assert.equal(NO_PRODUCER_EMISSIONS.includes('blocking-absent'), false);
+    });
 });
 
 test('H1.5 readRouteProducers names the batches nobody can answer from the proven route and D1 alone, and leaves every batch that has its own producer served', async t => {
   const batchesOf = (f: ReturnType<typeof fixture>, routes: Ref = reference(f.route)) => ok(readRouteProducers(f.store, { project: f.project, routes }));
-  await t.test('R1 a design-decision predecessor question: only its answer batch is unserved, with the exact gap and the verdict of G4b', child => {
-    const f = fixture(child, 'design-decision'), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
-    const read = batchesOf(f);
-    assert.deepEqual(read.routes, reference(f.route));
-    assert.deepEqual(read.batches.map(row => row.batch).sort(), f.route.value.batches.map(row => row.id).sort(), 'Every batch of the route is judged');
-    const unserved = read.batches.filter(row => row.unserved.length);
-    assert.equal(unserved.length, 1);
-    const batch = f.route.value.batches.find(item => item.id === unserved[0]!.batch)!;
-    assert.deepEqual([batch.model, batch.task, batch.items.map(item => item.field)], ['MC2', 'input-field', ['answer']]);
-    const verdict = answerProducerOf(gap.value.gap);
-    if (verdict.present) assert.fail('A design-decision predecessor question has no producer');
-    assert.deepEqual(unserved[0]!.unserved.map(row => [row.target, row.field, row.blocking, row.producer.code, row.producer.field, row.producer.message]),
-      [[f.target, 'answer', true, 'route_result_unsupported', 'answer', verdict.message]], 'A blocking question of the pass, with the verdict of G4b');
-    assert.deepEqual(unserved[0]!.unserved[0]!.gap, reference(gap));
-    for (const row of read.batches) {
-      const routed = f.route.value.batches.find(item => item.id === row.batch)!;
-      assert.deepEqual(row.records, canonicalOrder(routed.items.map(item => ({ id: item.record.id, revision: item.record.revision, hash: item.record.hash }))),
-        'The bases of the verdict are the exact D1 records the batch names');
-    }
-    const served = read.batches.filter(row => !row.unserved.length).map(row => f.route.value.batches.find(item => item.id === row.batch)!);
-    assert.ok(served.length > 0);
-    assert.ok(served.some(item => item.task === 'node-expansion'), 'The node expansion has its own producer');
-    assert.ok(served.some(item => item.model === 'MC2' && item.task === 'input-field'), 'The other input fields have their own producers');
-  });
+  // OWN1 (№3711): the answer batch of a design or owner question of the pass is served by the model (MC2, F5.3).
+  for (const kind of ['design-decision', 'owner-decision'] as const)
+    await t.test(`R1 a ${kind} predecessor question: its own answer batch is served, beside the node expansion and the other input fields`, child => {
+      const f = fixture(child, kind), read = batchesOf(f);
+      assert.deepEqual(read.routes, reference(f.route));
+      assert.deepEqual(read.batches.map(row => row.batch).sort(), f.route.value.batches.map(row => row.id).sort(), 'Every batch of the route is judged');
+      const answer = f.route.value.batches.find(item => item.items.some(row => row.target === f.target))!;
+      assert.deepEqual([answer.model, answer.task, answer.kind, answer.items.map(item => item.field)], ['MC2', 'input-field', kind, ['answer']]);
+      assert.equal(read.batches.every(row => row.unserved.length === 0), true);
+      for (const row of read.batches) {
+        const routed = f.route.value.batches.find(item => item.id === row.batch)!;
+        assert.deepEqual(row.records, canonicalOrder(routed.items.map(item => ({ id: item.record.id, revision: item.record.revision, hash: item.record.hash }))),
+          'The bases of the verdict are the exact D1 records the batch names');
+      }
+      assert.ok(f.route.value.batches.some(item => item.task === 'node-expansion'), 'The node expansion has its own producer');
+    });
   await t.test('R2 M5 addressing of an unaddressed question is served', child => {
     const f = fixture(child, 'design-decision', false), read = batchesOf(f);
     const m5 = f.route.value.batches.find(item => item.model === 'MC2' && item.task === 'input-field' && item.items.every(row => row.field === 'address'))!;
@@ -4149,7 +4173,7 @@ test('H1.5 readRouteProducers names the batches nobody can answer from the prove
     assert.ok(fact);
     assert.equal(read.batches.every(row => row.unserved.length === 0), true);
   });
-  for (const kind of ['owner-decision', 'environment-confirmation', 'post-implementation-proof'] as const)
+  for (const kind of ['environment-confirmation', 'post-implementation-proof'] as const)
     await t.test(`R4 ${kind}: M6 makes no batch of it, so nothing is unserved and G4b alone names the question`, child => {
       const f = fixture(child, kind), read = batchesOf(f);
       assert.equal(f.route.value.batches.some(item => item.items.some(row => row.target === f.target)), false);
@@ -4168,8 +4192,10 @@ test('H1.5 readRouteProducers names the batches nobody can answer from the prove
   });
 });
 
+// OWN1: the route of an owner question is today's (the fixture writes it by today's code), which the base era cannot
+// read; the era of its G4b record stays covered by the design question.
 test('H1.5 ERA: G4b records written by the code of the base commit are read by the new code with the same result, and the new preparation derives that very record', async t => {
-  for (const kind of ['design-decision', 'owner-decision'] as const) {
+  for (const kind of ['design-decision'] as const) {
     await t.test(kind, child => {
       const f = fixture(child, kind), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
       const requests: AnswersGateRequest[] = [{ ...f.request, results: [] },
@@ -4178,13 +4204,16 @@ test('H1.5 ERA: G4b records written by the code of the base commit are read by t
 out(args.map(request => reference(take(writeAnswersGate(store, request)))));`, requests) as Ref[];
       f.restart();
       assert.equal(written.length, 2);
-      const expected = kind === 'owner-decision' ? ['owner_result_unavailable', 'owner-result'] : ['route_result_unsupported', 'answer'];
+      const expected = ['route_result_unsupported', 'answer'];
       written.forEach((ref, index) => {
         const saved = ok(readAnswersGate(f.store, { project: f.project, record: ref }));
         assert.equal(saved.hash, ref.hash);
         assert.deepEqual(saved.value.result.findings.filter(item => item.at.target === f.target).map(item => [item.code, item.at.field]), [expected]);
-        assert.deepEqual(ok(prepareAnswersGate(f.store, requests[index]!)).record, saved, 'The new derivation is the record the base wrote');
-        traceOf(f, saved);
+        // OWN1 (№3711): the era rule — the record keeps the verdict of its era; today the model is the producer of this
+        // question, and the same identity is never given another outcome: the new code refuses to rewrite it.
+        const again = prepareAnswersGate(f.store, requests[index]!);
+        assert.equal(again.ok ? 'derived' : again.refusal.code, 'answer_version_stale');
+        // Its trace is derived by today's producer table, which names this question's producer now: no era trace of it.
       });
     });
   }
@@ -4442,7 +4471,8 @@ test('LP5 (return №3294 п.3) a never-dispatched work whose remaining acceptan
   assert.equal(outcomeOf(f, m).reason, 'interrupted');
 });
 
-test('LP7 row 7: beside the joined input of its block, an answer without a producer stays its own unserved batch — the joined batch is served whole', t => {
+// OWN1 (№3711): the answer batch is served by the model since; it still stays its own batch beside the joined input.
+test('LP7 row 7: beside the joined input of its block, an answer stays its own batch — the joined batch is served whole', t => {
   const f = fixture(t, 'design-decision', true, false, { block: 'garden-consume-block' });
   // The explicit successor of the base route over the same D1 is born by today's rule: the block's input fields join.
   const saved = f.route.value.request, joinedRoute = ok(writeRoutes(f.store, { project: f.project, gaps: saved.gaps as GapReadRequest,
@@ -4456,6 +4486,5 @@ test('LP7 row 7: beside the joined input of its block, an answer without a produ
   assert.deepEqual(joined.items[0]!.consumers, answer.items[0]!.consumers, 'The same complete consumer set, yet never one batch');
   const producers = ok(readRouteProducers(f.store, { project: f.project, routes: reference(joinedRoute) }));
   assert.deepEqual(producers.batches.find(row => row.batch === joined.id)!.unserved, [], 'Every joined field has its producer');
-  assert.deepEqual(producers.batches.find(row => row.batch === answer.id)!.unserved.map(row => [row.field, row.producer.code]),
-    answer.items.map(() => ['answer', 'route_result_unsupported']));
+  assert.deepEqual(producers.batches.find(row => row.batch === answer.id)!.unserved, [], 'The model decides the answer');
 });

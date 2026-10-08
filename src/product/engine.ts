@@ -1,4 +1,5 @@
 import { runIntegrityCheck } from "../om/integrity.js";
+import { listBypassDecisions } from "../om/addressing.js";
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { configureDispatch } from '../om/dispatch.js';
@@ -284,6 +285,8 @@ export class ProductEngine {
       case "om-stop": this.#project(command.project); return stopPass(this.store, { project: command.project });
       // NR1 (№3646): the integrity check of the database on request; it also runs by itself at every om-start and om-continue.
       case "om-fsck": this.#project(command.project); return runIntegrityCheck(this.store, { project: command.project });
+      // OWN1 (№3714): read only — the questions the pass decided in the bypass, with the model's choice and its alternatives.
+      case "om-decisions": this.#project(command.project); return listBypassDecisions(this.store, { project: command.project });
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);

@@ -1236,3 +1236,94 @@ test('D3.1 operation history proves unique inputs and answers once per view at o
     } finally { store.close(); }
   }
 });
+
+// OWN1 (№3711, №3713, №3714): the bypass — the model decides an addressed design or owner question of the pass.
+const decisionValue = (decision = 'Keep the minimal records'): Json => ({ decision,
+  rationale: 'The minimal records do not duplicate the stage states',
+  alternatives: [{ option: 'Wait for the owner', consequences: 'The pass stands at this question until the owner answers' },
+    { option: 'Record every command', consequences: 'More records and a risk of duplicating the stage states' }] });
+function addressedAs(f: ReturnType<typeof fixture>, kind: string, consumer = block): InputBuildResult {
+  const addressed = applyAddressing(f.pure(), [{ question, consumer, kind: kind as never, basis: fakeRef }], f.graph.value as Graph);
+  assert.deepEqual(addressed.refusals, []);
+  return addressed.result as InputBuildResult;
+}
+for (const kind of ['design-decision', 'owner-decision'] as const) test(`OWN1 F5.3 decides an addressed ${kind} question: it leaves the questions and stands decided with its exact decision; a formless answer leaves it open`, t => {
+  const f = fixture(t), graph = f.graph.value as Graph, base = addressedAs(f, kind);
+  assert.equal(base.input!.questions[0]!.kind, kind);
+  const decided = applyInputDecisions(base, [{ target: question, field: 'answer', value: decisionValue(), basis: fakeRef }], graph);
+  assert.deepEqual(decided.refusals, []);
+  assert.deepEqual(decided.result.input!.questions, []);
+  assert.deepEqual(decided.result.input!.decided, [{ question: base.input!.questions[0], value: decisionValue(), decision: fakeRef }]);
+  assert.ok(!decided.result.gaps.some(gap => gap.target === question));
+  // The same decision again changes nothing; another decision of the decided question is no question any more.
+  assert.deepEqual(applyInputDecisions(decided.result as InputBuildResult, [{ target: question, field: 'answer', value: decisionValue(), basis: fakeRef }], graph), decided);
+  assert.equal(applyInputDecisions(decided.result as InputBuildResult, [{ target: question, field: 'answer',
+    value: decisionValue('Record every command'), basis: fakeRef }], graph).refusals[0]!.code, 'addressing_invalid');
+  const formless: Json[] = ['JSON', null, {}, { decision: 'Keep it', rationale: 'Because' },
+    { ...decisionValue() as Record<string, Json>, alternatives: [] },
+    { ...decisionValue() as Record<string, Json>, alternatives: [(decisionValue() as { alternatives: Json[] }).alternatives[0]!] },
+    { ...decisionValue() as Record<string, Json>, decision: 'TBD' },
+    { ...decisionValue() as Record<string, Json>, rationale: '' },
+    { ...decisionValue() as Record<string, Json>, extra: 'field' },
+    { ...decisionValue() as Record<string, Json>, alternatives: [{ option: 'Keep the minimal records', consequences: 'The same option as the decision' },
+      { option: 'Wait for the owner', consequences: 'The pass stands at this question until the owner answers' }] },
+    { ...decisionValue() as Record<string, Json>, alternatives: [{ option: 'Wait for the owner', consequences: 'none' },
+      { option: 'Record every command', consequences: 'More records and a risk' }] }];
+  for (const value of formless) {
+    const refused = applyInputDecisions(base, [{ target: question, field: 'answer', value, basis: fakeRef }], graph);
+    assert.equal(refused.refusals[0]!.code, 'addressing_invalid', canonical(value));
+    assert.deepEqual(refused.result, base, 'An invalid decision closes nothing');
+  }
+});
+
+test('OWN1 F5.3 never decides a fact, an environment confirmation or an unaddressed question', t => {
+  const f = fixture(t), graph = f.graph.value as Graph;
+  for (const base of [addressedAs(f, 'repository-fact'), addressedAs(f, 'environment-confirmation'), f.pure()]) {
+    const refused = applyInputDecisions(base, [{ target: question, field: 'answer', value: decisionValue(), basis: fakeRef }], graph);
+    assert.equal(refused.refusals[0]!.code, 'addressing_field_unsupported', canonical(base.input!.questions[0]!.kind));
+    assert.deepEqual(refused.result, base);
+  }
+});
+
+test('OWN1 D3 writes the decision of a design question as a new B1 that keeps it decided after restart; an invalid decision writes nothing; om-decisions reads it', t => {
+  const f = fixture(t);
+  const addressed = ok(writeAddressing(f.store, f.request(reference(f.input), 'address', question, { consumer: block, kind: 'design-decision' })));
+  const open = ok(writeGaps(f.store, gapRequest(f, addressed, 'own1-open'))).records.find(row => row.value.gap.target === question)!;
+  assert.deepEqual([open.value.gap.code, open.value.gap.field, open.value.gap.blocking], ['predecessor_question', 'answer', true]);
+  const before = canonical(f.store.list().map(reference) as unknown as Json);
+  refusedWith(prepareAddressing(f.store, f.request(reference(addressed), 'answer', question, { decision: 'Keep it' })), 'addressing_invalid');
+  assert.equal(canonical(f.store.list().map(reference) as unknown as Json), before);
+  const saved = ok(writeAddressing(f.store, f.request(reference(addressed), 'answer', question, decisionValue())));
+  assert.equal(saved.revision, addressed.revision + 1);
+  assert.deepEqual(saved.value.input.questions, []);
+  assert.equal(saved.value.input.decided![0]!.question.id, question);
+  assert.deepEqual(saved.value.input.decided![0]!.value, decisionValue());
+  assert.ok(saved.value.input.decided![0]!.decision.id.startsWith('om-input-decision:garden:'));
+  f.restart(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(saved))), saved);
+  // The decided question is no gap of the next D1: nothing is left to route or pay for it again.
+  assert.ok(!ok(writeGaps(f.store, gapRequest(f, saved, 'own1-decided'))).records.some(row => row.value.gap.target === question));
+  const written = canonical(f.store.list().map(reference) as unknown as Json);
+  const listed = ok(f.engine.execute({ type: 'om-decisions', project: f.project }) as unknown as OmResult<{ decisions: { id: string; question: string; consumer: string; kind: string; decision: string; alternatives: Json[]; record: Ref; input: Ref; call: Ref | null }[] }>);
+  assert.deepEqual(listed.decisions.map(row => [row.id, row.consumer, row.kind, row.decision, row.alternatives.length, row.call]),
+    [[question, block, 'design-decision', 'Keep the minimal records', 2, null]]);
+  assert.equal(listed.decisions[0]!.question, f.input.value.input.questions[0]!.question);
+  assert.deepEqual(listed.decisions[0]!.record, saved.value.input.decided![0]!.decision);
+  assert.deepEqual(listed.decisions[0]!.input, reference(saved));
+  assert.equal(canonical(f.store.list().map(reference) as unknown as Json), written, 'om-decisions reads only');
+});
+
+test('OWN1 №3719 an owner-shaped decision stands only on the exact H2 result of its question: a missing or foreign record writes nothing', t => {
+  const f = fixture(t);
+  const addressed = ok(writeAddressing(f.store, f.request(reference(f.input), 'address', question, { consumer: block, kind: 'owner-decision' })));
+  const before = canonical(f.store.list().map(reference) as unknown as Json);
+  const forged = { id: 'om-owner-result:garden:forged', revision: 1, hash: '5'.repeat(64) };
+  const lookalike = f.store.write({ id: 'om-owner-result:garden:lookalike', kind: 'om-owner-result', expected: 0,
+    value: { project: 'garden', command: forged, value: 'Keep everything' } });
+  const after = canonical(f.store.list().map(reference) as unknown as Json);
+  for (const owner of [forged, reference(lookalike)]) {
+    const refused = prepareAddressing(f.store, f.request(reference(addressed), 'answer', question, { owner, value: 'Keep everything' } as unknown as Json));
+    assert.equal(refused.ok, false, owner.id);
+  }
+  assert.equal(canonical(f.store.list().map(reference) as unknown as Json), after);
+  assert.notEqual(before, after);
+});

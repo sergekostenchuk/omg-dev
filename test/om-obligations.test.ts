@@ -403,17 +403,23 @@ function pendingOwners(f: ReturnType<typeof fixture>): ObligationRequest {
   return { ...f.request, assignments: f.input.value.input.questions.map((_, index) => ({ pending: ownerWrite(ownerAssignment(f, index)) })) };
 }
 
-test("D7 native D3 late questions retain kind, deadline and original address; H2 adds explicit assignment without closing or advancing anything", t => {
+test("D7 native D3 late questions retain kind, deadline and original address; the bypass carries them to their consumers, H2 replaces that by its explicit assignment without closing or advancing anything", t => {
   const f = fixture(t, ["environment-confirmation", "post-implementation-proof"]);
   const late = f.gaps.records.filter(row => row.value.gap.moment !== "om-pass");
   assert.equal(late.length, 2);
   assert.deepEqual(late.map(row => row.value.gap.moment).sort(), ["task-result", "task-start"]);
   assert.equal(f.store.get("phase:garden:R2"), null); assert.equal(f.store.get("phase:garden:L3"), null);
-  const before = revisions(f.store), noAssignment = denied(prepareOmObligations(f.store, f.request), "obligation_assignment_unresolved");
-  assert.equal(noAssignment.route, "owner");
-  assert.ok(late.some(row => row.value.gap.target === noAssignment.at.target));
-  denied(writeOmObligations(f.store, f.request), "obligation_assignment_unresolved");
+  const before = revisions(f.store);
+  // OWN1 (№3711, №3716): without H2 the engine carries each late gap to its own consumer, with what the pass knows of
+  // its own database; the question stays as it is.
+  const bypass = ok(prepareOmObligations(f.store, f.request));
+  assert.equal(bypass.writes.length, 2, "Only the producer and its ledger; no owner command is invented");
   assert.deepEqual(revisions(f.store), before);
+  assert.deepEqual(bypass.record.value.assignments.map(row => [row.obligation, row.responsibleNode, row.responsibleConsumer, row.returnCondition]).sort(),
+    late.map(row => [row.value.gap.id, "garden-produce-block", "garden-produce-block",
+      f.input.value.input.questions.find(q => q.id === row.value.gap.target)!.question]).sort());
+  for (const row of bypass.record.value.assignments)
+    assert.match(row.reason, /^Assigned by the engine in the bypass: the consumer answers it at task-(start|result)\. Own database facts at this pass: stages discovery stage:garden:discovery@\d+, .*; layers L2 .*; accepted nodes \d+\.$/);
   const request = pendingOwners(f), prepared = ok(prepareOmObligations(f.store, request));
   assert.equal(prepared.writes.length, 4, "Two H2 contracts and the complete producer/ledger are one transaction");
   assert.deepEqual(revisions(f.store), before);

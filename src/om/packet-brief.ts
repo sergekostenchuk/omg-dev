@@ -283,7 +283,10 @@ export function resolveBriefAnswer(payload: Record<string, any>, input: Record<s
 function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
   const input = basis.input as Record<string, any>;
   const targets = new Set((payload.questions as { target: string }[]).map(question => question.target));
+  const consumers = new Set<string>([...(basis.node ? [basis.node] : []),
+    ...(payload.questions as { consumers?: string[] }[]).flatMap(question => question.consumers ?? [])]);
   const node = basis.graph.nodes.find(row => row.id === basis.node);
+  const decided = (input.decided ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer));
   const requirementIds = new Set(node?.implements ?? []);
   const knownRequirements = new Set((input.requirements ?? []).map((row: { id: string }) => row.id));
   const selectRequirement = (selected: unknown): void => {
@@ -310,6 +313,14 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
     requirements: (input.requirements ?? []).filter((row: { id: string }) => requirementIds.has(row.id)),
     criteria: (input.criteria ?? []).filter((row: { id: string; requirement: string }) => targets.has(row.id) || requirementIds.has(row.requirement)),
     contracts, questions: (input.questions ?? []).filter((row: { id: string }) => targets.has(row.id)),
+    // OWN1 (№3713): what the bypass decided for the consumers of this work reaches them — the question, the decision taken
+    // and its alternatives — never a question silently gone. A packet with nothing decided keeps its bytes of its era.
+    ...(decided.length ? { decided } : {}),
+    // OWN1 (№3716): a question of these consumers left for their task start (the environment) is answered then, from
+    // observation; what the pass knows of its own database goes with the packet, never in place of that observation.
+    ...((input.questions ?? []).some((row: { consumer: string; kind: string | null }) => consumers.has(row.consumer)
+      && row.kind === 'environment-confirmation') ? { ownDatabase: { stages: (input.sources ?? [])
+      .map((row: { stage: string; id: string; revision: number }) => ({ stage: row.stage, id: row.id, revision: row.revision })) } } : {}),
     actors: basis.graph.actors ?? [], allowedNodes: basis.graph.nodes.filter(row => row.kind !== 'product').map(row => ({ id: row.id, kind: row.kind, title: row.title })),
     graphRequirements: (basis.graph.requirements ?? []).filter(row => requirementIds.has(row.id)) };
 }
@@ -317,8 +328,15 @@ function fieldValueShape(gap: BriefBasis['gaps'][number], basis: BriefBasis): Re
   const enumOf = (values: string[]) => values.length ? { type: 'string', enum: values } : { not: {} };
   const nodes = basis.graph.nodes.map(node => node.id);
   const input = basis.input as Record<string, any>;
-  // M6 can preserve a design-decision question for its owner. E4 still forbids dispatch of that batch.
-  if (gap.field === 'answer' && input.questions.some((row: { id: string }) => row.id === gap.target)) return {};
+  // OWN1 (№3711, №3714): in the bypass the model decides a design or owner question of the pass — the decision, why, and
+  // two or three other options with their consequences; F5.3 checks the content on receipt.
+  if (gap.field === 'answer' && input.questions.some((row: { id: string }) => row.id === gap.target)) {
+    const words = { type: 'string', minLength: 3 };
+    return { type: 'object', additionalProperties: false, required: ['decision', 'rationale', 'alternatives'], properties: {
+      decision: words, rationale: words,
+      alternatives: { type: 'array', minItems: 2, maxItems: 3, items: { type: 'object', additionalProperties: false,
+        required: ['option', 'consequences'], properties: { option: words, consequences: words } } } } };
+  }
   if (gap.field === 'checkKind') return { enum: ['test', 'full-run', 'environment-observation'] };
   if (gap.field === 'nodes') return { type: 'array', minItems: 1, uniqueItems: true, items: enumOf(basis.graph.nodes.filter(node => node.kind === 'block').map(node => node.id)) };
   if (gap.field === 'address') {
@@ -339,8 +357,18 @@ function fieldValueShape(gap: BriefBasis['gaps'][number], basis: BriefBasis): Re
 }
 
 const SEARCH_RULE = 'Search finds one literal substring within each line, without case sensitivity (JavaScript toLowerCase). A phrase with spaces is one substring, not AND/OR. Regular expressions are not supported: |, . and * are ordinary characters. Use separate search entries for different terms. Results are matching lines with their source and line number. [] means no matches in the successfully read exact scope, not absence of functionality throughout the project. An unavailable scope is a refusal, not an empty success. String within is a literal relative path, not a glob; {label:S1} selects a source of this packet, and saved context is read with read_context.';
+/** OWN1 (№3719 P2-2): a packet of questions the bypass gives the model to decide — no owner is asked in this pass. */
+const decidesQuestions = (payload: Record<string, any>, basis: BriefBasis): boolean => payload.task === 'input-field'
+  && basis.gaps.some(gap => gap.field === 'answer' && payload.questions.some((question: { id: string }) => question.id === gap.question));
+/** A decision the example shows; it passes the content check of F5.3 itself, so a copied form is no refused answer. */
+const DECISION_EXAMPLE = Object.freeze({ decision: 'Choose the option the requirements support best',
+  rationale: 'Name the requirement or fact of this brief the choice follows from',
+  alternatives: [{ option: 'A second concrete option', consequences: 'What would follow if it were chosen instead' },
+    { option: 'A third concrete option', consequences: 'What would follow if that one were chosen' }] });
 function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis: BriefBasis) {
   const schema = JSON.parse(canonical(payload.responseForm.schema));
+  if (decidesQuestions(payload, basis))
+    schema.oneOf = schema.oneOf.filter((branch: { properties: { action?: { const?: string } } }) => branch.properties.action?.const !== 'need_owner');
   const enumOf = (domain: BriefLabel['domain']) => {
     const values = labels.filter(label => label.domain === domain && (domain !== 'question' || payload.questions.some((question: { id: string }) => question.id === label.value))).map(label => label.label);
     return values.length ? { type: 'string', enum: values } : { not: {} };
@@ -593,7 +621,7 @@ function briefExamples(payload: Record<string, any>, labels: BriefLabel[], basis
   const controls = [
     { ...envelope, action: 'cannot_answer', questionIds, reason: 'Name the concrete missing fact or incompatible requirement.' },
     { ...envelope, action: 'pause', questionIds, reason: 'Explain why this attempt must pause.' },
-    { ...envelope, action: 'need_owner', questionIds, reason: 'An authority decision is needed.', decision: 'State the exact decision needed.' },
+    ...(decidesQuestions(payload, basis) ? [] : [{ ...envelope, action: 'need_owner', questionIds, reason: 'An authority decision is needed.', decision: 'State the exact decision needed.' }]),
     { ...envelope, action: 'need_source', questionIds, missing: 'Need additional saved context.',
       reads: [{ action: 'read_context', record: label('context', basis.contexts[0]), pointer: '' }] },
   ];
@@ -615,7 +643,8 @@ function briefExamples(payload: Record<string, any>, labels: BriefLabel[], basis
   } else if (payload.task === 'input-field') {
     const results = basis.gaps.filter(gap => payload.questions.some((question: { id: string }) => question.id === gap.question)).flatMap(gap => {
       const shape = fieldValueShape(gap, basis);
-      const value = sampleValue(gap.field === 'state' ? { ...shape, required: Object.keys(shape.properties) } : shape);
+      const value = gap.field === 'answer' ? json(DECISION_EXAMPLE)
+        : sampleValue(gap.field === 'state' ? { ...shape, required: Object.keys(shape.properties) } : shape);
       return value === undefined || object(value) && !Object.keys(value).length ? [] : [{ target: gap.target, field: gap.field, basis: label('gap', gap.ref), value }];
     });
     if (results.length) examples.unshift(json({ ...envelope, action: 'answer', results }));
@@ -778,6 +807,7 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
       ? 'This routed design-decision question remains the owner’s assignment; this packet does not authorize a model dispatch. Preserve its exact question and declared control forms.'
       : payload.model === 'MC1' ? 'Establish the requested repository facts for the listed consumers. Return the value required by each question contract and verifiable source citations; do not infer unsupported claims. Ask for exact source/context reads when evidence is insufficient.'
       : payload.task === 'input-field' ? 'Fill only the assigned missing fields of the accepted input. Preserve all existing producer values. Address identifies a real consumer and knowledge kind; nodes identifies known nodes; state names writer/authority/rollback participants; checkKind describes how the criterion is checked.'
+        + (decidesQuestions(payload, basis) ? ' Decide each assigned question (field answer) yourself — the owner is not asked in this pass: the decision you recommend, why, and two or three other concrete options, each with what it would lead to.' : '')
         : 'Refine the assigned upper node into the next graph level. Design its useful result, endpoints, tests and local relations. Keep upper contracts and all flows; supply exact fills for the assigned slots. At L3 preserve the operation boundary and bind every concrete endpoint to its declared code. Existing code needs evidence; new implementation paths may be planned.',
     canonical({ task: payload.task, model: payload.model, purpose: payload.purpose, questions, ancestry }),
     ...(object(payload.correction) ? ['# Correction of your previous answer',

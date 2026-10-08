@@ -24,6 +24,16 @@ export const GAP_ROUTES = sealed({
   'repository-fact': ['code', 'research'], 'design-decision': ['design'], 'owner-decision': ['owner'],
   'environment-confirmation': ['environment'], 'post-implementation-proof': ['task-result'],
 });
+/**
+ * OWN1 (№3711, №3713): the bypass — an owner question the pass needs now is decided by the model on the design route
+ * (MC2 input-field, applied by F5.3 as a decision of the model, never as an owner's H2); an owner's own H2 result offered
+ * for it is still admitted by G4b. D1 keeps the routes an offered result may take: its records stay those of their era,
+ * and an attempt open on them is not cut off from its own D1 by a new code.
+ */
+export function bypassRouteOf(gap: Pick<Gap, 'kind' | 'code' | 'field' | 'moment'>): 'design' | null {
+  return gap.kind === 'owner-decision' && gap.code === 'predecessor_question' && gap.field === 'answer' && gap.moment === 'om-pass'
+    ? 'design' : null;
+}
 export const GAP_DEFAULT_MOMENTS = sealed({
   'repository-fact': 'om-pass', 'design-decision': 'om-pass', 'owner-decision': 'om-pass',
   'environment-confirmation': 'task-start', 'post-implementation-proof': 'task-result',

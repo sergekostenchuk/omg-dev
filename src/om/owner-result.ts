@@ -128,7 +128,9 @@ function deriveOwnerQuestion(store: Store, readers: OwnerReaders, project: strin
   const routes = take(readers.routes(store, { project, record: routesRef }));
   const gap = take(readRecord<GapRecord>(store, gapRef,
     { unit: 'H2', target: gapRef.id, idPrefix: `om-gap:${project}:`, kind: 'gap' }));
-  const line = routes.record.value.routes.find(item => item.route === 'owner' && same(item.record, exactRef(gapRef)));
+  // OWN1 (№3713): in the bypass M6 routes an owner question of the pass to the model (design); the owner's own explicit
+  // answer of that very question stays admitted. The kind checks below keep it an owner-decision line.
+  const line = routes.record.value.routes.find(item => (item.route === 'owner' || item.route === 'design') && same(item.record, exactRef(gapRef)));
   const body = gap.value.gap;
   if (!line || !shape(body) || line.gap !== body.id || line.target !== body.target || line.field !== body.field
     || line.kind !== 'owner-decision' || body.kind !== 'owner-decision' || !isRef(line.input))
@@ -278,8 +280,9 @@ export function readOwnerResult(store: Store, request: unknown,
 
 /**
  * The projection feed for the owner UI (договор №2719-7: om-state names the wait, the projection names the question).
- * Lists every owner-routed owner-decision gap of every current om-routes head of the project, re-derived through the
- * same path the producer and the gate use, with the exact Ref of the result that already answered it (if any).
+ * Lists every owner-decision gap (owner-routed, or routed to the model by the OWN1 bypass) of every current om-routes
+ * head of the project, re-derived through the same path the producer and the gate use, with the exact Ref of the result
+ * that already answered it (if any).
  * Reading is not authority — this endpoint proves nothing and grants nothing.
  */
 export function listOwnerQuestions(store: Store, project: string,
@@ -298,7 +301,8 @@ export function listOwnerQuestions(store: Store, project: string,
       if (!routes.ok) continue;
       const routesRef = reference(routes.value.record);
       for (const line of routes.value.record.value.routes) {
-        if (line.route !== 'owner') continue;
+        // OWN1: an owner question the bypass routes to the model is still the owner's to answer explicitly.
+        if (line.route !== 'owner' && !(line.route === 'design' && line.kind === 'owner-decision')) continue;
         try {
           const question = deriveOwnerQuestion(store, readers, project, exactRef(routesRef), line.record);
           const hit = answered.find(view => same(view.value.question.gap, question.gap)
@@ -313,4 +317,24 @@ export function listOwnerQuestions(store: Store, project: string,
     }
     return items;
   });
+}
+
+/**
+ * OWN1 (№3719 P2-1): the owner's proved answers of the questions of one exact M6 route over one exact B1 — the same scan
+ * and proof G4b admits them by. The owner's answer is above the model's: a question it answers is never sent to the
+ * model, and its value is what the consumers get.
+ */
+export interface OwnerAnswer { gap: Ref; target: string; field: string; result: Ref; value: Json }
+export function ownerAnswersOf(store: Store, project: string, routes: Ref, input: Ref, readers: OwnerReaders): OwnerAnswer[] {
+  const answers: OwnerAnswer[] = [];
+  for (const head of store.list<OwnerResult>(OWNER_RESULT_KIND)) {
+    if (!head.id.startsWith(ownerResultNamespace(project))) continue;
+    const proved = readOwnerResult(store, { project, record: exactRef(head) }, readers);
+    if (!proved.ok) continue;
+    const question = proved.value.question;
+    if (!same(question.routes, routes) || !same(question.input, input)) continue;
+    answers.push({ gap: exactRef(question.gap), target: question.route.target, field: question.route.field,
+      result: exactRef(head), value: proved.value.record.value.value as unknown as Json });
+  }
+  return answers;
 }

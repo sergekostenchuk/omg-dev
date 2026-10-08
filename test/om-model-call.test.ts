@@ -263,7 +263,7 @@ import { settleCandidate } from '../src/om/frame-accept.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, writeOmObligations } from '../src/om/obligations.js';
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
-import { prepareAnswersGateTrace } from '../src/om/answers-gate.js';
+import { answerProducerOf, prepareAnswersGateTrace } from '../src/om/answers-gate.js';
 import { readRecord } from '../src/om/refs.js';
 import { runModelCall, readModelCall, readModelCallState, readManagedModelDiagnostic, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type ModelCallRequest, type OmModelCall } from '../src/om/model-call.js';
 import { readCall } from '../src/om/call-record.js';
@@ -285,12 +285,14 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'What encoding is supported?',
-      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }, ...(extraQuestion ? [{ id: 'spare', question: 'Which optional format?', consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Address during OM' }] : [])];
+      consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM' }, ...(extraQuestion ? [{ id: 'spare', question: 'Which optional format?', consumer: 'garden-consume-block',
+        // OWN1 (№3711): a design question of the pass is the model's; the one no producer of the pass serves is a later one.
+        moment: kind === 'design' ? 'task-start' : 'om-pass', blocksCurrentStage: false, resolution: 'Address during OM' }] : [])];
     return value;
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = valueOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
-  // 'design' also addresses the spare question as a design decision: its predecessor question has no answer producer (H1.5).
+  // 'design' also addresses the spare question as a design decision of task start: no producer of the pass answers it (H1.5, OWN1).
   const input = kind === 'field' ? base : valueOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
     decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
       decision: { target: 'discovery:encoding', field: 'address', value: { consumer: 'garden-consume-block', kind: 'repository-fact' } } })) as Write },
@@ -3478,10 +3480,13 @@ test('H1.5 №2164 E4 sends nothing for a design-decision answer batch: a ready 
   const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
   assert.equal(f.packet.value.state, 'ready', 'E2 still calls the packet ready: the prohibition stands in E4');
   assert.deepEqual([f.batch.model, f.batch.task, f.batch.items.map(item => item.field)], ['MC2', 'input-field', ['answer']]);
-  // The reviewer's probe (№2164): the very G4b that would judge the answer refuses it as unsupported, so paying buys nothing.
+  // The reviewer's probe (№2164): no producer of the pass answers it, so paying buys nothing; a later question is no
+  // blocking gap of the pass, so the full G4b names nothing for it (OWN1: D7 carries it).
+  const spare = f.gaps.records.find(row => row.value.gap.target === 'discovery:spare')!.value.gap;
+  assert.deepEqual([spare.moment, answerProducerOf(spare).present], ['task-start', false]);
   const judged = valueOf(prepareAnswersGateTrace(f.store, { project: f.project, gaps: f.gapRequest, routes: reference(f.routes), results: [] }))
     .trace.filter(entry => entry.finding.at.target === 'discovery:spare');
-  assert.deepEqual(judged.map(entry => [entry.finding.code, entry.cause.emission]), [['route_result_unsupported', 'unsupported-absent']]);
+  assert.deepEqual(judged, []);
   f.steps([{ research: h15CannotAnswer, usage }]);
   const before = h15Heads(f.store), gap = f.gaps.records.find(row => row.value.gap.target === 'discovery:spare')!;
   const { result, kinds } = await h15Written(f.store, () => runModelCall(f.store, f.request));

@@ -65,8 +65,11 @@ export interface OmInput {
   questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
     moment?: typeof QUESTION_MOMENTS[number]; addressedBy?: Ref; originalConsumer?: string }[];
   facts?: AppliedInputFact[];
+  /** OWN1 (№3711): predecessor questions the model decided in the bypass, each with its F5.3 decision; no longer asked. */
+  decided?: DecidedInputQuestion[];
   map: { nodes: string[]; artifacts: string[]; connectors: string[] };
 }
+export interface DecidedInputQuestion { question: OmInput['questions'][number]; value: Json; decision: Ref }
 export interface AppliedInputFact { question: OmInput['questions'][number]; value: Json; answer: Ref; mc1Question: Ref }
 export interface InputBuildResult { input: OmInput | null; hash: string | null; refusals: Refusal[]; gaps: InputGap[] }
 /**

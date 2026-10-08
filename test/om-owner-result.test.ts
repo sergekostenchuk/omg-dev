@@ -31,7 +31,8 @@ function ok<T>(result: OmResult<T>): T {
 }
 function snapshot(store: Store): Ref[] { return store.list().map(reference); }
 
-/** The same B1→D1→M6 chain as the answers-gate fixture, with one owner-decision unknown routed to 'owner'. */
+/** The same B1→D1→M6 chain as the answers-gate fixture, with one owner-decision unknown — routed to the model by the
+ * OWN1 bypass, and still answered by the owner's explicit H2. */
 function gatePrefix(store: Store) {
   const engine = new ProductEngine(store), project = 'garden', block = 'garden-produce-block';
   const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
@@ -61,7 +62,7 @@ function gatePrefix(store: Store) {
   const route = ok(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
   const owner = gaps.records.find(row => row.value.gap.target === target && row.value.gap.kind === 'owner-decision');
   assert.ok(owner, 'The fixture must carry the owner-decision gap');
-  assert.equal(route.value.routes.find(row => row.gap === owner.value.gap.id)?.route, 'owner');
+  assert.equal(route.value.routes.find(row => row.gap === owner.value.gap.id)?.route, 'design');
   return { project, block, target, input, graph, horizon, gaps, route, owner };
 }
 function fixture(t: TestContext) {

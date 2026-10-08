@@ -10,6 +10,7 @@ import { readLayerEnvelope, readLayerAcceptance, type LayerAcceptanceRequest } f
 import { prepareLayerAcceptance } from './frame-obligations.js';
 import { readOmInput, prepareExistingOmInput, prepareReopenOmInput, deriveOmInput, withHistoricalReads, type InputBuildResult, type OmInput, type OmInputRecord, type InputGap } from './input.js';
 import { readAnswerForInput } from './accepted-answer.js';
+import { OWNER_COMMAND_KIND, OWNER_RESULT_KIND, ownerCommandPrefix, ownerResultNamespace, type OwnerCommand, type OwnerResult } from './owner-result.js';
 
 export const ADDRESSING_KINDS = sealed([...ENGINE_KINDS]);
 export const ADDRESSING_CHECK_KINDS = sealed(['test', 'full-run', 'environment-observation'] as const);
@@ -17,7 +18,7 @@ export const ADDRESSING_CODES = Object.freeze([
   'addressing_invalid', 'addressing_overrides_producer', 'addressing_conflict', 'addressing_source_invalid', 'addressing_field_unsupported',
 ] as const);
 export interface AddressingDecision { question: string; consumer: string; kind: typeof ENGINE_KINDS[number]; basis: Ref }
-export interface InputFieldDecision { target: string; field: 'address' | 'nodes' | 'state' | 'checkKind'; value: Json; basis: Ref }
+export interface InputFieldDecision { target: string; field: 'address' | 'nodes' | 'state' | 'checkKind' | 'answer'; value: Json; basis: Ref }
 export interface AddressingResult { result: InputBuildResult; refusals: Refusal[] }
 export interface InputDecisionProposal {
   project: string; input: Ref; graph: Ref; layers: Ref[];
@@ -72,6 +73,37 @@ function requirePure(input: unknown, decisions: unknown, graph: unknown): assert
 }
 function fieldDecision(value: unknown): asserts value is InputFieldDecision {
   if (!object(value) || !text(value.target) || !text(value.field) || !Object.hasOwn(value, 'value') || !isRef(value.basis)) invalid('decision');
+}
+/**
+ * OWN1 (№3711, №3714): a decision of the model in the bypass — what is decided and why, and the two or three other
+ * options it weighed, each with what it would lead to. Checked by content on receipt: real words, no placeholder, the
+ * options distinct from the decision and from each other. The owner sees all of it (om-decisions) and may choose later.
+ */
+export interface ModelDecision { decision: string; rationale: string; alternatives: { option: string; consequences: string }[] }
+const PLACEHOLDERS = new Set(['', '-', 'n/a', 'na', 'none', 'unknown', 'tbd', 'todo', 'нет', 'неизвестно', 'не знаю', '?']);
+const said = (value: unknown, words: number): value is string => text(value)
+  && !PLACEHOLDERS.has(value.trim().toLowerCase()) && value.trim().split(/\s+/).length >= words;
+export function decidedAnswer(value: unknown): value is ModelDecision {
+  if (!object(value) || Object.keys(value).length !== 3 || !said(value.decision, 2) || !said(value.rationale, 3)
+    || !Array.isArray(value.alternatives) || value.alternatives.length < 2 || value.alternatives.length > 3) return false;
+  const options = [(value.decision as string).trim().toLowerCase()];
+  for (const item of value.alternatives as unknown[]) {
+    if (!object(item) || Object.keys(item).length !== 2 || !said(item.option, 2) || !said(item.consequences, 3)) return false;
+    const option = (item.option as string).trim().toLowerCase();
+    if (options.includes(option)) return false;
+    options.push(option);
+  }
+  return true;
+}
+/**
+ * OWN1 (№3719 P2-1): the owner's own answer of a question the bypass would give to the model — the exact proved H2
+ * result and its value. It stands above the model's: the question leaves the input decided by the owner. Its proof is
+ * D3's (deriveInputDecisions), never the model's: E3 accepts only a ModelDecision from a model.
+ */
+export interface OwnerDecided { owner: Ref; value: Json }
+export function ownerDecided(value: unknown): value is OwnerDecided {
+  return object(value) && Object.keys(value).length === 2 && isRef(value.owner) && Object.hasOwn(value, 'value')
+    && value.owner.id.startsWith('om-owner-result:');
 }
 /** Pure F5.3 transition. Saved operations additionally prove the base, graph and proposal references. */
 export function applyInputDecisions(inputResult: InputBuildResult, decisions: InputFieldDecision[], graph: Graph): Sealed<AddressingResult> {
@@ -133,10 +165,26 @@ export function applyInputDecisions(inputResult: InputBuildResult, decisions: In
         check(rows.length === 1, 'addressing_invalid', target, field, 'The criterion must exist once');
         check(rows[0]!.checkKind === null || rows[0]!.checkKind === value, 'addressing_overrides_producer', target, field, 'The supplied check kind cannot be replaced');
         rows[0]!.checkKind = value as string;
+      } else if (field === 'answer') {
+        // OWN1 (№3702, №3711): the bypass — the model decides an addressed design or owner question of the pass; the
+        // decision is checked by its content on receipt and the question leaves the input, kept with its decision.
+        const matches = input.questions.filter(q => q.id === target);
+        // The same decision again is no change: its question already stands decided by it.
+        if (!matches.length && (input.decided ?? []).some(row => row.question.id === target && same(row.value, value) && same(row.decision, basis))) continue;
+        check(matches.length === 1, 'addressing_invalid', target, field, 'The exact predecessor question must exist once');
+        const question = matches[0]!;
+        check(nodes.has(question.consumer) && (question.kind === 'design-decision' || question.kind === 'owner-decision'),
+          'addressing_field_unsupported', target, field, 'The model decides only an addressed design or owner question; facts need D3.1');
+        check(decidedAnswer(value) || ownerDecided(value), 'addressing_invalid', target, field,
+          'A decision names what is decided and why and two or three other options with their consequences, in words of its own');
+        input.questions = input.questions.filter(q => q.id !== target);
+        input.decided = [...(input.decided ?? []), { question, value: value as unknown as Json, decision: basis }]
+          .sort((a, b) => order(a.question.id, b.question.id));
       } else fail('addressing_field_unsupported', target, field, 'Only missing MC2 input fields belong to F5.3; facts need D3.1');
     }
     const remaining = gaps.filter(gap => {
       if (!decisions.some(decision => decision.target === gap.target && decision.field === gap.field)) return true;
+      if (gap.field === 'answer') return input.questions.some(q => q.id === gap.target);
       if (gap.code === 'contract_node_unbound') return input.contracts.find(row => row.id === gap.target)?.nodes === null;
       if (gap.code === 'acceptance_kind_missing') return input.criteria.find(row => row.id === gap.target)?.checkKind === null;
       if (gap.code === 'contract_boundary_prose') {
@@ -211,6 +259,18 @@ export function deriveInputDecisions(store: Store, request: { project: string; p
         && same(value, normalizeInputDecisionProposal(value)) && ref.id === inputDecisionWrite(value).id && proposal.revision === 1,
         'addressing_source_invalid', ref.id, 'basis', 'The proposal must belong to this exact base and graph');
       const decision: InputFieldDecision = { ...value.decision, basis: ref };
+      if (decision.field === 'answer' && ownerDecided(decision.value)) {
+        // OWN1: an owner's decision stands only on the exact H2 result of this very question, with its very value.
+        const owner = decision.value as unknown as OwnerDecided;
+        const result = take(readRecord<OwnerResult>(store, owner.owner,
+          { unit: 'F5.3', target: decision.target, idPrefix: ownerResultNamespace(request.project), kind: OWNER_RESULT_KIND }));
+        const command = take(readRecord<OwnerCommand>(store, result.value.command,
+          { unit: 'F5.3', target: decision.target, idPrefix: ownerCommandPrefix(request.project), kind: OWNER_COMMAND_KIND }));
+        check(result.value.project === request.project && command.value.question.route.target === decision.target
+          && command.value.question.route.field === 'answer' && same(result.value.value, owner.value),
+          'addressing_source_invalid', ref.id, 'owner', 'An owner decision is the exact H2 result of this question and its value');
+        references.push(owner.owner, result.value.command);
+      }
       const levels = unique(decisionNodes(decision).flatMap(id => {
         const node = graph.nodes.find(node => node.id === id); return node && LEVEL[node.kind] > 1 ? [LEVEL[node.kind]] : [];
       }));
@@ -294,6 +354,15 @@ export function writeAddressing(store: Store, request: AddressingRequest): OmRes
   });
 }
 
+/** OWN1 (№3719 P2-1): the D3 request that decides one question by the owner's exact proved H2 answer. */
+export interface OwnerDecisionRequest { project: string; input: Ref; graph: Ref; target: string; owner: Ref; value: Json }
+export function writeOwnerDecision(store: Store, request: OwnerDecisionRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.input) || !isRef(request.graph)
+    || !text(request.target) || !isRef(request.owner) || !Object.hasOwn(request, 'value')) invalid('owner');
+  return writeAddressing(store, { project: request.project, input: request.input, graph: request.graph, decisions: [{
+    pending: inputDecisionWrite({ project: request.project, input: request.input, graph: request.graph, layers: [],
+      decision: { target: request.target, field: 'answer', value: { owner: request.owner, value: request.value } as unknown as Json } }) as Write }] });
+}
 /** The fact supplier proves acceptance and applicability; B1 owns the resulting input derivation. */
 export function prepareApplyAnswer(store: Store, request: ApplyAnswerRequest): OmResult<Sealed<PreparedAddressing>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.input)
@@ -369,5 +438,48 @@ export function writeReopenAnswers(store: Store, request: ReopenAnswersRequest):
       if (!written.ok) return written;
     }
     return delivered(prepared.value.record);
+  });
+}
+
+/** OWN1 (№3714): one question the bypass decided — what was asked, of whom, what the model chose, the options it weighed. */
+export interface BypassDecision {
+  id: string; question: string; kind: string | null; consumer: string;
+  /** Who decided: the model in the bypass, or the owner by an explicit H2 answer (OWN1 №3719), which stands above it. */
+  by: 'model' | 'owner'; owner: Ref | null;
+  decision: string; rationale: string; alternatives: ModelDecision['alternatives'];
+  /** The exact input decision, the first B1 that holds it, and the model call that produced that B1 with its start (ISO). */
+  record: Ref; input: Ref; call: Ref | null; at: string | null;
+}
+/**
+ * The questions of the current B1 decided in the bypass, for the owner to read. Nothing is written or checked anew: each
+ * row is the B1 entry as recorded, the first B1 revision that holds it, and the E4 whose applied input that revision is.
+ */
+export function listBypassDecisions(store: Store, request: { project: string }): OmResult<Sealed<{ input: Ref | null; decisions: BypassDecision[] }>> {
+  if (!(store instanceof Store) || !object(request) || !text(request.project)) invalid('project');
+  return withHistoricalReads(() => {
+    const id = `om-input:${request.project}`, head = store.get<OmInputRecord>(id);
+    if (!head) return delivered(sealed({ input: null, decisions: [] }));
+    const decided = head.value.input.decided ?? [];
+    const firstHolding = (question: string): Revision<OmInputRecord> => {
+      for (let revision = 1; revision <= head.revision; revision++) {
+        const found = store.get<OmInputRecord>(id, revision);
+        if (found && (found.value.input.decided ?? []).some(row => row.question.id === question)) return found;
+      }
+      return head;
+    };
+    const calls = decided.length ? store.list<{ startedAt?: number; om?: { input?: Ref | null } }>('model-call')
+      .filter(row => row.id.startsWith(`model-call:${request.project}:om:`)) : [];
+    const decisions = decided.map((row): BypassDecision => {
+      const input = reference(firstHolding(row.question.id)), owned = ownerDecided(row.value);
+      const value = owned ? null : row.value as unknown as ModelDecision, owner = owned ? row.value as unknown as OwnerDecided : null;
+      const call = owned ? undefined : calls.find(item => item.value.om?.input && same(item.value.om.input, input));
+      return { id: row.question.id, question: row.question.question, kind: row.question.kind as string | null, consumer: row.question.consumer,
+        by: owned ? 'owner' : 'model', owner: owner ? owner.owner : null,
+        decision: owner ? (typeof owner.value === 'string' ? owner.value : canonical(owner.value)) : value!.decision,
+        rationale: value ? value.rationale : '', alternatives: value ? value.alternatives : [], record: row.decision, input,
+        call: call ? reference(call) : null,
+        at: call && Number.isFinite(call.value.startedAt) ? new Date(call.value.startedAt!).toISOString() : null };
+    });
+    return delivered(sealed({ input: reference(head), decisions }));
   });
 }

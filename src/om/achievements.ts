@@ -422,8 +422,16 @@ function inputFieldKeys(store: Store, record: Sealed<Revision<Json>>, context: A
     const found = store.get<InputDecisionProposal>(ref.id, ref.revision);
     hold(found && found.kind === INPUT_DECISION_KIND && same(reference(found), ref), "Every decision stands at its exact reference");
     const decision = found.value.decision;
-    hold(BLOCK_INPUT_FIELDS.includes(decision.field) && assigned.has(`${decision.target}\u0000${decision.field}`),
+    hold((BLOCK_INPUT_FIELDS.includes(decision.field) || decision.field === "answer") && assigned.has(`${decision.target}\u0000${decision.field}`),
       "Every decision belongs to the input fields assigned to this call");
+    if (decision.field === "answer") {
+      // OWN1: the model's decision of a question the pass needs: B1 moved the question to decided with this exact decision.
+      const row = (accepted.input.decided ?? []).find(item => item.question.id === decision.target);
+      hold(row && same(row.value, decision.value) && same(row.decision, ref)
+        && previous.input.questions.some(item => item.id === decision.target), "The accepted input holds this exact decision of the question");
+      key(decision.target, "answer", null, row.value as unknown as Json);
+      continue;
+    }
     if (decision.field === "checkKind") {
       const row = accepted.input.criteria.find(item => item.id === decision.target);
       const before = previous.input.criteria.find(item => item.id === decision.target);
