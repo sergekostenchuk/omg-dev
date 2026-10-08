@@ -1645,7 +1645,7 @@
 - Отдаёт: —
 - Читает записи: om-gap; om-routes; om-input
 - Пишет записи: om-input (поле decided); решение входа
-- Разрешённые пути: `src/om/answers-gate.ts`, `src/om/routes.ts`, `src/om/addressing.ts`, `src/om/input.ts`, `src/om/obligations.ts`, `src/om/packet-brief.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`, `src/om/owner-result.ts`, `src/om/achievements.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/om-commands.test.ts`, `test/om-answers-gate.test.ts`, `test/om-routes.test.ts`, `test/om-addressing.test.ts`, `test/om-obligations.test.ts`, `test/om-run.test.ts`
+- Разрешённые пути: `src/om/answers-gate.ts`, `src/om/routes.ts`, `src/om/addressing.ts`, `src/om/input.ts`, `src/om/obligations.ts`, `src/om/packet-brief.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`, `src/om/owner-result.ts`, `src/om/achievements.ts`, `src/om/run.ts`, `src/om/answer-form.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/om-commands.test.ts`, `test/om-answers-gate.test.ts`, `test/om-routes.test.ts`, `test/om-addressing.test.ts`, `test/om-obligations.test.ts`, `test/om-run.test.ts`
 - Из движка как есть: опись №3708; MC2 input-field (packet-brief.ts:321); LP8.1 — переоткрытие unable
 - После: NR, LP8
 - Тесты сверх обязательных:
