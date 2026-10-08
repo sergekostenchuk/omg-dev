@@ -11,6 +11,8 @@ mkdir -p "$OUT"; rm -rf "$OUT"/copy.sqlite* "$OUT/prof" "$OUT"/*.log "$OUT"/*.js
 rm -rf "$OUT/bin"; cp -R "$H/bin" "$OUT/bin"
 if [ -n "${SRC:-}" ]; then cp "$SRC" "$OUT/copy.sqlite" && chmod u+w "$OUT/copy.sqlite"; else sqlite3 "file:$HOME/OMG/.omg/state.sqlite?mode=ro&immutable=1" ".backup $OUT/copy.sqlite" || { echo "STOP: копия"; exit 1; }; fi
 cmd() { "$NODE" "$RUN/dist/src/cli.js" command "$OUT/copy.sqlite"; }
+# Копия — новый экземпляр базы: сборки с деревом хэшей (NR) требуют явного принятия; старые сборки команду просто не знают.
+printf '%s' '{"type":"om-integrity-accept","project":"omg-live","reason":"history-run copy"}' | cmd > "$OUT/integrity-accept.out" 2>&1 || true
 STATE=$(printf '%s' '{"type":"om-state","project":"omg-live"}' | cmd 2>/dev/null)
 TOK=$(jq -r '.value.control.control.value.stop.token // empty' <<<"$STATE")
 [ -n "$TOK" ] || { echo "STOP: на копии нет стоящего стопа (проход должен быть остановлен): $(head -c 300 <<<"$STATE")"; exit 1; }
