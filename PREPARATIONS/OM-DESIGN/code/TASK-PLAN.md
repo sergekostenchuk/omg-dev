@@ -1645,7 +1645,7 @@
 - Отдаёт: —
 - Читает записи: om-gap; om-routes; om-input
 - Пишет записи: om-input (поле decided); решение входа
-- Разрешённые пути: `src/om/answers-gate.ts`, `src/om/routes.ts`, `src/om/addressing.ts`, `src/om/input.ts`, `src/om/obligations.ts`, `src/om/packet-brief.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`, `test/om-answers-gate.test.ts`, `test/om-routes.test.ts`, `test/om-addressing.test.ts`, `test/om-obligations.test.ts`, `test/om-run.test.ts`
+- Разрешённые пути: `src/om/answers-gate.ts`, `src/om/routes.ts`, `src/om/addressing.ts`, `src/om/input.ts`, `src/om/obligations.ts`, `src/om/packet-brief.ts`, `src/om/gaps.ts`, `test/om-gaps.test.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/om-commands.test.ts`, `test/om-answers-gate.test.ts`, `test/om-routes.test.ts`, `test/om-addressing.test.ts`, `test/om-obligations.test.ts`, `test/om-run.test.ts`
 - Из движка как есть: опись №3708; MC2 input-field (packet-brief.ts:321); LP8.1 — переоткрытие unable
 - После: NR, LP8
 - Тесты сверх обязательных:
@@ -1653,6 +1653,7 @@
   - пустой или бессодержательный ответ — отказ при получении
   - назначение по умолчанию D7 — правилом, без записи владельца
   - один полный прогон и одно ревью
+  - ПРЕДОТВЕТЫ (слово пользователя ~00:00): ответ модели — решение, обоснование, 2–3 альтернативы с последствиями и рекомендация; всё в decided; команда только для чтения om-decisions — список решённых в обходе вопросов для показа владельцу; замена выбора владельцем — позже с UI
 
 ### CORE1 · Ядро движка к проду: выделить код и зависимости, нужные продукту; легаси (старый маршрут без OM, совместимость с эрами, которых нет в живых данных, неактивное) удалить вместе с тестами; сборка и полный прогон — только ядро
 
@@ -1685,7 +1686,7 @@
 - Пишет записи: интерфейс сервиса движка и подключения
 - Разрешённые пути: `src/product/commands.ts`, `src/cli.ts`, `src/service/server.ts`, `test/service.test.ts`
 - Из движка как есть: продуктовые команды om-start/om-continue/om-state/om-stop/om-spend/om-fsck; проект SEC1
-- После: NR
+- После: NR, OWN1
 - Тесты сверх обязательных:
   - ДО КОДА — проект Codex-omg вместе с SEC1: исследование, как подключают такие движки в харнесы (MCP, плагины Claude Code/Codex/Cursor), и как продукты выдают и сохраняют ключ владельца (ключ восстановления, связка ключей ОС, экспорт); пути уточняются проектом
   - один и тот же сценарий проекта через MCP и через CLI даёт одинаковые записи
