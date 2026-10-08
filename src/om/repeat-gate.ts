@@ -2189,26 +2189,12 @@ function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
       requiredManagedAccepting(store, input.project, closure, snapshot as CompletionSnapshot).noop) : null };
   return { reason, confirmed, snapshot, routed, classifications, rows, address, journal, series, owner, progress };
 }
+/** NR1 (№3600): a trusted read — the close proof was written once as the single full managed outcome derivation. */
 export function readCompletionCloseAt(store: Store, project: string, ref: Ref): OmResult<Sealed<CompletionCloseRecord>> {
-  return managedResult(() => historicalRead(store, { reader: 'G7.completion-close', project, ref }, () => {
-    const record = managedTake(readRecord<CompletionCloseRecord>(store, ref, { unit: UNIT, target: ref.id,
-      kind: COMPLETION_CLOSE_KIND, idPrefix: `${COMPLETION_CLOSE_KIND}:${project}:` }));
-    const value = record.value;
-    if (!isPlainObject(value) || value.contract !== 'om-completion-close/v1' && value.contract !== 'om-completion-close/v2' || value.project !== project
-      || !isRef(value.binding) || !isRef(value.work) || !Array.isArray(value.additions) || !value.additions.every(isRef)
-      || !isRef(value.series) || !isPlainObject(value.claim)
-      || !Array.isArray(value.claim.accepting) || !value.claim.accepting.every(isRef)
-      || !Array.isArray(value.claim.cancelling) || !value.claim.cancelling.every(isRef)
-      || !Array.isArray(value.claim.refusals) || !value.claim.refusals.every(row => isPlainObject(row)
-        && isText(row.row) && isText(row.name) && isText(row.goal))
-      || !['result', 'refused', 'off-form', 'interrupted', 'awaiting-owner'].includes(value.claim.reason)
-      || ![value.ledger, value.journal].every(item => item === null || isRef(item)))
-      managedFail(ref.id, 'record', 'The immutable close proof retains all exact pre-close sources');
-    const derived = deriveManagedClose(store, closeInput(value));
-    if (record.revision !== 1 || record.id !== completionCloseId(project, value.binding.id) || canonical(value) !== canonical(derived.value))
-      managedFail(ref.id, 'record', 'The close proof must equal the single full managed outcome derivation');
-    return derived.value;
-  }, () => managedFail(ref.id, 'history', 'A close proof cannot depend on its own closed attempt')));
+  return managedResult(() => historicalRead(store, { reader: 'G7.completion-close', project, ref }, () =>
+    managedTake(readRecord<CompletionCloseRecord>(store, ref, { unit: UNIT, target: ref.id,
+      kind: COMPLETION_CLOSE_KIND, idPrefix: `${COMPLETION_CLOSE_KIND}:${project}:` })).value,
+  () => managedFail(ref.id, 'history', 'A close proof cannot depend on its own closed attempt')));
 }
 function prepareManagedGateClose(store: Store, request: AnyCloseAttemptRequest): OmResult<Sealed<RepeatTransition>> | null {
   const seriesHead = store.get<AnyRepairSeries>(seriesAddress(request).id);

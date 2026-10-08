@@ -136,11 +136,7 @@ function context(store: Store, request: ObligationRequest): Context {
     fail('obligation_context_mismatch', request.lines.id, 'gaps', 'Line history and the full gap set must name the same exact source context');
   const sources = normalized.gaps.sources;
   const frames = [sources.operations, ...('frame' in sources.works ? [sources.works] : [])];
-  const inputs = unique([request.lines, ...normalized.gaps.records, sources.input, sources.graph, sources.horizon,
-    ...frames.flatMap(item => [item.frame.graph, item.frame.horizon, ...item.proposals,
-      ...(item.frame.layer ? [item.frame.layer] : []), ...(item.frame.frame ? [item.frame.frame] : []),
-      ...(item.frame.upper ? [item.frame.upper.horizon, ...(item.frame.upper.frame ? [item.frame.upper.frame] : [])] : [])]),
-    ...('state' in sources.works ? [sources.works.layer] : [])]);
+  const inputs = requestInputs(normalized);
   const graph = take(readRecord<Graph>(store, sources.graph,
     { unit: 'D7', target: sources.graph.id, id: `graph:${request.project}`, kind: 'graph' })).value as Graph;
   const acceptedNodes = new Set<string>();
@@ -318,25 +314,15 @@ function deriveTransfer(store: Store, request: ObligationTransferRequest): Oblig
     inputs: unique([...previous.inputs, ...original.inputs, ...basis.inputs, ...projected.inputs,
       request.from.producer, request.from.ledger, request.from.assignment, original.owner]) };
 }
+/** NR (№3600): a trusted read — prepareObligationTransfer derived the transfer from the original H2 authority once. */
 function loadTransfer(store: Store, project: string, ref: Ref): ObligationTransfer {
   return historicalRead(store, { reader: 'D7.obligation-transfer', project, ref }, () => {
     const record = take(readRecord<ObligationTransferRecord>(store, ref,
-      { unit: 'D7', target: ref.id, idPrefix: transferNamespace(project), kind: OM_OBLIGATION_TRANSFER_KIND }));
+      { unit: 'D7', target: ref.id, idPrefix: transferNamespace(project), kind: OM_OBLIGATION_TRANSFER_KIND })) as Revision<ObligationTransferRecord>;
     const value = record.value;
-    if (!object(value) || !keys(value, ['contract', 'project', 'from', 'context', 'gap', 'owner', 'assignments'])
-      || value.contract !== OM_OBLIGATION_TRANSFER_CONTRACT || value.project !== project || !isRef(value.owner)
-      || !Array.isArray(value.assignments) || !value.assignments.every(object))
-      ownerInvalid(ref.id, 'transfer', 'A saved transfer needs its explicit contract and complete derived owner assignment');
-    const request = { project: value.project, from: value.from, context: value.context, gap: value.gap } as ObligationTransferRequest;
-    try { requireTransfer(request); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'obligation_request_invalid')
-        ownerInvalid(ref.id, 'transfer', 'The saved transfer must retain every exact source and target reference');
-      throw error;
-    }
-    const derived = deriveTransfer(store, request);
-    if (!same(record, derived.record)) ownerInvalid(ref.id, 'transfer', 'The transfer is derived from original H2 authority, not from caller-supplied replacement fields');
-    return sealed(derived) as ObligationTransfer;
+    return sealed({ record, owner: value.owner, assignments: value.assignments,
+      inputs: unique([ref, value.from.producer, value.from.ledger, value.from.assignment, value.owner, value.gap,
+        value.context.lines, ...value.context.gaps.records]) }) as ObligationTransfer;
   }, () => ownerInvalid(ref.id, 'transfer', 'Obligation transfer history contains a cycle'));
 }
 /** F5 records a derived transfer; only the original H2 command grants the assignment. */
@@ -396,9 +382,22 @@ function derive(store: Store, basis: Context): OmObligations {
     request: basis.request, assignments: assignments(store, basis) }, false);
   const producer = row<OmObligationProducer>({ contract: OM_OBLIGATION_CONTRACT, project: basis.request.project,
     request: basis.request, ledger: reference(record) }, true);
-  return { record, producer, handoff: { era: OM_OBLIGATION_CONTRACT, producer: reference(producer), scope: reference(record),
-    obligations: record.value.assignments.map(assignment => ({ ...assignment, scope: reference(record) })) },
-  inputs: handoffInputs(basis.request.project, basis.inputs, record, producer) };
+  return { record, producer, handoff: handoffOf(record, producer), inputs: handoffInputs(basis.request.project, basis.inputs, record, producer) };
+}
+/** The exact sources a producing request names — its line history, gap set and the frames of its source context. */
+function requestInputs(request: ObligationRequest): Ref[] {
+  const sources = request.gaps.sources;
+  const frames = [sources.operations, ...('frame' in sources.works ? [sources.works] : [])];
+  return unique([request.lines, ...request.gaps.records, sources.input, sources.graph, sources.horizon,
+    ...frames.flatMap(item => [item.frame.graph, item.frame.horizon, ...item.proposals,
+      ...(item.frame.layer ? [item.frame.layer] : []), ...(item.frame.frame ? [item.frame.frame] : []),
+      ...(item.frame.upper ? [item.frame.upper.horizon, ...(item.frame.upper.frame ? [item.frame.upper.frame] : [])] : [])]),
+    ...('state' in sources.works ? [sources.works.layer] : [])]);
+}
+/** The handoff of a producer/ledger pair: its era, both exact references and every assignment scoped to the ledger. */
+function handoffOf(record: Revision<OmObligationRecord>, producer: Revision<OmObligationProducer>): OmObligationHandoff {
+  return { era: OM_OBLIGATION_CONTRACT, producer: reference(producer), scope: reference(record),
+    obligations: record.value.assignments.map(assignment => ({ ...assignment, scope: reference(record) })) };
 }
 function handoffInputs(project: string, inputs: readonly Ref[], record: Revision<OmObligationRecord>, producer: Revision<OmObligationProducer>): Ref[] {
   // Prior producer/ledger pairs prove transfer authority; they are not additional
@@ -416,25 +415,15 @@ function load(store: Store, project: string, ref: Ref): OmObligations {
     () => sealed(loadRecord(store, project, ref)) as OmObligations,
     () => ownerInvalid(ref.id, 'history', 'The obligation producer history contains a cycle'));
 }
+/** NR (№3600): a trusted read — prepareOmObligations derived the producer and its ledger from their exact context once;
+ * the handoff and its inputs follow from them and from the request they name. */
 function loadRecord(store: Store, project: string, ref: Ref): OmObligations {
   const producer = take(readRecord<OmObligationProducer>(store, ref,
-    { unit: 'D7', target: ref.id, idPrefix: namespace(project, true), kind: 'om-obligation-basis' }));
-  const value = producer.value;
-  if (!object(value) || value.contract !== OM_OBLIGATION_CONTRACT || value.project !== project || !isRef(value.ledger))
-    fail('obligation_record_invalid', ref.id, 'producer', 'An OM producer needs its declared era, exact context and mandatory ledger');
-  try { requireRequest(value.request as ObligationRequest); }
-  catch (error) {
-    if (error instanceof EngineError && error.code === 'obligation_request_invalid')
-      fail('obligation_record_invalid', ref.id, 'request', 'The saved producer context is incomplete');
-    throw error;
-  }
-  if (value.request.project !== project) fail('obligation_context_mismatch', ref.id, 'project', 'The producing request is foreign');
-  const expected = derive(store, context(store, value.request as ObligationRequest));
-  checked(producer, expected.producer);
-  const record = take(readRecord<OmObligationRecord>(store, value.ledger,
-    { unit: 'D7', target: value.ledger.id, idPrefix: namespace(project, false), kind: 'om-obligations' }));
-  checked(record, expected.record);
-  return expected;
+    { unit: 'D7', target: ref.id, idPrefix: namespace(project, true), kind: 'om-obligation-basis' })) as Revision<OmObligationProducer>;
+  const record = take(readRecord<OmObligationRecord>(store, producer.value.ledger,
+    { unit: 'D7', target: producer.value.ledger.id, idPrefix: namespace(project, false), kind: 'om-obligations' })) as Revision<OmObligationRecord>;
+  return { producer, record, handoff: handoffOf(record, producer),
+    inputs: handoffInputs(project, requestInputs(producer.value.request as ObligationRequest), record, producer) };
 }
 export function readOmObligations(store: Store, request: ReadOmObligationsRequest): OmResult<Sealed<OmObligations>> {
   requireStore(store);

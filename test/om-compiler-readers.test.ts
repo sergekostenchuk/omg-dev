@@ -355,6 +355,25 @@ interface Saved {
     legacy: { directory: string; database: string; plan: { id: string; value: { tasks: { id: string }[] } } } };
   planned: string; base: Record<string, Outcome>; current: Record<string, Outcome>;
 }
+/** NR1 (№3600): equal outputs but `references`, which name only records of the base's checked trail (local: om-fixture registers the readers). */
+function sameButReferences(actual: unknown, expected: unknown, message: string): void {
+  const collect = (value: unknown, into: Set<string>): unknown => {
+    if (Array.isArray(value)) return value.map(item => collect(item, into));
+    if (value === null || typeof value !== 'object') return value;
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'references' && Array.isArray(item)) {
+        for (const ref of item) into.add(JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1))));
+        continue;
+      }
+      result[key] = collect(item, into);
+    }
+    return result;
+  };
+  const mine = new Set<string>(), theirs = new Set<string>();
+  assert.deepEqual(collect(JSON.parse(JSON.stringify(actual)), mine), collect(JSON.parse(typeof expected === 'string' ? expected : JSON.stringify(expected)), theirs), message);
+  assert.deepEqual([...mine].filter(ref => !theirs.has(ref)), [], `${message}: a trusted reader names only records of the checked trail`);
+}
 let saved: Promise<Saved> | undefined, built: Saved | undefined;
 after(() => {
   if (built) for (const path of [built.directory, built.build.root, built.build.legacy.directory]) rmSync(path, { recursive: true, force: true });
@@ -391,7 +410,10 @@ test('R3+R4 on a saved legal base the slot reproduces the base implementation ex
   assert.equal((current as Record<string, unknown>)['slot'], 'present');
   for (const variant of ['m8', 'absent', 'substituted', 'legacy'])
     for (const name of new Set([...Object.keys(base[variant]!), ...Object.keys(current[variant]!)]))
-      assert.deepEqual(current[variant]![name], base[variant]![name], `${variant}.${name}: records/Ref, guards, references, text and hash`);
+      // NR1 (№3600): the trusted readers name the records they read, a subset of the trail the base named; all else is equal.
+      if (current[variant]![name] === undefined || base[variant]![name] === undefined)
+        assert.deepEqual(current[variant]![name], base[variant]![name], `${variant}.${name}: records/Ref, guards, references, text and hash`);
+      else sameButReferences(current[variant]![name], JSON.stringify(base[variant]![name]), `${variant}.${name}: records/Ref, guards, text and hash`);
   // The scenario reached each OM read it claims to compare, rather than agreeing on an early refusal.
   const m8 = current['m8']!, plan = value(m8, 'compile') as { value: { feasibility: Ref; tasks: unknown[] } };
   assert.ok(plan.value.feasibility.id.startsWith('om-feasibility:'));

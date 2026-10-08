@@ -323,32 +323,16 @@ function requireRead(store: Store, request: unknown): asserts request is RoutesR
   requireStore(store);
   if (!object(request) || !text(request.project) || !isRef(request.record)) invalid('record');
 }
+/** NR1 (№3600): a trusted read — prepareRoutes wrote the routing derived by its saved algorithm from its exact sources. */
 function loadRoutes(store: Store, request: RoutesReadRequest) {
   return historicalRead(store, { reader: 'M6.route-result', project: request.project, ref: request.record }, () => {
     const record = take(readRecord<RoutesRecord>(store, request.record,
       { unit: 'M6', target: request.record.id, kind: ROUTES_KIND, idPrefix: `om-routes:${request.project}:` }));
-    const value = record.value;
-    if (!object(value) || value.project !== request.project || !object(value.request) || value.request.project !== request.project || !Array.isArray(value.request.tasks)
-      || !value.request.tasks.every(isRef) || !Array.isArray(value.searches))
-      fail('route_record_invalid', record.id, 'record', 'A route must retain its full source task and search grounds');
-    let source: RoutesRequest;
-    try { source = requestForHistory(copy(value.request) as SavedRoutesRequest); requireRequest(source); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'route_request_invalid') fail('route_record_invalid', record.id, 'request', 'The saved routing request is malformed');
-      throw error;
-    }
-    for (const search of value.searches) if (!object(search) || !text(search.gap) || !isRef(search.index) || !Array.isArray(search.checks)
-      || !search.checks.every(check => object(check) && isRef(check.answer) && (check.invalidation === null || object(check.invalidation))))
-      fail('route_record_invalid', record.id, 'searches', 'Every historical search needs an exact index and explicit checks');
-    // History is derived strictly by the saved algorithm: no property is task-v1, never a guess among the others.
-    if (Object.hasOwn(value, 'grouping') && value.grouping !== 'consumer-set-v1' && value.grouping !== 'block-input-v1')
+    // The saved algorithm is read by its name (LP7 rows 16, 17): no property is task-v1, an unknown name is never read as another.
+    if (Object.hasOwn(record.value, 'grouping') && record.value.grouping !== 'consumer-set-v1' && record.value.grouping !== 'block-input-v1')
       fail('route_record_invalid', record.id, 'grouping', 'The saved routing contract is unsupported');
-    const grouping: RouteGrouping = Object.hasOwn(value, 'grouping') ? value.grouping as RouteGrouping : 'task-v1';
-    const derived = deriveRoutes(store, normalized(source), false, grouping, value.searches as RouteSearch[]);
-    if (record.revision !== 1 || record.id !== idOf(derived.value.request) || !same(value, derived.value))
-      fail('route_record_invalid', record.id, 'content', 'Routing must be rederived from its exact saved sources and complete answer searches');
-    return copy({ record: record as Revision<RoutesRecord>, references: unique([reference(record), ...derived.references]) });
-  }, () => fail('route_record_invalid', request.record.id, 'history', 'Routing history contains a cycle'));
+    return copy({ record: record as Revision<RoutesRecord>, references: [reference(record)] });
+  }, () => fail('route_record_invalid', request.record.id, 'history', 'Routing cannot derive through itself'));
 }
 /** Historical repetition carries no new model admission. E2/G8 must prepare the current route before sending. */
 export function readRoutes(store: Store, request: RoutesReadRequest): OmResult<Sealed<{ record: Revision<RoutesRecord>; references: Ref[] }>> {

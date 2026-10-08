@@ -15,7 +15,7 @@ import { journalId, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIN
   type RefusalJournal, type UnitRefusalRecord, type OriginSource } from './refusal-journal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
-import { readRebaseBasis, buildRebasedLayer, type OmRebasedFrame } from './layer-basis.js';
+import { prepareRebaseBasis, buildRebasedLayer, type OmRebasedFrame } from './layer-basis.js';
 
 export const FRAME_ACCEPT_CODES = Object.freeze([
   'candidate_level_unsupported', 'candidate_missing', 'candidate_graph_mismatch', 'gate_outcome_mismatch',
@@ -496,7 +496,7 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
     }
     to = currentFrameRequest(to);
     request = { from, to };
-    const basis = take(readRebaseBasis(store, request));
+    const basis = take(prepareRebaseBasis(store, request));
     for (const ref of [to.graph, to.horizon, from.layer, from.frame, ...basis.currentReferences]) current(store, ref);
     const guards: Ref[] = [...basis.currentReferences, to.graph, to.horizon, from.layer, from.frame];
     // Each horizon can carry different availability sources; admit both, preserving their complete guards.

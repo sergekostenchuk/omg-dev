@@ -703,7 +703,8 @@ test('X44 environment change: the discarded historical capture leaks nothing int
     assert.deepEqual(storeSnapshot(store), before, 'a discarded capture leaves nothing durable and no leaked guards');
     store.writeMany = writeMany;
     assert.equal(refused.ok, false);
-    if (!refused.ok) assert.equal(refused.refusal.code, 'record_missing', 'the pre-existing managed-proof boundary is unchanged');
+    // NR1 (№3591): the saved managed proof is not walked again, so the first refusal is the stale environment itself.
+    if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.target], ['input_stale', `environment:${p.project}`], 'the stale request is refused');
     // The next, independent capture starts from its own empty accumulator: one issuance set, one commit.
     const currentEnvironment = reference(store.get(`environment:${p.project}`)!);
     const prepared = ok(prepareQuestionPacket(store, { ...p.request, environment: currentEnvironment }));
@@ -1324,7 +1325,8 @@ test('PF3 rows 1-4, 14, 15: cold and warm reads give the same new Revisions; a w
     cold = reads(); coldEvents = events.splice(0);
     const first = bodyDelta(before);
     assert.equal(storeReads() - counted, 9, 'Every public read is counted once');
-    assert.deepEqual([first.loads, first.digests], [3, 3], 'Three distinct exact bodies are loaded and checked once each');
+    // NR1 (№3591): a body is read as written — loaded once, never hashed again on reading (om-fsck checks bodies at start).
+    assert.deepEqual([first.loads, first.digests], [3, 0], 'Three distinct exact bodies are loaded once each and not hashed again');
     const again = storeBodyCache(), recounted = storeReads();
     warm = reads(); warmEvents = events.splice(0);
     const second = bodyDelta(again);

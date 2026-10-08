@@ -125,11 +125,14 @@ function commit(store: Store, mode: Mode, unit: string, target: string, stage: s
  * chain is derived. An explicit launch intent that differs from the saved one is still the intent conflict of startRun,
  * whatever the phase. A pass that has not ended is returned as read, so a build depends on exactly that record.
  */
-function livePass(store: Store, project: string, outcomes: readonly string[] | undefined): Revision<RunRecord> | null {
+function livePass(store: Store, project: string, outcomes: readonly string[] | undefined, reweigh = false): Revision<RunRecord> | null {
   const saved = take(readRun(store, { project })) as Revision<RunRecord> | null;
   if (!saved) return null;
   const phase = saved.value.state.phase;
   if (phase !== "complete" && phase !== "unable") return saved;
+  // LP8.1 (№3670): the check an unable pass makes while it weighs its grounds again by today's rules reads the bases as a
+  // live pass would; nothing is built until the pass is reopened.
+  if (reweigh && phase === "unable") return saved;
   if (outcomes !== undefined) take(startRun(store, { project, outcomes: [...outcomes] }));
   return fail("run_bases_terminal", saved.id, "state.phase", `The pass of this project ended (${phase}); no bases are built for it`, reference(saved));
 }
@@ -460,16 +463,17 @@ export function writeRunBases(store: Store, request: RunBasesRequest, options: R
  * today, or the first `missing` stage a build would write. `completion` checks only the bases that complete an accepted
  * group, without its B3. An existing pass is required; its intent is never changed.
  */
-export function prepareRunBases(store: Store, request: { project: string }, options: { completion?: boolean } = {}): OmResult<Sealed<CheckedRunBases>> {
+export function prepareRunBases(store: Store, request: { project: string }, options: { completion?: boolean; reweigh?: boolean } = {}): OmResult<Sealed<CheckedRunBases>> {
   requireRequest(store, request);
   if (request.outcomes !== undefined) invalid("outcomes", "Checking the bases never names a new intent");
-  if (!object(options) || !Object.keys(options).every(key => key === "completion") || options.completion !== undefined && typeof options.completion !== "boolean")
-    invalid("options", "A check names only whether it completes an accepted group");
+  if (!object(options) || !Object.keys(options).every(key => key === "completion" || key === "reweigh")
+    || options.completion !== undefined && typeof options.completion !== "boolean" || options.reweigh !== undefined && typeof options.reweigh !== "boolean")
+    invalid("options", "A check names only whether it completes an accepted group and whether an unable pass weighs its grounds again");
   request = sealed(request) as RunBasesRequest;
   const mode: Mode = { write: false, guards: [], completion: options.completion ?? false, admission: { blocked: [], guards: [] },
     pass: { guard: null } };
   return run(() => {
-    livePass(store, request.project, undefined);
+    livePass(store, request.project, undefined, options.reweigh ?? false);
     try { return { state: "ready" as const, built: chain(store, request, mode) }; }
     catch (error) { if (error instanceof BasesMissing) return { state: "missing" as const, stage: error.stage }; throw error; }
   });

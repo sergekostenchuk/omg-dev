@@ -8,7 +8,7 @@ import { Store } from "../storage/store.js";
 import { normalizeAnswerContract, type AnswerQuestionContract } from "./accepted-answer.js";
 import { readAcceptedFrame, type AcceptedFrameRequest } from "./frame-accept.js";
 import { readCandidate } from "./frame-candidate.js";
-import { readFrame, workFillCode, type FrameFill, type FrameObligation, type FrameRead } from "./frame-obligations.js";
+import { readFrame, recordedWorkFillCode, type FrameFill, type FrameObligation, type FrameRead } from "./frame-obligations.js";
 import type { ProposalReplacement } from "./frame-proposals.js";
 import type { OmRebasedFrame } from "./layer-basis.js";
 import { historicalRead, withHistoricalReads } from "./input.js";
@@ -515,11 +515,10 @@ function snapshot(frame: FrameRead, obligationId: string): { obligation: FrameOb
   if (!frame.accepted || !obligation || frame.result.open.some(value => value.id === obligationId)
     || !fills.length || fills.some(fill => fill.source !== "accepted")) return null;
   if (obligation.level === 3 && obligation.kind === "connection-end") fills = fills.map(fill => {
-    const codeRef = take(workFillCode(frame.upper, frame.accepted!, obligation, fill));
-    if (fill.codeRef !== undefined && canonical(codeRef) !== canonical(fill.codeRef))
-      reject("result_identity_unfilled", obligation.id, "fills.codeRef", "An accepted work result retains its exact proved code endpoint");
-    // Native predecessors keep their own frame format. Their endpoint is inferred
-    // by the same checked C2 flow reader, never selected from Node.code by position.
+    // A work frame keeps the code end its acceptance proved. Native predecessors keep their
+    // own frame format; their endpoint is inferred by the common C2 flow reader, never
+    // selected from Node.code by position.
+    const codeRef = fill.codeRef ?? take(recordedWorkFillCode(frame.upper, frame.accepted!, obligation, fill));
     return { ...fill, codeRef };
   });
   return { obligation, fills, content: take(normalizeResultContent(frame.accepted.graph, obligation, fills)) as ResultContent };

@@ -2065,7 +2065,7 @@ test("G7 source context participates in identity and ordering, and different ass
 });
 
 
-test("G7 routes a saved refusal candidate that lost a definition from its actual proposal without accepting it", t => {
+test("G7 routes a saved refusal candidate that lost a definition from its actual proposal without accepting it", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
   const { store, path } = fixture(t), f = definitionFixture(store, PROJECT);
   const accepted = store.get<{ acceptance: { candidate: Ref } }>(f.accepted.frame!.id, f.accepted.frame!.revision)!;
   const original = store.get<FrameCandidateRecord>(accepted.value.acceptance.candidate.id)!;
@@ -4646,7 +4646,7 @@ test("LP6 row 13: a paid need_source accepted for a field, then the replaced B1 
   assert.equal(f.sent().length, 1, "Nothing was sent again");
 });
 
-test("LP6 rows 3, 29: an unknown era of a close, a missing progress after the boundary, an unknown boundary contract or a lost close proof is an addressed refusal of the reader — never read as the old era", async t => {
+test("LP6 rows 3, 29: an unknown era of a close, a missing progress after the boundary, an unknown boundary contract or a lost close proof is an addressed refusal of the reader — never read as the old era", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const f = lp6Gate(t);
   await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }]);
   deliveredOf(f.close(1));

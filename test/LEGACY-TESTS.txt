@@ -1,0 +1,11 @@
+# CORE1 (№3660): test files not run by `npm run check:backend` — legacy routes, eras absent from the live data, inactive parts.
+# One file name per line (as in test/), the reason after `#`. `npm test` still runs every file; the code is not removed here.
+# №3666: list of Codex-omg №3665 (~/REPORTS/review/omg-legacy-audit-3654_081026.md), the user's decision: legacy is not run.
+devin-stdio.test.ts               # Неактивный для выбранного ядра второй провайдер; текущий проход использует Codex.
+execution.test.ts                 # Исполнение git-задач после компилятора; выбранная граница ядра заканчивается компиляцией.
+import-ring.test.ts               # Оснастка анализа импортов и исторические числовые пороги, не сценарий продукта.
+preparation-run.test.ts           # Самостоятельный старый continue-preparation R2→L3→R3; текущий путь ведёт OM.
+refinement-research.test.ts       # Автоматический старый производитель R1/R2/L2/L3 через research-phase, не OM-проход.
+refinement.test.ts                # Единый старый маршрут R0/L1/R1/L2/R2/L3/R3.
+repair.test.ts                    # Старый repair-plan после исполнения, закрытый для производства после первого B1.
+task-obligation-execution.test.ts # Сроки обязательств при исполнении задач после компилятора.

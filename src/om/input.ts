@@ -616,75 +616,13 @@ export function readOmInput(store: Store, project: string, ref: Ref): InputResul
   });
 }
 
+/** NR1 (№3600): a trusted read. Every input revision was derived by prepareOmInput / deriveOmInput from its exact sources
+ * and predecessor (a refresh carries accepted decisions, never erases them) and written under its guards; it is read at its
+ * exact reference, never rebuilt. */
 function readInputRecord(store: Store, project: string, ref: Ref): InputResult<Sealed<Revision<OmInputRecord>>> {
   requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
   const read = readRecord<OmInputRecord>(store, ref, { unit: "G1", target: `om-input:${project}`, id: `om-input:${project}`, kind: "om-input" });
-  if (!read.ok) return transfer("refs", read);
-  const body = read.value.value;
-  if (!object(body) || body.projectId !== project || !object(body.input) || !Array.isArray(body.input.sources)
-    || body.input.sources.length !== INPUT_STAGES.length || !Array.isArray(body.gaps))
-    return refuse("record_forged", "OM input has an incomplete saved source set", at(ref.id, "sources", ref), "producer");
-  if (Object.hasOwn(body, "derivation")) {
-    const lineage: unknown = body.derivation;
-    if (!object(lineage) || !isRef(lineage.previous) || lineage.previous.id !== ref.id || lineage.previous.revision !== ref.revision - 1)
-      return refuse("record_forged", "Derived input needs its immediately preceding exact input", at(ref.id, "derivation", ref), "producer");
-    let rebuilt: InputResult<Sealed<OmInputRecord>>;
-    if (lineage.kind === "fact") {
-      if (!isRef(lineage.answer) || !isRef(lineage.question))
-        return refuse("record_forged", "An applied fact needs its exact accepted answer and MC1 question", at(ref.id, "derivation", ref), "producer");
-      rebuilt = deriveOmInput(store, { project, kind: "fact", previous: lineage.previous, answer: lineage.answer, question: lineage.question });
-    } else if (lineage.kind === "reopen-facts") {
-      const invalidations = normalizedInvalidations(lineage.invalidations);
-      if (!invalidations) return refuse("record_forged", "Reopening facts needs a nonempty, unambiguous set of exact invalidations",
-        at(ref.id, "derivation.invalidations", ref), "producer");
-      const dependencies = Object.hasOwn(lineage, "dependencies") ? normalizedDependencies(lineage.dependencies) : undefined;
-      if (dependencies === null) return refuse("record_forged", "Dependent recovery needs exact, unambiguous causes",
-        at(ref.id, "derivation.dependencies", ref), "producer");
-      rebuilt = deriveOmInput(store, { project, kind: "reopen-facts", previous: lineage.previous, invalidations,
-        ...(dependencies ? { dependencies } : {}) });
-    } else if (Object.hasOwn(lineage, "kind")) {
-      if (lineage.kind !== "refresh" || !object(lineage.stages) || INPUT_STAGES.some(stage => !isRef(lineage.stages[stage]))
-        || (lineage.inventory !== null && !isRef(lineage.inventory)))
-        return refuse("record_forged", "A refresh needs explicit exact stages and inventory", at(ref.id, "derivation", ref), "producer");
-      const previous = readOmInput(store, project, lineage.previous);
-      if (!previous.ok) return previous;
-      const root = deriveInputRecord(store, { project, stages: lineage.stages as InputRequest['stages'], inventory: lineage.inventory, expected: 0 });
-      if (!root.ok) return root;
-      rebuilt = refreshInputRecord(store, previous.value as Revision<OmInputRecord>, root.value as OmInputRecord);
-    } else {
-      if (!isRef(lineage.graph) || !Array.isArray(lineage.decisions) || !lineage.decisions.every(isRef))
-        return refuse("record_forged", "Addressed input needs its exact graph and decisions", at(ref.id, "derivation", ref), "producer");
-      rebuilt = deriveOmInput(store, { project, previous: lineage.previous, graph: lineage.graph, decisions: lineage.decisions });
-    }
-    if (!rebuilt.ok) return rebuilt;
-    if (canonical(rebuilt.value) !== canonical(body))
-      return refuse("record_forged", "Addressed input must derive from its exact previous input and checked decisions", at(ref.id, "derivation", ref), "producer");
-    return delivered(read.value);
-  }
-  const refs = new Map<UpstreamStage, Ref>();
-  for (const source of body.input.sources) {
-    const stage = object(source) ? source.stage as UpstreamStage : null;
-    if (!stage || !INPUT_STAGES.includes(stage) || !isRef(source) || refs.has(stage))
-      return refuse("record_forged", "OM input sources are foreign or duplicated", at(ref.id, "sources", ref), "producer");
-    refs.set(stage, { id: source.id, revision: source.revision, hash: source.hash });
-  }
-  const rebuilt = deriveInputRecord(store, { project, stages: Object.fromEntries(refs) as InputRequest['stages'],
-    inventory: body.input.inventory, expected: 0 });
-  if (!rebuilt.ok) return rebuilt;
-  if (canonical(rebuilt.value) !== canonical(body))
-    return refuse("record_forged", "OM input must be derived again from its exact saved sources", at(ref.id, "input", ref), "producer");
-  // Genuine stage-only history stays valid, but a later root cannot erase an already checked decision
-  // chain merely by omitting derivation. Walking exact predecessors also catches repeated stripped roots.
-  if (ref.revision > 1) {
-    const prior = store.get<OmInputRecord>(ref.id, ref.revision - 1);
-    if (!prior || prior.kind !== "om-input")
-      return refuse("record_forged", "An input revision needs its exact preceding input", at(ref.id, "previous", ref), "producer");
-    const previous = readOmInput(store, project, reference(prior));
-    if (!previous.ok) return previous;
-    if (previous.value.value.derivation)
-      return refuse("record_forged", "A stage-only root cannot erase accepted input decisions", at(ref.id, "derivation", ref), "producer");
-  }
-  return delivered(read.value);
+  return read.ok ? delivered(read.value) : transfer("refs", read);
 }
 
 // Both arguments have passed their source-derived historical readers. Inventory is the only independent

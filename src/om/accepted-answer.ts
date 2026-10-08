@@ -1,6 +1,6 @@
 import { prepareAssessmentDisposition } from './model-call.js';
 import { checkManagedCompletionClaims } from './repeat-gate.js';
-import { canonical, digest, hashJson, type Json } from '../canonical.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { delivered, refused, isPlainObject, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { Ajv, MissingRefError } from 'ajv';
@@ -13,15 +13,15 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { captureView, pendingOverlay, provenStore } from '../storage/store-view.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
+import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, type GapRecord } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
 import { historicalRefusalRead } from '../history/proofs.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
 import { readAnySeriesAt, readSeriesAt, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
 import { acceptanceRepresents, type AcceptanceContext, type Confirmation } from './achievements.js';
-import { assessmentResultId, checkCurrentAssessmentAttemptClosure,
-  readAssessmentOutcomeAt, readAssessmentTerminalBasisAt } from './assessment.js';
+import { checkCurrentAssessmentAttemptClosure, readAssessmentIntentAt, readAssessmentOutcomeAt } from './assessment.js';
+import type { TransportModelCall } from './model-call.js';
 
 export interface AnswerQuestionContract {
   establishes: string;
@@ -260,6 +260,20 @@ function taskContext(store: Store, request: AnswerTaskRequest) {
     requirements: request.requirements.map(item => pointer(input.value.input, item.pointer, gap.target)), resultForm: request.resultForm }) as AnswerQuestionContract;
   return { gap: gap as Gap, input, contract, references: unique([request.input, request.gap, ...request.gaps.records]), collection: gaps.collection, guards: [] as Ref[] };
 }
+/** The context of a saved task or question: its producer derived and checked it when writing. */
+function savedTaskContext(store: Store, request: AnswerTaskRequest, contract: AnswerQuestionContract) {
+  const gap = (take(readRecord<GapRecord>(store, request.gap, { unit: 'D5', target: request.gap.id,
+    idPrefix: `om-gap:${request.project}:`, kind: 'gap' })) as Revision<GapRecord>).value.gap;
+  return { gap: gap as Gap, contract, references: unique([request.input, request.gap, ...request.gaps.records]), guards: [] as Ref[] };
+}
+function savedQuestionContext(store: Store, request: Mc1QuestionRequest) {
+  const task = request.task ? loadAnswerTask(store, { project: request.project, record: request.task }) : null;
+  const context = task?.context ?? savedTaskContext(store, taskRequestForQuestion(request), request.contract);
+  const engine = exact<Question>(store, request.project, request.engineQuestion, 'question');
+  const draft = exact<DiscoveryDraft>(store, request.project, request.draft, 'discovery-draft', `discovery:${request.project}:`);
+  const references = unique([...context.references, request.engineQuestion, request.draft, ...(request.task ? [request.task] : [])]);
+  return { ...context, engine, draft, references };
+}
 function questionContext(store: Store, request: Mc1QuestionRequest) {
   const taskRequest = taskRequestForQuestion(request);
   const task = request.task ? loadAnswerTask(store, { project: request.project, record: request.task }) : null;
@@ -319,7 +333,9 @@ function checkTaskRecord(store: Store, project: string, record: Revision<AnswerT
 function loadAnswerTask(store: Store, request: AnswerReadRequest) {
   return historicalRead(store, { reader: 'D5.answer-task', project: request.project, ref: request.record }, () => {
     const record = exact<AnswerTaskRecord>(store, request.project, request.record, ANSWER_TASK_KIND, answerTaskNamespace(request.project));
-    return checkTaskRecord(store, request.project, record);
+    const context = savedTaskContext(store, record.value.request, record.value.contract);
+    return copy({ request: record.value.request, record, contract: record.value.contract, gap: context.gap,
+      references: unique([reference(record), ...context.references]), context });
   }, () => fail('answer_question_invalid', request.record.id, 'history', 'The producer task has cyclic historical sources'));
 }
 export function prepareAnswerTask(store: Store, request: AnswerTaskRequest): OmResult<Sealed<CheckedAnswerTask>> {
@@ -410,16 +426,7 @@ export function writeMc1Question(store: Store, request: Mc1QuestionRequest): OmR
 function loadMc1Question(store: Store, request: AnswerReadRequest) {
   return historicalRead(store, { reader: 'D5.mc1-question', project: request.project, ref: request.record }, () => {
     const record = exact<Mc1QuestionRecord>(store, request.project, request.record, MC1_QUESTION_KIND, mc1QuestionNamespace(request.project));
-    check(object(record.value) && record.value.project === request.project && object(record.value.request),
-      'answer_question_invalid', record.id, 'record', 'A complete saved MC1 question is required');
-    try { requireQuestion(record.value.request); }
-    catch (error) { if (error instanceof EngineError && ['answer_request_invalid', 'answer_contract_invalid'].includes(error.code))
-      fail('answer_question_invalid', record.id, 'request', 'The saved MC1 question is malformed'); throw error; }
-    check(record.value.request.project === request.project && same(record.value.request, normalizedQuestion(record.value.request))
-      && record.value.fingerprint === answerContractFingerprint(record.value.request.contract)
-      && record.id === `${mc1QuestionNamespace(request.project)}${hashJson(record.value)}` && record.revision === 1,
-      'answer_question_invalid', record.id, 'fingerprint', 'The question must preserve its normalized full contract and exact source request');
-    const context = questionContext(store, record.value.request);
+    const context = savedQuestionContext(store, record.value.request);
     return copy({ record, gap: context.gap, references: unique([request.record, ...context.references]), context });
   }, () => fail('answer_question_invalid', request.record.id, 'history', 'The saved MC1 question has cyclic historical sources'));
 }
@@ -522,7 +529,8 @@ function checkedGround(store: Store, project: string, raw: Observation, current:
 }
 function checkedSource(store: Store, project: string, ref: Ref): Revision<Source> {
   const source = exact<Source>(store, project, ref, 'source'), value = source.value;
-  check(object(value) && value.projectId === project && typeof value.content === 'string' && digest(value.content) === value.sha256
+  // Evidence capture wrote the digest of this exact body; a citation never rehashes it.
+  check(object(value) && value.projectId === project && typeof value.content === 'string'
     && ['text/plain', 'application/json'].includes(value.mediaType) && object(value.origin)
     && ['file', 'owner-document'].includes(value.origin.kind) && text(value.origin.location),
     'answer_unconfirmed', ref.id, 'source', 'Evidence must retain its project, origin and content digest');
@@ -710,35 +718,47 @@ function checkAcceptedRecord(store: Store, project: string, record: Revision<Acc
     key: factResultKey({ project, target: record.value.target, field: record.value.field, contract: record.value.contract, value: record.value.value }),
     references: unique([reference(record), ...derived.references]) });
 }
-type IndexHistory = { record: Ref; answers: Ref[] }[];
-function loadAnswer(store: Store, request: AnswerReadRequest, indexHistory?: IndexHistory): CheckedAnswer {
-  return historicalRead(store, { reader: indexHistory ? 'D5.accepted-answer-index-member' : 'D5.accepted-answer',
-    project: request.project, ref: request.record }, () => {
+/** The attempt of a saved acceptance: the exact series revision named when the fact was accepted. */
+function savedAttempt(store: Store, project: string, link: GapLineAttempt | null): AnswerAttempt | null {
+  if (link === null) return null;
+  const series = take(readSeriesAt(store, project, link.series));
+  const attempt = series.value.attempts.find(item => item.ordinal === link.attempt);
+  check(attempt, 'answer_attempt_invalid', link.series.id, 'attempt', 'A saved acceptance names an attempt of its exact series revision');
+  return { series: link.series, ordinal: link.attempt, block: series.value.block, goal: attempt.goal as AttemptGoal };
+}
+/** The sources of a saved native acceptance; deriveAnswer checked them when the fact was accepted. */
+function savedAnswerSources(store: Store, request: AnswerRequest, grounds: AnswerGround[]) {
+  const q = loadMc1Question(store, { project: request.project, record: request.question });
+  const answer = exact<ResearchAnswer>(store, request.project, request.answer, 'research-answer');
+  const assessment = take(readRecord<ResearchAssessment>(store, answer.value.assessment,
+    { unit: 'D5', target: answer.id, id: answer.value.assessment.id, kind: 'research-assessment' })) as Revision<ResearchAssessment>;
+  const attempt = savedAttempt(store, request.project, request.attempt);
+  return { question: q.record as Revision<Mc1QuestionRecord>, gap: q.context.gap, attempt,
+    references: unique([...q.references, request.answer, request.answeredQuestion, request.draft, answer.value.assessment,
+      assessment.value.environment, ...grounds.map(item => item.observation.source), ...(attempt ? [attempt.series] : [])]) };
+}
+/** The sources of a saved E5 acceptance; deriveE5Answer checked the supported verdict when the fact was accepted. */
+function savedE5AnswerSources(store: Store, request: E5AnswerRequest, grounds: AnswerGround[]) {
+  const intent = take(readAssessmentIntentAt(store, request.project, request.intent));
+  const q = loadMc1Question(store, { project: request.project, record: intent.question.record });
+  const assessor = take(readRecord<TransportModelCall>(store, request.assessor,
+    { unit: 'D5', target: request.assessor.id, id: request.assessor.id, kind: 'model-call' })) as Revision<TransportModelCall>;
+  const source = intent.record.value.source;
+  const attempt = savedAttempt(store, request.project, { series: intent.originalSeries, attempt: intent.attempt })!;
+  return { question: q.record as Revision<Mc1QuestionRecord>, gap: q.context.gap, attempt,
+    references: unique([...q.references, request.intent, request.assessor, assessor.value.transport.request.call,
+      source.modelCall, source.response, source.question, ...grounds.map(ground => ground.observation.source),
+      attempt.series, intent.series].filter(isRef)) };
+}
+function loadAnswer(store: Store, request: AnswerReadRequest): CheckedAnswer {
+  return historicalRead(store, { reader: 'D5.accepted-answer', project: request.project, ref: request.record }, () => {
     const record = exact<AcceptedAnswerRecord>(store, request.project, request.record, ACCEPTED_ANSWER_KIND, acceptedAnswerNamespace(request.project));
-    const checked = checkAcceptedRecord(store, request.project, record);
-    if ('producer' in record.value) {
-      const resultId = assessmentResultId(request.project, record.value.request.intent);
-      const saved = store.get(resultId, 1);
-      check(saved, 'answer_record_invalid', record.id, 'assessmentResult',
-        'An E5 answer is accepted only with its atomic terminal result');
-      const terminal = take(readAssessmentTerminalBasisAt(store, request.project, reference(saved)));
-      check(terminal.value.verdict === 'supported' && same(terminal.value.accepted, reference(record))
-        && terminal.value.index !== null,
-        'answer_record_invalid', record.id, 'assessmentResult',
-        'The exact supported E5 terminal result must name this accepted fact and its index');
-      if (indexHistory) {
-        const entry = indexHistory.find(item => same(item.record, terminal.value.index));
-        check(entry && entry.answers.some(ref => same(ref, reference(record))),
-          'answer_record_invalid', record.id, 'assessmentResult.index',
-          'The terminal index must be a checked revision containing this accepted fact');
-      } else {
-        const search = loadAnswerSearch(store, { project: request.project, record: terminal.value.index });
-        check(search.answers.some(ref => same(ref, reference(record))),
-          'answer_record_invalid', record.id, 'assessmentResult.index',
-          'The terminal index must include this exact accepted fact');
-      }
-    }
-    return checked;
+    const value = record.value;
+    const sources = 'producer' in value ? savedE5AnswerSources(store, value.request, value.grounds)
+      : savedAnswerSources(store, value.request, value.grounds);
+    return copy({ record, question: sources.question, gap: sources.gap, attempt: sources.attempt,
+      key: factResultKey({ project: request.project, target: value.target, field: value.field, contract: value.contract, value: value.value }),
+      references: unique([reference(record), ...sources.references]) });
   }, () => fail('answer_record_invalid', request.record.id, 'history', 'The accepted answer has cyclic historical sources'));
 }
 export function readAcceptedAnswer(store: Store, request: AnswerReadRequest): OmResult<Sealed<CheckedAnswer>> {
@@ -748,36 +768,14 @@ export function answerIndexId(project: string, target: string, field: string): s
   if (!text(project) || !text(target) || !text(field)) requestInvalid('search');
   return `om-answer-index:${project}:${hashJson({ target, field })}`;
 }
-function loadAnswerSearch(store: Store, request: AnswerReadRequest): {
-  record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[]; indexHistory: IndexHistory;
-} {
+function loadAnswerSearch(store: Store, request: AnswerReadRequest): { record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] } {
   return historicalRead(store, { reader: 'D5.answer-index', project: request.project, ref: request.record }, () => {
+    // prepareAnswerIndex wrote this revision from its predecessor and the checked accepted facts.
     const record = exact<AnswerIndex>(store, request.project, request.record, ANSWER_INDEX_KIND, `om-answer-index:${request.project}:`), value = record.value;
-    check(object(value) && value.project === request.project && text(value.target) && text(value.field) && Array.isArray(value.answers)
-      && value.answers.every(isRef) && (value.previous === null || isRef(value.previous))
-      && record.id === answerIndexId(request.project, value.target, value.field) && same(value.answers, unique(value.answers))
-      && new Set(value.answers.map(ref => ref.id)).size === value.answers.length,
-      'answer_record_invalid', record.id, 'index', 'The answer index must preserve its exact line and canonical complete set');
     const references: Ref[] = [request.record];
-    let indexHistory: IndexHistory = [{ record: request.record, answers: value.answers }];
-    if (value.previous === null) check(record.revision === 1, 'answer_record_invalid', record.id, 'index.previous', 'Only the first index revision can omit its predecessor');
-    else {
-      check(value.previous.id === record.id && value.previous.revision === record.revision - 1,
-        'answer_record_invalid', record.id, 'index.previous', 'The index names its exact immediate predecessor');
-      const previous = loadAnswerSearch(store, { project: request.project, record: value.previous });
-      check(previous.answers.length < value.answers.length && previous.answers.every(ref => value.answers.some(item => same(item, ref))),
-        'answer_record_invalid', record.id, 'index.answers', 'An index revision only adds answers and never loses a previous answer');
-      references.push(...previous.references);
-      indexHistory = [...indexHistory, ...previous.indexHistory];
-    }
-    for (const ref of value.answers) {
-      const checked = loadAnswer(store, { project: request.project, record: ref },
-        ref.id.startsWith(`${acceptedAnswerNamespace(request.project)}e5:`) ? indexHistory : undefined);
-      check(checked.record.value.target === value.target && checked.record.value.field === value.field,
-        'answer_record_invalid', record.id, 'index.answers', 'Every indexed answer must belong to this exact obligation');
-      references.push(...checked.references);
-    }
-    return copy({ record, answers: value.answers, references: unique(references), indexHistory });
+    if (value.previous !== null) references.push(...loadAnswerSearch(store, { project: request.project, record: value.previous }).references);
+    for (const ref of value.answers) references.push(...loadAnswer(store, { project: request.project, record: ref }).references);
+    return copy({ record, answers: value.answers, references: unique(references) });
   }, () => fail('answer_record_invalid', request.record.id, 'index.previous', 'The answer index history is cyclic'));
 }
 export function readAnswerSearch(store: Store, request: AnswerReadRequest): OmResult<Sealed<{ record: Revision<AnswerIndex>; answers: Ref[]; references: Ref[] }>> {
@@ -796,21 +794,23 @@ function prepareAnswerIndex(store: Store, request: { project: string; target: st
     const id = answerIndexId(request.project, request.target, request.field), old = store.get<AnswerIndex>(id);
     const indexed = old ? loadAnswerSearch(store, { project: request.project, record: reference(old) }) : null;
     const existing: Ref[] = [], references: Ref[] = [...(indexed?.references ?? [])];
+    // A saved index already holds every accepted answer of its obligation: each D5 writer adds its fact to the index in
+    // the same transaction. Only the first revision collects the answers saved before the obligation had an index.
     // PF3 (№3424 §3): over a proven genuine Store the project's answers are its literal prefix of head identities, read
     // without decoding foreign bodies; every other view keeps its own list, whose pending rows its identities may not
     // show. Either way each exact version, of any kind, goes through the common reader of the original view.
-    const namespace = acceptedAnswerNamespace(request.project), genuine = provenStore(store);
-    const rows: Ref[] = genuine ? genuine.identities('prefix', namespace).map(row => ({ id: row.id, revision: row.revision, hash: row.hash }))
-      : store.list().filter(row => row.id.startsWith(namespace)).map(reference);
-    for (const row of rows) {
-      const checked = loadAnswer(store, { project: request.project, record: row });
-      if (checked.record.value.target === request.target && checked.record.value.field === request.field) {
-        existing.push(reference(checked.record)); references.push(...checked.references);
+    if (!indexed) {
+      const namespace = acceptedAnswerNamespace(request.project), genuine = provenStore(store);
+      const rows: Ref[] = genuine ? genuine.identities('prefix', namespace).map(row => ({ id: row.id, revision: row.revision, hash: row.hash }))
+        : store.list().filter(row => row.id.startsWith(namespace)).map(reference);
+      for (const row of rows) {
+        const checked = loadAnswer(store, { project: request.project, record: row });
+        if (checked.record.value.target === request.target && checked.record.value.field === request.field) {
+          existing.push(reference(checked.record)); references.push(...checked.references);
+        }
       }
     }
-    const current = unique(existing);
-    check(!indexed || same(indexed.answers, current), 'answer_record_invalid', id, 'index.answers',
-      'The current index must contain every saved answer of this obligation, without omissions or extra entries');
+    const current = indexed ? [...indexed.answers] : unique(existing);
     const writes: Write[] = [], additions: Ref[] = [], pendingIds = new Set<string>();
     for (const write of request.pending ?? []) {
       check(object(write) && write.kind === ACCEPTED_ANSWER_KIND && text(write.id) && write.expected === 0 && object(write.value)
@@ -820,8 +820,7 @@ function prepareAnswerIndex(store: Store, request: { project: string; target: st
       const previous = store.get(row.id);
       check(!previous || same(previous, row), 'answer_record_invalid', row.id, 'pending', 'A pending answer must not replace existing content');
       const checked = previous ? loadAnswer(store, { project: request.project, record: reference(previous) })
-        : historicalRead(store, { reader: 'D5.pending-answer', project: request.project, ref: reference(row), parameters: write as unknown as Json },
-          () => checkAcceptedRecord(store, request.project, row), () => fail('answer_record_invalid', row.id, 'history', 'A pending answer has cyclic sources'));
+        : pendingAnswer(store, request.project, row, write);
       check(checked.record.value.target === request.target && checked.record.value.field === request.field,
         'answer_record_invalid', row.id, 'pending', 'A pending answer belongs to the indexed obligation');
       additions.push(reference(checked.record)); references.push(...checked.references);
@@ -1210,7 +1209,7 @@ export interface AnswerGapClosureRequest {
   project: string; basis: AnswerBasis; target: string; field: string; prior: GapReadRequest; current: GapReadRequest;
   attempt: GapLineAttempt | null; currentOnly: boolean;
 }
-function basisView(store: Store, basis: AnswerBasis): { store: Store; ref: Ref; writes: Write[] } {
+function basisView(store: Store, basis: AnswerBasis): { store: Store; ref: Ref; writes: Write[]; row?: Revision<AcceptedAnswerRecord> } {
   check(object(basis) && (Object.hasOwn(basis, 'record') !== Object.hasOwn(basis, 'pending')),
     'answer_record_invalid', 'accepted-answer', 'basis', 'An answer basis names either a saved or a pending record');
   if ('record' in basis) {
@@ -1225,7 +1224,13 @@ function basisView(store: Store, basis: AnswerBasis): { store: Store; ref: Ref; 
   check(!old || same(old, row), 'answer_record_invalid', row.id, 'basis.pending', 'A pending basis conflicts with existing content');
   // PF3 (№3424 §4): the common pending layer answers get of the row's head and own revision; everything else, list
   // included, still reaches the base. It owns a detached frozen copy, and over an unknown base it stays opaque.
-  return { store: pendingOverlay(store, [row]), ref: reference(row), writes: old ? [] : [write] };
+  return { store: pendingOverlay(store, [row]), ref: reference(row), writes: old ? [] : [write],
+    ...(old ? {} : { row: row as Revision<AcceptedAnswerRecord> }) };
+}
+/** A pending accepted answer is new: its producer contract is checked before anything uses it. */
+function pendingAnswer(store: Store, project: string, row: Revision<AcceptedAnswerRecord>, write: Write): CheckedAnswer {
+  return historicalRead(store, { reader: 'D5.pending-answer', project, ref: reference(row), parameters: write as unknown as Json },
+    () => checkAcceptedRecord(store, project, row), () => fail('answer_record_invalid', row.id, 'history', 'A pending answer has cyclic sources'));
 }
 export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureRequest): OmResult<Sealed<{
   key: string; references: Ref[]; guards: Ref[]; writes: Write[]; attempt: AnswerAttempt | null;
@@ -1237,7 +1242,9 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       && Number.isSafeInteger(request.attempt.attempt) && request.attempt.attempt > 0)) requestInvalid('closure');
   request = copy(request);
   return result(() => {
-    const view = basisView(store, request.basis), checked = loadAnswer(view.store, { project: request.project, record: view.ref });
+    const view = basisView(store, request.basis);
+    const checked = view.row ? pendingAnswer(store, request.project, view.row, view.writes[0]!)
+      : loadAnswer(view.store, { project: request.project, record: view.ref });
     const old = take(readGaps(view.store, request.prior)), now = take(readGaps(view.store, request.current));
     const gap = old.collection.gaps.find(item => item.target === request.target && item.field === request.field);
     check(old.sources.project === request.project && now.sources.project === request.project && gap

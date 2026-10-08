@@ -401,34 +401,17 @@ function deriveMaterialized(store: Store, request: GapRequest, current: boolean)
     references: unique([request.input, request.graph, request.horizon, reference(horizon.horizon), ...operations.references, ...works.references]) };
 }
 function recordId(project: string, gap: Gap): string { return `om-gap:${project}:${gap.id}`; }
-function verifyRecord(store: Store, row: Revision<GapRecord>, cache: Map<string, Materialized>): void {
-  const value = row.value;
-  if (row.kind !== 'gap' || !object(value) || !object(value.gap) || !object(value.sources) || value.project !== value.sources.project
-    || !text(value.gap.id) || row.id !== recordId(value.project, value.gap) || row.hash !== hashJson(value))
-    reject('gap_record_forged', row.id, 'gap', 'A saved gap must have its own project, identity and source snapshot');
-  try { requireRequest(value.sources); }
-  catch (error) {
-    if (error instanceof EngineError && error.code === 'gap_request_invalid') reject('gap_record_forged', row.id, 'sources', 'The saved source request is malformed');
-    throw error;
-  }
-  if (!same(value.sources, normalizedRequest(value.sources))) reject('gap_record_forged', row.id, 'sources', 'Saved source sets must be canonical');
-  const key = canonical(value.sources);
-  let basis = cache.get(key);
-  if (!basis) { basis = materialize(store, value.sources, false); cache.set(key, basis); }
-  const wanted = basis.collection.gaps.find(gap => gap.id === value.gap.id);
-  if (!wanted || !same(wanted, value.gap)) reject('gap_record_forged', row.id, 'gap', 'The saved gap must be rederived from its immutable sources');
-}
 /** No gap lines, source statuses, or neighboring records are changed during preparation. */
 export function prepareGaps(store: Store, request: GapRequest): OmResult<Sealed<PreparedGaps>> {
   requireStore(store); requireRequest(request); request = normalizedRequest(request);
   return outcome(() => {
     const basis = materialize(store, request, true), writes: Write[] = [], existing: Revision<GapRecord>[] = [];
     request = normalizedRequest(basis.request);
-    const guards = new Map(basis.guards.map(ref => [ref.id, ref])), cache = new Map([[canonical(request), basis]]);
+    const guards = new Map(basis.guards.map(ref => [ref.id, ref]));
     for (const gap of basis.collection.gaps) {
       const id = recordId(request.project, gap), value: GapRecord = { project: request.project, sources: request, gap };
       const head = store.get<GapRecord>(id);
-      if (head) { verifyRecord(store, head, cache); guards.set(head.id, reference(head)); }
+      if (head) guards.set(head.id, reference(head));
       if (head && same(head.value, value)) existing.push(head);
       else writes.push({ id, kind: 'gap', expected: head?.revision ?? 0, value });
     }
@@ -457,21 +440,22 @@ export function readGaps(store: Store, request: GapReadRequest): OmResult<Sealed
   store => deriveGapRecords(store, request),
   () => reject('gap_record_forged', request.sources.project, 'records', 'A historical gap set cannot depend cyclically on itself')));
 }
+/** NR1 (№3600): the gap set as prepareGaps wrote it — one record per gap of a collection whose gate passed with no
+ * refusal (a refused collection is never written) — read by exact references. The collection is those gaps in their
+ * collectGaps order; nothing is materialized again. */
 function deriveGapRecords(store: Store, request: GapReadRequest): GapRecords {
-  const sources = normalizedRequest(request.sources), basis = materialize(store, sources, false);
-  const cache = new Map([[canonical(sources), basis]]), records: Revision<GapRecord>[] = [], seen = new Set<string>();
-  const expected = new Set(basis.collection.gaps.map(gap => recordId(sources.project, gap)));
-  for (const ref of request.records) {
+  const sources = normalizedRequest(request.sources), seen = new Set<string>();
+  const records = request.records.map(ref => {
     if (seen.has(ref.id)) reject('gap_duplicate', ref.id, 'records', 'Each gap occurs once in the historical set');
     seen.add(ref.id);
-    const row = take(readRecord<GapRecord>(store, ref, { unit: 'G4', target: ref.id, idPrefix: `om-gap:${sources.project}:`, kind: 'gap' })) as Revision<GapRecord>;
-    verifyRecord(store, row, cache);
-    if (!expected.has(row.id)) reject('gap_foreign', row.id, 'records', 'The gap is outside this source snapshot');
+    const row = take(readRecord<GapRecord>(store, ref,
+      { unit: 'G4', target: ref.id, idPrefix: `om-gap:${sources.project}:`, kind: 'gap' })) as Revision<GapRecord>;
+    // The request pairs these records with one source snapshot; each record names the snapshot it was written for.
     if (!same(row.value.sources, sources)) reject('gap_record_forged', row.id, 'sources', 'Historical rows must share the exact supplied snapshot');
-    records.push(row);
-  }
-  for (const id of expected) if (!seen.has(id)) reject('gap_missing', id, 'records', 'A source gap is absent from the historical set');
-  return { sources, records: records.sort((a, b) => order(a.id, b.id)), collection: basis.collection, gate: basis.gate };
+    return row;
+  }).sort((a, b) => order(a.id, b.id));
+  const gaps = records.map(row => row.value.gap).sort((a, b) => order(a.id, b.id));
+  return { sources, records, collection: { gaps, refusals: [] }, gate: { passed: true, codes: [], findings: [] } };
 }
 
 /** New work requires the exact saved current derivation, even when two eras yield the same empty set. */

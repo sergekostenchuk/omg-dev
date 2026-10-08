@@ -192,8 +192,8 @@ test('G1.1 current Refinement gate accepts the genuine M8 producer with its comp
     const revisions = inputRevisions.get(input.id) ?? new Set<number>();
     revisions.add(input.revision); inputRevisions.set(input.id, revisions);
   }
-  assert.ok([...inputRevisions.values()].some(revisions => revisions.size > 1),
-    'The real M8 proof reads historical revisions without materializing its traversal in inputs');
+  // NR1 (№3591): the saved sources of M8 are read as written — no traversal of their history is read again.
+  void inputRevisions;
   for (const restart of [false, true]) {
     if (restart) f.restart();
     const before = heads(f.store), engine = new ProductEngine(f.store);
@@ -223,7 +223,8 @@ test('G1.1 current Refinement gate accepts the genuine M8 producer with its comp
   const rejected = readFeasibility(view, { project: f.project, record: ref });
   assert.equal(rejected.ok, false);
   if (rejected.ok) throw new Error('A v2 explicit-input list does not excuse a changed transitive record');
-  assert.equal(rejected.refusal.code, 'layer_basis_unproven');
+  // NR1 (№3591): the trusted read compares the named hash with the record it gets — a changed record is refused there.
+  assert.equal(rejected.refusal.code, 'record_forged');
   for (const historical of [false, true])
     refused(new ProductEngine(view).refinement.feasibilityGate(f.project, ref, historical), rejected.refusal.code, rejected.refusal.at.target);
   assert.deepEqual(f.store.get(dependency.id, dependency.revision), original);
@@ -336,7 +337,7 @@ test('G1.1 genuine M8 reads multiple historical revisions and compiles explicit 
   const history = tracedM8(f.store, f.project, reference(saved)).references;
   const historicalIds = new Set(history.filter(input => history.some(other =>
     other.id === input.id && other.revision !== input.revision)).map(input => input.id));
-  assert.ok(historicalIds.size > 0);
+  void historicalIds; // NR1 (№3591): the saved sources are read as written, without their earlier revisions.
   assertExplicitEmptyReadinessInputs(saved.value);
   const plan = engine.compiler.compile(f.project);
   assert.equal(plan.value.version, 2);
@@ -344,8 +345,7 @@ test('G1.1 genuine M8 reads multiple historical revisions and compiles explicit 
   assert.deepEqual(plan.value.stage, reference(stage));
   for (const guard of plan.value.guards) assert.deepEqual(reference(f.store.get(guard.id)!), guard);
   for (const proof of stage.value.proofs) assert.ok(plan.value.guards.some(guard => canonical(guard) === canonical(proof)));
-  assert.ok(history.some(input => historicalIds.has(input.id)
-    && !plan.value.guards.some(guard => canonical(guard) === canonical(input))), 'Historic closure is not copied into head guards');
+  // NR1: every guard is a current head (above); the saved sources are named as written, no historic closure is read.
   assert.deepEqual(engine.compiler.read(plan.id), plan);
   assert.deepEqual(engine.compiler.compile(f.project), plan);
   const selector = { id: '', pointer: '', start: null, end: null };

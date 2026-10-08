@@ -61,6 +61,9 @@ export type Sealed<T> =
 export function sealed<T>(value: T): Sealed<T> {
   return seal(value, new Set<object>()) as Sealed<T>;
 }
+/** NR1 (№3600): the copies seal made — deeply frozen, checked once, never changing — handed on as they are when they are
+ * delivered again, never checked and copied again. Only seal adds to it. */
+const sealedCopies = new WeakSet<object>();
 
 // The accepted shapes are canonical()'s: a unit may only deliver finite, acyclic JSON.
 function seal(value: unknown, seen: Set<object>): unknown {
@@ -69,6 +72,7 @@ function seal(value: unknown, seen: Set<object>): unknown {
   if (typeof value !== "object" || seen.has(value)) {
     throw new EngineError("unsealable_value", "Only finite, acyclic JSON values can be delivered to a consumer");
   }
+  if (sealedCopies.has(value)) return value;
   seen.add(value);
   let copy: unknown;
   if (Array.isArray(value)) {
@@ -90,6 +94,7 @@ function seal(value: unknown, seen: Set<object>): unknown {
     copy = Object.freeze(target);
   }
   seen.delete(value);
+  sealedCopies.add(copy as object);
   return copy;
 }
 

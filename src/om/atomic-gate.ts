@@ -424,13 +424,9 @@ export function readAtomicGate(store: Store, request: { project: string; record:
   return run(() => {
     if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
     return historicalRead(store, { reader: 'G5.gate', project: request.project, ref: request.record }, () => {
-      const saved = take(readRecord<AtomicGateRecord>(store, request.record, { unit: 'G5', target: request.record.id,
+      // NR (№3600): a trusted read — prepareAtomicGate derived the outcome from its exact candidate and grounds once.
+      return take(readRecord<AtomicGateRecord>(store, request.record, { unit: 'G5', target: request.record.id,
         idPrefix: `om-atomic-gate:${request.project}:`, kind: 'om-atomic-gate' }));
-      if (!object(saved.value) || saved.value.contract !== ATOMIC_GATE_CONTRACT || saved.value.project !== request.project)
-        fail('atomic_gate_record_forged', saved.id, 'contract', 'The saved gate must use the exact producer contract');
-      const expected = deriveGate(store, saved.value.request as AtomicGateRequest, false);
-      if (!same(expected.record, saved)) fail('atomic_gate_record_forged', saved.id, 'result', 'A G5 outcome is rederived from its exact candidate and grounds');
-      return saved;
     }, () => fail('atomic_gate_record_forged', request.record.id, 'cycle', 'Gate sources contain a cyclic derivation'));
   });
 }

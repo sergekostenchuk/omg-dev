@@ -6,8 +6,9 @@ import { recoverOmModelCall } from "./model-call.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { acquireRunExecution, readRunControl, releaseRunExecution, resumeStoppedRun, runOwnerState, stopRun, unfinishedRunCalls,
   RunControlGate, RunControlLost, type RunControlRecord, type RunControlStatus, type RunExecution } from "./run-control.js";
-import { advanceRun, readRun, startRun, type RunRecord, type RunRequest } from "./run.js";
+import { advanceRun, readRun, startRun, unableReopens, type RunRecord, type RunRequest } from "./run.js";
 import { writeRunBases } from "./run-bases.js";
+import { integrityGate } from "./integrity.js";
 
 /**
  * H1.3 — the driver of a pass (№1910 п.1): the one production entry that starts and continues the OM pass of a project.
@@ -89,6 +90,11 @@ async function held(store: Store, project: string, action: (execution: RunExecut
   try { return await action(execution.value as RunExecution); }
   finally { releaseRunExecution(store, execution.value as RunExecution); }
 }
+/** LP8.1: an unable pass is weighed with its saved dispatch; without one it stands as it is. */
+function reopens(store: Store, project: string): boolean {
+  const dispatch = dispatchOf(store, project);
+  return dispatch.ok && unableReopens(store, dispatch.value);
+}
 function dispatchOf(store: Store, project: string): OmResult<RunRequest> {
   const read = readDispatch(store, { project });
   return read.ok ? { ok: true, value: { project, dispatch: read.value.dispatch } } : read;
@@ -100,11 +106,16 @@ function dispatchOf(store: Store, project: string): OmResult<RunRequest> {
  */
 export async function startPass(store: Store, request: PassStartRequest): Promise<OmResult<Sealed<PassOutcome>>> {
   requireRequest(store, request, ["project", "outcomes"]);
+  // NR1 (№3646): om-fsck runs at every start and continue; damage found stops the pass for the owner, with its addresses.
+  const damaged = integrityGate(store, request.project);
+  if (damaged) return damaged as OmResult<Sealed<PassOutcome>>;
   const project = request.project, control = controlOf(store, project), run = savedRun(store, project);
   if (control.stopped) return delivered({ end: "stopped", run, control, refusal: null }) as OmResult<Sealed<PassOutcome>>;
   const intent = request.outcomes === undefined ? {} : { outcomes: request.outcomes };
   const phase = run?.value.state.phase;
-  if (phase === "complete" || phase === "unable") {
+  // LP8.1 (№3670): an unable pass whose grounds today's rules no longer prove final is driven — its first transition
+  // reopens it; one whose grounds stand is read like a completed one.
+  if (phase === "complete" || phase === "unable" && !reopens(store, project)) {
     // An ended pass is read, not driven: its intent is checked as any start checks it, and no execution is taken.
     const same = startRun(store, { project, ...intent });
     if (!same.ok) return ended(store, project, same.refusal);
@@ -133,12 +144,14 @@ function coldStart(store: Store, project: string, intent: { outcomes?: readonly 
 /** Continues the existing pass with its saved intent; it never creates a pass and never lifts a stop. */
 export async function continuePass(store: Store, request: PassRequest): Promise<OmResult<Sealed<PassOutcome>>> {
   requireRequest(store, request, ["project"]);
+  const damaged = integrityGate(store, request.project);
+  if (damaged) return damaged as OmResult<Sealed<PassOutcome>>;
   const project = request.project, control = controlOf(store, project), run = savedRun(store, project);
   if (control.stopped) return delivered({ end: "stopped", run, control, refusal: null }) as OmResult<Sealed<PassOutcome>>;
   if (!run) return refused("record_missing", "There is no pass to continue; a continue never starts one",
     { unit: UNIT, target: `om-run:${project}`, field: "run" }, "owner") as OmResult<Sealed<PassOutcome>>;
   const phase = run.value.state.phase;
-  if (phase === "complete" || phase === "unable") return delivered({ end: phase, run, control, refusal: null }) as OmResult<Sealed<PassOutcome>>;
+  if (phase === "complete" || phase === "unable" && !reopens(store, project)) return delivered({ end: phase, run, control, refusal: null }) as OmResult<Sealed<PassOutcome>>;
   const dispatch = dispatchOf(store, project);
   if (!dispatch.ok) return dispatch;
   return held(store, project, execution => drive(store, project, dispatch.value, execution, reference(run)));

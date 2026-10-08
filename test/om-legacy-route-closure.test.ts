@@ -21,6 +21,7 @@ import { reference, type Ref, type StageArtifact } from '../src/pipeline/contrac
 import { ProductEngine } from '../src/product/engine.js';
 import { continuePreparation } from '../src/product/preparation-run.js';
 import { git } from '../src/runtime/environment.js';
+import { checkStoreIntegrity } from '../src/storage/fsck.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { executionFixture } from './execution-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
@@ -730,7 +731,8 @@ test('S1.5 №2363 a corrupt record surfaces when it is a candidate of the searc
   stillLegacy(f.engine);
   f.reopen(); stillLegacy(f.engine);
   corrupt('om-horizon:p:broken', 'om-horizon');
-  const integrity = (error: unknown) => error instanceof EngineError && error.code === 'record_corrupt';
-  assert.throws(() => f.engine.legacyRoute('p'), integrity);
-  f.reopen(); assert.throws(() => f.engine.legacyRoute('p'), integrity);
+  // NR1 (№3591/№3646): a read takes the body as written; a row the Store never wrote is found by om-fsck at its address.
+  const corrupted = () => checkStoreIntegrity(f.store).findings.filter(item => item.code === 'revision_corrupt').map(item => item.id).sort();
+  assert.deepEqual(corrupted(), ['om-horizon:p:broken', 'research-context:p:broken']);
+  f.reopen(); assert.deepEqual(corrupted(), ['om-horizon:p:broken', 'research-context:p:broken']);
 });

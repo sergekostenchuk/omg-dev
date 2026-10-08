@@ -6,7 +6,6 @@ import type { Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type RefusalRoute, type Sealed, type SourceCodes } from "./refusal.js";
-
 import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
@@ -493,29 +492,16 @@ export function writeHorizon(store: Store, request: HorizonRequest): HorizonResu
   if (!written.ok) return transfer("refs", written);
   return delivered({ horizon: written.value[0] as unknown as Revision<HorizonRecord>, gate: written.value[1] as unknown as Revision<OmHorizonRecord> });
 }
+/** NR1 (№3600): a trusted read — prepareHorizon derived the horizon and its G2 outcome from their exact sources once. */
 export function readHorizon(store: Store, project: string, ref: Ref): HorizonResult<Sealed<HorizonRecords>> {
   requireStore(store, project);
   if (!isRef(ref)) invalid("reference");
   const gate = readRecord<OmHorizonRecord>(store, ref, { unit: "G2", target: project, idPrefix: `om-horizon:${project}:`, kind: "om-horizon" });
   if (!gate.ok) return transfer("refs", gate);
   const value = gate.value.value;
-  const forged = () => refuse("record_forged", "The G2 outcome must be rederived from its exact horizon sources", address(ref.id, "horizon", ref), "producer");
-  if (!object(value) || value.project !== project || !text(value.choiceVersion) || !isRef(value.horizon)
-    || ref.id !== `om-horizon:${project}:${value.choiceVersion}` || ref.revision !== 1) return forged();
   const horizon = readRecord<HorizonRecord>(store, value.horizon, { unit: "G2", target: project,
     id: `horizon:${project}:${value.choiceVersion}`, kind: "horizon" });
   if (!horizon.ok) return transfer("refs", horizon);
-  const record = horizon.value.value as HorizonRecord;
-  if (horizon.value.revision !== 1 || !object(record) || record.project !== project || !object(record.request) || record.request.project !== project) return forged();
-  try { requireRequest(store, record.request); }
-  catch (error) {
-    if (error instanceof EngineError && error.code === "horizon_request_invalid") return forged();
-    throw error;
-  }
-  if (record.request.choice.choiceVersion !== value.choiceVersion || canonical(record.request) !== canonical(normalizedRequest(record.request))) return forged();
-  const derived = deriveHorizon(store, record.request);
-  if (!derived.ok) return derived;
-  if (canonical(record) !== canonical(derived.value) || canonical(value) !== canonical(gateRecord(derived.value as HorizonRecord, value.horizon))) return forged();
   return delivered({ horizon: horizon.value, gate: gate.value });
 }
 
@@ -592,16 +578,8 @@ function readIssuanceRecord(store: Store, project: string, ref: Ref): HorizonRes
   if (!issuanceKeys(value, fields)) return bad("record");
   if (value.contract !== HORIZON_ISSUANCE_CONTRACT) return bad("contract");
   if (value.project !== project) return bad("project");
-  const request: HorizonIssuanceRequest = { project: value.project, choiceVersion: value.choiceVersion, horizon: value.horizon, transition: value.transition };
-  const checked = checkIssuanceRequest(store, request);
-  if (!checked.ok) return bad(checked.refusal.at.field ?? "request");
-  if (saved.value.revision !== 1 || saved.value.id !== issuanceId(request)) return bad("identity");
-  if (!["accepted", "refused"].includes(value.state)) return bad("state");
-  if (!Array.isArray(value.codes) || !value.codes.every(text)) return bad("codes");
-  const derived = deriveHorizonIssuance(store, request);
-  if (!derived.ok) return derived;
-  if (canonical(saved.value) !== canonical(derived.value.record)) return bad("content");
-  return delivered({ record: saved.value, references: issuanceRefs([ref, ...derived.value.references]) });
+  // NR (№3600): a trusted read — prepareHorizonIssuance derived the issuance from its exact P and horizon once.
+  return delivered({ record: saved.value, references: issuanceRefs([ref, value.horizon, value.transition]) });
 }
 /** Historical delivery never replaces the named P revision with its later applied/discarded head. */
 export function readHorizonIssuance(store: Store, request: { project: string; record: Ref }): HorizonResult<Sealed<CheckedHorizonIssuance>> {

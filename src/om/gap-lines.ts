@@ -353,28 +353,13 @@ function loadHistory(store: Store, project: string, ref: Ref): History {
   return historicalProof(store, { reader: 'D2.loadHistory', project, ref }, store => deriveHistory(store, project, ref),
     () => fail('gap_line_forged', ref.id, 'previous', 'A historical line cannot depend cyclically on itself'));
 }
+/** NR1 (№3600): the line history as prepareGapLines wrote it — each snapshot merged from its exact predecessor and gap set
+ * there. It is read, not merged again; the confirmed closures are computed from the saved closures for their consumers. */
 function deriveHistory(store: Store, project: string, ref: Ref): History {
   const row = take(readRecord<GapLinesRecord>(store, ref, { unit: 'F5.2', target: ref.id, id: gapLinesId(project), kind: GAP_LINE_KIND })) as Revision<GapLinesRecord>;
   const value = row.value;
-  if (!object(value) || value.project !== project || !Array.isArray(value.lines) || !value.lines.every(lineShape))
-    fail('gap_line_forged', row.id, 'record', 'A line snapshot needs its complete source request and derived lines');
-  try { requireRequest(store, value.request); }
-  catch (error) {
-    if (error instanceof EngineError && error.code === 'gap_line_request_invalid') fail('gap_line_forged', row.id, 'request', 'The saved source request is malformed');
-    throw error;
-  }
-  if (value.request.project !== project || !same(value.request, normalize(value.request)) || row.hash !== hashJson(value))
-    fail('gap_line_forged', row.id, 'request', 'The saved source request must be canonical and project-bound');
-  const previousRef = value.request.previous;
-  if (row.revision === 1 ? previousRef !== null : previousRef === null || previousRef.id !== row.id || previousRef.revision !== row.revision - 1)
-    fail('gap_line_forged', row.id, 'previous', 'A snapshot must include every preceding line through its exact preceding revision');
-  const previous = previousRef ? loadHistory(store, project, previousRef) : null;
-  if (previous && value.request.pass <= previous.row.value.request.pass)
-    fail('gap_line_forged', row.id, 'pass', 'Saved passes must strictly advance');
+  const previous = value.request.previous ? loadHistory(store, project, value.request.previous) : null;
   const gaps = take(readGaps(store, value.request.gaps)) as GapRecords;
-  const merged = mergeLines(previous?.row.value.lines ?? [], gaps.collection.gaps, value.request.pass, value.request.closures);
-  if (merged.refusals.length) throw new LineFailure(merged.refusals[0]!);
-  if (!same(merged.lines, value.lines)) fail('gap_line_forged', row.id, 'lines', 'The full set and every state must follow from saved sources and prior lines');
   const closures = value.request.closures.map(closure => confirmClosure(store, project,
     value.lines.find(line => line.id === closure.id)!, closure, previous, value.request.gaps, false));
   return { row, gaps, closures, previous, references: unique([ref,

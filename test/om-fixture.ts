@@ -275,3 +275,32 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
 export async function createCrossOmFixture(t: TestContext, project = "garden"): Promise<OmFixture> {
   return createOmFixture(t, "cross", project);
 }
+
+/**
+ * NR1 (№3591, №3600): a trusted reader returns what its records hold and names the records it read itself; the checked
+ * reader of an earlier era named the whole trail it had checked again. Outputs of the eras are equal but for `references`,
+ * and the trusted ones are a subset of the trail. Compares exactly that.
+ */
+export function sameButReferences(actual: unknown, expected: unknown, message?: string): void {
+  const parsed = typeof expected === "string" ? JSON.parse(expected) as unknown : JSON.parse(JSON.stringify(expected)) as unknown;
+  const current = JSON.parse(JSON.stringify(actual)) as unknown;
+  const collect = (value: unknown, into: Set<string>): unknown => {
+    if (Array.isArray(value)) return value.map(item => collect(item, into));
+    if (value === null || typeof value !== "object") return value;
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "references" && Array.isArray(item)) {
+        for (const ref of item) into.add(JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1))));
+        continue;
+      }
+      result[key] = collect(item, into);
+    }
+    return result;
+  };
+  const mine = new Set<string>(), theirs = new Set<string>();
+  assert.deepEqual(collect(current, mine), collect(parsed, theirs), message);
+  const extra = [...mine].filter(ref => !theirs.has(ref));
+  const named = (refs: Iterable<string>, id: string) => [...refs].filter(ref => (JSON.parse(ref) as { id: string }).id === id).map(ref => (JSON.parse(ref) as { revision: number }).revision);
+  assert.deepEqual(extra.map(ref => { const { id, revision } = JSON.parse(ref) as { id: string; revision: number };
+    return `${id}@${revision} (trail: ${named(theirs, id).join(",") || "none"})`; }), [], `${message ?? "references"}: a trusted reader names only records of the checked trail`);
+}

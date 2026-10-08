@@ -9,12 +9,12 @@ import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal,
 import { readAnySeriesAt, seriesRequestOf, prepareSeriesLineAdmission, prepareEscalateSeries,
   readSeriesWorkAdmission, seriesRequiresAdmissionProof,
   STOP_REVIEW_KIND, stopReviewNamespace, type AnyRepairSeries, type AttemptGoal } from './series.js';
-import { stopReportOfNewEra, stopReportSources, readStopReport, STOP_REPORT_CONTRACT_V2, type AnyStopReport, type StopReportSources } from './stop-report.js';
-import { prepareLiftOriginHold, readOriginHoldAt, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace,
+import { stopReportOfNewEra, stopReportSources, STOP_REPORT_CONTRACT_V2, type AnyStopReport, type StopReportSources } from './stop-report.js';
+import { prepareLiftOriginHold, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace,
   REFUSAL_CLASSES, type RefusalClass } from './repeat-gate.js';
 import { normalizeOriginSource, type OriginSource } from './refusal-journal.js';
-import { recordCall, readCall, type AnyRecordCallRequest, type CallBasis, type DispatchContract } from './call-record.js';
-import { adapterRequest, transportUnder, readModelTransport, type ModelTransportOutcome } from './model-call.js';
+import { recordCall, type AnyRecordCallRequest, type CallBasis, type DispatchContract } from './call-record.js';
+import { adapterRequest, transportUnder, type ModelTransportOutcome } from './model-call.js';
 import { withHistoricalReads } from './input.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 
@@ -22,7 +22,6 @@ export const STOP_ANALYSIS_CONTRACT = 'om-stop-analysis/v1';
 /** LP6 (№3325 §4): a new intent stands on the report of the new era; its results and failures inherit its contract. */
 export const STOP_ANALYSIS_CONTRACT_V2 = 'om-stop-analysis/v2';
 type AnalysisContract = typeof STOP_ANALYSIS_CONTRACT | typeof STOP_ANALYSIS_CONTRACT_V2;
-const CONTRACTS: readonly string[] = [STOP_ANALYSIS_CONTRACT, STOP_ANALYSIS_CONTRACT_V2];
 export const STOP_ANALYSIS_FAILURE_KIND = 'om-stop-analysis-failure';
 export const STOP_ANALYSIS_CODES = Object.freeze(['analysis_request_invalid', 'analysis_invalid', 'analysis_conflict',
   'analysis_response_invalid', 'assessor_not_independent', 'context_too_large'] as const);
@@ -49,6 +48,8 @@ export interface AnalysisRecord {
   block?: string; owner?: { kind: 'mechanism'; mechanism: 'M5:addressing' };
   stop: number; goals: string[]; attempt: number; row: string | null;
   class: RefusalClass | null; basis: OriginSource[];
+  /** LP8 (№3622): the first acceptance of an answer an old adapter wrapper refused — the refusal and the exchange it read. */
+  recovery?: { failure: Ref; exchange: Ref };
 }
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -175,21 +176,10 @@ function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnySto
   } else call = { ...common, block: series.value.block, gaps: [{ ...gap, consumer: 'A6:stop-analysis' }] };
   return copy({ contract, request, sources: stopReportSources(report), report, packet, call });
 }
+/** NR (№3600): a trusted read — prepareStopAnalysis derived the intent from its exact report sources once. */
 function readIntent(store: Store, project: string, ref: Ref): Revision<AnalysisIntent> {
-  const record = take(readRecord<AnalysisIntent>(store, ref, { unit: 'A6', target: ref.id,
-    idPrefix: `om-analysis-intent:${project}:`, kind: 'om-analysis-intent' }));
-  const saved = record.value;
-  if (!object(saved) || !keys(saved, ['contract', 'request', 'sources', 'report', 'packet', 'call'])
-    || !CONTRACTS.includes(saved.contract as string) || !object(saved.sources))
-    fail('analysis_invalid', ref.id, 'intent', 'An analysis intent must retain its producer and complete exact sources');
-  requireRequest(store, saved.request as StopAnalysisRequest);
-  if (saved.request.project !== project) fail('analysis_invalid', ref.id, 'project', 'An intent belongs to its project');
-  const report = take(readStopReport(store, { project, sources: saved.sources })) as AnyStopReport;
-  const derived = deriveIntent(store, saved.request as StopAnalysisRequest, report);
-  if (record.id !== intentId(project, identity(store, derived.request, seriesOf(store, derived.request).value))
-    || record.revision !== 1 || !same(derived, saved)) fail('analysis_invalid', ref.id, 'intent', 'The exact sources do not reproduce this intent');
-  originalGuards(store, reference(record), derived);
-  return record as Revision<AnalysisIntent>;
+  return take(readRecord<AnalysisIntent>(store, ref, { unit: 'A6', target: ref.id,
+    idPrefix: `om-analysis-intent:${project}:`, kind: 'om-analysis-intent' })) as Revision<AnalysisIntent>;
 }
 function originalGuards(store: Store, intentRef: Ref, intent: AnalysisIntent): TransactionGuard[] {
   const guards: TransactionGuard[] = [...intent.report.guards, intent.request.dispatch.config, intent.request.dispatch.adapter];
@@ -291,6 +281,8 @@ function resultAddress(intent: AnalysisIntent, body: AnalysisRecord, key: string
   return body.state === 'failed' ? { id: failureId(intent.request.project, key), kind: STOP_ANALYSIS_FAILURE_KIND }
     : { id: groundId(intent.request, key), kind: intent.request.hold === null ? STOP_REVIEW_KIND : ORIGIN_ANALYSIS_KIND };
 }
+/** NR (№3600): a trusted read — runStopAnalysis (or its LP8 recovery) wrote the result from the physical response and its
+ * fixed context once, atomically with its escalation or lift. */
 export function readStopAnalysis(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<AnalysisRecord>>> {
   requireRead(store, request);
   return result(() => {
@@ -298,40 +290,94 @@ export function readStopAnalysis(store: Store, request: { project: string; recor
     const namespaces = [stopReviewNamespace(project), originAnalysisNamespace(project), `${STOP_ANALYSIS_FAILURE_KIND}:${project}:`];
     const kind = [STOP_REVIEW_KIND, ORIGIN_ANALYSIS_KIND, STOP_ANALYSIS_FAILURE_KIND][namespaces.findIndex(prefix => ref.id.startsWith(prefix))];
     if (!kind) fail('analysis_invalid', ref.id, 'id', 'This is not an analysis result address of the named project');
-    const saved = take(readRecord<AnalysisRecord>(store, ref, { unit: 'A6', target: ref.id, id: ref.id, kind }));
-    const body = saved.value;
-    if (!object(body) || !CONTRACTS.includes(body.contract as string) || !isRef(body.intent) || !isRef(body.transport))
-      fail('analysis_invalid', ref.id, 'contract', 'An A6 result must name its intent and physical response');
-    const intent = readIntent(store, project, body.intent);
-    const history = intent.value.sources.journal === null ? undefined : { journal: intent.value.sources.journal };
-    const physical = take(readModelTransport(store, { project, record: body.transport }, history));
-    const original = take(readCall(store, project, physical.record.value.transport.request.call, history));
-    const expectedCall = { ...intent.value.call, projectId: project, packet: { hash: hashJson(intent.value.packet),
-      chars: canonical(intent.value.packet).length, bytes: Buffer.byteLength(canonical(intent.value.packet)) } };
-    const actualCall = Object.fromEntries(Object.keys(expectedCall).map(key => [key, (original.value as unknown as Record<string, unknown>)[key]]));
-    if (!same(actualCall, expectedCall) || !same(physical.record.value.transport.request.packet, intent.value.packet)
-      || physical.record.value.transport.request.role !== 'reviewer')
-      fail('analysis_invalid', ref.id, 'transport', 'The physical response must belong to this exact reviewer request');
-    const derived = deriveRecord(intent, physical), key = identity(store, intent.value.request, seriesOf(store, intent.value.request).value);
-    const address = resultAddress(intent.value, derived, key);
-    if (saved.id !== address.id || saved.kind !== address.kind || saved.revision !== 1 || !same(body, derived))
-      fail('analysis_invalid', ref.id, 'result', 'The physical response and fixed context do not reproduce the saved analysis');
-    if (derived.state === 'origin-established') {
-      const before = intent.value.request.hold!;
-      const after = store.get(before.id, before.revision + 1);
-      if (!after) fail('analysis_invalid', ref.id, 'lift', 'An established origin was atomically saved with its exact lift');
-      if (intent.value.sources.journal === null) fail('analysis_invalid', ref.id, 'sources.journal', 'Origin history needs its exact journal');
-      const hold = take(readOriginHoldAt(store, project, reference(after), intent.value.sources.journal));
-      if (!hold.value.lift || !same(hold.value.lift.record, ref)) fail('analysis_invalid', ref.id, 'lift', 'This exact analysis must be the lift ground');
+    return take(readRecord<AnalysisRecord>(store, ref, { unit: 'A6', target: ref.id, id: ref.id, kind })) as Revision<AnalysisRecord>;
+  });
+}
+/** The adapter wrapper fields whose absence alone refused an answer of the old adapter (LP1/LP2 fixed the adapter). */
+const WRAPPER_FIELDS: readonly string[] = ['confirmed', 'usage', 'envelope'];
+interface RecoverableAnswer { failure: Revision<AnalysisRecord>; intent: Revision<AnalysisIntent>; exchange: Ref; raw: string; key: string }
+/**
+ * LP8 (№3620, №3622): a failed review whose physical response completed (exit 0, the exact request id, a research payload)
+ * and was refused only for the wrapper of the old adapter — never for its content. Its saved payload is the answer the
+ * reviewer gave; it has not been accepted yet. Null for any other failure: an empty, interrupted, foreign or malformed one.
+ */
+function recoverableAnswer(store: Store, project: string, failureRef: Ref): RecoverableAnswer | null {
+  const prefix = `${STOP_ANALYSIS_FAILURE_KIND}:${project}:`;
+  if (!failureRef.id.startsWith(prefix)) return null;
+  const read = readStopAnalysis(store, { project, record: failureRef });
+  if (!read.ok) return null;
+  const failure = read.value as Revision<AnalysisRecord>, error = failure.value.error;
+  if (failure.value.state !== 'failed' || !error || error.code !== 'model_adapter_response_invalid' || !WRAPPER_FIELDS.includes(error.at.field ?? '')) return null;
+  const intent = readIntent(store, project, failure.value.intent);
+  const physical = store.get<{ transport?: { exchange?: unknown } }>(failure.value.transport.id, failure.value.transport.revision);
+  const exchangeRef = physical?.hash === failure.value.transport.hash ? physical.value.transport?.exchange : undefined;
+  if (!isRef(exchangeRef)) return null;
+  const exchange = store.get<{ wire?: { requestId?: unknown }; process?: { exitCode?: unknown; signal?: unknown; stdout?: unknown } | null }>(exchangeRef.id, exchangeRef.revision);
+  const process = exchange?.hash === exchangeRef.hash ? exchange.value.process : null;
+  if (!process || process.exitCode !== 0 || process.signal !== null || typeof process.stdout !== 'string') return null;
+  let envelope: unknown;
+  try { envelope = JSON.parse(process.stdout); } catch { return null; }
+  const requestId = exchange!.value.wire?.requestId;
+  if (!object(envelope) || envelope.protocol !== 'omg-agent/v1' || !text(requestId) || envelope.requestId !== requestId
+    || requestId !== intent.value.call.call || !object(envelope.research)) return null;
+  let raw: string;
+  try { raw = canonical(envelope.research as Json); } catch { return null; }
+  return { failure, intent, exchange: exchangeRef, raw, key: failureRef.id.slice(prefix.length) };
+}
+/** LP8: the review this failure was recovered into, if one is saved: the result at the review's own address naming it. */
+export function readRecoveredStopAnalysis(store: Store, project: string, failureRef: Ref): Sealed<Revision<AnalysisRecord>> | null {
+  const prefix = `${STOP_ANALYSIS_FAILURE_KIND}:${project}:`;
+  if (!failureRef.id.startsWith(prefix)) return null;
+  const read = readStopAnalysis(store, { project, record: failureRef });
+  if (!read.ok || read.value.value.state !== 'failed') return null;
+  const intent = readIntent(store, project, read.value.value.intent), key = failureRef.id.slice(prefix.length);
+  for (const id of [groundId(intent.value.request, key)]) {
+    const row = store.get<AnalysisRecord>(id);
+    if (row && object(row.value) && object(row.value.recovery) && same(row.value.recovery.failure, failureRef))
+      return take(readStopAnalysis(store, { project, record: reference(row) }));
+  }
+  return null;
+}
+export function stopAnalysisRecoverable(store: Store, project: string, failureRef: Ref): boolean {
+  const found = recoverableAnswer(store, project, failureRef);
+  return found !== null && parseAnswer(found.intent.value, found.raw).ok;
+}
+/**
+ * LP8 (№3622): the one acceptance of the saved answer — by the producer of A6, as if it had just arrived: parsed against
+ * the fixed request and written at the review's own address with its escalation or lift, linked to the refusal and the
+ * exchange. No model is called and nothing old is changed. A repeat returns the saved recovery; an answer that does not
+ * pass this first acceptance recovers nothing (the refusal stands).
+ */
+export function writeStopAnalysisRecovery(store: Store, request: { project: string; failure: Ref }): OmResult<Sealed<Revision<AnalysisRecord>>> {
+  if (!(store instanceof Store) || !object(request) || !keys(request, ['project', 'failure']) || !text(request.project) || !isRef(request.failure))
+    throw new EngineError('analysis_request_invalid', 'A recovery names its project and the exact refused review');
+  return result(() => {
+    const saved = readRecoveredStopAnalysis(store, request.project, request.failure);
+    if (saved) return saved;
+    const found = recoverableAnswer(store, request.project, request.failure);
+    if (!found) fail('analysis_invalid', request.failure.id, 'recovery', 'Only a complete answer refused for the old adapter wrapper is recovered');
+    const parsed = parseAnswer(found.intent.value, found.raw);
+    if (!parsed.ok) return fail('analysis_response_invalid', request.failure.id, 'recovery', parsed.refusal.message);
+    const intent = found.intent.value, answer = parsed.value as AnalysisAnswer, failed = found.failure.value;
+    const holding = intent.request.hold === null ? null : intent.report.context.holds.find(hold => same(hold.hold, intent.request.hold))!;
+    const state = holding !== null ? answer.origin === null || answer.origin.class === 'unknown' ? 'origin-unestablished' : 'origin-established'
+      : answer.cause === null || answer.change === null ? 'undecided' : 'decided';
+    const record: AnalysisRecord = copy({ ...failed, state, cause: answer.cause, change: answer.change, error: null,
+      class: answer.origin?.class ?? null, basis: answer.origin?.basis ?? [], recovery: { failure: request.failure, exchange: found.exchange } });
+    const address = resultAddress(intent, record, found.key), write: Write = { ...address, expected: 0, value: json(record) };
+    let writes: readonly Write[] = [write];
+    let guards = uniqueTransactionGuards([request.failure, reference(found.intent), found.exchange, { id: write.id, absent: true }]);
+    if (state === 'undecided') {
+      const series = seriesOf(store, intent.request), transition = take(prepareEscalateSeries(store, { ...seriesRequestOf(series.value),
+        stop: record.stop, review: { pending: { id: write.id, kind: write.kind, value: json(write.value) } } }));
+      writes = transition.writes; guards = uniqueTransactionGuards([...guards, ...transition.guards]);
+    } else if (state === 'origin-established') {
+      const transition = take(prepareLiftOriginHold(store, { project: request.project, hold: intent.request.hold!, ground: 'origin-analysis',
+        record: { pending: { id: write.id, kind: write.kind, value: json(write.value) } } }));
+      writes = transition.writes; guards = uniqueTransactionGuards([...guards, ...transition.guards]);
     }
-    if (derived.state === 'undecided') {
-      const before = intent.value.request.series, after = store.get(before.id, before.revision + 1);
-      if (!after) fail('analysis_invalid', ref.id, 'escalation', 'An undecided review was atomically saved with its escalation');
-      const series = take(readAnySeriesAt(store, project, reference(after)));
-      if (!series.value.escalations.some(item => same(item.review, ref) && item.after === derived.stop))
-        fail('analysis_invalid', ref.id, 'escalation', 'This exact review must be the escalation ground');
-    }
-    return saved as Revision<AnalysisRecord>;
+    const stored = take(writeGuarded(store, { unit: 'A6', target: write.id, writes, guards }));
+    return stored.find(row => row.id === write.id)! as unknown as Revision<AnalysisRecord>;
   });
 }
 /**
@@ -349,7 +395,7 @@ export async function runStopAnalysis(store: Store, request: StopAnalysisRequest
     const existing = [groundId(request, key), failureId(request.project, key)].flatMap(id => {
       const row = store.get(id); return row ? [row] : [];
     });
-    if (existing.length > 1) fail('analysis_invalid', request.series.id, 'result', 'A single reviewer request cannot have two results');
+    // LP8: a review recovered from a refused answer stands at the review address beside its refusal; it is the result.
     if (existing[0]) return readStopAnalysis(store, { project: request.project, record: reference(existing[0]) });
     const originalIntent = { id: intentId(request.project, key), revision: 1, hash: hashJson(intent) };
     const source = prepared.writes.length ? take(writeGuarded(gate.view(), { unit: 'A6', target: intentId(request.project, key),

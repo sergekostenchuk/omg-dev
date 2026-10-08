@@ -1,3 +1,4 @@
+import { runIntegrityCheck } from "../om/integrity.js";
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { configureDispatch } from '../om/dispatch.js';
@@ -281,6 +282,8 @@ export class ProductEngine {
       case "om-state": this.#project(command.project); return readPass(this.store, { project: command.project });
       case "om-spend": this.#project(command.project); return spendReport(this.store, { project: command.project });
       case "om-stop": this.#project(command.project); return stopPass(this.store, { project: command.project });
+      // NR1 (№3646): the integrity check of the database on request; it also runs by itself at every om-start and om-continue.
+      case "om-fsck": this.#project(command.project); return runIntegrityCheck(this.store, { project: command.project });
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);

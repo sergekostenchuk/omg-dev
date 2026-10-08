@@ -77,9 +77,9 @@ function prefixBound(prefix: string): string | null {
   return null;
 }
 
+/** NR1 (№3600): the sha256 of a body is its identity, computed once when it was written; a read does not hash it again. */
 function decode<T>(row: Record<string, unknown>): Revision<T> {
   const body = String(row['body']);
-  requireCondition(digest(body) === row['sha256'], "record_corrupt", "Stored revision checksum mismatch");
   return { id: String(row['entity_id']), kind: String(row['kind']), revision: Number(row['revision']),
     hash: String(row['sha256']), value: JSON.parse(body) as T };
 }
@@ -223,8 +223,7 @@ export class Store {
       bodyCounters.misses++;
       const loaded = this.#statement("SELECT body FROM revisions WHERE entity_id=? AND revision=?").get(id, revision);
       requireCondition(loaded !== undefined, "record_corrupt", "A selected revision disappeared before its body was read");
-      body = String(loaded['body']); bodyCounters.loads++; bodyCounters.loadedChars += body.length; bodyCounters.digests++;
-      requireCondition(digest(body) === hash, "record_corrupt", "Stored revision checksum mismatch");
+      body = String(loaded['body']); bodyCounters.loads++; bodyCounters.loadedChars += body.length;
     }
     bodyCounters.parses++;
     const value = JSON.parse(body) as T;
@@ -322,6 +321,34 @@ export class Store {
       WHERE e.sequence > ? AND e.sequence <= ? ORDER BY e.sequence`).all(from, to);
     eventCounters.rangeEvents += rows.length;
     return rows.map(row => ({ sequence: Number(row['sequence']), id: String(row['entity_id']), revision: Number(row['revision']), kind: String(row['kind']) }));
+  }
+  /** NR1 (№3633): every stored revision as written — its body text and the sha256 stored with it — in id and revision
+   * order, for the integrity check (om-fsck) alone; no product read uses it. */
+  *integrityRevisions(): Generator<{ id: string; revision: number; kind: string; body: string; sha256: string }> {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    for (const row of this.#db.prepare("SELECT entity_id, revision, kind, body, sha256 FROM revisions ORDER BY entity_id, revision").iterate())
+      yield { id: String(row['entity_id']), revision: Number(row['revision']), kind: String(row['kind']), body: String(row['body']), sha256: String(row['sha256']) };
+  }
+  /**
+   * NR1 (№3674 п.1): runs the integrity check (om-fsck) inside one read transaction, so its events, heads and revisions
+   * are one committed snapshot of the database — a lawful write of another connection meanwhile is wholly outside it.
+   */
+  integritySnapshot<T>(check: () => T): T {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    this.#db.exec("BEGIN DEFERRED");
+    try {
+      // The snapshot is taken by the first read of the transaction.
+      this.#db.prepare("SELECT 1 FROM heads LIMIT 1").get();
+      return check();
+    } finally { this.#db.exec("COMMIT"); }
+  }
+  /** NR1 (№3633): every event and every head as stored, for the integrity check (om-fsck) alone. */
+  integrityLedger(): { events: { sequence: number; id: string; revision: number }[]; heads: Map<string, number> } {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const events = this.#db.prepare("SELECT sequence, entity_id, revision FROM events ORDER BY sequence").all()
+      .map(row => ({ sequence: Number(row['sequence']), id: String(row['entity_id']), revision: Number(row['revision']) }));
+    const heads = new Map(this.#db.prepare("SELECT entity_id, revision FROM heads").all().map(row => [String(row['entity_id']), Number(row['revision'])]));
+    return { events, heads };
   }
   /** PF4: what the event at one sequence made — its id, revision and hash — so a kept mark names its own history. */
   eventAt(sequence: number): { id: string; revision: number; hash: string } | null {

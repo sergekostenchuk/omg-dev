@@ -26,7 +26,7 @@ import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Questio
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
-import { PROPOSAL_REFUSAL_CODES, prepareFrameProposals, readFrameProposals, observeProposal, type LayerProposal, type FrameProposals } from './frame-proposals.js';
+import { PROPOSAL_REFUSAL_CODES, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { FRAME_REFUSAL_CODES, flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, completionWorkId, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
@@ -1183,36 +1183,13 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
   }
   return { value: base, guards: unique(guards), references: unique(references), writes, ...(briefBasis ? { briefBasis } : {}) };
 }
+/** NR1 (№3600): a trusted read. The packet was derived by prepareQuestionPacket from its exact sources and written once
+ * (with its completed no-progress attempt, when it has one); it is read at its exact reference, never derived again. */
 function loadPacket(store: Store, project: string, ref: Ref): Revision<QuestionPacketRecord> {
-  return historicalRead(store, { reader: 'E2.question-packet', project, ref }, () => {
-    const record = take(readRecord<QuestionPacketRecord>(store, ref, { unit: 'E2', target: ref.id,
-      idPrefix: packetNamespace(project), kind: QUESTION_PACKET_KIND }));
-    if (!object(record.value) || record.value.project !== project || !object(record.value.request))
-      fail('packet_record_invalid', ref.id, 'record', 'The packet must carry its complete producer request');
-    try { requirePacket(store, record.value.request); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'question_packet_request_invalid')
-        fail('packet_record_invalid', ref.id, 'request', 'The saved producer request is malformed');
-      throw error;
-    }
-    const request = record.value.request;
-    if (briefContract(record.value.packetContract) && record.value.answerProtocol !== PACKET_ANSWER_PROTOCOL)
-      fail('packet_record_invalid', ref.id, 'answerProtocol', 'The brief contract requires answer/v3');
-    if (record.value.answerProtocol !== undefined && !answerProtocols.includes(record.value.answerProtocol as AnswerProtocol))
-      fail('packet_record_invalid', ref.id, 'answerProtocol', 'The packet answer contract era is unsupported');
-    if ((record.value.packetContract !== undefined && (![PACKET_CONTRACT, WORKS_PACKET_CONTRACT, BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT].includes(record.value.packetContract)
-      || record.value.answerProtocol === undefined)) || (record.value.answerProtocol === PACKET_ANSWER_PROTOCOL && record.value.packetContract === undefined))
-      fail('packet_record_invalid', ref.id, 'packetContract', 'The packet derivation contract era is unsupported');
-    if (request.project !== project || record.id !== packetId(request, record.value.answerProtocol, record.value.packetContract) || record.revision !== 1)
-      fail('packet_record_invalid', ref.id, 'request', 'A packet preserves the identity of its exact immutable source request');
-    const expected = derivePacket(store, request, false, record.value.answerProtocol, record.value.packetContract, record.value as QuestionPacketRecord);
-    if (!same(expected.value, record.value))
-      fail('packet_record_invalid', ref.id, 'value', 'The complete packet, assignment and native bindings must follow from their exact sources');
-    const completion = continuationFinish(store, record.value as QuestionPacketRecord);
-    if (completion?.writes.length)
-      fail('packet_record_invalid', ref.id, 'completion', 'The no-progress packet and its completed attempt must be saved together');
-    return record as Revision<QuestionPacketRecord>;
-  }, () => fail('packet_chain_invalid', ref.id, 'previous', 'The packet history contains a cycle'));
+  return historicalRead(store, { reader: 'E2.question-packet', project, ref }, () =>
+    take(readRecord<QuestionPacketRecord>(store, ref, { unit: 'E2', target: ref.id,
+      idPrefix: packetNamespace(project), kind: QUESTION_PACKET_KIND })) as Revision<QuestionPacketRecord>,
+  () => fail('packet_chain_invalid', ref.id, 'previous', 'The packet history contains a cycle'));
 }
 export function readQuestionPacket(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<QuestionPacketRecord>>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
@@ -1669,25 +1646,16 @@ function partSource(store: Store, request: PartResultRequest) {
     revision: 1, hash: hashJson(resultValue), value: resultValue };
   return { record, proposal, frameSource, references: unique([...checked.references, ...derived.references]) };
 }
+/** NR1 (№3600): a trusted read of a saved part result and the proposal written with it (preparePartResult derived both
+ * from the saved response of its own call, in one guarded transaction). */
 function checkedPart(store: Store, project: string, ref: Ref): CheckedPartResult {
   return historicalRead(store, { reader: 'E2.part-result', project, ref }, () => {
     const saved = take(readRecord<PartResultRecord>(store, ref, { unit: 'E2', target: ref.id,
-      idPrefix: `om-part-result:${project}:`, kind: PART_RESULT_KIND }));
-    if (!object(saved.value) || saved.value.project !== project || !isRef(saved.value.proposal))
-      fail('part_result_invalid', ref.id, 'record', 'A result must preserve its sources and derived proposal');
-    try { requirePart(store, saved.value.request); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'question_packet_request_invalid')
-        fail('part_result_invalid', ref.id, 'request', 'The saved part sources are malformed');
-      throw error;
-    }
-    if (saved.value.request.project !== project) fail('part_result_invalid', ref.id, 'project', 'The result belongs to another project');
-    const expected = partSource(store, saved.value.request);
-    if (!same(expected.record, saved)) fail('part_result_invalid', ref.id, 'proposal', 'The result must be derived from the saved response of its own call');
-    const observed = take(observeProposal(store, { project, proposal: saved.value.proposal,
-      request: { frame: expected.frameSource.frame, proposals: [saved.value.proposal] } }));
-    if (!same(observed.record, expected.proposal)) fail('part_result_invalid', ref.id, 'proposal', 'The original proposal does not match the common typed response derivation');
-    return { record: expected.record, proposal: expected.proposal, references: unique([...expected.references, ...observed.references, ref]) };
+      idPrefix: `om-part-result:${project}:`, kind: PART_RESULT_KIND })) as Revision<PartResultRecord>;
+    const proposal = store.get<LayerProposal>(saved.value.proposal.id, saved.value.proposal.revision) as Revision<LayerProposal> | null;
+    if (!proposal || proposal.hash !== saved.value.proposal.hash) fail('part_result_invalid', ref.id, 'proposal', 'The result names its saved proposal');
+    const request = saved.value.request as { packet: Ref; call: Ref; response: Ref };
+    return { record: saved, proposal, references: unique([ref, saved.value.proposal, request.packet, request.call, request.response].filter(isRef)) };
   }, () => fail('packet_chain_invalid', ref.id, 'history', 'The part-result history contains a cycle'));
 }
 export function readPartResult(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<CheckedPartResult>> {

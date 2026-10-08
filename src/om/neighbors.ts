@@ -7,7 +7,7 @@ import { RefinementRelations } from '../graph/relations.js';
 import { graphSchema, graphV2Schema } from '../graph/schema.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
-import { prepareDeliveries, readDeliveries, type DeliveryRead, type DeliveryReadRequest } from './deliveries.js';
+import { prepareDeliveries, type DeliveryRead, type DeliveryReadRequest } from './deliveries.js';
 import type { CandidateReadRequest } from './frame-candidate.js';
 import { flowKey, readFrame, readFrameFlow, type FrameFlowRead, type FrameObligation, type FrameRequest } from './frame-obligations.js';
 import { withHistoricalReads } from './input.js';
@@ -309,13 +309,7 @@ function checkedRecord(store: Store, request: NeighborReadRequest): Revision<Nei
   requireStore(store, request, 'neighbors');
   const row = unwrap(readRecord<NeighborCollection>(store, request.neighbors, { unit: 'F7.3', target: request.neighbors.id,
     kind: 'om-neighbors', idPrefix: `om-neighbors:${request.project}:` }));
-  const value = row.value;
-  if (!object(value) || value.contract !== NEIGHBOR_CONTRACT || value.project !== request.project || !object(value.source)
-    || value.source.project !== request.project || !isRef(value.source.candidate) || !Array.isArray(value.packets) || row.revision !== 1)
-    reject('neighbor_record_forged', row.id, 'record', 'The packet collection requires its exact producer contract and sources');
-  const derived = deriveCollection(store, unwrap(readDeliveries(store, value.source as DeliveryReadRequest)));
-  if (row.id !== collectionId(derived.value) || !same(value, derived.value))
-    reject('neighbor_record_forged', row.id, 'packets', 'Every packet and its full membership must be derived from the exact saved sources');
+  // NR (№3600): a trusted read — the collection was derived from its exact saved deliveries once, by its producer.
   return row as Revision<NeighborCollection>;
 }
 /** Historical reading never discovers current delivery heads or admits new work. */

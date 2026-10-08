@@ -11,7 +11,7 @@ import { historicalRead, withHistoricalReads } from './input.js';
 import type { Source } from '../evidence/evidence.js';
 import { checkAnswerForm as checkAnswerFormOf } from './answer-form.js';
 import { readMc1Question as readMc1QuestionOf, prepareMc1Question as prepareMc1QuestionOf, prepareAnswerCitations as prepareAnswerCitationsOf, prepareE5AcceptedAnswer as prepareE5AcceptedAnswerOf,
-  readAcceptedAnswer as readAcceptedAnswerOf, readAnswerSearch as readAnswerSearchOf, acceptedAnswerNamespace, answerIndexId,
+  readAcceptedAnswer as readAcceptedAnswerOf, acceptedAnswerNamespace, answerIndexId,
   ANSWER_INDEX_KIND,
   type AnswerGround, type AnswerQuestionContract, type Mc1QuestionRequest } from './accepted-answer.js';
 import { callLedgerId, readCallLedger as readCallLedgerOf, readFactAssessmentOrigin as readFactAssessmentOriginOf, readCall as readCallOf, recordCall as recordCallOf,
@@ -22,7 +22,7 @@ import { readApplicationSources as readApplicationSourcesOf, captureApplicationF
   prepareApplicationEnvironment as prepareApplicationEnvironmentOf, prepareAssessmentDisposition as prepareAssessmentDispositionOf, readAssessmentCessation as readAssessmentCessationOf, readCompletionWorkAt as readCompletionWorkAtOf, readCompletionDispositionContext as readCompletionDispositionContextOf, prepareCompletionCause as prepareCompletionCauseOf, readCompletionCause as readCompletionCauseOf,
   type CompletionCause, type TransportModelCall } from './model-call.js';
 import { readPacketResponse as readPacketResponseOf } from './question-packet.js';
-import { prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readAnySeriesAt as readAnySeriesAtOf, readSeriesWorkAdmission as readSeriesWorkAdmissionOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf,
+import { prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf, readAnySeriesAt as readAnySeriesAtOf, readSeriesAdmissionChange as readSeriesAdmissionChangeOf, readCurrentSeriesPointer as readCurrentSeriesPointerOf,
   type SeriesAdmissionChange, seriesCurrentId,
   seriesId, readCompletionBinding as readCompletionBindingOf, completionWorkId, prepareCompletionAdmission as prepareCompletionAdmissionOf, type AttemptGoal, type ClaimedRefusal, type CompletionReason } from './series.js';
 import { prepareCloseAttempt as prepareCloseAttemptOf } from './repeat-gate.js';
@@ -53,7 +53,6 @@ const prepareMc1Question = transferring('accepted-answer', prepareMc1QuestionOf)
 const prepareAnswerCitations = transferring('accepted-answer', prepareAnswerCitationsOf);
 const prepareE5AcceptedAnswer = transferring('accepted-answer', prepareE5AcceptedAnswerOf);
 const readAcceptedAnswer = transferring('accepted-answer', readAcceptedAnswerOf);
-const readAnswerSearch = transferring('accepted-answer', readAnswerSearchOf);
 const readCallLedger = transferring('call-record', readCallLedgerOf);
 const readFactAssessmentOrigin = transferring('call-record', readFactAssessmentOriginOf);
 const readCall = transferring('call-record', readCallOf);
@@ -73,7 +72,6 @@ const readCompletionCause = transferring('model-call', readCompletionCauseOf);
 const readPacketResponse = transferring('question-packet', readPacketResponseOf);
 const prepareSeriesLineAdmission = transferring('series', prepareSeriesLineAdmissionOf);
 const readAnySeriesAt = transferring('series', readAnySeriesAtOf);
-const readSeriesWorkAdmission = transferring('series', readSeriesWorkAdmissionOf);
 const readSeriesAdmissionChange = transferring('series', readSeriesAdmissionChangeOf);
 const readCurrentSeriesPointer = transferring('series', readCurrentSeriesPointerOf);
 const readCompletionBinding = transferring('series', readCompletionBindingOf);
@@ -346,43 +344,13 @@ export function writeAssessmentIntent(store: Store, request: AssessmentIntentReq
     writes: prepared.value.writes, guards: prepared.value.guards });
   return written.ok ? delivered(written.value[0]!) : written;
 }
+/** NR (№3600): a trusted read — the intent was derived from the original answer and its admission once (prepare). */
 export function readAssessmentIntentAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<CheckedAssessmentIntent>> {
   requireIntentRef(store, project, ref);
-  return checked(() => historicalRead(store, { reader: 'E5.assessment-intent', project, ref }, () => {
-    const record = take(readRecord<AssessmentIntentRecord>(store, ref, { unit: 'E5', target: ref.id,
-      kind: ASSESSMENT_INTENT_KIND, idPrefix: `${ASSESSMENT_INTENT_KIND}:${project}:` }));
-    const value = record.value;
-    if (record.revision !== 1 || !object(value) || value.contract !== INTENT_CONTRACT || value.project !== project
-      || !object(value.source) || !isRef(value.source.modelCall) || !isRef(value.source.call)
-      || !isRef(value.source.packet) || !isRef(value.source.response) || !isRef(value.source.question)
-      || !text(value.source.questionId) || !isRef(value.series) || !object(value.dispatch)
-      || !isRef(value.dispatch.adapter) || !isRef(value.dispatch.config)
-      || !Array.isArray(value.originalGuards) || !value.originalGuards.every(isRef)
-      || record.id !== intentId(project, value.source))
-      fail('assessment_intent_invalid', ref.id, 'record', 'The intent needs its complete exact source and fixed identity', ref);
-    const derived = sourceBody(store, project, value.source, value.dispatch, value.series, false);
-    if (!same({ ...value, originalGuards: [] }, { ...derived.value, originalGuards: [] }))
-      fail('assessment_intent_invalid', ref.id, 'content', 'The intent must be rederived from the original answer', ref);
-    const pointerGuards = value.originalGuards.filter(guard => guard.id === seriesCurrentId(project));
-    if (pointerGuards.length > 1)
-      fail('assessment_intent_invalid', ref.id, 'originalGuards', 'One intent has at most one original series pointer guard', ref);
-    const seriesAdmission = readSeriesWorkAdmission(store, { project, series: value.series,
-      pointer: pointerGuards[0] ?? null });
-    if (!seriesAdmission.ok)
-      fail('assessment_intent_invalid', ref.id, 'originalGuards',
-        'The original series and its saved pointer must prove the historical work admission', value.series);
-    const required = refs([...derived.requiredGuards, ...seriesAdmission.value.guards]);
-    if (required.some(guard => !value.originalGuards.some(saved => same(saved, guard))))
-      fail('assessment_intent_invalid', ref.id, 'originalGuards', 'The intent must retain every exact question and citation source guard', ref);
-    for (const guard of value.originalGuards) {
-      const found = store.get(guard.id, guard.revision);
-      if (!found || !same(reference(found), guard))
-        fail('assessment_intent_invalid', ref.id, 'originalGuards', 'The original admission retains exact checked sources', guard);
-    }
-    if (!same(value.originalGuards, refs(value.originalGuards)))
-      fail('assessment_intent_invalid', ref.id, 'originalGuards', 'Original guards have one canonical order', ref);
-    return checkedIntent(record as unknown as Revision<AssessmentIntentRecord>);
-  }, () => fail('assessment_intent_invalid', ref.id, 'history', 'An intent cannot depend on itself', ref)));
+  return checked(() => historicalRead(store, { reader: 'E5.assessment-intent', project, ref }, () =>
+    checkedIntent(take(readRecord<AssessmentIntentRecord>(store, ref, { unit: 'E5', target: ref.id,
+      kind: ASSESSMENT_INTENT_KIND, idPrefix: `${ASSESSMENT_INTENT_KIND}:${project}:` })) as unknown as Revision<AssessmentIntentRecord>),
+  () => fail('assessment_intent_invalid', ref.id, 'history', 'An intent cannot depend on itself', ref)));
 }
 /** Required evidence is derived from the exact fact and B1's already applied facts, never from caller-supplied guards. */
 function assessmentFilePrerequisites(store: Store, project: string, intentRef: Ref) {
@@ -692,51 +660,21 @@ function prepareManagedAssessmentProducts(store: Store, project: string, result:
 }
 
 /** Reprove the paid terminal outcome without descending into its D5 answer or index. */
+/** NR (№3600): a trusted read — the terminal result was written once from the paid assessor response or its termination. */
 export function readAssessmentTerminalBasisAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<Revision<AssessmentResultRecord>>> {
   requireIntentRef(store, project, ref);
-  return checked(() => historicalRead(store, { reader: 'E5.assessment-result-basis', project, ref }, () => {
-    const record = take(readRecord<AssessmentResultRecord>(store, ref, { unit: 'E5', target: ref.id,
-      kind: ASSESSMENT_RESULT_KIND, idPrefix: `${ASSESSMENT_RESULT_KIND}:${project}:` }));
-    const value = record.value;
-    if (object(value) && value.contract === TERMINATION_CONTRACT) {
-      if (record.revision !== 1 || !isRef(value.intent) || !isRef(value.assessor) || !isRef(value.binding)
-        || !isRef(value.assignment) || !isRef(value.work) || record.id !== assessmentResultId(project, value.intent)
-        || !same(value, terminationValue(store, project, value)))
-        fail('assessment_result_invalid', ref.id, 'termination', 'The complete termination must equal its exact common derivation', ref);
-      return record;
-    }
-    if (record.revision !== 1 || !object(value) || value.contract !== RESULT_CONTRACT || value.project !== project
-      || !isRef(value.intent) || !isRef(value.assessor) || !Array.isArray(value.reasons)
-      || !value.reasons.every(text) || !(value.accepted === null || isRef(value.accepted))
-      || !(value.index === null || isRef(value.index)) || record.id !== assessmentResultId(project, value.intent))
-      fail('assessment_result_invalid', ref.id, 'record', 'The saved result needs one exact intent and assessor', ref);
-    const physical = take(readAssessmentResultAt(store, project, value.intent, value.assessor));
-    if (value.verdict !== physical.verdict || !same(value.reasons, physical.reasons))
-      fail('assessment_result_invalid', ref.id, 'verdict', 'The terminal verdict derives from the paid assessor response', ref);
-    if (value.verdict === 'supported') {
-      if (!value.accepted || !value.index) fail('assessment_result_invalid', ref.id, 'accepted', 'Support needs its complete D5 acceptance', ref);
-    } else if (value.accepted !== null || value.index !== null)
-      fail('assessment_result_invalid', ref.id, 'accepted', 'An unsupported verdict cannot accept a fact', ref);
-    return record;
-  }, () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
+  return checked(() => historicalRead(store, { reader: 'E5.assessment-result-basis', project, ref }, () =>
+    take(readRecord<AssessmentResultRecord>(store, ref, { unit: 'E5', target: ref.id,
+      kind: ASSESSMENT_RESULT_KIND, idPrefix: `${ASSESSMENT_RESULT_KIND}:${project}:` })) as Revision<AssessmentResultRecord>,
+  () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
 }
 
+/** NR (№3600): the terminal result as written; its D5 acceptance was written with it by the same producer. */
 export function readAssessmentTerminalAt(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<Revision<AssessmentResultRecord>>> {
   requireIntentRef(store, project, ref);
-  return checked(() => historicalRead(store, { reader: 'E5.assessment-result', project, ref }, () => {
-    const record = take(readAssessmentTerminalBasisAt(store, project, ref));
-    const value = record.value;
-    if (value.verdict === 'supported') {
-      const answer = take(readAcceptedAnswer(store, { project, record: value.accepted! }));
-      if (!('producer' in answer.record.value) || answer.record.value.producer !== 'E5'
-        || !same(answer.record.value.request, { project, intent: value.intent, assessor: value.assessor }))
-        fail('assessment_result_invalid', ref.id, 'accepted', 'The exact D5 answer must belong to this supported verdict', ref);
-      const search = take(readAnswerSearch(store, { project, record: value.index! }));
-      if (!search.answers.some(candidate => same(candidate, value.accepted)))
-        fail('assessment_result_invalid', ref.id, 'index', 'The complete D5 index must include the accepted answer', value.index!);
-    }
-    return record;
-  }, () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
+  return checked(() => historicalRead(store, { reader: 'E5.assessment-result', project, ref },
+    () => take(readAssessmentTerminalBasisAt(store, project, ref)) as Revision<AssessmentResultRecord>,
+    () => fail('assessment_result_invalid', ref.id, 'history', 'A result cannot depend on itself', ref)));
 }
 
 export function assessmentRefusalId(project: string, result: Ref): string {
@@ -769,6 +707,7 @@ function assessmentRefusalBody(store: Store, project: string, resultRef: Ref): {
 }
 
 /** Reprove every field of a saved A2 source from the exact paid E5 result. */
+/** NR (№3600): a trusted read of a saved E5 refusal, its terminal result and intent (writeAssessmentRefusal derived it once). */
 export function readAssessmentRefusalAt(store: Store, project: string, source: Ref): AssessmentResult<Sealed<{
   record: Sealed<Revision<UnitRefusalRecord>>; result: Sealed<Revision<AssessmentResultRecord>>;
   intent: Sealed<CheckedAssessmentIntent>; target: string; consumer: string; guards: Ref[];
@@ -777,22 +716,11 @@ export function readAssessmentRefusalAt(store: Store, project: string, source: R
   return checked(() => historicalRead(store, { reader: 'E5.assessment-refusal', project, ref: source }, () => {
     const record = take(readRecord<UnitRefusalRecord>(store, source, { unit: 'E5', target: source.id,
       kind: UNIT_REFUSAL_KIND, idPrefix: `${unitRefusalNamespace(project)}e5:` }));
-    const value = record.value as unknown;
-    const first = object(value) && Array.isArray(value['refusals']) ? value['refusals'][0] as unknown : null;
-    const origin = object(first) ? first['origin'] : null;
-    const firstSource = object(origin) && Array.isArray(origin['sources']) ? origin['sources'][0] as unknown : null;
-    const resultRef = object(firstSource) ? firstSource['ref'] : null;
-    if (record.revision !== 1 || !isRef(resultRef))
-      fail('assessment_refusal_invalid', source.id, 'origin.sources',
-        'An E5 refusal must name its exact terminal result', source);
-    const derived = assessmentRefusalBody(store, project, resultRef);
-    if (record.id !== assessmentRefusalId(project, resultRef) || !same(record.value, derived.value))
-      fail('assessment_refusal_invalid', source.id, 'record',
-        'The whole saved refusal must derive from the exact E5 result', source);
-    return { record, result: derived.result, intent: derived.intent, target: derived.target,
-      consumer: derived.consumer, guards: refs([source, resultRef, derived.intent.intent]) };
-  }, () => fail('assessment_refusal_invalid', source.id, 'history',
-    'An assessment refusal cannot depend on itself', source)));
+    const resultRef = (record.value as UnitRefusalRecord).refusals[0]!.origin.sources[0]!.ref;
+    const result = take(readAssessmentTerminalAt(store, project, resultRef));
+    const intent = take(readAssessmentIntentAt(store, project, result.value.intent));
+    return { record, result, intent, target: intent.question.target, consumer: intent.block, guards: refs([source, resultRef, intent.intent]) };
+  }, () => fail('assessment_refusal_invalid', source.id, 'history', 'An assessment refusal cannot depend on itself', source)));
 }
 
 function writeAssessmentRefusal(store: Store, project: string, result: Ref): Revision<UnitRefusalRecord> {

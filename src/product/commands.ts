@@ -29,6 +29,7 @@ export type ProductCommand =
   | { type: "om-state"; project: string }
   | { type: "om-spend"; project: string }
   | { type: "om-stop"; project: string }
+  | { type: "om-fsck"; project: string }
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
@@ -93,7 +94,7 @@ omStart.properties['outcomes'] = { type: "array", minItems: 1, items: text };
 const omContinue = command("om-continue", { project });
 omContinue.properties['resumeStop'] = text;
 const schema = { oneOf: [
-  omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }),
+  omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),

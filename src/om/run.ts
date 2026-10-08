@@ -16,7 +16,8 @@ import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readC
   resumeSeries as resumeSeriesOf, reconcileSeries as reconcileSeriesOf, prepareReconcileSeries as prepareReconcileSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
-import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest } from "./stop-analysis.js";
+import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest,
+  readRecoveredStopAnalysis, stopAnalysisRecoverable, writeStopAnalysisRecovery as writeStopAnalysisRecoveryOf, type AnalysisRecord } from "./stop-analysis.js";
 import { ceasedCycleGround as ceasedCycleGroundOf, modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
   writeCompletionCessation as writeCompletionCessationOf, readAreaReplacement as readAreaReplacementOf,
   prepareCompletionFinalization as prepareCompletionFinalizationOf, writeCompletionFinalization as writeCompletionFinalizationOf,
@@ -89,7 +90,10 @@ const readRoutes = transferring("routes", readRoutesOf);
 const writeRoutes = transferring("routes", writeRoutesOf);
 const readQuestionQueue = transferring("queue", readQuestionQueueOf);
 const readHorizon = transferring("horizon", readHorizonOf);
-const prepareRunBases = transferring("run-bases", prepareRunBasesOf);
+/** LP8.1: set only while an unable pass weighs its grounds again (selectNext is synchronous). */
+let reweighing = false;
+const prepareRunBases = transferring("run-bases", (store: Store, request: { project: string }, options: { completion?: boolean } = {}) =>
+  prepareRunBasesOf(store, request, reweighing ? { ...options, reweigh: true } : options));
 const readRunStandingGuards = transferring("run-bases", readRunStandingGuardsOf);
 const writeRunBases = transferring("run-bases", writeRunBasesOf);
 const readOmInput = transferring("input", readOmInputOf);
@@ -109,6 +113,7 @@ const readCompletionCloseAt = transferring("repeat-gate", readCompletionCloseAtO
 const readStopContext = transferring("repeat-gate", readStopContextOf);
 const prepareStopAnalysis = transferring("stop-analysis", prepareStopAnalysisOf);
 const readStopAnalysis = transferring("stop-analysis", readStopAnalysisOf);
+const writeStopAnalysisRecovery = transferring("stop-analysis", writeStopAnalysisRecoveryOf);
 const prepareCompletionCause = transferring("model-call", prepareCompletionCauseOf);
 const ceasedCycleGround = transferring("model-call", ceasedCycleGroundOf);
 const readCompletionWorkAt = transferring("model-call", readCompletionWorkAtOf);
@@ -174,7 +179,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -197,7 +202,15 @@ export type RunState =
   /** The proved end of the pass: its accepted M8, M9 stage and compilation stage (row 27). */
   | { readonly phase: "complete"; readonly proof: readonly Ref[] }
   /** The proved end of the pass without a result: no lawful step is left and these grounds stand (№1908 п.1). Not a wait. */
-  | { readonly phase: "unable"; readonly reasons: readonly RunReason[] };
+  | { readonly phase: "unable"; readonly reasons: readonly RunReason[] }
+  /**
+   * LP8.1 (№3670): an end without a result whose grounds the current rules no longer prove final — the exact unable
+   * revision and its grounds, and the new ground found instead (the next step, a wait or the proved completion). The
+   * pass goes on from here as from "ready".
+   */
+  | { readonly phase: "reopened"; readonly from: Ref; readonly reasons: readonly RunReason[]; readonly ground: RunReopenGround };
+/** What the current rules found in place of the end: exactly one of a next step, an addressed wait or the completion proof. */
+export type RunReopenGround = { readonly step: RunStep } | { readonly wait: RunWait } | { readonly complete: readonly Ref[] };
 export interface RunRecord {
   readonly contract: typeof RUN_CONTRACT; readonly project: string;
   /** The exact B1 the pass began from; new B1 revisions never rewrite it (№1737 п.1). */
@@ -274,10 +287,19 @@ function checkRecord(value: unknown, project: string): value is RunRecord {
   else if (state.phase === "waiting") { if (!checkWait(state.wait) || Object.keys(state).length !== 2) return false; }
   else if (state.phase === "complete") { if (!Array.isArray(state.proof) || state.proof.length !== 3 || !state.proof.every(isRef) || Object.keys(state).length !== 2) return false; }
   else if (state.phase === "unable") { if (!checkReasons(state.reasons) || Object.keys(state).length !== 2) return false; }
+  else if (state.phase === "reopened") {
+    if (Object.keys(state).length !== 4 || !isRef(state.from) || !checkReasons(state.reasons) || !checkReopenGround(state.ground)) return false;
+  }
   else return false;
   const last = value.last;
   return last === null || object(last) && Object.keys(last).length === 3 && checkStep(last.step) && Array.isArray(last.products)
     && last.products.every(isRef) && (last.refusal === null ? last.products.length > 0 : checkWait(last.refusal) && last.products.length === 0);
+}
+function checkReopenGround(ground: unknown): ground is RunReopenGround {
+  if (!object(ground) || Object.keys(ground).length !== 1) return false;
+  if (Object.hasOwn(ground, "step")) return checkStep(ground.step);
+  if (Object.hasOwn(ground, "wait")) return checkWait(ground.wait);
+  return Object.hasOwn(ground, "complete") && Array.isArray(ground.complete) && ground.complete.length === 3 && ground.complete.every(isRef);
 }
 function checkWait(wait: unknown): wait is RunWait {
   return object(wait) && Object.keys(wait).length === 5 && ["code", "message", "target", "field"].every(key => isText(wait[key]))
@@ -377,10 +399,20 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
     const saved = take(readRun(store, { project: request.project }));
     if (!saved) fail("record_missing", runId(request.project), "run", "The pass must be started before it advances");
     const head = saved as unknown as Revision<RunRecord>, state = head.value.state;
-    // A completed pass returns its proved completion and an unable one its grounds, before any environment, base or
-    // payment is looked at; neither starts a second pass by itself (№1737 п.1, №1995 п.11).
-    if (state.phase === "complete" || state.phase === "unable") return { record: head, performed: null, products: [] };
+    // A completed pass returns its proved completion before any environment, base or payment is looked at; it never starts
+    // a second pass by itself (№1737 п.1, №1995 п.11).
+    if (state.phase === "complete") return { record: head, performed: null, products: [] };
     const gate = new RunControlGate(store, request.project, control), hold = gate.admit().hold, guarded = gate.view();
+    // LP8.1 (№3670): an unable pass weighs its grounds again by the current rules at every entry (they may have been proved
+    // final by rules since changed — a failed review LP8 now recovers). Still final: the saved end stands and nothing is
+    // written. Otherwise one transition reopens it — the exact unable revision, its grounds and the new ground — and the
+    // pass goes on from there by its ordinary choice.
+    if (state.phase === "unable") {
+      const again = reweigh(store, request, head);
+      if ("unable" in again) return { record: head, performed: null, products: [] };
+      const ground: RunReopenGround = "step" in again ? { step: again.step } : "complete" in again ? { complete: again.complete } : { wait: again.wait };
+      return transition(guarded, head, { phase: "reopened", from: reference(head), reasons: state.reasons, ground }, head.value.last, null, []);
+    }
     // LP3 (№2817-4, №2870): a saved cycle of a packet E2's reader proves to be a step of a cycle (a continuation or a later
     // part, chosen by the order of the products) and that was never cycled is not performed: the pass chooses again by an
     // ordinary new transition, and its history and the saved records stay as they are. A cycle of it that was performed is
@@ -413,6 +445,23 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
       return { record: head, performed: null, products: [] };
     return transition(guarded, head, { phase: "waiting", wait: next.wait }, head.value.last, null, []);
   });
+}
+/** LP8.1 (№3670): the choice an unable pass would make today — reads only, its bases read as a live pass reads them. */
+function reweigh(store: Store, request: RunRequest, head: Revision<RunRecord>): Next {
+  reweighing = true;
+  try { return selectNext(store, request, historyOf(store, head)); } finally { reweighing = false; }
+}
+/**
+ * LP8.1 (№3670): whether the next transition of this unable pass reopens it — the same weighing, without a write, so a
+ * start or continue of a pass whose grounds still stand takes no execution and writes nothing. A refusal met on the way
+ * is the refusal of that transition; here it leaves the pass as it stands.
+ */
+export function unableReopens(store: Store, request: RunRequest): boolean {
+  requireRequest(store, request);
+  try {
+    const saved = take(readRun(store, { project: request.project })) as Revision<RunRecord> | null;
+    return saved !== null && saved.value.state.phase === "unable" && !("unable" in reweigh(store, request, saved));
+  } catch (error) { if (error instanceof RunFailure) return false; throw error; }
 }
 function settle(store: Store, head: Revision<RunRecord>, step: RunStep, outcome: Performed): RunAdvance {
   if ("wait" in outcome) return transition(store, head, { phase: "waiting", wait: outcome.wait }, { step, products: [], refusal: outcome.wait }, step, []);
@@ -468,6 +517,8 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       }
       case "evaluate": return mapped(writeAnswersEvaluation(store, body as never), written => [refOf(written.evaluation)]);
       case "analyze": return mapped(await recovering(raw, project, () => runStopAnalysis(raw, body as never, undefined, hold)), record => [refOf(record)]);
+      // LP8 (№3622): the one acceptance of a saved reviewer answer the old adapter wrapper refused — no model is called.
+      case "recover-analysis": return mapped(writeStopAnalysisRecovery(store, body as never), record => [refOf(record)]);
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
       case "cease-check": return mapped(writeAnswersCheckCessation(store, body as never), record => [refOf(record)]);
       case "finalize": return mapped(writeCompletionFinalization(store, body as never), record => [refOf(record)]);
@@ -852,6 +903,16 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   }
   const context = read.value.context;
   stand(trail, read.value.reads as Ref[]);
+  // LP8 (№3622): a failed review read with its recovery — the saved recovered review, the recovery step for an answer the
+  // old adapter wrapper refused, or the failure as it stands.
+  const analysisOf = (ref: Ref, attempt: number | null): { record: Sealed<Revision<AnalysisRecord>> } | { step: RunStep } => {
+    const record = take(readStopAnalysis(store, { project, record: ref })) as Sealed<Revision<AnalysisRecord>>;
+    if (record.value.state !== "failed") return { record };
+    const recovered = readRecoveredStopAnalysis(store, project, ref);
+    if (recovered) return { record: recovered };
+    if (stopAnalysisRecoverable(store, project, ref)) return step("recover-analysis", { project, failure: ref }, series.id, attempt);
+    return { record };
+  };
   // №1814: the A6 of one exact ground goes on with the request this pass saved for it — its original dispatch — and
   // finds its result by that request; only a ground never analysed gets the current dispatch. A6 names a hold by the
   // hold itself, and a stop by its origin series and stop attempt, never by the series revision or the dispatch.
@@ -860,7 +921,9 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
     const analysis = saved ?? { project, series: reference(series), hold: hold.hold, dispatch: request.dispatch };
     const done = performed("analyze", analysis);
     if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, hold.attempt);
-    const record = take(readStopAnalysis(store, { project, record: done[0]! }));
+    const reviewed = analysisOf(done[0]!, hold.attempt);
+    if ("step" in reviewed) return reviewed;
+    const record = reviewed.record;
     if (record.value.state === "failed") return { final: [reasonOf("hold-analysis-failed", "analysis_failed", hold.hold.id, "hold",
       "The independent review of this hold ended without a result of its own; nothing automatic lifts the hold", [hold.hold, done[0]!])] };
     if (record.value.state === "origin-unestablished") return { final: [reasonOf("hold-origin-unestablished", "origin_hold", hold.hold.id, "hold",
@@ -889,10 +952,12 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   const analysis = saved ?? { project, series: reference(series), hold: null, dispatch: request.dispatch };
   const done = performed("analyze", analysis);
   if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, stop.attempt);
-  const record = take(readStopAnalysis(store, { project, record: done[0]! }));
+  const reviewed = analysisOf(done[0]!, stop.attempt);
+  if ("step" in reviewed) return reviewed;
+  const record = reviewed.record;
   if (record.value.state === "decided") return step("resume", { ...seriesRequestOf(series.value), stop: stop.attempt, ground: "review-record",
     text: `The independent review of this stop decided: ${record.value.change?.text ?? record.value.cause?.text ?? "an addressed change"}`,
-    review: { ref: done[0]! } }, series.id, null);
+    review: { ref: reference(record) } }, series.id, null);
   if (record.value.state === "failed") return { final: [reasonOf("stop-analysis-failed", "analysis_failed", series.id, "stop",
     `The independent review of the stop after attempt ${stop.attempt} ended without a result of its own; nothing automatic continues the series`,
     [reference(series), done[0]!])] };

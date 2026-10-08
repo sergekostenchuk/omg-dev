@@ -20,6 +20,7 @@ import { assertSchema, removeProofCache } from "../src/storage/schema.js";
 import { canonical, digest, type Json } from "../src/canonical.js";
 import { copyFileSync } from "node:fs";
 import { EngineError } from "../src/errors.js";
+import { checkStoreIntegrity } from "../src/storage/fsck.js";
 
 const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
 function fixture(t: test.TestContext) {
@@ -258,7 +259,7 @@ test("the exported hash-form surface cannot be mutated into accepting an upperca
   } finally { try { (mutable['compile'] as (s: string) => void)(HASH_PATTERN); } catch { /* absent */ } }
 });
 
-test("transaction guards read database heads directly and positive guards retain checksum validation", t => {
+test("transaction guards read database heads directly and positive guards retain checksum validation", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, t => {
   const { store, path } = fixture(t);
   const source = store.write({ id: "source", kind: "source", expected: 0, value: {} });
   store.get = () => { throw new Error("A transaction must not use a public read wrapper"); };
@@ -409,7 +410,9 @@ test("S1.3/Q4 identities('prefix') selects the literal entity_id head range in i
   const raw = new DatabaseSync(path);
   try { raw.exec("DROP TRIGGER revisions_no_update; UPDATE revisions SET body='null' WHERE entity_id='q44:z'"); }
   finally { raw.close(); }
-  assert.throws(() => store.get("q44:z"), code("record_corrupt"), "The corrupt body is still corrupt for a real read");
+  // NR1 (№3591/№3646): a read takes the body as written; the body unlike its hash is found by om-fsck at its address.
+  assert.ok(checkStoreIntegrity(store).findings.some(item => item.code === "revision_corrupt" && item.id === "q44:z" && item.revision === 1),
+    "The corrupt body is found by the whole check");
   assert.deepEqual(store.identities("prefix", "q44:").map(row => row.id), ["q44:%", "q44:A", "q44:_x", "q44:a", "q44:a:b", "q44:z", "q44:\u{10ffff}x"],
     "Identities never decode bodies: the corrupt row is still reported by its stored hash");
   assert.deepEqual(store.identities("prefix", "q44x:"), [neighbor].map(identity), "The neighbor outside the range is untouched");

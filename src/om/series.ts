@@ -9,7 +9,7 @@ import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readPreparedSeriesTransition as readPreparedSeriesTransitionOf, prepareSeriesTransition as prepareSeriesTransitionOf,
   comparePreparedSeriesSlices as comparePreparedSeriesSlicesOf, type PreparedSeriesDecision } from "./series-transition.js";
 import { readHorizonIssuance as readHorizonIssuanceOf, prepareHorizonIssuance as prepareHorizonIssuanceOf } from "./horizon.js";
-import { readModelTerminalWitness as readModelTerminalWitnessOf, completionClosedWork as completionClosedWorkOf } from "./model-call.js";
+import { readModelTerminalWitness as readModelTerminalWitnessOf } from "./model-call.js";
 import { delivered, isPlainObject, isText, localErrors, localRefusals, sealed, transfer, transferring, type Failed, type OmResult,
   type RefusalRoute, type Sealed, type SourceCodes } from "./refusal.js";
 import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from "./refs.js";
@@ -147,7 +147,6 @@ const comparePreparedSeriesSlices = transferring("series-transition", comparePre
 const readHorizonIssuance = transferring("horizon", readHorizonIssuanceOf);
 const prepareHorizonIssuance = transferring("horizon", prepareHorizonIssuanceOf);
 const readModelTerminalWitness = transferring("model-call", readModelTerminalWitnessOf);
-const completionClosedWork = transferring("model-call", completionClosedWorkOf);
 const readJournal = transferring("refusal-journal", readJournalOf);
 const readGaps = transferring("gaps", readGapsOf);
 const prepareCurrentGaps = transferring("gaps", prepareCurrentGapsOf);
@@ -501,21 +500,8 @@ export type AnyEscalateSeriesRequest = EscalateSeriesRequest | MechanismEscalate
 
 const GOAL_KEYS = Object.freeze(["key", "questions", "result"] as const);
 const ACHIEVEMENT_KEYS = Object.freeze(["key", "basis"] as const);
-const STORED_REFUSAL_KEYS = Object.freeze(["row"] as const);
 const CLAIMED_REFUSAL_KEYS = Object.freeze(["name", "goal", "row"] as const);
 const OUTCOME_KEYS = Object.freeze(["reason", "achieved", "cancelled", "refusals"] as const);
-const ATTEMPT_KEYS = Object.freeze(["ordinal", "goal", "outcome", "verdict"] as const);
-const BASIS_KEYS = Object.freeze(["ground", "text"] as const);
-const REVIEW_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "review"] as const);
-const INPUTS_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "refusal", "input", "confirmation"] as const);
-const OWNER_GROUND_KEYS = Object.freeze([...BASIS_KEYS, "decision"] as const);
-const groundKeys = (ground: ContinuationGround): readonly string[] =>
-  ground === "review-record" ? REVIEW_GROUND_KEYS : ground === "inputs-fixed" ? INPUTS_GROUND_KEYS : OWNER_GROUND_KEYS;
-const SERIES_KEYS = Object.freeze([
-  "projectId", "block", "line", "slice", "predecessor", "basis",
-  "inherited", "attempts", "continuations", "escalations", "withoutProgress", "ladder", "stop",
-] as const);
-const ESCALATION_KEYS = Object.freeze(["after", "review"] as const);
 const REF_SOURCE_KEYS = Object.freeze(["ref"] as const);
 const PENDING_SOURCE_KEYS = Object.freeze(["pending"] as const);
 const PENDING_KEYS = Object.freeze(["id", "kind", "value"] as const);
@@ -656,32 +642,14 @@ export function readAnySeriesAt(store: Store, project: string, ref: Ref): Series
     () => readSeriesHistory(store, project, ref),
     () => problem('series_invalid', 'Series history may not depend on itself', { target: ref.id, ref }, 'history')));
 }
+/** NR1 (№3600): a trusted read — every revision of a series was built by its transition producer from the exact
+ * predecessor revision and written under its guards; the history is read at its exact reference, never checked again. */
 function readSeriesHistory(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<AnyRepairSeries>>> {
   requireStore(store);
   requireProject(project);
   if (!isRef(ref)) raise("series_request_invalid", "Historical series reading needs an exact reference",
     { unit: UNIT, target: REPAIR_SERIES_KIND, field: "reference" });
-  const prefix = `${REPAIR_SERIES_KIND}:${project}:`;
-  const read = readRecord<AnyRepairSeries>(store, ref, { unit: UNIT, target: ref.id, kind: REPAIR_SERIES_KIND, idPrefix: prefix });
-  if (!read.ok) return read;
-  // Decode the address, never the body's claimed owner. Colons inside an existing block id retain their meaning.
-  const suffix = ref.id.slice(prefix.length);
-  if (suffix.startsWith("mechanism:")) {
-    const match = /^mechanism:([1-9][0-9]*):M5:addressing$/.exec(suffix);
-    if (!match || !Number.isSafeInteger(Number(match[1]))) return problem("series_invalid", "The mechanism series address is malformed", { target: ref.id, ref }, "id");
-    const address = seriesAddress({ project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, line: Number(match[1]) });
-    const broken = checkSeries(store, read.value.value, address, { target: ref.id, ref });
-    return broken ?? delivered(read.value as Revision<AnyRepairSeries>);
-  }
-  const separator = suffix.indexOf(":");
-  const line = Number(suffix.slice(0, separator)), block = suffix.slice(separator + 1);
-  const context: Context = { target: ref.id, ref };
-  if (separator < 1 || !Number.isSafeInteger(line) || line < 1 || !block.length
-    || suffix !== `${line}:${block}`)
-    return problem("series_invalid", "The historical record must stand at a canonical series address", context, "id");
-  const address: Address = { project, owner: { kind: "block", block }, line, id: ref.id };
-  const broken = checkSeries(store, read.value.value, address, context);
-  return broken ?? delivered(read.value as Revision<AnyRepairSeries>);
+  return readRecord<AnyRepairSeries>(store, ref, { unit: UNIT, target: ref.id, kind: REPAIR_SERIES_KIND, idPrefix: `${REPAIR_SERIES_KIND}:${project}:` });
 }
 
 /** Work and participation share exact lineage proof, but only active participation admits new work. */
@@ -822,9 +790,6 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): SeriesRe
       unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: at,
     });
     if (!read.ok) return read;
-    const broken = checkSeries(store, read.value.value, { ...address, line: address.line - 1, id: at },
-      { target: address.id, ref: reference(read.value) });
-    if (broken) return broken;
     earlier = read.value as Revision<AnyRepairSeries>;
     inherited = [...earlier.value.inherited, ...earlier.value.attempts].map(attempt => copyAttempt(attempt, ACHIEVED_ORDER));
     // The continuations come across with the attempts: a stop already answered must not come back to life in the
@@ -1239,23 +1204,11 @@ function progressTransitionValue(store: Store, project: string, source: Ref, hel
 export function readSeriesProgressTransitionAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<SeriesProgressTransition>>> {
   requireStore(store); requireProject(project);
   check(isRef(ref), "series_request_invalid", "A progress transition is read at its exact reference");
+  // NR1 (№3600): a trusted read — the transition was written once as the derivation of its stop and window.
   return withHistoricalReads(() => historicalRead(store, { reader: 'A3.progress-transition', project, ref, parameters: null }, () => {
     const read = readRecord<SeriesProgressTransition>(store, ref, { unit: UNIT, target: ref.id, kind: SERIES_PROGRESS_TRANSITION_KIND,
       idPrefix: `${SERIES_PROGRESS_TRANSITION_KIND}:${project}:` });
-    if (!read.ok) return read;
-    const record = read.value, value = record.value as unknown as Record<string, unknown>, context: Context = { target: ref.id, ref };
-    if (!isPlainObject(value) || !exactKeys(value, ["contract", "project", "series", "stop", "rows"])
-      || value['contract'] !== SERIES_PROGRESS_TRANSITION_CONTRACT || value['project'] !== project || !isRef(value['series'])
-      || !Number.isSafeInteger(value['stop']) || record.revision !== 1
-      || record.id !== seriesProgressTransitionId(project, value['series'] as Ref, value['stop'] as number))
-      return problem("series_invalid", "A progress transition names its contract, project, exact source series and stop at its own address", context, "record");
-    const source = readAnySeriesAt(store, project, value['series'] as Ref);
-    if (!source.ok) return source;
-    const derived = progressTransitionValue(store, project, value['series'] as Ref, source.value.value, context);
-    if (!derived.ok) return derived;
-    if (canonical(derived.value as unknown as Json) !== canonical(value as Json) || derived.value.stop !== value['stop'])
-      return problem("series_invalid", "A progress transition is the one derivation of its stop and window", context, "record");
-    return delivered(record as Revision<SeriesProgressTransition>);
+    return (read.ok ? delivered(read.value as Revision<SeriesProgressTransition>) : read) as SeriesResult<Sealed<Revision<SeriesProgressTransition>>>;
   }, () => problem("series_invalid", "A progress transition cannot prove itself", { target: ref.id, ref }, "history")));
 }
 function prepareReconcile(store: Store, request: ReconcileSeriesRequest): SeriesResult<Prepared> {
@@ -1563,9 +1516,9 @@ function currentSeries(store: Store, address: Address): SeriesResult<Revision<An
   const read = readRecord<AnyRepairSeries>(store, reference(head), {
     unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: address.id,
   });
+  // NR1 (№3600): the head was written by its transition producer; it is read, not checked again.
   if (!read.ok) return read;
-  const broken = checkSeries(store, read.value.value, address, { target: address.id, ref: reference(head) });
-  return broken ?? { ok: true, value: read.value as Revision<AnyRepairSeries> };
+  return { ok: true, value: read.value as Revision<AnyRepairSeries> };
 }
 
 const missing = (address: Address): SeriesResult<never> =>
@@ -2082,366 +2035,6 @@ const said = (value: unknown): boolean =>
 // ---------------------------------------------------------------------------
 // The stored record.
 
-/**
- * Checks a stored series and everything it stands on.
- * Its address fields must be the address it was found at, its attempts must be attempts held in canonical form, and
- * every DERIVED field — each verdict, the count and the stop — is derived again here and compared: a record that
- * merely agrees with itself is not a history this unit ever wrote. Its inherited attempts are derived again from the
- * predecessor read at the EXACT reference it names, and that predecessor is checked the same way, down the line to
- * the first. The line of a predecessor is one less than its successor's, so the lineage ends at line 1 and cannot
- * close on itself.
- */
-function checkSeries(store: Store, value: unknown, address: Address, context: Context): SeriesResult<never> | null {
-  const mechanism = address.owner.kind === "mechanism";
-  const managed = isPlainObject(value) && (Object.hasOwn(value as object, "contract") || Object.hasOwn(value as object, "activation"));
-  const marked = isPlainObject(value) && Object.hasOwn(value as object, "achievedOrder");
-  const lp6Keys = !mechanism && isPlainObject(value) ? ["progressPolicy", "reconciliations"].filter(key => Object.hasOwn(value as object, key)) : [];
-  const keys = [...(mechanism ? [...SERIES_KEYS.filter(key => key !== "block"), "owner", "scope", "admissions"]
-    : [...SERIES_KEYS, ...(managed ? ["contract", "activation"] : []), ...lp6Keys]), ...(marked ? ["achievedOrder"] : [])];
-  if (!isPlainObject(value) || !exactKeys(value, keys)) {
-    return problem("series_invalid", "A series carries its address, its history of attempts and what follows from them, and nothing else", context, "value");
-  }
-  const series = value as Record<string, unknown>;
-  // An absent order is the fec6932 era; a present one names the order this unit writes, and nothing else (№2556-2).
-  if (marked && series['achievedOrder'] !== ACHIEVED_ORDER)
-    return problem("series_invalid", "A series names the order of its achieved results only as this unit writes it", context, "achievedOrder");
-  const order = series['achievedOrder'] as AchievedOrder | undefined;
-  if (!isText(series['projectId']) || (!mechanism && !isText(series['block'])) || !Number.isSafeInteger(series['line'])) {
-    return problem("series_invalid", "A series names the project, block and line it belongs to", context, "projectId");
-  }
-  // A series of another block, project or line standing at this address is not this series, however well it reads.
-  if (series['projectId'] !== address.project || series['line'] !== address.line
-    || (address.owner.kind === "block" ? series['block'] !== address.owner.block : canonical(series['owner'] ?? null) !== canonical(address.owner))) {
-    return problem("series_foreign", `A series of ${String(series['block'])} in ${String(series['projectId'])} cannot stand for ${address.id}`, context, "block");
-  }
-  if (!isText(series['slice'])) return problem("series_invalid", "A series names the slice of the horizon it belongs to", context, "slice");
-  const predecessor = series['predecessor'];
-  if (predecessor !== null && !isRef(predecessor)) {
-    return problem("series_invalid", "A series names its predecessor by an exact reference, or null when it opens the first line", context, "predecessor");
-  }
-  if ((address.line === 1) !== (predecessor === null)) {
-    return problem("series_invalid", "Only the first line of a series has no predecessor", context, "predecessor");
-  }
-  const basis = series['basis'];
-  const grounded = predecessor === null
-    ? basis === null
-    : isPlainObject(basis) && exactKeys(basis, BASIS_KEYS) && basisProblem(basis) === null;
-  if (!grounded) {
-    return problem("series_invalid", "A successor of a series carries the recorded ground it stands on, and a first line carries none", context, "basis");
-  }
-  const inherited = series['inherited'];
-  const attempts = series['attempts'];
-  if (!Array.isArray(inherited) || !Array.isArray(attempts)) {
-    return problem("series_invalid", "A series carries its inherited history and its own attempts, each explicitly empty when there is none", context, "attempts");
-  }
-  const all = [...inherited, ...attempts];
-  for (let index = 0; index < all.length; index += 1) {
-    const path = index < inherited.length ? `inherited.${index}` : `attempts.${index - inherited.length}`;
-    const found = checkAttempt(all[index], index + 1, context, path, order);
-    if (found) return found;
-  }
-  // Only the last attempt may still be running: a second open cycle would leave two histories in one series.
-  if (all.some((item, index) => (item as Attempt).outcome === null && index !== all.length - 1)) {
-    return problem("series_invalid", "Only the last attempt of a series may still be running", context, "attempts");
-  }
-  if (inherited.some(item => (item as Attempt).outcome === null)) {
-    return problem("series_invalid", "An inherited attempt was completed in the series it was begun in", context, "inherited");
-  }
-  const continuations = series['continuations'];
-  if (!Array.isArray(continuations)) {
-    return problem("series_invalid", "A series carries its recorded continuations, explicitly empty until a stop was continued", context, "continuations");
-  }
-  // A continuation may answer an INHERITED stop: a slice that moved does not lift one, so the successor is where the
-  // stop its predecessor saved is continued. Stops are still answered in the order they were saved, and once each.
-  let last = 0;
-  for (let index = 0; index < continuations.length; index += 1) {
-    const item = continuations[index];
-    const flawed = groundProblem(item, isRef);
-    if (flawed !== null) {
-      return problem("series_invalid", "A continuation names the recorded ground it stands on with the records that ground is made of", context, `continuations.${index}.${flawed}`);
-    }
-    if (!exactKeys(item, [...groundKeys((item as Continuation).ground), "after"])) {
-      return problem("series_invalid", "A continuation carries the records of its own ground and the attempt it follows, and nothing else", context, `continuations.${index}`);
-    }
-    const after = (item as Record<string, unknown>)['after'];
-    if (!Number.isSafeInteger(after) || Number(after) <= last || Number(after) > all.length) {
-      return problem("series_invalid", "A continuation follows one attempt of this series, and one attempt is continued once", context, `continuations.${index}.after`);
-    }
-    last = Number(after);
-  }
-  const escalations = series['escalations'];
-  if (!Array.isArray(escalations)) {
-    return problem("series_invalid", "A series carries its escalations, explicitly empty until a stop was sent to the owner", context, "escalations");
-  }
-  let raised = 0;
-  for (let index = 0; index < escalations.length; index += 1) {
-    const item = escalations[index];
-    if (!isPlainObject(item) || !exactKeys(item, ESCALATION_KEYS) || !isRef((item as Record<string, unknown>)['review'])) {
-      return problem("series_invalid", "An escalation names the stop it sent to the owner and the exact review it was sent on, and nothing else", context, `escalations.${index}`);
-    }
-    const after = (item as Record<string, unknown>)['after'];
-    if (!Number.isSafeInteger(after) || Number(after) <= raised || Number(after) > all.length) {
-      return problem("series_invalid", "An escalation follows one attempt of this series, and one stop is escalated once", context, `escalations.${index}.after`);
-    }
-    raised = Number(after);
-  }
-  const progressFlaw = progressPolicyProblem(series, all.length);
-  if (progressFlaw !== null) return problem("series_invalid", progressFlaw.message, context, progressFlaw.field);
-
-  if (mechanism) {
-    if (!isPlainObject(series['scope']) || !Array.isArray(series['admissions']))
-      return problem("series_invalid", "A mechanism retains its full scope and exact attempt admissions", context, "scope");
-    const checked = mechanismResult(() => {
-      const scope = series['scope'] as unknown as GapReadRequest;
-      try { requireScope(scope); } catch (error) {
-        if (error instanceof EngineError && error.code === 'series_request_invalid') mechanismCheck(false, address.id, 'scope', 'The saved mechanism scope is malformed');
-        throw error;
-      }
-      const projected = mechanismProjection(store, address.project, scope, false);
-      mechanismCheck(projected.slice === series['slice'] && projected.value.questions.length > 0, address.id, 'slice', 'The saved semantic slice must follow from its exact full D1 evidence');
-      const admissions = series['admissions'] as unknown[];
-      mechanismCheck(admissions.length === all.length, address.id, 'admissions', 'Every inherited and own attempt retains exactly one admission');
-      for (let index = 0; index < admissions.length; index++) {
-        const row = admissions[index];
-        mechanismCheck(mechanismObject(row) && exactKeys(row, ['attempt', 'basis']) && row.attempt === index + 1, address.id, 'admissions', 'Admission order and attempt identity must agree');
-        try { requireAdmission(row.basis); } catch (error) {
-          if (error instanceof EngineError && error.code === 'series_request_invalid') mechanismCheck(false, address.id, 'admissions', 'A saved attempt admission is malformed');
-          throw error;
-        }
-        const proof = mechanismAdmission(store, { project: address.project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: address.line }, row.basis, false);
-        const attempt = all[index] as Attempt;
-        mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
-          address.id, 'admissions.goal', 'The historical declared goal must equal the exact whole batch');
-        if (index >= inherited.length) mechanismCheck(proof.slice === projected.slice, address.id, 'admissions.scope', 'Own attempts must belong to this exact semantic slice');
-      }
-      return true;
-    });
-    if (!checked.ok) return checked;
-  }
-  const draft = plainSeries(series as unknown as AnyRepairSeries);
-  let samePredecessorSlice = false;
-  if (predecessor !== null) {
-    const at = ownerSeriesId(address.project, address.owner, address.line - 1);
-    const read = readRecord<AnyRepairSeries>(store, predecessor, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: at });
-    if (!read.ok) {
-      return problem("series_invalid", `The predecessor a series names is not a series of this block: ${read.refusal.code}`, context, "predecessor");
-    }
-    const broken = checkSeries(store, read.value.value, { ...address, line: address.line - 1, id: at }, { ...context, ref: reference(read.value) });
-    if (broken) return broken;
-    // T3: the inherited history is derived AGAIN from the predecessor at the revision it names, so a predecessor that
-    // has since moved on does not make this record false, and a rewritten history is not taken for an inherited one.
-    // Proved in its own era above; its history is copied in the era of this successor.
-    const handedDown = [...read.value.value.inherited, ...read.value.value.attempts].map(attempt => copyAttempt(attempt, order));
-    if ("owner" in draft && "owner" in read.value.value && canonical(draft.admissions.slice(0, read.value.value.admissions.length)) !== canonical(read.value.value.admissions))
-      return problem("series_invalid", "The successor must inherit every exact admission unchanged", context, "admissions");
-    if (hashJson(handedDown) !== hashJson(draft.inherited)) {
-      return problem("series_invalid", "The inherited history is not the history its predecessor holds", context, "inherited");
-    }
-    // The continuations already recorded come across whole and unchanged: dropping one would raise a stop that was
-    // answered long ago, and adding one would give the successor a window nobody opened.
-    const answered = read.value.value.continuations.map(plainContinuation);
-    if (hashJson(draft.continuations.slice(0, answered.length)) !== hashJson(answered)) {
-      return problem("series_invalid", "The continuations a successor inherits are not the ones its predecessor holds", context, "continuations");
-    }
-    // The same for escalations: a successor that dropped one would hand a stop the owner alone may continue back to
-    // the reviewer, and one change of horizon does not do that.
-    const sent = read.value.value.escalations.map(plainEscalation);
-    if (hashJson(draft.escalations.slice(0, sent.length)) !== hashJson(sent)) {
-      return problem("series_invalid", "The escalations a successor inherits are not the ones its predecessor holds", context, "escalations");
-    }
-    samePredecessorSlice = read.value.value.slice === draft.slice;
-    // LP6: the boundary and the reconciliations a line holds travel to its successor whole and unchanged.
-    const before = read.value.value as AnyRepairSeries;
-    if ("block" in before && before.progressPolicy !== undefined
-      && hashJson(series['progressPolicy'] ?? null) !== hashJson(before.progressPolicy as unknown as Json))
-      return problem("series_invalid", "A successor keeps the progress boundary its predecessor holds", context, "progressPolicy");
-    const settledBefore = "block" in before ? (before.reconciliations ?? []).map(reconciliationOf) : [];
-    const settledHere = (series['reconciliations'] as Reconciliation[] | undefined ?? []).map(reconciliationOf);
-    if (hashJson(settledHere.slice(0, settledBefore.length) as unknown as Json) !== hashJson(settledBefore as unknown as Json))
-      return problem("series_invalid", "The reconciliations a successor inherits are not the ones its predecessor holds", context, "reconciliations");
-  }
-  const boundary = checkProgressBoundary(store, series as unknown as AnyRepairSeries, address, context);
-  if (boundary) return boundary;
-
-  const activation = checkSeriesActivation(store, series as unknown as AnyRepairSeries, address, context);
-  if (!activation.ok) return activation;
-  // Only the proved legacy era compares opaque labels. Managed successors stand on A's comparison of
-  // activeBasis slices; a retained legacy label can equal the new hash without denoting the same subject.
-  if (activation.value === 'legacy' && samePredecessorSlice)
-    return problem("series_invalid", "A successor stands on a slice its predecessor did not hold", context, "slice");
-  if (context.ref) for (const attempt of draft.attempts) {
-    const binding = readCompletionBinding(store, address.project, context.ref, attempt.ordinal);
-    if (!binding.ok) return binding;
-    if (binding.value && attempt.outcome) {
-      const id = completionCloseId(address.project, binding.value.id), close = store.get(id);
-      if (!close) return refuse('completion_invalid', 'A managed outcome needs its exact G7 close proof',
-        { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
-      const proof = readCompletionCloseAt(store, address.project, reference(close));
-      if (!proof.ok) return proof;
-      const work = store.get<CompletionWork>(completionWorkId(address.project, binding.value.id), proof.value.work.revision + 1);
-      const priorWork = store.get<CompletionWork>(proof.value.work.id, proof.value.work.revision);
-      // H1.0c: one closed-work formula for every close, over its exact additions and final journal.
-      const closedWork = priorWork ? completionClosedWork(store, address.project, priorWork, proof.value, reference(close)) : null;
-      if (closedWork && !closedWork.ok) return closedWork;
-      // LP6: the era of a managed close follows the boundary of the series — v2 with its progress from it on, v1 before.
-      const policy = "block" in draft ? draft.progressPolicy : undefined;
-      if ((policy !== undefined && attempt.ordinal >= policy.from) !== (attempt.outcome.progress !== undefined))
-        return refuse('completion_invalid', 'A managed close keeps the progress rules of its side of the series boundary',
-          { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
-      if (!sameRef(proof.value.binding, reference(binding.value)) || canonical(outcomeOf(proof.value.outcome, order)) !== canonical(attempt.outcome)
-        || !work || work.kind !== COMPLETION_WORK_KIND || !work.value.closed || !sameRef(work.value.closed, reference(close))
-        || !work.value.previous || !sameRef(work.value.previous, proof.value.work) || !priorWork
-        || canonical(work.value) !== canonical(closedWork!.value) || attempt.terminal)
-        return refuse('completion_invalid', 'The managed outcome, closed registry and proof must agree',
-          { unit: UNIT, target: address.id, field: 'completion' }, 'producer');
-    }
-  }
-  for (const attempt of draft.attempts) if (attempt.terminal !== undefined) {
-    const witness = checkTerminalCompletion(store, address.project, address.id, attempt);
-    if (!witness.ok) return witness;
-  }
-  // LP6: a standalone attempt never carries progress — only a managed close of a block derives it.
-  if (context.ref) for (const attempt of draft.attempts) {
-    if (attempt.outcome?.progress === undefined) continue;
-    const binding = readCompletionBinding(store, address.project, context.ref, attempt.ordinal);
-    if (!binding.ok) return binding;
-    if (binding.value === null) return problem("series_invalid", "Only a managed close of a block carries progress", context, `attempts.${attempt.ordinal}.outcome.progress`);
-  }
-  const derived = walk(draft);
-  if (derived.flaw !== null) {
-    return problem("series_invalid", derived.flaw.message, context, derived.flaw.field);
-  }
-  for (const attempt of [...draft.inherited, ...draft.attempts]) {
-    if ((derived.verdicts.get(attempt.ordinal) ?? null) !== attempt.verdict) {
-      return problem("series_invalid", "An attempt does not hold the verdict its outcome and the history of its goal give it", context, `attempts.${attempt.ordinal}.verdict`);
-    }
-  }
-  if (series['withoutProgress'] !== derived.withoutProgress) {
-    return problem("series_invalid", "The count of attempts without progress is not the count its attempts give", context, "withoutProgress");
-  }
-  if (hashJson(series['ladder'] ?? null) !== hashJson(derived.ladder)) {
-    return problem("series_invalid", "The ladder is not the ladder its attempts and continuations give", context, "ladder");
-  }
-  if (hashJson(series['stop'] ?? null) !== hashJson(derived.stop)) {
-    return problem("series_invalid", "The saved stop is not the stop its attempts give", context, "stop");
-  }
-  return null;
-}
-
-/** LP6: the shape of the boundary and of the reconciliations a block series may hold. */
-function progressPolicyProblem(series: Record<string, unknown>, attempts: number): { field: string; message: string } | null {
-  const policy = series['progressPolicy'], settles = series['reconciliations'];
-  if (policy === undefined && settles === undefined) return null;
-  if (policy === undefined) return { field: "reconciliations", message: "A reconciliation belongs to a series whose progress boundary was activated" };
-  if (!isPlainObject(policy) || !exactKeys(policy, ["contract", "previous", "from"]) || (policy as Record<string, unknown>)['contract'] !== SERIES_PROGRESS_CONTRACT)
-    return { field: "progressPolicy", message: "A progress boundary names its contract, the revision before it and the first attempt it covers" };
-  const { previous, from } = policy as Record<string, unknown>;
-  if (!Number.isSafeInteger(from) || (from as number) < 1 || (from as number) > attempts + 1)
-    return { field: "progressPolicy.from", message: "The boundary is an attempt of this series or the next one" };
-  // The producer always activates on a stored revision (a close of an open attempt, or a reconciled stop), so the
-  // reader takes nothing else: a boundary without the revision before it would be believed, not proved.
-  if (!isRef(previous))
-    return { field: "progressPolicy.previous", message: "A progress boundary names the exact revision of the series it was activated on" };
-  if (settles === undefined) return null;
-  if (!Array.isArray(settles)) return { field: "reconciliations", message: "Reconciliations are a list" };
-  let last = 0;
-  for (let index = 0; index < settles.length; index += 1) {
-    const item = settles[index];
-    if (!isPlainObject(item) || !exactKeys(item, ["after", "transition", "achieved"]) || !isRef((item as Record<string, unknown>)['transition'])
-      || !Array.isArray((item as Record<string, unknown>)['achieved'])
-      || !((item as Record<string, unknown>)['achieved'] as unknown[]).every(row => isPlainObject(row) && exactKeys(row, ["goal", "key"])
-        && isText((row as Record<string, unknown>)['goal']) && isText((row as Record<string, unknown>)['key'])))
-      return { field: `reconciliations.${index}`, message: "A reconciliation names its stop, its exact transition and the results it proved" };
-    const after = (item as Record<string, unknown>)['after'];
-    if (!Number.isSafeInteger(after) || (after as number) <= last || (after as number) >= (from as number))
-      return { field: `reconciliations.${index}.after`, message: "A reconciliation answers one saved stop before the boundary, once" };
-    last = after as number;
-  }
-  return null;
-}
-/**
- * LP6 (№3325 §4): the boundary is derived from the proved state before it, never taken on a caller's word. Activated in
- * this line, it names the exact earlier revision of this very series that held no boundary, and starts at that
- * revision's open attempt — or at the next one when every attempt there was closed. Inherited, it is exactly the
- * boundary of the predecessor this line names. Each reconciliation is the exact transition record its common reader derives.
- */
-function checkProgressBoundary(store: Store, value: AnyRepairSeries, address: Address, context: Context): SeriesResult<never> | null {
-  if (!("block" in value) || value.progressPolicy === undefined) return null;
-  const policy = value.progressPolicy;
-  if (policy.previous === null) return problem("series_invalid", "A progress boundary names the revision it was activated on", context, "progressPolicy.previous");
-  if (policy.previous.id === address.id) {
-    const read = readRecord<AnyRepairSeries>(store, policy.previous, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND, id: address.id });
-    if (!read.ok) return problem("series_invalid", `The revision before the progress boundary does not stand: ${read.refusal.code}`, context, "progressPolicy.previous");
-    const before = read.value.value;
-    if (!("block" in before) || before.progressPolicy !== undefined || (context.ref && read.value.revision >= context.ref.revision))
-      return problem("series_invalid", "The progress boundary stands on an earlier revision of this series without one", context, "progressPolicy.previous");
-    const prior = [...before.inherited, ...before.attempts];
-    const open = prior.find(item => item.outcome === null);
-    if (policy.from !== (open?.ordinal ?? prior.length + 1))
-      return problem("series_invalid", "The boundary starts at the attempt open before it, or at the next one", context, "progressPolicy.from");
-    const ours = [...value.inherited, ...value.attempts];
-    for (const attempt of prior) if (attempt.outcome !== null && hashJson(copyAttempt(attempt, before.achievedOrder) as unknown as Json)
-      !== hashJson(copyAttempt(ours[attempt.ordinal - 1]!, value.achievedOrder) as unknown as Json))
-      return problem("series_invalid", "The history before the progress boundary is the history it was activated on", context, "progressPolicy.previous");
-  } else {
-    if (value.predecessor === null)
-      return problem("series_invalid", "An inherited progress boundary needs the line it came from", context, "progressPolicy.previous");
-    const read = readRecord<AnyRepairSeries>(store, value.predecessor, { unit: UNIT, target: address.id, kind: REPAIR_SERIES_KIND,
-      id: ownerSeriesId(address.project, address.owner, address.line - 1) });
-    if (!read.ok) return problem("series_invalid", `The line a progress boundary came from does not stand: ${read.refusal.code}`, context, "progressPolicy");
-    const before = read.value.value;
-    if (!("block" in before) || before.progressPolicy === undefined
-      || hashJson(policyOf(before.progressPolicy) as unknown as Json) !== hashJson(policyOf(policy) as unknown as Json))
-      return problem("series_invalid", "An inherited progress boundary is exactly the boundary of the predecessor", context, "progressPolicy");
-  }
-  for (let index = 0; index < (value.reconciliations ?? []).length; index += 1) {
-    const item = value.reconciliations![index]!;
-    const read = readSeriesProgressTransitionAt(store, address.project, item.transition);
-    if (!read.ok) return read;
-    const record = read.value.value;
-    if (record.stop !== item.after || hashJson(reconciliationOf(item).achieved as unknown as Json) !== hashJson(reconciledOf(record as unknown as SeriesProgressTransition) as unknown as Json)
-      || !lineageIds(address).includes(record.series.id))
-      return problem("series_invalid", "A reconciliation is the exact transition of a stop of this line", context, `reconciliations.${index}`);
-  }
-  return null;
-}
-const lineageIds = (address: Address): string[] => Array.from({ length: address.line }, (_, index) =>
-  ownerSeriesId(address.project, address.owner, index + 1));
-
-function checkAttempt(value: unknown, ordinal: number, context: Context, path: string, order: AchievedOrder | undefined): SeriesResult<never> | null {
-  if (!isPlainObject(value) || !exactKeys(value, [...ATTEMPT_KEYS, ...(Object.hasOwn(value as object, "terminal") ? ["terminal"] : [])])) {
-    return problem("series_invalid", "An attempt carries its ordinal, its goal, its outcome and the verdict derived from them", context, path);
-  }
-  const attempt = value as Record<string, unknown>;
-  if (Object.hasOwn(attempt, 'terminal') && !isRef(attempt['terminal']))
-    return problem('series_invalid', 'A terminal completion names its exact E4 witness', context, `${path}.terminal`);
-  // Ordinals run on without gaps across the whole lineage, so the attempt a stop or a continuation names is one attempt.
-  if (attempt['ordinal'] !== ordinal) {
-    return problem("series_invalid", `An attempt at position ${ordinal} carries the ordinal ${String(attempt['ordinal'])}`, context, `${path}.ordinal`);
-  }
-  const goal = goalProblem(attempt['goal']);
-  if (goal) return problem("series_invalid", "An attempt names the goal it was begun for", context, `${path}.goal.${goal}`);
-  // An unordered set held out of canonical order is not the goal or the outcome this unit writes: two readings of one
-  // fact would then differ, and a repeat of it would look like a contradiction.
-  if (hashJson(goalOf(attempt['goal'] as AttemptGoal)) !== hashJson(attempt['goal'])) {
-    return problem("series_invalid", "A goal is not held as this unit writes one", context, `${path}.goal`);
-  }
-  if (attempt['outcome'] === null) {
-    return attempt['verdict'] === null ? null
-      : problem("series_invalid", "An attempt still running carries no verdict", context, `${path}.verdict`);
-  }
-  const outcome = outcomeProblem(attempt['outcome'], STORED_REFUSAL_KEYS);
-  if (outcome) return problem("series_invalid", "An attempt holds the outcome of the cycle it closed", context, `${path}.${outcome}`);
-  if (hashJson(outcomeOf(attempt['outcome'] as AttemptOutcome, order)) !== hashJson(attempt['outcome'])) {
-    return problem("series_invalid", "An outcome is not held as this unit writes one", context, `${path}.outcome`);
-  }
-  if (!ATTEMPT_VERDICTS.includes(attempt['verdict'] as AttemptVerdict)) {
-    return problem("series_invalid", "A completed attempt carries the verdict derived from its outcome", context, `${path}.verdict`);
-  }
-  const contradiction = outcomeContradiction(attempt['outcome'] as AttemptOutcome);
-  return contradiction ? problem("series_invalid", contradiction, context, `${path}.outcome`) : null;
-}
-
 // Own keys only, and exactly these: a value parsed from JSON may carry "__proto__" as an own field, and an unexpected
 // field is a difference in content, not a detail to ignore.
 function exactKeys(value: unknown, keys: readonly string[]): boolean {
@@ -2840,36 +2433,10 @@ function rootOf(store: Store, project: string, series: Revision<AnyRepairSeries>
   return reference(root);
 }
 function checkedMembership(store: Store, project: string, ref: Ref): Revision<SeriesMembership> {
-  return historicalRead(store, { reader: 'A3.membership', project, ref, parameters: null }, () => {
-    const record = sourceRecord<SeriesMembership>(store, ref, project, SERIES_MEMBERSHIP_KIND), value = record.value;
-    mechanismCheck(mechanismObject(value) && exactKeys(value, ['contract', 'project', 'mode', 'roots', 'activation'])
-      && value.contract === 'om-series-membership/v1' && value.project === project
-      && ['legacy', 'transition-managed'].includes(value.mode) && Array.isArray(value.roots)
-      && (value.mode === 'legacy' ? value.activation === null : isRef(value.activation)), ref.id, 'membership', 'Membership declares its producer, mode and complete root set');
-    const blocks = new Set<string>();
-    for (const row of value.roots) {
-      mechanismCheck(mechanismObject(row) && exactKeys(row, ['block', 'root']) && typeof row.block === 'string' && isRef(row.root)
-        && !blocks.has(row.block), ref.id, 'roots', 'Every block occurs exactly once with an exact root');
-      blocks.add(row.block);
-      const series = mechanismTake(readAnySeriesAt(store, project, row.root));
-      mechanismCheck('block' in series.value && series.value.block === row.block && series.value.line === 1
-        && row.root.revision === 1, ref.id, 'roots', 'Membership names the immutable original block root');
-    }
-    mechanismCheck(canonical(value.roots) === canonical(ordered(value.roots, row => row.block)), ref.id, 'roots', 'Membership roots have canonical order');
-    if (record.revision > 1) {
-      const previous = store.get<SeriesMembership>(ref.id, record.revision - 1);
-      mechanismCheck(previous, ref.id, 'previous', 'Membership history may not lose a revision');
-      const checked = checkedMembership(store, project, reference(previous));
-      mechanismCheck(checked.value.roots.every(row => value.roots.some(next => canonical(next) === canonical(row)))
-        && (checked.value.mode !== 'transition-managed' || value.mode === 'transition-managed'), ref.id, 'roots', 'Membership preserves all existing roots and the managed era');
-    }
-    if (value.activation !== null) {
-      const activation = checkedApplied(store, project, value.activation);
-      mechanismCheck(activation.value.previous === null && activation.value.roots.every(row => value.roots.some(next => canonical(next) === canonical(row))),
-        ref.id, 'activation', 'The mode change stands on the original complete bootstrap');
-    }
-    return record;
-  }, () => { mechanismCheck(false, ref.id, 'membership', 'Membership history may not depend on itself'); throw new Error('Unreachable'); });
+  // NR1 (№3600): a trusted read — membership is written by registration and activation producers only.
+  return historicalRead(store, { reader: 'A3.membership', project, ref, parameters: null },
+    () => sourceRecord<SeriesMembership>(store, ref, project, SERIES_MEMBERSHIP_KIND),
+    () => { mechanismCheck(false, ref.id, 'membership', 'Membership history may not depend on itself'); throw new Error('Unreachable'); });
 }
 interface CapturedMembership { record: Revision<SeriesMembership> | null; value: SeriesMembership; series: Revision<RepairSeries>[] }
 function captureMembership(store: Store, project: string): CapturedMembership {
@@ -3008,24 +2575,11 @@ function deriveApplied(store: Store, request: SeriesActivationRequest, membershi
     ...(order === undefined ? {} : { achievedOrder: order }) };
 }
 function checkedApplied(store: Store, project: string, ref: Ref): Revision<AppliedSeriesTransition> {
-  return historicalRead(store, { reader: 'A3.applied', project, ref, parameters: null }, () => {
-    const record = mechanismTake(readRecord<AppliedSeriesTransition>(store, ref, { unit: UNIT, target: project, kind: SERIES_APPLIED_KIND,
-      idPrefix: `${SERIES_APPLIED_KIND}:${project}:` })) as Revision<AppliedSeriesTransition>;
-    const value = record.value;
-    mechanismCheck(mechanismObject(value) && exactKeys(value, ['contract', 'project', 'prepared', 'issuance', 'membership', 'roots', 'previous', 'decisions',
-      ...(Object.hasOwn(value, 'achievedOrder') ? ['achievedOrder'] : [])])
-      && value.contract === 'om-series-applied/v1' && value.project === project && isRef(value.prepared) && isRef(value.issuance)
-      && (value.membership === null || isRef(value.membership)) && (value.previous === null || isRef(value.previous))
-      && Array.isArray(value.roots) && Array.isArray(value.decisions), ref.id, 'applied', 'Applied transition requires all exact producer sources');
-    const request = { project, prepared: value.prepared, issuance: value.issuance };
-    mechanismCheck(record.revision === 1 && ref.id === activationId(request), ref.id, 'id', 'The application is immutable and determined by its exact P/G pair');
-    mechanismCheck(!Object.hasOwn(value, 'achievedOrder') || value.achievedOrder === ACHIEVED_ORDER, ref.id, 'achievedOrder',
-      'An application names the order of its new lines only as this unit writes it');
-    // The saved choice, never the version of today's code: an application of the fec6932 era stays one.
-    const derived = deriveApplied(store, request, value.membership, value.roots, value.previous, value.achievedOrder);
-    mechanismCheck(canonical(value) === canonical(derived), ref.id, 'decisions', 'Applied decisions are rederived from P/G and original participants');
-    return record;
-  }, () => { mechanismCheck(false, ref.id, 'applied', 'Applied history may not depend on itself'); throw new Error('Unreachable'); });
+  // NR1 (№3600): a trusted read — the application was written once from its exact P/G pair (deriveApplied).
+  return historicalRead(store, { reader: 'A3.applied', project, ref, parameters: null }, () =>
+    mechanismTake(readRecord<AppliedSeriesTransition>(store, ref, { unit: UNIT, target: project, kind: SERIES_APPLIED_KIND,
+      idPrefix: `${SERIES_APPLIED_KIND}:${project}:` })) as Revision<AppliedSeriesTransition>,
+    () => { mechanismCheck(false, ref.id, 'applied', 'Applied history may not depend on itself'); throw new Error('Unreachable'); });
 }
 function activationWrites(store: Store, applied: Revision<AppliedSeriesTransition>): Write[] {
   const value = applied.value, prepared = mechanismTake(readPreparedSeriesTransition(store, { project: value.project, record: value.prepared })).record.value;
@@ -3068,23 +2622,10 @@ function currentAfter(store: Store, applied: Revision<AppliedSeriesTransition>, 
       previous: applied.value.previous, series } satisfies CurrentSeriesPointer };
 }
 function checkedCurrent(store: Store, project: string, ref: Ref): Revision<CurrentSeriesPointer> {
-  return historicalRead(store, { reader: 'A3.current-history', project, ref, parameters: null }, () => {
-    const record = sourceRecord<CurrentSeriesPointer>(store, ref, project, SERIES_CURRENT_KIND), value = record.value;
-    mechanismCheck(mechanismObject(value) && exactKeys(value, ['contract', 'project', 'applied', 'membership', 'previous', 'series'])
-      && value.contract === 'om-series-current/v1' && value.project === project && isRef(value.applied) && isRef(value.membership)
-      && (value.previous === null || isRef(value.previous)) && Array.isArray(value.series), ref.id, 'pointer', 'The pointer retains its exact activation and membership');
-    const applied = checkedApplied(store, project, value.applied), writes = activationWrites(store, applied);
-    const expected = revisionOfWrite<CurrentSeriesPointer>(currentAfter(store, applied, writes));
-    mechanismCheck(canonical(record) === canonical(expected), ref.id, 'pointer', 'The pointer is rederived from the complete applied transition');
-    const membership = sourceRecord<SeriesMembership>(store, value.membership, project, SERIES_MEMBERSHIP_KIND);
-    mechanismCheck(canonical(membership) === canonical(revisionOfWrite(membershipAfter(store, applied))), ref.id, 'membership', 'The pointer retains the membership committed with its application');
-    for (const row of value.series) {
-      const activation = sourceRecord<RepairSeries>(store, row.activation, project, REPAIR_SERIES_KIND, row.activation.id);
-      const write = writes.find(write => write.id === activation.id);
-      mechanismCheck(write && canonical(activation) === canonical(revisionOfWrite(write)), ref.id, 'series', 'Every activation revision must be committed exactly as derived');
-    }
-    return record;
-  }, () => { mechanismCheck(false, ref.id, 'pointer', 'Pointer history may not depend on itself'); throw new Error('Unreachable'); });
+  // NR1 (№3600): a trusted read — the pointer was committed with its application (currentAfter).
+  return historicalRead(store, { reader: 'A3.current-history', project, ref, parameters: null },
+    () => sourceRecord<CurrentSeriesPointer>(store, ref, project, SERIES_CURRENT_KIND),
+    () => { mechanismCheck(false, ref.id, 'pointer', 'Pointer history may not depend on itself'); throw new Error('Unreachable'); });
 }
 export function readAppliedSeriesTransition(store: Store, request: { project: string; record: Ref }): SeriesResult<Sealed<Revision<AppliedSeriesTransition>>> {
   requireStore(store); check(mechanismObject(request) && isRef(request.record), 'series_request_invalid', 'Applied history needs an exact reference'); requireProject(request.project);
@@ -3140,74 +2681,6 @@ export function applySeriesActivation(store: Store, request: SeriesActivationReq
   return written.ok ? delivered({ ...prepared.value, writes: [] }) : written;
 }
 
-function checkSeriesActivation(store: Store, value: AnyRepairSeries, address: Address, context: Context): SeriesResult<'legacy' | 'managed'> {
-  return mechanismResult<'legacy' | 'managed'>(() => {
-    if (address.owner.kind === 'mechanism') return 'legacy';
-    const activation = value.activation;
-    const era = lookupSeriesEra(store, address.project, address.id);
-    mechanismCheck(context.ref && context.ref.id === address.id, address.id, 'era', 'Era checking requires the exact reference of this series');
-    if (!era || context.ref.revision < era.value.firstManaged.revision) {
-      mechanismCheck(value.contract === undefined && activation === undefined, address.id, 'era',
-        'Managed fields require the own immutable era source at or before this revision');
-      // No future producer is traversed below the threshold. Without a marker, already recorded positive
-      // evidence still prevents a managed revision or predecessor from masquerading as legacy.
-      if (!era) for (let revision = 1; revision < context.ref.revision; revision += 1) {
-        const previous = store.get<AnyRepairSeries>(address.id, revision);
-        mechanismCheck(previous && previous.value.contract === undefined && previous.value.activation === undefined,
-          address.id, 'activation', 'A managed revision cannot return to the legacy producer');
-      }
-      if (value.predecessor !== null) {
-        const previous = mechanismTake(readAnySeriesAt(store, address.project, value.predecessor));
-        mechanismCheck(previous.value.contract === undefined, address.id, 'activation', 'A managed successor preserves its producer');
-      }
-      return 'legacy';
-    }
-    const firstManaged = checkedEraProduction(store, era);
-    if (context.ref.revision === firstManaged.revision)
-      mechanismCheck(sameRef(context.ref, reference(firstManaged)), address.id, 'era', 'The first managed revision retains its complete exact reference');
-    mechanismCheck(value.contract === MANAGED_SERIES_CONTRACT && mechanismObject(activation)
-      && activation.contract === SERIES_ACTIVATION_CONTRACT, address.id, 'activation', 'The managed producer requires its explicit activation contract');
-    if (activation.state === 'unactivated') {
-      mechanismCheck(sameRef(context.ref, reference(firstManaged)), address.id, 'activation',
-        'An unactivated root remains exactly its original registered revision until activation');
-      mechanismCheck(exactKeys(activation, ['contract', 'state', 'registered']) && isRef(activation.registered)
-        && value.line === 1 && value.attempts.length === 0 && value.inherited.length === 0 && value.continuations.length === 0
-        && value.escalations.length === 0, address.id, 'activation', 'An unactivated root has a registration basis and no work history');
-      const registered = checkedApplied(store, address.project, activation.registered);
-      mechanismCheck(registered.value.previous === null && !registered.value.roots.some(row => row.block === (address.owner as { block: string }).block),
-        address.id, 'registered', 'An unactivated root is newly registered after the original bootstrap');
-    } else {
-      mechanismCheck(activation.state === 'activated' && exactKeys(activation, ['contract', 'state', 'applied', 'prepared', 'participation', 'activeBasis'])
-        && isRef(activation.applied) && isRef(activation.prepared) && ['active', 'excluded', 'boundary', 'unselected'].includes(activation.participation)
-        && (activation.activeBasis === null || isRef(activation.activeBasis)), address.id, 'activation', 'An activated line retains its exact applied participation and last active basis');
-      const applied = checkedApplied(store, address.project, activation.applied);
-      const writes = activationWrites(store, applied), write = writes.find(row => row.id === address.id && (row.value as RepairSeries).contract === MANAGED_SERIES_CONTRACT
-        && canonical((row.value as RepairSeries).activation) === canonical(activation));
-      mechanismCheck(write && sameRef(applied.value.prepared, activation.prepared), address.id, 'activation', 'The saved activation is derived for this exact line by A');
-      const original = revisionOfWrite<RepairSeries>(write);
-      mechanismCheck(value.slice === original.value.slice && canonical(value.predecessor) === canonical(original.value.predecessor)
-        && canonical(value.basis) === canonical(original.value.basis) && canonical(value.inherited) === canonical(original.value.inherited),
-        address.id, 'activation', 'The activated local subject and inherited history remain exactly those derived by A');
-      mechanismCheck(original.value.attempts.every((attempt, index) => {
-        const later = value.attempts[index];
-        return later && (attempt.outcome === null
-          ? attempt.ordinal === later.ordinal && canonical(attempt.goal) === canonical(later.goal)
-          : canonical(attempt) === canonical(later));
-      }) && canonical(value.continuations.slice(0, original.value.continuations.length)) === canonical(original.value.continuations)
-        && canonical(value.escalations.slice(0, original.value.escalations.length)) === canonical(original.value.escalations),
-        address.id, 'history', 'An activated line preserves every original attempt, continuation and escalation');
-      if (context.ref && context.ref.id === address.id) {
-        mechanismCheck(context.ref.revision >= original.revision, address.id, 'activation', 'An activation cannot precede its applied revision');
-        if (context.ref.revision === original.revision) mechanismCheck(canonical(value) === canonical(original.value), address.id, 'activation', 'The first activated revision equals its source-derived body');
-        else {
-          const saved = sourceRecord<RepairSeries>(store, reference(original), address.project, REPAIR_SERIES_KIND, address.id);
-          mechanismCheck(canonical(saved) === canonical(original), address.id, 'activation', 'The immutable activation revision must still exist');
-        }
-      }
-    }
-    return 'managed';
-  });
-}
 function mutationAdmission(store: Store, source: Revision<AnyRepairSeries>): SeriesResult<Sealed<{ guards: readonly Ref[] }>> {
   // Legacy commands already read their own exact source. Activation rewrites it in the same CAS transaction,
   // preserving their established race codes and avoiding a stricter reread of unrelated legacy records.
@@ -3321,16 +2794,6 @@ export function readSeriesAdmissionChange(store: Store, request: SeriesWorkAdmis
       guards: request.currentPointer === undefined ? refsUnique([current, ...(head ? [reference(head)] : [])]) : [] };
   });
 }
-function checkTerminalCompletion(store: Store, project: string, id: string, attempt: Attempt): SeriesResult<true> {
-  if (!isRef(attempt.terminal)) return problem('series_invalid', 'A terminal completion retains its exact E4 witness', { target: id, ref: undefined }, 'terminal');
-  const witness = readModelTerminalWitness(store, { project, record: attempt.terminal });
-  if (!witness.ok) return witness;
-  if (witness.value.series.id !== id || witness.value.attempt !== attempt.ordinal || canonical(witness.value.goal) !== canonical(attempt.goal)
-    || !attempt.outcome || attempt.outcome.reason !== witness.value.reason || attempt.outcome.achieved.length || attempt.outcome.cancelled.length)
-    return problem('series_invalid', 'Terminal completion must equal the already observed physical outcome of its own call', { target: id, ref: attempt.terminal }, 'terminal');
-  return { ok: true, value: true };
-}
-
 /** This lookup establishes only a threshold. It deliberately never traverses the future producer. */
 function lookupSeriesEra(store: Store, project: string, id: string): Revision<SeriesEra> | null {
   const at = seriesEraId(project, id), raw = store.get<SeriesEra>(at, 1);
@@ -3378,33 +2841,11 @@ function registeredMembership(before: SeriesMembership, block: string, root: Ref
   return { ...before, roots: ordered([...before.roots, { block, root: exactRef(root) }], row => row.block) };
 }
 function checkedEraProduction(store: Store, era: Revision<SeriesEra>): Revision<RepairSeries> {
-  const { project, seriesId: id, firstManaged, origin } = era.value;
-  return historicalRead(store, { reader: 'A3.era-production', project, ref: reference(era), parameters: null }, () => {
-    // A raw exact read breaks S -> era -> first S recursion. Its body is checked against the SAME producer
-    // used to prepare activation or registration, never accepted from its own declared fields.
-    const first = sourceRecord<RepairSeries>(store, firstManaged, project, REPAIR_SERIES_KIND, id);
-    if (origin.kind === 'activation') {
-      const applied = checkedApplied(store, project, origin.applied);
-      const write = activationWrites(store, applied).find(write => {
-        const activation = (write.value as RepairSeries).activation;
-        return write.id === id && activation?.state === 'activated' && sameRef(activation.applied, origin.applied);
-      });
-      mechanismCheck(write && canonical(revisionOfWrite(write)) === canonical(first), era.id, 'firstManaged',
-        'The first managed revision must equal its exact common applied producer');
-    } else {
-      const before = checkedRegistrationSources(store, project, origin.membership, origin.pointer);
-      mechanismCheck(mechanismObject(first.value) && typeof first.value.block === 'string'
-        && firstManaged.revision === 1 && id === seriesId(project, first.value.block, 1), era.id, 'firstManaged',
-      'Registration is the first revision of its own block root');
-      const value = registeredRoot(project, first.value.block, origin.slice, before.value, origin.achievedOrder);
-      mechanismCheck(canonical(value) === canonical(first.value), era.id, 'registration', 'The root must equal its exact registration inputs');
-      const membership = registeredMembership(before.value, value.block, firstManaged);
-      // Reading output membership through checkedMembership would recurse back to this new root.
-      const output = { id: before.id, revision: before.revision + 1, hash: hashJson(membership) };
-      sourceRecord<SeriesMembership>(store, output, project, SERIES_MEMBERSHIP_KIND);
-    }
-    return first;
-  }, () => { mechanismCheck(false, era.id, 'era', 'The era producer may not depend on itself'); throw new Error('Unreachable'); });
+  const { project, seriesId: id, firstManaged } = era.value;
+  // NR1 (№3600): a trusted read — the first managed revision was written by its activation or registration producer.
+  return historicalRead(store, { reader: 'A3.era-production', project, ref: reference(era), parameters: null },
+    () => sourceRecord<RepairSeries>(store, firstManaged, project, REPAIR_SERIES_KIND, id),
+    () => { mechanismCheck(false, era.id, 'era', 'The era producer may not depend on itself'); throw new Error('Unreachable'); });
 }
 function prepareEraWrite(store: Store, first: Revision<RepairSeries>, origin: SeriesEraOrigin): Write | null {
   const project = first.value.projectId, existing = lookupSeriesEra(store, project, first.id);
@@ -3535,47 +2976,11 @@ function completionPlanSources(store: Store, before: Revision<AnyRepairSeries>, 
   }
   return { owner, goal, guards };
 }
-function completionBindingBody(store: Store, project: string, value: CompletionOwner): CompletionOwner {
-  if (!isPlainObject(value) || value.contract !== 'om-completion-owner/v1' || value.project !== project
-    || !isRef(value.previous) || !isRef(value.series) || value.previous.id !== value.series.id
-    || value.series.revision !== value.previous.revision + 1 || !Number.isSafeInteger(value.attempt) || goalProblem(value.goal) !== null
-    || !exactKeys(value, ['contract', 'project', 'series', 'previous', 'attempt', 'owner', 'goal', 'plan', 'admission']))
-    completionFail(COMPLETION_OWNER_KIND, 'binding', 'The immutable owner needs its full original opening sources');
-  if (value.admission !== null) {
-    try { requireAdmission(value.admission); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'series_request_invalid')
-        completionFail(value.series.id, 'admission', 'The saved mechanism admission must be complete');
-      throw error;
-    }
-  }
-  // Descend only into the predecessor, never the S this binding creates.
-  const before = completionTake(readAnySeriesAt(store, project, value.previous)) as Revision<AnyRepairSeries>;
-  const request: AnyBeginAttemptRequest = { ...seriesRequestOf(before.value), attempt: value.attempt, goal: value.goal,
-    ...('owner' in before.value ? { admission: value.admission! } : {}) } as AnyBeginAttemptRequest;
-  const plan = normalizeCompletionPlan(value.plan), sources = completionPlanSources(store, before, request, plan, false);
-  if (value.attempt !== before.value.inherited.length + before.value.attempts.length + 1
-    || running(before.value) || before.value.stop) completionFail(value.series.id, 'attempt', 'The owner must originate at one lawful next opening');
-  const opened = settled({ ...plainSeries(before.value),
-    ...('owner' in before.value && 'owner' in request ? { admissions: [...before.value.admissions,
-      { attempt: value.attempt, basis: normalizedAdmission(request.admission) }] } : {}),
-    attempts: [...before.value.attempts.map(attempt => copyAttempt(attempt, before.value.achievedOrder)),
-      { ordinal: value.attempt, goal: sources.goal, outcome: null, verdict: null }] });
-  if (value.series.hash !== hashJson(opened)) completionFail(value.series.id, 'opening', 'The opening S must follow from its exact predecessor and full assignment');
-  const exact = completionTake(readRecord<AnyRepairSeries>(store, value.series,
-    { unit: 'G7', target: value.series.id, kind: REPAIR_SERIES_KIND, id: before.id }));
-  if (canonical(exact.value) !== canonical(opened)) completionFail(value.series.id, 'opening', 'The original opening cannot be rewritten');
-  return { contract: 'om-completion-owner/v1', project, series: exactRef(value.series), previous: reference(before),
-    attempt: value.attempt, owner: sources.owner, goal: sources.goal, plan, admission: 'owner' in request ? normalizedAdmission(request.admission) : null };
-}
+/** NR1 (№3600): a trusted read — the owner was written once, atomically with its opening, by prepareManagedBeginAttempt. */
 export function readCompletionOwnerAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<CompletionOwner>>> {
-  return completionResult(() => historicalRead(store, { reader: 'G7.completion-owner', project, ref }, () => {
-    const record = completionExact<CompletionOwner>(store, project, ref, COMPLETION_OWNER_KIND);
-    const value = completionBindingBody(store, project, record.value);
-    if (record.revision !== 1 || record.id !== completionOwnerId(project, value.series.id, value.attempt)
-      || canonical(value) !== canonical(record.value)) completionFail(record.id, 'binding', 'The owner must equal its complete shared derivation');
-    return record;
-  }, () => completionFail(ref.id, 'history', 'A completion owner cannot derive from itself')));
+  return completionResult(() => historicalRead(store, { reader: 'G7.completion-owner', project, ref },
+    () => completionExact<CompletionOwner>(store, project, ref, COMPLETION_OWNER_KIND),
+    () => completionFail(ref.id, 'history', 'A completion owner cannot derive from itself')));
 }
 /** Addressed selector. Missing a known managed ordinal is damage, never a legacy fallback. */
 export function readCompletionBinding(store: Store, project: string, series: Ref, ordinal: number): SeriesResult<Sealed<Revision<CompletionOwner> | null>> {
@@ -3643,22 +3048,19 @@ export function answersGateAssignment(binding: Revision<CompletionOwner>): Revis
   return { id: completionAssignmentId(value.project, binding.id, value.key), kind: COMPLETION_ASSIGNMENT_KIND,
     revision: 1, hash: hashJson(value), value };
 }
-/** The saved check equals its derivation from the exact binding; only a block owner has one (№1628 Q2). */
+/** NR1 (№3600): a trusted read — the check was written as its derivation from the exact block binding (№1628 Q2). */
 export function readAnswersGateAssignmentAt(store: Store, project: string, ref: Ref): SeriesResult<Sealed<Revision<AnswersGateAssignment>>> {
   requireStore(store); requireProject(project);
   check(isRef(ref), 'series_request_invalid', 'An answers-gate assignment is read by an exact reference');
-  return completionResult(() => historicalRead(store, { reader: 'G7.answers-assignment', project, ref }, () => {
-    const record = completionExact<AnswersGateAssignment>(store, project, ref, COMPLETION_ASSIGNMENT_KIND);
-    const value = record.value;
-    if (!isPlainObject(value) || value.contract !== ANSWERS_GATE_ASSIGNMENT_CONTRACT || value.project !== project
-      || !isRef(value.binding) || !exactKeys(value, ['contract', 'project', 'binding', 'key', 'kind', 'owner', 'goal', 'plan']))
-      completionFail(ref.id, 'assignment', 'The answers-gate assignment retains its full exact contract');
-    const binding = completionTake(readCompletionOwnerAt(store, project, value.binding));
-    if (binding.value.owner.kind !== 'block') completionFail(ref.id, 'owner', 'Only a block owner has an answers-gate check');
-    if (canonical(record) !== canonical(answersGateAssignment(binding)))
-      completionFail(ref.id, 'assignment', 'The answers-gate assignment must equal its derivation from the exact binding');
-    return record;
-  }, () => completionFail(ref.id, 'history', 'An answers-gate assignment cannot derive from itself')));
+  return completionResult(() => historicalRead(store, { reader: 'G7.answers-assignment', project, ref },
+    () => {
+      const row = completionExact<AnswersGateAssignment>(store, project, ref, COMPLETION_ASSIGNMENT_KIND);
+      // The two assignment contracts share one kind; each is read only by the reader of its own contract.
+      if (!isPlainObject(row.value) || row.value.contract !== ANSWERS_GATE_ASSIGNMENT_CONTRACT)
+        completionFail(ref.id, 'contract', 'A physical assignment is read by its own reader, never as an answers check');
+      return row;
+    },
+    () => completionFail(ref.id, 'history', 'An answers-gate assignment cannot derive from itself')));
 }
 /** G7's managed A3 preparer returns the indivisible opening bundle, never an unbacked S write. */
 export function prepareManagedBeginAttempt(store: Store, request: AnyBeginAttemptRequest): SeriesResult<Sealed<AnySeriesTransition>> {

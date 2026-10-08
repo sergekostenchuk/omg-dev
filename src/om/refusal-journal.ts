@@ -164,10 +164,6 @@ const RECORD_KEYS = Object.freeze(["gate", "refusals"] as const);
 const ENTRY_KEYS = Object.freeze([...ENTRY_TEXTS, "origin"] as const);
 const ORIGIN_KEYS = Object.freeze([...ORIGIN_TEXTS, "sources"] as const);
 const SOURCE_KEYS = Object.freeze(["role", "ref"] as const);
-const ROW_KEYS = Object.freeze(["id", "gate", "code", "goal", "remedy", "origin", "source"] as const);
-const CLASSIFICATION_TEXTS = Object.freeze(["row", "class", "addressee"] as const);
-const CLASSIFICATION_KEYS = Object.freeze([...CLASSIFICATION_TEXTS, "basis"] as const);
-const JOURNAL_KEYS = Object.freeze(["projectId", "rows", "classifications"] as const);
 const WRITE_KEYS = Object.freeze(["id", "kind", "expected", "value"] as const);
 const BATCH_KEYS = Object.freeze(["project", "sources", "pending", "classifications"] as const);
 
@@ -179,8 +175,6 @@ interface Prepared { readonly transition: JournalTransition; readonly current: R
 // The same shape is read on two paths: as it arrives from a gate, and as it already stands in the journal. What is
 // wrong is the same; who is at fault is not, so each path carries its own codes.
 const INCOMING: Codes = { entry: "refusal_entry_invalid", origin: "origin_invalid", source: "origin_source_invalid" };
-const STORED: Codes = { entry: "journal_invalid", origin: "journal_invalid", source: "journal_invalid" };
-
 function frameContextShape(value: unknown): value is FrameRequest {
   if (!isPlainObject(value) || !exactKeys(value, ["project", "level", "horizon", "graph", "layer", "frame", "upper",
     ...(Object.hasOwn(value as object, "workZoneContract") ? ["workZoneContract"] : [])])) return false;
@@ -736,10 +730,8 @@ export function readJournalAt(store: Store, project: string, ref: Ref): OmResult
   // the exact {id, revision, hash}; the refusal context keeps the reference as it was received. Only a successful
   // result is reused, a refusal or a fault runs again; a repeated entry into the same active key is a cyclic proof.
   const derive = (source: Store): OmResult<Sealed<Revision<RefusalJournal>>> => {
-    const read = readRecord<RefusalJournal>(source, ref, { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
-    if (!read.ok) return read;
-    const broken = checkJournal(source, read.value.value, project, { target, ref });
-    return broken ?? read;
+    // NR (№3600): a trusted read — every journal revision was checked by its batch producer when it was new.
+    return readRecord<RefusalJournal>(source, ref, { unit: UNIT, target, kind: REFUSAL_JOURNAL_KIND, id: target });
   };
   if (journalProofExecutor === null) return derive(store);
   const exact: Ref = { id: ref.id, revision: ref.revision, hash: ref.hash };
@@ -837,126 +829,6 @@ function checkOrigin(value: unknown, context: Context, path: string, codes: Code
     const item = sources[index];
     const issue = sourceIssue(item);
     if (issue !== null) return problem(codes.source, "A source needs its role, exact reference and complete context", context, issue ? `${where}.${issue}` : where);
-  }
-  return null;
-}
-
-function checkJournal(store: Store, value: unknown, project: string, context: Context): OmResult<never> | null {
-  const marked = isPlainObject(value) && Object.hasOwn(value as object, "sourceOrder");
-  if (!isPlainObject(value) || !exactKeys(value, [...JOURNAL_KEYS, ...(marked ? ["sourceOrder"] : [])]))
-    return problem("journal_invalid", "A journal carries its project and its rows", context, "value");
-  const journal = value as Record<string, unknown>;
-  // An absent order is the fec6932 era; a present one names the order this unit writes, and nothing else (№2556-3).
-  if (marked && journal['sourceOrder'] !== SOURCE_ORDER)
-    return problem("journal_invalid", "A journal names the order of its sources only as this unit writes it", context, "sourceOrder");
-  const order = journal['sourceOrder'] as SourceOrder | undefined;
-  const projectId = journal['projectId'];
-  if (!isText(projectId)) return problem("journal_invalid", "A journal names the project it belongs to", context, "projectId");
-  // A journal of another project standing at this address is not this project's journal, however well it reads.
-  if (projectId !== project) return problem("journal_foreign", `A journal of ${String(projectId)} cannot stand for ${project}`, context, "projectId");
-  const rows = journal['rows'];
-  if (!Array.isArray(rows)) return problem("journal_invalid", "A journal carries a set of rows", context, "rows");
-  const seen = new Set<string>();
-  const answers = new Set<string>();
-  const derived = new Map<string, ReadonlyMap<string, JournalRow>>();
-  for (let index = 0; index < rows.length; index += 1) {
-    const path = `rows.${index}`;
-    const row = rows[index];
-    if (!isPlainObject(row) || !exactKeys(row, ROW_KEYS)) return problem("journal_invalid", "A journal row carries its id, its gate, the refusal and the record it was taken from", context, path);
-    const fields = row as Record<string, unknown>;
-    const id = fields['id'];
-    const gate = fields['gate'];
-    const from = fields['source'];
-    if (!isText(id) || !isText(gate)) return problem("journal_invalid", "A journal row names its id and its gate", context, `${path}.id`);
-    if (!isRef(from)) return problem("journal_invalid", "A journal row names the exact record it was taken from", context, `${path}.source`);
-    const bad = checkRefusal({ code: fields['code'], goal: fields['goal'], remedy: fields['remedy'], origin: fields['origin'] }, context, path, STORED);
-    if (bad) return bad;
-    // T3: the row is derived AGAIN from the refusal record it names, not read back from its own fields. A row that
-    // merely agrees with itself — content rewritten and its id recomputed to match — is not a refusal the gate gave.
-    const produced = rowsOfSource(store, project, from, context, path, derived, order);
-    if ("ok" in produced) return produced;
-    const rowId = id as string;
-    const original = produced.get(rowId);
-    if (!original || hashJson(original) !== hashJson(row)) {
-      return problem("journal_invalid", "A journal row does not hold the refusal the record it names produced", context, path);
-    }
-    if (seen.has(rowId)) return problem("journal_invalid", "A journal holds each refusal once", context, `${path}.id`);
-    seen.add(rowId);
-    if (answersRowMarks(project, original).any) answers.add(rowId);
-  }
-  return checkClassifications(journal['classifications'], seen, context, answers, order);
-}
-
-/**
- * The rows the named refusal record produces, derived by the same function that appends them.
- * The record is read at the EXACT revision the row names, so a gate that has since rewritten its record does not
- * make a row journalled earlier false; and it is read as this project's refusal record, so a row cannot borrow its
- * ground from another project or from a record of another kind.
- */
-function rowsOfSource(
-  store: Store, project: string, source: Ref, context: Context, path: string,
-  derived: Map<string, ReadonlyMap<string, JournalRow>>, order: SourceOrder | undefined,
-): ReadonlyMap<string, JournalRow> | OmResult<never> {
-  const key = `${source.id}:${source.revision}:${source.hash}`;
-  const known = derived.get(key);
-  if (known) return known;
-  const read = readRecord<UnitRefusalRecord>(store, source, {
-    unit: UNIT, target: context.target, kind: UNIT_REFUSAL_KIND, idPrefix: unitRefusalNamespace(project),
-  });
-  if (!read.ok) {
-    return problem("journal_invalid", `The record a row names is not a refusal of this project: ${read.refusal.code}`, context, `${path}.source`);
-  }
-  const broken = checkUnitRefusalRecord(read.value.value, context);
-  if (broken) return problem("journal_invalid", "The record a row names holds no refusal it could have come from", context, `${path}.source`);
-  // C36: a G4b row is read through the same typed derivation that admitted it, and refused where none is loaded.
-  const answers = answersSourceIssue(store, project, source, read.value.value);
-  if (answers !== null) {
-    return problem("journal_invalid", `The record a row names is not a G4b source its typed reader proves: ${answers.refused ? answers.refused.code : answers.field}`,
-      context, `${path}.source`);
-  }
-  const rows = new Map<string, JournalRow>();
-  for (const entry of read.value.value.refusals) {
-    const row = rowOf(read.value.value.gate, entry, source, order);
-    rows.set(row.id, row);
-  }
-  derived.set(key, rows);
-  return rows;
-}
-
-function checkClassifications(value: unknown, rows: ReadonlySet<string>, context: Context, answers: ReadonlySet<string>,
-  order: SourceOrder | undefined): OmResult<never> | null {
-  // A journal of the earlier shape, which carried no set of classifications at all, is not an unclassified journal:
-  // "nothing classified yet" is said with an empty set, and an absent one says nothing (T4).
-  if (!Array.isArray(value)) return problem("journal_invalid", "A journal carries its set of classifications, explicitly empty until G7 has classified a refusal", context, "classifications");
-  const classified = new Set<string>();
-  for (let index = 0; index < value.length; index += 1) {
-    const path = `classifications.${index}`;
-    const item = value[index];
-    if (!isPlainObject(item) || !exactKeys(item, CLASSIFICATION_KEYS)) {
-      return problem("journal_invalid", "A classification carries the row it stands for, its class, its addressee and its grounds", context, path);
-    }
-    const fields = item as Record<string, unknown>;
-    for (const field of CLASSIFICATION_TEXTS) {
-      if (!isText(fields[field])) return problem("journal_invalid", `A classification names its ${field}`, context, `${path}.${field}`);
-    }
-    const basis = fields['basis'];
-    if (!Array.isArray(basis)) return problem("journal_invalid", "A classification carries the grounds it was derived from", context, `${path}.basis`);
-    for (let ground = 0; ground < basis.length; ground += 1) {
-      const where = `${path}.basis.${ground}`;
-      const issue = sourceIssue(basis[ground]);
-      if (issue !== null) return problem("journal_invalid", "A ground needs its role, exact reference and complete context", context, issue ? `${where}.${issue}` : where);
-    }
-    if (hashJson(classificationOf(item as unknown as RefusalClassification, order)) !== hashJson(item)) {
-      return problem("journal_invalid", "A classification is not held as this unit writes one", context, path);
-    }
-    const row = fields['row'] as string;
-    // A classification of a refusal this journal does not hold stands for nothing, and a second one for the same
-    // row would leave two answers where G7 decided once.
-    if (!rows.has(row)) return problem("journal_invalid", "A classification stands for a refusal this journal does not hold", context, `${path}.row`);
-    // №1628 Q1: a G4b row is an observation or a pointer to an existing ground, never a refusal G7 classifies.
-    if (answers.has(row)) return problem("journal_invalid", "A G4b row is never classified: a stored classification of one is not a decision G7 took", context, `${path}.row`);
-    if (classified.has(row)) return problem("journal_invalid", "A refusal is classified once", context, `${path}.row`);
-    classified.add(row);
   }
   return null;
 }

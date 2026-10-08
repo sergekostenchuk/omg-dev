@@ -22,7 +22,7 @@ export function initialize(data) { root = data.root; repository = data.repositor
 const bodies = {
   'src/om/layer-basis.js': { verifyHistoricalBasis: ["C5", "request"] },
   'src/om/frame-obligations.js': { frameSources: ["C2.basis", "request"], frameDerive: ["C2.derive", "request"] },
-  'src/om/frame-candidate.js': { verifyRecordSources: ["C4", "{ id: row.id, revision: row.revision, hash: row.hash, request: row.value.request }"] },
+  // NR1 (№3600): C4 verifyRecordSources and A2 checkJournal are gone — a saved candidate and journal are read as written.
   'src/om/gap-lines.js': { deriveHistory: ["D2", "{project, ref}"] },
   'src/om/gaps.js': { deriveMaterialized: ["D1", "request", "!current"], deriveGapRecords: ["D1.records", "request"] },
   'src/om/atomic-gate.js': { deriveGate: ["G5", "request", "!current"] },
@@ -32,7 +32,6 @@ const bodies = {
   // attempt (need_source) is another derivation; without them two packets of one attempt looked like one key twice.
   'src/om/question-packet.js': { derivePacket: ["E2.derive", "[request.routes, request.batch, request.attempt ?? null, request.previous.length, request.environment, request.continuation ?? null]", "!current"],
     previousRefusals: ["E2.refusals", "[batch.id, request.attempt ?? null]", "!current"] },
-  'src/om/refusal-journal.js': { checkJournal: ["A2.checkJournal", "context.ref ?? context.target"] },
   'src/om/answers-gate.js': { deriveAnswersGroups: ["G4b.groups", "{ id: evaluation.id, revision: evaluation.revision, hash: evaluation.hash }"] },
   'src/om/model-call.js': { deriveCompletionSnapshot: ["G7.snapshot", "{ id: work.id, revision: work.revision, hash: work.hash }"] },
 };
@@ -122,9 +121,10 @@ export async function load(url, context, nextLoad) {
       // S1.3 (№2185-4): a proof kept by an earlier operation serves this one only after its footprint check; whether it
       // served or had moved is observed apart. PF4: the check is the chain and the events after the proof's mark. Absent in
       // builds before PF4 (whose own anchor no longer matched since PF1), so optional.
-      const kept = 'if (chainsIntact(kept.events) && currentJournal(kept.events)) {';
-      if (source.split(kept).length === 2)
-        source = source.replace(kept, 'if ((current => globalThis.__operationCost.kept?.(key, source, current) ?? current)(chainsIntact(kept.events) && currentJournal(kept.events))) {');
+      // NR1 (№3600): the chains and read functions are not checked again at a reuse — the events after the mark decide.
+      const kept = 'if (currentJournal(kept.events)) {';
+      if (source.split(kept).length !== 2) throw new Error('The reuse decision of a kept proof was not identified');
+      source = source.replace(kept, 'if ((current => globalThis.__operationCost.kept?.(key, source, current) ?? current)(currentJournal(kept.events))) {');
       source += '\nglobalThis.__operationCost.sourceView = sourceView;\n';
     }
   }
@@ -234,6 +234,10 @@ Store.prototype.get = function (...args) { if (active) { active.get++; if (args[
 Store.prototype.list = function (...args) { if (active) active.list++; return originalList.apply(this, args); };
 const stores = [], reports = [], paths = new WeakMap();
 function ok(result) { if (!result.ok) assert.fail(result.refusal.code + ': ' + result.refusal.message); return result.value; }
+// NR1 (№3600): the producer's check of a new combination (reader X.fresh) and the trusted read of the same saved request
+// (reader X) are two proofs by design, each expanding once per view.
+const freshAndTrusted = (attempts, count, view) => count === 2 && attempts.length === 2 && attempts.every(attempt => attempt && attempt.view === view)
+  && new Set(attempts.map(attempt => attempt.reader)).size === 2 && new Set(attempts.map(attempt => attempt.reader.replace(/\.fresh$/, ''))).size === 1;
 function measured(label, operation, unique = true) {
   assert.equal(active, null);
   const sample = { proofs: new Map(), bodyAttempts: new Map(), attempts: [], misses: new Map(), get: 0, heads: 0, list: 0 }; active = sample;
@@ -242,6 +246,7 @@ function measured(label, operation, unique = true) {
   const repeated = [...sample.proofs].filter(([identity, count]) => {
     if (count <= 1) return false;
     const attempts = sample.bodyAttempts.get(identity), view = JSON.parse(identity)[1];
+    if (freshAndTrusted(attempts, count, view)) return false;
     // Only the common mechanism's explicit per-attempt refusal to cache permits repeated expansion.
     // A Proxy type alone, another reader's exclusion, or several body calls inside one action do not.
     return !(attempts.length === count && new Set(attempts).size === count
@@ -371,7 +376,10 @@ try {
     assert.deepEqual(next.result, cold.result);
     // PF3.3 (№3587): no residual reread inside a traced read leaves the derivation unaccounted any more — the history it
     // proved is complete and kept at the Store, so the next operation reuses it by the Store's events.
-    assert.equal(next.sample.proofs.size, 0, 'The next external preparation reuses the complete histories kept at the Store');
+    // NR1 (№3600): the basis of the saved layer (C5) is read as written — by its exact references, nothing unfolded — and the
+    // preparation of a new operation may read it again; every other history is reused from the Store.
+    assert.deepEqual([...next.sample.proofs.keys()].map(key => JSON.parse(key)[0]).filter(family => family !== 'C5'), [],
+      'The next external preparation reuses the complete histories kept at the Store');
     const warm = withHistoricalReads(() => {
       ok(prepareGapLines(copy, request));
       return measured('prepareGapLines.warm.' + size, () => ok(prepareGapLines(copy, request)));
@@ -406,7 +414,10 @@ try {
       withHistoricalReads(() => {
         ok(confirmResults(copy, confirmation));
         const separate = measured('confirmResults.separate-store', () => ok(confirmResults(other, confirmation)));
-        assert.deepEqual(separate.result, confirmed.result); assert.ok(separate.sample.proofs.size > 0, 'The same database does not merge distinct Stores');
+        // NR1: a distinct Store keeps no proof of another in memory; it may take what that one saved in the database (PF4
+        // §5.2) — now that saved histories are read as written, all of them are — so it proves at most what the first did.
+        assert.deepEqual(separate.result, confirmed.result);
+        assert.ok(separate.sample.proofs.size <= confirmed.sample.proofs.size, 'The same database does not merge distinct Stores beyond their saved proofs');
       });
     }
   }
@@ -420,18 +431,12 @@ try {
   const witness = accepted.record.value.gate;
   withHistoricalReads(() => {
     const original = ok(readAcceptedFrame(pendingStore, acceptance));
+    // NR1 (№3591/№3646): the accepted frame is read as written — the gate it names is not read again on the way, so a view
+    // hiding it reads the same frame; a revision missing from the database is found by om-fsck at the start (reference_missing).
     hidden = witness;
-    const absent = readAcceptedFrame(pending, acceptance);
-    assert.equal(absent.ok, false, 'A separate pending view cannot borrow the source Store proof when its gate is missing');
-    assert.ok(absent.refusal.at.target && absent.refusal.at.field);
+    assert.deepEqual(ok(readAcceptedFrame(pending, acceptance)), original);
     hidden = null;
     assert.deepEqual(ok(readAcceptedFrame(pending, acceptance)), original);
-    hidden = witness;
-    const changed = readAcceptedFrame(pending, acceptance);
-    assert.equal(changed.ok, false, 'Changing a visible pending dependency invalidates its successful proof inside the same scope');
-    assert.ok(changed.refusal.at.target && changed.refusal.at.field);
-    hidden = null;
-    assert.deepEqual(ok(readAcceptedFrame(pending, acceptance)), original, 'A refused proof is not cached and its restored source can be checked again');
   });
   const currentStore = cloneStore(seed.database, 'current-admission');
   ok(prepareWorksAcceptance(currentStore, f.request));
@@ -440,8 +445,11 @@ try {
   const stale = prepareWorksAcceptance(currentStore, f.request);
   assert.equal(stale.ok, false, 'The next public preparation observes a moved current prerequisite');
   assert.equal(stale.refusal.code, 'input_stale');
-  for (const family of ['C5', 'C2.basis', 'C2.derive', 'C4', 'D1', 'D1.records', 'D2', 'G5'])
+  for (const family of ['C5', 'C2.basis', 'C2.derive', 'D1.records', 'D2'])
     assert.ok(reports.some(report => report[family] > 0), 'The genuine scenario reached ' + family);
+  // NR1 (№3591): the historical D1 materialization and G5 derivation never run — saved gaps and gates are read as written.
+  for (const family of ['D1', 'G5'])
+    assert.ok(reports.every(report => !(report[family] > 0)), 'A saved record is read as written, ' + family + ' is not derived again');
   assert.equal(readFileSync(seed.trace, 'utf8'), seed.traceBytes, 'Proof operations do not send another adapter request');
   console.log(JSON.stringify({ reports }));
 } finally {
@@ -589,6 +597,10 @@ function begin(label) {
     reads: { unfold: { exact: 0, head: 0, list: 0, history: 0 }, footprint: { exact: 0, head: 0, list: 0, history: 0 } } };
   active = sample; return sample;
 }
+// NR1 (№3600): the producer's check of a new combination (reader X.fresh) and the trusted read of the same saved request
+// (reader X) are two proofs by design, each expanding once per view.
+const freshAndTrusted = (attempts, count, view) => count === 2 && attempts.length === 2 && attempts.every(attempt => attempt && attempt.view === view)
+  && new Set(attempts.map(attempt => attempt.reader)).size === 2 && new Set(attempts.map(attempt => attempt.reader.replace(/\.fresh$/, ''))).size === 1;
 function measured(label, operation) {
   const sample = begin(label); let result;
   try { result = operation(); } finally { active = null; }
@@ -611,6 +623,7 @@ function finish(label, sample, result) {
   const repeated = [...sample.proofs].filter(([identity, count]) => {
     if (count <= 1) return false;
     const attempts = sample.bodyAttempts.get(identity), view = JSON.parse(identity)[1];
+    if (freshAndTrusted(attempts, count, view)) return false;
     return !(attempts.length === count && new Set(attempts).size === count
       && attempts.every(attempt => attempt && attempt.view === view) && attempts.slice(1).every(excused)
       && new Set(attempts.map(attempt => attempt.identity)).size === 1);
@@ -775,10 +788,13 @@ try {
   const cold = withHistoricalReads(() => {
     const first = measured('fixed.readQuestionPacket.1', () => readPacket(fixed));
     assert.deepEqual(first.result, third.packet);
-    for (const family of ['E2.derive', 'E2.refusals', 'A2.checkJournal', 'G4b.groups', 'G7.snapshot']) assert.ok(first.report.families[family] > 0, 'The cold packet proof reached ' + family);
-    for (const reader of ['E2.question-packet', 'A2.readJournalAt', 'G4b.refusal', 'G4b.finding', 'G4b.evaluation', 'G7.completion-work'])
-      assert.ok(first.report.executions[reader] > 0, 'The cold packet proof executed ' + reader);
-    assert.equal(first.report.regions - first.report.temporary, 1, 'A read on the real Store proves in one region apart from the temporary views of its history: ' + JSON.stringify(first.report.origins));
+    // NR1 (№3591): a saved packet is read as written — its history (E2 derivation, preceding refusals) is not derived again.
+    for (const family of ['E2.derive', 'E2.refusals']) assert.equal(first.report.families[family] ?? 0, 0, 'The cold packet read does not derive ' + family);
+    // One exact read, or none when the read saved with the database (PF4) serves it.
+    assert.ok((first.report.executions['E2.question-packet'] ?? 0) <= 1, 'The cold packet read is one exact read: ' + JSON.stringify(first.report.executions));
+    assert.deepEqual(Object.keys(first.report.executions).filter(reader => reader !== 'E2.question-packet'), [], 'The cold packet read proves nothing else');
+    // NR1: at most the one region of the real Store — none when the read saved with the database (PF4) serves it.
+    assert.ok(first.report.regions - first.report.temporary <= 1, 'A read on the real Store proves in at most one region: ' + JSON.stringify(first.report.origins));
     for (const size of [2, 4]) {
       const again = repeats('fixed.readQuestionPacket', size, () => readPacket(fixed));
       assert.deepEqual(again.result, third.packet);
@@ -791,10 +807,10 @@ try {
   withHistoricalReads(() => {
     const first = measured('fixed.readJournalAt.1', () => readJournal(fixed));
     assert.deepEqual(reference(first.result), third.journal);
-    // The exact revision proves the earlier revisions its G4b rows lead to, each distinct key once.
-    assert.ok(first.report.executions['A2.readJournalAt'] >= 1 && first.report.executions['A2.readJournalAt'] === first.report.keys['A2.readJournalAt'],
-      'Every exact journal key proves once: ' + JSON.stringify([first.report.executions, first.report.keys]));
-    assert.equal(first.report.families['A2.checkJournal'], first.report.keys['A2.readJournalAt']);
+    // NR1 (№3591): the exact revision is read as written; its earlier revisions are not proved again (each key at most once).
+    assert.equal(first.report.executions['A2.readJournalAt'] ?? 0, first.report.keys['A2.readJournalAt'] ?? 0,
+      'Every exact journal key is read at most once: ' + JSON.stringify([first.report.executions, first.report.keys]));
+    assert.ok((first.report.keys['A2.readJournalAt'] ?? 0) <= 1, 'Only the exact journal revision is read: ' + JSON.stringify(first.report.keys));
     for (const size of [2, 4]) {
       const again = repeats('fixed.readJournalAt', size, () => readJournal(fixed));
       assert.deepEqual(again.result, first.result);
@@ -805,10 +821,13 @@ try {
   const external = measured('fixed.readQuestionPacket.external', () => readPacket(fixed));
   // S1.3 (№2185-4): a new operation of the same Store reuses the kept complete proofs instead of proving history again.
   assert.deepEqual(external.result, cold.result);
-  assert.ok(external.report.misses < cold.report.misses, 'A new operation of the same Store reuses its kept proofs: ' + external.report.misses + ' of ' + cold.report.misses);
+  // NR1: the saved packet is one exact read, kept with the Store and saved with the database (PF4) — a new operation and a
+  // reopened Store run at most that one read again and never its history.
+  assert.ok(external.report.misses <= cold.report.misses, 'A new operation of the same Store reuses its kept proofs: ' + external.report.misses + ' of ' + cold.report.misses);
   const reopened = new Store(paths.get(fixed)); stores.push(reopened);
   const restarted = measured('fixed.readQuestionPacket.restart', () => readPacket(reopened));
-  assert.deepEqual(restarted.result, cold.result); assert.ok(restarted.report.misses > 0, 'A new Store proves history again');
+  assert.deepEqual(restarted.result, cold.result);
+  for (const family of ['E2.derive', 'E2.refusals']) assert.equal(restarted.report.families[family] ?? 0, 0, 'A reopened Store does not derive ' + family);
   assert.equal(hashJson(restarted.result.value), third.packet.hash);
   // A6: the owner's decision continues the series; attempt 4 carries the refusals of attempt 3, pays its own calls and ends with a result.
   const decision = f.store.write({ id: ownerDecisionNamespace(project) + 's11-go-on', kind: OWNER_DECISION_KIND, expected: 0,
@@ -911,10 +930,14 @@ test('S1.1 a real block ladder 1/2/3 with G4b deliver all reaches A3 and resumes
   const labels = ladder.reports.map(report => report.label);
   for (const attempt of [2, 3, 4]) for (const kind of ['writeQuestionPacket', 'readQuestionPacket', 'writeAnswersEvaluation'])
     assert.ok(labels.includes(kind + '.' + attempt), 'The ladder measured ' + kind + '.' + attempt);
-  for (const reader of ['E2.question-packet', 'A2.readJournalAt', 'G4b.refusal', 'G4b.finding', 'G4b.evaluation', 'G7.completion-work'])
-    assert.ok(ladder.reports.some(report => report.label.startsWith('writeAnswersEvaluation.') && (report.executions[reader] ?? 0) > 0), 'The real evaluation reached ' + reader);
-  for (const family of ['E2.derive', 'E2.refusals', 'A2.checkJournal', 'G4b.groups', 'G7.snapshot'])
+  const evaluated = [...new Set(ladder.reports.filter(report => report.label.startsWith('writeAnswersEvaluation.')).flatMap(report => Object.keys(report.executions)))].sort();
+  // NR1: the saved packet of the attempt is read as written once, before its evaluation (kept since), not inside it.
+  for (const reader of ['A2.readJournalAt', 'G4b.refusal', 'G4b.finding', 'G4b.evaluation', 'G7.completion-work'])
+    assert.ok(ladder.reports.some(report => report.label.startsWith('writeAnswersEvaluation.') && (report.executions[reader] ?? 0) > 0), 'The real evaluation reached ' + reader + ': ' + JSON.stringify(evaluated));
+  for (const family of ['G4b.groups', 'G7.snapshot'])
     assert.ok(ladder.reports.some(report => (report.families[family] ?? 0) > 0), 'The ladder reached ' + family);
+  // NR1 (№3591): a saved packet is read as written — the historical E2 derivation and its preceding refusals never run.
+  for (const family of ['E2.derive', 'E2.refusals']) assert.ok(ladder.reports.every(report => !((report.families[family] ?? 0) > 0)), 'No saved packet is derived again: ' + family);
   assert.ok(ladder.reports.every(report => report.repeats === 0));
   for (const row of ladder.reports) t.diagnostic(JSON.stringify(row));
   for (const row of ladder.unfoldings) t.diagnostic(JSON.stringify(row));
@@ -923,8 +946,10 @@ test('S1.1 a real block ladder 1/2/3 with G4b deliver all reaches A3 and resumes
   // S1.3 (№2185-4, №2201): across all operations of the ladder a complete exact proof of D1/B1/C2 is derived once per
   // Store — never again in a later operation while its footprint is current. On the base (a0957fa) the same ladder derives
   // them again: D1.materialize 45 bodies for 35 identities, B1.readOmInput 90 for 70, C2.frame* 45 for 35.
+  // NR1: D1 is not materialized from saved records any more; what is still read is read once per exact key and Store.
+  assert.ok(cross['B1.readOmInput'] && cross['B1.readOmInput'].executions > 0, 'The ladder read B1');
   for (const reader of ['D1.materialize', 'D1.readGaps', 'B1.readOmInput', 'C2.frameDerive', 'C2.frameBasis']) {
-    assert.ok(cross[reader] && cross[reader].executions > 0, 'The ladder derived ' + reader);
+    if (!cross[reader]) continue;
     assert.equal(cross[reader].repeated, 0, reader + ': one derivation per exact key and Store across operations: ' + JSON.stringify(cross[reader]));
   }
   const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(hooks).href)}, { data: { log: ${JSON.stringify(graph)} } });`;
@@ -937,8 +962,9 @@ test('S1.1 a real block ladder 1/2/3 with G4b deliver all reaches A3 and resumes
   const closed = JSON.parse(isolated.stdout.trim().split('\n').at(-1)!) as { exported: string; alone: { ok: boolean; refusal?: { code: string; message: string; at: { field?: string } } };
     registered: unknown; executed: number; conflict: string | null; malformed: string | null };
   assert.equal(closed.exported, 'function');
-  assert.equal(closed.alone.ok, false, 'Without its typed reader a journal holding G4b rows does not read (C36)');
-  assert.equal(closed.alone.refusal!.code, 'journal_invalid'); assert.match(closed.alone.refusal!.message, /reader$/);
+  // NR1 (№3591): a saved journal is read as written — its G4b rows are not derived again, so the journal module alone reads
+  // it without their typed reader (C36 guarded that derivation on reading).
+  assert.equal(closed.alone.ok, true, 'A saved journal holding G4b rows reads as written without their typed reader');
   assert.deepEqual(closed.registered, closed.alone, 'The executor changes the cost of a repeat, never the derivation, its value or its refusal');
   assert.deepEqual([closed.executed, closed.conflict, closed.malformed], [1, 'journal_proof_conflict', 'journal_request_invalid']);
 });
@@ -1039,10 +1065,10 @@ function rereadPacket(f, prefix, ref) {
   const saved = f.store.get(ref.id, ref.revision);
   f.restart();
   const cold = measured(prefix + '.packet.cold', () => read(f.store));
-  assert.equal(cold.result.hash, saved.hash); assert.ok(cold.report.misses > 0);
-  // The read proves in the one region of the real Store; the history it unfolds may hold works content, whose necessary
-  // temporary views (№1887-6/№1915-5) are counted apart and equal its executed content bodies (checked in finish()).
-  assert.equal(cold.report.regions - cold.report.temporary, 1, 'A read on the real Store proves in one region apart from the temporary views of its history: ' + JSON.stringify(cold.report.origins));
+  assert.equal(cold.result.hash, saved.hash);
+  // NR1 (№3591): the saved packet is read as written, and its read is kept with the Store (PF4 saved proofs) — a reopened
+  // Store may take it without running a proof body, so the cold read has at most the one region of the real Store.
+  assert.ok(cold.report.regions - cold.report.temporary <= 1, 'A read on the real Store proves in at most one region: ' + JSON.stringify(cold.report.origins));
   const hot = withHistoricalReads(() => { read(f.store); return measured(prefix + '.packet.hot', () => read(f.store)); });
   assert.deepEqual(hot.result, cold.result); assert.equal(hot.report.misses, 0);
   assert.deepEqual(hot.report.reads.unfold, { exact: 0, head: 0, list: 0, history: 0 });
@@ -1053,10 +1079,10 @@ function rereadPacket(f, prefix, ref) {
   }
   const kept = measured(prefix + '.packet.kept', () => read(f.store));
   assert.deepEqual(kept.result, cold.result);
-  assert.ok(kept.report.misses < cold.report.misses, 'The next operation of the unchanged Store is served by its kept proofs: ' + kept.report.misses);
+  assert.ok(kept.report.misses <= cold.report.misses, 'The next operation of the unchanged Store is served by its kept proofs: ' + kept.report.misses);
   f.restart();
   const restarted = measured(prefix + '.packet.restart', () => read(f.store));
-  assert.deepEqual(restarted.result, cold.result); assert.ok(restarted.report.misses > 0);
+  assert.deepEqual(restarted.result, cold.result);
   return cold;
 }
 `;
@@ -1260,11 +1286,12 @@ function checkScenario(t: import('node:test').TestContext, run: Awaited<ReturnTy
   assert.ok(run.reports.every(report => report.repeats === 0 && report.cycles === 0));
   for (const reader of ['E2.question-packet', 'A2.readJournalAt', 'G4b.answers', 'G7.completion-work'])
     assert.ok(run.reports.some(report => (report.executions[reader] ?? 0) > 0), 'The real pass reached ' + reader);
-  for (const family of ['E2.derive', 'E2.refusals', 'A2.checkJournal', 'G7.snapshot'])
-    assert.ok(run.reports.some(report => (report.families[family] ?? 0) > 0), 'The real pass reached ' + family);
+  assert.ok(run.reports.some(report => (report.families['G7.snapshot'] ?? 0) > 0), 'The real pass reached G7.snapshot');
+  // NR1 (№3591): a saved packet is read as written — the historical E2 derivation and its preceding refusals never run.
+  for (const family of ['E2.derive', 'E2.refusals']) assert.ok(run.reports.every(report => !((report.families[family] ?? 0) > 0)), 'No saved packet is derived again: ' + family);
   t.diagnostic(JSON.stringify(run.outcomes));
   for (const row of run.reports) t.diagnostic(JSON.stringify({ label: row.label, action: row.action, ms: row.ms, misses: row.misses, regions: row.regions, nested: row.nested,
-    refined: (row as { refinedRepeats?: number }).refinedRepeats, executions: row.executions }));
+    refined: (row as { refinedRepeats?: number }).refinedRepeats, executions: row.executions, families: row.families }));
 }
 
 test('S1.1 mixed N2 on the accepted H1 pass: A positive, B1 negative, B2 positive — and B stopped, reviewed (decided) and continued by the pass; history costs by exact keys', async t => {
@@ -1282,8 +1309,10 @@ test('S1.1 L3 produce → consume on the accepted H1 pass with mixed outcomes: n
   t.diagnostic(JSON.stringify(cross));
   const content = cross['E2.works-proposal-content'];
   assert.ok(content && content.executions > 0, 'The real pass reached the work-part content');
-  assert.ok(content.served > 0, 'Later operations take the kept work-part content');
-  assert.ok(content.repeated < content.identities, 'The work-part content is not derived again in every operation: ' + JSON.stringify(content));
+  // NR1 (№3591): the work-part content is the parse of a new answer — once per answer; a saved packet carrying it is read
+  // as written, so later operations neither derive nor take it again.
+  assert.equal(content.executions, content.identities, 'Each work-part content is parsed once: ' + JSON.stringify(content));
+  assert.equal(content.repeated, 0, 'The work-part content is not derived again: ' + JSON.stringify(content));
 });
 
 // E2.2 (№1801, №1792): the causes of the preceding attempt reach the repeated packet by the exact chain attempt → claimed
@@ -1445,8 +1474,9 @@ try {
   withHistoricalReads(() => {
     const cold = measured('fixed.readQuestionPacket.2', () => readSecond(fixed));
     assert.deepEqual(cold.result, second.packet);
-    for (const family of ['E2.derive', 'E2.refusals', 'A2.checkJournal']) assert.ok(cold.report.families[family] > 0, 'The cold proof reached ' + family);
-    assert.ok(cold.report.executions['E5.assessment-refusal'] > 0, 'The cold proof proved the E5 cause through its own reader, not by the text of the row');
+    // NR1 (№3591): the saved packet is read as written — its E2 derivation and the E5 cause of its refusals were proved
+    // when it was written (the producer path above) and are not derived again on reading.
+    for (const family of ['E2.derive', 'E2.refusals']) assert.equal(cold.report.families[family] ?? 0, 0, 'The cold read does not derive ' + family);
   });
   console.log(JSON.stringify({ reports, outcomes: { questions: batch.items.map(item => item.target + '/' + item.field), delivered: third.packet.value.packet.refusals, capacity, fullChars: blocked.value.fullChars } }));
 } finally {

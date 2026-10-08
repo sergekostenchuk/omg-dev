@@ -1,4 +1,4 @@
-import { canonical, hashJson, type Json } from '../canonical.js';
+import { canonical, hashJson} from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { composeLayer, layerDesignOf } from '../graph/layer-design.js';
 import { type Binding, type Endpoint, type Graph } from '../graph/model.js';
@@ -11,10 +11,10 @@ import { requireGraph, validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
-import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals, readFrameProposals,
+import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals,
   type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
-import { historicalProof, withHistoricalReads } from './input.js';
+import { withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 
@@ -585,34 +585,6 @@ function deriveCandidate(frame: FrameRead, proposals: ProposalObservation[], wor
     return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly);
   });
 }
-function verifyRecord(store: Store, row: Revision<FrameCandidateRecord>, project: string): void {
-  const value = row.value;
-  if (row.kind !== 'frame-candidate' || row.revision !== 1 || !object(value) || value.project !== project
-    || !object(value.request) || !object(value.graph) || !object(value.base) || !Array.isArray(value.proposals)
-    || row.hash !== hashJson(value)) reject('candidate_graph_mismatch', row.id, 'record', 'An immutable candidate names its own exact content and source request');
-  checkedEra(value, row.id);
-  try { requireRequest(value.request); }
-  catch (error) {
-    if (error instanceof EngineError && error.code === 'candidate_request_invalid')
-      reject('candidate_graph_mismatch', row.id, 'request', 'The saved candidate source request is incomplete');
-    throw error;
-  }
-  if (value.request.frame.project !== project || ![2, 3].includes(value.request.frame.level) || !same(value.request, normalizeRequest(value.request)))
-    reject('candidate_graph_mismatch', row.id, 'request', 'A candidate must have canonical sources for its own project and supported level');
-  requireLevel({ request: value.request.frame }, value.request.works);
-  historicalProof(store, { reader: 'C4.verifyRecord', project, ref: reference(row), parameters: value.request as unknown as Json },
-    source => verifyRecordSources(source, row),
-    () => reject('candidate_graph_mismatch', row.id, 'history', 'The exact candidate must not depend on itself'));
-}
-function verifyRecordSources(store: Store, row: Revision<FrameCandidateRecord>): void {
-  const value = row.value;
-  const sources = take(readFrameProposals(store, value.request));
-  if (value.level === 3) checkedWorksBasis(store, value.request, false);
-  const expected = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], value.request.works, checkedEra(value, row.id)));
-  if (expected.state === 'candidate' && value.level === 3) checkWorkObligations(store, value.request, expected.candidate as FrameCandidate);
-  if (expected.state !== 'candidate' || !same(value, { ...expected.candidate, request: value.request }) || row.id !== idOf(expected.candidate as FrameCandidate))
-    reject('candidate_graph_mismatch', row.id, 'graph', 'The complete candidate must be rederived from its saved sources');
-}
 export function readCandidate(store: Store, request: CandidateReadRequest): CandidateResult<Revision<FrameCandidateRecord>> {
   requireStore(store); requireRead(request); request = copy(request);
   return outcome(() => {
@@ -622,9 +594,8 @@ export function readCandidate(store: Store, request: CandidateReadRequest): Cand
       if (loaded.refusal.code === 'record_missing') reject('candidate_missing', request.candidate.id, 'candidate', loaded.refusal.message);
       throw new CandidateFailure(loaded.refusal);
     }
-    const row = loaded.value as Revision<FrameCandidateRecord>;
-    verifyRecord(store, row, request.project);
-    return row;
+    // NR (№3600): a trusted read — prepareCandidate derived the saved candidate from its exact sources once.
+    return loaded.value as Revision<FrameCandidateRecord>;
   });
 }
 /** Observe the saved refusal object and its sources without declaring its assembly or G3 successful. */
@@ -678,7 +649,6 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
     const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
     const common = { guards: unique([...sources.guards, ...(basis?.guards ?? [])]) as Ref[], expected: sources.expected as PreparedFrame['expected'] };
     const existingResult = (existing: Revision<FrameCandidateRecord>, candidate: FrameCandidate): PreparedCandidate => {
-      verifyRecord(store, existing, request.frame.project);
       const { request: _request, ...content } = existing.value;
       if (!same(content, candidate)) reject('candidate_graph_mismatch', existing.id, 'candidate', 'An existing candidate with this identity has a different derived result');
       if (candidate.level === 3) checkWorkObligations(store, request, candidate);

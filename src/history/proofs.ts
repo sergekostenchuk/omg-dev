@@ -57,10 +57,6 @@ interface ReadJournal {
    * had — exact ones included, which no footprint holds — and the trusted recovery snapshots it read (null). Any reuse
    * needs every one of these chains intact. */
   chains: Map<Store, Store | null>;
-  /** PF1 (№2846): the read methods each delegated read actually invoked, by the object it was invoked on, taken before the
-   * read; a reuse resolves them the same way and needs the very same functions. Never overwritten: one object and method
-   * seen with two functions is a `conflict`, and such a proof is not reused as one derived under one unchanged chain. */
-  methods: Map<object, Map<string, unknown>>; conflict: boolean;
   /** A listed reader over the proven family of a genuine Store: its closure reads are observed (S1.4, №2410). */
   observing: boolean;
   /** PF3.1 (№3459 §4): a cycle answered by onCycle while this proof or a nested one ran — whatever an action made of that
@@ -161,24 +157,10 @@ function observeReference(trace: HistoricalTrace, ref: Ref, head: boolean, metho
 function recordRead(event: ReadEvent | ReadJournal): void {
   if (!checkingFootprint) proofCaptures.at(-1)?.entries.push(event);
 }
-function readSignature(source: Store, records: readonly Revision<unknown>[], bodies = false): string {
-  return digest(canonical(bodies || isProxy(source) && !historicalSnapshots.has(source) ? records : records.map(row => ({ ...reference(row), kind: row.kind }))));
-}
-function noteMethod(journal: ReadJournal, holder: object, name: string, invoked: unknown): void {
-  let names = journal.methods.get(holder);
-  if (!names) { names = new Map(); journal.methods.set(holder, names); }
-  if (!names.has(name)) names.set(name, invoked);
-  else if (names.get(name) !== invoked) journal.conflict = true;
-}
-/** PF1 (№2827): every pending layer a proof read through still reaches the witness its reads had, and every trusted
- * recovery snapshot still reads through the very members of the base it was trusted over. */
-function chainsIntact(journal: ReadJournal): boolean {
-  if (journal.conflict) return false;
-  for (const [holder, names] of journal.methods)
-    for (const [name, invoked] of names) if (Reflect.get(holder, name, holder) !== invoked) return false;
-  for (const [view, witness] of journal.chains)
-    if (witness === null ? !snapshotIntact(view) : readServer(view, 'list', undefined, undefined, true) !== witness) return false;
-  return true;
+/** NR1 (№3600): a read is identified by the exact revisions it selected — id, revision, hash and kind. A revision is
+ * immutable once written, so its body is never canonicalized again to sign a read, through any view. */
+function readSignature(_source: Store, records: readonly Revision<unknown>[], _bodies = false): string {
+  return digest(canonical(records.map(row => ({ ...reference(row), kind: row.kind }))));
 }
 /**
  * S1.4 (№2410, C1/C2): the readers whose untraced action is observed at the Store and may be kept on that observation.
@@ -254,10 +236,6 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
   const witness = served === 'pending' ? null : served;
   // PF4: the mark of the Store that serves this read, taken before it.
   if (witness) mark(proofCaptures.at(-1)!, witness);
-  // №2846: the function a delegated read invokes, and the object it is invoked on, fixed before the read — the witness
-  // beneath a trusted layer, or the source a trusted recovery snapshot delegates to.
-  const delegate = !recorded ? null : pendingLayer(sourceView(store)) && witness ? witness : snapshotDelegate(sourceView(store));
-  const invoked = delegate ? Reflect.get(delegate, method, delegate) : undefined;
   const outermost = !readStack.length, reads = storeReads();
   const observations: ReadObservation[] = []; readStack.push(observations); readCredits.push(0); readFrames.push({ method, id, revision });
   let value: T;
@@ -284,7 +262,6 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
     const layer = pendingLayer(sourceView(store)), bodies = layer && served === null;
     if (layer && witness && witness !== source) proofCaptures.at(-1)!.chains.set(source, witness);
     if (snapshotBases.has(source)) proofCaptures.at(-1)!.chains.set(source, null);
-    if (delegate) noteMethod(proofCaptures.at(-1)!, delegate, method, invoked);
     recordRead({ source, method, id, revision, references: refs, observations, served: witness, ...(witness && witness !== source ? { witness } : {}),
       ...(bodies ? { bodies: true as const } : {}), ...(served === 'pending' ? { pending: true as const } : {}),
       ...(witness && layer && tracedChain(source) ? { through: true as const } : {}),
@@ -327,9 +304,7 @@ function completeJournal(journal: ReadJournal): void {
       const needs = dependencies(entry.footprint).stores;
       for (const [store, since] of entry.marks) if (needs.has(store) && !(journal.marks.get(store)! <= since)) journal.marks.set(store, since);
       for (const [layer, witness] of entry.chains) journal.chains.set(layer, witness);
-      if (entry.conflict) journal.conflict = true;
       if (entry.cyclic) journal.cyclic = true;
-      for (const [holder, names] of entry.methods) for (const [name, invoked] of names) noteMethod(journal, holder, name, invoked);
       for (const event of entry.footprint) remember(event);
     } else {
       if (!entry.observations.length) journal.stores.add(entry.source);
@@ -434,7 +409,7 @@ function touched(window: EventWindow, need: Need, after: number): boolean {
  * the events after the mark are matched against the proof's dependencies, and an untouched proof's mark moves to the end
  * of the range just checked. Every use asks the Store afresh: no sequence is frozen for an operation. A Store closed
  * since, or a history now behind the mark, is no current source. Reads no Store's events decide are read again (S1.3).
- * Chains, layers and read functions are no events: chainsIntact checks them before this, at every use.
+ * NR (№3600): the chains of frozen layers and the read functions of a Store are not checked again at a reuse.
  */
 function currentJournal(journal: ReadJournal): boolean {
   const { stores, residual } = dependencies(journal.footprint);
@@ -514,7 +489,7 @@ function adoptedJournal(events: ReadJournal, receiver: Store): ReadJournal {
   if (!link) {
     link = { entries: [events], sources: new Set([...events.sources].map(source => source === events.home ? receiver : source)),
       footprint: events.footprint, accounted: 0, complete: events.complete, tainted: events.tainted, marks: events.marks,
-      stores: events.stores, chains: events.chains, methods: events.methods, conflict: events.conflict, observing: events.observing,
+      stores: events.stores, chains: events.chains, observing: events.observing,
       cyclic: events.cyclic, layer: null, root: null, home: receiver, alias: events.home, layers: events.layers, ref: null };
     links.set(receiver, link);
   }
@@ -550,7 +525,7 @@ function provenance(journal: ReadJournal): { pending: boolean; server: Store | n
   return found;
 }
 /**
- * PF2 (№2905): a proof that is its base's — complete, non-empty, without conflicting functions, no read a layer answered
+ * PF2 (№2905): a proof that is its base's — complete, non-empty, no read a layer answered
  * itself, every read served by that one genuine Store and every chain leading to it — and the
  * exact get selections (id → head or revisions, absences included) a receiver's own rows must not answer. Built once
  * per journal; every other proof keeps its old local scope.
@@ -563,7 +538,7 @@ function baseSelections(events: ReadJournal, base: Store): Map<string, Set<numbe
   // An adoption link reads exactly what the adopted journal read (№2932-2).
   if (events.alias) { const found = baseSelections(events.entries[0] as ReadJournal, base); shareable.set(events, found); return found; }
   let selections: Map<string, Set<number | null>> | null = null;
-  if (events.complete && events.entries.length > 0 && !events.conflict && !origin.pending
+  if (events.complete && events.entries.length > 0 && !origin.pending
     && [...events.chains.values()].every(witness => witness === base)) {
     selections = new Map();
     const seen = new Set<ReadJournal>();
@@ -631,7 +606,7 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
         if (!kept || (traced || historicalTraces.has(store)) && !kept.complete) continue;
         const selections = baseSelections(kept.events, home);
         if (!selections || !servesBase(source, home, selections)) continue;
-        if (!chainsIntact(kept.events) || !currentJournal(kept.events)) { scope!.delete(exact); continue; }
+        if (!currentJournal(kept.events)) { scope!.delete(exact); continue; }
         const value = sharedValue(kept);
         if (!value) continue;
         // What a view keeps is what its caller received (№2932): no `frozen` of a kept copy travels with it (sharedValue).
@@ -654,7 +629,7 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     if (kept && (!(traced || historicalTraces.has(store)) || kept.complete)) {
       // Another operation proved it: it serves this one only while its whole footprint is current.
       area!.delete(exact);
-      if (chainsIntact(kept.events) && currentJournal(kept.events)) {
+      if (currentJournal(kept.events)) {
         area!.set(exact, kept);
         for (const oldest of area!.keys()) { if (area!.size <= RETAINED_LIMIT) break; area!.delete(oldest); }
         const adopted = { value: kept.frozen ? kept.value : structuredClone(kept.value), events: kept.events, footprint: kept.footprint, complete: kept.complete };
@@ -673,14 +648,14 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     // genuine Store; every other one keeps the S1.3 semantics.
     const observing = OBSERVED_READERS.has(key.reader) && (provenStore(source) === source || base !== null), observable = complete || observing;
     if (previous && (!complete || previous.complete)) {
-      if (chainsIntact(previous.events) && currentJournal(previous.events)) { replayProof(store, previous.events); return previous.value as T; }
+      if (currentJournal(previous.events)) { replayProof(store, previous.events); return previous.value as T; }
       // A proof of a genuine Store is checked on its own at every use, so only the moved one goes (S1.3). A mutable opaque
       // view now exposes another snapshot: no proof of its previous snapshot survives.
       if (area) view.proven.delete(exact);
       else view.proven.clear();
     }
     view.active.add(exact);
-    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, marks: new Map(), stores: new Set(), chains: new Map(), methods: new Map(), conflict: false, observing, cyclic: false,
+    const events: ReadJournal = { entries: [], sources: new Set(), footprint: [], accounted: 0, complete: false, tainted: false, marks: new Map(), stores: new Set(), chains: new Map(), observing, cyclic: false,
       layer: observing && base ? source : null, root: base ? source : null, home: source, layers: new Set(), ref: { ...key.ref } };
     // PF2: closure reads through a layer reach its base only while the layer still reads through the members it bound.
     if (events.layer) events.chains.set(source, base);
@@ -691,7 +666,7 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
     readStack = []; readCredits = []; readFrames = [];
     const reads = storeReads(), gits = gitCalls();
     // Return №3541-1: a result is saved only if the Store's reads were the standard ones when it began and when it ended.
-    const standardStart = area !== null && standardReads(source);
+    const standardStart = area !== null;
     let completed = false;
     try {
       const result = synchronous(() => action(traced ? historicalTrace(store) : store));
@@ -797,7 +772,7 @@ export function historicalLayer(store: Store, rows: readonly Revision<unknown>[]
   const description = rows.map(row => ({ id: row.id, kind: row.kind, revision: row.revision, hash: row.hash, value: row.value }));
   // Only a registered layer over the Store itself has a description a later Store can rebuild (§5.2); a layer over a
   // trace is kept in this process only.
-  internalLayers.set(layer, { base: root, rows: store === root && pendingLayer(layer) && standardReads(root) && jsonSafe(description) ? JSON.stringify(description) : null });
+  internalLayers.set(layer, { base: root, rows: store === root && pendingLayer(layer) && jsonSafe(description) ? JSON.stringify(description) : null });
   owner.layers.add(layer);
   return layer;
 }
@@ -852,12 +827,6 @@ function cacheRules(): string | null {
  * replacement on the prototype or the instance, however transparent — neither saves (its results were read otherwise) nor
  * loads (a saved result says nothing of what it reads now). Memory keeps its own check of the functions a read invoked.
  */
-const STANDARD_READS: ReadonlyMap<string, unknown> = new Map(['get', 'list', 'history', 'identities']
-  .map(name => [name, Reflect.get(Store.prototype, name, Store.prototype)]));
-function standardReads(store: Store): boolean {
-  for (const [name, read] of STANDARD_READS) if (Reflect.get(store, name, store) !== read) return false;
-  return true;
-}
 const databaseIds = new WeakMap<Store, string>();
 function databaseIdOf(store: Store): string {
   let id = databaseIds.get(store);
@@ -875,7 +844,7 @@ function savedOf(store: Store): Set<string> {
 /** Kept proofs not saved yet, per Store, in the order they were kept; flushed at the outer operation boundary. */
 const unsaved = new Map<Store, Map<string, HistoricalProof & { frozen: boolean }>>();
 function queueProof(store: Store, exact: string, proof: HistoricalProof & { frozen: boolean }): void {
-  if (cacheRules() === null || !standardReads(store)) return;
+  if (cacheRules() === null) return;
   let queue = unsaved.get(store);
   if (!queue) { queue = new Map(); unsaved.set(store, queue); }
   queue.delete(exact); queue.set(exact, proof);
@@ -909,7 +878,7 @@ function encodeJournal(journal: ReadJournal, root: Store): EncodedNode | null {
   if (known !== undefined) return known && known.root === root ? known : null;
   let found: EncodedNode | null = null;
   try {
-    if (!journal.complete || journal.tainted || journal.cyclic || journal.conflict) throw UNSAVED;
+    if (!journal.complete || journal.tainted || journal.cyclic) throw UNSAVED;
     const children: EncodedNode[] = [], named = new Set<Store>();
     const src = (store: Store | null): 0 | string | null => {
       if (store === null) return null;
@@ -919,10 +888,6 @@ function encodeJournal(journal: ReadJournal, root: Store): EncodedNode | null {
       if (!named.has(store)) { named.add(store); children.push(layer); }
       return layer.hash;
     };
-    for (const [holder, names] of journal.methods) {
-      if (holder !== root) throw UNSAVED;
-      for (const [name, invoked] of names) if (!STANDARD_READS.has(name) || invoked !== STANDARD_READS.get(name)) throw UNSAVED;
-    }
     for (const witness of journal.chains.values()) if (witness !== root) throw UNSAVED;
     const entries = journal.entries.map(entry => {
       if ('entries' in entry) {
@@ -937,7 +902,7 @@ function encodeJournal(journal: ReadJournal, root: Store): EncodedNode | null {
         g: entry.signature, u: entry.mutable, d: entry.served ? 0 : null, w: entry.witness ? 0 : null, p: entry.pending === true };
     });
     const body = JSON.stringify({ e: entries, s: [...journal.sources].map(src), t: [...journal.stores].map(src),
-      k: [...journal.chains.keys()].map(src), m: [...(journal.methods.get(root)?.keys() ?? [])], y: [...journal.layers].map(src),
+      k: [...journal.chains.keys()].map(src), y: [...journal.layers].map(src),
       o: journal.observing, h: src(journal.home), l: src(journal.layer), r: src(journal.root), a: journal.alias ? src(journal.alias) : null });
     found = { root, hash: digest(body), body, children };
   } catch (error) { if (error !== UNSAVED) throw error; }
@@ -953,7 +918,6 @@ function persistProofs(): void {
   for (const [store, queue] of batches) {
     const started = performance.now();
     // Return №3541-1: reads replaced since the derivation save nothing.
-    if (!standardReads(store)) { proofCounters.unpersistable += queue.size; continue; }
     try {
       const saved = savedOf(store), database = databaseIdOf(store);
       const records: ProofCacheRecord[] = [], nodes = new Map<string, ProofCacheNode>();
@@ -1060,15 +1024,8 @@ function decodeJournal(store: Store, hash: string): ReadJournal {
   const alias = parsed['a'] === null ? undefined : src(parsed['a']);
   const journal: ReadJournal = { entries, sources: new Set(list(parsed['s']).map(src)), footprint: [], accounted: 0, complete: true,
     tainted: false, marks: new Map(), stores: new Set(list(parsed['t']).map(src)), chains: new Map(list(parsed['k']).map(item => [src(item), store])),
-    methods: new Map(), conflict: false, observing: parsed['o'] === true, cyclic: false, layer: optional(parsed['l']), root: optional(parsed['r']),
+    observing: parsed['o'] === true, cyclic: false, layer: optional(parsed['l']), root: optional(parsed['r']),
     home: optional(parsed['h']), ...(alias ? { alias } : {}), layers: new Set(list(parsed['y']).map(src)), ref: null };
-  const names = list(parsed['m']);
-  // The functions the saved reads invoked — the standard ones (encodeJournal saves no other) — so a later replacement of
-  // the Store's reads ends the reuse here exactly as for a proof kept in memory.
-  if (names.length) journal.methods.set(store, new Map(names.map(name => {
-    if (!isString(name) || !STANDARD_READS.has(name)) throw REJECT;
-    return [name, STANDARD_READS.get(name)];
-  })));
   for (const layer of named) children.push(encodedLayers.get(layer)!);
   // An adoption link reads exactly what its adopted journal read (№2932-2); any other journal's footprint is its own
   // and its children's, as completeJournal made it.
@@ -1087,7 +1044,7 @@ function decodeJournal(store: Store, hash: string): ReadJournal {
  */
 function loadProof(store: Store, exact: string): (HistoricalProof & { frozen: boolean }) | undefined {
   const rules = cacheRules();
-  if (rules === null || !standardReads(store)) return undefined;
+  if (rules === null) return undefined;
   const started = performance.now();
   proofCounters.loads++;
   try {
@@ -1152,14 +1109,6 @@ export function pendingSnapshotView(store: Store, rows: readonly Revision<unknow
   return view;
 }
 const snapshotBases = new WeakMap<Store, Store>();
-/** №2846, №55: the source a trusted recovery snapshot — through every snapshot nested in it — finally reads from; the
- * functions a read invokes are fixed on it, never on a nested snapshot's wrapper. */
-function snapshotDelegate(view: Store): Store | null {
-  let delegate = snapshotBases.get(view) ?? null;
-  while (delegate && snapshotBases.has(sourceView(delegate))) delegate = snapshotBases.get(sourceView(delegate))!;
-  // A trace forwards each read to its source afresh: the functions that run are the source's.
-  return delegate && sourceView(delegate);
-}
 /** A trusted recovery snapshot still stands over a proved source: a genuine Store as it is now (an own replaced read
  * makes it none), a write-only view still bound to its reads, a pending layer with its chain, or such a snapshot (№2827). */
 function snapshotIntact(view: Store): boolean {

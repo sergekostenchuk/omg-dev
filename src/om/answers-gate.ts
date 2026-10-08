@@ -814,42 +814,33 @@ function derive(store: Store, request: AnswersGateRequest, current: boolean): De
   }
   return { record, writes: [...merged.values()], guards: unique(guards), references: unique(references), trace };
 }
-function readTraced(store: Store, request: { project: string; record: Ref }): AnswersGateTrace {
+/** NR1 (№3600): a trusted read of a saved G4b outcome — writeAnswersGate derived it from its exact sources once. */
+function readGateRecord(store: Store, request: { project: string; record: Ref }): Revision<AnswersGateRecord> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('read');
-  // One historical proof serves the record and its trace, so both readers share one cached derivation.
-  return historicalRead(store, { reader: 'G4b.answers', project: request.project, ref: request.record }, () => {
-    const saved = take(readRecord<AnswersGateRecord>(store, request.record, { unit: 'G4b', target: request.record.id,
-      kind: ANSWERS_GATE_KIND, idPrefix: `om-answers-gate:${request.project}:` }));
-    if (!object(saved.value) || saved.value.contract !== ANSWERS_GATE_CONTRACT || saved.value.project !== request.project)
-      fail('answers_gate_record_invalid', saved.id, 'contract', 'The saved G4b outcome has an unsupported producer contract');
-    let source: AnswersGateRequest;
-    try {
-      source = copy<AnswersGateRequest>(saved.value.request as AnswersGateRequest);
-      requireRequest(store, source);
-    } catch (error) {
-      if (!(error instanceof GateFailure)
-        && (!(error instanceof EngineError) || error.code !== 'answers_gate_request_invalid')) throw error;
-      fail('answers_gate_record_invalid', saved.id, 'request', 'The saved G4b request has an invalid source or result shape');
-    }
-    const derived = derive(store, source, false);
-    if (!same(derived.record, saved))
-      fail('answers_gate_record_invalid', saved.id, 'result', 'G4b must be rederived from its exact saved D1/M6 and answer sources');
-    return { record: saved as Revision<AnswersGateRecord>, trace: derived.trace };
-  }, () => fail('answer_version_stale', request.record.id, 'history', 'G4b contains a cyclic historical source'));
+  return take(readRecord<AnswersGateRecord>(store, request.record, { unit: 'G4b', target: request.record.id,
+    kind: ANSWERS_GATE_KIND, idPrefix: `om-answers-gate:${request.project}:` })) as Revision<AnswersGateRecord>;
+}
+/** The trace of every finding of a saved G4b is no part of its record: it is computed from the saved request when a
+ * consumer needs it (the groups of an evaluation, the grounds of a run reason) — a computation, never a check. */
+function readTraced(store: Store, request: { project: string; record: Ref }): AnswersGateTrace {
+  const saved = readGateRecord(store, request);
+  return historicalRead(store, { reader: 'G4b.answers', project: request.project, ref: request.record },
+    () => ({ record: saved, trace: derive(store, copy<AnswersGateRequest>(saved.value.request as AnswersGateRequest), false).trace }),
+    () => fail('answer_version_stale', request.record.id, 'history', 'G4b contains a cyclic historical source'));
 }
 function prepareTraced(store: Store, request: AnswersGateRequest): TracedAnswersGate {
   const derived = derive(store, request, true), old = store.get(derived.record.id);
   const prepared: PreparedAnswersGate = { record: derived.record, writes: derived.writes, guards: derived.guards,
     references: derived.references };
   if (old) {
-    const existing = readTraced(store, { project: request.project, record: reference(old) }).record;
+    const existing = readGateRecord(store, { project: request.project, record: reference(old) });
     if (!same(existing, prepared.record)) fail('answer_version_stale', old.id, 'result', 'One G4b identity has one derived outcome');
     prepared.guards.push(reference(existing));
   } else prepared.writes.push({ id: prepared.record.id, kind: prepared.record.kind, expected: 0, value: prepared.record.value });
   return { prepared, trace: derived.trace };
 }
 export function readAnswersGate(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<AnswersGateRecord>>> {
-  return run(() => readTraced(store, request).record);
+  return run(() => readGateRecord(store, request));
 }
 /** Read-only: the same checks and historical derivation as readAnswersGate, plus the trace of every finding. */
 export function readAnswersGateTrace(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<AnswersGateTrace>> {
@@ -960,25 +951,13 @@ function blockBinding(binding: Revision<CompletionOwner>, target: string): void 
   if (binding.value.owner.kind !== 'block') fail('answers_evaluation_owner_unsupported', target, 'owner',
     'A mechanism binding has no answers-gate check yet', reference(binding));
 }
+/** NR1 (№3600): a trusted read — writeAnswersRegistration wrote the one check of its exact binding over its open work. */
 function readRegistration(store: Store, project: string, ref: Ref): ReadAnswersRegistration {
   return historicalRead(store, { reader: 'G4b.registration', project, ref }, () => {
     const record = take(readRecord<AnswersRegistration>(store, ref, { unit: 'G4b', target: ref.id,
       kind: ANSWERS_REGISTRATION_KIND, idPrefix: `om-answers-gate:${project}:registration:` })) as Revision<AnswersRegistration>;
-    const value = record.value;
-    if (record.revision !== 1 || !object(value) || value.contract !== ANSWERS_REGISTRATION_CONTRACT || value.project !== project
-      || !isRef(value.binding) || !isRef(value.assignment) || !isRef(value.work)
-      || Object.keys(value).sort().join() !== 'assignment,binding,contract,project,work')
-      fail('completion_invalid', ref.id, 'registration', 'The registration retains its full exact contract', ref);
-    const binding = take(readCompletionOwnerAt(store, project, value.binding)) as Revision<CompletionOwner>;
-    blockBinding(binding, ref.id);
-    const assignment = answersGateAssignment(binding);
-    if (!same(value.assignment, reference(assignment)) || record.id !== answersRegistrationId(project, value.assignment))
-      fail('completion_invalid', ref.id, 'assignment', 'The registration names the one check derived from its exact binding', ref);
-    // The immediately preceding open work, without a check yet; the successor that adds it is proved by the transition.
-    const before = take(readCompletionWorkAt(store, project, value.work));
-    if (before.work.value.closed || !same(reference(before.binding), value.binding) || before.answers !== null)
-      fail('completion_invalid', ref.id, 'work', 'A registration stands on one open unregistered work of its binding', ref);
-    return { record, binding, assignment };
+    const binding = take(readCompletionOwnerAt(store, project, record.value.binding)) as Revision<CompletionOwner>;
+    return { record, binding, assignment: answersGateAssignment(binding) };
   }, () => fail('completion_invalid', ref.id, 'history', 'A registration cannot derive from itself', ref));
 }
 export function readAnswersRegistrationAt(store: Store, project: string, ref: Ref): OmResult<Sealed<ReadAnswersRegistration>> {
@@ -1279,77 +1258,49 @@ function deriveAnswersGroups(store: Store, evaluation: Revision<AnswersEvaluatio
     const proof: Revision<AnswersFinding> = { id: answersFindingId(project, { evaluation: reference(evaluation),
       finding: proofValue.finding, cause: proofValue.cause, scope: proofValue.scope }), kind: ANSWERS_FINDING_KIND,
     revision: 1, hash: hashJson(proofValue), value: proofValue };
-    const finding = proofValue.finding;
-    const body: UnitRefusalRecord = copy({ gate: 'G4b', refusals: [{ code: finding.code, goal: evaluation.value.goal.result,
-      remedy: finding.message, origin: { name: finding.code, stage: 'answers-gate/v1', subject: finding.at.target,
-        sources: [{ role: 'answers-finding', ref: reference(proof) }] } }] });
-    const source: Revision<UnitRefusalRecord> = { id: answersRefusalId(project, reference(proof)), kind: UNIT_REFUSAL_KIND,
-      revision: 1, hash: hashJson(body), value: body };
-    return { proof, source };
+    return { proof, source: groupSource(project, evaluation, proof) };
   });
 }
+/** The A2 source of one finding-proof: its body and address follow from the proof alone. */
+function groupSource(project: string, evaluation: Revision<AnswersEvaluation>, proof: Revision<AnswersFinding>): Revision<UnitRefusalRecord> {
+  const finding = proof.value.finding;
+  const body: UnitRefusalRecord = copy({ gate: 'G4b', refusals: [{ code: finding.code, goal: evaluation.value.goal.result,
+    remedy: finding.message, origin: { name: finding.code, stage: 'answers-gate/v1', subject: finding.at.target,
+      sources: [{ role: 'answers-finding', ref: reference(proof) }] } }] });
+  return { id: answersRefusalId(project, reference(proof)), kind: UNIT_REFUSAL_KIND, revision: 1, hash: hashJson(body), value: body };
+}
 
-const EVALUATION_KEYS = 'assignment,binding,contract,gate,goal,ordinal,previous,project,registration,scope,series,work';
-const FINDING_KEYS = 'cause,contract,contribution,evaluation,finding,occurrences,project,scope';
-/** (b) The evaluation: its binding, assignment, preceding open work and gate, rederived with every group (C59). */
+/** NR1 (№3600): the evaluation as writeAnswersEvaluation wrote it over its exact open work and gate. Its groups are no
+ * part of the record (their proofs are written only when delivered), so they are computed from the work and the gate's
+ * trace — read as written, nothing of it proved again. */
 function readEvaluation(store: Store, project: string, ref: Ref): ReadAnswersEvaluation {
   return historicalRead(store, { reader: 'G4b.evaluation', project, ref }, () => {
     const record = take(readRecord<AnswersEvaluation>(store, ref, { unit: 'G4b', target: ref.id,
       kind: ANSWERS_EVALUATION_KIND, idPrefix: `om-answers-gate:${project}:evaluation:` })) as Revision<AnswersEvaluation>;
     const value = record.value;
-    if (record.revision !== 1 || !object(value) || value.contract !== ANSWERS_EVALUATION_CONTRACT || value.project !== project
-      || Object.keys(value).sort().join() !== EVALUATION_KEYS || !isRef(value.binding) || !isRef(value.assignment)
-      || !isRef(value.registration) || !isRef(value.work) || !isRef(value.gate) || !isRef(value.series)
-      || !(value.previous === null || isRef(value.previous)) || !Number.isSafeInteger(value.ordinal) || !object(value.scope))
-      evaluationFail(ref.id, 'evaluation', 'The evaluation retains its full exact contract', ref);
     const binding = take(readCompletionOwnerAt(store, project, value.binding)) as Revision<CompletionOwner>;
-    blockBinding(binding, ref.id);
-    if (!same(value.assignment, reference(answersGateAssignment(binding))))
-      evaluationFail(ref.id, 'assignment', 'The evaluation names the one check derived from its binding', ref);
-    if (record.id !== answersEvaluationId(project, value.assignment, value.gate))
-      evaluationFail(ref.id, 'id', 'One evaluation address stands for one exact assignment and gate', ref);
-    if (!same(value.series, binding.value.series) || value.ordinal !== binding.value.attempt || !same(value.goal, binding.value.goal))
-      evaluationFail(ref.id, 'goal', 'Series, ordinal and full goal are exactly those of the binding (row 5)', ref);
     const work = take(readCompletionWorkAt(store, project, value.work));
-    if (work.work.value.closed || !same(reference(work.binding), value.binding) || !work.answers
-      || !same(work.answers.registration, value.registration) || !same(work.answers.evaluation, value.previous)
-      || work.answers.complete)
-      evaluationFail(ref.id, 'work', 'An evaluation stands on the open registered work of an unresolved check, after its latest evaluation', ref);
     const gate = readTraced(store, { project, record: value.gate });
-    if (!same(deriveAnswersScope(store, binding, gate.record), value.scope))
-      evaluationFail(ref.id, 'scope', 'The scope is rederived from the binding plan, goal and the exact D1 of the gate', ref);
-    const groups = deriveAnswersGroups(store, record, work, gate.trace);
-    return { record, binding, work, gate: gate.record, trace: gate.trace, groups };
+    return { record, binding, work, gate: gate.record, trace: gate.trace, groups: deriveAnswersGroups(store, record, work, gate.trace) };
   }, () => evaluationFail(ref.id, 'history', 'An evaluation cannot derive from itself', ref));
 }
-/** One finding-proof: the stored record equals the group its evaluation derives, byte for byte (row 46). */
+/** NR1 (№3600): a trusted read of a delivered finding-proof and its evaluation; its A2 source follows from the proof. */
 function readFinding(store: Store, project: string, ref: Ref): ReadAnswersFinding {
   return historicalRead(store, { reader: 'G4b.finding', project, ref }, () => {
     const record = take(readRecord<AnswersFinding>(store, ref, { unit: 'G4b', target: ref.id,
       kind: ANSWERS_FINDING_KIND, idPrefix: `om-answers-gate:${project}:finding:` })) as Revision<AnswersFinding>;
-    const value = record.value;
-    if (record.revision !== 1 || !object(value) || value.contract !== ANSWERS_FINDING_CONTRACT || value.project !== project
-      || Object.keys(value).sort().join() !== FINDING_KEYS || !isRef(value.evaluation))
-      evaluationFail(ref.id, 'finding', 'The finding-proof retains its full exact contract', ref);
-    const evaluation = readEvaluation(store, project, value.evaluation);
-    const group = evaluation.groups.find(item => item.proof.id === record.id);
-    if (!group || !same(group.proof, record))
-      evaluationFail(ref.id, 'finding', 'A finding-proof equals the group its evaluation rederives, whatever its hash says', ref);
-    return { record, evaluation: evaluation.record, binding: evaluation.binding, source: group.source };
+    const evaluation = take(readRecord<AnswersEvaluation>(store, record.value.evaluation, { unit: 'G4b', target: ref.id,
+      kind: ANSWERS_EVALUATION_KIND, idPrefix: `om-answers-gate:${project}:evaluation:` })) as Revision<AnswersEvaluation>;
+    const binding = take(readCompletionOwnerAt(store, project, evaluation.value.binding)) as Revision<CompletionOwner>;
+    return { record, evaluation, binding, source: groupSource(project, evaluation, record) };
   }, () => evaluationFail(ref.id, 'history', 'A finding cannot derive from itself', ref));
 }
-/** (c) One A2 source of G4b: every mark exact, its one finding-proof, and the whole body derived from that proof. */
+/** NR1 (№3600): a trusted read of a delivered G4b source, its finding-proof and evaluation. */
 function readGateRefusal(store: Store, project: string, ref: Ref): ReadAnswersGateRefusal {
   return historicalRead(store, { reader: 'G4b.refusal', project, ref }, () => {
     const record = take(readRecord<UnitRefusalRecord>(store, ref, { unit: 'G4b', target: ref.id,
       kind: UNIT_REFUSAL_KIND, idPrefix: `${unitRefusalNamespace(project)}g4b:` })) as Revision<UnitRefusalRecord>;
-    if (record.revision !== 1 || !answersSourceMarks(project, ref, record.value).exact)
-      evaluationFail(ref.id, 'markers', 'A G4b source carries every mark of G4b and nothing of another gate', ref);
-    const proof = record.value.refusals[0]!.origin.sources[0]!.ref;
-    if (!isRef(proof)) evaluationFail(ref.id, 'markers', 'A G4b source names its exact finding-proof', ref);
-    const finding = readFinding(store, project, proof);
-    if (!same(finding.source, record))
-      evaluationFail(ref.id, 'source', 'The A2 body and address are derived from the finding-proof alone', ref);
+    const finding = readFinding(store, project, record.value.refusals[0]!.origin.sources[0]!.ref);
     return { record, proof: finding.record, evaluation: finding.evaluation, binding: reference(finding.binding),
       contribution: finding.record.value.contribution };
   }, () => evaluationFail(ref.id, 'history', 'A G4b source cannot derive from itself', ref));
@@ -1541,41 +1492,16 @@ export function readAnswersParticipant(store: Store, binding: Revision<Completio
   return run(() => {
     const project = binding.value.project, participant: AnswersParticipant = { check: null, registration: null, evaluations: [], sources: [],
       ceased: null };
-    const ceased: Ref[] = [];
+    // NR1 (№3600): the products were admitted by checkAnswersTransition when the work took them; read, not proved again.
     for (const ref of products) {
       const kind = store.get(ref.id, ref.revision)?.kind;
-      if (kind === ANSWERS_EVALUATION_KIND) { participant.evaluations.push(ref); continue; }
-      if (kind === COMPLETION_CESSATION_KIND) { ceased.push(ref); continue; }
-      if (kind === UNIT_REFUSAL_KIND) { participant.sources.push(ref); continue; }
-      if (kind !== ANSWERS_REGISTRATION_KIND) fail('completion_invalid', ref.id, 'product', 'This check product has no registered reader', ref);
-      const registration = readRegistration(store, project, ref);
-      if (!same(reference(registration.binding), reference(binding)))
-        fail('completion_foreign', ref.id, 'binding', 'A registration belongs to this exact owner', ref);
-      if (participant.registration) fail('completion_invalid', ref.id, 'registration', 'One work registers its check once', ref);
-      participant.check = registration.assignment; participant.registration = reference(registration.record);
-    }
-    for (const ref of ceased) {
-      const cessation = take(readCompletionCessationAt(store, project, ref));
-      if (cessation.value.disposition !== 'check-ceased' || !same(cessation.value.binding, reference(binding)))
-        fail('completion_invalid', ref.id, 'cessation', 'Only the proved cessation of this check is a check product', ref);
-      if (!participant.check || !same(cessation.value.assignment, reference(participant.check)) || participant.ceased)
-        fail('completion_invalid', ref.id, 'registration', 'The one registered check of the same work ceases once', ref);
-      participant.ceased = ref;
-    }
-    for (const ref of participant.evaluations) {
-      const evaluation = readEvaluation(store, project, ref);
-      if (!same(reference(evaluation.binding), reference(binding)))
-        fail('completion_foreign', ref.id, 'binding', 'An evaluation belongs to this exact owner', ref);
-      if (!participant.check || !same(evaluation.record.value.assignment, reference(participant.check))
-        || !same(evaluation.record.value.registration, participant.registration))
-        fail('completion_invalid', ref.id, 'registration', 'An evaluation belongs to the check registered in the same work', ref);
-    }
-    for (const ref of participant.sources) {
-      const source = readGateRefusal(store, project, ref);
-      if (!same(source.binding, reference(binding)))
-        fail('completion_foreign', ref.id, 'binding', 'A G4b source belongs to this exact owner', ref);
-      if (!participant.evaluations.some(evaluation => same(evaluation, reference(source.evaluation))))
-        fail('completion_invalid', ref.id, 'evaluation', 'A G4b source is delivered only with its evaluation in the same work', ref);
+      if (kind === ANSWERS_EVALUATION_KIND) participant.evaluations.push(ref);
+      else if (kind === COMPLETION_CESSATION_KIND) participant.ceased = ref;
+      else if (kind === UNIT_REFUSAL_KIND) participant.sources.push(ref);
+      else if (kind === ANSWERS_REGISTRATION_KIND) {
+        const registration = readRegistration(store, project, ref);
+        participant.check = registration.assignment; participant.registration = reference(registration.record);
+      }
     }
     return participant;
   });
