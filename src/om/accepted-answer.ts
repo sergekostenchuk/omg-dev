@@ -15,6 +15,7 @@ import { captureView, pendingOverlay, provenStore } from '../storage/store-view.
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest } from './gaps.js';
 import { historicalRead, withHistoricalReads, prepareExistingOmInput, readOmInput, type OmInput, type OmInputRecord } from './input.js';
+import { historicalRefusalRead } from '../history/proofs.js';
 import { gapLineKey, gapLineExpectedResult, type GapLineAttempt } from './gap-lines.js';
 import { readAnySeriesAt, readSeriesAt, prepareSeriesLineAdmission, type RepairSeries, type AttemptGoal } from './series.js';
 import { factResultKey } from './result-identity.js';
@@ -445,6 +446,7 @@ function attemptOf(store: Store, project: string, gap: Gap, link: GapLineAttempt
   if (current) head(store, link.series);
   return { series: link.series, ordinal: link.attempt, block: series.value.block, goal: attempt.goal as AttemptGoal };
 }
+type CitationGround = { source: Revision<Source>; ground: AnswerGround };
 function citationGround(store: Store, project: string, citation: AnswerCitation, era: GroundsEra) {
   if (era !== 'legacy') {
     const selector = citation.selector;
@@ -452,8 +454,11 @@ function citationGround(store: Store, project: string, citation: AnswerCitation,
       || selector.kind === 'text-range' && Object.keys(selector).every(key => ['kind', 'start', 'end'].includes(key)),
     'answer_unconfirmed', citation.source.id, 'selector', 'A citation must contain only its standard selector fields');
   }
-  return historicalRead(store, { reader: 'D5.citation', project, ref: citation.source,
-    parameters: { selector: citation.selector, era } as unknown as Json }, () => {
+  // PF4 (№3499 §2): a refusal of this exact saved citation is a result of its full key — kept as a value inside the proof,
+  // so a caller that catches it keeps a complete trail; outside, the very same AnswerFailure is thrown again. Only this
+  // module's own refusal is taken: any other error, a failed Store read included, leaves the proof as it was.
+  const kept = historicalRefusalRead<CitationGround | { ok: false; refusal: Refusal }>(store, { reader: 'D5.citation', project,
+    ref: citation.source, parameters: { selector: citation.selector, era } as unknown as Json }, () => { try {
     const source = checkedSource(store, project, citation.source), value = source.value;
     // Only saved bytes are projected into Evidence's standard selector. This is not current admission.
     const historicalSource = { ...source, value: { ...value, origin: { kind: 'owner-document' as const, location: value.origin.location } } };
@@ -472,7 +477,10 @@ function citationGround(store: Store, project: string, citation: AnswerCitation,
       proofLimit: value.origin.kind === 'file' ? 'repository-observation'
         : era === 'legacy' ? 'quoted-intent-requires-attribution' : 'reported-not-runtime-proof' };
     return copy({ source, ground });
-  }, () => fail('answer_unconfirmed', citation.source.id, 'history', 'A citation has cyclic historical sources'));
+  } catch (error) { if (error instanceof AnswerFailure) return { ok: false, refusal: error.refusal }; throw error; } },
+  () => fail('answer_unconfirmed', citation.source.id, 'history', 'A citation has cyclic historical sources'));
+  if ('ok' in kept) throw new AnswerFailure(kept.refusal);
+  return kept;
 }
 function currentCitation(store: Store, source: Revision<Source>): void {
   head(store, reference(source));

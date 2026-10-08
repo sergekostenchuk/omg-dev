@@ -2978,3 +2978,23 @@ test("PF3.1 return №3473 (rows 16-18, 24): every direct read inside a traced r
     assert.equal(counts.inner, childMode === 'none' ? 0 : 1, `${label}: the unchanged child — cold here or kept from before — is derived once in all`);
   }
 });
+
+test("PF4 rows 6, 8: a cycle answered by onCycle and caught by an ancestor leaves the ancestor's trail incomplete — no kept refusal and no kept ancestor; an unlisted reader keeps its former limits", t => {
+  const { first } = historicalStores(t);
+  const anchor = first.write({ id: 'pf4:anchor', kind: 'k', expected: 0, value: {} });
+  type Outcome = { ok: true; value: Json } | { ok: false; refusal: { code: string } };
+  const cycled = (): Outcome => ({ ok: false, refusal: { code: 'model_delivery_invalid' } });
+  const childKey = { reader: 'E4.continuation', project: 'garden', ref: reference(anchor), parameters: 'pf4-cycle' };
+  let children = 0, parents = 0;
+  const child = (): Outcome => proofs.historicalRefusalRead(first, childKey, () => { children++; first.get(anchor.id); return child(); }, cycled);
+  const parent = () => historicalRead(first, { reader: 'G7.completion-effective', project: 'garden', ref: reference(anchor), parameters: 'pf4-cycle' },
+    () => { parents++; first.get(anchor.id); const outcome = child(); return outcome.ok ? 'ok' : outcome.refusal.code; }, noCycle);
+  assert.equal(withHistoricalReads(parent), 'model_delivery_invalid');
+  assert.equal(withHistoricalReads(parent), 'model_delivery_invalid');
+  assert.deepEqual([parents, children], [2, 2], 'Neither the cyclic refusal nor the ancestor that caught it is kept beyond its operation');
+  // Row 8: the former limits stand — an unlisted reader keeps no refusal, and the PF3.1 tests of empty trails stay as they are.
+  let unlisted = 0;
+  const other = () => proofs.historicalRefusalRead(first, { ...childKey, reader: 'PF4.unlisted' }, () => { unlisted++; first.get(anchor.id); return cycled(); }, cycled);
+  withHistoricalReads(() => { other(); other(); });
+  assert.equal(unlisted, 2);
+});

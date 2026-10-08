@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { canonical, hashJson, type Json } from '../src/canonical.js';
+import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Question, writeMc1Question,
   prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, applicableAnswer, confirmAnswerGapClosure,
@@ -1391,4 +1391,82 @@ test('PF3 rows 26-28: basisView on the common pending layer keeps admission, vis
   const value = f.store.get<Record<string, unknown>>(accepted.id)!.value;
   assert.deepEqual(value, accepted.value, 'The caller\'s and the saved objects are neither frozen nor changed by the layer');
   assert.ok(!Object.isFrozen(equal.basis.pending.value) && !Object.isFrozen(value), 'A sealed caller value stays the caller\'s own');
+});
+
+// ---- PF4 part 1 (№3499 rows 1-7): a refusal of an exact saved citation is a result of its full key ----
+import { historicalRead as pf4HistoricalRead } from '../src/history/proofs.js';
+
+function citationStore(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pf4-d5-')), store = new Store(join(root, 'state.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, store };
+}
+
+test('PF4 rows 1-4, 6: D5 keeps its own refusal as a value inside the proof — the same success, the same record_foreign of a read that is not a source, a missing source that appears, distinct keys; a caller catching the refusal keeps a complete trail; a Store failure is no refusal to keep', t => {
+  const { root, store } = citationStore(t), project = 'garden';
+  const second = new Store(join(root, 'state.sqlite'));
+  t.after(() => second.close());
+  const notes = new Evidence(store).document(project, 'notes', 'hello world', 'text/plain', 0);
+  const config = new Evidence(store).document(project, 'config', '{"a":1}', 'application/json', 0);
+  const input = store.write({ id: `om-input:${project}`, kind: 'om-input', expected: 0, value: { input: true } });
+  const read = (source: Ref, selector: Selector) => readAnswerCitations(store, { project, citations: [{ source, selector }] });
+  // Row 1: the success of an exact saved citation, the same at every repeat.
+  const range: Selector = { kind: 'text-range', start: 0, end: 5 };
+  const success = read(reference(notes), range);
+  assert.ok(success.ok);
+  if (success.ok) assert.equal(success.value.grounds[0]!.observation.value, 'hello');
+  withHistoricalReads(() => { assert.deepEqual(read(reference(notes), range), success); assert.deepEqual(read(reference(notes), range), success); });
+  // Row 2: a read_source of a record that is no source — the former refusal, its code, message and address.
+  const whole: Selector = { kind: 'json-pointer', pointer: '' };
+  const foreign = rejected(read(reference(input), whole), 'record_foreign');
+  assert.equal(foreign.message, `A reference to om-input:${project} lies outside source:${project}:`);
+  assert.deepEqual([foreign.at.unit, foreign.at.field], ['D5', 'id']);
+  assert.deepEqual(rejected(read(reference(input), whole), 'record_foreign'), foreign);
+  // A listed historical reader that catches the refusal keeps a complete trail: it serves the next operation.
+  let parents = 0;
+  const parent = () => pf4HistoricalRead(store, { reader: 'G7.completion-effective', project, ref: reference(input) }, () => {
+    parents++; store.get(input.id);
+    const cited = read(reference(input), whole); return cited.ok ? 'cited' : cited.refusal.code;
+  }, () => { throw new Error('Unexpected cycle'); });
+  assert.equal(withHistoricalReads(parent), 'record_foreign');
+  assert.equal(withHistoricalReads(parent), 'record_foreign');
+  assert.equal(parents, 1, 'The caught D5 refusal no longer makes its caller incomplete');
+  // Row 3: a missing exact source refuses on its absence; once written by another Store, the citation succeeds.
+  const lateValue = { projectId: project, origin: { kind: 'owner-document' as const, location: 'late' }, content: 'late text', mediaType: 'text/plain' as const, sha256: digest('late text') };
+  const late: Ref = { id: `source:${project}:late`, revision: 1, hash: hashJson(lateValue) };
+  rejected(read(late, { kind: 'text-range', start: 0, end: 4 }), 'record_missing');
+  new Evidence(second).document(project, 'late', 'late text', 'text/plain', 0);
+  const appeared = read(late, { kind: 'text-range', start: 0, end: 4 });
+  assert.ok(appeared.ok, 'The former refusal does not stick once its source appears');
+  // Row 4: a selector that does not resolve, another project's source, another selector of one source — each its own key.
+  rejected(read(reference(config), { kind: 'json-pointer', pointer: '/missing' }), 'answer_unconfirmed');
+  const json = read(reference(config), { kind: 'json-pointer', pointer: '/a' });
+  assert.ok(json.ok); if (json.ok) assert.equal(json.value.grounds[0]!.observation.value, 1);
+  assert.equal(rejected(readAnswerCitations(store, { project: 'other', citations: [{ source: reference(notes), selector: range }] }), 'record_foreign').at.field, 'id');
+  // Row 6: a failure of the Store itself is thrown as before and kept as nothing: the next read succeeds.
+  const original = Store.prototype.get;
+  let armed = true;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) {
+    if (armed && args[0] === config.id) { armed = false; throw new EngineError('record_corrupt', 'injected storage failure'); }
+    return original.apply(this, args);
+  } as typeof original;
+  const pointer: Selector = { kind: 'json-pointer', pointer: '' };
+  try { assert.throws(() => read(reference(config), pointer), (error: unknown) => error instanceof EngineError && error.code === 'record_corrupt'); }
+  finally { Store.prototype.get = original; }
+  assert.ok(read(reference(config), pointer).ok, 'No negative result was kept from the failed read');
+});
+
+test('PF4 row 7: a warm historical citation of a file source stays the saved bytes; the current check of the file refuses after a change, at every current use', t => {
+  const { root, store } = citationStore(t), project = 'garden';
+  writeFileSync(join(root, 'answer.json'), JSON.stringify({ answer: 'JSON' }));
+  const source = new Evidence(store).file(project, 'answer', root, 'answer.json', 'application/json', 0);
+  const request = { project, citations: [{ source: reference(source), selector: { kind: 'json-pointer', pointer: '/answer' } as Selector }] };
+  const saved = readAnswerCitations(store, request);
+  assert.ok(saved.ok);
+  assert.ok(prepareAnswerCitations(store, request).ok);
+  writeFileSync(join(root, 'answer.json'), JSON.stringify({ answer: 'changed' }));
+  for (let use = 0; use < 2; use++) {
+    assert.deepEqual(readAnswerCitations(store, request), saved, 'History reads the saved bytes');
+    rejected(prepareAnswerCitations(store, request), 'answer_inapplicable');
+  }
 });

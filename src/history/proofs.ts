@@ -572,7 +572,8 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       completeJournal(events); completed = true;
       // Complete only if every physical read of this action was traced, it ran no git (№2217) and every nested journal —
       // derived here or taken from a cache — is complete too (№2201): a dependency outside the Store travels to every parent.
-      events.complete = observable && !events.tainted && storeReads() - reads === events.accounted && gitCalls() === gits
+      // PF4 (№3499 §2): a cycle answered inside — whatever an action made of that answer — leaves the trail incomplete.
+      events.complete = observable && !events.tainted && !events.cyclic && storeReads() - reads === events.accounted && gitCalls() === gits
         && events.entries.every(entry => !('entries' in entry) || entry.complete);
       const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);
       // PF3.1 (№3459 §4): a refusal is a result like any other, but it is kept — here and across operations — only for a
@@ -627,7 +628,7 @@ export function historicalRead<T>(store: Store, key: HistoricalReadKey, action: 
  * PF3.1 (№3459 §4): the historical readers whose own refusal, derived from exact saved inputs with a complete acyclic trail,
  * is the same result at every repeat and may be kept like a success; it never stands for a current check.
  */
-const REFUSAL_READERS: ReadonlySet<string> = new Set(['E4.continuation']);
+const REFUSAL_READERS: ReadonlySet<string> = new Set(['E4.continuation', 'D5.citation']);
 /** A historical read whose refusal may be kept as well — effective only for a reader listed in REFUSAL_READERS. */
 export function historicalRefusalRead<T>(store: Store, key: HistoricalReadKey, action: () => T, onCycle: () => T): T {
   return useHistoricalProof(store, key, action, onCycle, value => !(object(value) && value.ok === false), false, true);
