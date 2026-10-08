@@ -1,5 +1,5 @@
 #!/bin/bash
 # Заглушка модели для сухой проверки: отмечает вызов и отказывает, ничего не отправляя наружу.
-echo "$(date +%s) $(date +%H:%M:%S) codex-stub $*" >> "${HISTORY_RUN_OUT:?}/stub-calls.log"
+echo "$(date +%s) $(date +%H:%M:%S) codex-stub $*" >> "$(dirname "$0")/../stub-calls.log"
 case "$1" in --version) echo "codex-cli 0.160.0 (stub)"; exit 0;; esac
 sleep 2; echo "stub: no model in dry check" >&2; exit 1

@@ -7,7 +7,8 @@
 # Мерило черновика: до первого вызова — секунды или минута, между вызовами — секунды; в профиле нет повторных выводов истории.
 set -u; H=$(cd "$(dirname "$0")" && pwd); RUN=${RUN:?сборка}; OUT=${OUT:?папка результата}; DUR=${DURATION_MIN:-20}; NODE=$(command -v node)
 mkdir -p "$OUT"; rm -rf "$OUT"/copy.sqlite* "$OUT/prof" "$OUT"/*.log "$OUT"/*.jsonl "$OUT"/*.out "$OUT"/*.err "$OUT/report.txt"; mkdir -p "$OUT/prof"
-export HISTORY_RUN_OUT="$OUT"
+# Заглушки — своя копия в $OUT/bin: адаптер чистит окружение вызова, поэтому журнал пишется рядом с самой заглушкой.
+rm -rf "$OUT/bin"; cp -R "$H/bin" "$OUT/bin"
 if [ -n "${SRC:-}" ]; then cp "$SRC" "$OUT/copy.sqlite" && chmod u+w "$OUT/copy.sqlite"; else sqlite3 "file:$HOME/OMG/.omg/state.sqlite?mode=ro&immutable=1" ".backup $OUT/copy.sqlite" || { echo "STOP: копия"; exit 1; }; fi
 cmd() { "$NODE" "$RUN/dist/src/cli.js" command "$OUT/copy.sqlite"; }
 STATE=$(printf '%s' '{"type":"om-state","project":"omg-live"}' | cmd 2>/dev/null)
@@ -15,7 +16,7 @@ TOK=$(jq -r '.value.control.control.value.stop.token // empty' <<<"$STATE")
 [ -n "$TOK" ] || { echo "STOP: на копии нет стоящего стопа (проход должен быть остановлен): $(head -c 300 <<<"$STATE")"; exit 1; }
 printf '%s' "{\"type\":\"om-continue\",\"project\":\"omg-live\",\"resumeStop\":\"$TOK\"}" > "$OUT/input.json"
 START=$(date +%s); echo "старт $(date +%H:%M:%S); сборка $(git -C "$RUN" rev-parse --short HEAD 2>/dev/null) $RUN; копия $(du -h "$OUT/copy.sqlite" | cut -f1)" | tee "$OUT/report.txt"
-PATH="$H/bin:$PATH" "$NODE" "$RUN/dist/src/cli.js" command "$OUT/copy.sqlite" < "$OUT/input.json" > "$OUT/continue.out" 2> "$OUT/continue.err" &
+PATH="$OUT/bin:$PATH" "$NODE" "$RUN/dist/src/cli.js" command "$OUT/copy.sqlite" < "$OUT/input.json" > "$OUT/continue.out" 2> "$OUT/continue.err" &
 P=$!
 "$NODE" "$H/../stall-watch.mjs" --pid $P --db "$OUT/copy.sqlite" --always --sample 30 --log "$OUT/profile.jsonl" --profiles "$OUT/prof" > /dev/null 2>&1 &
 W=$!

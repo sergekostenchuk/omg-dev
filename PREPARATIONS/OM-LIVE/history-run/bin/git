@@ -1,3 +1,3 @@
 #!/bin/bash
 # Предохранитель: сухая проверка не запускает git (в live-source git запрещён).
-echo "$(date +%H:%M:%S) git-fuse $*" >> "${HISTORY_RUN_OUT:?}/git-calls.log"; exit 1
+echo "$(date +%H:%M:%S) git-fuse $*" >> "$(dirname "$0")/../git-calls.log"; exit 1
