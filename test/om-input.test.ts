@@ -15,7 +15,7 @@ import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/
 import { Store, storeEvents, storeReads, type Revision, type Write } from "../src/storage/store.js";
 import { execFileSync } from "node:child_process";
 import { removeProofCache } from "../src/storage/schema.js";
-import { captureView, pendingOverlay, storeView } from "../src/storage/store-view.js";
+import { captureView, pendingOverlay, storeView, transparentTrace } from "../src/storage/store-view.js";
 import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.js";
 import { sealed } from "../src/om/refusal.js";
 import { pendingCallStore } from "../src/om/model-call.js";
@@ -3426,4 +3426,169 @@ test("PF4 return №3541-2: a result is saved with every node it reaches whateve
   assert.deepEqual(state(), { roots: 1, dangling: 0 }, 'After another Store emptied the cache as well');
   count = computed;
   assert.deepEqual(proof(fresh(), a, 'after-clear'), { a: 1 }); assert.equal(computed, count);
+});
+
+// PF3.3 (№3568): a layer built over the trace of a traced proof — the live path E2.works-proposal-content → readFrameProposals.
+const pf33Passing = <T extends object>(target: T): T => new Proxy(target, { get: (object, key) => {
+  const member: unknown = Reflect.get(object, key, object); return typeof member === 'function' ? member.bind(object) : member; } });
+function pf33Child(layer: Store, counts: { parent: number; child: number }, anchor: Ref, reader = 'PF33.child') {
+  return historicalProof(layer, { reader, project: 'garden', ref: anchor }, source => {
+    counts.child++;
+    return canonical([source.get('pf33:x')?.value ?? null, source.get('pf33:x', 1)?.value ?? null, source.get('pf33:h')?.value ?? null,
+      source.get('pf33:dep')?.value ?? null, source.get('pf33:late')?.value ?? null, source.get('pf33:rev', 2)?.value ?? null,
+      source.list('k').map(row => row.id), source.history('pf33:x').map(row => row.revision)] as Json);
+  }, noCycle);
+}
+/** A traced parent whose action lays its own rows over the trace it is given — the key's Ref only (internal), or any rows
+ * (a plain overlay), or over a view of unknown making — and reads a traced child at that layer. */
+function pf33Parent(store: Store, counts: { parent: number; child: number }, anchor: Revision<Json>, kind: 'plain' | 'internal' | 'opaque',
+  rows: Revision<Json>[] = [pf4Row('pf33:x', 3, { x: 3 }), pf4Row('pf33:h', 7, { h: 'own' })]) {
+  return historicalProof(store, { reader: 'PF33.parent', project: 'garden', ref: reference(anchor), parameters: kind }, source => {
+    counts.parent++;
+    const layer = kind === 'internal' ? proofs.historicalLayer(source, [anchor]) : pendingOverlay(kind === 'opaque' ? pf33Passing(source) : source, rows);
+    return canonical([pf33Child(layer, counts, reference(anchor)), source.get('pf33:dep')?.value ?? null] as Json);
+  }, noCycle);
+}
+function pf33Stores(t: TestContext) {
+  const { first, second } = sameFileStores(t);
+  const write = (id: string, kind: string, value: Json) => first.write({ id, kind, expected: first.get(id)?.revision ?? 0, value });
+  write('pf33:x', 'k', { x: 1 }); write('pf33:x', 'k', { x: 2 }); write('pf33:h', 'other', { h: 'base' });
+  write('pf33:rev', 'other', { r: 1 });
+  const anchor = write('pf33:dep', 'k', { d: 1 });
+  return { first, second, anchor };
+}
+const pf33Delta = (before: ReturnType<typeof pf4Counters>) => {
+  const now = pf4Counters();
+  return { residualChecks: now.residualChecks - before.residualChecks, residualEvents: now.residualEvents - before.residualEvents };
+};
+
+test("PF3.3 (№3568 rows 1-3, 5, 6, 13, 19, 20, 23): through a layer over its trace a traced proof is reused in its operation by the events of the Store beneath — no residual reread, no read, no event — and derived again exactly when a delegated head, a delegated absence of a head or of a revision moves, through this or a second Store, between two uses of one operation too; an unrelated write and a base head its own row hides derive nothing; a plain overlay keeps its proofs within the operation, an internal layer at its Store as before", t => {
+  for (const kind of ['plain', 'internal'] as const) {
+    const { first, second, anchor } = pf33Stores(t);
+    const counts = { parent: 0, child: 0 }, call = () => pf33Parent(first, counts, anchor, kind);
+    const write = (id: string, kindOf: string, value: Json) => second.write({ id, kind: kindOf, expected: second.get(id)?.revision ?? 0, value });
+    withHistoricalReads(() => {
+      const cold = call();
+      assert.match(cold, kind === 'plain' ? /\{\\"x\\":3\}.*\{\\"h\\":\\"own\\"\}/ : /\{\\"x\\":2\}.*\{\\"h\\":\\"base\\"\}/);
+      const before = pf4Counters(), reads = storeReads(), sequence = first.lastEvent();
+      assert.equal(call(), cold);
+      assert.deepEqual([counts, pf33Delta(before), storeReads() - reads, first.lastEvent()], [{ parent: 1, child: 1 }, { residualChecks: 0, residualEvents: 0 }, 0, sequence],
+        `${kind}, rows 1, 23: the second use in the operation is checked by the Store's events — no residual reread, no read, no event`);
+      write('pf33:dep', 'k', { d: 2 });
+      assert.match(call(), /d\\?":2/);
+      assert.equal(counts.parent, 2, `${kind}, row 13: a write of a second Store between two uses of one operation is seen by the second`);
+    });
+    const sequence = first.lastEvent();
+    withHistoricalReads(call);
+    assert.equal(counts.parent, kind === 'internal' ? 2 : 3, `${kind}, rows 19, 20: kept across operations only from an internal layer (§4 №3499)`);
+    assert.equal(first.lastEvent(), sequence, `${kind}, row 23: the check and the save at the operation's boundary add no event`);
+    withHistoricalReads(() => {
+      call();
+      const parents = counts.parent, before = pf4Counters();
+      write('pf33:unrelated', 'other', {}); call();
+      assert.deepEqual([counts.parent, pf33Delta(before)], [parents, { residualChecks: 0, residualEvents: 0 }], `${kind}, row 6: an unrelated write derives nothing and rereads nothing`);
+      write('pf33:h', 'other', { h: 'moved' });
+      assert.equal(/moved/.test(call()), kind === 'internal');
+      assert.equal(counts.parent, kind === 'internal' ? parents + 1 : parents,
+        `${kind}, row 6: a base head the layer's own row hides derives nothing; the internal layer owns only the key's row, so there it is delegated and moved`);
+    });
+    for (const [id, label] of [['pf33:late', 'an absent head'], ['pf33:rev', 'an absent exact revision']] as const) withHistoricalReads(() => {
+      call();
+      const parents = counts.parent;
+      write(id, 'other', { created: kind });
+      assert.match(call(), /created/);
+      assert.equal(counts.parent, parents + 1, `${kind}, row 5: ${label} created by a second Store derives again`);
+    });
+  }
+});
+
+test("PF3.3 (№3568 rows 9, 11, 14, 18, 21): a view of unknown making under the layer keeps the residual reread; a read member replaced at the same sequence ends the reuse in memory and nothing over a trace is saved, so a new Store derives again; a write made while the proof is derived — by an observer of its trace — is seen at the next use; one child key over two layers with different own rows, then the bare Store, transfers nothing", t => {
+  const { first, second, anchor } = pf33Stores(t);
+  const opaque = { parent: 0, child: 0 };
+  withHistoricalReads(() => {
+    const cold = pf33Parent(first, opaque, anchor, 'opaque'), before = pf4Counters();
+    assert.equal(pf33Parent(first, opaque, anchor, 'opaque'), cold);
+    assert.ok(pf33Delta(before).residualChecks > 0 && opaque.parent === 1, 'Row 9: the old path — reused by reading again in full');
+    // A trace of the factory with no layer above it is admitted nowhere new: its reads keep the old conservative path.
+    const bare = transparentTrace(first);
+    let derived = 0;
+    const read = () => historicalProof(bare, { reader: 'PF33.bare', project: 'garden', ref: reference(anchor) }, source => { derived++; return source.get('pf33:dep')!.value; }, noCycle);
+    const value = read(), again = pf4Counters();
+    assert.deepEqual(read(), value);
+    assert.ok(pf33Delta(again).residualChecks > 0 && derived === 1, 'Row 9: a trace alone is no witness of the Store beneath it');
+  });
+  for (const kind of ['plain', 'internal'] as const) {
+    const counts = { parent: 0, child: 0 }, original = Store.prototype.get;
+    withHistoricalReads(() => {
+      const cold = pf33Parent(first, counts, anchor, kind), sequence = first.lastEvent();
+      Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+      try { assert.equal(pf33Parent(first, counts, anchor, kind), cold); } finally { Store.prototype.get = original; }
+      assert.deepEqual([counts.parent, first.lastEvent()], [2, sequence], `${kind}, row 11: a replaced read under the same sequence is no reuse`);
+    });
+    const before = pf4Counters(), fresh = new Store(first.path);
+    t.after(() => fresh.close());
+    withHistoricalReads(() => pf33Parent(fresh, counts, anchor, kind));
+    assert.equal(counts.parent, 3, `${kind}, row 21: a new Store derives again — nothing read through a trace was saved or loaded`);
+    assert.equal(pf4Counters().loaded - before.loaded, 0);
+  }
+  // Row 14: the observer of the parent's trace writes the dependency right after the derivation read it.
+  const counts = { parent: 0, child: 0 };
+  let seen = 0, wrote = false;
+  withHistoricalReads(() => {
+    // The child reads the dependency first, the parent last: the write follows the derivation's last read of it.
+    const observed = historicalTrace(first, (ref, head, method) => { if (method === 'get' && head && ref.id === 'pf33:dep' && ++seen === 2) { wrote = true; second.write({ id: 'pf33:dep', kind: 'k', expected: ref.revision, value: { d: 'during' } }); } });
+    const cold = pf33Parent(observed, counts, anchor, 'plain');
+    assert.ok(wrote && !/during/.test(cold), 'The derivation read the value before the write');
+    assert.match(pf33Parent(first, counts, anchor, 'plain'), /during/);
+    assert.equal(counts.parent, 2, 'Row 14: the mark taken before the read does not skip a write made during the derivation');
+  });
+  // Row 18: one child key over two layers of different own rows, then the bare Store.
+  const shared = { parent: 0, child: 0 }, dep = first.get('pf33:dep')!;
+  const [left, right, bare] = withHistoricalReads(() => [
+    historicalProof(first, { reader: 'PF33.two', project: 'garden', ref: reference(dep), parameters: 'left' }, source => pf33Child(pendingOverlay(source, [pf4Row('pf33:x', 3, { x: 'left' })]), shared, reference(dep)), noCycle),
+    historicalProof(first, { reader: 'PF33.two', project: 'garden', ref: reference(dep), parameters: 'right' }, source => pf33Child(pendingOverlay(source, [pf4Row('pf33:x', 3, { x: 'right' })]), shared, reference(dep)), noCycle),
+    pf33Child(first, shared, reference(dep))]);
+  assert.ok(/left/.test(left) && /right/.test(right) && !/left|right/.test(bare) && /\{"x":2\}/.test(bare));
+  assert.equal(shared.child, 3, 'Row 18: each layer derives its own; the bare Store takes no layer\'s result and no own row becomes its fact');
+});
+
+test("PF3.3 (№3568 rows 15, 16): observers of the parent's trace — ordered and distinct, cold, reused, nested, in the next operation and after a write — get the very stream, values and derivations the accepted engine d3ab5fcd gives", t => {
+  const { first: store, second } = sameFileStores(t);
+  const w = (id: string, expected: number, value: Json) => store.write({ id, kind: 'k', expected, value });
+  w('s:x', 0, { x: 1 }); w('s:x', 1, { x: 2 }); const y = w('s:y', 0, { y: 1 }); w('s:o', 0, { o: 1 });
+  const row = (id: string, revision: number, value: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(value), value });
+  const ref = { id: y.id, revision: y.revision, hash: y.hash };
+  const counts = { parent: 0, child: 0 };
+  const child = (layer: Store) => historicalProof(layer, { reader: 'PF33.child', project: 'garden', ref }, source => {
+    counts.child++;
+    return canonical([source.get('s:x')?.value ?? null, source.get('s:x', 3)?.value ?? null, source.get('s:x', 1)?.value ?? null, source.get('s:y')?.value ?? null,
+      source.get('s:absent') as unknown as Json, source.list('k').map(r => r.id), source.history('s:x').map(r => r.revision), source.get('s:o')?.value ?? null]);
+  }, noCycle);
+  const parent = (view: Store, name: string, internal: boolean) => historicalProof(view, { reader: 'PF33.parent', project: 'garden', ref, parameters: name }, source => {
+    counts.parent++;
+    const rows = [row('s:x', 3, { x: 3 }), row('s:o', 2, { o: 'own' })];
+    const layer = internal ? proofs.historicalLayer(source, [row(ref.id, ref.revision, { y: 1 })]) : pendingOverlay(source, rows);
+    return canonical([child(layer), child(layer), source.get('s:y')?.value ?? null]);
+  }, noCycle);
+  const out: [string, string, { value: string; into: string[] }][] = [];
+  const stream = (mode: 'ordered' | 'distinct', call: (view: Store) => string) => {
+    const into: string[] = []; const value = call(historicalTrace(store, (r, head, method) => into.push(`${method}:${r.id}@${r.revision}:${head}`), mode)); return { value, into }; };
+  for (const internal of [false, true]) for (const mode of ['ordered', 'distinct'] as const) {
+    const name = `${internal ? 'internal' : 'plain'}-${mode}`;
+    withHistoricalReads(() => {
+      out.push([name, 'cold', stream(mode, v => parent(v, name, internal))]);
+      out.push([name, 'reuse', stream(mode, v => parent(v, name, internal))]);
+      out.push([name, 'nested', stream(mode, v => historicalProof(v, { reader: 'PF33.grand', project: 'garden', ref, parameters: name }, s => parent(s, name, internal), noCycle))]);
+      out.push([name, 'nested-reuse', stream(mode, v => historicalProof(v, { reader: 'PF33.grand', project: 'garden', ref, parameters: name }, s => parent(s, name, internal), noCycle))]);
+    });
+    withHistoricalReads(() => { out.push([name, 'next-op', stream(mode, v => parent(v, name, internal))]); });
+    second.write({ id: 's:y', kind: 'k', expected: store.get('s:y')!.revision, value: { y: name } });
+    withHistoricalReads(() => { out.push([name, 'after-write', stream(mode, v => parent(v, name, internal))]); });
+  }
+  const flat = out.map(([name, call, { value, into }]) => [name, call, value, into]);
+  assert.deepEqual(out[0]![2].into, ['get:s:x@1:false', 'get:s:y@1:true', 'list:s:o@1:false', 'list:s:x@2:false', 'list:s:y@1:false', 'history:s:x@1:false', 'history:s:x@2:false',
+    'get:s:x@1:false', 'get:s:y@1:true', 'list:s:o@1:false', 'list:s:x@2:false', 'list:s:y@1:false', 'history:s:x@1:false', 'history:s:x@2:false', 'get:s:y@1:true'],
+    'The cold ordered stream: what the layer delegates, twice, then the parent\'s own read; no own row and no absence');
+  assert.equal(digest(canonical([flat, counts] as unknown as Json)), '15ddb3237bace74d7bf215529db8d31ba176d5f526c75580a05ffb68fc6e8c8f',
+    'Every stream, value and derivation count is that of the accepted engine (computed on d3ab5fcd)');
 });

@@ -76,9 +76,9 @@ const pendingLayers = new WeakMap<object, PendingLayer>();
  * owns detached, deeply frozen copies of the rows behind a private index — the caller's objects are neither frozen nor
  * shared, and a later change to them leaves this snapshot as it was. Only `get` of a row's id, at its head or at its own
  * revision, is answered here; another revision, another id, an absence, list, history, identities and the writes go to
- * the base exactly as before, and later rows of one id replace earlier ones. Over a base with proved reads it is a frozen
- * object and a registered layer of that base (№2012-2); over anything else it stays an opaque Proxy, whose reads may reach
- * another source beneath it.
+ * the base exactly as before, and later rows of one id replace earlier ones. Over a base with proved reads — or a
+ * historical trace of such a base (PF3.3) — it is a frozen object and a registered layer of that base (№2012-2); over
+ * anything else it stays an opaque Proxy, whose reads may reach another source beneath it.
  */
 export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]): Store {
   const owned = new Map<string, Revision<unknown>>();
@@ -90,7 +90,9 @@ export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]):
     if (row && (revision === undefined || revision === row.revision)) { if (layer) pendingReads?.(layer, id, revision, row); return row as Revision<T>; }
     return base.get<T>(id, revision);
   };
-  if (!provenSourceReads(base)) return new Proxy(base, { get(target, key) {
+  // PF3.3 (№3568 §1): a historical trace this module built reads exactly what the source beneath it reads; over such a
+  // source a trace is as proved as that source, and the layer over it is a registered one whose chain crosses the trace.
+  if (!provenSourceReads(beneathTraces(base))) return new Proxy(base, { get(target, key) {
     if (key === 'get') return get;
     const member: unknown = Reflect.get(target, key, target);
     return typeof member === 'function' ? member.bind(target) : member;
@@ -110,7 +112,8 @@ export function pendingOverlay(base: Store, rows: readonly Revision<unknown>[]):
     if (typeof member !== 'function') continue;
     // The reads a proof's events go through (get, list, history) are the ones a witness must still reach; a member the
     // base refuses afresh on every access (a write-only view's undeclared method) proves nothing either way.
-    if (READ_METHODS.has(name)) bound.set(name, member);
+    // PF3.3: over a trace, the member its new wrapper of every access finally invokes — the one a witness must still reach.
+    if (READ_METHODS.has(name)) bound.set(name, servingMember(base, name));
     Object.defineProperty(methods, name, { value: name === 'get' ? get : member.bind(base) });
   }
   Object.freeze(methods);
@@ -138,7 +141,7 @@ export function pendingSelections(view: unknown): readonly (readonly [string, nu
   for (let cursor = view; ;) {
     const layer = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
     if (!layer) return provenStore(cursor) ? Object.freeze(found) : null;
-    if ([...layer.bound].some(([name, member]) => Reflect.get(layer.base, name, layer.base) !== member)) return null;
+    if (!layerIntact(layer)) return null;
     for (const row of layer.rows.values()) found.push(Object.freeze([row.id, row.revision] as const));
     cursor = layer.base;
   }
@@ -160,18 +163,90 @@ export function pendingWithin(view: unknown, layer: unknown): boolean {
  * row's id at its head or own revision, decided by method, id and revision; otherwise the genuine Store that serves it
  * through a proved chain of pending layers and write-only views; null when any link is of unknown origin (a caller's
  * Proxy, a capture, a Transaction preview, a projection) or a base no longer reads through the members a layer bound.
+ * PF3.3 (№3568 §1): with `traces`, the chain also goes on through the historical traces of this module's own making —
+ * each overlap still decided where it is — for the witness of a read only; without it a trace ends the chain as before,
+ * and so does every right that rests on a layer being its base's own (sharing, adoption, observation).
  */
-export function readServer(view: unknown, method: string, id: string | undefined, revision: number | undefined): Store | 'pending' | null {
+export function readServer(view: unknown, method: string, id: string | undefined, revision: number | undefined, traces = false): Store | 'pending' | null {
   for (let cursor = view; ;) {
     const layer = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
-    if (!layer) return provenStore(cursor);
+    if (!layer) {
+      const source = traces ? traceSource(cursor) : undefined;
+      if (source === undefined) return provenStore(cursor);
+      cursor = source;
+      continue;
+    }
     if (method === 'get' && id !== undefined) {
       const row = layer.rows.get(id);
       if (row && (revision === undefined || row.revision === revision)) return 'pending';
     }
-    if ([...layer.bound].some(([name, member]) => Reflect.get(layer.base, name, layer.base) !== member)) return null;
+    if (!layerIntact(layer)) return null;
     cursor = layer.base;
   }
+}
+/** PF3.3: whether the chain of pending layers of a view ends at a historical trace — its witness, if any, is reached only
+ * through one. Only the answer is handed out. */
+export function tracedChain(view: unknown): boolean {
+  for (let cursor = view; ;) {
+    const layer = typeof cursor === 'object' && cursor !== null ? pendingLayers.get(cursor) : undefined;
+    if (!layer) return traceSource(cursor) !== undefined;
+    cursor = layer.base;
+  }
+}
+/** A layer's base still reads through the members it bound. */
+const layerIntact = (layer: PendingLayer): boolean => [...layer.bound].every(([name, member]) => servingMember(layer.base, name) === member);
+
+/**
+ * PF3.3 (№3568 §1): the historical traces this module built and the source each was built over, written only by
+ * transparentTrace and never handed out. A trace answers each read with exactly what its source's current member returns
+ * for it, called on that source: the one installed observer is shown the read and performs it, yet cannot change what the
+ * trace returns. Its reads are its source's by construction — never by a caller's claim, a flag, instanceof or freezing;
+ * a Proxy of any other making, however alike, is no trace.
+ */
+const traceSources = new WeakMap<object, Store>();
+const traceSource = (candidate: unknown): Store | undefined => typeof candidate === 'object' && candidate !== null ? traceSources.get(candidate) : undefined;
+/** The first link beneath a view's historical traces: the view itself when it is none. */
+function beneathTraces(candidate: unknown): unknown {
+  let cursor = candidate;
+  for (let source = traceSource(cursor); source !== undefined; source = traceSource(cursor)) cursor = source;
+  return cursor;
+}
+/** The member a read of `name` at `base` finally invokes: a trace makes a new wrapper at every access, and each wrapper
+ * calls its source's current member, so through traces it is that of the first link beneath them. */
+function servingMember(base: object, name: string): unknown {
+  const holder = beneathTraces(base) as object;
+  return Reflect.get(holder, name, holder);
+}
+export type TraceRead = (view: Store, method: 'get' | 'list' | 'history', selection: string | undefined, revision: number | undefined, read: () => unknown) => unknown;
+/** The one observer of every trace's reads — the historical proofs' — installed once; a second installation is refused, so
+ * no caller can put an observer of its own between a trace and its source. */
+let traceReads: TraceRead | null = null;
+export function observeTraceReads(observer: TraceRead): void {
+  if (traceReads !== null || typeof observer !== 'function')
+    throw new EngineError('store_view_composition_unsupported', 'The reads of historical traces have their one observer already');
+  traceReads = observer;
+}
+/** The historical trace of a source: get, list and history are shown to the installed observer with the read itself, which
+ * it performs; the trace returns what that read returned (the read is performed here if the observer did not). Every
+ * other member is the source's, bound to it, resolved at each access. */
+export function transparentTrace(source: Store): Store {
+  const answer = <T,>(method: 'get' | 'list' | 'history', selection: string | undefined, revision: number | undefined, read: () => T): T => {
+    const observer = traceReads;
+    if (observer === null) return read();
+    let result: { value: T } | null = null;
+    observer(view, method, selection, revision, () => { const value = read(); result = { value }; return value; });
+    const done = result as { value: T } | null;
+    return done === null ? read() : done.value;
+  };
+  const view: Store = new Proxy(source, { get(target, key) {
+    if (key === 'get') return <T,>(id: string, revision?: number): Revision<T> | null => answer('get', id, revision, () => target.get<T>(id, revision));
+    if (key === 'list') return <T,>(kind?: string): Revision<T>[] => answer('list', kind, undefined, () => target.list<T>(kind));
+    if (key === 'history') return <T,>(id: string): Revision<T>[] => answer('history', id, undefined, () => target.history<T>(id));
+    const value: unknown = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  traceSources.set(view, source);
+  return view;
 }
 
 const READ_METHODS = new Set(['get', 'list', 'history']);

@@ -92,7 +92,7 @@ export async function load(url, context, nextLoad) {
       if (source.split(miss).length !== 2) throw new Error('The common historical proof action was not identified');
       source = source.replace(miss, 'const costAttempt = globalThis.__operationCost.miss(key, sourceView(store), traced, source);\n'
         + 'const result = globalThis.__operationCost.action(costAttempt, () => synchronous(() => action(traced ? historicalTrace(store) : store)));');
-      const replayable = 'const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);';
+      const replayable = 'const replayable = !isProxy(source) && !tracedChain(source) || [...events.sources].every(observed => observed === source);';
       if (source.split(replayable).length !== 2) throw new Error('The common historical proof replay decision was not identified');
       source = source.replace(replayable, replayable + '\nglobalThis.__operationCost.replayability(costAttempt, replayable);');
       // S1.1 (№1787): a repeated entry into an ACTIVE exact key is a real cycle, not repeated work; the key and the
@@ -369,7 +369,9 @@ try {
     else assert.deepEqual(cold.families, preparationFamilies, 'More closures of the same frame do not create additional historical foundations');
     const next = measured('prepareGapLines.external.' + size, () => ok(prepareGapLines(copy, request)));
     assert.deepEqual(next.result, cold.result);
-    assert.ok(next.sample.proofs.size > 0, 'The next external preparation proves history again');
+    // PF3.3 (№3587): no residual reread inside a traced read leaves the derivation unaccounted any more — the history it
+    // proved is complete and kept at the Store, so the next operation reuses it by the Store's events.
+    assert.equal(next.sample.proofs.size, 0, 'The next external preparation reuses the complete histories kept at the Store');
     const warm = withHistoricalReads(() => {
       ok(prepareGapLines(copy, request));
       return measured('prepareGapLines.warm.' + size, () => ok(prepareGapLines(copy, request)));
@@ -391,7 +393,8 @@ try {
     else assert.deepEqual(confirmed.families, confirmationFamilies, 'Distinct result keys share the same exact accepted frame and prior D2 history');
     assert.equal(confirmed.result.achieved.length, size);
     const repeated = measured('confirmResults.external.' + size, () => ok(confirmResults(copy, confirmation)));
-    assert.deepEqual(repeated.result, confirmed.result); assert.ok(repeated.sample.proofs.size > 0);
+    assert.deepEqual(repeated.result, confirmed.result);
+    assert.equal(repeated.sample.proofs.size, 0, 'PF3.3: the kept complete histories serve the next confirmation');
     const warmed = withHistoricalReads(() => {
       ok(confirmResults(copy, confirmation));
       return measured('confirmResults.warm.' + size, () => ok(confirmResults(copy, confirmation)));

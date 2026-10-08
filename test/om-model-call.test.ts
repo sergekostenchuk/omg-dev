@@ -3431,8 +3431,9 @@ test('S1.1 (№2012) the pending overlay of E4 is frozen only over proved reads:
   const shellProbe = probe(opaque);
   assert.equal(shellProbe.bodies, 2); assert.equal(observed, 2, 'The lower collector sees both readings');
   assert.deepEqual(shellProbe.first, { base: row, head: pendingRow, exact: pendingRow, later: null }, 'The same answers through the opaque branch');
-  // A traced Store and a genuine Store with an own reading override: opaque as well.
-  assert.equal(types.isProxy(pendingCallStore(historicalTrace(store), [pendingWrite])), true);
+  // A traced Store: a registered layer since PF3.3 (№3568 §1) — a trace of the common factory over a proved Store is a known
+  // composition. A genuine Store with an own reading override stays opaque.
+  assert.equal(types.isProxy(pendingCallStore(historicalTrace(store), [pendingWrite])), false);
   const overridden = new Store(store.path); t.after(() => overridden.close());
   Object.defineProperty(overridden, 'get', { value: overridden.get.bind(overridden) });
   assert.equal(types.isProxy(pendingCallStore(overridden, [pendingWrite])), true);

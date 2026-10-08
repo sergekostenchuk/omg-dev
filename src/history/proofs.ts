@@ -7,7 +7,7 @@ import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { observeStore, Store, storeReads, type ProofCacheNode, type ProofCacheRecord, type Revision, type StoreEvent } from "../storage/store.js";
-import { genuineStore, observePendingReads, pendingLayer, pendingOverlay, pendingSelections, pendingWithin, provenStore, readServer } from "../storage/store-view.js";
+import { genuineStore, observePendingReads, observeTraceReads, pendingLayer, pendingOverlay, pendingSelections, pendingWithin, provenStore, readServer, tracedChain, transparentTrace } from "../storage/store-view.js";
 import { gitCalls } from "../runtime/environment.js";
 
 /**
@@ -34,7 +34,10 @@ type ReadEvent = ReadObservation & { signature: string; mutable: boolean; observ
   /** The signature covers the whole rows: the read came through a pending layer whose base has no proved chain. */
   bodies?: true;
   /** PF2 (№2905): a pending layer answered this read from its own rows — constant for that layer, never its base's. */
-  pending?: true };
+  pending?: true;
+  /** PF3.3 (№3568 §1): the witness was reached through a historical trace beneath a layer — a dependency checked by its
+   * events, never a ground for sharing, adoption or saving (those keep №3499 §4 and PF2). */
+  through?: true };
 /** `accounted`: physical Store reads this journal traced (its own and its nested proofs'); `complete`: every read of the
  * proof and of every proof nested in it was traced and none of them ran git — the only journal whose footprint is its
  * whole dependency area. */
@@ -174,7 +177,7 @@ function chainsIntact(journal: ReadJournal): boolean {
   for (const [holder, names] of journal.methods)
     for (const [name, invoked] of names) if (Reflect.get(holder, name, holder) !== invoked) return false;
   for (const [view, witness] of journal.chains)
-    if (witness === null ? !snapshotIntact(view) : readServer(view, 'list', undefined, undefined) !== witness) return false;
+    if (witness === null ? !snapshotIntact(view) : readServer(view, 'list', undefined, undefined, true) !== witness) return false;
   return true;
 }
 /**
@@ -245,8 +248,9 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
   const distinct = !enclosing || enclosing.method !== method || enclosing.id !== id || enclosing.revision !== revision;
   const recorded = distinct && !checkingFootprint && historicalViews !== null && proofCaptures.length > 0;
   // PF1 (№2797-3): a row a pending layer answers from its own frozen rows is constant for that overlay; any other read is
-  // witnessed by the genuine Store that serves it through proved layers, or by none.
-  const served = recorded ? readServer(sourceView(store), method, id, revision) : null;
+  // witnessed by the genuine Store that serves it through proved layers, or by none. PF3.3 (№3568 §1): beneath a layer the
+  // chain goes on through historical traces of the factory's own making, each overlap decided where it is.
+  const served = recorded ? readServer(sourceView(store), method, id, revision, pendingLayer(sourceView(store))) : null;
   const witness = served === 'pending' ? null : served;
   // PF4: the mark of the Store that serves this read, taken before it.
   if (witness) mark(proofCaptures.at(-1)!, witness);
@@ -283,23 +287,21 @@ function observedRead<T>(store: Store, method: ReadEvent['method'], id: string |
     if (delegate) noteMethod(proofCaptures.at(-1)!, delegate, method, invoked);
     recordRead({ source, method, id, revision, references: refs, observations, served: witness, ...(witness && witness !== source ? { witness } : {}),
       ...(bodies ? { bodies: true as const } : {}), ...(served === 'pending' ? { pending: true as const } : {}),
+      ...(witness && layer && tracedChain(source) ? { through: true as const } : {}),
       signature: readSignature(source, records, bodies), mutable: served !== 'pending'
         && (bodies || isProxy(source) && !historicalSnapshots.has(source) || method !== 'get' || revision === undefined || value === null) });
   }
   return value;
 }
+// A trace the factory made for anyone else forwards its reads untouched, as its source would answer them.
+observeTraceReads((view, method, id, revision, read) => historicalTraces.has(view) ? observedRead(view, method, id, revision, read) : read());
 /** Construct, rather than trust a claim about, a transparent source view. Opaque/pending views keep their identity. */
 export function historicalTrace(store: Store, observe?: (ref: Ref, head: boolean, method: ReadEvent['method']) => void,
   mode: 'ordered' | 'distinct' = 'ordered'): Store {
   if (!(store instanceof Store) || (observe !== undefined && typeof observe !== 'function') || !['ordered', 'distinct'].includes(mode)) invalid('history.trace');
-  const view = new Proxy(store, { get(target, key) {
-    if (key === 'get') return <T>(id: string, revision?: number): Revision<T> | null =>
-      observedRead(view, 'get', id, revision, () => target.get<T>(id, revision));
-    if (key === 'list') return <T>(kind?: string): Revision<T>[] => observedRead(view, 'list', kind, undefined, () => target.list<T>(kind));
-    if (key === 'history') return <T>(id: string): Revision<T>[] => observedRead(view, 'history', id, undefined, () => target.history<T>(id));
-    const value: unknown = Reflect.get(target, key, target);
-    return typeof value === 'function' ? value.bind(target) : value;
-  } });
+  // PF3.3 (№3568 §1): the common factory builds the Proxy, so a trace is known by its making: each read is observed by
+  // observedRead (installed below, once) and is exactly the source's own.
+  const view = transparentTrace(store);
   historicalTraces.set(view, { source: store, observe, mode, seen: new Set(), journals: new WeakMap() });
   return view;
 }
@@ -461,7 +463,7 @@ function currentResidual(footprint: readonly ReadEvent[]): boolean {
     for (const event of footprint) {
       // A witnessed event of an overlay is checked at its witness only while the same proved layers still lead there; a
       // broken chain is no current source at all, never a weaker check of what an unknown view now answers (№2827).
-      if (event.witness && readServer(event.source, event.method, event.id, event.revision) !== event.witness) return false;
+      if (event.witness && readServer(event.source, event.method, event.id, event.revision, true) !== event.witness) return false;
       if (snapshotBases.has(event.source) && !snapshotIntact(event.source)) return false;
       const records = event.method === 'get' ? (() => { const row = event.source.get<unknown>(event.id!, event.revision); return row ? [row] : []; })()
         : event.method === 'list' ? event.source.list<unknown>(event.id)
@@ -541,7 +543,8 @@ function provenance(journal: ReadJournal): { pending: boolean; server: Store | n
   for (const entry of journal.entries) {
     if ('entries' in entry) { const child = provenance(entry); if (child.pending) found.pending = true; serve(child.server); }
     else if (entry.pending) found.pending = true;
-    else serve(entry.bodies ? null : entry.witness ?? (provenStore(entry.source) === entry.source ? entry.source : null));
+    // PF3.3: a witness reached through a trace serves the check of this read, never a claim that the proof is its base's.
+    else serve(entry.bodies || entry.through ? null : entry.witness ?? (provenStore(entry.source) === entry.source ? entry.source : null));
   }
   provenances.set(journal, found);
   return found;
@@ -699,7 +702,8 @@ function useHistoricalProof<T>(store: Store, key: HistoricalReadKey, action: (so
       // PF4 (№3499 §2): a cycle answered inside — whatever an action made of that answer — leaves the trail incomplete.
       events.complete = observable && !events.tainted && !events.cyclic && storeReads() - reads === events.accounted && gitCalls() === gits
         && events.entries.every(entry => !('entries' in entry) || entry.complete);
-      const replayable = !isProxy(source) || [...events.sources].every(observed => observed === source);
+      // PF3.3: a layer whose chain crosses a trace forwards to the collectors behind that trace exactly as an opaque view did.
+      const replayable = !isProxy(source) && !tracedChain(source) || [...events.sources].every(observed => observed === source);
       // PF3.1 (№3459 §4): a refusal is a result like any other, but it is kept — here and across operations — only for a
       // historical consumer that asked for it explicitly and is listed below, from a complete, acyclic derivation of plain
       // data; every other refusal keeps the old rule, whatever its cacheable predicate says.
@@ -782,9 +786,9 @@ const internalLayers = new WeakMap<Store, InternalLayer>();
 export function historicalLayer(store: Store, rows: readonly Revision<unknown>[]): Store {
   const layer = pendingOverlay(store, rows);
   const owner = historicalViews && !readStack.length && !checkingFootprint ? proofCaptures.at(-1) : undefined, ref = owner?.ref;
-  // Over the Store itself the factory builds a registered layer; over a transparent trace of it (a traced caller) the
-  // opaque layer it always built there, whose delegated reads reach the Store through the trace and are recorded — and
-  // checked by reading them again — as before. Either belongs to this derivation only with its rows fixed by the key.
+  // Over the Store itself the factory builds a registered layer; over a transparent trace of it (a traced caller) a layer
+  // whose delegated reads reach the Store through the trace and are recorded there — witnessed by the Store through the
+  // trace since PF3.3. Either belongs to this derivation only with its rows fixed by the key.
   const root = genuineStore(store) ? store : historicalTraces.has(store) && genuineStore(sourceView(store)) ? sourceView(store) : null;
   if (!owner || !ref || !root || owner.home !== root || !rows.length) return layer;
   try {
@@ -793,7 +797,7 @@ export function historicalLayer(store: Store, rows: readonly Revision<unknown>[]
   const description = rows.map(row => ({ id: row.id, kind: row.kind, revision: row.revision, hash: row.hash, value: row.value }));
   // Only a registered layer over the Store itself has a description a later Store can rebuild (§5.2); a layer over a
   // trace is kept in this process only.
-  internalLayers.set(layer, { base: root, rows: pendingLayer(layer) && standardReads(root) && jsonSafe(description) ? JSON.stringify(description) : null });
+  internalLayers.set(layer, { base: root, rows: store === root && pendingLayer(layer) && standardReads(root) && jsonSafe(description) ? JSON.stringify(description) : null });
   owner.layers.add(layer);
   return layer;
 }
@@ -927,7 +931,7 @@ function encodeJournal(journal: ReadJournal, root: Store): EncodedNode | null {
         children.push(child);
         return { n: child.hash };
       }
-      if (entry.bodies || entry.served && entry.served !== root || entry.witness && entry.witness !== root) throw UNSAVED;
+      if (entry.bodies || entry.through || entry.served && entry.served !== root || entry.witness && entry.witness !== root) throw UNSAVED;
       return { s: src(entry.source), m: entry.method, i: entry.id ?? null, v: entry.revision ?? null, f: refsOf(entry.references),
         b: entry.observations.map(seen => ({ s: src(seen.source), m: seen.method, i: seen.id ?? null, v: seen.revision ?? null, f: refsOf(seen.references) })),
         g: entry.signature, u: entry.mutable, d: entry.served ? 0 : null, w: entry.witness ? 0 : null, p: entry.pending === true };
@@ -1143,7 +1147,8 @@ export function pendingSnapshotView(store: Store, rows: readonly Revision<unknow
   // This map is complete before use and never changes. Exact fallback reads are immutable only for a known source, and
   // only while that source is still a proved one (PF1, №2827): the view reads through it afresh on every call.
   const base = sourceView(store);
-  if (!isProxy(base) || historicalSnapshots.has(base)) { historicalSnapshots.add(view); snapshotBases.set(view, store); }
+  // PF3.3: a layer whose chain crosses a trace is trusted no more than the opaque view it used to be.
+  if (!isProxy(base) && !tracedChain(base) || historicalSnapshots.has(base)) { historicalSnapshots.add(view); snapshotBases.set(view, store); }
   return view;
 }
 const snapshotBases = new WeakMap<Store, Store>();

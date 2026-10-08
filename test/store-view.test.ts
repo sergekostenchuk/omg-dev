@@ -12,7 +12,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, isRef, type Ref } from '../src/pipeline/contracts.js';
 import { observeStore, Store, storeBodyCache, storeReads, type Revision, type StoreBodyCache, type StoreObserver, type TransactionGuard, type Write } from '../src/storage/store.js';
-import { captureView, genuineStore, observePendingReads, pendingOverlay, pendingSelections, provenReads, provenStore, readServer, storeView, type StoreViewPolicy } from '../src/storage/store-view.js';
+import { captureView, genuineStore, observePendingReads, pendingOverlay, pendingSelections, provenReads, provenStore, observeTraceReads, readServer, storeView, tracedChain, transparentTrace, type StoreViewPolicy } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -1223,6 +1223,78 @@ test('PF2 (№2905) the selections a chain of pending layers answers itself are 
   Store.prototype.list = function (this: Store, ...args: Parameters<typeof list>) { return list.apply(this, args); } as typeof list;
   try { assert.equal(pendingSelections(outer), null, 'A base read replaced after the layers were built ends the proved chain'); }
   finally { Store.prototype.list = list; }
+});
+
+test('PF3.3 (№3568 rows 1-4, 7-10, 12) a pending overlay over a historical trace is a registered layer whose chain crosses the trace: its own rows are pending, every other read is witnessed by the Store beneath through each overlap — for the witness only, the plain chain still ends at the trace; a Proxy of any other making, a projection beneath and a replaced member keep the conservative path', t => {
+  const { root, store } = fixture(t);
+  const row = (id: string, revision: number, body: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(body), value: body });
+  store.write({ id: 'pf33:x', kind: 'k', expected: 0, value: { v: 1 } });
+  store.write({ id: 'pf33:x', kind: 'k', expected: 1, value: { v: 2 } });
+  const y = store.write({ id: 'pf33:y', kind: 'k', expected: 0, value: { y: 1 } });
+  store.write({ id: 'pf33:%_Ö', kind: 'k', expected: 0, value: { literal: true } });
+  const trace = historicalTrace(store);
+  assert.notEqual(trace.get, trace.get, 'Row 12: a trace makes a new wrapper of its read at every access');
+  const value = { v: 3, nested: { n: 1 } };
+  const rows = [row('pf33:x', 3, value as unknown as Json), row('pf33:z', 1, { z: 'first' }), row('pf33:z', 1, { z: 'last' })];
+  const layer = pendingOverlay(trace, rows);
+  value.nested.n = 2; (rows[1]!.value as { z: string }).z = 'changed';
+  assert.ok(!types.isProxy(layer) && layer instanceof Store && Object.isFrozen(layer), 'Over a trace of a genuine Store the overlay is a registered layer');
+  assert.deepEqual([layer.get('pf33:x')!.value, layer.get('pf33:x', 3)!.value, layer.get('pf33:z')!.value], [{ v: 3, nested: { n: 1 } }, { v: 3, nested: { n: 1 } }, { z: 'last' }],
+    'Rows 2, 4: its own head and revision, the last row of an id, a snapshot the caller can no longer change');
+  assert.deepEqual([layer.get('pf33:x', 2)!.value, layer.get('pf33:x', 1)!.value, layer.get(y.id)!.value, layer.get('pf33:absent'), layer.get('pf33:x', 9)],
+    [{ v: 2 }, { v: 1 }, { y: 1 }, null, null], 'Row 3: another revision of its id, another id and an absence are the base\'s');
+  assert.deepEqual([layer.list('k'), layer.list('none'), layer.list(), layer.history('pf33:x'), layer.history('pf33:z'), layer.identities('prefix', 'pf33:%_'), layer.identities('prefix', 'PF33:')],
+    [store.list('k'), [], store.list(), store.history('pf33:x'), [], store.identities('prefix', 'pf33:%_'), []], 'Row 7: list, history and prefix are the base\'s, literal and case-sensitive, empty or not');
+  assert.deepEqual([readServer(layer, 'get', 'pf33:x', undefined, true), readServer(layer, 'get', 'pf33:x', 3, true), readServer(layer, 'get', 'pf33:x', 2, true),
+    readServer(layer, 'get', y.id, undefined, true), readServer(layer, 'get', 'pf33:absent', undefined, true), readServer(layer, 'list', 'k', undefined, true), readServer(layer, 'history', 'pf33:z', undefined, true)],
+    ['pending', 'pending', store, store, store, store, store], 'Rows 1-3: the witness of a delegated read is the Store beneath the trace');
+  assert.deepEqual([readServer(layer, 'get', y.id, undefined), readServer(layer, 'get', 'pf33:x', undefined), pendingSelections(layer), tracedChain(layer), tracedChain(pendingOverlay(store, rows))],
+    [null, 'pending', null, true, false], 'Without traces the chain ends at the trace as before: no sharing or adoption rests on it');
+  // Row 8: layer → trace → layer → trace → Store; every overlap is decided where it is.
+  const inner = pendingOverlay(historicalTrace(store), [row('pf33:w', 2, { w: 2 }), row('pf33:v', 1, { v: 'inner' })]);
+  const outer = pendingOverlay(historicalTrace(inner), [row('pf33:w', 3, { w: 3 })]);
+  assert.ok(!types.isProxy(inner) && !types.isProxy(outer));
+  assert.deepEqual([outer.get('pf33:w')!.value, outer.get('pf33:w', 2)!.value, outer.get('pf33:w', 1), outer.get('pf33:v')!.value, outer.get(y.id)!.value],
+    [{ w: 3 }, { w: 2 }, null, { v: 'inner' }, { y: 1 }]);
+  assert.deepEqual([readServer(outer, 'get', 'pf33:w', undefined, true), readServer(outer, 'get', 'pf33:w', 2, true), readServer(outer, 'get', 'pf33:w', 1, true),
+    readServer(outer, 'get', 'pf33:v', undefined, true), readServer(outer, 'get', y.id, undefined, true), readServer(outer, 'list', 'k', undefined, true)],
+    ['pending', 'pending', store, 'pending', store, store], 'Row 8: the outer row, the inner rows beneath it, and the Store for the rest');
+  // Row 9: a Proxy of any other making, in any position, however alike, keeps the opaque overlay and no witness.
+  const passThrough = <T extends object>(target: T): T => new Proxy(target, { get: (object, key) => {
+    const member: unknown = Reflect.get(object, key, object); return typeof member === 'function' ? member.bind(object) : member; } });
+  const lookalike = Object.freeze(Object.create(trace) as Store);
+  for (const [name, base] of [['a trace over a caller\'s Proxy', historicalTrace(passThrough(store))], ['a caller\'s Proxy over a trace', passThrough(trace)],
+    ['a frozen object inheriting from a trace', lookalike], ['a trace over an opaque overlay', historicalTrace(pendingOverlay(passThrough(store), [row('pf33:q', 1, {})]))],
+    ['a trace over a frozen Proxy', historicalTrace(Object.freeze(passThrough(store)) as Store)]] as [string, Store][]) {
+    const over = pendingOverlay(base, [row('pf33:o', 1, { o: 1 })]);
+    assert.ok(types.isProxy(over), `Row 9: ${name} is no proved source`);
+    assert.deepEqual([over.get('pf33:o')!.value, over.get(y.id)!.value, readServer(over, 'get', y.id, undefined, true), readServer(over, 'get', 'pf33:o', undefined, true)],
+      [{ o: 1 }, { y: 1 }, null, null], `Row 9: ${name} answers as before and has no witness`);
+  }
+  // Row 9: the one observer of traces is the engine's; no caller puts another between a trace and its source.
+  assert.throws(() => observeTraceReads((_view, _method, _id, _revision, read) => { const rows = read() as Revision<Json>; return rows; }), (error: unknown) =>
+    error instanceof EngineError && error.code === 'store_view_composition_unsupported');
+  assert.deepEqual([transparentTrace(store).get(y.id), transparentTrace(store).list('k'), transparentTrace(store).history('pf33:x')], [store.get(y.id), store.list('k'), store.history('pf33:x')],
+    'A trace of the factory reads exactly what its source reads');
+  // Row 10: a Transaction preview or a capture beneath a trace, and another database.
+  const tx = transactionForTests(store);
+  const overPreview = pendingOverlay(historicalTrace(tx.view), [row('pf33:t', 1, {})]);
+  assert.ok(!types.isProxy(overPreview), 'A preview beneath a trace is admitted as it is beneath a layer (№2012-2)');
+  assert.deepEqual([readServer(overPreview, 'get', 'pf33:t', undefined, true), readServer(overPreview, 'get', y.id, undefined, true)], ['pending', null], 'Row 10: what the preview answers has no witness');
+  assert.ok(types.isProxy(pendingOverlay(historicalTrace(captureView(store).view), [row('pf33:c', 1, {})])), 'Row 10: a capture beneath a trace is no proved source');
+  const other = new Store(join(root, 'other.sqlite'));
+  t.after(() => other.close());
+  const overOther = pendingOverlay(historicalTrace(other), [row('pf33:u', 1, {})]);
+  assert.equal(readServer(overOther, 'get', y.id, undefined, true), other, 'Row 10: another database is its own witness, never this one');
+  // Row 12: the member the trace finally invokes is the one bound; its replacement under the same sequence ends the chain.
+  const sequence = store.lastEvent(), original = Store.prototype.get;
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+  try {
+    assert.deepEqual([readServer(layer, 'get', y.id, undefined, true), readServer(layer, 'get', 'pf33:x', undefined, true), readServer(outer, 'get', y.id, undefined, true)],
+      [null, 'pending', null], 'A replaced read beneath the trace leaves no witness; the own frozen row stays');
+  } finally { Store.prototype.get = original; }
+  assert.deepEqual([store.lastEvent(), readServer(layer, 'get', y.id, undefined, true), readServer(layer, 'list', 'k', undefined, true)], [sequence, store, store],
+    'Restored, the same chain is proved again at the same sequence');
 });
 
 // PF3 (№3424): the body cache of a Store. Each test names the rows of outcome table §5 it pins down.
