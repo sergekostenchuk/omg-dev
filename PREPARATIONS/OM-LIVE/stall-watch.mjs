@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Сторож простоя живого прохода: node ~/OMG/PREPARATIONS/OM-LIVE/stall-watch.mjs [--threshold 60] [--sample 20] [--pid <pid движка>]
+// Диагностика на копии: --pid <pid> --db <копия> --always (профиль непрерывно окнами по --sample с) --log <файл> --profiles <папка>
 // Если движок дольше порога не пишет в базу и не ждёт модель — снимает профиль процессора с идущего процесса
 // (инспектор по SIGUSR1, только чтение, проход не останавливается) и пишет, какое место кода занимает время.
 // Журнал: ~/OMG/.omg/stall-watch.jsonl; профили: ~/OMG/.omg/stall-profiles/*.cpuprofile (открываются в Chrome DevTools).
@@ -7,8 +8,8 @@ import { statSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdi
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 
-const args = Object.fromEntries(process.argv.slice(2).reduce((a, x, i, all) => (x.startsWith("--") ? [...a, [x.slice(2), all[i + 1]]] : a), []));
-const OMG = `${homedir()}/OMG/.omg`, DB = `${OMG}/state.sqlite`, LOG = args.log ?? `${OMG}/stall-watch.jsonl`, PROFILES = args.profiles ?? `${OMG}/stall-profiles`;
+const args = Object.fromEntries(process.argv.slice(2).reduce((a, x, i, all) => (x.startsWith("--") ? [...a, [x.slice(2), all[i + 1]?.startsWith("--") ? true : all[i + 1]]] : a), []));
+const OMG = `${homedir()}/OMG/.omg`, DB = args.db ?? `${OMG}/state.sqlite`, ALWAYS = "always" in args, LOG = args.log ?? `${OMG}/stall-watch.jsonl`, PROFILES = args.profiles ?? `${OMG}/stall-profiles`;
 const THRESHOLD = Number(args.threshold ?? 60) * 1000, SAMPLE = Number(args.sample ?? 20) * 1000, POLL = 15_000, PORT = 9229;
 mkdirSync(PROFILES, { recursive: true });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -45,7 +46,7 @@ function summarize(p) {
   const nodes = new Map(p.nodes.map(n => [n.id, n])), parent = new Map();
   for (const n of p.nodes) for (const c of n.children ?? []) parent.set(c, n.id);
   const key = n => { const f = n.callFrame, file = (f.url || "").replace(/^.*\/dist\//, "").replace(/^file:\/\//, ""); return `${f.functionName || "(anon)"} ${file}:${f.lineNumber + 1}`; };
-  const engineFrame = n => /runner-live\/dist\//.test(n.callFrame.url || "");
+  const engineFrame = n => /\/dist\/src\//.test(n.callFrame.url || "");
   const self = new Map(), incl = new Map(), stacks = new Map(); let total = 0;
   for (const s of p.samples) {
     total++; const leaf = nodes.get(s); const k = key(leaf); self.set(k, (self.get(k) ?? 0) + 1);
@@ -67,13 +68,14 @@ for (;;) {
   const e = engine();
   if (!e) { await sleep(POLL); continue; }
   const quiet = Date.now() - lastWrite();
-  if (quiet >= THRESHOLD && !waitingModel(e) && Date.now() - lastProfiled >= THRESHOLD) {
+  if (ALWAYS || (quiet >= THRESHOLD && !waitingModel(e) && Date.now() - lastProfiled >= THRESHOLD)) {
     try {
       const prof = await profile(e), file = `${PROFILES}/${new Date().toISOString().replace(/[:.]/g, "-")}.cpuprofile`;
       writeFileSync(file, JSON.stringify(prof));
       log({ event: "stall", quietSec: Math.round(quiet / 1000), pid: e.pid, profile: file, ...summarize(prof) });
     } catch (error) { log({ event: "profile-error", quietSec: Math.round(quiet / 1000), error: String(error?.message ?? error) }); }
     lastProfiled = Date.now();
+    if (ALWAYS) continue;
   }
   await sleep(POLL);
 }
