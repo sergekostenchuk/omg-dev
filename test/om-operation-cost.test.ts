@@ -120,10 +120,11 @@ export async function load(url, context, nextLoad) {
       if (source.split(enter).length !== 2 || source.split(leave).length !== 2) throw new Error('The footprint check of the common proof was not identified');
       source = source.replace(enter, enter + ' globalThis.__operationCost.footprint(1);').replace(leave, 'globalThis.__operationCost.footprint(-1); ' + leave);
       // S1.3 (№2185-4): a proof kept by an earlier operation serves this one only after its footprint check; whether it
-      // served or had moved is observed apart. Absent in builds before S1.3, so optional.
-      const kept = 'if (currentFootprint(kept.footprint)) {';
+      // served or had moved is observed apart. PF4: the check is the chain and the events after the proof's mark. Absent in
+      // builds before PF4 (whose own anchor no longer matched since PF1), so optional.
+      const kept = 'if (chainsIntact(kept.events) && currentJournal(kept.events)) {';
       if (source.split(kept).length === 2)
-        source = source.replace(kept, 'if (globalThis.__operationCost.kept?.(key, source, currentFootprint(kept.footprint)) ?? currentFootprint(kept.footprint)) {');
+        source = source.replace(kept, 'if ((current => globalThis.__operationCost.kept?.(key, source, current) ?? current)(chainsIntact(kept.events) && currentJournal(kept.events))) {');
       source += '\nglobalThis.__operationCost.sourceView = sourceView;\n';
     }
   }
@@ -1228,7 +1229,7 @@ try {
   assert.equal(f.store.history('om-frame:' + project + ':3').length, 1);
   const outcomes = { consume: consume.attempts.map(item => item.outcome.reason), produce: produce.attempts.map(item => item.outcome.reason), calls: f.sent().length, performed: p.performed };
   rereadPacket(f, 'l3.consume2', invented.packet);
-  console.log(JSON.stringify({ reports, outcomes }));
+  console.log(JSON.stringify({ reports, outcomes, cross: crossOperation(['E2.works-proposal-content', 'E2.part-result', 'E4.part-assembly']) }));
 } finally {
   active = null;
   for (const store of stores) store.close();
@@ -1268,7 +1269,18 @@ test('S1.1 mixed N2 on the accepted H1 pass: A positive, B1 negative, B2 positiv
 });
 
 test('S1.1 L3 produce → consume on the accepted H1 pass with mixed outcomes: no invented filling for the refused goal, the positive result kept, the frame completed lawfully', async t => {
-  checkScenario(t, await runScenario(t, 'mixed-works', mixedWorksScenario));
+  const run = await runScenario(t, 'mixed-works', mixedWorksScenario);
+  checkScenario(t, run);
+  // PF4 (№3499 rows 21, 28): the work-part content reads its preview through an internal layer of its own key — over the
+  // Store or a traced caller's trace of it — so the composite result is kept at its Store and later operations take it.
+  // What is still derived again is derived over the pending writes of a current preparation (a layer over a layer) or an
+  // opaque view, which §4 leaves outside: before PF4 this pass derived it 394 times for 51 keys (343 repeats).
+  const cross = (run as unknown as { cross: Record<string, { executions: number; identities: number; served: number; moved: number; repeated: number }> }).cross;
+  t.diagnostic(JSON.stringify(cross));
+  const content = cross['E2.works-proposal-content'];
+  assert.ok(content && content.executions > 0, 'The real pass reached the work-part content');
+  assert.ok(content.served > 0, 'Later operations take the kept work-part content');
+  assert.ok(content.repeated < content.identities, 'The work-part content is not derived again in every operation: ' + JSON.stringify(content));
 });
 
 // E2.2 (№1801, №1792): the causes of the preceding attempt reach the repeated packet by the exact chain attempt → claimed

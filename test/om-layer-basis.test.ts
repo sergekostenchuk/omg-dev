@@ -12,6 +12,7 @@ import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store } from "../src/storage/store.js";
+import { removeProofCache } from "../src/storage/schema.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -560,6 +561,9 @@ test("D8.4.2: a damaged assessment inside the layer's saved proof refuses the hi
     raw.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
       .run(canonical(damaged), hashJson(damaged), assessment.id, assessment.revision);
   } finally { raw.close(); }
+  // PF4 (№3499, №3533): a saved check is trusted after a restart and an in-place change of an immutable revision is no
+  // event, so the damage is simulated together with the cache — the history itself is read cold.
+  f.store.close(); removeProofCache(join(f.root, "state.sqlite"));
   f.reopen();
   refusedAs(readLayerBasis(f.store, request), "layer_basis_unproven");
   const raw2 = new DatabaseSync(join(f.root, "state.sqlite"));
@@ -568,6 +572,7 @@ test("D8.4.2: a damaged assessment inside the layer's saved proof refuses the hi
     raw2.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
       .run(canonical(saved.value), hashJson(saved.value), assessment.id, assessment.revision);
   } finally { raw2.close(); }
+  f.store.close(); removeProofCache(join(f.root, "state.sqlite"));
   f.reopen();
   assert.deepEqual(delivered(readLayerBasis(f.store, request)).references, baseline.references);
 });
@@ -623,12 +628,15 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       raw.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
         .run(canonical(mutate(saved.value)), hashJson(mutate(saved.value)), id, saved.revision);
     } finally { raw.close(); }
+    // PF4 (№3499, №3533): an in-place change of an immutable revision is no event; the saved checks go with it.
+    removeProofCache(database);
     return () => {
       const raw2 = new DatabaseSync(database);
       try {
         raw2.exec("DROP TRIGGER IF EXISTS revisions_no_update");
         raw2.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?").run(canonical(saved.value), hashJson(saved.value), id, saved.revision);
       } finally { raw2.close(); }
+      removeProofCache(database);
     };
   };
   for (const [name, id, mutate, address] of [

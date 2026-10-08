@@ -119,6 +119,21 @@ function keepBody(area: Map<string, CachedBody>, key: string, body: string): voi
 function releaseArea(area: Map<string, CachedBody>): void { for (const entry of [...area.values()]) forgetBody(entry); }
 const IDENTITY_COLUMNS = "r.entity_id, r.revision, r.kind, r.sha256";
 
+/** PF4 (№3499 §3.1): one committed product event without its body — what a write changed, never what it wrote. */
+export interface StoreEvent { sequence: number; id: string; revision: number; kind: string }
+/** PF4 (№3499 §5.1): a checked result and the shared nodes it reaches, written together or not at all. */
+export interface ProofCacheRecord { key: string; body: string; nodes: readonly string[] }
+export interface ProofCacheNode { hash: string; body: string }
+export interface ProofCacheWritten { records: number; nodes: number; evicted: number; swept: string[]; bytes: number }
+const eventCounters = { marks: 0, ranges: 0, rangeEvents: 0, tails: 0, cacheReads: 0, nodeReads: 0, cacheWrites: 0, cacheBusy: 0, cacheClears: 0 };
+/** Diagnostics of the technical reads and writes PF4 adds (event marks and ranges, the proof cache). None of them is a
+ * product read: storeReads() and the read observer never see them, so no proof takes them for a dependency. */
+export function storeEvents(): Readonly<typeof eventCounters> { return Object.freeze({ ...eventCounters }); }
+const busyError = (error: unknown): boolean => {
+  const code = (error as { errcode?: unknown } | null)?.errcode;
+  return code === 5 || code === 6;
+};
+
 export class Store {
   readonly path: string;
   #db: DatabaseSync;
@@ -288,6 +303,120 @@ export class Store {
       this.#commits++;
       return results;
     } catch (error) { this.#writing = false; this.#db.exec("ROLLBACK"); throw error; }
+  }
+  /**
+   * PF4 (№3499 §3.1): the sequence of the last committed product event (0 for none). Writers are serialized and
+   * sequences only grow, so every commit after this answer carries a greater sequence. Never a product read.
+   */
+  lastEvent(): number {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    eventCounters.marks++;
+    return Number(this.#statement("SELECT coalesce(max(sequence), 0) AS last FROM events").get()!['last']);
+  }
+  /** PF4: the committed events in (from, to], in sequence order, with the kind of the revision each one made — no bodies.
+   * Sequences may have gaps; completeness is the range itself, never a count. */
+  events(from: number, to: number): StoreEvent[] {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    eventCounters.ranges++;
+    const rows = this.#statement(`SELECT e.sequence, e.entity_id, e.revision, r.kind FROM events e JOIN revisions r USING(entity_id, revision)
+      WHERE e.sequence > ? AND e.sequence <= ? ORDER BY e.sequence`).all(from, to);
+    eventCounters.rangeEvents += rows.length;
+    return rows.map(row => ({ sequence: Number(row['sequence']), id: String(row['entity_id']), revision: Number(row['revision']), kind: String(row['kind']) }));
+  }
+  /** PF4: what the event at one sequence made — its id, revision and hash — so a kept mark names its own history. */
+  eventAt(sequence: number): { id: string; revision: number; hash: string } | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    eventCounters.tails++;
+    const row = this.#statement(`SELECT e.entity_id, e.revision, r.sha256 FROM events e JOIN revisions r USING(entity_id, revision)
+      WHERE e.sequence = ?`).get(sequence);
+    return row ? { id: String(row['entity_id']), revision: Number(row['revision']), hash: String(row['sha256']) } : null;
+  }
+  /** PF4 (№3499 §5.2): one saved result of the proof cache by its key, or null. */
+  proofCacheRead(key: string): string | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    eventCounters.cacheReads++;
+    const row = this.#statement("SELECT body FROM proof_cache WHERE key = ?").get(key);
+    return row ? String(row['body']) : null;
+  }
+  /** PF4: one shared node of the proof cache by its content hash, or null. */
+  proofCacheNode(hash: string): string | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    eventCounters.nodeReads++;
+    const row = this.#statement("SELECT body FROM proof_nodes WHERE hash = ?").get(hash);
+    return row ? String(row['body']) : null;
+  }
+  /**
+   * PF4 (№3499 §5.3): saves checked results, their nodes and links in one transaction of this connection, then keeps
+   * at most `roots` results (oldest written go first) and `bytes` of encoded data, and sweeps the nodes no kept result
+   * reaches. `nodes` are all the nodes the results reach (return №3541-2): whether each is saved is decided here, inside
+   * the transaction — another connection may have swept it since anyone looked — and a missing one is written from what
+   * was given; a result naming a node that is neither saved nor given is no complete result, and nothing is written. No product table, event, hash or commit count changes, so changeStamp() stays as it was. A cache another
+   * writer holds is skipped at once (null) and never waited for; durability is relaxed for this transaction only — a
+   * lost one costs a cold derivation, and the next product commit syncs everything before it.
+   */
+  proofCacheWrite(records: readonly ProofCacheRecord[], nodes: readonly ProofCacheNode[], limits: { roots: number; bytes: number }): ProofCacheWritten | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    if (this.#busy) { eventCounters.cacheBusy++; return null; }
+    this.#db.exec("PRAGMA busy_timeout=0; PRAGMA synchronous=NORMAL");
+    try {
+      try { this.#db.exec("BEGIN IMMEDIATE"); }
+      catch (error) { if (busyError(error)) { eventCounters.cacheBusy++; return null; } throw error; }
+      try {
+        const written: ProofCacheWritten = { records: 0, nodes: 0, evicted: 0, swept: [], bytes: 0 };
+        const present = this.#statement("SELECT 1 AS present FROM proof_nodes WHERE hash = ?");
+        const node = this.#statement("INSERT INTO proof_nodes(hash, size, body) VALUES(?, ?, ?)");
+        const given = new Map(nodes.map(item => [item.hash, item])), ensured = new Set<string>();
+        const ensure = (hash: string) => {
+          if (ensured.has(hash)) return;
+          if (!present.get(hash)) {
+            const item = given.get(hash);
+            requireCondition(item !== undefined, "proof_cache_incomplete", "A saved result names a node that is neither saved nor given");
+            node.run(item.hash, 2 * item.body.length, item.body);
+            written.nodes++;
+          }
+          ensured.add(hash);
+        };
+        const unlink = this.#statement("DELETE FROM proof_links WHERE key = ?");
+        const link = this.#statement("INSERT OR IGNORE INTO proof_links(key, node) VALUES(?, ?)");
+        const record = this.#statement(`INSERT OR REPLACE INTO proof_cache(key, written, size, body)
+          VALUES(?, (SELECT coalesce(max(written), 0) + 1 FROM proof_cache), ?, ?)`);
+        let unlinked = false;
+        for (const item of records) {
+          unlinked = Number(unlink.run(item.key).changes) > 0 || unlinked;
+          record.run(item.key, 2 * item.body.length, item.body);
+          for (const hash of item.nodes) { ensure(hash); link.run(item.key, hash); }
+          written.records++;
+        }
+        const evict = (keys: readonly unknown[]) => {
+          for (const key of keys) { unlink.run(key as string); this.#statement("DELETE FROM proof_cache WHERE key = ?").run(key as string); }
+          written.evicted += keys.length;
+        };
+        const sweep = () => { for (const row of this.#statement(
+          "DELETE FROM proof_nodes WHERE NOT EXISTS (SELECT 1 FROM proof_links WHERE node = proof_nodes.hash) RETURNING hash").all())
+          written.swept.push(String(row['hash'])); };
+        evict(this.#statement("SELECT key FROM proof_cache ORDER BY written DESC LIMIT -1 OFFSET ?").all(limits.roots).map(row => row['key']));
+        if (unlinked || written.evicted) sweep();
+        const total = () => Number(this.#statement(`SELECT (SELECT coalesce(sum(size), 0) FROM proof_cache)
+          + (SELECT coalesce(sum(size), 0) FROM proof_nodes) AS total`).get()!['total']);
+        for (let bytes = total(); bytes > limits.bytes; bytes = total()) {
+          const count = Number(this.#statement("SELECT count(*) AS count FROM proof_cache").get()!['count']);
+          evict(this.#statement("SELECT key FROM proof_cache ORDER BY written LIMIT ?").all(Math.max(1, Math.ceil(count / 2))).map(row => row['key']));
+          sweep();
+          if (!count) break;
+        }
+        written.bytes = total();
+        this.#db.exec("COMMIT");
+        eventCounters.cacheWrites++;
+        return written;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    } finally { this.#db.exec("PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000"); }
+  }
+  /** PF4 (№3499 §5.1): empties the proof cache; history, heads, events and hashes stay as they are. */
+  proofCacheClear(): void {
+    requireCondition(!this.#closed && !this.#busy, "store_busy", "Store is closed or creating a snapshot");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try { this.#db.exec("DELETE FROM proof_links; DELETE FROM proof_nodes; DELETE FROM proof_cache; COMMIT"); eventCounters.cacheClears++; }
+    catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
   async snapshot(directory: string, options: SnapshotOptions = {}): Promise<Snapshot> {
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");

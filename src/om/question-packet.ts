@@ -33,6 +33,7 @@ import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, un
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords } from './gaps.js';
 import { gapLineKey, gapLineExpectedResult } from './gap-lines.js';
 import { readOmInput, historicalRead, historicalProof, withHistoricalReads } from './input.js';
+import { historicalLayer } from '../history/proofs.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareOmObligations, readOmObligations, type ObligationRequest, type OmObligations, type OmObligationHandoff } from './obligations.js';
@@ -1565,8 +1566,10 @@ function partProposal(store: Store, project: string, packet: Revision<QuestionPa
       edges: reuse(previous.flatMap(item => item.edges), body.edges) };
     const preview: Revision<LayerProposal> = { id: `om-proposal:${project}:answer-content:${hashJson(contextual)}`,
       kind: 'layer-proposal', revision: 1, hash: hashJson(contextual), value: contextual };
+    // PF4 (№3499 §4): the preview is exactly the Ref of this key — its id, revision and content hash — so the layer it is
+    // read through is internal to this derivation: its row is constant, every other read is the Store's own.
     historicalRead(store, { reader: 'E2.works-proposal-content', project, ref: reference(preview), parameters: json(frameSource) },
-      () => take(readFrameProposals(pendingCallStore(store, [{ id: preview.id, kind: preview.kind, expected: 0, value: preview.value }]),
+      () => take(readFrameProposals(historicalLayer(store, [sealed({ id: preview.id, revision: 1, hash: hashJson(preview.value), kind: preview.kind, value: preview.value })]),
         { frame: frameSource.frame,
         proposals: [...frameSource.proposals, reference(preview)] })),
       () => fail('packet_chain_invalid', packet.id, 'proposal', 'The work-part content has a cyclic source derivation'));

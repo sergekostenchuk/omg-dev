@@ -8,12 +8,17 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { observeStore, Store, storeReads, checkTransactionGuards, type AbsentGuard, type ReadGuard, type StoreObserver, type TransactionGuard } from "../src/storage/store.js";
+import { historicalRead, withHistoricalReads } from "../src/history/proofs.js";
+import { reference } from "../src/pipeline/contracts.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { isRef } from "../src/pipeline/contracts.js";
 import { HASH_PATTERN, HASH_RE } from "../src/canonical.js";
 import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import { readOmAdmissionGuards } from "../src/om/input.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
+import { assertSchema, removeProofCache } from "../src/storage/schema.js";
+import { canonical, digest, type Json } from "../src/canonical.js";
+import { copyFileSync } from "node:fs";
 import { EngineError } from "../src/errors.js";
 
 const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
@@ -461,4 +466,206 @@ test("S1.4 the Store reports each completed read once with its request and resul
     writeOnly.get(a.id); writeOnly.list("proof"); assert.equal(untraced, 0, "A write-only view of the Store reads as the Store itself");
     capture.get(a.id); capture.list("proof"); capture.history(a.id); assert.equal(untraced, 3, "Every read through an opaque view is reported as untraced (№2395)");
   } finally { observeStore(previous); }
+});
+
+// PF4 part 2 (№3499 §3.1, §5): committed events without bodies, migration 2 and the proof cache of this database.
+test("PF4 rows 14-16: the last committed event and the events in (from, to] — sequence order, the revision's kind, several events of one id and a gap in the numbers — read no body, count no product read and reach no observer", t => {
+  const { store, path } = fixture(t);
+  assert.equal(store.lastEvent(), 0);
+  store.write({ id: "pf4:a", kind: "one", expected: 0, value: {} });
+  const second = new Store(path);
+  try {
+    second.writeMany([{ id: "pf4:b", kind: "two", expected: 0, value: {} }, { id: "pf4:a", kind: "one", expected: 1, value: { v: 2 } }]);
+    const raw = new DatabaseSync(path);
+    try {
+      raw.prepare("INSERT INTO revisions VALUES(?,?,?,?,?)").run("pf4:c", 1, "three", "{}", digest("{}"));
+      raw.prepare("INSERT INTO heads VALUES(?,?)").run("pf4:c", 1);
+      raw.prepare("INSERT INTO events(sequence, entity_id, revision) VALUES(10, ?, ?)").run("pf4:c", 1);
+    } finally { raw.close(); }
+    const hash = second.get("pf4:a")!.hash, reads = storeReads(), seen: string[] = [];
+    const previous = observeStore({ begin: () => { seen.push("read"); return undefined; }, end() {}, write() {}, untraced() {} });
+    try {
+      assert.equal(store.lastEvent(), 10);
+      assert.deepEqual(store.events(0, 10), [
+        { sequence: 1, id: "pf4:a", revision: 1, kind: "one" }, { sequence: 2, id: "pf4:b", revision: 1, kind: "two" },
+        { sequence: 3, id: "pf4:a", revision: 2, kind: "one" }, { sequence: 10, id: "pf4:c", revision: 1, kind: "three" }]);
+      assert.deepEqual(store.events(3, 9), [], "A gap in the numbers is no missing event: the range is what SQLite holds");
+      assert.deepEqual(store.events(1, 3).map(event => event.sequence), [2, 3], "The range is (from, to]");
+      assert.deepEqual(store.eventAt(3), { id: "pf4:a", revision: 2, hash });
+      assert.equal(store.eventAt(5), null);
+    } finally { observeStore(previous); }
+    assert.equal(storeReads(), reads, "No product read is counted"); assert.deepEqual(seen, [], "No observer sees them");
+  } finally { second.close(); }
+  store.close();
+  assert.throws(() => store.lastEvent(), code("store_busy")); assert.throws(() => store.events(0, 1), code("store_busy"));
+});
+
+test("PF4 rows 37-39 (№3523): the proof cache is an extension of v1 — schema, user_version and migrations stay as they were; it is installed in the transaction of the open, wholly or not at all; an incomplete or foreign extension is migration_mismatch, removed by the door without touching the history; snapshots with and without it read and restore alike", async t => {
+  const { store, path, root, snapshots } = fixture(t);
+  const objects = (db: DatabaseSync) => db.prepare("SELECT type || ':' || name AS object FROM sqlite_master WHERE name LIKE 'proof_%' ORDER BY name").all().map(row => String(row['object']));
+  const shape = (db: DatabaseSync) => ({ user: Number(db.prepare("PRAGMA user_version").get()!['user_version']),
+    migrations: db.prepare("SELECT version, sha256 FROM migrations ORDER BY version").all().map(row => [Number(row['version']), String(row['sha256'])]),
+    cache: objects(db), record: objects(db).includes('table:proof_cache_schema') ? db.prepare("SELECT version FROM proof_cache_schema").all().map(row => Number(row['version'])) : [] });
+  const product = (db: DatabaseSync) => canonical(["identity", "revisions", "heads", "events"].map(table => db.prepare(`SELECT * FROM ${table} ORDER BY 1, 2`).all()) as unknown as Json);
+  const inspect = <T,>(read: (db: DatabaseSync) => T, at = path): T => { const db = new DatabaseSync(at, { readOnly: true }); try { return read(db); } finally { db.close(); } };
+  const EXTENSION = ["table:proof_cache", "table:proof_cache_schema", "table:proof_links", "index:proof_links_node", "table:proof_nodes"];
+  store.write({ id: "pf4:m", kind: "k", expected: 0, value: { v: 1 } });
+  store.close();
+  const installed = inspect(shape);
+  assert.deepEqual([installed.user, installed.migrations.length, installed.cache, installed.record], [1, 1, EXTENSION, [2]],
+    "Row 37: v1 as it was, the extension beside it with its own record");
+  const history = inspect(product);
+  new Store(path).close();
+  assert.deepEqual(inspect(shape), installed, "Row 37: a repeated open changes nothing");
+  removeProofCache(path);
+  assert.deepEqual(inspect(shape), { ...installed, cache: [], record: [] }); assert.equal(inspect(product), history, "Row 39: the door touches no product row");
+  inspect(db => assertSchema(db));
+  removeProofCache(path);
+  assert.deepEqual(inspect(shape).cache, [], "Row 39: the door is idempotent");
+  const prepare = DatabaseSync.prototype.prepare;
+  DatabaseSync.prototype.prepare = function (this: DatabaseSync, sql: string) {
+    if (sql.includes("INSERT INTO proof_cache_schema")) throw new Error("pf4: interrupted install");
+    return prepare.call(this, sql);
+  };
+  try { assert.throws(() => new Store(path), /interrupted install/); } finally { DatabaseSync.prototype.prepare = prepare; }
+  assert.deepEqual(inspect(shape).cache, [], "Row 37: an interrupted install leaves nothing of the extension");
+  const reopened = new Store(path);
+  assert.deepEqual(reopened.get("pf4:m")!.value, { v: 1 }); reopened.close();
+  assert.deepEqual(inspect(shape), installed); assert.equal(inspect(product), history);
+  const broken = (change: string) => {
+    const raw = new DatabaseSync(path); raw.exec(change); raw.close();
+    assert.throws(() => new Store(path), code("migration_mismatch"), change);
+    assert.throws(() => inspect(db => assertSchema(db)), code("migration_mismatch"));
+    removeProofCache(path);
+    assert.equal(inspect(product), history, "Row 39: removing an incomplete extension keeps the history");
+    new Store(path).close();
+    assert.deepEqual(inspect(shape), installed);
+  };
+  broken("DROP TABLE proof_nodes");
+  broken("DELETE FROM proof_cache_schema");
+  broken("UPDATE proof_cache_schema SET version = 3");
+  broken("UPDATE proof_cache_schema SET sha256 = 'other'");
+  const raw = new DatabaseSync(path);
+  raw.exec("DROP TABLE proof_links; CREATE VIEW proof_links AS SELECT 1 AS key");
+  raw.close();
+  assert.throws(() => removeProofCache(path), code("migration_mismatch"), "An object of another type under its name is no object of the extension");
+  assert.deepEqual(inspect(objects), ["table:proof_cache", "table:proof_cache_schema", "view:proof_links", "table:proof_nodes"],
+    "The refused door rolled back: nothing was dropped");
+  const fix = new DatabaseSync(path); fix.exec("DROP VIEW proof_links"); fix.close();
+  removeProofCache(path);
+  const current = new Store(path);
+  const withExtension = await current.snapshot(snapshots);
+  current.close();
+  assert.equal(inspectSnapshot(withExtension.path).contentHash, withExtension.contentHash);
+  const withoutExtension = join(root, "without-extension.sqlite");
+  copyFileSync(withExtension.path, withoutExtension);
+  removeProofCache(withoutExtension);
+  assert.equal(inspectSnapshot(withoutExtension).contentHash, withExtension.contentHash, "Row 38: the extension is no part of the history a snapshot names");
+  assert.deepEqual(inspect(objects, withoutExtension), []);
+  const restored = restoreSnapshot(snapshots, join(root, "restored", "state.sqlite"));
+  const opened = new Store(restored.path);
+  try { assert.deepEqual(opened.get("pf4:m")!.value, { v: 1 }); assert.equal(opened.proofCacheRead("absent"), null); } finally { opened.close(); }
+  const fromBare = new Store(withoutExtension);
+  try { assert.equal(fromBare.history("pf4:m").length, 1); } finally { fromBare.close(); }
+  assert.deepEqual(inspect(objects, withoutExtension), EXTENSION, "Row 38: a snapshot without the extension starts cold and installs it on a working open");
+});
+
+/** The engine of one commit, transpiled from git, on its own process (the ee3fd4c producer above uses the same loader). */
+function atCommit(root: string, commit: string, script: string): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
+  const loader = join(root, `legacy-${commit}-loader.mjs`);
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, next) {
+  const prefix = new URL('dist/src/', root).href;
+  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  return next(url, context);
+}`);
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
+  const src = (module: string) => JSON.stringify(new URL(`dist/src/${module}.js`, repositoryUrl).href);
+  const output = execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, "--input-type=module", "--no-warnings", "--eval",
+    `const { Store } = await import(${src('storage/store')}); const { inspectSnapshot } = await import(${src('storage/snapshots')});
+const out = value => process.stdout.write(JSON.stringify(value));
+${script}`], { cwd: repository, encoding: "utf8", timeout: 60_000 });
+  return JSON.parse(output);
+}
+
+test("PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays", async t => {
+  const { store, path, root, snapshots } = fixture(t);
+  const dep = store.write({ id: "pf4:dep", kind: "k", expected: 0, value: { v: 1 } });
+  const other = store.write({ id: "pf4:other", kind: "k", expected: 0, value: { v: 1 } });
+  const runs = { dep: 0, other: 0 };
+  const prove = (target: Store, name: keyof typeof runs) => withHistoricalReads(() => historicalRead(target, { reader: "M6.route-result", project: "garden",
+    ref: reference(name === "dep" ? dep : other), parameters: "pf4-legacy" }, () => { runs[name]++; return target.get(`pf4:${name}`)!.value; }, () => { throw new Error("cycle"); }));
+  prove(store, "dep"); prove(store, "other");
+  const snapshot = await store.snapshot(snapshots);
+  store.close();
+  const bare = join(root, "bare-snapshot.sqlite");
+  copyFileSync(snapshot.path, bare);
+  removeProofCache(bare);
+  const legacy = atCommit(root, "3e8aa784b5d61188dfa6ad171f9d8cccefb2f1b6", `const store = new Store(${JSON.stringify(path)});
+const before = store.get('pf4:dep').value;
+store.write({ id: 'pf4:dep', kind: 'k', expected: 1, value: { v: 2 } });
+store.close();
+out({ before, snapshots: [inspectSnapshot(${JSON.stringify(snapshot.path)}).contentHash, inspectSnapshot(${JSON.stringify(bare)}).contentHash] });`) as { before: Json; snapshots: string[] };
+  assert.deepEqual(legacy.before, { v: 1 });
+  assert.deepEqual(legacy.snapshots, [snapshot.contentHash, snapshot.contentHash], "The old engine reads snapshots with and without the extension");
+  assert.equal(inspectSnapshot(bare).contentHash, snapshot.contentHash, "And so does this one");
+  const reopened = new Store(path); t.after(() => reopened.close());
+  assert.deepEqual(prove(reopened, "dep"), { v: 2 }); assert.equal(runs.dep, 2, "The old engine's write is an event after the saved mark");
+  assert.deepEqual(prove(reopened, "other"), { v: 1 }); assert.equal(runs.other, 1, "A check it did not touch is taken as saved");
+});
+
+test("PF4 rows 34-36: the proof cache is written in one transaction of its own — a failure inside leaves nothing, a held cache is skipped at once — bounded by results and bytes with unreferenced nodes swept and shared ones kept; it adds no event, moves no change stamp and no read count, and can be emptied", t => {
+  const { store, path } = fixture(t);
+  store.write({ id: "pf4:w", kind: "k", expected: 0, value: {} });
+  const stamp = store.changeStamp(), last = store.lastEvent(), reads = storeReads();
+  const limits = { roots: 3, bytes: 1024 * 1024 };
+  const record = (key: string, nodes: string[]) => ({ key, body: JSON.stringify({ key }), nodes });
+  const node = (hash: string) => ({ hash, body: JSON.stringify({ hash }) });
+  const raw = new DatabaseSync(path); t.after(() => raw.close());
+  const count = (table: string) => Number(raw.prepare(`SELECT count(*) AS n FROM ${table}`).get()!['n']);
+  raw.exec("CREATE TRIGGER pf4_fail BEFORE INSERT ON proof_nodes WHEN NEW.hash = 'fail' BEGIN SELECT RAISE(ABORT, 'pf4_fail'); END");
+  assert.throws(() => store.proofCacheWrite([record("a", ["shared", "fail"])], [node("shared"), node("fail")], limits), /pf4_fail/);
+  assert.deepEqual([count("proof_cache"), count("proof_nodes"), count("proof_links")], [0, 0, 0], "Row 34: a failure inside leaves nothing");
+  raw.exec("DROP TRIGGER pf4_fail");
+  raw.exec("BEGIN IMMEDIATE");
+  assert.equal(store.proofCacheWrite([record("a", ["shared"])], [node("shared")], limits), null, "Row 35: a held cache is skipped at once");
+  raw.exec("ROLLBACK");
+  assert.equal(store.write({ id: "pf4:after-busy", kind: "k", expected: 0, value: {} }).revision, 1, "Row 35: product writes go on");
+  const lastAfter = store.lastEvent(), stampAfter = store.changeStamp();
+  const first = store.proofCacheWrite([record("a", ["shared", "a1"]), record("b", ["shared", "b1"])], [node("shared"), node("a1"), node("b1")], limits)!;
+  assert.deepEqual([first.records, first.nodes, first.evicted], [2, 3, 0]);
+  const second = store.proofCacheWrite([record("c", ["shared", "c1"]), record("d", ["d1"])], [node("c1"), node("d1")], limits)!;
+  assert.equal(second.evicted, 1); assert.deepEqual(second.swept, ["a1"], "The oldest result goes, with only the nodes no kept result reaches");
+  assert.equal(store.proofCacheRead("a"), null); assert.notEqual(store.proofCacheNode("shared"), null);
+  const replaced = store.proofCacheWrite([record("b", ["b2"])], [node("b2")], limits)!;
+  assert.deepEqual(replaced.swept, ["b1"], "Row 36: a replaced result takes its old links with it; the pair is one row");
+  assert.equal(JSON.parse(store.proofCacheRead("b")!).key, "b");
+  const small = store.proofCacheWrite([record("e", ["e1"])], [{ hash: "e1", body: "x".repeat(4000) }], { roots: 512, bytes: 6000 })!;
+  assert.ok(small.bytes <= 6000 && small.evicted > 0, "Row 35: the byte bound evicts the oldest results");
+  assert.deepEqual([store.changeStamp(), store.lastEvent(), storeReads()], [stampAfter, lastAfter, reads + 1],
+    "The cache writes add no event, move no change stamp and count no product read (the one counted is the product write's own check)");
+  assert.equal(lastAfter, last + 1); assert.notEqual(stampAfter, stamp);
+  store.proofCacheClear();
+  assert.deepEqual([count("proof_cache"), count("proof_nodes"), count("proof_links")], [0, 0, 0]);
+  assert.equal(store.get("pf4:w")!.revision, 1);
+  // Return №3541-2: whether a node is saved is decided inside the transaction. A node another connection swept is
+  // written again from what was given; a result naming a node neither saved nor given writes nothing at all.
+  store.proofCacheWrite([record("f", ["f1"])], [node("f1")], limits);
+  raw.prepare("DELETE FROM proof_links").run(); raw.prepare("DELETE FROM proof_nodes").run();
+  const again = store.proofCacheWrite([record("g", ["f1", "g1"])], [node("f1"), node("g1")], limits)!;
+  assert.equal(again.nodes, 2, "The swept node is written again in the result's own transaction");
+  assert.equal(Number(raw.prepare("SELECT count(*) AS n FROM proof_links l LEFT JOIN proof_nodes n ON l.node = n.hash WHERE n.hash IS NULL").get()!['n']), 0);
+  assert.throws(() => store.proofCacheWrite([record("h", ["absent"])], [], limits), code("proof_cache_incomplete"));
+  assert.equal(store.proofCacheRead("h"), null, "Nothing of an incomplete result is written");
 });

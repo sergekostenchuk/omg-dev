@@ -12,7 +12,9 @@ import { QUESTION_MOMENTS, preparationMomentSchema, featurePreparationMomentSche
 import { collectGaps, GAP_MOMENTS, type GapSources } from "../src/om/gaps.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
-import { Store, type Revision, type Write } from "../src/storage/store.js";
+import { Store, storeEvents, storeReads, type Revision, type Write } from "../src/storage/store.js";
+import { execFileSync } from "node:child_process";
+import { removeProofCache } from "../src/storage/schema.js";
 import { captureView, pendingOverlay, storeView } from "../src/storage/store-view.js";
 import { RunControlGate, RunControlLost, stopRun } from "../src/om/run-control.js";
 import { sealed } from "../src/om/refusal.js";
@@ -421,8 +423,13 @@ test("historical input reads reuse the same era schema objects after source move
     f.store.write({ id: source.id, kind: source.kind, expected: source.revision,
       value: { ...clone(source.value), content, sha256: digest(content) } });
     repeat(false);
+    // PF4 (№3499 rows 29, 40): a reopened Store takes the check this database saved, without validating again; once the
+    // saved checks are gone it validates cold, with the same schema objects.
     f.reopen();
-    assert.ok(repeat(true) > 0, "A reopened Store validates cold, with the same schema objects");
+    assert.equal(repeat(false), 0, "A reopened Store answers from the saved check");
+    f.store.proofCacheClear();
+    f.reopen();
+    assert.ok(repeat(true) > 0, "Without a saved check a reopened Store validates cold, with the same schema objects");
     assert.equal(f.store.history(saved.id).length, 1);
   } finally {
     Ajv.prototype.compile = compile;
@@ -1315,8 +1322,15 @@ test("S1 cold and cached proofs replay nested dependencies to every transparent 
   const later: Ref[] = [];
   read(historicalTrace(first, ref => later.push(ref))); assert.equal(outer, 1); assert.equal(inner, 1);
   assert.deepEqual(later, [a, b, b, a].map(reference));
+  // PF4 (№3499 rows 28, 29): a new Store instance of the database takes the saved checks and replays the cold stream;
+  // without them it starts cold and proves again.
   const reopened = new Store(first.path); t.after(() => reopened.close());
-  read(reopened); assert.equal(outer, 2); assert.equal(inner, 2, 'A new Store instance starts cold and proves again');
+  const restarted: Ref[] = [];
+  read(historicalTrace(reopened, ref => restarted.push(ref))); assert.equal(outer, 1); assert.equal(inner, 1, 'A reopened Store takes the saved proofs');
+  assert.deepEqual(restarted, [a, b, b, a].map(reference), 'A saved proof replays the full ordered stream');
+  reopened.proofCacheClear();
+  const cold = new Store(first.path); t.after(() => cold.close());
+  read(cold); assert.equal(outer, 2); assert.equal(inner, 2, 'Without saved checks a new Store instance starts cold and proves again');
 });
 
 test("S1 deep repeated DAG stays compact without external observers", t => {
@@ -1344,14 +1358,21 @@ test("S1 deep repeated DAG stays compact without external observers", t => {
       assert.equal(read(first, depth), 2 ** depth);
       assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'The same DAG expands each exact proof once');
     });
-    // S1.3 (№2185-4): the next operation of the same Store reuses the kept DAG; a new Store instance proves it again.
+    // S1.3 (№2185-4): the next operation of the same Store reuses the kept DAG; PF4 (№3499 row 29): a new Store instance
+    // takes the saved DAG — one node per shared proof — and proves it again only without the saved checks.
     assert.equal(read(first, depth), 2 ** depth);
     assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'The next operation reuses the kept DAG of this Store');
     const reopened = new Store(first.path);
     try {
       assert.equal(read(reopened, depth), 2 ** depth);
-      assert.deepEqual(calls, Array<number>(depth + 1).fill(2), 'A new Store instance proves the DAG again');
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(1), 'A new Store instance takes the saved DAG');
+      reopened.proofCacheClear();
     } finally { reopened.close(); }
+    const cold = new Store(first.path);
+    try {
+      assert.equal(read(cold, depth), 2 ** depth);
+      assert.deepEqual(calls, Array<number>(depth + 1).fill(2), 'Without saved checks a new Store instance proves the DAG again');
+    } finally { cold.close(); }
   } finally { Array.prototype.push = originalPush; }
 });
 
@@ -1593,9 +1614,14 @@ test("S1.3 kept complete proofs serve later operations of one Store and are deri
   const moved = read(first);
   assert.deepEqual([moved.head!.revision, moved.history.length, calls], [2, 2, 4], 'A new head and history');
   assert.deepEqual(read(first), moved); assert.equal(calls, 4);
-  assert.deepEqual(read(second), moved); assert.equal(calls, 5, 'The second Store instance is its own cold source');
+  // PF4 (№3499 rows 29, 36): another Store instance of the database — a second connection, a reopened one — takes the
+  // saved check; without it, it is its own cold source.
+  assert.deepEqual(read(second), moved); assert.equal(calls, 4, 'The second Store instance takes the saved check');
   const reopened = new Store(first.path); t.after(() => reopened.close());
-  assert.deepEqual(read(reopened), moved); assert.equal(calls, 6, 'A reopened Store starts cold');
+  assert.deepEqual(read(reopened), moved); assert.equal(calls, 4, 'A reopened Store takes the saved check');
+  reopened.proofCacheClear();
+  const cold = new Store(first.path); t.after(() => cold.close());
+  assert.deepEqual(read(cold), moved); assert.equal(calls, 5, 'Without a saved check a new Store instance starts cold');
 });
 
 test("S1.3 incomplete proofs stay within one operation: an untraced read of a plain Store, a closure read inside a traced proof, and a traced proof nesting one; a complete proof outlives it", t => {
@@ -1994,7 +2020,11 @@ test("S1.4 every read of a closure-captured Store is observed at the Store — h
     () => { exact++; return canonical(store.get(a.id, 1) as Json); }, noCycle));
   const saved = proveExact(first); bump(a.id);
   assert.equal(proveExact(first), saved); assert.equal(exact, 1, 'A later head leaves the proved exact revision lawful');
-  assert.equal(proveExact(second), saved); assert.equal(exact, 2, 'Another Store instance starts cold');
+  // PF4 (№3499 row 29): another Store instance of the database takes the saved check; without it, it derives.
+  assert.equal(proveExact(second), saved); assert.equal(exact, 1, 'Another Store instance takes the saved check');
+  second.proofCacheClear();
+  const cold = new Store(first.path); t.after(() => cold.close());
+  assert.equal(proveExact(cold), saved); assert.equal(exact, 2, 'Without a saved check another Store instance starts cold');
   // Q4: a prefix identity read is a dependency on its literal range only — outside changes keep the proof,
   // a new head inside the range moves its signature and is derived again.
   let prefixRuns = 0;
@@ -2284,9 +2314,13 @@ test("PF1 (№2797-6 rows 1–3) through a pending overlay over a genuine Store 
     const cold = prove();
     assert.deepEqual(reuse(), { value: cold, runs: 0, gets: 0, identities: 0 }, 'Rows 1–2: under an unchanged stamp nothing is read again — neither the pending row nor the base');
     first.write({ id: 'pf1i:other', kind: 'k', expected: 0, value: {} });
+    const advanced = proofs.historicalProofCounters().advanced;
     const disjoint = reuse();
-    assert.deepEqual([disjoint.value, disjoint.runs, disjoint.gets, disjoint.identities], [cold, 0, 0, 2],
-      'Row 3: a disjoint write moves the stamp; the two delegated reads are checked as identities, the pending row never, and nothing is derived again');
+    // PF4 (№3499 row 10): the disjoint write is an event of another id — matched against the proof's dependencies, never
+    // read as identities; the mark moves past it.
+    assert.deepEqual([disjoint.value, disjoint.runs, disjoint.gets, disjoint.identities], [cold, 0, 0, 0],
+      'Row 3: a disjoint write is checked by its event alone — no identity, no pending row, nothing derived again');
+    assert.ok(proofs.historicalProofCounters().advanced > advanced, 'Row 3: the mark moved past the checked event');
     assert.deepEqual(reuse(), { value: cold, runs: 0, gets: 0, identities: 0 }, 'The checked events keep the new stamp');
     first.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
     const moved = reuse();
@@ -2638,9 +2672,11 @@ test("PF2 (№2905 rows 8, 9, 14) a second Store moving a dependency derives aga
   const read = pf2Reader(counts, dep, 'stores');
   const cold = withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:a', 1, {})])));
   second.write({ id: 'pf2s:other', kind: 'other', expected: 0, value: {} });
-  const identities = counts.identities;
+  const identities = counts.identities, advanced = proofs.historicalProofCounters().advanced;
   assert.deepEqual(withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:b', 1, {})]))), cold);
-  assert.equal(counts.runs, 1, 'Row 9: a disjoint write — no derivation'); assert.ok(counts.identities > identities, 'Row 9: checked as identities');
+  // PF4 (№3499 row 10): the disjoint write is checked by its event, not by reading identities.
+  assert.equal(counts.runs, 1, 'Row 9: a disjoint write — no derivation'); assert.equal(counts.identities, identities, 'Row 9: no identity read');
+  assert.ok(proofs.historicalProofCounters().advanced > advanced, 'Row 9: checked by the events after its mark');
   second.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
   assert.deepEqual((withHistoricalReads(() => read(pendingOverlay(first, [pf1Row('pf2s:c', 1, {})]))) as { head: unknown }).head, { d: 2 });
   assert.equal(counts.runs, 2, 'Row 8: a moved head derives again');
@@ -2997,4 +3033,397 @@ test("PF4 rows 6, 8: a cycle answered by onCycle and caught by an ancestor leave
   const other = () => proofs.historicalRefusalRead(first, { ...childKey, reader: 'PF4.unlisted' }, () => { unlisted++; first.get(anchor.id); return cycled(); }, cycled);
   withHistoricalReads(() => { other(); other(); });
   assert.equal(unlisted, 2);
+});
+
+// PF4 part 2 (№3499 §3–5, rows 9–40): events instead of a footprint walk, internal layers, the proof cache.
+const pf4Counters = () => proofs.historicalProofCounters();
+/** Another process of the same database: a write no observer of this process sees. */
+function pf4OtherProcess(path: string, write: Write): void {
+  const store = new URL('../src/storage/store.js', import.meta.url).href;
+  execFileSync(process.execPath, ['--input-type=module', '--no-warnings', '--eval',
+    `import { Store } from ${JSON.stringify(store)}; const s = new Store(${JSON.stringify(path)}); s.write(${JSON.stringify(write)}); s.close();`]);
+}
+
+test("PF4 rows 9-13, 17, 18: a kept proof is current at one light read of the last event; only events after its mark that touch its dependencies derive it again — an unrelated write of this or a second Store moves the mark, a moved head and a former absence derive, a later head leaves an exact revision lawful; no sequence is frozen for an operation, and a write after the mark — during the derivation in another process, or before the flush — is never skipped", t => {
+  const { first, second } = sameFileStores(t);
+  const x = first.write({ id: 'pf4:x', kind: 'k', expected: 0, value: { v: 1 } });
+  const y = first.write({ id: 'pf4:y', kind: 'k', expected: 0, value: { v: 1 } });
+  const runs = { x: 0, y: 0, exact: 0, absent: 0 };
+  const prove = (name: keyof typeof runs, read: () => unknown) => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(x), parameters: { pf4: name } },
+    () => { runs[name]++; return canonical(read() as Json); }, noCycle);
+  const all = () => ({ x: prove('x', () => first.get(x.id)), y: prove('y', () => first.get(y.id)), exact: prove('exact', () => first.get(x.id, 1)),
+    absent: prove('absent', () => [first.get('pf4:z'), first.get('pf4:z', 1)]) });
+  const cold = withHistoricalReads(all);
+  const before = pf4Counters(), reads = storeReads();
+  assert.deepEqual(withHistoricalReads(all), cold);
+  assert.deepEqual(runs, { x: 1, y: 1, exact: 1, absent: 1 });
+  assert.equal(storeReads(), reads, 'Row 9: nothing is read again');
+  assert.equal(pf4Counters().unchanged - before.unchanged, 3, 'Row 9: one light check per proof with mutable reads; the exact one has none');
+  assert.deepEqual([pf4Counters().ranges, pf4Counters().residualChecks], [before.ranges, before.residualChecks], 'Row 9: no range and no footprint walk');
+  first.write({ id: 'pf4:other', kind: 'other', expected: 0, value: {} });
+  second.write({ id: 'pf4:other2', kind: 'other', expected: 0, value: {} });
+  const unrelated = pf4Counters();
+  assert.deepEqual(withHistoricalReads(all), cold);
+  assert.deepEqual(runs, { x: 1, y: 1, exact: 1, absent: 1 }, 'Row 10: unrelated writes of this and a second Store derive nothing');
+  assert.equal(pf4Counters().advanced - unrelated.advanced, 3, 'Row 10: each mark moved past the checked events');
+  const moved = pf4Counters();
+  withHistoricalReads(all);
+  assert.equal(pf4Counters().ranges, moved.ranges, 'Row 10: after the move the next use reads no range');
+  second.write({ id: x.id, kind: 'k', expected: 1, value: { v: 2 } });
+  const head = withHistoricalReads(all);
+  assert.deepEqual(runs, { x: 2, y: 1, exact: 1, absent: 1 }, 'Rows 11, 12: only the moved head derives again; another id and the exact revision stay');
+  assert.notEqual(head.x, cold.x); assert.equal(head.exact, cold.exact);
+  second.write({ id: 'pf4:z', kind: 'k', expected: 0, value: { z: 1 } });
+  assert.match(withHistoricalReads(all).absent, /"z":1/); assert.equal(runs.absent, 2, 'Row 13: a former absence derives again');
+  withHistoricalReads(() => {
+    assert.equal(prove('y', () => first.get(y.id)), cold.y); assert.equal(runs.y, 1);
+    second.write({ id: y.id, kind: 'k', expected: 1, value: { v: 2 } });
+    assert.match(prove('y', () => first.get(y.id)), /"v":2/); assert.equal(runs.y, 2, 'Row 17: the second use in one operation asks the Store afresh');
+  });
+  let during = 0;
+  const proveDuring = () => withHistoricalReads(() => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(x), parameters: { pf4: 'during' } }, () => {
+    during++;
+    const value = first.get(y.id)!.value;
+    if (during === 1) pf4OtherProcess(first.path, { id: y.id, kind: 'k', expected: 2, value: { v: 3 } });
+    return canonical(value as Json);
+  }, noCycle));
+  assert.match(proveDuring(), /"v":2/);
+  assert.match(proveDuring(), /"v":3/); assert.equal(during, 2, 'Row 18: a write of another process during the derivation is after the mark');
+  let flushed = 0;
+  const proveFlushed = () => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(x), parameters: { pf4: 'flush' } },
+    () => { flushed++; return canonical(first.get(y.id)!.value as Json); }, noCycle);
+  withHistoricalReads(() => { proveFlushed(); second.write({ id: y.id, kind: 'k', expected: 3, value: { v: 4 } }); });
+  const restarted = new Store(first.path); t.after(() => restarted.close());
+  assert.match(withHistoricalReads(() => historicalRead(restarted, { reader: LISTED, project: 'garden', ref: reference(x), parameters: { pf4: 'flush' } },
+    () => { flushed++; return canonical(restarted.get(y.id)!.value as Json); }, noCycle)), /"v":4/);
+  assert.equal(flushed, 2, 'Row 18: a write between the derivation and the flush stays after the saved mark');
+});
+
+test("PF4 rows 14, 15: a list of a kind — empty or not —, the list of all, a history and a literal prefix are touched only by their own events: %, _ and case are ordinary characters, a Unicode prefix compares by code points, an empty prefix range waits for its first id, and a lone surrogate is decided by any event", t => {
+  const { first, second } = sameFileStores(t);
+  const a = first.write({ id: 'pf4p:a', kind: 'k', expected: 0, value: {} });
+  let n = 0;
+  const bump = (id: string, kind = 'k') => { const head = second.get(id); second.write({ id, kind, expected: head?.revision ?? 0, value: { v: ++n } }); };
+  const cases: [string, (store: Store) => unknown, () => void, () => void][] = [
+    ['empty kind', store => store.list('pf4-empty'), () => bump('pf4p:o1', 'pf4-other'), () => bump('pf4p:e1', 'pf4-empty')],
+    ['kind', store => store.list('k'), () => bump('pf4p:o2', 'pf4-other'), () => bump('pf4p:k1')],
+    ['all', store => store.list(), () => undefined, () => bump('pf4p:any', 'pf4-any')],
+    ['history', store => store.history(a.id), () => bump('pf4p:h-other'), () => bump(a.id)],
+    ['prefix %_', store => store.identities('prefix', 'pf4p:%_B'), () => { bump('pf4p:x_B'); bump('pf4p:%_b'); bump('pf4p:%'); bump('pf4p:%xB'); }, () => bump('pf4p:%_Bz')],
+    ['prefix unicode', store => store.identities('prefix', 'pf4p:ж\u{1D11E}'), () => { bump('pf4p:ж'); bump('pf4p:ж\u{1D11F}'); bump('pf4p:ж\uFFFF'); bump('pf4p:Ж\u{1D11E}'); }, () => bump('pf4p:ж\u{1D11E}!')],
+    ['empty prefix', store => store.identities('prefix', 'pf4p:none:'), () => bump('pf4p:none'), () => bump('pf4p:none:1')],
+    ['lone surrogate', store => store.get('pf4p:\uD800'), () => undefined, () => bump('pf4p:unrelated-to-surrogate')],
+  ];
+  for (const [name, read, unrelated, related] of cases) {
+    let runs = 0;
+    const prove = () => withHistoricalReads(() => historicalRead(first, { reader: LISTED, project: 'garden', ref: reference(a), parameters: { pf4: name } },
+      () => { runs++; return canonical(read(first) as Json); }, noCycle));
+    const cold = prove();
+    unrelated();
+    assert.equal(prove(), cold); assert.equal(runs, 1, `${name}: other events keep the proof`);
+    related();
+    prove(); assert.equal(runs, 2, `${name}: its own event derives it again`);
+    prove(); assert.equal(runs, 2, `${name}: and the new derivation is kept`);
+  }
+});
+
+const pf4Row = (id: string, revision: number, value: Json): Revision<Json> => ({ id, kind: 'k', revision, hash: hashJson(value), value });
+/** A listed reader that builds a layer of `row` over its own Store — internal when `row` is its key's Ref — and reads it
+ * through a traced child: the layer's own row, a delegated head, an exact revision and an absence. */
+function pf4Layered(store: Store, counts: { parent: number; child: number }, row: Revision<Json>, keyRow: Revision<Json> = row, base: Store = store,
+  childRef: Ref = reference(keyRow), name = 'pf4-layer') {
+  return historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(keyRow), parameters: name }, () => {
+    counts.parent++;
+    const layer = proofs.historicalLayer(base, [row]);
+    return historicalProof(layer, { reader: 'PF4.child', project: 'garden', ref: childRef }, source => {
+      counts.child++;
+      return canonical([source.get(row.id)?.value ?? null, source.get('pf4l:mask', 1)?.value ?? null, source.get('pf4l:dep')?.value ?? null,
+        source.get('pf4l:absent')?.value ?? null] as Json);
+    }, noCycle);
+  }, noCycle);
+}
+
+test("PF4 rows 21-26: a layer a derivation builds over its own Store from exactly its key's Ref is internal — the result is kept at the Store, its own row masks the base and stays constant, delegated reads are the Store's dependencies; rows outside the key, a layer over another Store or view, and a broken chain at an unchanged sequence keep the former limits; a child that read a layer's own row serves no other layer and is no proof of the bare Store", t => {
+  const { first, second } = sameFileStores(t);
+  first.write({ id: 'pf4l:mask', kind: 'k', expected: 0, value: { base: 1 } });
+  first.write({ id: 'pf4l:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const row = pf4Row('pf4l:mask', 2, { layer: 1 }), counts = { parent: 0, child: 0 };
+  const cold = withHistoricalReads(() => pf4Layered(first, counts, row));
+  assert.match(cold, /"layer":1/); assert.match(cold, /"base":1/);
+  assert.equal(withHistoricalReads(() => pf4Layered(first, counts, row)), cold);
+  assert.deepEqual(counts, { parent: 1, child: 1 }, 'Row 21: the composite result is kept at its Store, the layer is not derived again');
+  second.write({ id: 'pf4l:mask', kind: 'k', expected: 1, value: { base: 2 } });
+  assert.equal(withHistoricalReads(() => pf4Layered(first, counts, row)), cold);
+  assert.deepEqual(counts, { parent: 1, child: 1 }, 'Row 25: the head the layer answers itself is constant for it — the base head is no dependency');
+  second.write({ id: 'pf4l:dep', kind: 'k', expected: 1, value: { d: 2 } });
+  assert.match(withHistoricalReads(() => pf4Layered(first, counts, row)), /"d":2/);
+  assert.deepEqual(counts, { parent: 2, child: 2 }, 'Row 25: a delegated head is the Store\'s dependency');
+  second.write({ id: 'pf4l:absent', kind: 'k', expected: 0, value: { a: 1 } });
+  assert.match(withHistoricalReads(() => pf4Layered(first, counts, row)), /"a":1/);
+  assert.deepEqual(counts, { parent: 3, child: 3 }, 'Row 25: a delegated absence is the Store\'s dependency');
+  const outside = { parent: 0, child: 0 }, keyRow = pf4Row('pf4l:key', 1, { key: true });
+  withHistoricalReads(() => pf4Layered(first, outside, row, keyRow, first, reference(keyRow), 'pf4-outside'));
+  withHistoricalReads(() => pf4Layered(first, outside, row, keyRow, first, reference(keyRow), 'pf4-outside'));
+  assert.equal(outside.parent, 2, 'Row 22: a row that is not the key\'s Ref grants nothing — derived in every operation');
+  const directory = mkdtempSync(join(tmpdir(), 'pf4-other-db-')), other = new Store(join(directory, 'other.sqlite'));
+  t.after(() => { other.close(); rmSync(directory, { recursive: true, force: true }); });
+  const foreign = { parent: 0, child: 0 };
+  withHistoricalReads(() => pf4Layered(first, foreign, row, row, other, reference(row), 'pf4-foreign'));
+  withHistoricalReads(() => pf4Layered(first, foreign, row, row, other, reference(row), 'pf4-foreign'));
+  assert.equal(foreign.parent, 2, 'Row 23: a layer over another database is no internal layer of this Store');
+  const viewed = { parent: 0, child: 0 }, opaque = new Proxy(first, { get(target, key) {
+    const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member; } });
+  withHistoricalReads(() => pf4Layered(first, viewed, row, row, opaque, reference(row), 'pf4-opaque'));
+  withHistoricalReads(() => pf4Layered(first, viewed, row, row, opaque, reference(row), 'pf4-opaque'));
+  assert.equal(viewed.parent, 2, 'Row 23: a layer over an unknown Proxy keeps the conservative branch');
+  const other1 = pf4Row('pf4l:one', 1, { one: 1 }), other2 = pf4Row('pf4l:two', 1, { two: 2 }), shared = { parent: 0, child: 0 };
+  const anchor = first.get('pf4l:dep')!;
+  const [left, right] = withHistoricalReads(() => [pf4Layered(first, shared, other1, other1, first, reference(anchor), 'pf4-shared'),
+    pf4Layered(first, shared, other2, other2, first, reference(anchor), 'pf4-shared')]);
+  assert.notEqual(left, right); assert.deepEqual(shared, { parent: 2, child: 2 }, 'Row 24: a child that read one layer\'s own row serves no other layer');
+  let bare = 0;
+  const direct = withHistoricalReads(() => historicalProof(first, { reader: 'PF4.child', project: 'garden', ref: reference(anchor) }, source => {
+    bare++; return canonical([source.get('pf4l:one')?.value ?? null] as Json); }, noCycle));
+  assert.equal(bare, 1, 'Row 24: nor is it a proof of the bare Store'); assert.equal(direct, '[null]');
+  const original = Store.prototype.get, sequence = first.lastEvent();
+  Store.prototype.get = function (this: Store, ...args: Parameters<typeof original>) { return original.apply(this, args); } as typeof original;
+  try {
+    assert.equal(withHistoricalReads(() => pf4Layered(first, counts, row)), withHistoricalReads(() => pf4Layered(first, counts, row)));
+    assert.equal(first.lastEvent(), sequence);
+    assert.equal(counts.parent, 4, 'Row 26: a replaced read under the same sequence ends the reuse — the O(1) event check does not bypass the chain');
+  } finally { Store.prototype.get = original; }
+});
+
+test("PF4 rows 27-30, 40: a saved proof serves a new Store of the database without a derivation — its value, the ordered and distinct streams of its traced replay, the №3473 order of direct reads around a child, and an internal layer rebuilt as internal, so a parent derived over it is kept in its turn; after the restart a related event derives again and an unrelated one does not; opening reads no cache and no events", t => {
+  const { first, second } = sameFileStores(t);
+  const rows = Object.fromEntries(['x', 'y', 'z', 'w'].map(name => [name, first.write({ id: `pf4r:${name}`, kind: 'k', expected: 0, value: { name } })]));
+  first.write({ id: 'pf4l:mask', kind: 'k', expected: 0, value: { base: 1 } });
+  first.write({ id: 'pf4l:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const counts = { outer: 0, inner: 0 };
+  const child = (source: Store) => historicalProof(source, { reader: 'PF4.restart-child', project: 'garden', ref: reference(rows['z']!) },
+    nested => { counts.inner++; return nested.get(rows['z']!.id)!.value; }, noCycle);
+  const read = (store: Store) => historicalProof(store, { reader: 'PF4.restart', project: 'garden', ref: reference(rows['x']!) }, source => {
+    counts.outer++;
+    return [source.get(rows['y']!.id)!.value, child(source), source.get(rows['w']!.id)!.value, source.get(rows['y']!.id)!.value];
+  }, noCycle);
+  const stream = (store: Store, mode: 'ordered' | 'distinct') => {
+    const seen: string[] = [];
+    withHistoricalReads(() => read(historicalTrace(store, ref => seen.push(`${ref.id}@${ref.revision}`), mode)));
+    return seen;
+  };
+  const ordered = stream(first, 'ordered'), distinct = stream(first, 'distinct');
+  assert.deepEqual(ordered, ['pf4r:y@1', 'pf4r:z@1', 'pf4r:w@1', 'pf4r:y@1']);
+  const layered = { parent: 0, child: 0 }, row = pf4Row('pf4l:mask', 2, { layer: 1 });
+  const layer = withHistoricalReads(() => pf4Layered(first, layered, row));
+  const opened = { events: storeEvents(), proofs: pf4Counters() };
+  const restarted = new Store(first.path); t.after(() => restarted.close());
+  assert.deepEqual([storeEvents().marks, storeEvents().ranges, storeEvents().cacheReads, pf4Counters().loads],
+    [opened.events.marks, opened.events.ranges, opened.events.cacheReads, opened.proofs.loads], 'Row 40: opening reads no cache and no events');
+  assert.deepEqual(stream(restarted, 'ordered'), ordered); assert.deepEqual(stream(restarted, 'distinct'), distinct);
+  assert.deepEqual(counts, { outer: 1, inner: 1 }, 'Rows 27-29: the saved proof replays the cold stream without a derivation');
+  assert.equal(withHistoricalReads(() => pf4Layered(restarted, layered, row)), layer);
+  assert.deepEqual(layered, { parent: 1, child: 1 }, 'Row 29: the saved composite result with its internal layer');
+  let grand = 0;
+  const grandparent = () => withHistoricalReads(() => historicalRead(restarted, { reader: LISTED, project: 'garden', ref: reference(rows['w']!), parameters: 'pf4-grand' },
+    () => { grand++; return pf4Layered(restarted, layered, row); }, noCycle));
+  assert.equal(grandparent(), layer); assert.equal(grandparent(), layer);
+  assert.equal(grand, 1, 'Row 29: the rebuilt layer is internal again — a parent over it is kept');
+  second.write({ id: 'pf4r:unrelated', kind: 'k', expected: 0, value: {} });
+  assert.deepEqual(stream(restarted, 'ordered'), ordered); assert.equal(grandparent(), layer);
+  assert.deepEqual([counts.outer, layered.parent, grand], [1, 1, 1], 'Row 30: an unrelated event after the restart derives nothing');
+  second.write({ id: 'pf4l:dep', kind: 'k', expected: 1, value: { d: 2 } });
+  second.write({ id: rows['w']!.id, kind: 'k', expected: 1, value: { name: 'w2' } });
+  assert.deepEqual(stream(restarted, 'ordered'), ['pf4r:y@1', 'pf4r:z@1', 'pf4r:w@2', 'pf4r:y@1']);
+  assert.match(grandparent(), /"d":2/);
+  assert.deepEqual([counts.outer, counts.inner, layered.parent, grand], [2, 1, 2, 2], 'Row 30: related events derive exactly the touched proofs');
+});
+
+test("PF4 rows 31-33, 36: a saved check answers only its own full key and rules — another project, parameters or Ref, a record moved under another key, an unknown format, a missing node and a value JSON cannot keep are misses with an ordinary derivation; a received value stays the caller's own; two Stores saving the same key leave one whole pair", t => {
+  const { first, second } = sameFileStores(t);
+  const dep = first.write({ id: 'pf4c:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  let runs = 0;
+  const prove = (store: Store, key: Partial<HistoricalReadKey> = {}, value: (store: Store) => unknown = source => ({ dep: source.get(dep.id)!.value })) =>
+    withHistoricalReads(() => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(dep), parameters: 'pf4-cache', ...key },
+      () => { runs++; return value(store); }, noCycle));
+  const fresh = () => { const store = new Store(first.path); t.after(() => store.close()); return store; };
+  const saved = prove(first) as { dep: Json };
+  saved.dep = 'changed by the caller';
+  assert.deepEqual(prove(fresh()), { dep: { d: 1 } }); assert.equal(runs, 1, 'Row 32: the saved value is not the object a caller changed');
+  for (const key of [{ project: 'other' }, { parameters: 'pf4-cache-other' }, { ref: { ...reference(dep), hash: hashJson({ d: 0 }) } }]) prove(fresh(), key);
+  assert.equal(runs, 4, 'Row 31: another project, parameters or Ref is no hit');
+  const raw = new DatabaseSync(first.path); t.after(() => raw.close());
+  const exact = (parameters: string) => canonical({ reader: LISTED, project: 'garden', ref: reference(dep), parameters });
+  const original = raw.prepare('SELECT body FROM proof_cache WHERE key=?').get(digest(exact('pf4-cache')))!['body'] as string;
+  raw.prepare('INSERT OR REPLACE INTO proof_cache(key, written, size, body) VALUES(?, 0, 0, ?)').run(digest(exact('pf4-moved')), original);
+  prove(fresh(), { parameters: 'pf4-moved' }); assert.equal(runs, 5, 'Row 31: a record under another key is a miss');
+  raw.prepare('UPDATE proof_cache SET body=? WHERE key=?').run(original.replace('"format":"pf4-proof-cache/1"', '"format":"pf4-proof-cache/0"'), digest(exact('pf4-cache')));
+  assert.deepEqual(prove(fresh()), { dep: { d: 1 } }); assert.equal(runs, 6, 'Row 33: an unknown format is a miss and an ordinary derivation');
+  const node = (JSON.parse(raw.prepare('SELECT body FROM proof_cache WHERE key=?').get(digest(exact('pf4-cache')))!['body'] as string) as { node: string }).node;
+  raw.prepare('DELETE FROM proof_nodes WHERE hash=?').run(node);
+  prove(fresh()); assert.equal(runs, 7, 'Row 33: a missing node is a miss');
+  const lossy = (source: Store) => ({ kept: source.get(dep.id)!.revision, lost: undefined });
+  prove(first, { parameters: 'pf4-undefined' }, lossy);
+  const unsaved = pf4Counters().unpersistable;
+  prove(first, { parameters: 'pf4-undefined-2' }, lossy);
+  assert.ok(pf4Counters().unpersistable > unsaved, 'Row 33: a value JSON would change is not saved');
+  const reread = prove(fresh(), { parameters: 'pf4-undefined' }, lossy) as Record<string, unknown>;
+  assert.ok('lost' in reread); assert.equal(runs, 10, 'Row 33: it is derived again, with its undefined field');
+  const frozen = prove(first, { parameters: 'pf4-frozen' }, source => Object.freeze({ list: Object.freeze([source.get(dep.id)!.revision, 2]) }));
+  const loaded = prove(fresh(), { parameters: 'pf4-frozen' }, () => { throw new Error('derived again'); }) as { list: number[] };
+  assert.deepEqual(loaded, frozen); assert.ok(Object.isFrozen(loaded) && Object.isFrozen(loaded.list), 'Row 32: a frozen value is frozen after loading');
+  const plain = prove(fresh(), { parameters: 'pf4-plain' }, source => ({ list: [source.get(dep.id)!.revision] })) as { list: number[] };
+  const store = fresh();
+  const one = prove(store, { parameters: 'pf4-plain' }, () => { throw new Error('derived again'); }) as { list: number[] };
+  one.list.push(2);
+  assert.deepEqual(prove(store, { parameters: 'pf4-plain' }, () => { throw new Error('derived again'); }), plain, 'Row 32: each caller gets its own copy');
+  const marks = () => (JSON.parse(raw.prepare('SELECT body FROM proof_cache WHERE key=?').get(digest(exact('pf4-pair')))!['body'] as string) as { mark: number; value: Json });
+  prove(first, { parameters: 'pf4-pair' });
+  const earlier = marks();
+  second.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
+  prove(second, { parameters: 'pf4-pair' });
+  const later = marks();
+  assert.ok(later.mark > earlier.mark); assert.deepEqual(later.value, { dep: { d: 2 } }, 'Row 36: the later check replaced the whole pair');
+  const count = runs;
+  assert.deepEqual(prove(fresh(), { parameters: 'pf4-pair' }), { dep: { d: 2 } }); assert.equal(runs, count, 'Row 36: and it is current');
+});
+
+test("PF4 rows 34, 35, 38: nothing is saved before the outer boundary; a cache another writer holds is skipped and the work goes on; a too large result is not saved; a restored snapshot carries the checks of its own history only, and a mark from a later history is a miss", async t => {
+  const { first } = sameFileStores(t);
+  const dep = first.write({ id: 'pf4s:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  let runs = 0;
+  const prove = (store: Store, parameters: string, value: (store: Store) => unknown = source => source.get(dep.id)!.value) =>
+    withHistoricalReads(() => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(dep), parameters },
+      () => { runs++; return value(store); }, noCycle));
+  const key = (parameters: string) => digest(canonical({ reader: LISTED, project: 'garden', ref: reference(dep), parameters }));
+  withHistoricalReads(() => {
+    prove(first, 'pf4-boundary');
+    assert.equal(first.proofCacheRead(key('pf4-boundary')), null, 'Row 34: nothing is saved inside the operation');
+  });
+  assert.notEqual(first.proofCacheRead(key('pf4-boundary')), null, 'Row 34: the pair is saved at the outer boundary');
+  const holder = new DatabaseSync(first.path); t.after(() => holder.close());
+  holder.exec('BEGIN IMMEDIATE');
+  const busy = pf4Counters().flushBusy;
+  assert.deepEqual(prove(first, 'pf4-busy'), { d: 1 });
+  holder.exec('ROLLBACK');
+  assert.ok(pf4Counters().flushBusy > busy, 'Row 35: a held cache is skipped at once'); assert.equal(first.proofCacheRead(key('pf4-busy')), null);
+  const big = 'x'.repeat(33 * 1024 * 1024), unsaved = pf4Counters().unpersistable;
+  assert.equal((prove(first, 'pf4-big', source => ({ big, dep: source.get(dep.id)!.revision })) as { big: string }).big.length, big.length);
+  assert.ok(pf4Counters().unpersistable > unsaved); assert.equal(first.proofCacheRead(key('pf4-big')), null, 'Row 35: a too large result is not saved');
+  const backups = mkdtempSync(join(tmpdir(), 'pf4-snapshots-')); t.after(() => rmSync(backups, { recursive: true, force: true }));
+  prove(first, 'pf4-branch');
+  await first.snapshot(backups);
+  first.write({ id: dep.id, kind: 'k', expected: 1, value: { d: 2 } });
+  assert.deepEqual(prove(first, 'pf4-branch'), { d: 2 });
+  const later = first.proofCacheRead(key('pf4-branch'))!;
+  const { restoreSnapshot } = await import('../src/storage/snapshots.js');
+  const restoredPath = join(backups, 'restored', 'state.sqlite');
+  restoreSnapshot(backups, restoredPath);
+  const restored = new Store(restoredPath); t.after(() => restored.close());
+  const count = runs;
+  assert.deepEqual(prove(restored, 'pf4-branch'), { d: 1 }); assert.equal(runs, count, 'Row 38: the restored history serves its own saved check');
+  const raw = new DatabaseSync(restoredPath); t.after(() => raw.close());
+  raw.prepare('UPDATE proof_cache SET body=? WHERE key=?').run(later, key('pf4-branch'));
+  const again = new Store(restoredPath); t.after(() => again.close());
+  assert.deepEqual(prove(again, 'pf4-branch'), { d: 1 }); assert.equal(runs, count + 1, 'Row 38: a check from a later history is a miss');
+});
+
+test("PF4 row 40: a database of the former engine (no cache extension) opens without reading any cache or event, derives on demand under its old era and keeps what it derived", t => {
+  const directory = mkdtempSync(join(tmpdir(), 'pf4-v1-')), path = join(directory, 'state.sqlite');
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const legacy = new Store(path);
+  const dep = legacy.write({ id: 'pf4v:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  legacy.close();
+  removeProofCache(path);
+  const before = storeEvents(), loads = pf4Counters().loads;
+  const store = new Store(path); t.after(() => store.close());
+  assert.deepEqual([storeEvents().marks, storeEvents().ranges, storeEvents().cacheReads, pf4Counters().loads],
+    [before.marks, before.ranges, before.cacheReads, loads], 'Opening migrates and reads nothing else');
+  let runs = 0;
+  const prove = () => withHistoricalReads(() => historicalRead(store, { reader: LISTED, project: 'garden', ref: reference(dep), parameters: 'pf4-v1' },
+    () => { runs++; return store.get(dep.id)!.value; }, noCycle));
+  assert.deepEqual(prove(), { d: 1 }); assert.deepEqual(prove(), { d: 1 }); assert.equal(runs, 1);
+});
+
+test("PF4 row 21 (traced caller): a layer built over a transparent trace of the Store from the key's Ref is internal as well — the result is kept at the Store for traced callers with the cold stream replayed, a delegated read moving derives it again, and it stays in this process", t => {
+  const { first, second } = sameFileStores(t);
+  first.write({ id: 'pf4t:dep', kind: 'k', expected: 0, value: { d: 1 } });
+  const row = pf4Row('pf4t:own', 1, { own: 1 }), counts = { parent: 0, child: 0 };
+  const read = (store: Store) => historicalProof(store, { reader: 'PF4.traced-parent', project: 'garden', ref: reference(row) }, source => {
+    counts.parent++;
+    const layer = proofs.historicalLayer(source, [row]);
+    return historicalProof(layer, { reader: 'PF4.traced-child', project: 'garden', ref: reference(row) }, nested => {
+      counts.child++;
+      return canonical([nested.get(row.id)?.value ?? null, nested.get('pf4t:dep')?.value ?? null] as Json);
+    }, noCycle);
+  }, noCycle);
+  const stream = (store: Store) => {
+    const seen: string[] = [];
+    const value = withHistoricalReads(() => read(historicalTrace(store, ref => seen.push(`${ref.id}@${ref.revision}`))));
+    return { value, seen };
+  };
+  const cold = stream(first);
+  assert.deepEqual(cold.seen, ['pf4t:dep@1']); assert.match(cold.value, /"own":1/);
+  assert.deepEqual(stream(first), cold);
+  assert.deepEqual(counts, { parent: 1, child: 1 }, 'Kept at the Store and replayed to a new traced caller');
+  second.write({ id: 'pf4t:dep', kind: 'k', expected: 1, value: { d: 2 } });
+  const moved = stream(first);
+  assert.deepEqual(moved.seen, ['pf4t:dep@2']); assert.deepEqual(counts, { parent: 2, child: 2 }, 'A delegated read that moved derives it again');
+  const reopened = new Store(first.path); t.after(() => reopened.close());
+  assert.deepEqual(stream(reopened), moved); assert.equal(counts.parent, 3, 'A layer over a trace has no description another process could rebuild');
+});
+
+test("PF4 return №3541-1 (row 26 at the saved cache): a saved result is taken only by a Store whose reads are the standard ones — a read replaced after saving makes a new Store derive again and see what it reads now, a result derived with replaced reads is not saved, and an unchanged restart is served from the cache", t => {
+  const { first } = sameFileStores(t);
+  const x = first.write({ id: 'pf4m:x', kind: 'k', expected: 0, value: { v: 1 } });
+  first.write({ id: 'pf4m:y', kind: 'k', expected: 0, value: { v: 2 } });
+  const row = pf4Row('pf4m:pending', 1, { v: 3 });
+  let runs = 0;
+  const key = (name: string) => ({ reader: LISTED, project: 'garden', ref: reference(row), parameters: name });
+  const prove = (store: Store, name = 'pf4-methods') => withHistoricalReads(() => historicalRead(store, key(name), () => {
+    runs++;
+    const layer = proofs.historicalLayer(store, [row]);
+    return historicalProof(layer, { reader: 'PF4.methods-child', project: 'garden', ref: reference(x) },
+      source => canonical([source.get(row.id)!.value, source.get(x.id)!.value] as Json), noCycle);
+  }, noCycle));
+  const fresh = () => { const store = new Store(first.path); t.after(() => store.close()); return store; };
+  const cold = prove(first);
+  assert.equal(prove(fresh()), cold); assert.equal(runs, 1, 'An unchanged restart is served from the cache');
+  const original = Store.prototype.get;
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    return original.call(this, id === x.id ? 'pf4m:y' : id, revision);
+  } as typeof original;
+  try {
+    assert.match(prove(fresh()), /"v":2/); assert.equal(runs, 2, 'A new Store with replaced reads derives again and sees what it reads now');
+    assert.match(prove(first), /"v":2/); assert.equal(runs, 3, 'The proof kept in memory notices the replacement, as before');
+    prove(fresh(), 'pf4-replaced'); assert.equal(runs, 4);
+  } finally { Store.prototype.get = original; }
+  assert.equal(first.proofCacheRead(digest(canonical(key('pf4-replaced')))), null, 'A result derived with replaced reads is not saved');
+  prove(fresh(), 'pf4-replaced'); assert.equal(runs, 5, 'Back on the standard reads it is derived');
+  assert.equal(prove(fresh()), cold); assert.equal(runs, 5, 'The result saved under the standard reads serves again');
+});
+
+test("PF4 return №3541-2: a result is saved with every node it reaches whatever another Store swept meanwhile — after another Store's eviction by the 512-result bound and after its proofCacheClear, the new record has no dangling link and a new Store takes it without deriving", t => {
+  const { first, second } = sameFileStores(t);
+  const a = first.write({ id: 'pf4n:a', kind: 'k', expected: 0, value: { a: 1 } });
+  const b = first.write({ id: 'pf4n:b', kind: 'k', expected: 0, value: { b: 2 } });
+  let computed = 0;
+  const proof = (store: Store, row: Revision<Json>, parameters: Json) => withHistoricalReads(() => historicalRead(store,
+    { reader: LISTED, project: 'garden', ref: reference(row), parameters }, () => { computed++; return store.get(row.id)!.value; }, noCycle));
+  const fresh = () => { const store = new Store(first.path); t.after(() => store.close()); return store; };
+  const raw = new DatabaseSync(first.path); t.after(() => raw.close());
+  const state = () => ({ roots: Number(raw.prepare('SELECT count(*) AS n FROM proof_cache').get()!['n']),
+    dangling: Number(raw.prepare('SELECT count(*) AS n FROM proof_links l LEFT JOIN proof_nodes n ON l.node = n.hash WHERE n.hash IS NULL').get()!['n']) });
+  proof(first, a, 'original');
+  withHistoricalReads(() => { for (let index = 0; index < 512; index++) proof(second, b, index); });
+  assert.equal(first.proofCacheRead(digest(canonical({ reader: LISTED, project: 'garden', ref: reference(a), parameters: 'original' }))), null,
+    'The other Store evicted the first result and swept its node');
+  proof(first, a, 'after-eviction');
+  assert.deepEqual(state(), { roots: 512, dangling: 0 }, 'The new result was written with the node the other Store had swept');
+  let count = computed;
+  assert.deepEqual(proof(fresh(), a, 'after-eviction'), { a: 1 }); assert.equal(computed, count, 'A new Store takes it without deriving');
+  second.proofCacheClear();
+  proof(first, a, 'after-clear');
+  assert.deepEqual(state(), { roots: 1, dangling: 0 }, 'After another Store emptied the cache as well');
+  count = computed;
+  assert.deepEqual(proof(fresh(), a, 'after-clear'), { a: 1 }); assert.equal(computed, count);
 });

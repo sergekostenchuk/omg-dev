@@ -8,6 +8,7 @@ import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
+import { historicalProofCounters } from "../src/history/proofs.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -479,6 +480,9 @@ test("H1.2 R5 a failed review of the stop ends the pass on that very record: a r
   assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]), [["stop-analysis-failed", "analysis_failed", series.id, "stop"]]);
   assert.ok(reasons[0]!.basis.some(ref => ref.id === failure.id && ref.hash === failure.hash), "The Ref of exactly this review");
   assert.equal(series.value.escalations.length, 0, "A failed review escalates nothing and opens no door of its own");
+  // PF4 (№3499 row 42): the database carries the checks this process saved; a warm cache resumes nothing — the ended
+  // pass stays ended on its own record.
+  assert.ok(historicalProofCounters().writtenRecords > 0, "The restart meets a warm saved cache");
   f.restart();
   assert.equal(ok(await advanceRun(f.store, request)).performed, null);
   assert.equal(f.sent().length, sends, "A restart does not pay the review again");
@@ -1594,7 +1598,10 @@ test("5 4 H1 an answer received before a lost process is applied by the same sav
   const call = f.store.list().find(row => row.kind === "model-call")!;
   assert.notEqual((call.value as { om?: { application?: string } }).om?.application, "applied");
   f.restart();
+  const loaded = historicalProofCounters().loaded;
   const resumed = ok(await advanceRun(f.store, request));
+  // PF4 (№3499 row 43): the restarted process takes the checks the lost one saved; the saved receipt still decides.
+  assert.ok(historicalProofCounters().loaded > loaded, "The restart is served by saved checks");
   assert.deepEqual(resumed.performed, cycling, "The saved request is performed, not a new choice");
   assert.equal(f.sent().length, 1, "The saved receipt is applied without a second send");
   assert.equal((f.store.get(call.id)!.value as { om: { application: string } }).om.application, "applied");
