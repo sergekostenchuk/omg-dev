@@ -8,7 +8,7 @@
 set -u; H=$(cd "$(dirname "$0")" && pwd); RUN=${RUN:?сборка}; OUT=${OUT:?папка результата}; DUR=${DURATION_MIN:-20}; NODE=$(command -v node)
 mkdir -p "$OUT"; rm -rf "$OUT"/copy.sqlite* "$OUT/prof" "$OUT"/*.log "$OUT"/*.jsonl "$OUT"/*.out "$OUT"/*.err "$OUT/report.txt"; mkdir -p "$OUT/prof"
 export HISTORY_RUN_OUT="$OUT"
-if [ -n "${SRC:-}" ]; then cp "$SRC" "$OUT/copy.sqlite"; else sqlite3 "file:$HOME/OMG/.omg/state.sqlite?mode=ro&immutable=1" ".backup $OUT/copy.sqlite" || { echo "STOP: копия"; exit 1; }; fi
+if [ -n "${SRC:-}" ]; then cp "$SRC" "$OUT/copy.sqlite" && chmod u+w "$OUT/copy.sqlite"; else sqlite3 "file:$HOME/OMG/.omg/state.sqlite?mode=ro&immutable=1" ".backup $OUT/copy.sqlite" || { echo "STOP: копия"; exit 1; }; fi
 cmd() { "$NODE" "$RUN/dist/src/cli.js" command "$OUT/copy.sqlite"; }
 STATE=$(printf '%s' '{"type":"om-state","project":"omg-live"}' | cmd 2>/dev/null)
 TOK=$(jq -r '.value.control.control.value.stop.token // empty' <<<"$STATE")
