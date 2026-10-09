@@ -40,7 +40,7 @@ import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type Repai
 import { readCall, recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
 import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalRow, type RefusalJournal } from '../src/om/refusal-journal.js';
 import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORIGIN_DECISION_KIND, readDefinitions } from '../src/om/repeat-gate.js';
-import { prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
+import { ONE_ARTIFACT, prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
@@ -3323,6 +3323,52 @@ test('G5 a works packet of the wake-test era: several covering tests and an expl
     rejected(check(misplaced), 'part_answer_invalid');
   }
   assert.deepEqual(snapshot(f.store), before, 'E3 writes nothing');
+});
+
+// G6 (В4, №3869): the G5 invariant «one artifact per real work» is stated in the brief of a works packet of the transition
+// era and checked when its new work is accepted (E3), with the same words; one artifact passes.
+test('G6 a works packet of the transition era states the one-artifact rule; a new work that also produces a local connection of another artifact is refused at E3 with that rule; its example passes', async t => {
+  const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  assert.equal(packet.value.transitionEra, true, 'A works packet that assigns obligations is of the transition era');
+  const payload = packet.value.packet as Record<string, any>;
+  assert.ok(payload.brief.text.includes(ONE_ARTIFACT.rule), 'The brief states the rule');
+  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
+  const check = (answer: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: canonical(answer) });
+  const before = snapshot(f.store);
+  assert.ok(check(example).ok, 'One artifact');
+  const node = example.proposal.nodes[0];
+  // A second artifact: the work also produces a local L3 connection of another artifact.
+  const two = structuredClone(example), port = { id: 'example-port-extra', direction: 'out', contract: 'garden-contract' };
+  two.proposal.nodes[0].ports.push(port);
+  two.proposal.artifacts.push({ id: 'example-extra', contract: 'garden-contract', durability: 'reconstructible', external: false,
+    kind: 'intermediate', purpose: 'A second result of the same work', sensitivity: 'project_internal', terminal: false });
+  two.proposal.localConnectors.push({ id: 'example-extra-flow', artifact: 'example-extra', returnsTo: node.id, wakeTest: null,
+    bindings: [{ level: 3, anchor: null, producer: { node: node.id, port: port.id }, consumers: [{ node: node.id, port: 'example-port-2' }] }] });
+  const refused = rejected(check(two), 'part_result_invalid');
+  assert.deepEqual([refused.at.target, refused.at.field, refused.message], [node.id, 'outcome', ONE_ARTIFACT.rule]);
+  assert.deepEqual(snapshot(f.store), before, 'E3 writes nothing');
+});
+// G6 era: a works packet the base (bfd28369, before G6) issued keeps its bytes — no transition era, no rule in its brief,
+// and E3 does not refuse a second artifact (the G5 gate keeps its invariant at the common acceptance, as before).
+const G6_BASE = 'bfd28369d5a93b67bcee96e1de971c05378e9114';
+test('G6 a works packet issued before the transition era is admitted with its own bytes: no rule in its brief, and its E3 does not refuse a second artifact', async t => {
+  const f = await worksPacketFixture(t), request = f.request();
+  const saved = atCommit({ root: f.root, path: f.database }, G6_BASE, 'g6-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
+  assert.equal(Object.hasOwn(saved.value, 'transitionEra'), false, 'The base issues no transition era');
+  const again = ok(prepareQuestionPacket(f.store, request));
+  assert.deepEqual(again.writes, []); assert.deepEqual(reference(again.record), reference(saved), 'Admitted with its own bytes');
+  const payload = saved.value.packet as Record<string, any>;
+  assert.equal(payload.brief.text.includes(ONE_ARTIFACT.rule), false, 'Its brief keeps the bytes of its era');
+  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
+  const node = example.proposal.nodes[0], port = { id: 'example-port-extra', direction: 'out', contract: 'garden-contract' };
+  node.ports.push(port);
+  example.proposal.artifacts.push({ id: 'example-extra', contract: 'garden-contract', durability: 'reconstructible', external: false,
+    kind: 'intermediate', purpose: 'A second result of the same work', sensitivity: 'project_internal', terminal: false });
+  example.proposal.localConnectors.push({ id: 'example-extra-flow', artifact: 'example-extra', returnsTo: node.id, wakeTest: null,
+    bindings: [{ level: 3, anchor: null, producer: { node: node.id, port: port.id }, consumers: [{ node: node.id, port: 'example-port-2' }] }] });
+  const checked = checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw: canonical(example) });
+  assert.ok(checked.ok || (checked as { refusal: { message: string } }).refusal.message !== ONE_ARTIFACT.rule, 'The earlier era is not refused by the new rule');
 });
 
 test('MP1 №3052 real-work joins require designed condition and explicit required/optional; native assembly still owns actual inputs', async t => {

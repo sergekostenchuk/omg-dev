@@ -26,7 +26,7 @@ import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Questio
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
-import { PROPOSAL_REFUSAL_CODES, WAKE_TEST, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
+import { ONE_ARTIFACT, PROPOSAL_REFUSAL_CODES, WAKE_TEST, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { FRAME_REFUSAL_CODES, flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, completionWorkId, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
@@ -180,6 +180,12 @@ export interface QuestionPacketRecord {
    * continuation or correction keeps the era of its chain.
    */
   wakeTests?: true;
+  /**
+   * G6 (№3857, №3869): a works brief step issued since the group transition that assigns obligations shows the applied facts
+   * of its consumers and the one-artifact rule in its brief, and checks that rule when its new works are accepted; absent in
+   * one issued before, which keeps its bytes. A continuation or correction keeps the era of its chain.
+   */
+  transitionEra?: true;
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -1028,6 +1034,12 @@ function wakeTestsEra(contract: QuestionPacketRecord['packetContract'], saved?: 
     fail('packet_record_invalid', saved.request.routes.id, 'wakeTests', 'Only a works brief packet declares the wake-test era');
   return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.wakeTests === true : true);
 }
+/** G6: the saved step keeps its own era; a step issued now is of the transition era (works brief packets only). */
+function transitionEraOf(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
+  if (saved && Object.hasOwn(saved, 'transitionEra') && (saved.transitionEra !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
+    fail('packet_record_invalid', saved.request.routes.id, 'transitionEra', 'Only a works brief packet declares the transition era');
+  return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.transitionEra === true : true);
+}
 /** G5: the era is marked only where it changes the form — an assignment holding a producer end of a connection. */
 const holdsProducerEnd = (assigned: readonly FrameObligation[]): boolean =>
   assigned.some(item => item.kind === 'connection-end' && item.role === 'producer');
@@ -1073,10 +1085,11 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     fail('packet_record_invalid', request.routes.id, 'packetContract', 'The work answer era belongs only to an L3 node assignment');
   if (!worksPacketContract(contract) && Object.hasOwn(request, 'works'))
     fail('packet_task_set_invalid', request.routes.id, 'works', 'A D7 handoff is accepted only by the declared work-packet era');
-  const bindingsEra = worksBindingsEra(contract, saved), wakeEra = wakeTestsEra(contract, saved);
+  const bindingsEra = worksBindingsEra(contract, saved), wakeEra = wakeTestsEra(contract, saved), transitionStep = transitionEraOf(contract, saved);
   const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}),
     ...(contract ? { packetContract: contract } : {}), ...(briefVersion ? { briefContract: briefVersion } : {}),
-    ...(bindingsEra ? { worksBindings: true as const } : {}), ...(wakeEra ? { wakeTests: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
+    ...(bindingsEra ? { worksBindings: true as const } : {}), ...(wakeEra ? { wakeTests: true as const } : {}),
+    ...(transitionStep ? { transitionEra: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
@@ -1193,6 +1206,9 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     if (!shows) delete (base as { worksBindings?: true }).worksBindings;
     if (briefBasis) briefBasis.worksBindings = shows;
     if (!wakeEra || !holdsProducerEnd(open)) delete (base as { wakeTests?: true }).wakeTests;
+    // G6: the era is marked only where the brief states it — a step that assigns obligations.
+    if (!transitionStep || !open.length) delete (base as { transitionEra?: true }).transitionEra;
+    if (briefBasis) briefBasis.transitionEra = transitionStep && open.length > 0;
     if (!open.length) return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
     const allIds = open.map(item => item.id).sort(order);
     const whole = { ...context, assigned: allIds, connections: connectionContext(frame.frame.upper, open) };
@@ -1667,6 +1683,22 @@ function partProposal(store: Store, project: string, packet: Revision<QuestionPa
           || Object.hasOwn(fill, WAKE_TEST.field)) continue;
         if ([...tests.values()].filter(test => test.node === node.id && node.tests.includes(test.id) && test.covers.includes(obligation.connector!)).length > 1)
           fail('part_result_invalid', fill.obligation, WAKE_TEST.field, WAKE_TEST.rule);
+      }
+    }
+    // G6 (В4, №3869): the G5 invariant at the primary acceptance of a new work of this era — its outcome and the artifact
+    // of every connection it is the producer end of (the upper ones it fills, its own local ones) are one artifact.
+    if (value.transitionEra === true) {
+      const artifactOf = new Map([...graph.connectors, ...(contextual.localConnectors ?? [])].map(connector => [connector.id, connector.artifact]));
+      for (const node of body.nodes.filter(item => item.kind === 'work')) {
+        const artifacts = new Set([node.outcome]);
+        for (const fill of body.fills) {
+          const obligation = frame.result.obligations.find(item => item.id === fill.obligation);
+          if (fill.node === node.id && obligation?.kind === 'connection-end' && obligation.role === 'producer' && obligation.connector)
+            artifacts.add(artifactOf.get(obligation.connector) ?? obligation.connector);
+        }
+        for (const connector of contextual.localConnectors ?? []) if (connector.bindings.some(binding => binding.level === 3 && binding.producer.node === node.id))
+          artifacts.add(connector.artifact);
+        if (artifacts.size !== 1) fail('part_result_invalid', node.id, 'outcome', ONE_ARTIFACT.rule);
       }
     }
     const assignment = (packet.value.packet as Record<string, Json>).works as unknown as WorksPacketContext;

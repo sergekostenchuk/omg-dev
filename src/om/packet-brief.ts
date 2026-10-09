@@ -15,7 +15,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import { isPlainObject, type Refusal } from './refusal.js';
 import { bindingFlowIdentity } from '../graph/flow-identity.js';
-import { WAKE_TEST } from './frame-proposals.js';
+import { ONE_ARTIFACT, WAKE_TEST } from './frame-proposals.js';
 
 export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
@@ -129,6 +129,9 @@ export interface BriefBasis {
   worksBindings?: boolean;
   /** G5 (№3820, №3822): the wake-test era of the step — a producer end of its works form names its wake test. */
   wakeTests?: boolean;
+  /** G6 (№3857, №3869): the transition era of the step — its brief shows the applied facts of its consumers and states
+   * the one-artifact rule its primary acceptance checks. */
+  transitionEra?: boolean;
   project: string; graph: Graph; node: string | null; gaps: { question: string; target: string; field: string; ref: Ref; evidence: Json }[];
   /** MP2 (№2968 §2): the proved finished work of neighbouring roots — only in the form a packet issued after MP2 saves. */
   neighbors?: { contract: typeof NEIGHBOR_CONTRACT; works: Json[] };
@@ -292,6 +295,13 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
     ...(payload.questions as { consumers?: string[] }[]).flatMap(question => question.consumers ?? [])]);
   const node = basis.graph.nodes.find(row => row.id === basis.node);
   const decided = (input.decided ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer));
+  // G6 (№3857): a fact applied to B1 for these consumers or for a node above this one (its block) reaches their works —
+  // the question and its accepted answer.
+  const above = new Set<string>();
+  for (let at = basis.graph.nodes.find(row => row.id === basis.node); at && !above.has(at.id); at = basis.graph.nodes.find(row => row.id === at!.parent))
+    above.add(at.id);
+  const facts = basis.transitionEra ? (input.facts ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer)
+    || above.has(row.question.consumer)).map((row: { question: Json; value: Json }) => ({ question: row.question, value: row.value })) : [];
   const requirementIds = new Set(node?.implements ?? []);
   const knownRequirements = new Set((input.requirements ?? []).map((row: { id: string }) => row.id));
   const selectRequirement = (selected: unknown): void => {
@@ -321,6 +331,7 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
     // OWN1 (№3713): what the bypass decided for the consumers of this work reaches them — the question, the decision taken
     // and its alternatives — never a question silently gone. A packet with nothing decided keeps its bytes of its era.
     ...(decided.length ? { decided } : {}),
+    ...(facts.length ? { facts } : {}),
     // OWN1 (№3716): a question of these consumers left for their task start (the environment) is answered then, from
     // observation; what the pass knows of its own database goes with the packet, never in place of that observation.
     ...((input.questions ?? []).some((row: { consumer: string; kind: string | null }) => consumers.has(row.consumer)
@@ -538,7 +549,7 @@ export function briefRules(codes: BriefBasis['codes']): BriefRule[] {
     .sort((a, b) => compare(a.code, b.code)).map(row => ({ ...row, kinds: ['MC1', 'field', 'L2', 'L3'],
       repairable: row.phase === 'answer' && Object.hasOwn(REPAIRABLE, row.code),
       rule: row.phase === 'answer' && Object.hasOwn(REPAIRABLE, row.code) ? REPAIRABLE[row.code as keyof typeof REPAIRABLE]
-        : row.phase === 'assembly' ? GRAPH_RULES[row.code] ?? 'This C2/C3/C4 finding concerns the exact frame/proposal/assembly proof; it cannot be established or repaired by an unadmitted part response.'
+        : row.phase === 'assembly' ? (row.code === ONE_ARTIFACT.code ? ONE_ARTIFACT.rule : GRAPH_RULES[row.code]) ?? 'This C2/C3/C4 finding concerns the exact frame/proposal/assembly proof; it cannot be established or repaired by an unadmitted part response.'
           : 'Not a correctable model-answer failure: source, identity, admission or environment proof belongs to the engine.' }));
 }
 /** MP2: the rule, in words, a correction states for its exact refusal (null outside the closed repairable class). */
@@ -813,7 +824,8 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
     ancestry.push(ancestor); seen.add(ancestor.id); ancestor = basis.graph.nodes.find(node => node.id === ancestor!.parent);
   }
   const examples = briefExamples(payload, labels, basis);
-  const rules = briefRules(basis.codes).filter(row => payload.expansion ? row.phase === 'assembly' || row.repairable : row.repairable);
+  const codes = basis.transitionEra ? [...basis.codes, { code: ONE_ARTIFACT.code, phase: 'assembly' as const }] : basis.codes;
+  const rules = briefRules(codes).filter(row => payload.expansion ? row.phase === 'assembly' || row.repairable : row.repairable);
   const grouped = new Map<string, { codes: string[]; phase: string; repairable: boolean; rule: string }>();
   for (const row of rules) {
     const key = canonical([row.phase, row.repairable, row.rule]);

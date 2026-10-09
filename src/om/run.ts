@@ -47,6 +47,7 @@ import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { readGaps as readGapsOf, type GapReadRequest } from "./gaps.js";
 import { readFrameProposals as readFrameProposalsOf } from "./frame-proposals.js";
 import type { Graph } from "../graph/model.js";
+import { RefinementRelations } from "../graph/relations.js";
 import type { DispatchContract } from "./call-record.js";
 import { RunControlGate, RunControlLost, type RunControlHold } from "./run-control.js";
 
@@ -682,7 +683,11 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
   stand(trail, [bases.input, bases.refs.horizon, bases.refs.queue, bases.refs.routes]);
   // №1860 п.5 (C38): an accepted answer M6 already routes as answered is applied to B1 when no attempt works on the
   // B1 it would replace; the new B1 then gets its own bases in the next step.
-  if (!open.length) {
+  // G6 (В2, №3869): a group whose works acceptance waits only for the answers of its own blocking questions gets them
+  // applied while its attempts are the only ones open; LP5 ends its remainder on the replaced B1, and new work opens only
+  // once the whole group has ended — the answers still held are applied first.
+  const transition = waits.find(held => held.wait.code === "group_transition");
+  if (!open.length || transition && open.every(ref => transition.wait.basis.some(basis => basis.id === ref.id))) {
     const applied = applyStep(store, project, bases);
     if (applied) return applied;
   }
@@ -1353,6 +1358,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       const bound: FrameAttemptBinding = { series: reference(series), ordinal, obligations: obligationsOf(batches, level) };
       if (level === 2) return step("accept", { gate: checked.request, settle: { project, level: 2, candidate: candidate!.ref,
         outcome: { gate: "G3", candidate: candidate!.ref, graphHash: candidate!.graphHash, passed: true, codes: [] }, binding: bound } }, series.id, ordinal);
+      // G6 (В2, №3869): an accepted answer of a question that blocks this group's own works and that B1 still holds keeps
+      // their D1 open, so no G5 can pass on the old B1: neither the works step nor a wake choice for an assembly the
+      // transition replaces is paid. The machine choice applies the answer once only this group is open; LP5 then ends it.
+      const transition = groupTransition(store, project, (checked.request as { routes: Ref }).routes, group);
+      if (transition) return transition;
       const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: item.kind, record: item.record })));
       const sources = prepareWorksSources(store, { project, results });
       if (!sources.ok) {
@@ -1400,6 +1410,27 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   const claim = prepareManagedClaim(store, { ...address, outcome: { reason: "result", accepting, cancelling: [], refusals: [] } } as never);
   if (!claim.ok) return { wait: waitOf(claim.refusal, project) };
   return step("close", { ...address, outcome: claim.value.outcome }, series.id, ordinal);
+}
+/**
+ * G6 (В2, №3869): the wait of a group whose works acceptance stands on accepted answers of its own blocking questions not
+ * yet applied to B1 — a question whose consumer this group's works refine (or that refines them), answered in the current
+ * M6 of the attempt's plan, still held by B1. Its basis names those answers and every series of the group.
+ */
+function groupTransition(store: Store, project: string, routesRef: Ref, group: readonly Member[]): Held | null {
+  const routes = take(readRoutes(store, { project, record: routesRef })).record.value as unknown as RoutesRecord;
+  const held = new Set(store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.map(question => question.id));
+  const answered = routes.routes.filter(route => route.state === "answered" && route.answer && route.field === "answer" && held.has(route.target));
+  if (!answered.length) return null;
+  const graph = take(readRecord<Graph>(store, routes.request.gaps.sources.graph, { unit: UNIT, target: routes.request.gaps.sources.graph.id,
+    id: `graph:${project}`, kind: "graph" })).value;
+  const relations = new RefinementRelations(graph as Graph), nodes = group.flatMap(row => row.batches
+    .filter(batch => batch.task === "node-expansion" && batch.level === 3 && batch.node).map(batch => batch.node!));
+  const blocking = answered.filter(route => route.consumers.some(consumer => nodes.some(node => node === consumer
+    || relations.refines(node, consumer) || relations.refines(consumer, node))));
+  if (!blocking.length) return null;
+  return wait("group_transition", group[0]!.series.id, "answers",
+    "The group's works acceptance waits for the accepted answers of its own blocking questions to be applied to B1",
+    uniqueRefs([...blocking.map(route => route.answer!), ...group.map(row => reference(row.series))]), "dependent");
 }
 /**
  * G5.1: the wake step of the refused producer end — its proposal among this group's sources, while its choice is still

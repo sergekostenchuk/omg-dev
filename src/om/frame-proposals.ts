@@ -23,6 +23,11 @@ export interface ProposalFill { obligation: string; node: string; port?: string;
  * G5 (№3820, №3822): the wake test of a producer end — the one test of its own work that covers the connection and wakes the
  * consumers when they sleep. The answer form names it and E2 checks it by this one rule; the engine never picks one.
  */
+/** G6 (В4, №3869): one artifact per real work — the G5 gate's invariant, stated in the brief and checked at the primary
+ * acceptance of a new work, where its outcome and outgoing connections are known. */
+export const ONE_ARTIFACT = Object.freeze({ code: 'work_artifact_not_single' as const,
+  rule: 'A real work produces one artifact, including every outgoing connection: its outcome and the artifact of every '
+    + 'connection it is the producer end of are the same. A second artifact needs a work of its own.' });
 export const WAKE_TEST = Object.freeze({ field: 'wakeTest' as const,
   rule: 'When more than one test of its own work covers a connection, the producer end of that connection names in '
     + 'wakeTest exactly one of them: the test that wakes the consumers of the connection when they sleep. Name it even when '

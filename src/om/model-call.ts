@@ -32,6 +32,8 @@ import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as pr
 import { readGaps as readGapsOf } from './gaps.js';
 import { prepareOmObligations as prepareOmObligationsOf, readOmObligations as readOmObligationsOf, type OmObligations } from './obligations.js';
 import { taskBindingId, taskObligations } from '../graph/task-obligations.js';
+import type { Graph } from '../graph/model.js';
+import { RefinementRelations } from '../graph/relations.js';
 import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import type { CarriedObligation } from '../graph/obligation-policy.js';
 import { WORKS_FRAME_CONTRACT, readFrameBasis as readFrameBasisOf, prepareFrame as prepareFrameOf, type FrameRequest } from './frame-obligations.js';
@@ -4113,6 +4115,25 @@ function worksBasisAt(store: Store, project: string, works: { producer: Ref; led
   if (!same(reference(basis.record), works.ledger)) fail('completion_invalid', works.ledger.id, 'works', 'A D7 basis names its exact complete ledger');
   return basis;
 }
+/**
+ * G6 (В3): whether a question the origin input held is an applied fact of today's input whose consumer is this area — its
+ * node, a node above it (its block) or below it. The consumer is the applied fact's, addressed; the origin may hold the
+ * question still unaddressed.
+ */
+function learnedSince(store: Store, project: string, origin: OmObligations, today: OmObligations, node: string): boolean {
+  const before = origin.producer.value.request.gaps.sources, after = today.producer.value.request.gaps.sources;
+  if (same(before.input, after.input)) return false;
+  const now = take(readOmInput(store, project, after.input)).value.input;
+  const applied = new Map((now.facts ?? []).map(fact => [fact.question.id, fact.question.consumer]));
+  if (!applied.size) return false;
+  const held = new Set(now.questions.map(question => question.id));
+  const graph = take(readRecord<Graph>(store, after.graph, { unit: 'G7', target: after.graph.id, id: `graph:${project}`, kind: 'graph' })).value;
+  const relations = new RefinementRelations(graph as unknown as Graph);
+  return take(readOmInput(store, project, before.input)).value.input.questions.some(question => {
+    const consumer = held.has(question.id) ? undefined : applied.get(question.id);
+    return consumer !== undefined && (consumer === node || relations.refines(node, consumer) || relations.refines(consumer, node));
+  });
+}
 /** Whether any physical or result step of this root already exists in the work: a packet, its parts, a call, a cycle or a result. */
 function rootStarted(store: Store, binding: Revision<CompletionOwner>, before: Sealed<CompletionSnapshot>, root: Revision<CompletionAssignment>): boolean {
   const project = binding.value.project;
@@ -4213,6 +4234,13 @@ function reuseValue(store: Store, project: string, request: { binding: Ref; root
   if (!before3 || !same(before3.subject, area.subject)) return null;
   const origin = take(readPartAssembly(store, { project, record: answered.origin.assembly }));
   if (!same(reference(origin.proposal), answered.origin.proposal)) fail('completion_foreign', answered.origin.assembly.id, 'origin', 'The origin names its exact proposal');
+  // G6 (В3, №3869): a reuse never makes old work aware of new knowledge. The input the ORIGIN paid assembly was asked on
+  // is compared with today's: a question it held that today's input holds as an applied fact of this area makes the old
+  // result unfit, and the root is new work whose packet carries the answer. An intermediate
+  // reuse changes nothing; a saved reuse is never recomputed.
+  const originWorks = (origin.record.value as unknown as { works?: WorksPartBindings }).works;
+  if (!originWorks) fail('completion_foreign', answered.origin.assembly.id, 'works', 'A reused origin keeps the handoff it was asked on');
+  if (learnedSince(store, project, worksBasisAt(store, project, originWorks), basis, area.node)) return null;
   const proposal = origin.proposal.value as unknown as { level: number; worksContract?: string; fills: { obligation: string }[] };
   if (proposal.level !== 3 || proposal.worksContract !== WORKS_FRAME_CONTRACT
     || canonical([...new Set(proposal.fills.map(fill => fill.obligation))].sort()) !== canonical(area.open)) return null;

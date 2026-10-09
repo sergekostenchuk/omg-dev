@@ -22,6 +22,7 @@ import type { FrameRead, FrameRequest } from "../src/om/frame-obligations.js";
 import type { HorizonRecords } from "../src/om/horizon.js";
 import type { OmInputRecord } from "../src/om/input.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
+import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
@@ -1397,6 +1398,15 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
   void phase;
 });
 
+/**
+ * G6 (№3857 п.5): works are accepted only when their G5 gate passed and layer 3 is written — a performed works step proves
+ * neither (FA1 claimed it; №3855 п.5). The gates of the pass, their findings, and the accepted layer.
+ */
+function worksAcceptance(store: Store) {
+  const gates = store.list<{ result: { passed: boolean; findings: { code: string; target: string }[] } }>("om-atomic-gate");
+  return { passed: gates.some(row => row.value.result.passed), frame: !!store.get(`om-frame:${project}:3`),
+    findings: gates.flatMap(row => row.value.result.findings.map(item => `${item.code} ${item.target}`)) };
+}
 // OWN1 (№3711, №3716) replaced the end of R13/R13b: in the bypass a late question no H2 assigned no longer ends the pass.
 // OWN1.2 (№3806, №3809) replaces its carrying: the engine carries by default only what a work proves itself. The late
 // question of the environment without H2 is not in D7 — it stays open in B1 for its task start and binds no work, so the
@@ -1422,6 +1432,7 @@ test("OWN1.2 OWN1 H1.2 R13 R13b a late question of the environment no H2 assigne
   assert.deepEqual(ledgers.flatMap(row => row.value.assignments).filter(row => row.kind === "environment-confirmation"), [],
     "A late question of the environment without H2 is not carried");
   assert.ok(performed.includes("works"), `The works answer that binds nothing is accepted: ${performed.join(",")} ${JSON.stringify(state)}`);
+  assert.deepEqual(worksAcceptance(f.store), { passed: true, frame: true, findings: [] }, "G5 passed and layer 3 is written");
   assert.equal(JSON.stringify(f.store.list("om-unit-refusal")).includes("task_obligation_resolution_required"), false,
     "No works answer is refused for a binding no work can make");
   assert.equal(f.store.list("om-owner-gap-assignment").length, 0, "The pass invents no owner command");
@@ -1475,6 +1486,7 @@ test("OWN1.2 a D7 request the older rule performed (the environment question car
   assert.ok(ledgers.some(row => row.id === older!.ledger.id), "The older ledger stays as written");
   assert.ok(ledgers.some(row => row.id !== older!.ledger.id && !row.value.assignments.length), `The newer one is added beside it: ${JSON.stringify(ledgers.map(row => [row.id, row.value.assignments.length]))}`);
   assert.ok(performed.includes("works"), `The works answer that binds nothing is accepted: ${performed.join(",")} ${JSON.stringify(state)}`);
+  assert.deepEqual(worksAcceptance(f.store), { passed: true, frame: true, findings: [] }, "G5 passed and layer 3 is written");
 });
 
 
@@ -1513,25 +1525,93 @@ async function factWorksPass(t: test.TestContext, verdicts: Verdict[], facts = 1
   }
   return { f, performed, state, assessed, consume: blockSeries(f as unknown as Fixture) };
 }
-test("FA1 a technical E5 terminal of the attempt's own fact closes the attempt through G7 with its derived reason; the next attempt asks the fact again and the works are accepted", async t => {
+// G6 (№3857, №3869): the supported fact and the works of its block stood in one attempt, whose works D1 kept the fact's
+// question open on the old B1 — G5 refused them, which FA1 never saw (it proved a performed step, №3855 п.5). Now the
+// group waits for the transition: the answer is applied, LP5 ends the attempt on the replaced B1, the fact stays its
+// result, and the next attempt asks the works anew with the answer in its packet; G5 passes and layer 3 is written.
+test("FA1 G6 a technical E5 terminal of the attempt's own fact closes the attempt through G7 with its derived reason; the next attempt asks the fact again, the group's transition applies the answer, and new works carrying it pass G5 and write layer 3", async t => {
   for (const technical of ["off-form", "interrupted"] as const) await t.test(technical, async child => {
-    const { performed, state, assessed, consume } = await factWorksPass(child, [technical, "supported"]);
-    assert.deepEqual(assessed, [technical, "supported"], `The fact is assessed once per attempt: ${performed.join(",")} ${JSON.stringify(state)}`);
+    const { f, performed, state, assessed, consume } = await factWorksPass(child, [technical, "supported"]);
+    const trail = `${performed.join(",")} ${JSON.stringify(state)}`;
+    assert.deepEqual(assessed, [technical, "supported"], `The fact is assessed once per attempt: ${trail}`);
     assert.equal(consume.value.attempts[0]!.outcome?.reason, technical, "The common close derives the technical reason");
     assert.deepEqual(consume.value.attempts[0]!.outcome?.achieved, []);
-    assert.ok(consume.value.attempts.length >= 2, "The next attempt opens after the close");
-    assert.ok(performed.includes("works"), `The works are accepted after the fact is supported: ${performed.join(",")} ${JSON.stringify(state)}`);
+    assert.ok(performed.indexOf("apply") > 0 && performed.indexOf("apply") < performed.indexOf("works"), `The answer is applied before the works step: ${trail}`);
+    assert.equal(consume.value.attempts[1]!.outcome?.reason, "result", "LP5 ends the attempt of the old B1; the supported fact is its result");
+    assert.ok(consume.value.attempts[1]!.outcome!.achieved.length > 0, `The fact stays achieved: ${JSON.stringify(consume.value.attempts[1]!.outcome)}`);
+    assert.ok(consume.value.attempts.length >= 3, "New works are asked in a new attempt");
+    const works = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.packetContract === WORKS_BRIEF_PACKET_CONTRACT && row.value.packet);
+    const latest = works.filter(row => row.value.request.attempt?.ordinal === 3);
+    assert.ok(latest.length && latest.every(row => JSON.stringify(row.value.packet).includes("UTF-8")), "The new works packet carries the applied answer");
+    assert.deepEqual(worksAcceptance(f.store), { passed: true, frame: true, findings: [] }, `G5 passed and layer 3 is written: ${trail}`);
+    const next = ok(await advanceRun(f.store, f.request)).record.value.state as { phase: string };
+    assert.equal(next.phase, "step", "The pass goes on after the acceptance");
   });
+});
+// G6 В3 (№3869): a paid assembly ended by its area's replaced B1 is reused while the B1 still holds its area's question; once
+// the answer is applied it is no longer — it was asked without that knowledge — and the root is new work carrying the answer.
+// The consuming block's first attempt assembles its works, then G1 replaces its B1 before its interrupted E5 closes it:
+// LP5 ends it by its area (interrupted, the assembly kept). The second attempt reuses that assembly (the question still held)
+// and its fact is supported; the group's transition applies the answer; the third asks the works anew. The producing block,
+// whose area the fact does not concern, is reused throughout.
+test("G6 В3 a paid assembly ended by its area's B1 is reused while its area's question stands, and never once that question's answer is applied: the root is new work whose packet carries the answer; another area keeps its reuse", async t => {
+  const f = worksFixture(t, false, true);
+  ok(startRun(f.store, { project }));
+  const performed: string[] = [], answered = new Set<string>(), verdicts: Verdict[] = ["interrupted", "supported"];
+  let assessed = 0, replaceAfter: string | null = null, replaced = false;
+  for (let index = 0; index < 400 && !performed.includes("works"); index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const action = advanced.performed?.action ?? "";
+    if (action) performed.push(action);
+    if (!replaced && replaceAfter && action === "cycle" && JSON.stringify(advanced.performed!.request).includes(replaceAfter)) { lp5ReplaceB1(f); replaced = true; }
+    const state = advanced.record.value.state as unknown as { phase: string; step?: { action: string; request: { packet: Ref } } };
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+    if (state.phase !== "step") continue;
+    const key = JSON.stringify(state.step!.request);
+    if (state.step!.action === "cycle" && !answered.has(key)) {
+      answered.add(key);
+      const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (batch.model !== "MC1") {
+        f.answer(saved);
+        const attempt = packet.value.request.attempt;
+        if (!replaced && attempt?.ordinal === 1 && attempt.series.id.endsWith("garden-consume-block")) replaceAfter = saved.id;
+      } else {
+        const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(source),
+            selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage });
+      }
+    }
+    if (state.phase === "step" && state.step!.action === "assess" && !answered.has(key)) {
+      answered.add(key); f.push(assessor(verdicts[Math.min(assessed++, verdicts.length - 1)]!));
+    }
+  }
+  const trail = performed.join(",");
+  assert.ok(replaced, `G1 replaced the B1 after the first works of the consuming block: ${trail}`);
+  const consume = blockSeries(f as unknown as Fixture, "garden-consume-block").value.attempts;
+  assert.deepEqual(consume.slice(0, 2).map(row => row.outcome?.reason), ["interrupted", "result"], trail);
+  const blockOf = (row: Revision<CompletionReuse>) => f.store.get<{ owner: { block?: string } }>(row.value.binding.id, row.value.binding.revision)!.value.owner.block;
+  const reuses = f.store.list<CompletionReuse>(COMPLETION_REUSE_KIND);
+  assert.equal(reuses.filter(row => blockOf(row) === "garden-consume-block").length, 1, `The second attempt reused the first assembly while the question stood: ${trail}`);
+  const works = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.packetContract === WORKS_BRIEF_PACKET_CONTRACT
+    && row.value.packet && row.value.request.attempt?.series.id.endsWith("garden-consume-block"));
+  assert.deepEqual(works.map(row => row.value.request.attempt!.ordinal).sort(), [1, 3], "The third attempt asks its works anew; the second never did");
+  assert.ok(JSON.stringify(works.find(row => row.value.request.attempt!.ordinal === 3)!.value.packet).includes("UTF-8"), "The new packet carries the answer");
+  assert.ok(reuses.filter(row => blockOf(row) === "garden-produce-block").length >= 2, "The producing block keeps its reuse after either replacement");
+  assert.deepEqual(worksAcceptance(f.store), { passed: true, frame: true, findings: [] }, trail);
 });
 // FA1 return №3833: a technical terminal beside a lawful negative verdict of another own fact is no technical failure —
 // the negative verdict is the attempt's own cause, so nothing is paid again and the earlier wait stands.
 test("FA1 №3833 an own off-form E5 terminal beside an own insufficient or conflicting verdict keeps the earlier frame_gate wait: no close, no fact asked or assessed again", async t => {
   for (const negative of ["insufficient", "conflicting"] as const) await t.test(negative, async child => {
-    const { performed, state, assessed, consume } = await factWorksPass(child, ["off-form", negative], 2);
+    const { f, performed, state, assessed, consume } = await factWorksPass(child, ["off-form", negative], 2);
     assert.deepEqual(assessed, ["off-form", negative], `Each fact is assessed once: ${performed.join(",")} ${JSON.stringify(state)}`);
     assert.equal(consume.value.attempts.length, 1, "No next attempt is opened");
     assert.equal(consume.value.attempts[0]!.outcome, null, "The attempt is not closed through the technical branch");
     assert.equal(performed.includes("works"), false);
+    assert.equal(worksAcceptance(f.store).frame, false, "No acceptance");
     assert.deepEqual([state.phase, (state.wait as { code?: string } | undefined)?.code], ["waiting", "frame_gate"]);
   });
 });
